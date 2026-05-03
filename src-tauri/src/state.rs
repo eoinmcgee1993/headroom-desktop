@@ -583,7 +583,9 @@ impl AppState {
         // App-version-triggered atomic runtime upgrade. Replaces the old
         // receipt-vs-pinned drift path.
         if self.should_run_runtime_upgrade(app) {
-            self.run_upgrade_with_ui(app);
+            // Auto-trigger never forces rebuild — that's reserved for the
+            // user-facing "Retry with full rebuild" recovery flow.
+            self.run_upgrade_with_ui(app, false);
         }
 
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
@@ -679,7 +681,13 @@ impl AppState {
     /// runtime by waiting for proxy reachability. On boot-validation failure,
     /// rolls back to the previous venv and records a failure so the UI can
     /// render a retry banner.
-    pub fn run_upgrade_with_ui(&self, app: &tauri::AppHandle) {
+    ///
+    /// `force_rebuild` skips the in-place upgrade attempt and goes straight
+    /// to atomic rebuild. Set by the user-facing "Retry with full rebuild"
+    /// flow when an in-place upgrade installed cleanly but the proxy
+    /// failed to boot — typically an ABI mismatch in native deps that pip
+    /// can't detect.
+    pub fn run_upgrade_with_ui(&self, app: &tauri::AppHandle, force_rebuild: bool) {
         let _guard = match self.upgrade_lock.try_lock() {
             Some(g) => g,
             None => {
@@ -783,7 +791,7 @@ impl AppState {
             RuntimeMaintenancePlan::Upgrade(release) => {
                 match self
                     .tool_manager
-                    .atomic_upgrade_headroom(&release, progress)
+                    .atomic_upgrade_headroom(&release, progress, force_rebuild)
                 {
                     UpgradeOutcome::InstalledPendingValidation { pip_output_tail } => {
                         Ok(pip_output_tail)
@@ -921,7 +929,7 @@ impl AppState {
             proxy_reachable: is_headroom_proxy_reachable(),
             ensure_error: ensure_err,
         };
-        log::warn!(
+        log::info!(
             "run_upgrade_with_ui: post-spawn tracked_child={} python_installed={} \
              proxy_bypass={} pricing_allows_optimization={} runtime_paused={} \
              proxy_reachable={} ensure_error={:?}",
@@ -1008,6 +1016,10 @@ impl AppState {
                     "duration_ms": duration_ms,
                 })),
             );
+            analytics::set_headroom_ai_version(
+                app,
+                self.tool_manager.installed_headroom_version(),
+            );
             *self.runtime_upgrade_in_progress.lock() = false;
             self.invalidate_runtime_status_cache();
             return;
@@ -1067,6 +1079,10 @@ impl AppState {
         if let Err(err) = rollback_result {
             log::error!("run_upgrade_with_ui: rollback failed: {err:#}");
         }
+        analytics::set_headroom_ai_version(
+            app,
+            self.tool_manager.installed_headroom_version(),
+        );
         let restarted = self.ensure_headroom_running().is_ok();
 
         let err_msg = match log_tail.as_deref() {
@@ -1088,7 +1104,11 @@ impl AppState {
                 installed_version
             ),
         };
-        log::warn!("run_upgrade_with_ui: {err_msg}");
+        // Info-level: capture_upgrade_failure below fires a fully-tagged
+        // Level::Error Sentry event with target/fallback versions, log tail,
+        // boot diagnostics, and pip output. A warn! here would just produce
+        // a duplicate, less informative event.
+        log::info!("run_upgrade_with_ui: {err_msg}");
         let err = anyhow::anyhow!("{}", err_msg);
         let previous_app_label = previous_app_version
             .clone()
@@ -1197,7 +1217,12 @@ impl AppState {
     /// User-initiated retry of a previously-failed runtime upgrade. Resets
     /// the attempts counter so `should_run_runtime_upgrade` lets it through,
     /// then invokes `run_upgrade_with_ui` directly.
-    pub fn retry_runtime_upgrade(&self, app: &tauri::AppHandle) {
+    ///
+    /// `force_rebuild` is the "Retry with full rebuild" path — skips the
+    /// in-place attempt and runs atomic rebuild from scratch. Use when the
+    /// previous attempt installed cleanly but the proxy never booted (the
+    /// ABI-mismatch failure mode).
+    pub fn retry_runtime_upgrade(&self, app: &tauri::AppHandle, force_rebuild: bool) {
         {
             let mut profile = self.launch_profile.lock();
             if let Some(failure) = profile.last_runtime_upgrade_failure.as_mut() {
@@ -1205,7 +1230,7 @@ impl AppState {
             }
             persist_launch_profile(&self.launch_profile_path, &profile);
         }
-        self.run_upgrade_with_ui(app);
+        self.run_upgrade_with_ui(app, force_rebuild);
     }
 
     pub fn runtime_upgrade_in_progress(&self) -> bool {

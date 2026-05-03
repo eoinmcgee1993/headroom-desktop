@@ -101,6 +101,14 @@ const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
 ///   on disk and have not produced upgrade-failure events, so we let them
 ///   take the cheap in-place path. If 0.10.x fallbacks start appearing in
 ///   Sentry, raise the floor.
+/// - 0.3.8: a single `fallback: 0.10.12` boot-validation stall appeared in
+///   Sentry, but a clean-VM 0.3.5 → 0.3.7 upgrade reproduced the same
+///   0.10.12 → 0.19.0 in-place delta and succeeded. The N=1 failure looks
+///   environmental, not universal to the 0.10.x cohort. With the new
+///   "Retry with full rebuild" button as a recovery path for the
+///   environmental cases, we keep the floor at 0.10.0 rather than penalize
+///   the (probably ~99%) of 0.10.x users who succeed in-place. Re-evaluate
+///   if multi-machine 0.10.x failures show up in 0.3.8 telemetry.
 const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 10, 0);
 
 /// Parse the leading `major.minor.patch` from a version string, tolerating
@@ -1702,10 +1710,17 @@ impl ToolManager {
     ///
     /// On failure in any install step: rolls back internally, restoring the
     /// previous venv + receipt byte-for-byte, and returns `InstallFailed`.
+    ///
+    /// `force_rebuild` skips the in-place upgrade attempt and goes straight
+    /// to the move-aside-and-rebuild path. Used by the user-facing "Retry
+    /// with full rebuild" recovery flow when an in-place upgrade installed
+    /// cleanly but boot validation failed (typically an ABI mismatch in
+    /// native deps that pip can't detect).
     pub fn atomic_upgrade_headroom<F>(
         &self,
         release: &HeadroomRelease,
         mut progress: F,
+        force_rebuild: bool,
     ) -> UpgradeOutcome
     where
         F: FnMut(BootstrapStepUpdate),
@@ -1725,11 +1740,14 @@ impl ToolManager {
         // In-place path: mutate the live venv rather than rebuilding it.
         // Covers both the wheel-only case (lock unchanged) and the lock-churn
         // case (`pip install --upgrade -r lock` reinstalls only the pins that
-        // actually differ). Falls through to the atomic rebuild only for
-        // fresh installs and the rare case where the lock snapshot needed
-        // for safe rollback is missing on disk.
-        if let Some(ctx) = self.prepare_in_place_upgrade() {
-            return self.in_place_upgrade_headroom(release, ctx, progress);
+        // actually differ). Skipped when `force_rebuild` is set (user-
+        // initiated recovery from a botched in-place upgrade) or when
+        // `prepare_in_place_upgrade` decides the receipt isn't safe to
+        // mutate in-place.
+        if !force_rebuild {
+            if let Some(ctx) = self.prepare_in_place_upgrade() {
+                return self.in_place_upgrade_headroom(release, ctx, progress);
+            }
         }
 
         let venv_dir = self.runtime.venv_dir.clone();
@@ -5077,7 +5095,7 @@ after
             sha256: "deadbeef".into(),
         };
 
-        let outcome = manager.atomic_upgrade_headroom(&release, |_| {});
+        let outcome = manager.atomic_upgrade_headroom(&release, |_| {}, false);
 
         match outcome {
             UpgradeOutcome::InstallFailed { restored, .. } => {
@@ -5486,14 +5504,15 @@ exit 0
 
     #[test]
     fn receipt_requires_atomic_rebuild_below_floor() {
-        // Floor is 0.10.0 at time of writing — catches 0.5.x/0.6.x/0.8.x/0.9.x
-        // (different lock or smaller user base) while letting 0.10.x users
-        // (same lock as 0.8.2 but no observed Sentry failures) take the
-        // in-place path.
+        // Floor held at 0.10.0 in 0.3.8: a clean-VM 0.3.5 → 0.3.7 upgrade
+        // reproduced the 0.10.12 → 0.19.0 in-place delta successfully, so
+        // the single Sentry stall looks environmental rather than universal
+        // to the 0.10.x cohort. The "Retry with full rebuild" button is the
+        // recovery path for environmental cases.
         assert_eq!(ATOMIC_REBUILD_FLOOR_VERSION, (0, 10, 0));
 
-        // Pre-floor: shipped in 0.2.40 → 0.3.0-rc.10 desktop bundles, plus the
-        // 0.8.2 fallback that produced the original Sentry events.
+        // Pre-floor: shipped in 0.2.40 → 0.3.0-rc.10 desktop bundles, plus
+        // the 0.8.2 fallback that produced the original Sentry events.
         assert!(receipt_requires_atomic_rebuild("0.5.18"));
         assert!(receipt_requires_atomic_rebuild("0.5.24"));
         assert!(receipt_requires_atomic_rebuild("0.6.5"));

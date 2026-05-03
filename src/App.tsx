@@ -2702,6 +2702,18 @@ export default function App() {
                 type="button"
                 className="secondary-button secondary-button--small"
                 onClick={() =>
+                  void invoke("retry_runtime_upgrade_with_rebuild")
+                }
+                disabled={runtimeUpgradeProgress.running}
+              >
+                Retry with full rebuild
+              </button>
+            )}
+            {upgradeFailure.failurePhase === "boot_validation" && (
+              <button
+                type="button"
+                className="secondary-button secondary-button--small"
+                onClick={() =>
                   void invoke("open_external_link", {
                     url: "mailto:support@extraheadroom.com?subject=Headroom Update Issue",
                   }).catch(() => {})
@@ -2818,6 +2830,18 @@ export default function App() {
               >
                 Continue with previous version
               </button>
+              {upgradeFailure.failurePhase === "boot_validation" && (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() =>
+                    void invoke("retry_runtime_upgrade_with_rebuild")
+                  }
+                  disabled={runtimeUpgradeProgress.running}
+                >
+                  Retry with full rebuild
+                </button>
+              )}
               {upgradeFailure.failurePhase === "boot_validation" && (
                 <button
                   type="button"

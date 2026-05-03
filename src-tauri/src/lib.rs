@@ -1051,7 +1051,24 @@ fn retry_runtime_upgrade(app: AppHandle) -> Result<(), String> {
     let app_clone = app.clone();
     std::thread::spawn(move || {
         let state: tauri::State<'_, AppState> = app_clone.state();
-        state.retry_runtime_upgrade(&app_clone);
+        state.retry_runtime_upgrade(&app_clone, false);
+    });
+    Ok(())
+}
+
+/// User-initiated recovery path. Same flow as `retry_runtime_upgrade` but
+/// skips the in-place upgrade attempt and goes straight to atomic rebuild.
+/// Surfaced as the "Retry with full rebuild" button on a boot-validation
+/// failure: the in-place pip succeeded (smoke test passed) but the proxy
+/// never booted, which usually means stale native libs from the previous
+/// pin survived the upgrade. The rebuild path nukes the venv and starts
+/// fresh, fixing the broken state at the cost of re-downloading wheels.
+#[tauri::command]
+fn retry_runtime_upgrade_with_rebuild(app: AppHandle) -> Result<(), String> {
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        let state: tauri::State<'_, AppState> = app_clone.state();
+        state.retry_runtime_upgrade(&app_clone, true);
     });
     Ok(())
 }
@@ -2061,6 +2078,10 @@ pub fn run() {
             spawn_claude_projects_warmer(app.handle().clone());
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
+            analytics::set_headroom_ai_version(
+                &app_handle,
+                state.tool_manager.installed_headroom_version(),
+            );
             analytics::track_event(
                 &app_handle,
                 "app_started",
@@ -2167,6 +2188,7 @@ pub fn run() {
             get_bootstrap_progress,
             get_runtime_upgrade_progress,
             retry_runtime_upgrade,
+            retry_runtime_upgrade_with_rebuild,
             dismiss_runtime_upgrade_failure,
             get_runtime_status,
             get_headroom_logs,
@@ -3038,7 +3060,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             }
 
             consecutive_failures = consecutive_failures.saturating_add(1);
-            log::warn!(
+            log::info!(
                 "watchdog: proxy unreachable (failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}, bypass={bypass_active}), attempting restart"
             );
 
