@@ -751,6 +751,11 @@ pub(crate) struct WatchdogGiveUpReport {
     pub runtime_upgrade_in_progress: bool,
     pub consecutive_failures: u32,
     pub log_tail: Option<String>,
+    /// Last error returned by `ensure_headroom_running` during this down
+    /// episode, if any. Distinguishes "spawn keeps erroring" (Some) from
+    /// "spawn returned Ok but `/readyz` never came back" (None) — the two
+    /// failure modes look identical without this field.
+    pub last_startup_error: Option<String>,
 }
 
 pub(crate) fn build_watchdog_give_up_report(
@@ -759,6 +764,7 @@ pub(crate) fn build_watchdog_give_up_report(
     runtime_upgrade_in_progress: bool,
     exit_status: Option<String>,
     log_tail: Option<String>,
+    last_startup_error: Option<String>,
 ) -> WatchdogGiveUpReport {
     WatchdogGiveUpReport {
         message: format!(
@@ -770,6 +776,7 @@ pub(crate) fn build_watchdog_give_up_report(
         runtime_upgrade_in_progress,
         consecutive_failures,
         log_tail: log_tail.filter(|s| !s.is_empty()),
+        last_startup_error: last_startup_error.filter(|s| !s.is_empty()),
     }
 }
 
@@ -791,6 +798,7 @@ fn capture_watchdog_give_up(
     let upgrade_in_progress = state.runtime_upgrade_in_progress();
     let log_tail = tool_manager::newest_proxy_log_path(&state.tool_manager.logs_dir())
         .map(|path| tool_manager::tail_log_file(&path, 30));
+    let last_startup_error = state.last_startup_error.lock().clone();
 
     let report = build_watchdog_give_up_report(
         consecutive_failures,
@@ -798,6 +806,7 @@ fn capture_watchdog_give_up(
         upgrade_in_progress,
         exit_status,
         log_tail,
+        last_startup_error,
     );
 
     sentry::with_scope(
@@ -819,6 +828,9 @@ fn capture_watchdog_give_up(
             );
             if let Some(tail) = &report.log_tail {
                 scope.set_extra("proxy_log_tail", tail.clone().into());
+            }
+            if let Some(err) = &report.last_startup_error {
+                scope.set_extra("last_startup_error", err.clone().into());
             }
         },
         || {
@@ -4846,6 +4858,7 @@ Some unrelated content.
             false,
             Some("exit status: 1".to_string()),
             Some("Traceback (most recent call last):\n  ...".to_string()),
+            None,
         );
         assert_eq!(report.tracked_child_exit_status, "exit status: 1");
         assert_eq!(report.consecutive_failures, 3);
@@ -4863,7 +4876,7 @@ Some unrelated content.
     fn build_watchdog_give_up_report_falls_back_when_child_untracked() {
         // headroom_process_exited returns None when no Child handle is held
         // or the OS hasn't reaped the child. Payload must still be useful.
-        let report = build_watchdog_give_up_report(5, true, false, None, None);
+        let report = build_watchdog_give_up_report(5, true, false, None, None, None);
         assert_eq!(report.tracked_child_exit_status, "still_alive_or_untracked");
         assert!(report.bypass_active);
         assert!(report.log_tail.is_none());
@@ -4873,13 +4886,37 @@ Some unrelated content.
     fn build_watchdog_give_up_report_drops_empty_log_tail() {
         // tail_log_file returns "" when the log file is missing or unreadable.
         // Empty tails must not become an empty `proxy_log_tail` Sentry extra.
-        let report = build_watchdog_give_up_report(3, false, false, None, Some(String::new()));
+        let report =
+            build_watchdog_give_up_report(3, false, false, None, Some(String::new()), None);
         assert!(report.log_tail.is_none());
     }
 
     #[test]
     fn build_watchdog_give_up_report_propagates_upgrade_flag() {
-        let report = build_watchdog_give_up_report(3, false, true, None, None);
+        let report = build_watchdog_give_up_report(3, false, true, None, None, None);
         assert!(report.runtime_upgrade_in_progress);
+    }
+
+    #[test]
+    fn build_watchdog_give_up_report_carries_last_startup_error() {
+        let report = build_watchdog_give_up_report(
+            3,
+            false,
+            false,
+            None,
+            None,
+            Some("Address already in use (os error 48)".to_string()),
+        );
+        assert_eq!(
+            report.last_startup_error.as_deref(),
+            Some("Address already in use (os error 48)")
+        );
+    }
+
+    #[test]
+    fn build_watchdog_give_up_report_drops_empty_last_startup_error() {
+        let report =
+            build_watchdog_give_up_report(3, false, false, None, None, Some(String::new()));
+        assert!(report.last_startup_error.is_none());
     }
 }

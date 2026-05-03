@@ -1025,6 +1025,25 @@ impl AppState {
                 app,
                 self.tool_manager.installed_headroom_version(),
             );
+            // ensure_headroom_running's gate guards were suppressed during
+            // validation so a gated user's brand-new venv could actually be
+            // validated (otherwise we'd commit untested or roll back a
+            // perfectly good install). Now that the upgrade has committed,
+            // restore the gate state by stopping the validation Python if any
+            // gate is asserting Python should be down. Client-side routing is
+            // already pointed direct-to-Anthropic by whoever asserted the
+            // gate, so the validation Python wasn't receiving traffic anyway.
+            let gate_wants_python_down = self
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire)
+                || !self.pricing_allows_optimization()
+                || self.runtime_is_paused();
+            if gate_wants_python_down {
+                log::info!(
+                    "run_upgrade_with_ui: validation succeeded; stopping validation Python because a gate is active"
+                );
+                self.stop_headroom();
+            }
             *self.runtime_upgrade_in_progress.lock() = false;
             self.invalidate_runtime_status_cache();
             return;
@@ -2205,27 +2224,43 @@ impl AppState {
             return Ok(());
         }
 
-        // When the pricing gate has flipped on `proxy_bypass`, Python is
-        // intentionally down — the Rust intercept is routing direct to
-        // Anthropic. Don't restart Python here; that would just defeat the
-        // gate and (via the watchdog's failure path) eventually auto-pause
-        // the runtime.
-        if self
-            .proxy_bypass
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            log::debug!("ensure_headroom_running: short-circuit (proxy_bypass active)");
-            return Ok(());
-        }
+        // Suppress the gate guards while a runtime upgrade is mid-validation.
+        // The post-install boot validation in `run_upgrade_with_ui` calls
+        // back into this function to bring the new venv up; if any of the
+        // three gates below fires there, we silent-Ok-exit, the post-spawn
+        // snapshot finds nothing running, and a perfectly good upgrade gets
+        // rolled back as `not_started`. Routing isn't affected: client-side
+        // configuration (`disable_client_setup`/`clear_client_setups`) is
+        // mutated by whoever asserted the gate, so Claude Code is already
+        // pointed direct-to-Anthropic regardless of whether Python is
+        // bound on :6768. After validation, `run_upgrade_with_ui` calls
+        // `stop_headroom()` if a gate is still active so we don't leave
+        // the validation Python running where the user expected it down.
+        let in_upgrade_validation = *self.runtime_upgrade_in_progress.lock();
 
-        if !self.pricing_allows_optimization() {
-            self.enforce_pricing_gate();
-            self.stop_python_if_gated();
-            return Ok(());
-        }
+        if !in_upgrade_validation {
+            // When the pricing gate has flipped on `proxy_bypass`, Python is
+            // intentionally down — the Rust intercept is routing direct to
+            // Anthropic. Don't restart Python here; that would just defeat the
+            // gate and (via the watchdog's failure path) eventually auto-pause
+            // the runtime.
+            if self
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                log::debug!("ensure_headroom_running: short-circuit (proxy_bypass active)");
+                return Ok(());
+            }
 
-        if self.runtime_is_paused() {
-            return Ok(());
+            if !self.pricing_allows_optimization() {
+                self.enforce_pricing_gate();
+                self.stop_python_if_gated();
+                return Ok(());
+            }
+
+            if self.runtime_is_paused() {
+                return Ok(());
+            }
         }
 
         // Tear down any orphan proxy from an older desktop build BEFORE taking
@@ -2251,12 +2286,17 @@ impl AppState {
         if !self.tool_manager.python_runtime_installed() {
             return Ok(());
         }
-        if !self.pricing_allows_optimization() {
-            self.enforce_pricing_gate();
-            return Ok(());
-        }
-        if self.runtime_is_paused() {
-            return Ok(());
+        // Same upgrade-validation suppression as above. Re-read the flag
+        // because the upgrade could have completed between the two reads
+        // (lifecycle_lock can block for the duration of another spawn).
+        if !*self.runtime_upgrade_in_progress.lock() {
+            if !self.pricing_allows_optimization() {
+                self.enforce_pricing_gate();
+                return Ok(());
+            }
+            if self.runtime_is_paused() {
+                return Ok(());
+            }
         }
 
         // If the proxy is already live (e.g. started externally, or by us under
