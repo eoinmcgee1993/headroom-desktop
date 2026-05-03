@@ -141,6 +141,16 @@ struct AvailableAppUpdate {
 
 static ZERO_SPEND_ALERT_FIRED: AtomicBool = AtomicBool::new(false);
 
+// Set when the watchdog has captured a Sentry event for the current "down
+// episode". Reset whenever the proxy is observed reachable again, so a
+// subsequent crash re-fires.
+static WATCHDOG_DOWN_CAPTURED: AtomicBool = AtomicBool::new(false);
+
+// Set after the first port-conflict start failure has been captured this
+// session. Subsequent in-session port conflicts stay silent so the dashboard
+// doesn't drown in the sleep/wake / kill -9 race noise.
+static PORT_CONFLICT_CAPTURED: AtomicBool = AtomicBool::new(false);
+
 // Spend fields (actual_cost_usd, total_tokens_sent) were added to SavingsRecord in
 // schema v6, shipped in 0.2.40 on 2026-04-13. Records written before that date
 // deserialize those fields as 0 via #[serde(default)], producing false positives.
@@ -653,6 +663,15 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
     }
 }
 
+/// True when a Headroom proxy startup error chain looks like an environmental
+/// port conflict (another process — possibly a stale headroom child — holds
+/// the proxy port). Used to route these failures to a separate, rate-limited
+/// Sentry fingerprint so the dashboard isn't drowned in non-actionable noise.
+pub(crate) fn is_port_conflict_failure(technical_err: &str) -> bool {
+    port_conflict::is_port_conflict(technical_err)
+        || technical_err.contains("headroom proxy already running on port")
+}
+
 /// Report a headroom proxy startup failure to Sentry. If the error chain
 /// contains a `HeadroomStartupFailure`, its log tail, log path, and invocation
 /// are sent as structured `extra` fields so we can see what Python printed
@@ -663,13 +682,11 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
     // Environmental failures: another process holds port 6768, or a stale
     // headroom proxy is still bound. The user gets an actionable hint via
     // `state::classify_startup_error` and the persistent-conflict case is
-    // surfaced separately by `port_conflict::note_proxy_failed`. Skip Sentry
-    // here so the dashboard isn't drowned in non-actionable events.
-    if port_conflict::is_port_conflict(&technical_err)
-        || technical_err.contains("headroom proxy already running on port")
-    {
-        return;
-    }
+    // surfaced separately by `port_conflict::note_proxy_failed`. Capture once
+    // per session at Warning level under a distinct fingerprint so the
+    // dashboard sees real failures (stale child holding the port,
+    // sleep/wake race) without drowning in non-actionable noise.
+    let is_port_conflict = is_port_conflict_failure(&technical_err);
 
     let startup_failure = err
         .chain()
@@ -677,6 +694,33 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
 
     let headline = format!("{context}: {technical_err}");
     let truncated = headline.chars().take(400).collect::<String>();
+
+    if is_port_conflict {
+        if PORT_CONFLICT_CAPTURED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        sentry::with_scope(
+            |scope| {
+                let fp: &[&str] = &["proxy_start_port_conflict"];
+                scope.set_fingerprint(Some(fp));
+                if let Some(failure) = startup_failure {
+                    scope.set_extra("program", failure.program.clone().into());
+                    scope.set_extra("args", failure.args.join(" ").into());
+                    scope.set_extra("log_path", failure.log_path.clone().into());
+                    scope.set_extra("log_tail", failure.log_tail.clone().into());
+                    scope.set_extra("reason", failure.reason.clone().into());
+                }
+                scope.set_extra("error_chain", technical_err.clone().into());
+            },
+            || {
+                sentry::capture_message(&truncated, sentry::Level::Warning);
+            },
+        );
+        return;
+    }
 
     if let Some(failure) = startup_failure {
         sentry::with_scope(
@@ -697,16 +741,112 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
     }
 }
 
+/// Pure payload for `capture_watchdog_give_up`. Built before any Sentry side
+/// effects so it can be unit-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WatchdogGiveUpReport {
+    pub message: String,
+    pub tracked_child_exit_status: String,
+    pub bypass_active: bool,
+    pub runtime_upgrade_in_progress: bool,
+    pub consecutive_failures: u32,
+    pub log_tail: Option<String>,
+}
+
+pub(crate) fn build_watchdog_give_up_report(
+    consecutive_failures: u32,
+    bypass_active: bool,
+    runtime_upgrade_in_progress: bool,
+    exit_status: Option<String>,
+    log_tail: Option<String>,
+) -> WatchdogGiveUpReport {
+    WatchdogGiveUpReport {
+        message: format!(
+            "proxy_unreachable_post_boot (auto_paused after {consecutive_failures} failures)"
+        ),
+        tracked_child_exit_status: exit_status
+            .unwrap_or_else(|| "still_alive_or_untracked".to_string()),
+        bypass_active,
+        runtime_upgrade_in_progress,
+        consecutive_failures,
+        log_tail: log_tail.filter(|s| !s.is_empty()),
+    }
+}
+
+/// Capture once per "down episode" when the watchdog gives up on restarting
+/// the proxy. Fires before stop_headroom tears down the tracked child handle
+/// and proxy log, so the payload reflects the failure we're recovering from.
+fn capture_watchdog_give_up(
+    state: &AppState,
+    consecutive_failures: u32,
+    bypass_active: bool,
+) {
+    if WATCHDOG_DOWN_CAPTURED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let exit_status = state.headroom_process_exited();
+    let upgrade_in_progress = state.runtime_upgrade_in_progress();
+    let log_tail = tool_manager::newest_proxy_log_path(&state.tool_manager.logs_dir())
+        .map(|path| tool_manager::tail_log_file(&path, 30));
+
+    let report = build_watchdog_give_up_report(
+        consecutive_failures,
+        bypass_active,
+        upgrade_in_progress,
+        exit_status,
+        log_tail,
+    );
+
+    sentry::with_scope(
+        |scope| {
+            let fp: &[&str] = &["proxy_unreachable_post_boot"];
+            scope.set_fingerprint(Some(fp));
+            scope.set_extra(
+                "tracked_child_exit_status",
+                report.tracked_child_exit_status.clone().into(),
+            );
+            scope.set_extra("bypass_active", report.bypass_active.into());
+            scope.set_extra(
+                "runtime_upgrade_in_progress",
+                report.runtime_upgrade_in_progress.into(),
+            );
+            scope.set_extra(
+                "consecutive_failures",
+                (report.consecutive_failures as i64).into(),
+            );
+            if let Some(tail) = &report.log_tail {
+                scope.set_extra("proxy_log_tail", tail.clone().into());
+            }
+        },
+        || {
+            sentry::capture_message(&report.message, sentry::Level::Error);
+        },
+    );
+}
+
 /// Diagnostic snapshot taken at the moment a boot-validation failure is
 /// captured. Distinguishes "the new proxy never spawned" (tracked_child=false)
 /// from "spawned but crashed before writing logs" (no new log) from "spawned
 /// and bound but unreachable" (port_bound=true, log written, /livez never
 /// answered). None for install-phase failures where no proxy launch happened.
-#[derive(Default, Clone, Copy)]
+///
+/// When `tracked_child` is false, the secondary fields below identify which
+/// `ensure_headroom_running` short-circuit fired or whether the spawn errored
+/// outright — without these, every "Stalled" / "NotStarted" event looks
+/// identical in Sentry.
+#[derive(Default, Clone)]
 pub(crate) struct UpgradeBootDiagnostics {
     pub tracked_child: bool,
     pub new_proxy_log_written: bool,
     pub proxy_port_bound: bool,
+    pub python_installed: bool,
+    pub proxy_bypass: bool,
+    pub pricing_allows_optimization: bool,
+    pub runtime_paused: bool,
+    pub ensure_error: Option<String>,
 }
 
 /// Report a runtime upgrade failure to Sentry. `phase` is "install" for
@@ -776,7 +916,7 @@ pub(crate) fn capture_upgrade_failure(
             if let Some(tail) = log_tail_capped.as_deref() {
                 scope.set_extra("log_tail", tail.into());
             }
-            if let Some(diag) = boot_diagnostics {
+            if let Some(diag) = boot_diagnostics.as_ref() {
                 scope.set_tag("tracked_child", if diag.tracked_child { "true" } else { "false" });
                 scope.set_tag(
                     "new_proxy_log_written",
@@ -789,6 +929,16 @@ pub(crate) fn capture_upgrade_failure(
                 scope.set_extra("tracked_child", diag.tracked_child.into());
                 scope.set_extra("new_proxy_log_written", diag.new_proxy_log_written.into());
                 scope.set_extra("proxy_port_bound", diag.proxy_port_bound.into());
+                scope.set_extra("python_installed", diag.python_installed.into());
+                scope.set_extra("proxy_bypass", diag.proxy_bypass.into());
+                scope.set_extra(
+                    "pricing_allows_optimization",
+                    diag.pricing_allows_optimization.into(),
+                );
+                scope.set_extra("runtime_paused", diag.runtime_paused.into());
+                if let Some(err) = diag.ensure_error.as_deref() {
+                    scope.set_extra("ensure_headroom_running_error", err.into());
+                }
             }
             if let Some(failure) = cmd_failure {
                 scope.set_extra("program", failure.program.clone().into());
@@ -2860,6 +3010,9 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
             if runtime.proxy_reachable {
                 consecutive_failures = 0;
+                // End of "down episode" — re-arm Sentry capture so a future
+                // crash fires a fresh event.
+                WATCHDOG_DOWN_CAPTURED.store(false, Ordering::Release);
                 continue;
             }
 
@@ -2871,6 +3024,15 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                 log::error!(
                     "watchdog: giving up after {MAX_CONSECUTIVE_FAILURES} failures; disabling interception"
+                );
+                // Capture once per down episode, BEFORE stop_headroom tears
+                // down the tracked child and the proxy log handle, so the
+                // exit status and log tail reflect the failure we're about
+                // to recover from.
+                capture_watchdog_give_up(
+                    &*state,
+                    consecutive_failures,
+                    bypass_active,
                 );
                 state.set_runtime_paused(true);
                 state.stop_headroom();
@@ -3378,17 +3540,17 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
-        beta_channel_enabled_from, build_release_updater_config, check_headroom_learn_prereqs,
-        classify_bootstrap_failure, compute_tray_window_position, count_memories_created_today,
-        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
-        fetch_transformations_feed_from, install_pending_update, is_prerelease_version,
-        lifetime_token_milestone_kind, parse_live_learnings, parse_updater_endpoint_list,
-        pattern_matches_project, physical_rect_from_rect, read_applied_patterns_for_project,
-        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
-        watchdog_should_be_up, AvailableAppUpdate, BootstrapFailureKind,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds,
-        PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY,
+        beta_channel_enabled_from, build_release_updater_config, build_watchdog_give_up_report,
+        check_headroom_learn_prereqs, classify_bootstrap_failure, compute_tray_window_position,
+        count_memories_created_today, debounced_tray_runtime_visual, delete_applied_pattern,
+        empty_live_learnings_for_projects, fetch_transformations_feed_from, install_pending_update,
+        is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
+        parse_live_learnings, parse_updater_endpoint_list, pattern_matches_project,
+        physical_rect_from_rect, read_applied_patterns_for_project, resolve_release_updater_config,
+        select_updater_endpoints, store_checked_update, watchdog_should_be_up,
+        AvailableAppUpdate, BootstrapFailureKind, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -4474,5 +4636,79 @@ Some unrelated content.
     #[test]
     fn watchdog_should_be_up_skips_when_pricing_gate_bypassed() {
         assert!(!watchdog_should_be_up(true, false, false, false, true));
+    }
+
+    #[test]
+    fn is_port_conflict_failure_matches_non_headroom_bail() {
+        assert!(is_port_conflict_failure(
+            "port 6768 is occupied by a non-headroom process (python3.1 pid 1073); ..."
+        ));
+    }
+
+    #[test]
+    fn is_port_conflict_failure_matches_already_running_message() {
+        // Distinct from a foreign-process conflict: a stale headroom child
+        // still bound to the port.
+        assert!(is_port_conflict_failure(
+            "spawn aborted: headroom proxy already running on port 6768"
+        ));
+    }
+
+    #[test]
+    fn is_port_conflict_failure_rejects_unrelated_errors() {
+        // Generic startup failures must NOT route to the rate-limited port-
+        // conflict fingerprint — they need the Error-level capture.
+        assert!(!is_port_conflict_failure(
+            "ModuleNotFoundError: No module named 'headroom'"
+        ));
+        assert!(!is_port_conflict_failure(
+            "venv interpreter exited with status 1"
+        ));
+        assert!(!is_port_conflict_failure(""));
+    }
+
+    #[test]
+    fn build_watchdog_give_up_report_uses_exit_status_when_present() {
+        let report = build_watchdog_give_up_report(
+            3,
+            false,
+            false,
+            Some("exit status: 1".to_string()),
+            Some("Traceback (most recent call last):\n  ...".to_string()),
+        );
+        assert_eq!(report.tracked_child_exit_status, "exit status: 1");
+        assert_eq!(report.consecutive_failures, 3);
+        assert_eq!(
+            report.message,
+            "proxy_unreachable_post_boot (auto_paused after 3 failures)"
+        );
+        assert_eq!(
+            report.log_tail.as_deref(),
+            Some("Traceback (most recent call last):\n  ...")
+        );
+    }
+
+    #[test]
+    fn build_watchdog_give_up_report_falls_back_when_child_untracked() {
+        // headroom_process_exited returns None when no Child handle is held
+        // or the OS hasn't reaped the child. Payload must still be useful.
+        let report = build_watchdog_give_up_report(5, true, false, None, None);
+        assert_eq!(report.tracked_child_exit_status, "still_alive_or_untracked");
+        assert!(report.bypass_active);
+        assert!(report.log_tail.is_none());
+    }
+
+    #[test]
+    fn build_watchdog_give_up_report_drops_empty_log_tail() {
+        // tail_log_file returns "" when the log file is missing or unreadable.
+        // Empty tails must not become an empty `proxy_log_tail` Sentry extra.
+        let report = build_watchdog_give_up_report(3, false, false, None, Some(String::new()));
+        assert!(report.log_tail.is_none());
+    }
+
+    #[test]
+    fn build_watchdog_give_up_report_propagates_upgrade_flag() {
+        let report = build_watchdog_give_up_report(3, false, true, None, None);
+        assert!(report.runtime_upgrade_in_progress);
     }
 }

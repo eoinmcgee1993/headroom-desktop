@@ -2823,16 +2823,20 @@ pub(crate) fn newest_proxy_log_path(logs_dir: &Path) -> Option<PathBuf> {
 }
 
 fn headroom_python_startup_args() -> Vec<String> {
-    let mut args = vec![
+    // The `python -m headroom.proxy.server` argparse does NOT define the learn
+    // flags (--learn, --no-memory-tools, --no-memory-context, --memory-db-path);
+    // those live only on the `headroom proxy` click entrypoint. Passing them
+    // here makes argparse exit 2, so the fallback would always fail and mask
+    // the real entrypoint failure under spurious noise. Keep this variant to
+    // server-supported flags only.
+    vec![
         "-m".to_string(),
         "headroom.proxy.server".to_string(),
         "--port".to_string(),
         HEADROOM_PROXY_PORT.to_string(),
         "--no-http2".to_string(),
         "--log-messages".to_string(),
-    ];
-    args.extend(headroom_learn_startup_args());
-    args
+    ]
 }
 
 fn headroom_entrypoint_startup_args() -> Vec<String> {
@@ -4271,15 +4275,23 @@ mod tests {
         assert!(entrypoint_args.contains(&"--memory-db-path".to_string()));
 
         let python_args = headroom_python_startup_args();
-        assert!(python_args.starts_with(&[
-            "-m".to_string(),
-            "headroom.proxy.server".to_string(),
-            "--port".to_string(),
-            HEADROOM_PROXY_PORT.to_string(),
-            "--no-http2".to_string(),
-            "--log-messages".to_string(),
-        ]));
-        assert!(python_args.contains(&"--learn".to_string()));
+        assert_eq!(
+            python_args,
+            vec![
+                "-m".to_string(),
+                "headroom.proxy.server".to_string(),
+                "--port".to_string(),
+                HEADROOM_PROXY_PORT.to_string(),
+                "--no-http2".to_string(),
+                "--log-messages".to_string(),
+            ]
+        );
+        // The python -m fallback must not pass learn flags; argparse on
+        // headroom.proxy.server doesn't define them and would exit 2.
+        assert!(!python_args.contains(&"--learn".to_string()));
+        assert!(!python_args.contains(&"--no-memory-tools".to_string()));
+        assert!(!python_args.contains(&"--no-memory-context".to_string()));
+        assert!(!python_args.contains(&"--memory-db-path".to_string()));
     }
 
     #[test]

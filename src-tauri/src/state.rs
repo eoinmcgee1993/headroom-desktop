@@ -365,6 +365,20 @@ fn boot_validation_message(elapsed_secs: u64, active: bool) -> String {
     format!("{prefix}… ({}s elapsed{})", elapsed_secs, hint)
 }
 
+/// Reasons `ensure_headroom_running` may have returned `Ok(())` without
+/// actually spawning a tracked child. Captured immediately after the call so
+/// a "Stalled" / "NotStarted" Sentry event can attribute the silent no-op.
+#[derive(Debug, Clone)]
+struct PostSpawnSnapshot {
+    tracked_child: bool,
+    python_installed: bool,
+    proxy_bypass: bool,
+    pricing_allows_optimization: bool,
+    runtime_paused: bool,
+    proxy_reachable: bool,
+    ensure_error: Option<String>,
+}
+
 /// Outcome of the boot-validation loop.
 #[derive(Debug)]
 pub enum BootValidationOutcome {
@@ -376,6 +390,11 @@ pub enum BootValidationOutcome {
     Stalled,
     /// Hit the absolute max without reachability or obvious failure.
     TimedOut,
+    /// `ensure_headroom_running` short-circuited or errored — there is no
+    /// tracked child to wait on AND no externally-reachable proxy on :6768.
+    /// Reported instead of `Stalled` so we don't burn ~120s waiting for a
+    /// process that was never going to start.
+    NotStarted,
 }
 
 impl BootValidationOutcome {
@@ -388,6 +407,7 @@ impl BootValidationOutcome {
             BootValidationOutcome::ProcessExited => "process_exited",
             BootValidationOutcome::Stalled => "stalled",
             BootValidationOutcome::TimedOut => "timed_out",
+            BootValidationOutcome::NotStarted => "not_started",
         }
     }
 }
@@ -874,40 +894,67 @@ impl AppState {
         });
         emit_runtime_upgrade_progress(app, self);
 
-        if let Err(err) = self.ensure_headroom_running() {
-            log::warn!("run_upgrade_with_ui: new proxy failed to spawn: {err:#}");
+        let ensure_err = self
+            .ensure_headroom_running()
+            .err()
+            .map(|err| format!("{err:#}"));
+        if let Some(err) = ensure_err.as_deref() {
+            log::warn!("run_upgrade_with_ui: new proxy failed to spawn: {err}");
         }
-        // Diagnostic: confirm we actually have a tracked child. If this is
-        // false, something about ensure_headroom_running short-circuited
-        // (e.g., python_runtime_installed returned false because READY flag
-        // was missing, pricing gate fired, runtime paused).
-        {
-            let has_tracked = self.headroom_process.lock().is_some();
-            log::debug!(
-                "run_upgrade_with_ui: post-spawn tracked_child={} python_installed={}",
-                has_tracked,
-                self.tool_manager.python_runtime_installed()
-            );
-        }
+        // Snapshot the conditions that gate ensure_headroom_running so a
+        // silent short-circuit ("we returned Ok(()) but never spawned") is
+        // attributable in Sentry instead of surfacing as a blank "Stalled".
+        let post_spawn = PostSpawnSnapshot {
+            tracked_child: self.headroom_process.lock().is_some(),
+            python_installed: self.tool_manager.python_runtime_installed(),
+            proxy_bypass: self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire),
+            pricing_allows_optimization: self.pricing_allows_optimization(),
+            runtime_paused: self.runtime_is_paused(),
+            proxy_reachable: is_headroom_proxy_reachable(),
+            ensure_error: ensure_err,
+        };
+        log::warn!(
+            "run_upgrade_with_ui: post-spawn tracked_child={} python_installed={} \
+             proxy_bypass={} pricing_allows_optimization={} runtime_paused={} \
+             proxy_reachable={} ensure_error={:?}",
+            post_spawn.tracked_child,
+            post_spawn.python_installed,
+            post_spawn.proxy_bypass,
+            post_spawn.pricing_allows_optimization,
+            post_spawn.runtime_paused,
+            post_spawn.proxy_reachable,
+            post_spawn.ensure_error,
+        );
 
-        let app_for_progress = app.clone();
-        let self_ptr_progress: *const AppState = self as *const AppState;
-        let outcome = self.wait_for_boot_validation(move |elapsed, active| {
-            let state_ref = unsafe { &*self_ptr_progress };
-            let elapsed_secs = elapsed.as_secs();
-            let message = boot_validation_message(elapsed_secs, active);
-            // Gently creep 97 → 99.5 over the max budget so the bar keeps
-            // moving — the user sees *something* happen during long waits.
-            let percent = 97
-                + ((elapsed_secs as u128 * 250 / RUNTIME_UPGRADE_BOOT_MAX_SECS as u128).min(250)
-                    as u8)
-                    / 100;
-            state_ref.set_upgrade_progress(|p| {
-                p.message = message;
-                p.overall_percent = percent.min(99);
-            });
-            emit_runtime_upgrade_progress(&app_for_progress, state_ref);
-        });
+        let outcome = if !post_spawn.tracked_child && !post_spawn.proxy_reachable {
+            // No child to wait on AND nothing already listening on :6768.
+            // wait_for_boot_validation would burn ~120s of grace+silence
+            // here for nothing — bail with a distinct outcome so the
+            // failure path knows it's a non-start, not a hang.
+            log::warn!(
+                "run_upgrade_with_ui: skipping boot validation — no tracked child and no reachable proxy"
+            );
+            BootValidationOutcome::NotStarted
+        } else {
+            let app_for_progress = app.clone();
+            let self_ptr_progress: *const AppState = self as *const AppState;
+            self.wait_for_boot_validation(move |elapsed, active| {
+                let state_ref = unsafe { &*self_ptr_progress };
+                let elapsed_secs = elapsed.as_secs();
+                let message = boot_validation_message(elapsed_secs, active);
+                // Gently creep 97 → 99.5 over the max budget so the bar keeps
+                // moving — the user sees *something* happen during long waits.
+                let percent = 97
+                    + ((elapsed_secs as u128 * 250 / RUNTIME_UPGRADE_BOOT_MAX_SECS as u128)
+                        .min(250) as u8)
+                        / 100;
+                state_ref.set_upgrade_progress(|p| {
+                    p.message = message;
+                    p.overall_percent = percent.min(99);
+                });
+                emit_runtime_upgrade_progress(&app_for_progress, state_ref);
+            })
+        };
         let boot_ok = outcome.is_ok();
         let outcome_label = outcome.label();
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -965,13 +1012,6 @@ impl AppState {
             "run_upgrade_with_ui: boot validation failed ({}); rolling back to {:?}",
             outcome_label, installed_version
         );
-        // Capture the tail of the proxy log BEFORE stop_headroom runs — for
-        // a process that crashed on its own, we want what was written right
-        // before the exit.
-        let log_tail = crate::tool_manager::newest_proxy_log_path(&self.tool_manager.logs_dir())
-            .map(|path| crate::tool_manager::tail_log_file(&path, 30))
-            .filter(|s| !s.is_empty());
-
         // Diagnostics for Sentry — capture before stop_headroom() tears down
         // the tracked child and the proxy port. These three booleans
         // distinguish the failure modes that all surface as "Stalled":
@@ -979,13 +1019,33 @@ impl AppState {
         //   new_proxy_log_written=false → spawn happened but python never
         //                                 reached the logging setup
         //   proxy_port_bound=false → uvicorn never reached its bind() call
+        let new_proxy_log_written = log_mtime_advanced(
+            pre_upgrade_log_mtime,
+            newest_proxy_log_mtime(&self.tool_manager.logs_dir()),
+        );
         let boot_diagnostics = crate::UpgradeBootDiagnostics {
             tracked_child: self.headroom_process.lock().is_some(),
-            new_proxy_log_written: log_mtime_advanced(
-                pre_upgrade_log_mtime,
-                newest_proxy_log_mtime(&self.tool_manager.logs_dir()),
-            ),
+            new_proxy_log_written,
             proxy_port_bound: proxy_port_accepts_connection(),
+            python_installed: post_spawn.python_installed,
+            proxy_bypass: post_spawn.proxy_bypass,
+            pricing_allows_optimization: post_spawn.pricing_allows_optimization,
+            runtime_paused: post_spawn.runtime_paused,
+            ensure_error: post_spawn.ensure_error.clone(),
+        };
+
+        // Capture the tail of the proxy log BEFORE stop_headroom runs — for
+        // a process that crashed on its own, we want what was written right
+        // before the exit. Skip when no fresh writes happened during this
+        // validation window: the on-disk log is from a previous run and is
+        // actively misleading (the May 2026 incident showed 30 lines from a
+        // healthy proxy 16h before the failure).
+        let log_tail = if new_proxy_log_written {
+            crate::tool_manager::newest_proxy_log_path(&self.tool_manager.logs_dir())
+                .map(|path| crate::tool_manager::tail_log_file(&path, 30))
+                .filter(|s| !s.is_empty())
+        } else {
+            None
         };
 
         self.stop_headroom();
@@ -1011,7 +1071,7 @@ impl AppState {
                 tail
             ),
             None => format!(
-                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).",
+                "Headroom maintenance for app {} failed boot validation ({}, ran {}ms; internal headroom-ai target: {}, fallback: {:?}).\n\n(no new proxy log lines written during validation window)",
                 current_app_version,
                 outcome_label,
                 duration_ms,
@@ -1152,7 +1212,7 @@ impl AppState {
     /// case there's a live proxy we just don't own the Child handle for.
     /// `Err` (child was reaped by someone else) is also not treated as
     /// exited — the OS-level process may well still be serving traffic.
-    fn headroom_process_exited(&self) -> Option<String> {
+    pub(crate) fn headroom_process_exited(&self) -> Option<String> {
         let mut guard = self.headroom_process.lock();
         match guard.as_mut() {
             None => None,
@@ -4554,7 +4614,7 @@ mod tests {
 
     use super::{
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
-        boot_validation_stalled, bootstrap_complete_state, bootstrap_failed_state,
+        boot_validation_stalled, BootValidationOutcome, bootstrap_complete_state, bootstrap_failed_state,
         classify_startup_error, cpu_time_advanced, hf_cache_grew,
         lifetime_token_milestones_crossed, lifetime_usd_milestones_crossed, log_mtime_advanced,
         merge_daily_savings, merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
@@ -4635,6 +4695,19 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(90),
         ));
+    }
+
+    #[test]
+    fn boot_validation_outcome_labels_are_stable() {
+        // These labels become Sentry tags and analytics dimensions —
+        // changing them silently invalidates dashboards.
+        assert_eq!(BootValidationOutcome::Reachable.label(), "reachable");
+        assert_eq!(BootValidationOutcome::ProcessExited.label(), "process_exited");
+        assert_eq!(BootValidationOutcome::Stalled.label(), "stalled");
+        assert_eq!(BootValidationOutcome::TimedOut.label(), "timed_out");
+        assert_eq!(BootValidationOutcome::NotStarted.label(), "not_started");
+        assert!(BootValidationOutcome::Reachable.is_ok());
+        assert!(!BootValidationOutcome::NotStarted.is_ok());
     }
 
     #[test]
