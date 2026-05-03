@@ -4057,14 +4057,6 @@ html.window-hiding {
     border-color: rgba(255, 255, 255, 0.22);
   }
 
-  .install-prompt__alt summary {
-    color: rgba(242, 237, 232, 0.6);
-  }
-
-  .install-prompt__alt summary:hover {
-    color: #f2ede8;
-  }
-
   .install-prompt__foot-sep {
     color: rgba(242, 237, 232, 0.3);
   }
@@ -4804,45 +4796,6 @@ html.window-hiding {
 .install-prompt__cmd-copy:hover {
   background: #fff;
   border-color: rgba(58, 44, 22, 0.28);
-}
-
-.install-prompt__alt {
-  margin: 0;
-}
-
-.install-prompt__alt summary {
-  list-style: none;
-  cursor: pointer;
-  user-select: none;
-  font-size: var(--text-xs);
-  font-weight: 500;
-  color: #7a6340;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.install-prompt__alt summary::-webkit-details-marker {
-  display: none;
-}
-
-.install-prompt__alt summary::before {
-  content: "▸";
-  font-size: 0.65rem;
-  transition: transform 0.12s ease;
-  display: inline-block;
-}
-
-.install-prompt__alt[open] summary::before {
-  transform: rotate(90deg);
-}
-
-.install-prompt__alt summary:hover {
-  color: #3a2c16;
-}
-
-.install-prompt__alt > .install-prompt__cmd {
-  margin-top: 8px;
 }
 
 .install-prompt__foot {

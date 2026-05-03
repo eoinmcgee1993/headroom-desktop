@@ -111,17 +111,32 @@ fn is_executable(path: &Path) -> bool {
 /// the kernel returns `ENOEXEC` when we try to run it. Smoke-test by spawning
 /// `<path> --version` with a short timeout and rejecting anything that fails
 /// to spawn or exits non-zero.
+///
+/// PATH augmentation: the candidate's parent directory is prepended to PATH
+/// for the smoke test. nvm/volta/bun/asdf-managed `claude` installs are
+/// `#!/usr/bin/env node` scripts with `node` colocated in the same bin dir;
+/// without this, GUI launches inherit launchd's bare PATH and `env` fails to
+/// resolve `node`, exit 127, and we'd reject a perfectly working `claude`.
 fn is_runnable(path: &Path) -> bool {
     if !is_executable(path) {
         return false;
     }
-    let child = match Command::new(path)
+    let mut command = Command::new(path);
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    if let Some(dir) = path.parent() {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let augmented = if existing.is_empty() {
+            dir.display().to_string()
+        } else {
+            format!("{}:{}", dir.display(), existing)
+        };
+        command.env("PATH", augmented);
+    }
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return false,
     };
@@ -317,6 +332,43 @@ mod tests {
         let usr = candidates.iter().position(|p| p == Path::new("/usr/local/bin/claude"));
         assert!(opt.is_some() && usr.is_some());
         assert!(opt.unwrap() < usr.unwrap());
+    }
+
+    #[test]
+    fn is_runnable_finds_colocated_interpreter_via_augmented_path() {
+        // Regression: nvm/volta/bun/asdf installs of `claude` are
+        // `#!/usr/bin/env <interp>` scripts with the interpreter colocated in
+        // the same bin/. GUI launches inherit launchd's bare PATH, so without
+        // augmenting PATH with the candidate's parent, `env` exits 127 and we
+        // reject a working `claude`. Simulate by writing a script that shebangs
+        // a colocated fake interpreter, then strip PATH so the test inherits
+        // nothing useful.
+        let tmp = ScopedTempDir::new("runnable_colocated_interp");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        let interp = bin.join("fakenode");
+        fs::write(&interp, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&interp).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&interp, perms).unwrap();
+
+        let claude = bin.join("claude");
+        fs::write(&claude, "#!/usr/bin/env fakenode\n").unwrap();
+        let mut perms = fs::metadata(&claude).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&claude, perms).unwrap();
+
+        // Strip PATH so the only way `env fakenode` can resolve is via the
+        // augmentation `is_runnable` adds.
+        let saved = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/usr/bin:/bin");
+        let result = is_runnable(&claude);
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(result, "is_runnable must augment PATH with the candidate's bin dir so colocated interpreters resolve");
     }
 
     #[test]

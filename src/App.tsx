@@ -223,7 +223,6 @@ const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
 };
 
 const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
-const CLAUDE_CODE_INSTALL_NPM_CMD = "npm install -g @anthropic-ai/claude-code";
 const CLAUDE_CODE_INSTALL_CURL_CMD = "curl -fsSL https://claude.ai/install.sh | bash";
 
 const SALES_CONTACT_URL = (
@@ -3879,31 +3878,16 @@ export default function App() {
                         </header>
                         <div className="install-prompt__cmd">
                           <code className="install-prompt__cmd-text">
-                            {CLAUDE_CODE_INSTALL_NPM_CMD}
+                            {CLAUDE_CODE_INSTALL_CURL_CMD}
                           </code>
                           <button
                             className="install-prompt__cmd-copy"
                             type="button"
-                            onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_NPM_CMD)}
+                            onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_CURL_CMD)}
                           >
                             Copy
                           </button>
                         </div>
-                        <details className="install-prompt__alt">
-                          <summary>Other install methods</summary>
-                          <div className="install-prompt__cmd">
-                            <code className="install-prompt__cmd-text">
-                              {CLAUDE_CODE_INSTALL_CURL_CMD}
-                            </code>
-                            <button
-                              className="install-prompt__cmd-copy"
-                              type="button"
-                              onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_CURL_CMD)}
-                            >
-                              Copy
-                            </button>
-                          </div>
-                        </details>
                         <div className="install-prompt__foot">
                           <button
                             className="install-prompt__link"
