@@ -71,6 +71,23 @@ impl FileLogger {
     }
 }
 
+// Drop transient updater transport errors (offline laptop, flaky wifi, GitHub
+// blip) from Sentry. They still hit the local log file via write_record.
+fn skip_sentry(target: &str, msg: &str) -> bool {
+    if !target.starts_with("tauri_plugin_updater") {
+        return false;
+    }
+    msg.contains("error sending request")
+        || msg.contains("dns error")
+        || msg.contains("connection refused")
+        || msg.contains("connection reset")
+        || msg.contains("operation timed out")
+        || msg.contains("network is unreachable")
+        || msg.contains("os error 50") // macOS: Network is down
+        || msg.contains("os error 51") // macOS: Network is unreachable
+        || msg.contains("os error 65") // macOS: No route to host
+}
+
 impl Log for FileLogger {
     fn enabled(&self, _meta: &Metadata) -> bool {
         true
@@ -83,11 +100,14 @@ impl Log for FileLogger {
         self.write_record(record);
 
         if record.level() <= Level::Warn {
+            let msg = format!("{}", record.args());
+            if skip_sentry(record.target(), &msg) {
+                return;
+            }
             let level = match record.level() {
                 Level::Error => sentry::Level::Error,
                 _ => sentry::Level::Warning,
             };
-            let msg = format!("{}", record.args());
             let truncated: String = msg.chars().take(SENTRY_MESSAGE_CHAR_CAP).collect();
             sentry::capture_message(&truncated, level);
         }
@@ -135,4 +155,46 @@ fn log_path() -> PathBuf {
     dirs::data_local_dir()
         .map(|d| d.join("headroom/headroom-desktop.log"))
         .unwrap_or_else(|| std::env::temp_dir().join("headroom-desktop.log"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skip_sentry;
+
+    #[test]
+    fn skips_updater_transport_errors() {
+        assert!(skip_sentry(
+            "tauri_plugin_updater::updater",
+            "failed to check for updates: error sending request for url (https://github.com/...)"
+        ));
+        assert!(skip_sentry(
+            "tauri_plugin_updater",
+            "dns error: failed to lookup address"
+        ));
+        assert!(skip_sentry(
+            "tauri_plugin_updater::updater",
+            "operation timed out"
+        ));
+    }
+
+    #[test]
+    fn keeps_updater_non_transport_errors() {
+        assert!(!skip_sentry(
+            "tauri_plugin_updater::updater",
+            "signature verification failed"
+        ));
+        assert!(!skip_sentry(
+            "tauri_plugin_updater",
+            "invalid release manifest"
+        ));
+    }
+
+    #[test]
+    fn keeps_other_targets() {
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::pricing",
+            "error sending request: timeout"
+        ));
+        assert!(!skip_sentry("reqwest", "error sending request"));
+    }
 }

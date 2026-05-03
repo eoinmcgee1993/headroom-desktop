@@ -78,6 +78,54 @@ const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
     // older receipt must do a real reinstall, so the legacy migration list is
     // empty until the next no-op cosmetic change.
 ];
+
+/// Receipts strictly below this version cannot be safely upgraded in place to
+/// the currently bundled headroom-ai — pip's in-place upgrade leaves stale
+/// `.so`/`.dylib` files from old native-extension pins (onnxruntime,
+/// tokenizers, cryptography, mmh3, py_rust_stemmers, uvloop/httptools)
+/// alongside the new ones, which surfaces as "smoke test passes, boot
+/// validation fails with no log lines and no port bound" — the python
+/// process segfaults on import before reaching logging setup.
+///
+/// Bumping this floor is a release-by-release decision: when a new lock
+/// adds native deps or bumps native pins ABI-incompatibly, raise the floor
+/// to the previous bundled version. When the new lock only churns pure-Python
+/// pins, leave the floor where it is.
+///
+/// Floor history:
+/// - 0.3.7: set to 0.10.0. 0.3.6's lock jump from 0.8.2 → 0.19.0 added
+///   fastembed/mmh3/py_rust_stemmers and bumped tokenizers/cryptography/
+///   uvicorn; the failing Sentry users all had `fallback: 0.8.2` (from
+///   0.2.50-era desktop). 0.3.0-rc.26 onward shipped headroom-ai 0.10.x
+///   against the same lock as 0.8.2 — these users have the same dep set
+///   on disk and have not produced upgrade-failure events, so we let them
+///   take the cheap in-place path. If 0.10.x fallbacks start appearing in
+///   Sentry, raise the floor.
+const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 10, 0);
+
+/// Parse the leading `major.minor.patch` from a version string, tolerating
+/// pre-release/build suffixes (`-rc.1`, `+build`, `.dev0`, etc.). Returns
+/// None when the prefix isn't a numeric `major.minor`. `patch` defaults to
+/// 0 when missing or unparseable, so `"0.19"` and `"0.19.0"` compare equal.
+fn parse_major_minor_patch(s: &str) -> Option<(u32, u32, u32)> {
+    let head = s.split(|c: char| c == '-' || c == '+').next()?;
+    let mut parts = head.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    let patch: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// True when the previously-installed receipt is too old to safely apply an
+/// in-place pip upgrade against — caller should fall through to the atomic
+/// venv rebuild path. Unparseable versions are treated as too old (be
+/// conservative: a rebuild is always safe, an unsafe in-place is not).
+fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
+    match parse_major_minor_patch(previous_version) {
+        Some(v) => v < ATOMIC_REBUILD_FLOOR_VERSION,
+        None => true,
+    }
+}
 const RTK_VERSION: &str = "0.37.2";
 const RTK_SHA256_MACOS_AARCH64: &str =
     "99e20a59847dedbb64032a3f7985f2fe959fcb9674d8eaf940fc58a189e27eca";
@@ -1203,6 +1251,9 @@ impl ToolManager {
 
     /// Bootstrap path: installs the pinned headroom release.
     fn install_headroom(&self) -> Result<()> {
+        // Bootstrap path runs at first launch where there is no boot
+        // validation yet — no caller will read the captured pip output, so
+        // skip the buffer to avoid allocating it.
         self.install_headroom_release(
             &HeadroomRelease {
                 version: HEADROOM_PINNED_VERSION.into(),
@@ -1210,10 +1261,16 @@ impl ToolManager {
                 sha256: HEADROOM_PINNED_SHA256.into(),
             },
             |_| {},
+            None,
         )
     }
 
-    fn install_headroom_release<F>(&self, release: &HeadroomRelease, mut progress: F) -> Result<()>
+    fn install_headroom_release<F>(
+        &self,
+        release: &HeadroomRelease,
+        mut progress: F,
+        pip_capture: Option<&std::cell::RefCell<PipOutputCapture>>,
+    ) -> Result<()>
     where
         F: FnMut(BootstrapStepUpdate),
     {
@@ -1253,7 +1310,9 @@ impl ToolManager {
         // Stream pip's stdout/stderr and translate noteworthy lines into
         // user-facing step updates so the progress UI actually changes
         // during the ~60-90s dependency install instead of staring at a
-        // single "Updating dependencies" frame.
+        // single "Updating dependencies" frame. Also funnel each line into
+        // the diagnostic capture so a later boot-validation failure can
+        // forensic the pip run that produced the broken venv.
         let deps_start = std::time::Instant::now();
         let deps_progress_ref = std::cell::RefCell::new(&mut progress);
         let mut dep_counter: u32 = 0;
@@ -1277,6 +1336,9 @@ impl ToolManager {
             ],
             &self.runtime.root_dir,
             |line| {
+                if let Some(cap) = pip_capture {
+                    cap.borrow_mut().push(line);
+                }
                 if let Some(update) =
                     pip_line_to_progress(line, deps_start.elapsed(), &mut dep_counter, 55, 80)
                 {
@@ -1301,7 +1363,7 @@ impl ToolManager {
         } else {
             headroom_spec.clone()
         };
-        run_pip_install_with_retries(
+        run_pip_install_with_retries_streaming(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -1317,6 +1379,11 @@ impl ToolManager {
                 &headroom_arg,
             ],
             &self.runtime.root_dir,
+            |line| {
+                if let Some(cap) = pip_capture {
+                    cap.borrow_mut().push(line);
+                }
+            },
         )
         .with_context(|| {
             if use_wheel {
@@ -1747,7 +1814,9 @@ impl ToolManager {
         }
 
         // install_headroom_release emits its own granular progress from ~40-90%.
-        if let Err(err) = self.install_headroom_release(release, &mut progress) {
+        let pip_capture = std::cell::RefCell::new(PipOutputCapture::new(100));
+        if let Err(err) = self.install_headroom_release(release, &mut progress, Some(&pip_capture))
+        {
             let restored = self.rollback_partial_upgrade(had_live_venv, had_receipt);
             return UpgradeOutcome::InstallFailed {
                 restored,
@@ -1790,7 +1859,9 @@ impl ToolManager {
             percent: 97,
         });
 
-        UpgradeOutcome::InstalledPendingValidation
+        UpgradeOutcome::InstalledPendingValidation {
+            pip_output_tail: pip_capture.into_inner().into_string(),
+        }
     }
 
     /// Tear down the new venv and restore the previous one. Called by the
@@ -1870,15 +1941,26 @@ impl ToolManager {
 
     /// Prepare to upgrade the runtime in place (no venv rebuild). Returns
     /// `None` when the caller should fall back to the full atomic rebuild:
-    /// either there is no prior install to upgrade, or the lock churned but
-    /// the active lock file is missing on disk so we can't safely snapshot
-    /// for rollback.
+    /// either there is no prior install to upgrade, the previously-installed
+    /// version is below `ATOMIC_REBUILD_FLOOR_VERSION` (in-place pip across
+    /// that delta leaves stale native libs), or the lock churned but the
+    /// active lock file is missing on disk so we can't safely snapshot for
+    /// rollback.
     ///
     /// When `Some`, the caller owns `previous_lock_backup` (if set): on
     /// success, `commit_headroom_upgrade` deletes it; on failure, rollback
     /// uses it to restore the prior pin set.
     fn prepare_in_place_upgrade(&self) -> Option<InPlaceUpgradeContext> {
         let previous_version = self.installed_headroom_version()?;
+        if receipt_requires_atomic_rebuild(&previous_version) {
+            log::info!(
+                "prepare_in_place_upgrade: receipt {} predates atomic-rebuild floor {:?}; \
+                 forcing full venv rebuild",
+                previous_version,
+                ATOMIC_REBUILD_FLOOR_VERSION
+            );
+            return None;
+        }
         let previous_lock_backup = if self.lock_pins_differ_from_installed() {
             let active = self.active_lock_path();
             if !active.exists() {
@@ -1949,6 +2031,13 @@ impl ToolManager {
             };
         }
 
+        // Bounded ring buffer collecting pip stdout/stderr across both
+        // install steps. Attached to the boot-validation Sentry event when
+        // it later fails — pip can return exit 0 while leaving the venv
+        // broken (skipped packages, ABI-mismatched native deps), and the
+        // tail is the only forensic record of what pip actually did.
+        let pip_capture = std::cell::RefCell::new(PipOutputCapture::new(100));
+
         // Dep-lock upgrade (only when pins changed).
         if ctx.previous_lock_backup.is_some() {
             progress(BootstrapStepUpdate {
@@ -1993,6 +2082,7 @@ impl ToolManager {
                 ],
                 &self.runtime.root_dir,
                 |line| {
+                    pip_capture.borrow_mut().push(line);
                     if let Some(update) =
                         pip_line_to_progress(line, deps_start.elapsed(), &mut dep_counter, 15, 55)
                     {
@@ -2045,7 +2135,7 @@ impl ToolManager {
         } else {
             headroom_spec.clone()
         };
-        if let Err(err) = run_pip_install_with_retries(
+        if let Err(err) = run_pip_install_with_retries_streaming(
             &self.runtime.managed_python(),
             &[
                 "-m",
@@ -2062,6 +2152,9 @@ impl ToolManager {
                 &headroom_arg,
             ],
             &self.runtime.root_dir,
+            |line| {
+                pip_capture.borrow_mut().push(line);
+            },
         ) {
             let restored = self.rollback_in_place_upgrade_inner(&ctx);
             let context_msg = if use_wheel {
@@ -2129,7 +2222,9 @@ impl ToolManager {
             percent: 97,
         });
 
-        UpgradeOutcome::InstalledPendingValidation
+        UpgradeOutcome::InstalledPendingValidation {
+            pip_output_tail: pip_capture.into_inner().into_string(),
+        }
     }
 
     fn pip_force_reinstall_headroom_version(&self, version: &str) -> Result<()> {
@@ -2823,16 +2918,20 @@ pub(crate) fn newest_proxy_log_path(logs_dir: &Path) -> Option<PathBuf> {
 }
 
 fn headroom_python_startup_args() -> Vec<String> {
-    let mut args = vec![
+    // The `python -m headroom.proxy.server` argparse does NOT define the learn
+    // flags (--learn, --no-memory-tools, --no-memory-context, --memory-db-path);
+    // those live only on the `headroom proxy` click entrypoint. Passing them
+    // here makes argparse exit 2, so the fallback would always fail and mask
+    // the real entrypoint failure under spurious noise. Keep this variant to
+    // server-supported flags only.
+    vec![
         "-m".to_string(),
         "headroom.proxy.server".to_string(),
         "--port".to_string(),
         HEADROOM_PROXY_PORT.to_string(),
         "--no-http2".to_string(),
         "--log-messages".to_string(),
-    ];
-    args.extend(headroom_learn_startup_args());
-    args
+    ]
 }
 
 fn headroom_entrypoint_startup_args() -> Vec<String> {
@@ -3023,12 +3122,51 @@ pub(crate) enum RuntimeMaintenanceKind {
 /// `InstalledPendingValidation` means install + smoke test succeeded but the
 /// backup is still on disk. The caller must either commit or rollback.
 pub enum UpgradeOutcome {
-    InstalledPendingValidation,
+    InstalledPendingValidation {
+        /// Last ~100 lines of pip stdout/stderr from this install. Attached
+        /// to the boot-validation Sentry event when it later fails — pip
+        /// can return exit 0 while leaving the venv in a broken state
+        /// (skipped packages, downgraded native deps with mismatched ABI,
+        /// etc.), and without the tail there's no record of what actually
+        /// happened. Empty string when capture was skipped (e.g., bootstrap).
+        pip_output_tail: String,
+    },
     InstallFailed {
         /// True if we successfully restored the old venv + receipt.
         restored: bool,
         error: anyhow::Error,
     },
+}
+
+/// Bounded ring buffer collecting pip stdout/stderr lines for post-mortem
+/// diagnostics. Keeps the LAST `max_lines` (drops oldest when full) so
+/// warnings, "Skipping X", "Successfully installed ..." lines that pip
+/// prints near the end of a run survive. Sentry extras cap at ~16KB; 100
+/// lines at the typical ~120-char pip line averages ~12KB.
+pub(crate) struct PipOutputCapture {
+    lines: std::collections::VecDeque<String>,
+    max_lines: usize,
+}
+
+impl PipOutputCapture {
+    pub(crate) fn new(max_lines: usize) -> Self {
+        Self {
+            lines: std::collections::VecDeque::with_capacity(max_lines),
+            max_lines,
+        }
+    }
+
+    pub(crate) fn push(&mut self, line: &str) {
+        if self.lines.len() >= self.max_lines {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line.to_string());
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        let parts: Vec<String> = self.lines.into_iter().collect();
+        parts.join("\n")
+    }
 }
 
 /// State required to perform (and roll back) an in-place upgrade — i.e. an
@@ -3899,10 +4037,12 @@ mod tests {
     use super::{
         bootstrap_requirements_lock_for_target, extract_required_pydantic_core_version,
         headroom_entrypoint_startup_args, headroom_python_startup_args,
-        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
+        parse_major_minor_patch, proxy_argv_contains_expected_flags,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
         sha256_bytes, verify_sha256_file, CommandFailure, HeadroomRelease, ManagedRuntime,
-        ToolManager, UpgradeOutcome, HEADROOM_PROXY_PORT, RTK_VERSION,
+        PipOutputCapture, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        HEADROOM_PROXY_PORT, RTK_VERSION,
     };
 
     #[test]
@@ -4271,15 +4411,23 @@ mod tests {
         assert!(entrypoint_args.contains(&"--memory-db-path".to_string()));
 
         let python_args = headroom_python_startup_args();
-        assert!(python_args.starts_with(&[
-            "-m".to_string(),
-            "headroom.proxy.server".to_string(),
-            "--port".to_string(),
-            HEADROOM_PROXY_PORT.to_string(),
-            "--no-http2".to_string(),
-            "--log-messages".to_string(),
-        ]));
-        assert!(python_args.contains(&"--learn".to_string()));
+        assert_eq!(
+            python_args,
+            vec![
+                "-m".to_string(),
+                "headroom.proxy.server".to_string(),
+                "--port".to_string(),
+                HEADROOM_PROXY_PORT.to_string(),
+                "--no-http2".to_string(),
+                "--log-messages".to_string(),
+            ]
+        );
+        // The python -m fallback must not pass learn flags; argparse on
+        // headroom.proxy.server doesn't define them and would exit 2.
+        assert!(!python_args.contains(&"--learn".to_string()));
+        assert!(!python_args.contains(&"--no-memory-tools".to_string()));
+        assert!(!python_args.contains(&"--no-memory-context".to_string()));
+        assert!(!python_args.contains(&"--memory-db-path".to_string()));
     }
 
     #[test]
@@ -4935,7 +5083,7 @@ after
             UpgradeOutcome::InstallFailed { restored, .. } => {
                 assert!(restored, "old venv should be restored after failure");
             }
-            UpgradeOutcome::InstalledPendingValidation => {
+            UpgradeOutcome::InstalledPendingValidation { .. } => {
                 panic!("unexpected success without python");
             }
         }
@@ -5008,10 +5156,12 @@ after
     fn prepare_in_place_skips_lock_snapshot_when_sha_matches() {
         let (root, runtime, manager) = seed_test_runtime("in-place-current");
         let current_sha = requirements_lock_sha(super::bootstrap_requirements_lock());
+        // Receipt must be ≥ ATOMIC_REBUILD_FLOOR_VERSION or `prepare_in_place_upgrade`
+        // forces an atomic rebuild before reaching the lock-snapshot logic.
         fs::write(
             runtime.tools_dir.join("headroom.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": "0.10.8",
+                "version": "0.19.0",
                 "artifact": { "requirementsLockSha256": current_sha },
             }))
             .unwrap(),
@@ -5021,7 +5171,7 @@ after
         let ctx = manager
             .prepare_in_place_upgrade()
             .expect("eligible for in-place");
-        assert_eq!(ctx.previous_version, "0.10.8");
+        assert_eq!(ctx.previous_version, "0.19.0");
         assert!(
             ctx.previous_lock_backup.is_none(),
             "lock unchanged => no snapshot"
@@ -5036,10 +5186,12 @@ after
         }
         let (root, runtime, manager) = seed_test_runtime("in-place-legacy");
         let legacy_sha = super::LEGACY_REQUIREMENTS_LOCK_SHAS[0];
+        // Receipt must be ≥ ATOMIC_REBUILD_FLOOR_VERSION; this test exercises
+        // the legacy-sha path, not the version-floor path.
         fs::write(
             runtime.tools_dir.join("headroom.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": "0.2.50",
+                "version": "0.19.0",
                 "artifact": { "requirementsLockSha256": legacy_sha },
             }))
             .unwrap(),
@@ -5049,7 +5201,7 @@ after
         let ctx = manager
             .prepare_in_place_upgrade()
             .expect("eligible for in-place");
-        assert_eq!(ctx.previous_version, "0.2.50");
+        assert_eq!(ctx.previous_version, "0.19.0");
         assert!(ctx.previous_lock_backup.is_none());
         let _ = fs::remove_dir_all(root);
     }
@@ -5057,10 +5209,13 @@ after
     #[test]
     fn prepare_in_place_snapshots_lock_when_pins_differ() {
         let (root, runtime, manager) = seed_test_runtime("in-place-lock-churn");
+        // Receipt must be ≥ ATOMIC_REBUILD_FLOOR_VERSION; this test is about
+        // the lock-snapshot path, not the version-floor path (covered by
+        // `receipt_requires_atomic_rebuild_below_floor`).
         fs::write(
             runtime.tools_dir.join("headroom.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": "0.10.4",
+                "version": "0.19.0",
                 "artifact": { "requirementsLockSha256": "deadbeef".repeat(8) },
             }))
             .unwrap(),
@@ -5072,7 +5227,7 @@ after
         let ctx = manager
             .prepare_in_place_upgrade()
             .expect("eligible for in-place");
-        assert_eq!(ctx.previous_version, "0.10.4");
+        assert_eq!(ctx.previous_version, "0.19.0");
         let backup = ctx
             .previous_lock_backup
             .as_ref()
@@ -5088,12 +5243,13 @@ after
     fn prepare_in_place_falls_back_to_atomic_when_lock_missing() {
         // Lock pins differ AND the active lock is missing on disk => caller
         // should fall through to the full atomic rebuild so rollback stays
-        // safe.
+        // safe. Receipt must be ≥ ATOMIC_REBUILD_FLOOR_VERSION so the
+        // version-floor early-return doesn't pre-empt the assertion target.
         let (root, runtime, manager) = seed_test_runtime("in-place-no-lock-on-disk");
         fs::write(
             runtime.tools_dir.join("headroom.json"),
             serde_json::to_vec(&serde_json::json!({
-                "version": "0.10.4",
+                "version": "0.19.0",
                 "artifact": { "requirementsLockSha256": "deadbeef".repeat(8) },
             }))
             .unwrap(),
@@ -5109,6 +5265,32 @@ after
         let (root, runtime, manager) = seed_test_runtime("in-place-no-receipt");
         fs::remove_file(runtime.tools_dir.join("headroom.json")).expect("drop receipt");
         assert!(manager.prepare_in_place_upgrade().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_in_place_falls_back_to_atomic_when_receipt_predates_floor() {
+        // 0.8.2 (shipped in headroom-desktop 0.2.50-rc.1 and the fallback
+        // version on every Sentry boot-validation stall observed for 0.3.6)
+        // is below the 0.10.0 floor. Force the rebuild even when the lock
+        // snapshot is takeable.
+        let (root, runtime, manager) = seed_test_runtime("in-place-pre-floor");
+        let current_sha = requirements_lock_sha(super::bootstrap_requirements_lock());
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.8.2",
+                "artifact": { "requirementsLockSha256": current_sha },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+        fs::write(manager.active_lock_path(), b"old-lock-content==1.0\n")
+            .expect("seed active lock");
+        assert!(
+            manager.prepare_in_place_upgrade().is_none(),
+            "0.8.2 receipt must force atomic rebuild even when lock snapshot is takeable"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5284,5 +5466,84 @@ exit 0
         assert!(failure.stderr.contains("command timed out after 100ms"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parse_major_minor_patch_handles_clean_and_pre_release() {
+        assert_eq!(parse_major_minor_patch("0.19.0"), Some((0, 19, 0)));
+        assert_eq!(parse_major_minor_patch("1.2.3"), Some((1, 2, 3)));
+        // Patch defaults to 0.
+        assert_eq!(parse_major_minor_patch("0.19"), Some((0, 19, 0)));
+        // Pre-release / build suffixes are stripped.
+        assert_eq!(parse_major_minor_patch("0.19.0-rc.1"), Some((0, 19, 0)));
+        assert_eq!(parse_major_minor_patch("0.19.0+build.5"), Some((0, 19, 0)));
+        assert_eq!(parse_major_minor_patch("0.19.0.dev0"), Some((0, 19, 0)));
+        // Nonsense returns None — caller treats as "rebuild" to be safe.
+        assert_eq!(parse_major_minor_patch(""), None);
+        assert_eq!(parse_major_minor_patch("not-a-version"), None);
+        assert_eq!(parse_major_minor_patch("0"), None);
+    }
+
+    #[test]
+    fn receipt_requires_atomic_rebuild_below_floor() {
+        // Floor is 0.10.0 at time of writing — catches 0.5.x/0.6.x/0.8.x/0.9.x
+        // (different lock or smaller user base) while letting 0.10.x users
+        // (same lock as 0.8.2 but no observed Sentry failures) take the
+        // in-place path.
+        assert_eq!(ATOMIC_REBUILD_FLOOR_VERSION, (0, 10, 0));
+
+        // Pre-floor: shipped in 0.2.40 → 0.3.0-rc.10 desktop bundles, plus the
+        // 0.8.2 fallback that produced the original Sentry events.
+        assert!(receipt_requires_atomic_rebuild("0.5.18"));
+        assert!(receipt_requires_atomic_rebuild("0.5.24"));
+        assert!(receipt_requires_atomic_rebuild("0.6.5"));
+        assert!(receipt_requires_atomic_rebuild("0.8.2"));
+        assert!(receipt_requires_atomic_rebuild("0.9.7"));
+
+        // At-or-above the floor: in-place is allowed (0.10.x cohort + future).
+        assert!(!receipt_requires_atomic_rebuild("0.10.4"));
+        assert!(!receipt_requires_atomic_rebuild("0.10.7"));
+        assert!(!receipt_requires_atomic_rebuild("0.10.8"));
+        assert!(!receipt_requires_atomic_rebuild("0.10.12"));
+        assert!(!receipt_requires_atomic_rebuild("0.19.0"));
+        assert!(!receipt_requires_atomic_rebuild("1.0.0"));
+
+        // Pre-release suffixes don't change the comparison.
+        assert!(!receipt_requires_atomic_rebuild("0.10.0-rc.1"));
+        assert!(receipt_requires_atomic_rebuild("0.9.99-rc.1"));
+
+        // Unparseable receipts are treated as too-old (conservative).
+        assert!(receipt_requires_atomic_rebuild(""));
+        assert!(receipt_requires_atomic_rebuild("garbage"));
+    }
+
+    #[test]
+    fn pip_output_capture_keeps_last_n_lines() {
+        let mut cap = PipOutputCapture::new(3);
+        cap.push("first");
+        cap.push("second");
+        cap.push("third");
+        // Buffer is now full; the next push must evict "first".
+        cap.push("fourth");
+        cap.push("fifth");
+        let out = cap.into_string();
+        // We keep the LAST 3 lines because the tail (warnings, "Successfully
+        // installed", "Skipping X") is the diagnostically interesting part.
+        assert_eq!(out, "third\nfourth\nfifth");
+    }
+
+    #[test]
+    fn pip_output_capture_handles_empty_and_partial_fill() {
+        let cap = PipOutputCapture::new(10);
+        assert_eq!(cap.into_string(), "");
+
+        let mut cap = PipOutputCapture::new(10);
+        cap.push("only line");
+        assert_eq!(cap.into_string(), "only line");
+
+        let mut cap = PipOutputCapture::new(10);
+        cap.push("a");
+        cap.push("b");
+        assert_eq!(cap.into_string(), "a\nb");
     }
 }

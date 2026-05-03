@@ -1,10 +1,11 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SHELL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn detect_claude_cli() -> Option<PathBuf> {
     if let Some(path) = probe_known_paths() {
@@ -14,8 +15,11 @@ pub fn detect_claude_cli() -> Option<PathBuf> {
 }
 
 fn probe_known_paths() -> Option<PathBuf> {
-    let home = home_dir();
-    let candidates = [
+    first_runnable(known_path_candidates(home_dir()).into_iter())
+}
+
+fn known_path_candidates(home: PathBuf) -> Vec<PathBuf> {
+    vec![
         home.join(".claude").join("local").join("claude"),
         PathBuf::from("/opt/homebrew/bin/claude"),
         PathBuf::from("/usr/local/bin/claude"),
@@ -23,10 +27,11 @@ fn probe_known_paths() -> Option<PathBuf> {
         home.join(".volta").join("bin").join("claude"),
         home.join(".bun").join("bin").join("claude"),
         PathBuf::from("/usr/bin/claude"),
-    ];
-    candidates
-        .into_iter()
-        .find(|candidate| is_executable(candidate))
+    ]
+}
+
+fn first_runnable<I: Iterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
+    candidates.into_iter().find(|candidate| is_runnable(candidate))
 }
 
 fn probe_via_login_shell() -> Option<PathBuf> {
@@ -82,7 +87,7 @@ fn read_path_from_shell(mut command: Command, timeout: Duration) -> Option<PathB
         return None;
     }
     let path = PathBuf::from(first_line);
-    if is_executable(&path) {
+    if is_runnable(&path) {
         Some(path)
     } else {
         None
@@ -99,6 +104,65 @@ fn is_executable(path: &Path) -> bool {
         return false;
     }
     meta.permissions().mode() & 0o111 != 0
+}
+
+/// `is_executable` only checks the POSIX exec bit; on dual-architecture Macs
+/// an Intel-only Homebrew remnant in `/usr/local/bin` will satisfy the bit but
+/// the kernel returns `ENOEXEC` when we try to run it. Smoke-test by spawning
+/// `<path> --version` with a short timeout and rejecting anything that fails
+/// to spawn or exits non-zero.
+///
+/// PATH augmentation: the candidate's parent directory is prepended to PATH
+/// for the smoke test. nvm/volta/bun/asdf-managed `claude` installs are
+/// `#!/usr/bin/env node` scripts with `node` colocated in the same bin dir;
+/// without this, GUI launches inherit launchd's bare PATH and `env` fails to
+/// resolve `node`, exit 127, and we'd reject a perfectly working `claude`.
+fn is_runnable(path: &Path) -> bool {
+    if !is_executable(path) {
+        return false;
+    }
+    let mut command = Command::new(path);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(dir) = path.parent() {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let augmented = if existing.is_empty() {
+            dir.display().to_string()
+        } else {
+            format!("{}:{}", dir.display(), existing)
+        };
+        command.env("PATH", augmented);
+    }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    matches!(wait_with_timeout(child, SMOKE_TEST_TIMEOUT), Some(status) if status.success())
+}
+
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> Option<ExitStatus> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 fn home_dir() -> PathBuf {
@@ -171,6 +235,170 @@ mod tests {
     fn is_executable_rejects_directories() {
         let tmp = ScopedTempDir::new("is_exec_dir");
         assert!(!is_executable(tmp.path()));
+    }
+
+    #[test]
+    fn is_runnable_accepts_working_executable() {
+        let tmp = ScopedTempDir::new("runnable_ok");
+        let path = tmp.path().join("claude");
+        make_executable(&path);
+        assert!(is_runnable(&path));
+    }
+
+    #[test]
+    fn is_runnable_rejects_executable_that_fails_to_spawn() {
+        // Regression: an x86_64-only Homebrew leftover at /usr/local/bin/claude
+        // on an arm64 Mac satisfied the POSIX exec bit but the kernel returned
+        // ENOEXEC when we tried to run it. The Python `mcp install` then hit
+        // the same ENOEXEC via shutil.which, raising an uncaught OSError and
+        // surfacing as "Headroom MCP install exited non-zero" in Sentry.
+        let tmp = ScopedTempDir::new("runnable_enoexec");
+        let path = tmp.path().join("claude");
+        fs::write(&path, b"\x00\x01\x02\x03not a binary").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        assert!(!is_runnable(&path));
+    }
+
+    #[test]
+    fn is_runnable_rejects_executable_that_exits_non_zero() {
+        let tmp = ScopedTempDir::new("runnable_exit1");
+        let path = tmp.path().join("claude");
+        fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        assert!(!is_runnable(&path));
+    }
+
+    #[test]
+    fn is_runnable_rejects_non_executable_file() {
+        let tmp = ScopedTempDir::new("runnable_no_x");
+        let path = tmp.path().join("claude");
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        // Exec bit not set — must short-circuit without spawning.
+        assert!(!is_runnable(&path));
+    }
+
+    #[test]
+    fn first_runnable_walks_past_broken_candidates() {
+        // Reproduces the production scenario: an Intel-only `/usr/local/bin/claude`
+        // remnant on an arm64 Mac is the second candidate examined; the first
+        // candidate (`~/.claude/local/claude`) does not exist; we want detection
+        // to skip the broken candidate and find the working one further down.
+        let tmp = ScopedTempDir::new("first_runnable_walk");
+        let broken = tmp.path().join("usr_local_claude");
+        fs::write(&broken, b"\x00\x01\x02\x03not a binary").unwrap();
+        let mut perms = fs::metadata(&broken).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&broken, perms).unwrap();
+
+        let working = tmp.path().join("npm_global_claude");
+        make_executable(&working);
+
+        let candidates = vec![
+            tmp.path().join("does_not_exist"),
+            broken.clone(),
+            working.clone(),
+            tmp.path().join("never_reached"), // would fail if we kept walking
+        ];
+
+        assert_eq!(first_runnable(candidates.into_iter()).as_deref(), Some(working.as_path()));
+    }
+
+    #[test]
+    fn first_runnable_returns_none_when_all_candidates_broken() {
+        let tmp = ScopedTempDir::new("first_runnable_none");
+        let broken = tmp.path().join("broken");
+        fs::write(&broken, b"\x00\x01\x02\x03").unwrap();
+        let mut perms = fs::metadata(&broken).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&broken, perms).unwrap();
+
+        let candidates = vec![tmp.path().join("missing"), broken];
+        assert!(first_runnable(candidates.into_iter()).is_none());
+    }
+
+    #[test]
+    fn known_path_candidates_includes_apple_silicon_and_intel_homebrew_in_order() {
+        // Apple Silicon Homebrew (/opt/homebrew/bin) must be examined before
+        // Intel Homebrew (/usr/local/bin) so that arm64 Macs that ALSO have an
+        // Intel-only `claude` left behind in /usr/local/bin reach the working
+        // arm64 binary first. The bug we fixed only surfaced because all
+        // earlier candidates were missing.
+        let candidates = known_path_candidates(PathBuf::from("/Users/test"));
+        let opt = candidates.iter().position(|p| p == Path::new("/opt/homebrew/bin/claude"));
+        let usr = candidates.iter().position(|p| p == Path::new("/usr/local/bin/claude"));
+        assert!(opt.is_some() && usr.is_some());
+        assert!(opt.unwrap() < usr.unwrap());
+    }
+
+    #[test]
+    fn is_runnable_finds_colocated_interpreter_via_augmented_path() {
+        // Regression: nvm/volta/bun/asdf installs of `claude` are
+        // `#!/usr/bin/env <interp>` scripts with the interpreter colocated in
+        // the same bin/. GUI launches inherit launchd's bare PATH, so without
+        // augmenting PATH with the candidate's parent, `env` exits 127 and we
+        // reject a working `claude`. Simulate by writing a script that shebangs
+        // a colocated fake interpreter, then strip PATH so the test inherits
+        // nothing useful.
+        let tmp = ScopedTempDir::new("runnable_colocated_interp");
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+
+        let interp = bin.join("fakenode");
+        fs::write(&interp, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&interp).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&interp, perms).unwrap();
+
+        let claude = bin.join("claude");
+        fs::write(&claude, "#!/usr/bin/env fakenode\n").unwrap();
+        let mut perms = fs::metadata(&claude).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&claude, perms).unwrap();
+
+        // Strip PATH so the only way `env fakenode` can resolve is via the
+        // augmentation `is_runnable` adds.
+        let saved = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/usr/bin:/bin");
+        let result = is_runnable(&claude);
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(result, "is_runnable must augment PATH with the candidate's bin dir so colocated interpreters resolve");
+    }
+
+    #[test]
+    fn is_runnable_kills_and_rejects_a_hung_executable() {
+        // A binary that hangs forever must not stall detection. We override
+        // the timeout indirectly by invoking wait_with_timeout directly with
+        // a short bound.
+        let tmp = ScopedTempDir::new("runnable_hang");
+        let path = tmp.path().join("claude");
+        fs::write(&path, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+
+        let child = Command::new(&path)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let start = Instant::now();
+        let result = wait_with_timeout(child, Duration::from_millis(200));
+        let elapsed = start.elapsed();
+        assert!(result.is_none());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timeout should bound the wait; took {elapsed:?}",
+        );
     }
 
     #[test]
