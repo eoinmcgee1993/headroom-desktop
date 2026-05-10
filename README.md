@@ -199,6 +199,12 @@ npm run test:all          # frontend + Rust
 cargo test --manifest-path src-tauri/Cargo.toml   # Rust only
 ```
 
+Clean Rust build artifacts (the `src-tauri/target/` directory grows quickly):
+
+```bash
+cargo clean --manifest-path src-tauri/Cargo.toml
+```
+
 ## Dependency pinning
 
 `headroom-ai` is installed from a specific pinned wheel on first run. Automatic upgrades are disabled — the app ships with one known-good version and only changes what it installs when the release artifact itself is updated.

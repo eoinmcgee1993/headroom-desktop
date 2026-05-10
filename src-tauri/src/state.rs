@@ -460,6 +460,18 @@ pub struct AppState {
     cached_rtk_gain_summary: Mutex<Option<(Option<RtkGainSummary>, Instant)>>,
     cached_rtk_today_stats: Mutex<Option<(Option<crate::models::RtkTodayStats>, Instant)>>,
     cached_claude_profile: Mutex<Option<(Option<String>, ClaudeAccountProfile, Instant)>>,
+    /// Last `IdentityFingerprint` we successfully posted to
+    /// `desktop/grace/start`. Used by the bearer-triggered identity-pusher
+    /// worker to skip redundant posts when the same Claude account/plan is
+    /// already on file with headroom-web.
+    last_pushed_identity_fingerprint: Mutex<Option<crate::pricing::IdentityFingerprint>>,
+    /// When we most recently completed a fresh OAuth profile fetch that
+    /// returned a *complete* identity (UUID + email + non-Unknown plan
+    /// tier). The identity-pusher worker uses this to throttle further
+    /// `/api/oauth/profile` calls to ~once per 24 h once we already know
+    /// who the user is. `Instant`, so it resets on app restart — first
+    /// post-restart bearer always triggers a fresh fetch.
+    last_complete_identity_fetch_at: Mutex<Option<Instant>>,
     /// Cached stdout of `headroom memory export`. Shared by every OptimizePanel
     /// that mounts at once — without it, N panels = N Python cold-starts.
     cached_memory_export: Mutex<Option<(String, Instant)>>,
@@ -563,6 +575,8 @@ impl AppState {
             cached_rtk_gain_summary: Mutex::new(None),
             cached_rtk_today_stats: Mutex::new(None),
             cached_claude_profile: Mutex::new(None),
+            last_pushed_identity_fingerprint: Mutex::new(None),
+            last_complete_identity_fetch_at: Mutex::new(None),
             cached_memory_export: Mutex::new(None),
             cached_claude_code_projects: Mutex::new(None),
             cached_headroom_learn_prereq: Mutex::new(None),
@@ -601,6 +615,18 @@ impl AppState {
             // Auto-trigger never forces rebuild — that's reserved for the
             // user-facing "Retry with full rebuild" recovery flow.
             self.run_upgrade_with_ui(app, false);
+        } else {
+            // No Python maintenance needed, but the desktop app version may
+            // still have moved (cosmetic-only release on the same headroom-ai
+            // pin). Without this stamp the launch profile drifts: every
+            // version in the chain that ships the same headroom-ai never
+            // gets recorded, and `previous_app_version` reads back as
+            // whatever desktop version most recently changed the Python pin
+            // — which can be many releases stale.
+            let current_app_version = app.package_info().version.to_string();
+            if self.can_stamp_no_maintenance(&current_app_version) {
+                self.stamp_app_version(&current_app_version);
+            }
         }
 
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
@@ -1144,17 +1170,22 @@ impl AppState {
         // a duplicate, less informative event.
         log::info!("run_upgrade_with_ui: {err_msg}");
         let err = anyhow::anyhow!("{}", err_msg);
-        let previous_app_label = previous_app_version
+        // The rollback restores the bundled headroom-ai Python package, not the
+        // desktop app itself — so user-facing rollback strings reference the
+        // Python target/fallback versions (e.g. 0.20.15 → 0.19.0) rather than
+        // the desktop app version (which never reverts).
+        let fallback_pkg_label = installed_version
             .clone()
             .unwrap_or_else(|| "the previous version".into());
         let error_hint = match maintenance_kind {
             RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => Some(format!(
-                "Reverted to Headroom {} and restarted it.",
-                previous_app_label
+                "Reverted to headroom-ai {} and restarted it.",
+                fallback_pkg_label
             )),
-            RuntimeMaintenanceKind::Upgrade if rollback_restored => {
-                Some(format!("Reverted to Headroom {}.", previous_app_label))
-            }
+            RuntimeMaintenanceKind::Upgrade if rollback_restored => Some(format!(
+                "Reverted to headroom-ai {}.",
+                fallback_pkg_label
+            )),
             RuntimeMaintenanceKind::RequirementsRepair if restarted => Some(
                 "Headroom restarted with the repaired runtime, but validation still failed.".into(),
             ),
@@ -1208,10 +1239,9 @@ impl AppState {
                 "duration_ms": duration_ms,
             })),
         );
-        let current_app_label = current_app_version.clone();
-        let fallback_app_label = previous_app_version
-            .clone()
-            .unwrap_or_else(|| "the previous version".into());
+        // Reuse the headroom-ai labels constructed above for the error_hint —
+        // same rationale: rollback is about the Python package, not the app.
+        let target_pkg_label = target_version.clone();
         self.set_upgrade_progress(|p| {
             p.running = false;
             p.complete = false;
@@ -1220,19 +1250,19 @@ impl AppState {
             p.message = match maintenance_kind {
                 RuntimeMaintenanceKind::Upgrade if rollback_restored && restarted => {
                     format!(
-                        "Headroom {} installed but didn't start. Reverted to {} and restarted it.",
-                        current_app_label, fallback_app_label
+                        "headroom-ai {} installed but didn't start. Reverted to headroom-ai {} and restarted it.",
+                        target_pkg_label, fallback_pkg_label
                     )
                 }
                 RuntimeMaintenanceKind::Upgrade if rollback_restored => {
                     format!(
-                        "Headroom {} installed but didn't start. Reverted to {}.",
-                        current_app_label, fallback_app_label
+                        "headroom-ai {} installed but didn't start. Reverted to headroom-ai {}.",
+                        target_pkg_label, fallback_pkg_label
                     )
                 }
                 RuntimeMaintenanceKind::Upgrade => format!(
-                    "Headroom {} installed but didn't start, and rollback failed. Reinstall from the Dashboard.",
-                    current_app_label
+                    "headroom-ai {} installed but didn't start, and rollback failed. Reinstall from the Dashboard.",
+                    target_pkg_label
                 ),
                 RuntimeMaintenanceKind::RequirementsRepair if restarted => {
                     "Headroom runtime repair finished, but startup validation still failed after restart.".into()
@@ -1482,6 +1512,27 @@ impl AppState {
         persist_launch_profile(&self.launch_profile_path, &profile);
     }
 
+    /// True when the launch-profile stamp can be safely advanced to
+    /// `current_app_version` from `warm_runtime_on_launch` even though no
+    /// runtime maintenance ran.
+    ///
+    /// Refuses to stamp when:
+    /// - the stamp already matches (no work; avoids a redundant disk write), or
+    /// - there's an unresolved upgrade failure for this exact app version
+    ///   (stamping would mask the failure record the retry banner relies on).
+    fn can_stamp_no_maintenance(&self, current_app_version: &str) -> bool {
+        let profile = self.launch_profile.lock();
+        if profile.last_launched_app_version.as_deref() == Some(current_app_version) {
+            return false;
+        }
+        if let Some(failure) = profile.last_runtime_upgrade_failure.as_ref() {
+            if failure.app_version == current_app_version {
+                return false;
+            }
+        }
+        true
+    }
+
     fn clear_upgrade_failure(&self) {
         let mut profile = self.launch_profile.lock();
         profile.last_runtime_upgrade_failure = None;
@@ -1608,9 +1659,56 @@ impl AppState {
         }
 
         let profile = pricing::detect_claude_profile_uncached(self);
+        if pricing::is_identity_complete(&profile) {
+            self.record_complete_identity_fetch();
+        }
         let mut cache = self.cached_claude_profile.lock();
         *cache = Some((current_token, profile.clone(), Instant::now()));
         profile
+    }
+
+    /// True iff a `desktop/grace/start` post with this exact set of Claude
+    /// fields has already been recorded as successful in this session.
+    /// Identity-pusher worker uses this to skip repeat posts when the bearer
+    /// rotates but the underlying account/plan has not changed.
+    pub fn identity_fingerprint_already_pushed(
+        &self,
+        fp: &crate::pricing::IdentityFingerprint,
+    ) -> bool {
+        self.last_pushed_identity_fingerprint
+            .lock()
+            .as_ref()
+            .map(|prev| prev == fp)
+            .unwrap_or(false)
+    }
+
+    /// Mark the given fingerprint as the most recent one we've pushed to
+    /// `desktop/grace/start`. Called by the worker after a successful post,
+    /// and by the sign-in / activation paths that send the same payload.
+    pub fn record_pushed_identity_fingerprint(
+        &self,
+        fp: crate::pricing::IdentityFingerprint,
+    ) {
+        *self.last_pushed_identity_fingerprint.lock() = Some(fp);
+    }
+
+    /// True iff a fresh OAuth profile fetch returned a *complete* identity
+    /// (UUID + email + non-Unknown plan tier) within `max_age`. The
+    /// identity-pusher worker uses this to throttle further OAuth calls.
+    pub fn complete_identity_fetched_within(&self, max_age: Duration) -> bool {
+        self.last_complete_identity_fetch_at
+            .lock()
+            .as_ref()
+            .map(|at| at.elapsed() < max_age)
+            .unwrap_or(false)
+    }
+
+    /// Record that we just successfully fetched a complete OAuth identity.
+    /// Called from `cached_claude_profile()` whenever a fresh fetch returns
+    /// a fully populated profile, so every code path that re-warms the
+    /// profile cache contributes to the throttle window.
+    fn record_complete_identity_fetch(&self) {
+        *self.last_complete_identity_fetch_at.lock() = Some(Instant::now());
     }
 
     /// The most recent classifier output that was something other than
@@ -5791,6 +5889,49 @@ mod tests {
         let plan = state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION"));
         assert!(plan.is_none());
 
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn can_stamp_no_maintenance_allows_stamp_when_version_changed_with_no_failure() {
+        let base_dir = temp_test_dir("can-stamp-fresh");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        // Stamp set to an older app version, no failure record.
+        state.stamp_app_version("0.3.6-rc.3");
+        assert!(state.can_stamp_no_maintenance("0.3.12-rc.3"));
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn can_stamp_no_maintenance_skips_stamp_when_already_current() {
+        let base_dir = temp_test_dir("can-stamp-idempotent");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        state.stamp_app_version("0.3.12-rc.3");
+        assert!(!state.can_stamp_no_maintenance("0.3.12-rc.3"));
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn can_stamp_no_maintenance_skips_stamp_when_failure_recorded_for_current_version() {
+        let base_dir = temp_test_dir("can-stamp-with-failure");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        state.stamp_app_version("0.3.6-rc.3");
+        state.record_upgrade_failure(RuntimeUpgradeFailure {
+            app_version: "0.3.12-rc.3".into(),
+            target_headroom_version: "0.20.15".into(),
+            fallback_headroom_version: Some("0.19.0".into()),
+            failure_phase: UpgradeFailurePhase::BootValidation,
+            attempts: 0,
+            first_attempt_at: Utc::now(),
+            last_attempt_at: Utc::now(),
+            error_message: "failed".into(),
+            error_hint: None,
+            rollback_restored: true,
+        });
+        assert!(!state.can_stamp_no_maintenance("0.3.12-rc.3"));
+        // Still allows stamping for an unrelated future version, since the
+        // failure record is keyed on the specific version that failed.
+        assert!(state.can_stamp_no_maintenance("0.3.13"));
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }
 
