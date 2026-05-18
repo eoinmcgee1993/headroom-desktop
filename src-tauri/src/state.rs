@@ -4716,6 +4716,13 @@ pub(crate) fn headroom_proxy_reachable() -> bool {
 /// suggested next step. Returns `None` for shapes we don't recognize, in which
 /// case the UI falls back to a generic "open logs" prompt.
 pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
+    // High-confidence endpoint protection signature: SIGKILL with no
+    // app-side cause, dlopen-not-permitted, fresh-extension permission
+    // denial, etc. Defer to the shared matcher in lib.rs so this list
+    // doesn't drift from the install-time classifier.
+    if crate::is_endpoint_protection_signal(raw) {
+        return Some(crate::endpoint_protection_hint_runtime());
+    }
     if raw.contains("is occupied by a non-headroom process") {
         // Only reaches here when even the fallback port range was unavailable
         // (`tool_manager` scans 6768..=6790 before bailing). At that point the
@@ -5249,6 +5256,47 @@ mod tests {
             "port 6768 is occupied by a non-headroom process (rapportd pid 594) and fallback ports 6769-6790 are also unavailable; cannot start proxy. Reboot to clear stuck listeners, then relaunch Headroom.";
         let hint = classify_startup_error(raw).expect("all-foreign should classify");
         assert!(hint.contains("Reboot"), "got: {hint}");
+    }
+
+    #[test]
+    fn classify_startup_error_endpoint_protection_signal_kill() {
+        let raw = "unable to keep headroom running in background (prior attempts: \
+                   /Users/x/venv/bin/headroom proxy --port 6768 exited with signal=9): \
+                   /Users/x/venv/bin/python3 -m headroom.proxy.server exited with signal=9";
+        let hint = classify_startup_error(raw).expect("SIGKILL should classify");
+        assert!(
+            hint.contains("endpoint protection"),
+            "expected EDR hint, got: {hint}"
+        );
+        assert!(hint.contains("Retry"), "hint should be actionable: {hint}");
+    }
+
+    #[test]
+    fn classify_startup_error_endpoint_protection_dlopen_blocked() {
+        let raw = "ImportError: dlopen(/Users/x/Library/Application Support/Headroom/headroom/runtime/venv/\
+                   lib/python3.12/site-packages/torch/lib/libtorch.dylib, 0x0006): tried: '...' \
+                   (operation not permitted)";
+        let hint = classify_startup_error(raw).expect("dlopen-blocked should classify");
+        assert!(
+            hint.contains("endpoint protection"),
+            "expected EDR hint, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn classify_startup_error_endpoint_protection_takes_priority_over_port_path() {
+        // SIGKILL while waiting on the port could surface as both a
+        // port-timeout AND a kill signature. EDR wins because it points to
+        // the actual root cause; otherwise the user spends time on a
+        // network/firewall red herring.
+        let raw = "unable to keep headroom running in background (prior attempts: \
+                   /venv/bin/headroom proxy --port 6768 never opened port 6768 within 60000ms: \
+                   Killed: 9)";
+        let hint = classify_startup_error(raw).expect("should classify");
+        assert!(
+            hint.contains("endpoint protection"),
+            "expected EDR to win over port hint, got: {hint}"
+        );
     }
 
     /// Defensive: classify_startup_error must NOT regress on any of the

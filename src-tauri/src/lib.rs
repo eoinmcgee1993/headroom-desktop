@@ -626,10 +626,22 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
         .chain()
         .find_map(|e| e.downcast_ref::<tool_manager::CommandFailure>());
 
+    // Match against stderr (where the real signal lives for CommandFailure)
+    // in addition to the error chain. For non-CommandFailure paths the
+    // chain is all we have.
+    let endpoint_protection_suspected = is_endpoint_protection_signal(&technical_err)
+        || cmd_failure
+            .map(|f| is_endpoint_protection_signal(&f.stderr))
+            .unwrap_or(false);
+
     if let Some(failure) = cmd_failure {
         sentry::with_scope(
             |scope| {
                 scope.set_tag("failure_kind", kind.as_str());
+                scope.set_tag(
+                    "endpoint_protection_suspected",
+                    if endpoint_protection_suspected { "true" } else { "false" },
+                );
                 scope.set_extra("program", failure.program.clone().into());
                 scope.set_extra("args", failure.args.join(" ").into());
                 scope.set_extra(
@@ -659,6 +671,10 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
         sentry::with_scope(
             |scope| {
                 scope.set_tag("failure_kind", kind.as_str());
+                scope.set_tag(
+                    "endpoint_protection_suspected",
+                    if endpoint_protection_suspected { "true" } else { "false" },
+                );
                 scope.set_extra("error_chain", technical_err.clone().into());
             },
             || {
@@ -1047,10 +1063,16 @@ pub(crate) fn capture_upgrade_failure(
     let err_capped: String = technical_err.chars().take(400).collect();
     summary.push_str(&format!(" err={err_capped}"));
 
+    let endpoint_protection_suspected = is_endpoint_protection_signal(&technical_err);
+
     sentry::with_scope(
         |scope| {
             scope.set_tag("flow", "runtime_upgrade");
             scope.set_tag("upgrade_phase", phase);
+            scope.set_tag(
+                "endpoint_protection_suspected",
+                if endpoint_protection_suspected { "true" } else { "false" },
+            );
             if let Some(o) = outcome {
                 scope.set_tag("outcome", o);
             }
@@ -1157,9 +1179,86 @@ pub(crate) fn capture_upgrade_failure(
     );
 }
 
+/// High-confidence signatures that an install/runtime failure was caused by
+/// endpoint-protection software (antivirus or EDR) blocking the freshly
+/// installed native code. Conservative on purpose — we only match patterns
+/// that are unlikely to surface from anything else, so the user-facing hint
+/// stays trustworthy. If the matcher grows past ~6 patterns we should split
+/// it by failure surface (install vs runtime) and consider tightening.
+///
+/// Input is matched case-insensitively.
+pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // Apple's loader rejecting a fresh signature (codesign tampered or not
+    // recognized by the kernel — almost always EDR injecting/rewriting).
+    if lower.contains("code signature invalid")
+        || lower.contains("code signature could not be verified")
+    {
+        return true;
+    }
+    // `dlopen` reports the "tried: ... (operation not permitted)" suffix when
+    // a sandbox/AV blocks a freshly-extracted .so/.dylib. The "library not
+    // loaded" prefix alone is too noisy (covers ordinary missing-dep cases),
+    // so require the "not permitted" companion.
+    if (lower.contains("library not loaded") || lower.contains("dlopen"))
+        && lower.contains("not permitted")
+    {
+        return true;
+    }
+    // SIGKILL with no app-side cause is the classic EDR signature — the
+    // process is killed before it can write a useful error. Plain "killed"
+    // is too noisy (covers OOM, user pkill), so require the explicit signal
+    // marker. CommandFailure formats this as "signal=9" or "Killed: 9".
+    if lower.contains("signal=9")
+        || lower.contains("killed: 9")
+        || lower.contains("exit code 137")
+    {
+        return true;
+    }
+    // `Operation not permitted` paired with a freshly-installed native
+    // extension path strongly implicates AV that hooks open(2)/exec(2). The
+    // bare phrase appears in too many unrelated permission errors, so we
+    // gate it on "site-packages" (where pip just wrote the file) or ".so" /
+    // ".dylib" appearing in the same chain.
+    if lower.contains("operation not permitted")
+        && (lower.contains("site-packages")
+            || lower.contains(".so")
+            || lower.contains(".dylib"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Shared hint copy for endpoint-protection failures. Two variants because
+/// the install-time and runtime surfaces want slightly different "what to
+/// do" wording (retry the install vs allow the runtime dir + click Retry).
+const ENDPOINT_PROTECTION_HINT_INSTALL: &str =
+    "Looks like endpoint protection (antivirus or EDR) blocked the new native code. \
+     Allow Headroom in your security software, then retry.";
+
+const ENDPOINT_PROTECTION_HINT_RUNTIME: &str =
+    "A Headroom component was killed at launch — usually endpoint protection (antivirus or EDR) \
+     interfering with freshly-installed code. Allow `~/Library/Application Support/Headroom` \
+     in your security software, then click Retry.";
+
+pub(crate) fn endpoint_protection_hint_install() -> String {
+    ENDPOINT_PROTECTION_HINT_INSTALL.to_string()
+}
+
+pub(crate) fn endpoint_protection_hint_runtime() -> String {
+    ENDPOINT_PROTECTION_HINT_RUNTIME.to_string()
+}
+
 /// Map common runtime-upgrade failure modes to a short user-facing hint.
 pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
-    let chain = format!("{err:#}").to_ascii_lowercase();
+    let chain_raw = format!("{err:#}");
+    // Endpoint protection check uses the raw chain (the matcher does its own
+    // case-folding) so signal patterns like "signal=9" match exactly.
+    if is_endpoint_protection_signal(&chain_raw) {
+        return Some(endpoint_protection_hint_install());
+    }
+    let chain = chain_raw.to_ascii_lowercase();
     if chain.contains("network")
         || chain.contains("timed out")
         || chain.contains("dns")
@@ -4001,17 +4100,18 @@ mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         beta_channel_enabled_from, build_release_updater_config, build_watchdog_give_up_report,
-        check_headroom_learn_prereqs, classify_bootstrap_failure, compute_tray_window_position,
-        count_memories_created_today, debounced_tray_runtime_visual, delete_applied_pattern,
-        empty_live_learnings_for_projects, extract_llm_failure_warnings,
-        fetch_transformations_feed_from, install_pending_update, is_port_conflict_failure,
-        is_prerelease_version, lifetime_token_milestone_kind, parse_live_learnings,
-        parse_request_count_from_stats_body, parse_updater_endpoint_list, pattern_matches_project,
-        physical_rect_from_rect, read_applied_patterns_for_project, resolve_release_updater_config,
-        select_updater_endpoints, store_checked_update, watchdog_should_be_up,
-        AvailableAppUpdate, BootstrapFailureKind, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        check_headroom_learn_prereqs, classify_bootstrap_failure, classify_upgrade_error,
+        compute_tray_window_position, count_memories_created_today, debounced_tray_runtime_visual,
+        delete_applied_pattern, empty_live_learnings_for_projects, extract_llm_failure_warnings,
+        fetch_transformations_feed_from, install_pending_update, is_endpoint_protection_signal,
+        is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
+        parse_live_learnings, parse_request_count_from_stats_body, parse_updater_endpoint_list,
+        pattern_matches_project, physical_rect_from_rect, read_applied_patterns_for_project,
+        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
+        watchdog_should_be_up, AvailableAppUpdate, BootstrapFailureKind,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -5335,5 +5435,92 @@ Some unrelated content.
         let extracted = extract_llm_failure_warnings(stderr).expect("warnings extracted");
         assert_eq!(extracted.matches("LLM analysis failed:").count(), 2);
         assert!(extracted.contains('\n'));
+    }
+
+    // Endpoint-protection signature matcher: kept conservative on purpose, so
+    // every match here represents a pattern we believe is high-confidence AV/
+    // EDR interference. Adding looser patterns dilutes the user-facing hint.
+
+    #[test]
+    fn is_endpoint_protection_signal_matches_code_signature_failures() {
+        assert!(is_endpoint_protection_signal(
+            "dyld[1234]: code signature invalid for '/path/to/_mmh3.so'"
+        ));
+        assert!(is_endpoint_protection_signal(
+            "ERROR: code signature could not be verified for headroom_core"
+        ));
+    }
+
+    #[test]
+    fn is_endpoint_protection_signal_matches_dlopen_not_permitted() {
+        let raw = "ImportError: dlopen(/Users/x/site-packages/torch/lib/libtorch.dylib, 0x0006): \
+                   tried: '/Users/x/site-packages/torch/lib/libtorch.dylib' (operation not permitted)";
+        assert!(is_endpoint_protection_signal(raw));
+
+        // "Library not loaded" variant of the same dyld error.
+        let raw2 = "Library not loaded: @rpath/libonnxruntime.dylib \
+                    Reason: tried: '...' (operation not permitted)";
+        assert!(is_endpoint_protection_signal(raw2));
+    }
+
+    #[test]
+    fn is_endpoint_protection_signal_matches_sigkill_signatures() {
+        assert!(is_endpoint_protection_signal(
+            "command exited with signal=9 (no stderr)"
+        ));
+        assert!(is_endpoint_protection_signal(
+            "headroom: Killed: 9"
+        ));
+        assert!(is_endpoint_protection_signal(
+            "exit code 137 from /venv/bin/python -m headroom.proxy.server"
+        ));
+    }
+
+    #[test]
+    fn is_endpoint_protection_signal_matches_fresh_so_permission_denial() {
+        assert!(is_endpoint_protection_signal(
+            "open() Operation not permitted on /Users/x/site-packages/mmh3.cpython-312-darwin.so"
+        ));
+        assert!(is_endpoint_protection_signal(
+            "Operation not permitted: cannot exec /venv/lib/libtorch_python.dylib"
+        ));
+    }
+
+    #[test]
+    fn is_endpoint_protection_signal_does_not_overmatch_benign_errors() {
+        // Bare "killed" with no signal marker — could be OOM, user pkill, etc.
+        assert!(!is_endpoint_protection_signal(
+            "process killed before completing"
+        ));
+        // "Library not loaded" without the "not permitted" gate — ordinary
+        // missing-dep error, very common during dev.
+        assert!(!is_endpoint_protection_signal(
+            "Library not loaded: @rpath/libfoo.dylib — Reason: image not found"
+        ));
+        // "Operation not permitted" without a fresh-extension context — could
+        // be any random filesystem permission issue.
+        assert!(!is_endpoint_protection_signal(
+            "Operation not permitted on /private/var/db/foo.txt"
+        ));
+        // Generic network/disk errors must not falsely trigger.
+        assert!(!is_endpoint_protection_signal(
+            "Could not resolve host: pypi.org"
+        ));
+        assert!(!is_endpoint_protection_signal("ENOSPC: no space left"));
+    }
+
+    #[test]
+    fn classify_upgrade_error_returns_endpoint_protection_hint_before_other_classifiers() {
+        // Even when the error contains a "network" keyword (which would
+        // otherwise hit the network classifier), the AV signal wins because
+        // it's a more specific match for the actual cause.
+        let err = anyhow::anyhow!(
+            "network unreachable during install — child exited with signal=9"
+        );
+        let hint = classify_upgrade_error(&err).expect("must classify");
+        assert!(
+            hint.contains("endpoint protection"),
+            "expected EDR hint, got: {hint}"
+        );
     }
 }
