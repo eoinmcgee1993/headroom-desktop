@@ -43,6 +43,7 @@ import {
 import headroomLogo from "./assets/headroom-logo.svg";
 import packageJson from "../package.json";
 import {
+  formatAppUpdateProgressCopy,
   getAppUpdateInstallStatusCopy,
   getBlockedAppUpdateCheckPatch,
   loadAppUpdateConfiguration,
@@ -2088,7 +2089,15 @@ export default function App() {
     }
 
     try {
-      applyAppUpdatePatch(await runAppUpdateInstall({ availableUpdate: appUpdateAvailable }));
+      const versionForCopy = appUpdateAvailable.version;
+      applyAppUpdatePatch(
+        await runAppUpdateInstall({
+          availableUpdate: appUpdateAvailable,
+          onProgress: (progress) => {
+            setAppUpdateStatusCopy(formatAppUpdateProgressCopy(versionForCopy, progress));
+          },
+        })
+      );
     } finally {
       setAppUpdateInstallBusy(false);
     }
@@ -3872,13 +3881,21 @@ export default function App() {
                       ? `Your Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan no longer matches your Claude ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} usage, so weekly usage limits now apply. Upgrade to restore unlimited optimization.`
                       : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your Claude account is ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}. Upgrade to match your Claude plan.`}
                   </p>
+                  {upgradeActionError && upgradeActionBusy === null ? (
+                    <p className="tier-mismatch-banner__error" role="status">
+                      {upgradeActionError}
+                    </p>
+                  ) : null}
                 </div>
                 <button
                   type="button"
                   className="tier-mismatch-banner__action"
+                  disabled={upgradeActionBusy === tierMismatch.recommendedTier}
                   onClick={() => void handleUpgradeAction(tierMismatch.recommendedTier)}
                 >
-                  Upgrade to {upgradePlanIntentLabel(tierMismatch.recommendedTier)}
+                  {upgradeActionBusy === tierMismatch.recommendedTier
+                    ? "Updating…"
+                    : `Upgrade to ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}`}
                 </button>
               </section>
             ) : null}

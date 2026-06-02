@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type Event, type UnlistenFn } from "@tauri-apps/api/event";
 import * as Sentry from "@sentry/react";
 
 import { describeInvokeError } from "./appHelpers";
@@ -8,6 +9,17 @@ export type AppUpdateInvoker = <T>(
   command: string,
   args?: Record<string, unknown>
 ) => Promise<T>;
+
+export type AppUpdateProgress =
+  | { phase: "downloading"; downloaded: number; total: number | null }
+  | { phase: "installing" };
+
+export type AppUpdateProgressListener = (
+  event: string,
+  handler: (event: Event<AppUpdateProgress>) => void
+) => Promise<UnlistenFn>;
+
+const APP_UPDATE_PROGRESS_EVENT = "app-update://progress";
 
 export interface AppUpdateStatePatch {
   config?: AppUpdateConfiguration;
@@ -156,15 +168,47 @@ export function getAppUpdateInstallStatusCopy(
   return availableUpdate ? `Downloading Headroom ${availableUpdate.version}…` : null;
 }
 
+export function formatAppUpdateProgressCopy(
+  version: string,
+  progress: AppUpdateProgress
+): string {
+  if (progress.phase === "installing") {
+    return `Installing Headroom ${version}…`;
+  }
+
+  const downloadedMb = progress.downloaded / 1_000_000;
+  if (progress.total && progress.total > 0) {
+    const totalMb = progress.total / 1_000_000;
+    const pct = Math.min(100, Math.round((progress.downloaded / progress.total) * 100));
+    return `Downloading Headroom ${version}: ${downloadedMb.toFixed(1)} MB of ${totalMb.toFixed(1)} MB (${pct}%)…`;
+  }
+  return `Downloading Headroom ${version}: ${downloadedMb.toFixed(1)} MB…`;
+}
+
 export async function runAppUpdateInstall({
   availableUpdate,
   invokeFn = invoke,
+  listenFn = listen as AppUpdateProgressListener,
+  onProgress,
 }: {
   availableUpdate: AvailableAppUpdate | null;
   invokeFn?: AppUpdateInvoker;
+  listenFn?: AppUpdateProgressListener;
+  onProgress?: (progress: AppUpdateProgress) => void;
 }): Promise<AppUpdateStatePatch> {
   if (!availableUpdate) {
     return {};
+  }
+
+  let unlisten: UnlistenFn | null = null;
+  if (onProgress) {
+    try {
+      unlisten = await listenFn(APP_UPDATE_PROGRESS_EVENT, (event) => {
+        onProgress(event.payload);
+      });
+    } catch (error) {
+      Sentry.captureException(error, { tags: { flow: "app_update_progress_listen" } });
+    }
   }
 
   try {
@@ -179,5 +223,7 @@ export async function runAppUpdateInstall({
     return {
       statusCopy: describeInvokeError(error, "Could not install the update."),
     };
+  } finally {
+    unlisten?.();
   }
 }

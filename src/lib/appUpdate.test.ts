@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { AppUpdateConfiguration, AvailableAppUpdate } from "./types";
 import {
+  formatAppUpdateProgressCopy,
   getAppUpdateInstallStatusCopy,
   getBlockedAppUpdateCheckPatch,
   loadAppUpdateConfiguration,
@@ -10,6 +11,8 @@ import {
   runAppUpdateInstall,
   sendAppUpdateNotification,
   shouldNotifyAboutAvailableAppUpdate,
+  type AppUpdateProgress,
+  type AppUpdateProgressListener,
 } from "./appUpdate";
 
 function installStorage(initial: Record<string, string> = {}) {
@@ -225,6 +228,103 @@ describe("app update helpers", () => {
 
     expect(invokeFn).not.toHaveBeenCalled();
     expect(result).toEqual({});
+  });
+
+  it("formats download progress with byte counts and percent when total is known", () => {
+    expect(
+      formatAppUpdateProgressCopy("0.3.0", {
+        phase: "downloading",
+        downloaded: 5_500_000,
+        total: 22_000_000,
+      })
+    ).toBe("Downloading Headroom 0.3.0: 5.5 MB of 22.0 MB (25%)…");
+  });
+
+  it("formats download progress without a percent when total is unknown", () => {
+    expect(
+      formatAppUpdateProgressCopy("0.3.0", {
+        phase: "downloading",
+        downloaded: 1_200_000,
+        total: null,
+      })
+    ).toBe("Downloading Headroom 0.3.0: 1.2 MB…");
+  });
+
+  it("formats the installing phase as a separate copy string", () => {
+    expect(
+      formatAppUpdateProgressCopy("0.3.0", { phase: "installing" })
+    ).toBe("Installing Headroom 0.3.0…");
+  });
+
+  it("does not subscribe to progress events when no onProgress callback is given", async () => {
+    const invokeFn = vi.fn().mockResolvedValueOnce(undefined);
+    const listenFn = vi.fn();
+
+    await runAppUpdateInstall({ availableUpdate, invokeFn, listenFn });
+
+    expect(listenFn).not.toHaveBeenCalled();
+  });
+
+  it("forwards progress events to onProgress and unsubscribes after install resolves", async () => {
+    const invokeFn = vi.fn().mockResolvedValueOnce(undefined);
+    const unlisten = vi.fn();
+    type EmittedHandler = Parameters<AppUpdateProgressListener>[1];
+    const handlerRef: { current: EmittedHandler | null } = { current: null };
+    const listenFn: AppUpdateProgressListener = vi.fn(async (_event, handler) => {
+      handlerRef.current = handler;
+      return unlisten;
+    });
+    const onProgress = vi.fn();
+
+    const installPromise = runAppUpdateInstall({
+      availableUpdate,
+      invokeFn,
+      listenFn,
+      onProgress,
+    });
+
+    await Promise.resolve();
+    expect(listenFn).toHaveBeenCalledTimes(1);
+    expect((listenFn as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toBe(
+      "app-update://progress"
+    );
+
+    handlerRef.current?.({
+      event: "app-update://progress",
+      id: 1,
+      payload: { phase: "downloading", downloaded: 100, total: 500 },
+    });
+    handlerRef.current?.({
+      event: "app-update://progress",
+      id: 2,
+      payload: { phase: "installing" },
+    });
+
+    await installPromise;
+
+    expect(onProgress).toHaveBeenCalledTimes(2);
+    expect(onProgress.mock.calls[0]?.[0]).toEqual({
+      phase: "downloading",
+      downloaded: 100,
+      total: 500,
+    });
+    expect(onProgress.mock.calls[1]?.[0]).toEqual({ phase: "installing" });
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it("unsubscribes from progress events even when install fails", async () => {
+    const invokeFn = vi.fn().mockRejectedValueOnce("permission denied");
+    const unlisten = vi.fn();
+    const listenFn: AppUpdateProgressListener = vi.fn(async () => unlisten);
+
+    await runAppUpdateInstall({
+      availableUpdate,
+      invokeFn,
+      listenFn,
+      onProgress: vi.fn(),
+    });
+
+    expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
   it("best-effort sends update notifications without surfacing delivery failures", async () => {
