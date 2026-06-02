@@ -850,6 +850,28 @@ export default function App() {
   }, [pricingStatus]);
 
   useEffect(() => {
+    const STORAGE_KEY = "headroom:lastNotifiedMismatchTier";
+    const mismatch = pricingStatus?.tierMismatch;
+    if (!mismatch) {
+      window.localStorage.removeItem(STORAGE_KEY);
+      return;
+    }
+    const rank: Record<string, number> = { pro: 1, max5x: 2, max20x: 3 };
+    const previous = window.localStorage.getItem(STORAGE_KEY);
+    // Notify on first detection and whenever the recommended tier climbs higher.
+    if (previous !== null && (rank[mismatch.recommendedTier] ?? 0) <= (rank[previous] ?? 0)) {
+      return;
+    }
+    const paidLabel = upgradePlanIntentLabel(mismatch.paidTier);
+    const recommendedLabel = upgradePlanIntentLabel(mismatch.recommendedTier);
+    void invoke("show_notification", {
+      title: "Upgrade your Headroom plan",
+      body: `Your Claude ${recommendedLabel} plan is above your Headroom ${paidLabel} plan. Upgrade to keep unlimited optimization.`,
+    }).catch(() => {});
+    window.localStorage.setItem(STORAGE_KEY, mismatch.recommendedTier);
+  }, [pricingStatus?.tierMismatch?.recommendedTier, pricingStatus?.tierMismatch]);
+
+  useEffect(() => {
     const claudeConnector = getClaudeConnector(connectors);
     if (!claudeConnector?.installed) {
       return;
@@ -3505,6 +3527,7 @@ export default function App() {
           }
           return `Headroom needs attention: ${primaryIssue}.`;
         })();
+  const tierMismatch = pricingStatus?.tierMismatch ?? null;
   const sortedClaudeProjects = [...claudeProjects].sort((left, right) => {
     const leftTime = Date.parse(left.lastWorkedAt);
     const rightTime = Date.parse(right.lastWorkedAt);
@@ -3821,6 +3844,25 @@ export default function App() {
 
       <section className="tray-panel">
         <div className="tray-content" hidden={activeView !== "home"}>
+            {tierMismatch ? (
+              <section className="tier-mismatch-banner" role="alert">
+                <div className="tier-mismatch-banner__body">
+                  <h2 className="tier-mismatch-banner__title">Upgrade your Headroom plan</h2>
+                  <p className="tier-mismatch-banner__message">
+                    {tierMismatch.clamped
+                      ? `Your Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan no longer matches your Claude ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} usage, so weekly usage limits now apply. Upgrade to restore unlimited optimization.`
+                      : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your Claude account is ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}. Upgrade to match your Claude plan.`}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="tier-mismatch-banner__action"
+                  onClick={() => void handleUpgradeAction(tierMismatch.recommendedTier)}
+                >
+                  Upgrade to {upgradePlanIntentLabel(tierMismatch.recommendedTier)}
+                </button>
+              </section>
+            ) : null}
             <section className={`callout-banner callout-banner--${calloutBanner.tone}`}>
               <span className={`callout-banner__dot callout-banner__dot--${calloutBanner.tone}`} aria-hidden="true" />
               <div className="callout-banner__body">

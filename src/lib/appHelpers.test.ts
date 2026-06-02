@@ -134,6 +134,18 @@ describe("app helpers", () => {
     ]);
   });
 
+  it("shows discounted prices on upgrade-target cards for an active subscriber with the launch discount", () => {
+    const result = getUpgradePlans("individual", "max20x", undefined, "pro", true, true);
+
+    const byId = (id: string) => result.plans.find((plan) => plan.id === id);
+    // Active plan card keeps its full list price (purchaseInfo conveys the real amount).
+    expect(byId("pro")?.price).toBe("$5");
+    expect(byId("pro")?.originalPrice).toBeUndefined();
+    // Upgrade targets show the discounted price with the full price struck through.
+    expect([byId("max5x")?.price, byId("max5x")?.originalPrice]).toEqual(["$10", "$20"]);
+    expect([byId("max20x")?.price, byId("max20x")?.originalPrice]).toEqual(["$20", "$40"]);
+  });
+
   describe("active plan purchase info", () => {
     const baseArgs = [
       "individual" as const,

@@ -587,12 +587,33 @@ pub enum ClaudePlanTier {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeadroomSubscriptionTier {
     Pro,
     Max5x,
     Max20x,
+}
+
+impl HeadroomSubscriptionTier {
+    pub fn rank(self) -> u8 {
+        match self {
+            HeadroomSubscriptionTier::Pro => 1,
+            HeadroomSubscriptionTier::Max5x => 2,
+            HeadroomSubscriptionTier::Max20x => 3,
+        }
+    }
+}
+
+/// The Headroom subscription tier that matches a detected Claude plan. Returns
+/// `None` for plans that carry no paid Headroom equivalent (Free/Unknown).
+pub fn headroom_tier_for_claude_plan(plan: &ClaudePlanTier) -> Option<HeadroomSubscriptionTier> {
+    match plan {
+        ClaudePlanTier::Pro => Some(HeadroomSubscriptionTier::Pro),
+        ClaudePlanTier::Max5x => Some(HeadroomSubscriptionTier::Max5x),
+        ClaudePlanTier::Max20x => Some(HeadroomSubscriptionTier::Max20x),
+        ClaudePlanTier::Free | ClaudePlanTier::Unknown => None,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -674,9 +695,22 @@ pub struct HeadroomPricingStatus {
     pub disable_threshold_percent: Option<f64>,
     pub effective_disable_threshold_percent: Option<f64>,
     pub recommended_subscription_tier: Option<HeadroomSubscriptionTier>,
+    pub tier_mismatch: Option<TierMismatch>,
     pub claude: ClaudeAccountProfile,
     pub account: Option<HeadroomAccountProfile>,
     pub launch_discount_active: bool,
+}
+
+/// Set when an active subscriber's paid Headroom tier is lower than the tier
+/// implied by their detected Claude plan. `clamped` flips true once the grace
+/// window has elapsed, at which point standard paid-plan usage gating applies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TierMismatch {
+    pub paid_tier: HeadroomSubscriptionTier,
+    pub recommended_tier: HeadroomSubscriptionTier,
+    pub grace_ends_at: DateTime<Utc>,
+    pub clamped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

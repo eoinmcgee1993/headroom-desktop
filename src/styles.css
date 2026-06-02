@@ -1751,6 +1751,52 @@ select {
   opacity: 0.6;
 }
 
+.tier-mismatch-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--warning);
+  border-radius: 14px;
+  background: var(--warning-tint);
+  color: var(--text-primary);
+}
+
+.tier-mismatch-banner__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.tier-mismatch-banner__title {
+  margin: 0 0 2px;
+  font-size: var(--text-sm);
+  font-weight: 700;
+}
+
+.tier-mismatch-banner__message {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.tier-mismatch-banner__action {
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  padding: 6px 12px;
+  color: var(--text-inverse);
+  background: var(--accent-strong);
+  transition: background 120ms ease;
+}
+
+.tier-mismatch-banner__action:hover {
+  background: var(--accent);
+}
+
 @keyframes callout-dot-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(79, 158, 145, 0.45); }
   50% { box-shadow: 0 0 0 5px rgba(79, 158, 145, 0); }

@@ -199,8 +199,10 @@ export function getUpgradePlans(
       ctaLabel: string
     ): UpgradePlan {
       const prices = PLAN_PRICES[id][billingPeriod];
-      // When user has an active plan, always show full prices — no discount badges.
-      const showDiscount = launchDiscountActive && !activeHeadroomPlanId;
+      // Upgrade-target cards show the discounted price because checkout always
+      // attaches the launch discount; the active plan card uses purchaseInfo
+      // (actual paid amount) instead of a generic discount badge.
+      const showDiscount = launchDiscountActive && id !== activeHeadroomPlanId;
       const price = showDiscount ? prices.discounted : prices.full;
       return {
         id,

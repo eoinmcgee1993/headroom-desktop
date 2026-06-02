@@ -161,15 +161,15 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
         None => true,
     }
 }
-const RTK_VERSION: &str = "0.37.2";
+const RTK_VERSION: &str = "0.42.0";
 const RTK_SHA256_MACOS_AARCH64: &str =
-    "99e20a59847dedbb64032a3f7985f2fe959fcb9674d8eaf940fc58a189e27eca";
+    "cddc9cd11cdf80b3342eebaba0e6ab26d9c8dec45295ea44cf98062987185724";
 const RTK_SHA256_MACOS_X86_64: &str =
-    "4052e7740a87e121f671a2de269b3f015dcc58b6171d6bedb300da7599cb4d94";
+    "3b1b9f13548599ae9d920f5e3169cc402db1930044ea24e0be4e236b7f072a99";
 const RTK_SHA256_LINUX_AARCH64: &str =
-    "1d8d7fcca6cb05e1867c08bb4e5aa5f107c037c607131e511b726ae33ac35a47";
+    "62bb749df1ed64f09149998c31de864932f047a1be4e0f882a8ceada849e0871";
 const RTK_SHA256_LINUX_X86_64: &str =
-    "3dfb7a05636a68687ba1c5aa696fa8d5fcb494447ded86d9eb8b88b7100a37c6";
+    "cdd4f87ac97ce958f71b53a991880d6adcc41cc5bca1044175a64630980152be";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -2715,71 +2715,90 @@ impl ToolManager {
 
     fn install_headroom_mcp(&self) -> Result<McpInstallMethod> {
         let entrypoint = self.headroom_entrypoint();
-        let args = ["mcp", "install", "--proxy-url", HEADROOM_PROXY_URL];
-        let mut cmd = build_command(&entrypoint, &args, &self.runtime.root_dir);
+        let detected_claude = crate::claude_cli::detect_claude_cli();
 
         // GUI apps launched from Finder/Dock inherit a minimal PATH that
         // excludes /opt/homebrew/bin, /usr/local/bin, ~/.claude/local/bin,
         // etc. Without augmentation, `shutil.which("claude")` inside the
         // Python CLI returns None and it falls back to writing
         // ~/.claude/mcp.json — a legacy path Claude Code ≥2.x does not read.
-        let detected_claude = crate::claude_cli::detect_claude_cli();
-        if let Some(claude_path) = detected_claude.as_ref() {
-            if let Some(dir) = claude_path.parent() {
-                let existing = std::env::var("PATH").unwrap_or_default();
-                let augmented = if existing.is_empty() {
-                    dir.display().to_string()
-                } else {
-                    format!("{}:{}", dir.display(), existing)
-                };
-                cmd.env("PATH", augmented);
+        let run_install = |force: bool| -> Result<(std::process::Output, Vec<&'static str>)> {
+            let mut args: Vec<&'static str> =
+                vec!["mcp", "install", "--proxy-url", HEADROOM_PROXY_URL];
+            if force {
+                args.push("--force");
             }
-        }
+            let mut cmd = build_command(&entrypoint, &args[..], &self.runtime.root_dir);
+            if let Some(claude_path) = detected_claude.as_ref() {
+                if let Some(dir) = claude_path.parent() {
+                    let existing = std::env::var("PATH").unwrap_or_default();
+                    let augmented = if existing.is_empty() {
+                        dir.display().to_string()
+                    } else {
+                        format!("{}:{}", dir.display(), existing)
+                    };
+                    cmd.env("PATH", augmented);
+                }
+            }
+            let output = cmd
+                .output()
+                .with_context(|| format!("starting {} {}", entrypoint.display(), args.join(" ")))
+                .context("configuring Headroom MCP integration")?;
+            Ok((output, args))
+        };
 
-        let output = cmd
-            .output()
-            .with_context(|| format!("starting {} {}", entrypoint.display(), args.join(" ")))
-            .context("configuring Headroom MCP integration")?;
+        // Always pass --force so that stale entrypoints left over from a
+        // previous Headroom version (e.g. venv python3 path → headroom CLI)
+        // are overwritten without a separate retry. --force is a no-op when
+        // the config is already correct or absent. Desktop owns this config.
+        let (output, args) = run_install(true)?;
 
         if !output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             let exit_code = output.status.code();
             let signal = exit_status_signal(&output.status);
-            let detected = detected_claude
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<not detected>".into());
-            sentry::with_scope(
-                |scope| {
-                    scope.set_extra("claude_cli_detected", detected.clone().into());
-                    scope.set_extra("exit_code", exit_code.map(|c| c.into()).unwrap_or(serde_json::Value::Null));
-                    scope.set_extra("signal", signal.map(|s| s.into()).unwrap_or(serde_json::Value::Null));
-                    scope.set_extra(
-                        "stdout_tail",
-                        stdout[stdout.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..].into(),
-                    );
-                    scope.set_extra(
-                        "stderr_tail",
-                        stderr[stderr.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..].into(),
-                    );
-                },
-                || {
-                    sentry::capture_message(
-                        "Headroom MCP install exited non-zero",
-                        sentry::Level::Warning,
-                    );
-                },
-            );
-            return Err(anyhow::Error::new(CommandFailure {
-                program: entrypoint.display().to_string(),
-                args: args.iter().map(|s| s.to_string()).collect(),
-                stdout,
-                stderr,
-                exit_code,
-                signal,
-            }))
-            .context("configuring Headroom MCP integration");
+
+            // If the Python CLI exited non-zero only because no supported tool
+            // (claude, codex, etc.) was detected on PATH, it wrote nothing --
+            // but the direct JSON write path below can still configure the
+            // integration. Fall through instead of surfacing a Sentry warning.
+            if !stdout.contains("not detected on this system") {
+                let detected = detected_claude
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<not detected>".into());
+                sentry::with_scope(
+                    |scope| {
+                        scope.set_extra("claude_cli_detected", detected.clone().into());
+                        scope.set_extra("exit_code", exit_code.map(|c| c.into()).unwrap_or(serde_json::Value::Null));
+                        scope.set_extra("signal", signal.map(|s| s.into()).unwrap_or(serde_json::Value::Null));
+                        scope.set_extra(
+                            "stdout_tail",
+                            stdout[stdout.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..].into(),
+                        );
+                        scope.set_extra(
+                            "stderr_tail",
+                            stderr[stderr.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..].into(),
+                        );
+                    },
+                    || {
+                        sentry::capture_message(
+                            "Headroom MCP install exited non-zero",
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
+                return Err(anyhow::Error::new(CommandFailure {
+                    program: entrypoint.display().to_string(),
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                    stdout,
+                    stderr,
+                    exit_code,
+                    signal,
+                }))
+                .context("configuring Headroom MCP integration");
+            }
         }
 
         // Ground truth: did Claude Code actually see the server? The Python

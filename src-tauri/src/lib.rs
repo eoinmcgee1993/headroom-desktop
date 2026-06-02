@@ -634,6 +634,20 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
             .map(|f| is_endpoint_protection_signal(&f.stderr))
             .unwrap_or(false);
 
+    // ENOSPC is environmental; skip the Sentry capture (see notes on
+    // `capture_upgrade_failure`).
+    let disk_full = is_disk_full_signal(&technical_err)
+        || cmd_failure
+            .map(|f| is_disk_full_signal(&f.stderr))
+            .unwrap_or(false);
+    if disk_full {
+        log::warn!(
+            "skipping Sentry capture for bootstrap_failed ({}): disk full (ENOSPC)",
+            kind.as_str()
+        );
+        return;
+    }
+
     if let Some(failure) = cmd_failure {
         sentry::with_scope(
             |scope| {
@@ -1036,6 +1050,20 @@ pub(crate) fn capture_upgrade_failure(
         .chain()
         .find_map(|e| e.downcast_ref::<tool_manager::CommandFailure>());
 
+    // ENOSPC is environmental — the user can't fix it by retrying, and the
+    // pip log dump bloats Sentry with thousands of "Requirement already
+    // satisfied" lines per report. Drop the Sentry capture; the user still
+    // sees the disk-full hint via `classify_upgrade_error`, and the local
+    // failure is recorded by the caller's `record_upgrade_failure` +
+    // analytics::track_event.
+    let cmd_stderr = cmd_failure.map(|f| f.stderr.as_str()).unwrap_or("");
+    if is_disk_full_signal(&technical_err) || is_disk_full_signal(cmd_stderr) {
+        log::warn!(
+            "skipping Sentry capture for runtime_upgrade_failed ({phase}): disk full (ENOSPC)"
+        );
+        return;
+    }
+
     // Sentry drops extras larger than ~16KB. Cap the tail aggressively so the
     // tail's tail (where the panic/error usually lives) survives.
     let log_tail_capped = log_tail.map(|s| {
@@ -1228,6 +1256,19 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
         return true;
     }
     false
+}
+
+/// True when an install/upgrade failure was caused by the user's disk
+/// running out of space. ENOSPC is environmental — the user can't fix it
+/// by retrying, only by freeing space — so we use this to drop noisy
+/// pip-log Sentry reports and emit a single clear local log line instead.
+/// The user-facing hint is produced separately by `classify_upgrade_error`.
+pub(crate) fn is_disk_full_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no space left on device")
+        || lower.contains("errno 28")
+        || lower.contains("enospc")
+        || lower.contains("disk full")
 }
 
 /// Shared hint copy for endpoint-protection failures. Two variants because
@@ -3480,6 +3521,12 @@ fn spawn_proxy_watchdog(app: AppHandle) {
     std::thread::spawn(move || {
         let mut consecutive_failures: u32 = 0;
         let mut last_tick = std::time::Instant::now();
+        // Set after a forced kill+restart of a hung process. Prevents the
+        // hung-kill path from looping forever if the new process also hangs:
+        // on the second trip through MAX_CONSECUTIVE_FAILURES we fall through
+        // to the permanent give-up path instead. Resets when the proxy
+        // recovers so a later hang triggers another rescue attempt.
+        let mut hung_kill_attempted = false;
 
         loop {
             std::thread::sleep(POLL);
@@ -3525,6 +3572,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
             if runtime.proxy_reachable {
                 consecutive_failures = 0;
+                hung_kill_attempted = false;
                 // End of "down episode" — re-arm Sentry capture so a future
                 // crash fires a fresh event.
                 WATCHDOG_DOWN_CAPTURED.store(false, Ordering::Release);
@@ -3566,6 +3614,30 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         "watchdog: backend /readyz answers ok after {consecutive_failures} intercept failures; skipping auto-pause and resetting counter"
                     );
                     consecutive_failures = 0;
+                    continue;
+                }
+                // Hung process: TCP port is accepting connections (the process
+                // is alive) but /readyz never responds. ensure_headroom_running
+                // returns Ok immediately when try_wait says the child is still
+                // alive, so the three restart attempts above were all no-ops.
+                // Kill the stuck process and start fresh before giving up
+                // permanently. We only do this once per down episode
+                // (hung_kill_attempted) so a persistently-hung new process
+                // doesn't loop; it falls through to the give-up path below.
+                if backend_readyz_outcome == "timeout" && !hung_kill_attempted {
+                    log::info!(
+                        "watchdog: backend /readyz hung (timeout) after {consecutive_failures} failures; force-killing and restarting"
+                    );
+                    hung_kill_attempted = true;
+                    state.stop_headroom();
+                    consecutive_failures = 0;
+                    match state.ensure_headroom_running() {
+                        Ok(()) => port_conflict::note_proxy_started(&app),
+                        Err(err) => {
+                            log::warn!("watchdog: hung-kill restart failed: {err:#}");
+                            port_conflict::note_proxy_failed(&app, &err, false);
+                        }
+                    }
                     continue;
                 }
                 // info! not warn!/error!: this is the documented recovery
@@ -4103,8 +4175,9 @@ mod tests {
         check_headroom_learn_prereqs, classify_bootstrap_failure, classify_upgrade_error,
         compute_tray_window_position, count_memories_created_today, debounced_tray_runtime_visual,
         delete_applied_pattern, empty_live_learnings_for_projects, extract_llm_failure_warnings,
-        fetch_transformations_feed_from, install_pending_update, is_endpoint_protection_signal,
-        is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
+        fetch_transformations_feed_from, install_pending_update, is_disk_full_signal,
+        is_endpoint_protection_signal, is_port_conflict_failure, is_prerelease_version,
+        lifetime_token_milestone_kind,
         parse_live_learnings, parse_request_count_from_stats_body, parse_updater_endpoint_list,
         pattern_matches_project, physical_rect_from_rect, read_applied_patterns_for_project,
         resolve_release_updater_config, select_updater_endpoints, store_checked_update,
@@ -5507,6 +5580,25 @@ Some unrelated content.
             "Could not resolve host: pypi.org"
         ));
         assert!(!is_endpoint_protection_signal("ENOSPC: no space left"));
+    }
+
+    #[test]
+    fn is_disk_full_signal_matches_pip_enospc_failures() {
+        assert!(is_disk_full_signal(
+            "ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device"
+        ));
+        assert!(is_disk_full_signal("OSError: [Errno 28] No space left on device"));
+        assert!(is_disk_full_signal("ENOSPC: no space left"));
+        assert!(is_disk_full_signal("disk full"));
+        // Case-insensitive.
+        assert!(is_disk_full_signal("NO SPACE LEFT ON DEVICE"));
+    }
+
+    #[test]
+    fn is_disk_full_signal_does_not_overmatch() {
+        assert!(!is_disk_full_signal("network unreachable"));
+        assert!(!is_disk_full_signal("permission denied"));
+        assert!(!is_disk_full_signal("Could not resolve host: pypi.org"));
     }
 
     #[test]

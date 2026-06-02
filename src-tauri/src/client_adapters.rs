@@ -2727,7 +2727,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let real_binary = "/bin/echo";
         assert!(Path::new(real_binary).exists());
 
-        // Match the real v0.37.2 behavior we observed during smoke testing:
+        // Match the real rtk behavior we observed during smoke testing:
         // emit a rewrite, then exit non-zero. The hook's `|| true` should
         // still preserve the rewritten command.
         let fake_rtk = root.join("fake-rtk");

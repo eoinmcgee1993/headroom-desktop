@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::device;
 use crate::keychain;
 use crate::models::{
-    BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, ClaudeUsage,
-    ClaudeUsageWindow, HeadroomAccountProfile, HeadroomAuthCodeRequest, HeadroomPricingStatus,
-    HeadroomSubscriptionTier, PricingGateReason,
+    headroom_tier_for_claude_plan, BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod,
+    ClaudePlanTier, ClaudeUsage, ClaudeUsageWindow, HeadroomAccountProfile, HeadroomAuthCodeRequest,
+    HeadroomPricingStatus, HeadroomSubscriptionTier, PricingGateReason, TierMismatch,
 };
 use crate::state::AppState;
 use crate::storage::{app_data_dir, config_file};
@@ -21,6 +21,7 @@ const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 #[cfg(not(debug_assertions))]
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 72;
+const TIER_MISMATCH_GRACE_DAYS: i64 = 14;
 // Set to true in dev builds to skip sign-in requirement (indefinite trial)
 #[cfg(debug_assertions)]
 const INDEFINITE_TRIAL: bool = true;
@@ -31,6 +32,8 @@ struct LocalPricingState {
     first_seen_at: DateTime<Utc>,
     #[serde(default)]
     reconcile_with_server: bool,
+    #[serde(default)]
+    mismatch_since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -400,8 +403,9 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
 
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
+    let tier_mismatch = resolve_tier_mismatch(account.as_ref(), &claude);
 
-    Ok(evaluate_pricing_status(
+    Ok(evaluate_pricing_status_with_mismatch(
         authenticated,
         local_state.first_seen_at,
         local_grace_ends_at,
@@ -411,6 +415,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         claude,
         launch_discount_active,
         last_known_good_plan_tier,
+        tier_mismatch,
     ))
 }
 
@@ -439,7 +444,7 @@ pub(crate) fn request_auth_code_with_base_url(
         .send()
         .map_err(|err| {
             let msg = format!("Could not request sign-in code: {err}");
-            sentry::capture_message(&msg, sentry::Level::Warning);
+            sentry::capture_message(&msg, sentry::Level::Info);
             msg
         })?;
 
@@ -519,17 +524,20 @@ pub(crate) fn verify_auth_code_with_base_url(
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
+    let account = remote_account_to_profile(body.account);
+    let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude);
 
-    Ok(evaluate_pricing_status(
+    Ok(evaluate_pricing_status_with_mismatch(
         true,
         local_state.first_seen_at,
         local_grace_ends_at,
         Utc::now() < local_grace_ends_at,
         None,
-        Some(remote_account_to_profile(body.account)),
+        Some(account),
         claude,
         body.launch_discount_active,
         last_known_good_plan_tier,
+        tier_mismatch,
     ))
 }
 
@@ -592,17 +600,20 @@ pub(crate) fn activate_account_with_base_url(
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
+    let account = remote_account_to_profile(body.account);
+    let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude);
 
-    Ok(evaluate_pricing_status(
+    Ok(evaluate_pricing_status_with_mismatch(
         true,
         local_state.first_seen_at,
         local_grace_ends_at,
         Utc::now() < local_grace_ends_at,
         None,
-        Some(remote_account_to_profile(body.account)),
+        Some(account),
         claude,
         body.launch_discount_active,
         last_known_good_plan_tier,
+        tier_mismatch,
     ))
 }
 
@@ -772,7 +783,7 @@ fn parse_claude_usage_response(body: &serde_json::Value) -> Result<ClaudeUsage, 
     })
 }
 
-fn evaluate_pricing_status(
+fn evaluate_pricing_status_with_mismatch(
     authenticated: bool,
     local_grace_started_at: DateTime<Utc>,
     local_grace_ends_at: DateTime<Utc>,
@@ -782,6 +793,7 @@ fn evaluate_pricing_status(
     claude: ClaudeAccountProfile,
     launch_discount_active: bool,
     last_known_good_plan_tier: Option<ClaudePlanTier>,
+    tier_mismatch: Option<TierMismatch>,
 ) -> HeadroomPricingStatus {
     #[cfg(debug_assertions)]
     let local_grace_active = if INDEFINITE_TRIAL {
@@ -809,7 +821,27 @@ fn evaluate_pricing_status(
                 .into();
     } else if let Some(account) = account.as_ref() {
         if account.subscription_active {
-            gate_message = "Headroom subscription active. Optimization stays fully enabled.".into();
+            if tier_mismatch.as_ref().is_some_and(|m| m.clamped) {
+                let gate = paid_plan_gate(
+                    &claude.plan_tier,
+                    claude.weekly_utilization_pct,
+                    account.invite_bonus_percent,
+                );
+                optimization_allowed = gate.optimization_allowed;
+                should_nudge = gate.should_nudge;
+                nudge_level = gate.nudge_level;
+                gate_reason = gate.gate_reason;
+                nudge_threshold_percent = gate.nudge_threshold_percent;
+                effective_nudge_thresholds_percent = gate.effective_nudge_thresholds_percent;
+                disable_threshold_percent = gate.disable_threshold_percent;
+                effective_disable_threshold_percent = gate.effective_disable_threshold_percent;
+                recommended_subscription_tier = gate.recommended_subscription_tier;
+                gate_message = gate.gate_message;
+            } else {
+                recommended_subscription_tier = tier_mismatch.as_ref().map(|m| m.recommended_tier);
+                gate_message =
+                    "Headroom subscription active. Optimization stays fully enabled.".into();
+            }
         } else if account.trial_active {
             gate_message =
                 "Your 14-day Headroom trial is active with unlimited optimization.".into();
@@ -896,10 +928,67 @@ fn evaluate_pricing_status(
         disable_threshold_percent,
         effective_disable_threshold_percent,
         recommended_subscription_tier,
+        tier_mismatch,
         claude,
         account,
         launch_discount_active,
     }
+}
+
+/// Pure comparison: returns `(paid_tier, recommended_tier)` when an active
+/// subscriber's paid tier is below the tier their confidently-detected Claude
+/// plan implies. Uses the live `claude.plan_tier` only — `Unknown`/`Free`
+/// (and any cached fallback) yield no recommended tier, so no mismatch fires.
+fn detect_tier_mismatch(
+    account: &HeadroomAccountProfile,
+    claude: &ClaudeAccountProfile,
+) -> Option<(HeadroomSubscriptionTier, HeadroomSubscriptionTier)> {
+    if !account.subscription_active {
+        return None;
+    }
+    let paid = account.subscription_tier?;
+    let recommended = headroom_tier_for_claude_plan(&claude.plan_tier)?;
+    (recommended.rank() > paid.rank()).then_some((paid, recommended))
+}
+
+/// Detects the mismatch and manages the persisted grace clock. Sets
+/// `mismatch_since` on first detection, clears it once resolved, and reports
+/// `clamped` after the grace window elapses.
+fn resolve_tier_mismatch(
+    account: Option<&HeadroomAccountProfile>,
+    claude: &ClaudeAccountProfile,
+) -> Option<TierMismatch> {
+    let (paid_tier, recommended_tier) = match account.and_then(|a| detect_tier_mismatch(a, claude)) {
+        Some(pair) => pair,
+        None => {
+            if let Ok(mut local) = load_or_initialize_local_state() {
+                if local.mismatch_since.is_some() {
+                    local.mismatch_since = None;
+                    let _ = write_local_state(&local);
+                }
+            }
+            return None;
+        }
+    };
+
+    let mut local = load_or_initialize_local_state().ok()?;
+    let since = match local.mismatch_since {
+        Some(since) => since,
+        None => {
+            let now = Utc::now();
+            local.mismatch_since = Some(now);
+            let _ = write_local_state(&local);
+            now
+        }
+    };
+
+    let grace_ends_at = since + Duration::days(TIER_MISMATCH_GRACE_DAYS);
+    Some(TierMismatch {
+        paid_tier,
+        recommended_tier,
+        grace_ends_at,
+        clamped: Utc::now() > grace_ends_at,
+    })
 }
 
 struct PaidPlanGate {
@@ -1417,6 +1506,7 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
     let state = LocalPricingState {
         first_seen_at: Utc::now(),
         reconcile_with_server: true,
+        mismatch_since: None,
     };
     write_local_state(&state)?;
     Ok(state)
@@ -1653,17 +1743,60 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::{
-        detect_plan_tier_from_profile, evaluate_pricing_status, is_identity_complete,
-        merge_background_account_sync, plan_tier_header_value, remote_account_to_profile,
-        resolve_account_api_base_url, ClaudeOauthProfile, ClaudeOauthProfileAccount,
-        ClaudeOauthProfileOrganization, HeadroomSubscriptionTier, IdentityFingerprint,
-        IdentityPayload, LocalPricingState, RemoteAccountResponse, RemoteAccountSyncError,
-        DEFAULT_ACCOUNT_API_BASE_URL,
+        detect_plan_tier_from_profile, detect_tier_mismatch, evaluate_pricing_status_with_mismatch,
+        is_identity_complete, merge_background_account_sync, plan_tier_header_value,
+        remote_account_to_profile, resolve_account_api_base_url, ClaudeOauthProfile,
+        ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
+        IdentityFingerprint, IdentityPayload, LocalPricingState, RemoteAccountResponse,
+        RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier,
-        HeadroomAccountProfile, PricingGateReason,
+        HeadroomAccountProfile, HeadroomPricingStatus, PricingGateReason, TierMismatch,
     };
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_pricing_status(
+        authenticated: bool,
+        local_grace_started_at: DateTime<Utc>,
+        local_grace_ends_at: DateTime<Utc>,
+        local_grace_active: bool,
+        account_sync_error: Option<String>,
+        account: Option<HeadroomAccountProfile>,
+        claude: ClaudeAccountProfile,
+        launch_discount_active: bool,
+        last_known_good_plan_tier: Option<ClaudePlanTier>,
+    ) -> HeadroomPricingStatus {
+        evaluate_pricing_status_with_mismatch(
+            authenticated,
+            local_grace_started_at,
+            local_grace_ends_at,
+            local_grace_active,
+            account_sync_error,
+            account,
+            claude,
+            launch_discount_active,
+            last_known_good_plan_tier,
+            None,
+        )
+    }
+
+    fn mismatch(recommended: HeadroomSubscriptionTier, clamped: bool) -> TierMismatch {
+        TierMismatch {
+            paid_tier: HeadroomSubscriptionTier::Pro,
+            recommended_tier: recommended,
+            grace_ends_at: Utc::now(),
+            clamped,
+        }
+    }
+
+    fn active_subscriber(tier: HeadroomSubscriptionTier) -> HeadroomAccountProfile {
+        let mut account = trial_account();
+        account.trial_active = false;
+        account.subscription_active = true;
+        account.subscription_tier = Some(tier);
+        account
+    }
 
     fn sample_remote_account() -> RemoteAccountResponse {
         RemoteAccountResponse {
@@ -3229,5 +3362,94 @@ mod tests {
         server.join().unwrap();
 
         assert_eq!(err, "Customer not found");
+    }
+
+    #[test]
+    fn detect_tier_mismatch_flags_under_subscribed_pro() {
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        let claude = empty_claude_profile(ClaudePlanTier::Max20x);
+        assert_eq!(
+            detect_tier_mismatch(&account, &claude),
+            Some((HeadroomSubscriptionTier::Pro, HeadroomSubscriptionTier::Max20x))
+        );
+    }
+
+    #[test]
+    fn detect_tier_mismatch_ignores_matching_or_higher_paid_tier() {
+        let claude = empty_claude_profile(ClaudePlanTier::Pro);
+        // Equal tiers.
+        assert!(detect_tier_mismatch(&active_subscriber(HeadroomSubscriptionTier::Pro), &claude)
+            .is_none());
+        // Paid higher than Claude plan.
+        assert!(detect_tier_mismatch(&active_subscriber(HeadroomSubscriptionTier::Max20x), &claude)
+            .is_none());
+    }
+
+    #[test]
+    fn detect_tier_mismatch_requires_confident_paid_claude_plan() {
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        // Unknown and Free carry no recommended paid tier.
+        assert!(
+            detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Unknown)).is_none()
+        );
+        assert!(
+            detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Free)).is_none()
+        );
+    }
+
+    #[test]
+    fn detect_tier_mismatch_ignores_inactive_subscription() {
+        let mut account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        account.subscription_active = false;
+        let claude = empty_claude_profile(ClaudePlanTier::Max20x);
+        assert!(detect_tier_mismatch(&account, &claude).is_none());
+    }
+
+    #[test]
+    fn within_grace_mismatch_keeps_optimization_unlimited() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status_with_mismatch(
+            true,
+            start,
+            end,
+            true,
+            None,
+            Some(active_subscriber(HeadroomSubscriptionTier::Pro)),
+            pro_profile_with_weekly(99.0),
+            false,
+            None,
+            Some(mismatch(HeadroomSubscriptionTier::Max20x, false)),
+        );
+        assert!(status.optimization_allowed);
+        assert!(!status.should_nudge);
+        assert!(status.tier_mismatch.is_some());
+        assert_eq!(
+            status.recommended_subscription_tier,
+            Some(HeadroomSubscriptionTier::Max20x)
+        );
+    }
+
+    #[test]
+    fn clamped_mismatch_applies_standard_usage_gate() {
+        let (start, end) = grace();
+        let status = evaluate_pricing_status_with_mismatch(
+            true,
+            start,
+            end,
+            true,
+            None,
+            Some(active_subscriber(HeadroomSubscriptionTier::Pro)),
+            pro_profile_with_weekly(99.0),
+            false,
+            None,
+            Some(mismatch(HeadroomSubscriptionTier::Max20x, true)),
+        );
+        // Over the disable threshold, the standard paid gate pauses optimization.
+        assert!(!status.optimization_allowed);
+        assert!(matches!(
+            status.gate_reason,
+            Some(PricingGateReason::WeeklyUsageLimitReached)
+        ));
+        assert!(status.tier_mismatch.is_some_and(|m| m.clamped));
     }
 }

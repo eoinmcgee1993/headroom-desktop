@@ -5693,6 +5693,7 @@ mod tests {
             disable_threshold_percent: None,
             effective_disable_threshold_percent: None,
             recommended_subscription_tier: None,
+            tier_mismatch: None,
             claude: ClaudeAccountProfile {
                 auth_method: ClaudeAuthMethod::Unknown,
                 email: None,
