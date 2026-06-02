@@ -717,6 +717,7 @@ export default function App() {
   const [planChangeBusy, setPlanChangeBusy] = useState(false);
   const [planChangeError, setPlanChangeError] = useState<string | null>(null);
   const [contactEmail, setContactEmail] = useState("");
+  const [contactMessage, setContactMessage] = useState("");
   const [contactSubmitBusy, setContactSubmitBusy] = useState(false);
   const [contactSubmitError, setContactSubmitError] = useState<string | null>(null);
   const [contactSubmitSuccess, setContactSubmitSuccess] = useState<string | null>(null);
@@ -2619,13 +2620,19 @@ export default function App() {
     }
 
     const trimmed = contactEmail.trim();
+    const trimmedMessage = contactMessage.trim().slice(0, 2000);
     setContactSubmitBusy(true);
     setContactSubmitError(null);
     setContactSubmitSuccess(null);
 
     try {
-      await invoke("submit_contact_request", { url: CONTACT_FORM_URL, email: trimmed });
+      await invoke("submit_contact_request", {
+        url: CONTACT_FORM_URL,
+        email: trimmed,
+        message: trimmedMessage || null,
+      });
       setContactEmail("");
+      setContactMessage("");
       setContactSubmitSuccess("Thanks. Check your inbox for a confirmation email.");
     } catch (error) {
       setContactSubmitError(
@@ -4401,6 +4408,22 @@ export default function App() {
                           placeholder="you@company.com"
                           type="email"
                           value={contactEmail}
+                        />
+                        <textarea
+                          className="upgrade-plan-card__contact-textarea"
+                          maxLength={2000}
+                          onChange={(event) => {
+                            setContactMessage(event.target.value);
+                            if (contactSubmitError) {
+                              setContactSubmitError(null);
+                            }
+                            if (contactSubmitSuccess) {
+                              setContactSubmitSuccess(null);
+                            }
+                          }}
+                          placeholder="Tell us about your team and what you're looking for (optional)"
+                          rows={4}
+                          value={contactMessage}
                         />
                         <button
                           className={`secondary-button upgrade-plan-card__button upgrade-plan-card__contact-submit${contactEmailValid ? " is-ready" : ""}`}

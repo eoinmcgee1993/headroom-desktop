@@ -1247,6 +1247,17 @@ select {
   color: var(--text-primary);
 }
 
+.upgrade-plan-card__contact-textarea {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+  font: inherit;
+  resize: vertical;
+}
+
 .upgrade-plan-card__contact-submit {
   cursor: not-allowed;
   opacity: 0.64;

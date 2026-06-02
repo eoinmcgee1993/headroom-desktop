@@ -2212,7 +2212,11 @@ fn track_analytics_event(app: AppHandle, name: String, properties: Option<Value>
 }
 
 #[tauri::command]
-async fn submit_contact_request(url: String, email: String) -> Result<(), String> {
+async fn submit_contact_request(
+    url: String,
+    email: String,
+    message: Option<String>,
+) -> Result<(), String> {
     let trimmed = email.trim();
     if trimmed.is_empty() || !trimmed.contains('@') {
         return Err("Enter a valid email address.".to_string());
@@ -2225,15 +2229,24 @@ async fn submit_contact_request(url: String, email: String) -> Result<(), String
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| err.to_string())?;
+    let message_owned = message
+        .map(|m| m.trim().chars().take(2000).collect::<String>())
+        .unwrap_or_default();
     let response = client
         .post(target)
-        .form(&[("contact_request[email]", trimmed)])
+        .form(&[
+            ("contact_request[email]", trimmed),
+            ("contact_request[message]", message_owned.as_str()),
+        ])
         .send()
         .await
         .map_err(|err| err.to_string())?;
 
+    // Rails answers a successful POST with a 302 to /#pricing. Redirect policy
+    // is none for SSRF defense, so accept 3xx as success here. 422 and 503 are
+    // the controller's explicit error renders.
     match response.status().as_u16() {
-        200..=299 => Ok(()),
+        200..=399 => Ok(()),
         422 => Err("Enter a valid email address.".to_string()),
         503 => Err("Email delivery still needs to be configured.".to_string()),
         status => Err(format!("Contact request failed with status {status}.")),
