@@ -61,6 +61,7 @@ import {
 } from "./lib/urgentNotifications";
 import {
   describeInvokeError,
+  detectSubscriberHasDiscount,
   getNextLowerUpgradePlanId,
   getPlanCycleTotalLabel,
   getPlanRenewalPriceLabel,
@@ -2429,9 +2430,25 @@ export default function App() {
       pricingStatus?.account?.subscriptionActive
         ? pricingStatus.account.subscriptionTier ?? null
         : null;
-    const subscriberHasDiscount = Boolean(
-      pricingStatus?.account?.subscriptionDiscountDuration
-    );
+    const accountBillingPeriod = pricingStatus?.account?.subscriptionBillingPeriod;
+    const currentBillingPeriod: BillingPeriod | null =
+      accountBillingPeriod === "annual" || accountBillingPeriod === "monthly"
+        ? accountBillingPeriod
+        : null;
+    // Treat the user as discounted when sync explicitly reports a discount OR
+    // when the launch discount is globally active and the user is paying
+    // below list — the latter catches the case where a `once`-duration
+    // discount has been consumed by its first invoice but the user is still
+    // morally entitled to the launch deal on future charges. Without this
+    // second branch, those users silently route into a PATCH that bills the
+    // full prorated diff (see the LAUNCH1YEAR `once` incident).
+    const subscriberHasDiscount = detectSubscriberHasDiscount({
+      subscriptionDiscountDuration: pricingStatus?.account?.subscriptionDiscountDuration,
+      launchDiscountActive: pricingStatus?.launchDiscountActive,
+      currentTier: activeHeadroomPlanId,
+      currentBillingPeriod,
+      subscriptionAmountCents: pricingStatus?.account?.subscriptionAmountCents
+    });
     const action = (() => {
       switch (planId) {
         case "free":

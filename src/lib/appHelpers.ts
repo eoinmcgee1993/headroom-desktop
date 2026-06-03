@@ -73,6 +73,45 @@ export function getPlanCycleTotalLabel(
   return formatCents(perMonth * cycleMonths);
 }
 
+/// Full-price cents for one complete billing cycle (annual = 12x the per-
+/// month figure, monthly = 1x).
+export function standardListPriceCents(
+  tier: HeadroomSubscriptionTier,
+  billingPeriod: BillingPeriod
+): number {
+  const perMonth = PLAN_PRICES[tier][billingPeriod].fullCents;
+  const cycleMonths = billingPeriod === "annual" ? 12 : 1;
+  return perMonth * cycleMonths;
+}
+
+/// Returns true when the user is effectively running with an active launch
+/// discount. The primary signal is the synced `subscription_discount_duration`,
+/// but that goes null after a `once`-duration discount is consumed by its
+/// first invoice — leaving the user looking "undiscounted" even though Polar's
+/// launch discount is still globally active and the user is paying below list.
+/// The secondary signal catches that case so the desktop doesn't silently
+/// route them into a PATCH that bills the full prorated diff.
+export function detectSubscriberHasDiscount(args: {
+  subscriptionDiscountDuration?: string | null;
+  launchDiscountActive?: boolean;
+  currentTier?: HeadroomSubscriptionTier | null;
+  currentBillingPeriod?: BillingPeriod | null;
+  subscriptionAmountCents?: number | null;
+}): boolean {
+  if (args.subscriptionDiscountDuration) return true;
+  if (
+    args.launchDiscountActive &&
+    args.currentTier &&
+    args.currentBillingPeriod &&
+    args.subscriptionAmountCents !== null &&
+    args.subscriptionAmountCents !== undefined
+  ) {
+    const listCents = standardListPriceCents(args.currentTier, args.currentBillingPeriod);
+    return args.subscriptionAmountCents < listCents;
+  }
+  return false;
+}
+
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
 type IndividualUpgradePlanId = "free" | "pro" | "max5x" | "max20x";
 type PaidUpgradePlanId = HeadroomSubscriptionTier;
