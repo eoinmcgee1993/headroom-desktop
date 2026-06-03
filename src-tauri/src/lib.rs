@@ -373,7 +373,52 @@ fn restart_app(app: AppHandle) {
         state.stop_headroom();
     }
     analytics::shutdown(&app);
-    app.request_restart();
+
+    // Tauri 2.x has an open bug on macOS (tauri-apps/tauri#13923, #11392)
+    // where `request_restart()` and `restart()` exit the process but never
+    // relaunch — especially with `tauri-plugin-single-instance` loaded.
+    // Workaround: spawn a detached relauncher via `open -n` against this
+    // app's .app bundle (which is in-place updated by the updater), then
+    // exit cleanly so the single-instance lock is released before the new
+    // process starts.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(bundle) = current_app_bundle_path() {
+            // Tiny sleep so the relaunch fires after our exit releases the
+            // single-instance lock; without it the new process can detect
+            // the still-dying old one and bail.
+            let cmd = format!(
+                "sleep 1 && /usr/bin/open -n {}",
+                shell_quote_path(&bundle)
+            );
+            let _ = Command::new("/bin/sh").arg("-c").arg(cmd).spawn();
+        }
+        app.exit(0);
+        return;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        app.request_restart();
+    }
+}
+
+/// Walks up from `current_exe` to find the enclosing `.app` bundle path.
+#[cfg(target_os = "macos")]
+fn current_app_bundle_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors()
+        .find(|p| p.extension().is_some_and(|ext| ext == "app"))
+        .map(|p| p.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote_path(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    // POSIX single-quote escaping: anything inside '...' is literal except
+    // ', which we close-escape-open. Safe against spaces / special chars in
+    // the bundle path (e.g. `/Applications/Headroom RC.app`).
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[tauri::command]

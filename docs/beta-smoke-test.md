@@ -46,10 +46,16 @@ Click the tray icon, open the dashboard. Expect savings chart and per-client sta
 In Settings, toggle Pause then Resume. After Pause, `cat ~/.claude/settings.json | grep -c headroom-rtk-rewrite` should return `0`; after Resume it should return `1`.
 
 ### 7. Real compression event (not just a heartbeat)
-Capture the compression counter, then trigger a large request (Claude: read a long file like `src-tauri/src/lib.rs` with no offset/limit so the prompt exceeds ~10k tokens), then re-check:
-```bash
-rtk proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
-```
+Timing matters here: a `Read` result becomes part of Claude's *next* outgoing prompt, not the one currently being composed. So the baseline capture, the large Read, and the re-check cannot all happen in one turn — the re-check will still show the old counter.
+
+Sequence:
+1. Capture the baseline:
+   ```bash
+   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
+   ```
+2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1500 lines is enough to clear the compression threshold).
+3. On the *next* turn, re-run the same `jq` command.
+
 Expect: `requests_compressed` increased by at least 1 between the two captures, and `total_tokens_removed` is strictly greater. A bumped mtime on `activity-facts.json` is not enough — interception without compression would still touch that file.
 
 ### 8. Bundled runtime is healthy
