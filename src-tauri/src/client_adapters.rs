@@ -798,8 +798,7 @@ fn normalize_setup_state(mut state: ClientSetupState) -> ClientSetupState {
 }
 
 fn normalize_setup_entries(mut entries: BTreeMap<String, String>) -> BTreeMap<String, String> {
-    entries.remove("codex_cli");
-    entries.remove("codex");
+    // codex_gui is a removed id; codex/codex_cli are live again, keep them.
     entries.remove("codex_gui");
 
     entries
@@ -808,8 +807,6 @@ fn normalize_setup_entries(mut entries: BTreeMap<String, String>) -> BTreeMap<St
 fn normalize_shell_file_entries(
     mut entries: BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<String, Vec<String>> {
-    entries.remove("codex_cli");
-    entries.remove("codex");
     entries.remove("codex_gui");
 
     for files in entries.values_mut() {
@@ -2323,7 +2320,7 @@ mod tests {
     };
 
     #[test]
-    fn normalize_setup_state_removes_legacy_codex_entries() {
+    fn normalize_setup_state_keeps_codex_but_drops_legacy_codex_gui() {
         let state = ClientSetupState {
             configured_clients: BTreeMap::from([
                 ("claude_code".into(), "2026-03-27T10:00:00Z".into()),
@@ -2336,6 +2333,7 @@ mod tests {
             ]),
             managed_shell_files: BTreeMap::from([
                 ("claude_code".into(), vec!["/Users/test/.zprofile".into()]),
+                ("codex_cli".into(), vec!["/Users/test/.zshrc".into()]),
                 ("codex_gui".into(), vec!["/Users/test/.zshrc".into()]),
             ]),
             remembered_shell_files: BTreeMap::from([
@@ -2346,16 +2344,20 @@ mod tests {
 
         let normalized = normalize_setup_state(state);
 
-        assert_eq!(normalized.configured_clients.len(), 1);
+        // codex_cli stays configured; only the removed codex_gui id is stripped.
         assert!(normalized.configured_clients.contains_key("claude_code"));
-        assert_eq!(normalized.remembered_clients.len(), 1);
+        assert!(normalized.configured_clients.contains_key("codex_cli"));
+        assert!(!normalized.configured_clients.contains_key("codex_gui"));
+
         assert!(normalized.remembered_clients.contains_key("claude_code"));
-        assert_eq!(normalized.managed_shell_files.len(), 1);
+        assert!(normalized.remembered_clients.contains_key("codex"));
+
         assert!(normalized.managed_shell_files.contains_key("claude_code"));
-        assert_eq!(normalized.remembered_shell_files.len(), 1);
-        assert!(normalized
-            .remembered_shell_files
-            .contains_key("claude_code"));
+        assert!(normalized.managed_shell_files.contains_key("codex_cli"));
+        assert!(!normalized.managed_shell_files.contains_key("codex_gui"));
+
+        assert!(normalized.remembered_shell_files.contains_key("claude_code"));
+        assert!(normalized.remembered_shell_files.contains_key("codex"));
     }
 
     #[test]

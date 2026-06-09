@@ -13,7 +13,6 @@ import {
   ArrowClockwise,
   Bell,
   Brain,
-  CaretDown,
   CaretLeft,
   Cpu,
   CurrencyCircleDollar,
@@ -688,7 +687,6 @@ export default function App() {
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
   const [connectorsBusy, setConnectorsBusy] = useState(false);
-  const [connectorDetailsOpen, setConnectorDetailsOpen] = useState(false);
   const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">("healthy");
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
   const [codexNudgeDismissed, setCodexNudgeDismissed] = useState(() => {
@@ -2090,7 +2088,14 @@ export default function App() {
   }
 
   function canConfigureConnectorWithoutDetection(connector: ClientConnectorStatus) {
-    return connector.installed || connector.clientId === "claude_code";
+    // Codex configuration is written to ~/.codex/config.toml, which both the CLI
+    // and the GUI app read, so the toggle should be usable even when the CLI
+    // binary isn't on the app's PATH (same rationale as claude_code).
+    return (
+      connector.installed ||
+      connector.clientId === "claude_code" ||
+      connector.clientId === "codex"
+    );
   }
 
   function getConnectorSupportWarning(connector: ClientConnectorStatus) {
@@ -4115,61 +4120,24 @@ export default function App() {
                     return null;
                   }
                   return (
-                    <div className="callout-banner__connectors-wrap">
-                      <button
-                        type="button"
-                        className={`callout-banner__connectors${connectorDetailsOpen ? " is-open" : ""}`}
-                        aria-expanded={connectorDetailsOpen}
-                        aria-label={connectorDetailsOpen ? "Hide connector details" : "Show connector details"}
-                        onClick={() => setConnectorDetailsOpen((open) => !open)}
-                      >
-                        {homeConnectors.map((connector) => {
-                          const status = connectorDashboardStatus(connector);
-                          return (
+                    <div className="callout-banner__connectors">
+                      {homeConnectors.map((connector) => {
+                        const status = connectorDashboardStatus(connector);
+                        return (
+                          <span
+                            className="callout-banner__chip"
+                            key={connector.clientId}
+                            title={status.label}
+                          >
                             <span
-                              className={`callout-banner__chip callout-banner__chip--${status.tone}`}
-                              key={connector.clientId}
-                            >
-                              <span className="callout-banner__chip-logo" aria-hidden="true">
-                                {renderConnectorLogo(connector.clientId)}
-                              </span>
-                              <span className="callout-banner__chip-name">{connector.name}</span>
-                              <span className="callout-banner__chip-status">{status.label}</span>
-                            </span>
-                          );
-                        })}
-                        <CaretDown
-                          className="callout-banner__connectors-caret"
-                          size={13}
-                          weight="bold"
-                          aria-hidden="true"
-                        />
-                      </button>
-                      {connectorDetailsOpen ? (
-                        <div className="callout-banner__connector-details">
-                          {homeConnectors.map((connector) => {
-                            const status = connectorDashboardStatus(connector);
-                            return (
-                              <div className="callout-banner__connector-detail" key={connector.clientId}>
-                                <div className="callout-banner__connector-detail-head">
-                                  <span className="callout-banner__chip-logo" aria-hidden="true">
-                                    {renderConnectorLogo(connector.clientId)}
-                                  </span>
-                                  <span className="callout-banner__chip-name">{connector.name}</span>
-                                  <span
-                                    className={`callout-banner__chip-status callout-banner__chip-status--${status.tone}`}
-                                  >
-                                    {status.label}
-                                  </span>
-                                </div>
-                                {connector.clientId === "codex" && connector.enabled
-                                  ? renderCodexUsage(pricingStatus?.codex)
-                                  : null}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ) : null}
+                              className={`callout-banner__chip-dot callout-banner__chip-dot--${status.tone}`}
+                              aria-hidden="true"
+                            />
+                            <span className="callout-banner__chip-name">{connector.name}</span>
+                            <span className="visually-hidden">{status.label}</span>
+                          </span>
+                        );
+                      })}
                     </div>
                   );
                 })()}
