@@ -601,13 +601,17 @@ function renderCodexUsageWindow(label: string, window: CodexUsageWindow) {
 function renderCodexUsage(codex: CodexUsage | null | undefined) {
   if (!codex || (!codex.primary && !codex.secondary)) {
     return (
-      <p className="connector-item__reason">
-        Send a Codex prompt through Headroom to sync your current usage window.
-      </p>
+      <div className="codex-usage codex-usage--empty">
+        <p className="codex-usage__title">Subscription usage</p>
+        <p className="codex-usage__hint">
+          Send a Codex prompt through Headroom to sync your current usage window.
+        </p>
+      </div>
     );
   }
   return (
     <div className="codex-usage">
+      <p className="codex-usage__title">Subscription usage</p>
       {codex.primary ? renderCodexUsageWindow("Primary", codex.primary) : null}
       {codex.secondary ? renderCodexUsageWindow("Secondary", codex.secondary) : null}
       {codex.creditsBalance ? (
@@ -3281,8 +3285,8 @@ export default function App() {
         version={appSemver}
       >
         <div className="post-install__lead">
-          <h1>Connect Claude Code</h1>
-          <p>Toggle to automatically configure Claude Code to route through Headroom.</p>
+          <h1>Connect your coding tools</h1>
+          <p>Toggle each tool to automatically route it through Headroom.</p>
           <div className="connector-list">
             {availableConnectors.map((connector) => {
               const unavailableReason = getConnectorUnavailableReason(connector);
@@ -3371,7 +3375,7 @@ export default function App() {
           </div>
           {unavailableConnectors.length > 0 ? (
             <div className="connector-list connector-list--unavailable">
-              <p className="connector-list__section-label">Claude Code not detected on this machine</p>
+              <p className="connector-list__section-label">Not detected on this machine</p>
               {unavailableConnectors.map((connector) => {
                 const unavailableReason = getConnectorUnavailableReason(connector);
                 const supportWarning = getConnectorSupportWarning(connector);
@@ -3461,7 +3465,7 @@ export default function App() {
         <div className="post-install__lead">
           <h1>Test your setup</h1>
           <p>
-            Send a message in Claude Code to verify the connection is working. You may need to restart Claude Code first.
+            Send a message in each connected tool to verify the connection is working. You may need to restart it first.
           </p>
           {hasEnabledApps ? (
             <div className="connector-list">
@@ -4677,7 +4681,9 @@ export default function App() {
                     const connectorLabel =
                       connector.clientId === "claude_code"
                         ? "Claude Code connection"
-                        : connector.name;
+                        : connector.clientId === "codex"
+                          ? "Codex connection"
+                          : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
                     const toggleDisabled =
