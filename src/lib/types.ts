@@ -407,6 +407,23 @@ export interface ClaudeAccountProfile {
   profileFetchError?: string | null;
 }
 
+export interface CodexUsageWindow {
+  usedPercent: number;
+  windowLabel?: string | null;
+  windowMinutes?: number | null;
+  secondsUntilReset?: number | null;
+}
+
+export interface CodexUsage {
+  limitName?: string | null;
+  primary?: CodexUsageWindow | null;
+  secondary?: CodexUsageWindow | null;
+  creditsBalance?: string | null;
+  creditsUnlimited: boolean;
+  shouldNudge: boolean;
+  gateMessage: string;
+}
+
 export interface HeadroomAccountProfile {
   email: string;
   trialStartedAt?: string | null;
@@ -446,6 +463,7 @@ export interface HeadroomPricingStatus {
   recommendedSubscriptionTier?: HeadroomSubscriptionTier | null;
   tierMismatch?: TierMismatch | null;
   claude: ClaudeAccountProfile;
+  codex?: CodexUsage | null;
   account?: HeadroomAccountProfile | null;
   launchDiscountActive: boolean;
 }

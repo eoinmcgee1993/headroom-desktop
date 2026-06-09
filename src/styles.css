@@ -3209,6 +3209,55 @@ details[open] .optimize-minimal__details summary::after {
   line-height: 1.3;
 }
 
+.codex-usage {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.codex-usage__row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.codex-usage__row-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.codex-usage__value {
+  font-weight: 600;
+}
+
+.codex-usage__bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--fill-hover);
+  overflow: hidden;
+}
+
+.codex-usage__bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.codex-usage__credits {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.codex-usage__nudge {
+  font-size: var(--text-xs);
+  color: var(--warning);
+  line-height: 1.3;
+}
+
 .connector-status-line {
   margin-top: 2px;
 }

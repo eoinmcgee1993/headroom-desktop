@@ -311,8 +311,12 @@ export function formatLearnStatus(project: {
   return `last scan: ${diffDays} days ago`;
 }
 
+const SUPPORTED_CONNECTOR_IDS = new Set(["claude_code", "codex"]);
+
 export function aggregateClientConnectors(connectors: ClientConnectorStatus[]) {
-  return connectors.filter((connector) => connector.clientId === "claude_code");
+  return connectors.filter((connector) =>
+    SUPPORTED_CONNECTOR_IDS.has(connector.clientId)
+  );
 }
 
 export function sortClientConnectors(connectors: ClientConnectorStatus[]) {

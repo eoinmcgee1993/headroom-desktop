@@ -130,6 +130,6 @@ export function buildInitialProxyVerificationRows(
       clientId: connector.clientId,
       name: connector.name,
       state: "processing",
-      message: "Waiting for a Claude Code prompt..."
+      message: `Waiting for a ${connector.name} prompt...`
     }));
 }

@@ -45,18 +45,34 @@ Click the tray icon, open the dashboard. Expect savings chart and per-client sta
 ### 6. Pause / resume cleanly strips and restores interception
 In Settings, toggle Pause then Resume. After Pause, `cat ~/.claude/settings.json | grep -c headroom-rtk-rewrite` should return `0`; after Resume it should return `1`.
 
-### 7. Real compression event (not just a heartbeat)
-Timing matters here: a `Read` result becomes part of Claude's *next* outgoing prompt, not the one currently being composed. So the baseline capture, the large Read, and the re-check cannot all happen in one turn — the re-check will still show the old counter.
+### 7. Proxy is actively optimizing this conversation (not just a heartbeat)
+First check which mode the proxy is in — the right signal differs:
+```bash
+rtk proxy curl -s http://127.0.0.1:6767/stats | jq -r '.summary.mode'
+```
+A Claude Code subscription/OAuth session (the normal desktop case) reports `cache`. The proxy deliberately stays in cache mode for this traffic because it's billed on the cache-weighted meter, where token mode's prefix rewrites bust the cache and inflate usage — so `requests_compressed` will *never* move here (see the `HEADROOM_MODE` comment in `tool_manager.rs`). The intercept only flips to `token` mode for pay-per-token API-key traffic. Pick the matching sub-check.
 
-Sequence:
+Timing matters either way: a `Read` result becomes part of Claude's *next* outgoing prompt, not the one currently being composed. So the baseline capture, the large Read, and the re-check cannot all happen in one turn — the re-check will still show the old numbers.
+
+**If mode is `cache`** (normal desktop / Claude Code subscription):
+1. Capture the baseline:
+   ```bash
+   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{prefix_frozen: .summary.uncompressed_requests.prefix_frozen, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
+   ```
+2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1300-1500 lines is plenty).
+3. On the *next* turn, re-run the same `jq` command.
+
+Expect: `cache_savings_usd` is strictly greater, `prefix_frozen` increased by at least 1, and `total_tokens_before` jumped by roughly the size of the Read. A bumped mtime on `activity-facts.json` is not enough — interception alone would still touch that file without delivering cache savings.
+
+**If mode is `token`** (pay-per-token API-key traffic):
 1. Capture the baseline:
    ```bash
    rtk proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
    ```
-2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1500 lines is enough to clear the compression threshold).
+2. End the turn with the same large Read in flight (~1300-1500 lines clears the compression threshold).
 3. On the *next* turn, re-run the same `jq` command.
 
-Expect: `requests_compressed` increased by at least 1 between the two captures, and `total_tokens_removed` is strictly greater. A bumped mtime on `activity-facts.json` is not enough — interception without compression would still touch that file.
+Expect: `requests_compressed` increased by at least 1, and `total_tokens_removed` is strictly greater.
 
 ### 8. Bundled runtime is healthy
 The desktop ships its own Python venv and `headroom` CLI; if either is broken, the proxy can't start cleanly on a fresh install.

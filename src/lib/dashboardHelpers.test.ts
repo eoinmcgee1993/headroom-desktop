@@ -153,6 +153,18 @@ describe("dashboard helpers", () => {
     ]);
   });
 
+  it("keeps codex alongside claude_code as a supported connector", () => {
+    const connectors: ClientConnectorStatus[] = [
+      { clientId: "codex", name: "Codex", installed: true, enabled: false, verified: false },
+      { clientId: "claude_code", name: "Claude Code", installed: true, enabled: true, verified: true },
+      { clientId: "cursor", name: "Cursor", installed: true, enabled: false, verified: false }
+    ];
+
+    expect(
+      aggregateClientConnectors(connectors).map((connector) => connector.clientId).sort()
+    ).toEqual(["claude_code", "codex"]);
+  });
+
   it("formats timestamps and learn recency with clear fallbacks", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-27T12:00:00Z"));

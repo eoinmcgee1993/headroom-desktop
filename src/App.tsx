@@ -142,6 +142,8 @@ import type {
   ClaudePlanTier,
   HeadroomAuthCodeRequest,
   HeadroomPricingStatus,
+  CodexUsage,
+  CodexUsageWindow,
   ClaudeCodeProject,
   ClientConnectorStatus,
   ClientSetupResult,
@@ -173,20 +175,31 @@ const navItems: NavItem[] = [
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
-    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Headroom also installs RTK, adds it to your shell PATH, and enables Claude Code auto-rewrite for bash commands."
+    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Headroom also installs RTK, adds it to your shell PATH, and enables Claude Code auto-rewrite for bash commands.",
+  codex:
+    "Headroom writes a managed provider block to ~/.codex/config.toml and exports OPENAI_BASE_URL in your shell profiles so Codex connects through Headroom."
 };
 
 const connectorSupportWarnings: Record<string, string> = {};
 
 const connectorUnavailableReasons: Record<string, string> = {
   claude_code:
-    "Claude Code was not detected. Install Claude Code and restart Headroom."
+    "Claude Code was not detected. Install Claude Code and restart Headroom.",
+  codex:
+    "Codex was not detected. Install the Codex CLI and restart Headroom."
 };
 
 const launcherConnectorFallback: ClientConnectorStatus[] = [
   {
     clientId: "claude_code",
     name: "Claude Code",
+    installed: false,
+    enabled: false,
+    verified: false
+  },
+  {
+    clientId: "codex",
+    name: "Codex",
     installed: false,
     enabled: false,
     verified: false
@@ -230,6 +243,8 @@ const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
 
 const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
 const CLAUDE_CODE_INSTALL_CURL_CMD = "curl -fsSL https://claude.ai/install.sh | bash";
+const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
+const CODEX_INSTALL_NPM_CMD = "npm i -g @openai/codex";
 
 const SALES_CONTACT_URL = (
   import.meta.env.VITE_HEADROOM_SALES_CONTACT_URL ??
@@ -558,6 +573,53 @@ function DailySavingsChart({
 
 function renderConnectorLogo(clientId: string) {
   return <Sparkle className="client-logo__glyph" size={20} weight="duotone" />;
+}
+
+function renderCodexUsageWindow(label: string, window: CodexUsageWindow) {
+  const pct = Math.max(0, Math.min(100, window.usedPercent));
+  const windowLabel = window.windowLabel ? `${label} (${window.windowLabel})` : label;
+  return (
+    <div className="codex-usage__row" key={label}>
+      <div className="codex-usage__row-head">
+        <span className="codex-usage__label">{windowLabel}</span>
+        <span className="codex-usage__value">{Math.round(pct)}%</span>
+      </div>
+      <div
+        className="codex-usage__bar"
+        role="progressbar"
+        aria-valuenow={Math.round(pct)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-label={`${windowLabel} usage`}
+      >
+        <span className="codex-usage__bar-fill" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function renderCodexUsage(codex: CodexUsage | null | undefined) {
+  if (!codex || (!codex.primary && !codex.secondary)) {
+    return (
+      <p className="connector-item__reason">
+        Send a Codex prompt through Headroom to sync your current usage window.
+      </p>
+    );
+  }
+  return (
+    <div className="codex-usage">
+      {codex.primary ? renderCodexUsageWindow("Primary", codex.primary) : null}
+      {codex.secondary ? renderCodexUsageWindow("Secondary", codex.secondary) : null}
+      {codex.creditsBalance ? (
+        <p className="codex-usage__credits">
+          Credits: {codex.creditsUnlimited ? "unlimited" : codex.creditsBalance}
+        </p>
+      ) : null}
+      {codex.shouldNudge ? (
+        <p className="codex-usage__nudge">{codex.gateMessage}</p>
+      ) : null}
+    </div>
+  );
 }
 
 function buildUpgradeIssueMailto(failure: RuntimeUpgradeFailure): string {
@@ -2012,10 +2074,7 @@ export default function App() {
     if (connector.installed) {
       return null;
     }
-    if (connector.clientId === "claude_code") {
-      return connectorUnavailableReasons[connector.clientId];
-    }
-    return null;
+    return connectorUnavailableReasons[connector.clientId] ?? null;
   }
 
   function applyAppUpdatePatch(patch: AppUpdateStatePatch) {
@@ -4662,6 +4721,9 @@ export default function App() {
                           {unavailableReason ? (
                             <p className="connector-item__reason">{unavailableReason}</p>
                           ) : null}
+                          {connector.clientId === "codex" && connector.enabled
+                            ? renderCodexUsage(pricingStatus?.codex)
+                            : null}
                         </div>
                         <div className="connector-item__controls">
                           <button
