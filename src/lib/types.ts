@@ -477,6 +477,17 @@ export interface HeadroomPricingStatus {
   codex?: CodexUsage | null;
   account?: HeadroomAccountProfile | null;
   launchDiscountActive: boolean;
+  activePercentOff?: number;
+  pricingCohorts?: PricingCohort[];
+}
+
+export interface PricingCohort {
+  key: string;
+  label: string;
+  percentOff: number;
+  capacity?: number | null;
+  status: "sold_out" | "active" | "upcoming";
+  spotsLeft?: number | null;
 }
 
 export interface TierMismatch {

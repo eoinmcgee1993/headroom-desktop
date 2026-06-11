@@ -5891,6 +5891,8 @@ mod tests {
             codex: None,
             account: None,
             launch_discount_active: false,
+            active_percent_off: 0,
+            pricing_cohorts: Vec::new(),
         }
     }
 

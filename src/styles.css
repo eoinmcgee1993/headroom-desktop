@@ -1116,6 +1116,66 @@ select {
   background: linear-gradient(180deg, rgba(242, 251, 247, 0.96), rgba(255, 255, 255, 0.94));
 }
 
+/* Scarcity ladder: founder -> early -> standard, the live cohort highlighted. */
+.pricing-ladder {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 0.4rem;
+  margin: 0 0 0.85rem;
+  padding: 0;
+  list-style: none;
+}
+
+.pricing-ladder__step {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.5rem;
+  background: var(--surface-raised);
+  text-align: center;
+}
+
+.pricing-ladder__label {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.pricing-ladder__percent {
+  font-size: var(--text-md);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.pricing-ladder__status {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.pricing-ladder__step--active {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+}
+
+.pricing-ladder__step--active .pricing-ladder__label,
+.pricing-ladder__step--active .pricing-ladder__percent,
+.pricing-ladder__step--active .pricing-ladder__status {
+  color: var(--accent-strong);
+}
+
+.pricing-ladder__step--sold_out {
+  opacity: 0.55;
+}
+
+.pricing-ladder__step--sold_out .pricing-ladder__percent {
+  text-decoration: line-through;
+}
+
 .upgrade-plan-card__sale-row {
   display: flex;
   align-items: center;

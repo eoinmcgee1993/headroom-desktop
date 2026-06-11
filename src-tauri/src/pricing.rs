@@ -10,8 +10,8 @@ use crate::models::{
     headroom_tier_for_claude_plan, headroom_tier_for_codex_plan, BillingPeriod,
     ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, ClaudeUsage, ClaudeUsageWindow,
     CodexPlanTier, CodexRateLimitSnapshot, CodexUsage, HeadroomAccountProfile,
-    HeadroomAuthCodeRequest, HeadroomPricingStatus, HeadroomSubscriptionTier, PricingGateReason,
-    TierMismatch,
+    HeadroomAuthCodeRequest, HeadroomPricingStatus, HeadroomSubscriptionTier, PricingCohort,
+    PricingGateReason, TierMismatch,
 };
 use crate::state::AppState;
 use crate::storage::{app_data_dir, config_file};
@@ -310,7 +310,9 @@ struct ClaudeOauthProfileOrganization {
 struct RemoteAccountEnvelope {
     account: RemoteAccountResponse,
     #[serde(default)]
-    launch_discount_active: bool,
+    active_percent_off: i64,
+    #[serde(default)]
+    pricing_ladder: Option<PricingLadderPayload>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -349,7 +351,38 @@ struct VerifyCodeResponse {
     session_token: String,
     account: RemoteAccountResponse,
     #[serde(default)]
-    launch_discount_active: bool,
+    active_percent_off: i64,
+    #[serde(default)]
+    pricing_ladder: Option<PricingLadderPayload>,
+}
+
+/// The `pricingLadder` object headroom-web nests in account/config payloads.
+/// Only the cohorts are consumed on the desktop; the active percent rides at
+/// the envelope top level (`active_percent_off`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PricingLadderPayload {
+    #[serde(default)]
+    cohorts: Vec<PricingCohort>,
+}
+
+/// Founder-pricing promo resolved from whichever payload the desktop fetched
+/// (authenticated envelope or public config). `launch_discount_active` is just
+/// `active_percent_off > 0`.
+#[derive(Debug, Clone, Default)]
+struct PricingPromo {
+    active_percent_off: i64,
+    cohorts: Vec<PricingCohort>,
+}
+
+fn build_promo(active_percent_off: i64, ladder: &Option<PricingLadderPayload>) -> PricingPromo {
+    PricingPromo {
+        active_percent_off,
+        cohorts: ladder
+            .as_ref()
+            .map(|l| l.cohorts.clone())
+            .unwrap_or_default(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -413,21 +446,21 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     let local_grace_active = Utc::now() < local_grace_ends_at;
     let session_token = read_session_token()?;
     let identity = IdentityPayload::for_state(state);
-    let (authenticated, account, account_sync_error, launch_discount_active) =
+    let (authenticated, account, account_sync_error, promo) =
         if let Some(token) = session_token.as_deref() {
             let envelope_result = fetch_remote_account(token, &identity);
-            let launch_discount_active = envelope_result
+            let promo = envelope_result
                 .as_ref()
-                .map(|e| e.launch_discount_active)
-                .unwrap_or(false);
+                .map(|e| build_promo(e.active_percent_off, &e.pricing_ladder))
+                .unwrap_or_default();
             let account_result = envelope_result.map(|e| e.account);
             let (auth, acc, err) = merge_background_account_sync(Some(token), account_result);
-            (auth, acc, err, launch_discount_active)
+            (auth, acc, err, promo)
         } else {
-            let launch_discount_active = fetch_public_config()
-                .map(|c| c.launch_discount_active)
-                .unwrap_or(false);
-            (false, None, None, launch_discount_active)
+            let promo = fetch_public_config()
+                .map(|c| build_promo(c.active_percent_off, &c.pricing_ladder))
+                .unwrap_or_default();
+            (false, None, None, promo)
         };
 
     let claude = detect_claude_profile(state);
@@ -442,7 +475,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         account_sync_error,
         account,
         claude,
-        launch_discount_active,
+        promo,
         last_known_good_plan_tier,
         tier_mismatch,
     );
@@ -713,7 +746,7 @@ pub(crate) fn verify_auth_code_with_base_url(
         None,
         Some(account),
         claude,
-        body.launch_discount_active,
+        build_promo(body.active_percent_off, &body.pricing_ladder),
         last_known_good_plan_tier,
         tier_mismatch,
     ))
@@ -789,7 +822,7 @@ pub(crate) fn activate_account_with_base_url(
         None,
         Some(account),
         claude,
-        body.launch_discount_active,
+        build_promo(body.active_percent_off, &body.pricing_ladder),
         last_known_good_plan_tier,
         tier_mismatch,
     ))
@@ -1052,7 +1085,7 @@ fn evaluate_pricing_status_with_mismatch(
     account_sync_error: Option<String>,
     account: Option<HeadroomAccountProfile>,
     claude: ClaudeAccountProfile,
-    launch_discount_active: bool,
+    promo: PricingPromo,
     last_known_good_plan_tier: Option<ClaudePlanTier>,
     tier_mismatch: Option<TierMismatch>,
 ) -> HeadroomPricingStatus {
@@ -1193,7 +1226,9 @@ fn evaluate_pricing_status_with_mismatch(
         claude,
         codex: None,
         account,
-        launch_discount_active,
+        launch_discount_active: promo.active_percent_off > 0,
+        active_percent_off: promo.active_percent_off,
+        pricing_cohorts: promo.cohorts,
     }
 }
 
@@ -1926,7 +1961,9 @@ fn clear_session_token() -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 struct PublicConfig {
     #[serde(default)]
-    launch_discount_active: bool,
+    active_percent_off: i64,
+    #[serde(default)]
+    pricing_ladder: Option<PricingLadderPayload>,
 }
 
 fn fetch_public_config() -> Option<PublicConfig> {
@@ -2055,7 +2092,7 @@ mod tests {
     use super::{
         detect_plan_tier_from_profile, detect_tier_mismatch, evaluate_pricing_status_with_mismatch,
         is_identity_complete, merge_background_account_sync, plan_tier_header_value,
-        remote_account_to_profile, resolve_account_api_base_url, ClaudeOauthProfile,
+        remote_account_to_profile, resolve_account_api_base_url, ClaudeOauthProfile, PricingPromo,
         ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
         IdentityFingerprint, IdentityPayload, LocalPricingState, RemoteAccountResponse,
         RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
@@ -2077,6 +2114,14 @@ mod tests {
         launch_discount_active: bool,
         last_known_good_plan_tier: Option<ClaudePlanTier>,
     ) -> HeadroomPricingStatus {
+        let promo = if launch_discount_active {
+            PricingPromo {
+                active_percent_off: 50,
+                cohorts: vec![],
+            }
+        } else {
+            PricingPromo::default()
+        };
         evaluate_pricing_status_with_mismatch(
             authenticated,
             local_grace_started_at,
@@ -2085,7 +2130,7 @@ mod tests {
             account_sync_error,
             account,
             claude,
-            launch_discount_active,
+            promo,
             last_known_good_plan_tier,
             None,
         )
@@ -3918,7 +3963,7 @@ mod tests {
             None,
             Some(active_subscriber(HeadroomSubscriptionTier::Pro)),
             pro_profile_with_weekly(99.0),
-            false,
+            PricingPromo::default(),
             None,
             Some(mismatch(HeadroomSubscriptionTier::Max20x, false)),
         );
@@ -3942,7 +3987,7 @@ mod tests {
             None,
             Some(active_subscriber(HeadroomSubscriptionTier::Pro)),
             pro_profile_with_weekly(99.0),
-            false,
+            PricingPromo::default(),
             None,
             Some(mismatch(HeadroomSubscriptionTier::Max20x, true)),
         );

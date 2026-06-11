@@ -151,6 +151,21 @@ describe("app helpers", () => {
     expect([byId("max20x")?.price, byId("max20x")?.originalPrice]).toEqual(["$20", "$40"]);
   });
 
+  it("drives discounted annual prices from the active cohort percent", () => {
+    // 25% off the early cohort: $5 -> $3.75, $20 -> $15, $40 -> $30.
+    const result = getUpgradePlans(
+      "individual", "free", undefined, undefined, undefined, true, "annual",
+      undefined, undefined, undefined, undefined, undefined, undefined, false, undefined, 25
+    );
+
+    expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
+      ["free", "$0"],
+      ["pro", "$3.75"],
+      ["max5x", "$15"],
+      ["max20x", "$30"],
+    ]);
+  });
+
   it("classifies tier direction for plan changes", () => {
     expect(isTierDowngrade("pro", "max20x")).toBe(false);
     expect(isTierDowngrade("max20x", "pro")).toBe(true);

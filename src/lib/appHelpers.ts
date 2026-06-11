@@ -9,12 +9,18 @@ export type { BillingPeriod };
 
 const PLAN_PRICES: Record<
   "pro" | "max5x" | "max20x",
-  Record<BillingPeriod, { full: string; fullCents: number; discounted: string }>
+  Record<BillingPeriod, { full: string; fullCents: number }>
 > = {
-  pro:   { annual: { full: "$5",  fullCents: 500,  discounted: "$2.50" }, monthly: { full: "$7.50", fullCents: 750,  discounted: "$3.75" } },
-  max5x: { annual: { full: "$20", fullCents: 2000, discounted: "$10"   }, monthly: { full: "$30",   fullCents: 3000, discounted: "$15"   } },
-  max20x:{ annual: { full: "$40", fullCents: 4000, discounted: "$20"   }, monthly: { full: "$60",   fullCents: 6000, discounted: "$30"   } },
+  pro:   { annual: { full: "$5",  fullCents: 500  }, monthly: { full: "$7.50", fullCents: 750  } },
+  max5x: { annual: { full: "$20", fullCents: 2000 }, monthly: { full: "$30",   fullCents: 3000 } },
+  max20x:{ annual: { full: "$40", fullCents: 4000 }, monthly: { full: "$60",   fullCents: 6000 } },
 };
+
+// Discounted price for a tier, mirroring the web `sale_price_cents` rounding
+// (half-up to the cent) so desktop and marketing prices never disagree.
+function discountedPriceLabel(fullCents: number, percentOff: number): string {
+  return formatCents(Math.round((fullCents * (100 - percentOff)) / 100));
+}
 const TIER_RANK: Record<HeadroomSubscriptionTier, number> = { pro: 1, max5x: 2, max20x: 3 };
 
 export function isTierDowngrade(
@@ -214,7 +220,8 @@ export function getUpgradePlans(
   subscriptionDiscountDuration?: string | null,
   subscriptionDiscountDurationInMonths?: number | null,
   subscriptionCancelAtPeriodEnd: boolean = false,
-  subscriptionEndsAt?: string | null
+  subscriptionEndsAt?: string | null,
+  activePercentOff: number = 0
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -325,10 +332,15 @@ export function getUpgradePlans(
     ): UpgradePlan {
       const prices = PLAN_PRICES[id][billingPeriod];
       // Upgrade-target cards show the discounted price because checkout always
-      // attaches the launch discount; the active plan card uses purchaseInfo
-      // (actual paid amount) instead of a generic discount badge.
+      // attaches the active cohort discount; the active plan card uses
+      // purchaseInfo (actual paid amount) instead of a generic discount badge.
+      // Percent is driven live by the cohort ladder; fall back to 50% for legacy
+      // callers that only signal launchDiscountActive without a percent.
+      const effectivePercentOff = activePercentOff > 0 ? activePercentOff : 50;
       const showDiscount = launchDiscountActive && id !== activeHeadroomPlanId;
-      const price = showDiscount ? prices.discounted : prices.full;
+      const price = showDiscount
+        ? discountedPriceLabel(prices.fullCents, effectivePercentOff)
+        : prices.full;
       return {
         id,
         name,

@@ -818,6 +818,30 @@ pub struct HeadroomPricingStatus {
     pub codex: Option<CodexUsage>,
     pub account: Option<HeadroomAccountProfile>,
     pub launch_discount_active: bool,
+    /// Percent off applied to the currently-selling founder-pricing cohort
+    /// (0 when full price). Drives the discounted prices in the upgrade view.
+    #[serde(default)]
+    pub active_percent_off: i64,
+    /// The founder-pricing ladder (founder -> early -> standard) rendered as a
+    /// scarcity stepper. Empty when the server reports no ladder.
+    #[serde(default)]
+    pub pricing_cohorts: Vec<PricingCohort>,
+}
+
+/// One rung of the founder-pricing ladder, surfaced by headroom-web. `status`
+/// is "sold_out" | "active" | "upcoming"; `spots_left` is set only for the
+/// active, capacity-bound cohort.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricingCohort {
+    pub key: String,
+    pub label: String,
+    pub percent_off: i64,
+    #[serde(default)]
+    pub capacity: Option<i64>,
+    pub status: String,
+    #[serde(default)]
+    pub spots_left: Option<i64>,
 }
 
 /// Set when an active subscriber's paid Headroom tier is lower than the tier

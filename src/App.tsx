@@ -846,7 +846,8 @@ export default function App() {
     pricingStatus?.account?.subscriptionDiscountDuration,
     pricingStatus?.account?.subscriptionDiscountDurationInMonths,
     pricingStatus?.account?.subscriptionCancelAtPeriodEnd ?? false,
-    pricingStatus?.account?.subscriptionEndsAt
+    pricingStatus?.account?.subscriptionEndsAt,
+    pricingStatus?.activePercentOff ?? 0
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -4579,8 +4580,35 @@ export default function App() {
 
               {pricingStatus?.launchDiscountActive ? (
                 <section className="upgrade-trial-callout upgrade-sale-banner">
-                  <p className="upgrade-trial-callout__message">🎉 50% off all paid plans — launch promotion</p>
+                  <p className="upgrade-trial-callout__message">
+                    🎉 {pricingStatus.activePercentOff ?? 0}% off all paid plans — founder pricing
+                  </p>
                 </section>
+              ) : null}
+
+              {pricingStatus?.pricingCohorts && pricingStatus.pricingCohorts.length > 0 ? (
+                <ol className="pricing-ladder" aria-label="Founder pricing ladder">
+                  {pricingStatus.pricingCohorts.map((cohort) => (
+                    <li
+                      key={cohort.key}
+                      className={`pricing-ladder__step pricing-ladder__step--${cohort.status}`}
+                    >
+                      <span className="pricing-ladder__label">{cohort.label}</span>
+                      <span className="pricing-ladder__percent">
+                        {cohort.percentOff > 0 ? `${cohort.percentOff}% off` : "Full price"}
+                      </span>
+                      <span className="pricing-ladder__status">
+                        {cohort.status === "sold_out"
+                          ? "Sold out"
+                          : cohort.status === "active"
+                          ? cohort.spotsLeft != null
+                            ? `${cohort.spotsLeft} spots left`
+                            : "Available now"
+                          : "Up next"}
+                      </span>
+                    </li>
+                  ))}
+                </ol>
               ) : null}
             </>
           ) : null}
@@ -4628,7 +4656,7 @@ export default function App() {
                           {plan.originalPrice && !activeHeadroomPlanId ? (
                             <div className="upgrade-plan-card__sale-row">
                               <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
-                              <span className="upgrade-plan-card__sale-badge">50% off</span>
+                              <span className="upgrade-plan-card__sale-badge">{pricingStatus?.activePercentOff ?? 50}% off</span>
                             </div>
                           ) : null}
                           <strong>{plan.price}</strong>
