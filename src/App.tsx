@@ -4600,12 +4600,12 @@ export default function App() {
                     );
                     return (
                       <section className="founder-promo" aria-label="Founder pricing">
-                        <p className="founder-promo__intro">
-                          <span className="founder-promo__live" aria-hidden="true" />
-                          Launch promotion active. Prices rise as {activeLabel.toLowerCase()} spots
-                          fill.
-                        </p>
-                        <div className="founder-promo__head">
+                        <div className="founder-promo__main">
+                          <p className="founder-promo__intro">
+                            <span className="founder-promo__live" aria-hidden="true" />
+                            Launch promotion active. Prices rise as {activeLabel.toLowerCase()} spots
+                            fill.
+                          </p>
                           <div className="founder-promo__urgency">
                             <div className="founder-promo__count-row">
                               {spotsLeft != null ? (
@@ -4626,29 +4626,29 @@ export default function App() {
                               </div>
                             ) : null}
                           </div>
-                          <div className="founder-promo__offer">
-                            <div className="founder-promo__steps">
-                              <div className="founder-promo__step founder-promo__step--now">
-                                <span className="founder-promo__step-tag">Now</span>
-                                <span className="founder-promo__step-pct">{pct}% OFF</span>
-                                {stepPricing ? (
-                                  <span className="founder-promo__step-price">{stepPricing.now} / month</span>
-                                ) : null}
-                              </div>
-                              {next ? (
-                                <div className="founder-promo__step founder-promo__step--next">
-                                  <span className="founder-promo__step-tag">Next</span>
-                                  <span className="founder-promo__step-pct">
-                                    {next.percentOff > 0 ? `${next.percentOff}% OFF` : "Full price"}
-                                  </span>
-                                  {stepPricing ? (
-                                    <span className="founder-promo__step-price">{stepPricing.next} / month</span>
-                                  ) : null}
-                                </div>
+                        </div>
+                        <div className="founder-promo__offer">
+                          <div className="founder-promo__steps">
+                            <div className="founder-promo__step founder-promo__step--now">
+                              <span className="founder-promo__step-tag">Now</span>
+                              <span className="founder-promo__step-pct">{pct}% OFF</span>
+                              {stepPricing ? (
+                                <span className="founder-promo__step-price">{stepPricing.now} / month</span>
                               ) : null}
                             </div>
-                            <p className="founder-promo__lock">Your price is locked in for good.</p>
+                            {next ? (
+                              <div className="founder-promo__step founder-promo__step--next">
+                                <span className="founder-promo__step-tag">Next</span>
+                                <span className="founder-promo__step-pct">
+                                  {next.percentOff > 0 ? `${next.percentOff}% OFF` : "Full price"}
+                                </span>
+                                {stepPricing ? (
+                                  <span className="founder-promo__step-price">{stepPricing.next} / month</span>
+                                ) : null}
+                              </div>
+                            ) : null}
                           </div>
+                          <p className="founder-promo__lock">Your price is locked in for good.</p>
                         </div>
                       </section>
                     );

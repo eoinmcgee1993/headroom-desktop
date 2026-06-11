@@ -1111,7 +1111,8 @@ select {
   gap: 10px;
 }
 
-/* Founder scarcity promo: intro line + compact urgency row + half-width bar. */
+/* Founder scarcity promo: intro + centered urgency on the left, price chips
+   floated top-right with the lock line centered beneath them. */
 .founder-promo {
   margin: 0 0 0.85rem;
   padding: 0.6rem 0.85rem;
@@ -1119,8 +1120,18 @@ select {
   border-radius: 0.7rem;
   background: var(--accent-tint);
   display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  flex-wrap: wrap;
+}
+
+.founder-promo__main {
+  display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  flex: 1 1 16rem;
+  min-width: 0;
 }
 
 .founder-promo__intro {
@@ -1161,18 +1172,11 @@ select {
   }
 }
 
-.founder-promo__head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 0.5rem 1rem;
-  flex-wrap: wrap;
-}
-
 .founder-promo__urgency {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  margin: auto 0;
 }
 
 .founder-promo__count-row {
