@@ -31,7 +31,9 @@ fn known_path_candidates(home: PathBuf) -> Vec<PathBuf> {
 }
 
 fn first_runnable<I: Iterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
-    candidates.into_iter().find(|candidate| is_runnable(candidate))
+    candidates
+        .into_iter()
+        .find(|candidate| is_runnable(candidate))
 }
 
 fn probe_via_login_shell() -> Option<PathBuf> {
@@ -304,7 +306,10 @@ mod tests {
             tmp.path().join("never_reached"), // would fail if we kept walking
         ];
 
-        assert_eq!(first_runnable(candidates.into_iter()).as_deref(), Some(working.as_path()));
+        assert_eq!(
+            first_runnable(candidates.into_iter()).as_deref(),
+            Some(working.as_path())
+        );
     }
 
     #[test]
@@ -328,8 +333,12 @@ mod tests {
         // arm64 binary first. The bug we fixed only surfaced because all
         // earlier candidates were missing.
         let candidates = known_path_candidates(PathBuf::from("/Users/test"));
-        let opt = candidates.iter().position(|p| p == Path::new("/opt/homebrew/bin/claude"));
-        let usr = candidates.iter().position(|p| p == Path::new("/usr/local/bin/claude"));
+        let opt = candidates
+            .iter()
+            .position(|p| p == Path::new("/opt/homebrew/bin/claude"));
+        let usr = candidates
+            .iter()
+            .position(|p| p == Path::new("/usr/local/bin/claude"));
         assert!(opt.is_some() && usr.is_some());
         assert!(opt.unwrap() < usr.unwrap());
     }

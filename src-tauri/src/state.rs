@@ -21,10 +21,10 @@ use crate::client_adapters::{detect_clients, ensure_rtk_integrations, rtk_integr
 use crate::insights::generate_daily_insights;
 use crate::models::{
     ActivityEvent, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus,
-    CodexRateLimitSnapshot, DailyInsight, DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus,
-    HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus,
-    RuntimeStatus, RuntimeUpgradeFailure, RuntimeUpgradeProgress, TransformationFeedEvent,
-    UpgradeFailurePhase, UsageEvent,
+    CodexRateLimitSnapshot, DailyInsight, DailySavingsPoint, DashboardState,
+    HeadroomLearnPrereqStatus, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience,
+    RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure, RuntimeUpgradeProgress,
+    TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
 };
 use crate::pricing;
 use crate::storage::{app_data_dir, config_file, ensure_data_dirs, telemetry_file};
@@ -1064,8 +1064,8 @@ impl AppState {
                 // Gently creep 97 → 99.5 over the max budget so the bar keeps
                 // moving — the user sees *something* happen during long waits.
                 let percent = 97
-                    + ((elapsed_secs as u128 * 250 / RUNTIME_UPGRADE_BOOT_MAX_SECS as u128)
-                        .min(250) as u8)
+                    + ((elapsed_secs as u128 * 250 / RUNTIME_UPGRADE_BOOT_MAX_SECS as u128).min(250)
+                        as u8)
                         / 100;
                 state_ref.set_upgrade_progress(|p| {
                     p.message = message;
@@ -1119,10 +1119,7 @@ impl AppState {
                     "duration_ms": duration_ms,
                 })),
             );
-            analytics::set_headroom_ai_version(
-                app,
-                self.tool_manager.installed_headroom_version(),
-            );
+            analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
             // ensure_headroom_running's gate guards were suppressed during
             // validation so a gated user's brand-new venv could actually be
             // validated (otherwise we'd commit untested or roll back a
@@ -1131,11 +1128,10 @@ impl AppState {
             // gate is asserting Python should be down. Client-side routing is
             // already pointed direct-to-Anthropic by whoever asserted the
             // gate, so the validation Python wasn't receiving traffic anyway.
-            let gate_wants_python_down = self
-                .proxy_bypass
-                .load(std::sync::atomic::Ordering::Acquire)
-                || !self.pricing_allows_optimization()
-                || self.runtime_is_paused();
+            let gate_wants_python_down =
+                self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
+                    || !self.pricing_allows_optimization()
+                    || self.runtime_is_paused();
             if gate_wants_python_down {
                 log::info!(
                     "run_upgrade_with_ui: validation succeeded; stopping validation Python because a gate is active"
@@ -1152,7 +1148,8 @@ impl AppState {
         // failure so the next launch can retry.
         log::warn!(
             "run_upgrade_with_ui: boot validation failed ({}); rolling back to {:?}",
-            outcome_label, installed_version
+            outcome_label,
+            installed_version
         );
         // Diagnostics for Sentry — capture before stop_headroom() tears down
         // the tracked child and the proxy port. These three booleans
@@ -1201,10 +1198,7 @@ impl AppState {
         if let Err(err) = rollback_result {
             log::error!("run_upgrade_with_ui: rollback failed: {err:#}");
         }
-        analytics::set_headroom_ai_version(
-            app,
-            self.tool_manager.installed_headroom_version(),
-        );
+        analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
         let restarted = self.ensure_headroom_running().is_ok();
 
         let err_msg = match log_tail.as_deref() {
@@ -1244,10 +1238,9 @@ impl AppState {
                 "Reverted to headroom-ai {} and restarted it.",
                 fallback_pkg_label
             )),
-            RuntimeMaintenanceKind::Upgrade if rollback_restored => Some(format!(
-                "Reverted to headroom-ai {}.",
-                fallback_pkg_label
-            )),
+            RuntimeMaintenanceKind::Upgrade if rollback_restored => {
+                Some(format!("Reverted to headroom-ai {}.", fallback_pkg_label))
+            }
             RuntimeMaintenanceKind::RequirementsRepair if restarted => Some(
                 "Headroom restarted with the repaired runtime, but validation still failed.".into(),
             ),
@@ -1811,10 +1804,7 @@ impl AppState {
     /// Mark the given fingerprint as the most recent one we've pushed to
     /// `desktop/grace/start`. Called by the worker after a successful post,
     /// and by the sign-in / activation paths that send the same payload.
-    pub fn record_pushed_identity_fingerprint(
-        &self,
-        fp: crate::pricing::IdentityFingerprint,
-    ) {
+    pub fn record_pushed_identity_fingerprint(&self, fp: crate::pricing::IdentityFingerprint) {
         *self.last_pushed_identity_fingerprint.lock() = Some(fp);
     }
 
@@ -1866,10 +1856,19 @@ impl AppState {
                 // the file on every classification refresh.
                 if matches!(
                     (&existing.plan_tier, tier),
-                    (crate::models::ClaudePlanTier::Free, crate::models::ClaudePlanTier::Free)
-                        | (crate::models::ClaudePlanTier::Pro, crate::models::ClaudePlanTier::Pro)
-                        | (crate::models::ClaudePlanTier::Max5x, crate::models::ClaudePlanTier::Max5x)
-                        | (crate::models::ClaudePlanTier::Max20x, crate::models::ClaudePlanTier::Max20x)
+                    (
+                        crate::models::ClaudePlanTier::Free,
+                        crate::models::ClaudePlanTier::Free
+                    ) | (
+                        crate::models::ClaudePlanTier::Pro,
+                        crate::models::ClaudePlanTier::Pro
+                    ) | (
+                        crate::models::ClaudePlanTier::Max5x,
+                        crate::models::ClaudePlanTier::Max5x
+                    ) | (
+                        crate::models::ClaudePlanTier::Max20x,
+                        crate::models::ClaudePlanTier::Max20x
+                    )
                 ) {
                     return;
                 }
@@ -2490,10 +2489,7 @@ impl AppState {
             // Anthropic. Don't restart Python here; that would just defeat the
             // gate and (via the watchdog's failure path) eventually auto-pause
             // the runtime.
-            if self
-                .proxy_bypass
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire) {
                 log::debug!("ensure_headroom_running: short-circuit (proxy_bypass active)");
                 return Ok(());
             }
@@ -2760,10 +2756,7 @@ impl AppState {
         // to identify our proxies regardless of port.
         let managed_python = self.tool_manager.managed_python();
         let command_patterns = [
-            format!(
-                "{} -m headroom.proxy.server",
-                managed_python.display()
-            ),
+            format!("{} -m headroom.proxy.server", managed_python.display()),
             format!(
                 "{} proxy --port",
                 self.tool_manager.headroom_entrypoint().display()
@@ -2912,9 +2905,7 @@ impl AppState {
     /// Acquires `lifecycle_lock` (via `stop_headroom` / `ensure_headroom_running`),
     /// so callers MUST NOT already hold it.
     pub fn apply_pricing_gate_status(&self, status: &crate::models::HeadroomPricingStatus) {
-        let was_bypassed = self
-            .proxy_bypass
-            .load(std::sync::atomic::Ordering::Acquire);
+        let was_bypassed = self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire);
         let should_bypass = !status.optimization_allowed;
 
         if should_bypass {
@@ -4586,12 +4577,7 @@ fn parse_rollup_by_provider(value: Option<&Value>) -> Vec<ProviderRollupDelta> {
     let mut out: Vec<ProviderRollupDelta> = providers
         .iter()
         .map(|(provider, entry)| {
-            let get_u64 = |key: &str| {
-                entry
-                    .get(key)
-                    .and_then(parse_u64_value)
-                    .unwrap_or_default()
-            };
+            let get_u64 = |key: &str| entry.get(key).and_then(parse_u64_value).unwrap_or_default();
             let get_f64 = |key: &str| {
                 entry
                     .get(key)
@@ -5299,13 +5285,13 @@ mod tests {
 
     use super::{
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
-        boot_validation_stalled, BootValidationOutcome, bootstrap_complete_state, bootstrap_failed_state,
+        boot_validation_stalled, bootstrap_complete_state, bootstrap_failed_state,
         classify_startup_error, cpu_time_advanced, hf_cache_grew,
         lifetime_token_milestones_crossed, lifetime_usd_milestones_crossed, log_mtime_advanced,
-        merge_daily_savings, merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, parse_ps_cpu_time, tcp_port_accepts_connection,
-        total_dir_size_bytes, AppState, ClaudeProjectScan,
-        DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
+        merge_daily_savings, merge_hourly_savings, most_recent_monday,
+        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        tcp_port_accepts_connection, total_dir_size_bytes, AppState, BootValidationOutcome,
+        ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
         PersistedSavingsState, SavingsObservation, SavingsTracker,
     };
 
@@ -5387,7 +5373,10 @@ mod tests {
         // These labels become Sentry tags and analytics dimensions —
         // changing them silently invalidates dashboards.
         assert_eq!(BootValidationOutcome::Reachable.label(), "reachable");
-        assert_eq!(BootValidationOutcome::ProcessExited.label(), "process_exited");
+        assert_eq!(
+            BootValidationOutcome::ProcessExited.label(),
+            "process_exited"
+        );
         assert_eq!(BootValidationOutcome::Stalled.label(), "stalled");
         assert_eq!(BootValidationOutcome::TimedOut.label(), "timed_out");
         assert_eq!(BootValidationOutcome::NotStarted.label(), "not_started");
@@ -5509,14 +5498,13 @@ mod tests {
                 return;
             }
         }
-        panic!(
-            "tcp_port_accepts_connection returned true on 16 freshly-released ephemeral ports"
-        );
+        panic!("tcp_port_accepts_connection returned true on 16 freshly-released ephemeral ports");
     }
 
     #[test]
     fn total_dir_size_bytes_returns_zero_for_missing_path() {
-        let missing = std::env::temp_dir().join(format!("headroom-no-such-{}", uuid::Uuid::new_v4()));
+        let missing =
+            std::env::temp_dir().join(format!("headroom-no-such-{}", uuid::Uuid::new_v4()));
         assert_eq!(total_dir_size_bytes(&missing, 1000), 0);
     }
 
@@ -6127,25 +6115,37 @@ mod tests {
     fn apply_codex_gate_flips_codex_bypass_without_stopping_backend() {
         let base_dir = temp_test_dir("headroom-codex-bypass");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
-        assert!(!state.codex_bypass.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!state
+            .codex_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
         assert!(
-            !state.proxy_bypass.load(std::sync::atomic::Ordering::Acquire),
+            !state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire),
             "Claude bypass must stay untouched by the Codex gate"
         );
 
         // Debounce: first gated reading just bumps the streak.
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
-        assert!(!state.codex_bypass.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!state
+            .codex_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
 
         // Second consecutive gated reading crosses the debounce threshold.
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
-        assert!(state.codex_bypass.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state
+            .codex_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
         // Crucially the Claude-wide bypass never flipped, so Claude stays optimized.
-        assert!(!state.proxy_bypass.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
 
         // An ungated reading clears the Codex bypass again.
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(true)));
-        assert!(!state.codex_bypass.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!state
+            .codex_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
 
         fs::remove_dir_all(base_dir).ok();
     }
@@ -6157,10 +6157,14 @@ mod tests {
         // Flip it on first.
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
-        assert!(state.codex_bypass.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state
+            .codex_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
         // A poll with no Codex signal must leave the gate as-is, not clear it.
         state.apply_codex_pricing_gate_status(None);
-        assert!(state.codex_bypass.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state
+            .codex_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
         fs::remove_dir_all(base_dir).ok();
     }
 

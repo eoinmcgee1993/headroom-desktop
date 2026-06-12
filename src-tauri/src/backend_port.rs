@@ -103,11 +103,9 @@ mod tests {
     #[test]
     fn select_fallback_returns_first_bindable_port() {
         // 6769, 6770 fail; 6771 succeeds.
-        let result = select_fallback(
-            "rapportd pid 594".to_string(),
-            Some(594),
-            |port: u16| port >= 6771,
-        )
+        let result = select_fallback("rapportd pid 594".to_string(), Some(594), |port: u16| {
+            port >= 6771
+        })
         .expect("ok");
         assert_eq!(
             result,
@@ -139,8 +137,8 @@ mod tests {
 
     #[test]
     fn select_fallback_preserves_unknown_occupant_pid() {
-        let result = select_fallback("unknown process".to_string(), None, |port| port == 6770)
-            .expect("ok");
+        let result =
+            select_fallback("unknown process".to_string(), None, |port| port == 6770).expect("ok");
         assert_eq!(result.port, 6770);
         assert_eq!(result.original_pid, None);
         assert_eq!(result.original_occupant, "unknown process");

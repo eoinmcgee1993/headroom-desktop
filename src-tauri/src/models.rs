@@ -902,15 +902,24 @@ mod tests {
     fn codex_plan_tier_from_claim_is_trimmed_case_insensitive_with_unknown_fallback() {
         assert_eq!(CodexPlanTier::from_claim("Plus"), CodexPlanTier::Plus);
         assert_eq!(CodexPlanTier::from_claim("  TEAM "), CodexPlanTier::Team);
-        assert_eq!(CodexPlanTier::from_claim("chatgptpaidplan"), CodexPlanTier::Unknown);
+        assert_eq!(
+            CodexPlanTier::from_claim("chatgptpaidplan"),
+            CodexPlanTier::Unknown
+        );
         assert_eq!(CodexPlanTier::from_claim(""), CodexPlanTier::Unknown);
     }
 
     #[test]
     fn codex_plan_maps_to_price_parity_headroom_tier() {
         use HeadroomSubscriptionTier::*;
-        assert_eq!(headroom_tier_for_codex_plan(&CodexPlanTier::Plus), Some(Pro));
-        assert_eq!(headroom_tier_for_codex_plan(&CodexPlanTier::Pro), Some(Max20x));
+        assert_eq!(
+            headroom_tier_for_codex_plan(&CodexPlanTier::Plus),
+            Some(Pro)
+        );
+        assert_eq!(
+            headroom_tier_for_codex_plan(&CodexPlanTier::Pro),
+            Some(Max20x)
+        );
         for plan in [
             CodexPlanTier::Team,
             CodexPlanTier::Business,
@@ -958,7 +967,12 @@ mod tests {
 
         let value = serde_json::to_value(&usage).unwrap();
         // Wire contract for the TS frontend: camelCase keys, not snake_case.
-        for key in ["optimizationAllowed", "shouldNudge", "nudgeLevel", "gateMessage"] {
+        for key in [
+            "optimizationAllowed",
+            "shouldNudge",
+            "nudgeLevel",
+            "gateMessage",
+        ] {
             assert!(value.get(key).is_some(), "missing camelCase key {key}");
         }
         assert!(value.get("optimization_allowed").is_none());
@@ -987,4 +1001,3 @@ mod tests {
         assert_eq!(cohort.spots_left, None);
     }
 }
-

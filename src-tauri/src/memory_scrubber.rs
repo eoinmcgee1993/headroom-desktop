@@ -47,10 +47,7 @@ fn scrub_all_in(projects_root: Option<&Path>, memory_db_path: &Path) {
                     path.display()
                 );
             }
-            Err(e) => log::warn!(
-                "memory_scrubber: failed to scrub {}: {e}",
-                path.display()
-            ),
+            Err(e) => log::warn!("memory_scrubber: failed to scrub {}: {e}", path.display()),
         }
     }
 
@@ -236,11 +233,23 @@ mod tests {
         )
         .unwrap();
         let rows = [
-            ("a", r#"{"source":"traffic_learner","category":"error_recovery"}"#),
-            ("b", r#"{"source":"traffic_learner","category":"environment"}"#),
-            ("c", r#"{"source":"traffic_learner","category":"preference"}"#),
+            (
+                "a",
+                r#"{"source":"traffic_learner","category":"error_recovery"}"#,
+            ),
+            (
+                "b",
+                r#"{"source":"traffic_learner","category":"environment"}"#,
+            ),
+            (
+                "c",
+                r#"{"source":"traffic_learner","category":"preference"}"#,
+            ),
             ("d", r#"{"source":"manual","category":"error_recovery"}"#),
-            ("e", r#"{"source":"traffic_learner","category":"error_recovery"}"#),
+            (
+                "e",
+                r#"{"source":"traffic_learner","category":"error_recovery"}"#,
+            ),
         ];
         for (id, meta) in rows {
             conn.execute(
@@ -282,10 +291,7 @@ mod tests {
 
         let mut found = discover_memory_md_files_in(projects);
         found.sort();
-        assert_eq!(
-            found,
-            vec![p1.join("MEMORY.md"), p2.join("MEMORY.md")]
-        );
+        assert_eq!(found, vec![p1.join("MEMORY.md"), p2.join("MEMORY.md")]);
     }
 
     #[test]
@@ -325,9 +331,18 @@ mod tests {
         )
         .unwrap();
         for (id, meta) in [
-            ("a", r#"{"source":"traffic_learner","category":"error_recovery"}"#),
-            ("b", r#"{"source":"traffic_learner","category":"error_recovery"}"#),
-            ("keep", r#"{"source":"traffic_learner","category":"environment"}"#),
+            (
+                "a",
+                r#"{"source":"traffic_learner","category":"error_recovery"}"#,
+            ),
+            (
+                "b",
+                r#"{"source":"traffic_learner","category":"error_recovery"}"#,
+            ),
+            (
+                "keep",
+                r#"{"source":"traffic_learner","category":"environment"}"#,
+            ),
         ] {
             conn.execute(
                 "INSERT INTO memories (id, content, user_id, created_at, valid_from, category, importance, metadata) \

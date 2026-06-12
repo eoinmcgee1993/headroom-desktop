@@ -12,7 +12,7 @@
 /// captured into `AppState::claude_bearer_token` so the usage-stats feature
 /// can call the Anthropic OAuth usage endpoint without touching the keychain.
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +34,16 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Dedicated Codex subscription-usage endpoint (ChatGPT OAuth/session auth).
+/// Current Codex no longer ships `x-codex-*` on the `/responses` handshake, so
+/// this is the only source left for the desktop gauge's rate-limit window.
+const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_USAGE_POLL_MIN_INTERVAL_SECS: u64 = 60;
+const CODEX_USAGE_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Epoch-seconds of the last usage-poll attempt; throttles the fire-and-forget
+/// GET to at most one per `CODEX_USAGE_POLL_MIN_INTERVAL_SECS`.
+static CODEX_USAGE_LAST_POLL: AtomicU64 = AtomicU64::new(0);
 
 /// Shared state written by the intercept layer.
 pub type SharedToken = Arc<Mutex<Option<BearerToken>>>;
@@ -257,6 +267,14 @@ async fn handle(
         }
     }
 
+    // The current Codex WS handshake no longer carries `x-codex-*` response
+    // headers, so `splice_with_codex_capture` below comes up empty. Fetch the
+    // live subscription window from the dedicated usage endpoint instead.
+    // Throttled and fire-and-forget, so the request hot path is untouched.
+    if is_codex {
+        maybe_spawn_codex_usage_poll(&buf, &codex_slot);
+    }
+
     // When the pricing gate has bypassed Headroom, the Python proxy on
     // `backend_addr` is intentionally stopped. Forward direct to Anthropic so
     // already-running CC sessions stay alive while optimization is off.
@@ -415,6 +433,195 @@ fn parse_codex_rate_limit_headers(head: &[u8]) -> Option<CodexRateLimitSnapshot>
         credits_balance,
         credits_unlimited,
     })
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Extract a single request header value (case-insensitive) from raw HTTP bytes.
+fn extract_header_value(buf: &[u8], name: &str) -> Option<String> {
+    let text = std::str::from_utf8(buf).ok()?;
+    for line in text.lines() {
+        if line.is_empty() {
+            break; // end of header block
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim().eq_ignore_ascii_case(name) {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+// Subset of the `GET /wham/usage` JSON body we map onto a snapshot. Unknown
+// fields are ignored by serde.
+#[derive(serde::Deserialize)]
+struct UsageWindowJson {
+    used_percent: Option<f64>,
+    limit_window_seconds: Option<i64>,
+    reset_at: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct UsageRateLimitJson {
+    primary_window: Option<UsageWindowJson>,
+    secondary_window: Option<UsageWindowJson>,
+}
+
+#[derive(serde::Deserialize)]
+struct UsageCreditsJson {
+    has_credits: Option<bool>,
+    unlimited: Option<bool>,
+    balance: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct UsagePayloadJson {
+    rate_limit: Option<UsageRateLimitJson>,
+    credits: Option<UsageCreditsJson>,
+    rate_limit_reached_type: Option<String>,
+}
+
+fn balance_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.trim().to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn codex_window_from_usage(win: &UsageWindowJson, now: i64) -> Option<CodexUsageWindow> {
+    let used_percent = win.used_percent?;
+    if used_percent.is_nan() {
+        return None;
+    }
+    // Round window seconds up to whole minutes, matching codex-rs.
+    let window_minutes = win
+        .limit_window_seconds
+        .filter(|s| *s > 0)
+        .map(|s| (s + 59) / 60);
+    Some(CodexUsageWindow {
+        used_percent,
+        window_label: window_minutes.map(codex_window_label),
+        window_minutes,
+        seconds_until_reset: win.reset_at.map(|r| (r - now).max(0)),
+    })
+}
+
+/// Map a parsed `GET /wham/usage` body onto a [`CodexRateLimitSnapshot`].
+/// Mirrors `parse_codex_usage_payload` in upstream `codex_rate_limits.py` and
+/// the header parser above. Returns `None` when there is no usable signal.
+fn codex_snapshot_from_usage_payload(payload: &UsagePayloadJson) -> Option<CodexRateLimitSnapshot> {
+    let now = now_epoch_secs() as i64;
+    let rate_limit = payload.rate_limit.as_ref();
+    let primary = rate_limit
+        .and_then(|r| r.primary_window.as_ref())
+        .and_then(|w| codex_window_from_usage(w, now));
+    let secondary = rate_limit
+        .and_then(|r| r.secondary_window.as_ref())
+        .and_then(|w| codex_window_from_usage(w, now));
+
+    let (credits_balance, credits_unlimited) = match payload.credits.as_ref() {
+        Some(c) => {
+            let has_credits = c.has_credits.unwrap_or(false);
+            // Only surface a balance when the account has credits; a "0"
+            // balance on a no-credits plan is noise to the gauge.
+            let balance = if has_credits {
+                c.balance
+                    .as_ref()
+                    .and_then(balance_to_string)
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+            (balance, c.unlimited.unwrap_or(false))
+        }
+        None => (None, false),
+    };
+
+    let limit_name = payload
+        .rate_limit_reached_type
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if primary.is_none() && secondary.is_none() && credits_balance.is_none() {
+        return None;
+    }
+
+    Some(CodexRateLimitSnapshot {
+        limit_name,
+        primary,
+        secondary,
+        credits_balance,
+        credits_unlimited,
+    })
+}
+
+/// GET the live Codex usage window (blocking; runs on a `spawn_blocking` thread).
+fn fetch_codex_usage_snapshot(
+    token: &str,
+    account_id: &str,
+    user_agent: &str,
+) -> Option<CodexRateLimitSnapshot> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(CODEX_USAGE_POLL_TIMEOUT)
+        .build()
+        .ok()?;
+    let resp = client
+        .get(CODEX_USAGE_URL)
+        .bearer_auth(token)
+        .header("ChatGPT-Account-Id", account_id)
+        .header("User-Agent", user_agent)
+        .header("Accept", "application/json")
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let payload: UsagePayloadJson = resp.json().ok()?;
+    codex_snapshot_from_usage_payload(&payload)
+}
+
+/// Fire-and-forget a throttled usage poll to refresh `codex_slot`.
+///
+/// Scoped to ChatGPT sessions by requiring both a bearer token and a
+/// `ChatGPT-Account-Id` header (API-key Codex traffic carries neither), and
+/// throttled to one live GET per `CODEX_USAGE_POLL_MIN_INTERVAL_SECS`.
+fn maybe_spawn_codex_usage_poll(buf: &[u8], codex_slot: &CodexRateLimitSlot) {
+    let Some(token) = extract_bearer(buf) else {
+        return;
+    };
+    let Some(account_id) = extract_header_value(buf, "chatgpt-account-id") else {
+        return;
+    };
+
+    let now = now_epoch_secs();
+    let last = CODEX_USAGE_LAST_POLL.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < CODEX_USAGE_POLL_MIN_INTERVAL_SECS {
+        return;
+    }
+    // Claim the slot; lose the race -> another connection is already polling.
+    if CODEX_USAGE_LAST_POLL
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    let user_agent =
+        extract_header_value(buf, "user-agent").unwrap_or_else(|| "headroom-desktop".to_string());
+    let slot = codex_slot.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Some(snapshot) = fetch_codex_usage_snapshot(&token, &account_id, &user_agent) {
+            *slot.lock() = Some(snapshot);
+        }
+    });
 }
 
 /// Best-effort decode of the ChatGPT plan from a Codex OAuth bearer JWT. Reads
@@ -830,20 +1037,21 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, codex_window_label, decode_codex_plan_tier, extract_bearer,
-        find_header_end, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
-        is_local_proxy_path, is_openai_path, parse_codex_rate_limit_headers, parse_request_head,
-        read_http_headers, request_is_loopback_safe, run, BypassFlag, SharedToken,
+        bearer_value_changed, codex_snapshot_from_usage_payload, codex_window_label,
+        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
+        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
+        is_openai_path, parse_codex_rate_limit_headers, parse_request_head, read_http_headers,
+        request_is_loopback_safe, run, BypassFlag, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
     use crate::models::CodexPlanTier;
     use base64::Engine;
+    use parking_lot::Mutex;
+    use serial_test::serial;
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-    use parking_lot::Mutex;
-    use serial_test::serial;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{timeout, Duration};
@@ -1003,7 +1211,9 @@ mod tests {
 
         // Run the intercept on its own ephemeral port.
         let token_slot: SharedToken = Arc::new(Mutex::new(None));
-        let intercept_listener = TcpListener::bind("127.0.0.1:0").await.expect("intercept bind");
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
         let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
         drop(intercept_listener); // free the port; run() rebinds the same one
         let slot_for_run = token_slot.clone();
@@ -1088,7 +1298,9 @@ mod tests {
         backend_port::set(dead_backend_addr.port());
 
         let token_slot: SharedToken = Arc::new(Mutex::new(None));
-        let intercept_listener = TcpListener::bind("127.0.0.1:0").await.expect("intercept bind");
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
         let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
         drop(intercept_listener);
         let slot_for_run = token_slot.clone();
@@ -1202,7 +1414,12 @@ mod tests {
             );
         }
         // Headers we want to forward must NOT be flagged.
-        for name in ["Authorization", "anthropic-version", "x-api-key", "Content-Type"] {
+        for name in [
+            "Authorization",
+            "anthropic-version",
+            "x-api-key",
+            "Content-Type",
+        ] {
             assert!(
                 !is_hop_by_hop_request_header(name),
                 "{name} must be forwarded"
@@ -1290,7 +1507,9 @@ mod tests {
         });
 
         let token_slot: SharedToken = Arc::new(Mutex::new(None));
-        let intercept_listener = TcpListener::bind("127.0.0.1:0").await.expect("intercept bind");
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
         let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
         drop(intercept_listener);
         let bypass: BypassFlag = Arc::new(AtomicBool::new(true));
@@ -1434,7 +1653,9 @@ mod tests {
         let upstream_base = format!("http://127.0.0.1:{}", dead_addr.port());
 
         let token_slot: SharedToken = Arc::new(Mutex::new(None));
-        let intercept_listener = TcpListener::bind("127.0.0.1:0").await.expect("intercept bind");
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
         let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
         drop(intercept_listener);
         let bypass: BypassFlag = Arc::new(AtomicBool::new(true));
@@ -1527,7 +1748,9 @@ mod tests {
         backend_port::set(first_addr.port());
 
         let token_slot: SharedToken = Arc::new(Mutex::new(None));
-        let intercept_listener = TcpListener::bind("127.0.0.1:0").await.expect("intercept bind");
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
         let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
         drop(intercept_listener);
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
@@ -1659,6 +1882,82 @@ mod tests {
         // No header terminator / garbage — must not panic, no signal.
         let head = "HTTP/1.1 200 OK\r\nx-codex-limit-name: codex";
         assert!(parse_codex_rate_limit_headers(head.as_bytes()).is_none());
+    }
+
+    // A faithful GET /wham/usage body (shape captured from a live Plus account).
+    const USAGE_BODY: &str = r#"{
+        "plan_type": "plus",
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {"used_percent": 23, "limit_window_seconds": 18000, "reset_at": 1781276043},
+            "secondary_window": {"used_percent": 6, "limit_window_seconds": 604800, "reset_at": 1781622947}
+        },
+        "credits": {"has_credits": false, "unlimited": false, "balance": "0"},
+        "rate_limit_reached_type": null,
+        "promo": null
+    }"#;
+
+    #[test]
+    fn usage_payload_maps_to_snapshot() {
+        let payload = serde_json::from_str(USAGE_BODY).expect("json");
+        let snap = codex_snapshot_from_usage_payload(&payload).expect("snapshot");
+        let primary = snap.primary.expect("primary");
+        assert_eq!(primary.used_percent, 23.0);
+        assert_eq!(primary.window_minutes, Some(300)); // 18000s rounded up
+        let secondary = snap.secondary.expect("secondary");
+        assert_eq!(secondary.used_percent, 6.0);
+        assert_eq!(secondary.window_minutes, Some(10080)); // 604800s
+                                                           // has_credits=false -> "0" balance must not surface as noise.
+        assert_eq!(snap.credits_balance, None);
+        assert!(!snap.credits_unlimited);
+    }
+
+    #[test]
+    fn usage_window_minutes_rounds_up() {
+        let payload = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":61}}}"#,
+        )
+        .expect("json");
+        let snap = codex_snapshot_from_usage_payload(&payload).expect("snapshot");
+        assert_eq!(snap.primary.expect("primary").window_minutes, Some(2));
+    }
+
+    #[test]
+    fn usage_credits_balance_kept_when_has_credits() {
+        let payload = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"used_percent":5}},"credits":{"has_credits":true,"unlimited":false,"balance":"$5.00"}}"#,
+        )
+        .expect("json");
+        let snap = codex_snapshot_from_usage_payload(&payload).expect("snapshot");
+        assert_eq!(snap.credits_balance.as_deref(), Some("$5.00"));
+    }
+
+    #[test]
+    fn usage_empty_payload_returns_none() {
+        let payload = serde_json::from_str("{}").expect("json");
+        assert!(codex_snapshot_from_usage_payload(&payload).is_none());
+        let payload = serde_json::from_str(r#"{"rate_limit":{}}"#).expect("json");
+        assert!(codex_snapshot_from_usage_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn usage_window_missing_used_percent_skipped() {
+        let payload = serde_json::from_str(
+            r#"{"rate_limit":{"primary_window":{"limit_window_seconds":60}}}"#,
+        )
+        .expect("json");
+        assert!(codex_snapshot_from_usage_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn extract_header_value_is_case_insensitive() {
+        let req = b"GET /v1/responses HTTP/1.1\r\nHost: x\r\nChatGPT-Account-Id: acct_9\r\n\r\n";
+        assert_eq!(
+            extract_header_value(req, "chatgpt-account-id").as_deref(),
+            Some("acct_9")
+        );
+        assert!(extract_header_value(req, "x-missing").is_none());
     }
 
     fn jwt_with_plan(plan: &str) -> String {

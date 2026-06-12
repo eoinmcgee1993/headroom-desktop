@@ -509,9 +509,7 @@ impl ToolManager {
                 }
                 PortState::ForeignOccupant(detail) => {
                     let pid = parse_pid_from_lsof_detail(&detail);
-                    let try_bind = |port: u16| {
-                        TcpListener::bind(("127.0.0.1", port)).is_ok()
-                    };
+                    let try_bind = |port: u16| TcpListener::bind(("127.0.0.1", port)).is_ok();
                     match backend_port::select_fallback(detail.clone(), pid, try_bind) {
                         Ok(SelectedFallback {
                             port,
@@ -664,7 +662,8 @@ impl ToolManager {
                         Ok(Some(status)) => {
                             reason = Some(format!(
                                 "exited with status {} before opening port {}",
-                                status, headroom_proxy_port()
+                                status,
+                                headroom_proxy_port()
                             ));
                             break;
                         }
@@ -1019,9 +1018,11 @@ impl ToolManager {
             // can SIGABRT mid-pull; the HTTPS fallback is stable.
             .env("HF_HUB_DISABLE_XET", "1")
             .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file.try_clone().with_context(|| {
-                format!("cloning {}", log_path.display())
-            })?))
+            .stdout(Stdio::from(
+                log_file
+                    .try_clone()
+                    .with_context(|| format!("cloning {}", log_path.display()))?,
+            ))
             .stderr(Stdio::from(log_file))
             .status()
             .with_context(|| format!("running kompress prefetch via {}", python.display()))?;
@@ -1518,16 +1519,19 @@ impl ToolManager {
         });
 
         // Try direct wheel download (with retries). If it fails, fall back to PyPI index.
-        let use_wheel =
-            match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
-                Ok(()) => true,
-                Err(download_err) => {
-                    log::warn!(
-                        "headroom wheel download failed (will fall back to pip index): {download_err}"
-                    );
-                    false
-                }
-            };
+        let use_wheel = match download_to_path(
+            &release.wheel_url,
+            &wheel_path,
+            Some(&release.sha256),
+        ) {
+            Ok(()) => true,
+            Err(download_err) => {
+                log::warn!(
+                    "headroom wheel download failed (will fall back to pip index): {download_err}"
+                );
+                false
+            }
+        };
 
         progress(BootstrapStepUpdate {
             step: "Updating dependencies",
@@ -2424,16 +2428,19 @@ impl ToolManager {
             .runtime
             .downloads_dir
             .join(format!("headroom_ai-{}-py3-none-any.whl", release.version));
-        let use_wheel =
-            match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
-                Ok(()) => true,
-                Err(download_err) => {
-                    log::warn!(
-                        "headroom wheel download failed (will fall back to pip index): {download_err}"
-                    );
-                    false
-                }
-            };
+        let use_wheel = match download_to_path(
+            &release.wheel_url,
+            &wheel_path,
+            Some(&release.sha256),
+        ) {
+            Ok(()) => true,
+            Err(download_err) => {
+                log::warn!(
+                    "headroom wheel download failed (will fall back to pip index): {download_err}"
+                );
+                false
+            }
+        };
 
         progress(BootstrapStepUpdate {
             step: "Applying update",
@@ -2897,15 +2904,25 @@ impl ToolManager {
                 sentry::with_scope(
                     |scope| {
                         scope.set_extra("claude_cli_detected", detected.clone().into());
-                        scope.set_extra("exit_code", exit_code.map(|c| c.into()).unwrap_or(serde_json::Value::Null));
-                        scope.set_extra("signal", signal.map(|s| s.into()).unwrap_or(serde_json::Value::Null));
+                        scope.set_extra(
+                            "exit_code",
+                            exit_code
+                                .map(|c| c.into())
+                                .unwrap_or(serde_json::Value::Null),
+                        );
+                        scope.set_extra(
+                            "signal",
+                            signal.map(|s| s.into()).unwrap_or(serde_json::Value::Null),
+                        );
                         scope.set_extra(
                             "stdout_tail",
-                            stdout[stdout.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..].into(),
+                            stdout[stdout.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..]
+                                .into(),
                         );
                         scope.set_extra(
                             "stderr_tail",
-                            stderr[stderr.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..].into(),
+                            stderr[stderr.char_indices().rev().nth(2047).map_or(0, |(i, _)| i)..]
+                                .into(),
                         );
                     },
                     || {
@@ -3320,7 +3337,8 @@ fn match_redactable(rest: &str) -> Option<usize> {
             let token_len = after
                 .bytes()
                 .take_while(|b| {
-                    b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=')
+                    b.is_ascii_alphanumeric()
+                        || matches!(*b, b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=')
                 })
                 .count();
             if token_len >= 8 {
@@ -4025,7 +4043,11 @@ pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_tex
 
     // Drop trailing blank lines so removing the last bullet of the last
     // section doesn't leave a `\n\n<!-- end -->` gap behind.
-    while out_lines.last().map(|s| s.trim().is_empty()).unwrap_or(false) {
+    while out_lines
+        .last()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(false)
+    {
         out_lines.pop();
     }
 
@@ -4068,9 +4090,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 /// behavior on macOS, but `file_type` is checked so we don't recurse into
 /// non-directories. Errors propagate so the caller can log + skip.
 fn collect_native_extensions(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("read_dir {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
@@ -4255,12 +4275,16 @@ where
                 if attempt < MAX_ATTEMPTS {
                     log::info!(
                         "pip install attempt {}/{} failed (will retry): {}",
-                        attempt, MAX_ATTEMPTS, err
+                        attempt,
+                        MAX_ATTEMPTS,
+                        err
                     );
                 } else {
                     log::warn!(
                         "pip install attempt {}/{} failed (final): {}",
-                        attempt, MAX_ATTEMPTS, compact_pip_failure(&err)
+                        attempt,
+                        MAX_ATTEMPTS,
+                        compact_pip_failure(&err)
                     );
                 }
                 last_err = Some(err);
@@ -4579,15 +4603,13 @@ mod tests {
 
     use super::{
         bootstrap_requirements_lock_for_target, extract_required_pydantic_core_version,
-        format_all_foreign_bail, format_already_running_bail,
-        headroom_entrypoint_startup_args, headroom_python_startup_args,
-        looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
-        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
-        receipt_requires_atomic_rebuild, redact_sensitive, requirements_lock_sha,
-        rtk_distribution_artifact, run_command, sanitize_log_variant, sha256_bytes,
-        verify_sha256_file, CommandFailure, HeadroomRelease, ManagedRuntime,
-        PipOutputCapture, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        RTK_VERSION,
+        format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
+        headroom_python_startup_args, looks_like_corrupt_venv_error, parse_major_minor_patch,
+        parse_pid_from_lsof_detail, proxy_argv_contains_expected_flags,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild, redact_sensitive,
+        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
+        sha256_bytes, verify_sha256_file, CommandFailure, HeadroomRelease, ManagedRuntime,
+        PipOutputCapture, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
@@ -5105,7 +5127,10 @@ mod tests {
     #[test]
     fn parse_pid_from_lsof_detail_extracts_numeric_pid() {
         assert_eq!(parse_pid_from_lsof_detail("rapportd pid 594"), Some(594));
-        assert_eq!(parse_pid_from_lsof_detail("python3.12 pid 1073"), Some(1073));
+        assert_eq!(
+            parse_pid_from_lsof_detail("python3.12 pid 1073"),
+            Some(1073)
+        );
         assert_eq!(
             parse_pid_from_lsof_detail("Google Chrome Helper pid 4242"),
             Some(4242)
@@ -5116,7 +5141,10 @@ mod tests {
     fn parse_pid_from_lsof_detail_returns_none_for_unknown_or_malformed() {
         assert_eq!(parse_pid_from_lsof_detail("unknown process"), None);
         assert_eq!(parse_pid_from_lsof_detail(""), None);
-        assert_eq!(parse_pid_from_lsof_detail("rapportd pid not-a-number"), None);
+        assert_eq!(
+            parse_pid_from_lsof_detail("rapportd pid not-a-number"),
+            None
+        );
         // Missing the " pid " separator entirely.
         assert_eq!(parse_pid_from_lsof_detail("rapportd 594"), None);
     }
@@ -5626,7 +5654,9 @@ after
         paths.sort();
 
         assert_eq!(paths.len(), 3, "expected 3 native files, got {paths:?}");
-        assert!(paths.iter().any(|p| p.ends_with("mmh3.cpython-312-darwin.so")));
+        assert!(paths
+            .iter()
+            .any(|p| p.ends_with("mmh3.cpython-312-darwin.so")));
         assert!(paths.iter().any(|p| p.ends_with("libtorch_python.dylib")));
         assert!(paths
             .iter()

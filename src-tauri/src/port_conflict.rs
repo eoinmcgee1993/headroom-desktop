@@ -130,7 +130,11 @@ fn record_failure_at(
                 prior.consecutive_failed_launches
             };
             PortConflictMarker {
-                detected_at: if same_occupant { prior.detected_at } else { now },
+                detected_at: if same_occupant {
+                    prior.detected_at
+                } else {
+                    now
+                },
                 last_seen_at: now,
                 occupant_cmd: cmd,
                 occupant_pid: pid,
@@ -214,11 +218,7 @@ fn capture_persistent_to_sentry(marker: &PortConflictMarker) {
 /// Returns `true` if the failure was a port conflict (caller should skip
 /// `capture_headroom_start_failure` for it). For unrelated errors, returns
 /// `false` and the caller should keep its existing reporting.
-pub fn note_proxy_failed(
-    app: &AppHandle,
-    err: &anyhow::Error,
-    increment_launches: bool,
-) -> bool {
+pub fn note_proxy_failed(app: &AppHandle, err: &anyhow::Error, increment_launches: bool) -> bool {
     let err_chain = format!("{err:#}");
     if !is_port_conflict(&err_chain) {
         return false;
@@ -313,7 +313,8 @@ mod tests {
 
     #[test]
     fn parse_occupant_handles_multi_word_cmd() {
-        let raw = "port 6768 is occupied by a non-headroom process (Google Chrome Helper pid 4242); ...";
+        let raw =
+            "port 6768 is occupied by a non-headroom process (Google Chrome Helper pid 4242); ...";
         let (cmd, pid) = parse_occupant(raw);
         assert_eq!(cmd.as_deref(), Some("Google Chrome Helper"));
         assert_eq!(pid, Some(4242));

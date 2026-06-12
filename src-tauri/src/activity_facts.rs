@@ -1291,7 +1291,10 @@ mod tests {
             "lastTrainSuggestion" => &post.last_train_suggestion,
             other => panic!("unknown field {other}"),
         };
-        assert!(!want_dropped, "{field} should drop to None after corruption");
+        assert!(
+            !want_dropped,
+            "{field} should drop to None after corruption"
+        );
 
         // All siblings must still be present.
         for (name, present) in [

@@ -270,9 +270,8 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 checks.push("Found Codex OPENAI_BASE_URL export in managed shell block.".into());
             }
             if toml_ok {
-                checks.push(
-                    "Found Headroom-managed provider block in ~/.codex/config.toml.".into(),
-                );
+                checks
+                    .push("Found Headroom-managed provider block in ~/.codex/config.toml.".into());
             }
             if !toml_ok {
                 failures.push(
@@ -1406,8 +1405,11 @@ fn codex_provider_block_matches() -> Result<bool> {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let base_url = format!("base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
     let openai_base = format!("openai_base_url = \"{}\"", HEADROOM_OPENAI_BASE_URL);
-    let root_ok = marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, "model_provider = \"headroom\"")
-        && marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, &openai_base);
+    let root_ok = marker_block_contains(
+        &content,
+        CODEX_ROOT_BLOCK_ID,
+        "model_provider = \"headroom\"",
+    ) && marker_block_contains(&content, CODEX_ROOT_BLOCK_ID, &openai_base);
     let table_ok = marker_block_contains(&content, CODEX_TABLE_BLOCK_ID, &base_url);
     Ok(root_ok && table_ok)
 }
@@ -2356,7 +2358,9 @@ mod tests {
         assert!(normalized.managed_shell_files.contains_key("codex_cli"));
         assert!(!normalized.managed_shell_files.contains_key("codex_gui"));
 
-        assert!(normalized.remembered_shell_files.contains_key("claude_code"));
+        assert!(normalized
+            .remembered_shell_files
+            .contains_key("claude_code"));
         assert!(normalized.remembered_shell_files.contains_key("codex"));
     }
 
@@ -3166,8 +3170,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         )
         .unwrap();
 
-        let result =
-            super::apply_client_setup("claude_code").expect("apply_client_setup succeeds");
+        let result = super::apply_client_setup("claude_code").expect("apply_client_setup succeeds");
         assert!(result.applied);
         assert_eq!(result.client_id, "claude_code");
 
@@ -3243,10 +3246,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::apply_client_setup("claude_code").expect("first apply");
         let zshrc_after_first = fs::read_to_string(home.path().join(".zshrc")).unwrap();
         let zshenv_after_first = fs::read_to_string(home.path().join(".zshenv")).unwrap();
-        let settings_after_first = fs::read_to_string(
-            home.path().join(".claude").join("settings.json"),
-        )
-        .unwrap();
+        let settings_after_first =
+            fs::read_to_string(home.path().join(".claude").join("settings.json")).unwrap();
         let hook_after_first = fs::read_to_string(
             home.path()
                 .join(".claude")
@@ -3258,10 +3259,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::apply_client_setup("claude_code").expect("second apply");
         let zshrc_after_second = fs::read_to_string(home.path().join(".zshrc")).unwrap();
         let zshenv_after_second = fs::read_to_string(home.path().join(".zshenv")).unwrap();
-        let settings_after_second = fs::read_to_string(
-            home.path().join(".claude").join("settings.json"),
-        )
-        .unwrap();
+        let settings_after_second =
+            fs::read_to_string(home.path().join(".claude").join("settings.json")).unwrap();
         let hook_after_second = fs::read_to_string(
             home.path()
                 .join(".claude")
@@ -3332,10 +3331,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             settings["env"]["ANTHROPIC_BASE_URL"].is_null(),
             "ANTHROPIC_BASE_URL stripped from settings.json env, got: {settings}"
         );
-        let still_has_headroom_hook = claude_hook_present_in_value(
-            &settings,
-            "headroom-rtk-rewrite.sh",
-        );
+        let still_has_headroom_hook =
+            claude_hook_present_in_value(&settings, "headroom-rtk-rewrite.sh");
         assert!(
             !still_has_headroom_hook,
             "Headroom hook entry stripped from settings.json, got: {settings}"
@@ -3473,7 +3470,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::apply_client_setup("codex").expect("apply succeeds");
 
         let raw = fs::read_to_string(&config_toml).unwrap();
-        let parsed: toml::Value = raw.parse().unwrap_or_else(|e| panic!("valid toml: {e}\n{raw}"));
+        let parsed: toml::Value = raw
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml: {e}\n{raw}"));
 
         assert_eq!(
             parsed.get("model_provider").and_then(|v| v.as_str()),
@@ -3568,8 +3567,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let target = tmp.path().join("settings.json");
         fs::write(&target, "{}").unwrap();
 
-        let headroom_backup = tmp.path().join("settings.json.headroom-backup-20260101000000");
-        let nommer_backup = tmp.path().join("settings.json.nommer-backup-20250101000000");
+        let headroom_backup = tmp
+            .path()
+            .join("settings.json.headroom-backup-20260101000000");
+        let nommer_backup = tmp
+            .path()
+            .join("settings.json.nommer-backup-20250101000000");
         let unrelated = tmp.path().join("settings.json.bak");
         let other_target_backup = tmp
             .path()

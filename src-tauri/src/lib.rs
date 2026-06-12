@@ -849,7 +849,11 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
                 scope.set_tag("failure_kind", kind.as_str());
                 scope.set_tag(
                     "endpoint_protection_suspected",
-                    if endpoint_protection_suspected { "true" } else { "false" },
+                    if endpoint_protection_suspected {
+                        "true"
+                    } else {
+                        "false"
+                    },
                 );
                 scope.set_extra("program", failure.program.clone().into());
                 scope.set_extra("args", failure.args.join(" ").into());
@@ -882,7 +886,11 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
                 scope.set_tag("failure_kind", kind.as_str());
                 scope.set_tag(
                     "endpoint_protection_suspected",
-                    if endpoint_protection_suspected { "true" } else { "false" },
+                    if endpoint_protection_suspected {
+                        "true"
+                    } else {
+                        "false"
+                    },
                 );
                 scope.set_extra("error_chain", technical_err.clone().into());
             },
@@ -1117,8 +1125,7 @@ fn capture_watchdog_give_up(
         .as_ref()
         .map(|child| child.id());
     let port_accepts_tcp = crate::state::proxy_port_accepts_connection();
-    let process_cpu_secs =
-        tracked_pid.and_then(crate::state::tracked_process_cpu_time_secs);
+    let process_cpu_secs = tracked_pid.and_then(crate::state::tracked_process_cpu_time_secs);
     let log_silent_secs = crate::state::newest_proxy_log_mtime(&logs_dir).and_then(|mtime| {
         std::time::SystemTime::now()
             .duration_since(mtime)
@@ -1294,7 +1301,11 @@ pub(crate) fn capture_upgrade_failure(
             scope.set_tag("upgrade_phase", phase);
             scope.set_tag(
                 "endpoint_protection_suspected",
-                if endpoint_protection_suspected { "true" } else { "false" },
+                if endpoint_protection_suspected {
+                    "true"
+                } else {
+                    "false"
+                },
             );
             if let Some(o) = outcome {
                 scope.set_tag("outcome", o);
@@ -1314,14 +1325,25 @@ pub(crate) fn capture_upgrade_failure(
                 scope.set_extra("log_tail", tail.into());
             }
             if let Some(diag) = boot_diagnostics.as_ref() {
-                scope.set_tag("tracked_child", if diag.tracked_child { "true" } else { "false" });
+                scope.set_tag(
+                    "tracked_child",
+                    if diag.tracked_child { "true" } else { "false" },
+                );
                 scope.set_tag(
                     "new_proxy_log_written",
-                    if diag.new_proxy_log_written { "true" } else { "false" },
+                    if diag.new_proxy_log_written {
+                        "true"
+                    } else {
+                        "false"
+                    },
                 );
                 scope.set_tag(
                     "proxy_port_bound",
-                    if diag.proxy_port_bound { "true" } else { "false" },
+                    if diag.proxy_port_bound {
+                        "true"
+                    } else {
+                        "false"
+                    },
                 );
                 scope.set_extra("tracked_child", diag.tracked_child.into());
                 scope.set_extra("new_proxy_log_written", diag.new_proxy_log_written.into());
@@ -1432,9 +1454,7 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     // process is killed before it can write a useful error. Plain "killed"
     // is too noisy (covers OOM, user pkill), so require the explicit signal
     // marker. CommandFailure formats this as "signal=9" or "Killed: 9".
-    if lower.contains("signal=9")
-        || lower.contains("killed: 9")
-        || lower.contains("exit code 137")
+    if lower.contains("signal=9") || lower.contains("killed: 9") || lower.contains("exit code 137")
     {
         return true;
     }
@@ -1444,9 +1464,7 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     // gate it on "site-packages" (where pip just wrote the file) or ".so" /
     // ".dylib" appearing in the same chain.
     if lower.contains("operation not permitted")
-        && (lower.contains("site-packages")
-            || lower.contains(".so")
-            || lower.contains(".dylib"))
+        && (lower.contains("site-packages") || lower.contains(".so") || lower.contains(".dylib"))
     {
         return true;
     }
@@ -1602,7 +1620,9 @@ fn debug_force_proxy_bypass(state: State<'_, AppState>, on: bool) -> Result<bool
             .ensure_headroom_running()
             .map_err(|err| err.to_string())?;
     }
-    Ok(state.proxy_bypass.load(std::sync::atomic::Ordering::Acquire))
+    Ok(state
+        .proxy_bypass
+        .load(std::sync::atomic::Ordering::Acquire))
 }
 
 #[tauri::command]
@@ -2672,7 +2692,8 @@ pub fn run() {
 
     #[cfg(target_os = "linux")]
     {
-        let has_display = std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
+        let has_display =
+            std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
         if !has_display {
             log::error!(
                 "Headroom requires a graphical display. Set DISPLAY or WAYLAND_DISPLAY before launching."
@@ -2759,12 +2780,11 @@ pub fn run() {
                         // we were processing the previous one.
                         while fresh_bearer_rx.try_recv().is_ok() {}
                         let app_handle = app_handle_for_pusher.clone();
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            move || {
+                        let result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                                 let state: tauri::State<'_, AppState> = app_handle.state();
                                 pricing::warm_and_push_identity(&state);
-                            },
-                        ));
+                            }));
                         if result.is_err() {
                             log::error!(
                                 "identity-pusher worker panicked during warm_and_push_identity"
@@ -2837,7 +2857,8 @@ pub fn run() {
                                 match pricing::get_pricing_status(&state) {
                                     Ok(status) => {
                                         state.apply_pricing_gate_status(&status);
-                                        state.apply_codex_pricing_gate_status(status.codex.as_ref());
+                                        state
+                                            .apply_codex_pricing_gate_status(status.codex.as_ref());
                                         let _ = app_handle.emit("pricing-refreshed", &status);
                                     }
                                     Err(err) => {
@@ -2854,10 +2875,7 @@ pub fn run() {
                     }
                 }));
                 if result.is_err() {
-                    sentry::capture_message(
-                        "deep link callback panicked",
-                        sentry::Level::Error,
-                    );
+                    sentry::capture_message("deep link callback panicked", sentry::Level::Error);
                 }
             });
             Ok(())
@@ -2970,9 +2988,7 @@ fn is_prerelease_version(version: &str) -> bool {
 
 fn beta_channel_enabled_from(env: Option<&str>, sentinel_exists: bool) -> bool {
     let env_yes = matches!(
-        env.map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
+        env.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
         Some("1") | Some("true") | Some("yes")
     );
     env_yes || sentinel_exists
@@ -3327,7 +3343,9 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
             if output.status.success() {
                 if let Some(warnings) = extract_llm_failure_warnings(&stderr) {
                     (
-                        format!("headroom learn could not produce recommendations for {project_name}."),
+                        format!(
+                            "headroom learn could not produce recommendations for {project_name}."
+                        ),
                         false,
                         Some(warnings),
                         output_tail,
@@ -3389,9 +3407,8 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
                 let claude_cli_path = claude_cli::detect_claude_cli()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "not_found".into());
-                let summary_msg = format!(
-                    "headroom learn failed (exit={exit_code_str}) {signature}"
-                );
+                let summary_msg =
+                    format!("headroom learn failed (exit={exit_code_str}) {signature}");
                 let fingerprint: [&str; 3] =
                     ["headroom_learn", exit_code_str.as_str(), signature.as_str()];
                 sentry::with_scope(
@@ -4511,11 +4528,9 @@ mod tests {
         check_headroom_learn_prereqs, classify_bootstrap_failure, classify_upgrade_error,
         compute_tray_window_position, count_memories_created_today, debounced_tray_runtime_visual,
         delete_applied_pattern, empty_live_learnings_for_projects, extract_llm_failure_warnings,
-        fetch_transformations_feed_from, install_pending_update,
-        noop_app_update_progress_emitter, is_disk_full_signal,
+        fetch_transformations_feed_from, install_pending_update, is_disk_full_signal,
         is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
-        is_prerelease_version,
-        lifetime_token_milestone_kind,
+        is_prerelease_version, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
         parse_live_learnings, parse_request_count_from_stats_body, parse_updater_endpoint_list,
         pattern_matches_project, physical_rect_from_rect, read_applied_patterns_for_project,
         resolve_release_updater_config, select_updater_endpoints, store_checked_update,
@@ -4700,7 +4715,10 @@ mod tests {
             select_updater_endpoints(Some("https://stable"), None, false),
             Some("https://stable")
         );
-        assert_eq!(select_updater_endpoints(None, Some("https://staging"), false), None);
+        assert_eq!(
+            select_updater_endpoints(None, Some("https://staging"), false),
+            None
+        );
     }
 
     #[test]
@@ -5580,11 +5598,7 @@ Some unrelated content.
         write_claude_md_with_headroom_block(tmp.path());
 
         let result = read_applied_patterns_for_project(tmp.path().to_str().unwrap());
-        let titles: Vec<&str> = result
-            .claude_md
-            .iter()
-            .map(|s| s.title.as_str())
-            .collect();
+        let titles: Vec<&str> = result.claude_md.iter().map(|s| s.title.as_str()).collect();
         assert!(
             titles.iter().any(|t| *t == "First Section"),
             "first section parsed, got titles: {titles:?}"
@@ -5622,10 +5636,7 @@ Some unrelated content.
             .expect("First Section preserved when one of two bullets deleted");
         assert_eq!(first.bullets, vec!["Second bullet.".to_string()]);
         assert!(
-            result
-                .claude_md
-                .iter()
-                .any(|s| s.title == "Second Section"),
+            result.claude_md.iter().any(|s| s.title == "Second Section"),
             "other sections preserved"
         );
     }
@@ -5648,11 +5659,7 @@ Some unrelated content.
         .expect("delete bullet");
 
         let result = read_applied_patterns_for_project(tmp.path().to_str().unwrap());
-        let titles: Vec<&str> = result
-            .claude_md
-            .iter()
-            .map(|s| s.title.as_str())
-            .collect();
+        let titles: Vec<&str> = result.claude_md.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(
             titles,
             vec!["First Section"],
@@ -6002,8 +6009,12 @@ Some unrelated content.
     #[test]
     fn is_network_download_signal_ignores_config_failures() {
         assert!(!is_network_download_signal("CERTIFICATE_VERIFY_FAILED"));
-        assert!(!is_network_download_signal("No usable temporary directory found"));
-        assert!(!is_network_download_signal("checksum mismatch for ...: expected abc, got def"));
+        assert!(!is_network_download_signal(
+            "No usable temporary directory found"
+        ));
+        assert!(!is_network_download_signal(
+            "checksum mismatch for ...: expected abc, got def"
+        ));
     }
 
     // Endpoint-protection signature matcher: kept conservative on purpose, so
@@ -6037,9 +6048,7 @@ Some unrelated content.
         assert!(is_endpoint_protection_signal(
             "command exited with signal=9 (no stderr)"
         ));
-        assert!(is_endpoint_protection_signal(
-            "headroom: Killed: 9"
-        ));
+        assert!(is_endpoint_protection_signal("headroom: Killed: 9"));
         assert!(is_endpoint_protection_signal(
             "exit code 137 from /venv/bin/python -m headroom.proxy.server"
         ));
@@ -6083,7 +6092,9 @@ Some unrelated content.
         assert!(is_disk_full_signal(
             "ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device"
         ));
-        assert!(is_disk_full_signal("OSError: [Errno 28] No space left on device"));
+        assert!(is_disk_full_signal(
+            "OSError: [Errno 28] No space left on device"
+        ));
         assert!(is_disk_full_signal("ENOSPC: no space left"));
         assert!(is_disk_full_signal("disk full"));
         // Case-insensitive.
@@ -6102,9 +6113,8 @@ Some unrelated content.
         // Even when the error contains a "network" keyword (which would
         // otherwise hit the network classifier), the AV signal wins because
         // it's a more specific match for the actual cause.
-        let err = anyhow::anyhow!(
-            "network unreachable during install — child exited with signal=9"
-        );
+        let err =
+            anyhow::anyhow!("network unreachable during install — child exited with signal=9");
         let hint = classify_upgrade_error(&err).expect("must classify");
         assert!(
             hint.contains("endpoint protection"),

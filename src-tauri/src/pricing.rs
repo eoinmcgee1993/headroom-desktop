@@ -186,10 +186,7 @@ impl IdentityFingerprint {
     /// plan tier. This is the bearer-not-yet-captured shape.
     fn is_empty(&self) -> bool {
         self.claude_account_uuid.is_none()
-            && matches!(
-                self.claude_plan_tier,
-                None | Some(ClaudePlanTier::Unknown)
-            )
+            && matches!(self.claude_plan_tier, None | Some(ClaudePlanTier::Unknown))
     }
 }
 
@@ -578,7 +575,9 @@ fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> Code
             should_nudge: false,
             nudge_level: 0,
             gate_reason: None,
-            gate_message: format!("Codex weekly usage is at {weekly_usage:.0}% of the current window."),
+            gate_message: format!(
+                "Codex weekly usage is at {weekly_usage:.0}% of the current window."
+            ),
         };
     }
 
@@ -1255,7 +1254,8 @@ fn resolve_tier_mismatch(
     account: Option<&HeadroomAccountProfile>,
     claude: &ClaudeAccountProfile,
 ) -> Option<TierMismatch> {
-    let (paid_tier, recommended_tier) = match account.and_then(|a| detect_tier_mismatch(a, claude)) {
+    let (paid_tier, recommended_tier) = match account.and_then(|a| detect_tier_mismatch(a, claude))
+    {
         Some(pair) => pair,
         None => {
             if let Ok(mut local) = load_or_initialize_local_state() {
@@ -1311,14 +1311,13 @@ fn paid_plan_gate(
     let nudge_threshold_percent = pricing
         .as_ref()
         .map(|policy| policy.nudge_thresholds_percent[0]);
-    let effective_nudge_thresholds_percent: Option<Vec<f64>> =
-        pricing.as_ref().map(|policy| {
-            policy
-                .nudge_thresholds_percent
-                .iter()
-                .map(|n| n + bonus)
-                .collect()
-        });
+    let effective_nudge_thresholds_percent: Option<Vec<f64>> = pricing.as_ref().map(|policy| {
+        policy
+            .nudge_thresholds_percent
+            .iter()
+            .map(|n| n + bonus)
+            .collect()
+    });
     let disable_threshold_percent = pricing
         .as_ref()
         .map(|policy| policy.disable_threshold_percent);
@@ -1490,12 +1489,16 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
             .unwrap_or(false),
         plan_tier,
         plan_detection_source,
-        organization_type: profile
-            .as_ref()
-            .and_then(|p| p.organization.as_ref().and_then(|o| o.organization_type.clone())),
-        rate_limit_tier: profile
-            .as_ref()
-            .and_then(|p| p.organization.as_ref().and_then(|o| o.rate_limit_tier.clone())),
+        organization_type: profile.as_ref().and_then(|p| {
+            p.organization
+                .as_ref()
+                .and_then(|o| o.organization_type.clone())
+        }),
+        rate_limit_tier: profile.as_ref().and_then(|p| {
+            p.organization
+                .as_ref()
+                .and_then(|o| o.rate_limit_tier.clone())
+        }),
         weekly_utilization_pct: usage
             .as_ref()
             .and_then(|u| u.seven_day.as_ref().map(|w| w.utilization)),
@@ -1882,9 +1885,7 @@ fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingSta
         Ok(response) => {
             // Record the fingerprint we just successfully posted so the
             // bearer-pusher worker doesn't immediately repost the same data.
-            state.record_pushed_identity_fingerprint(IdentityFingerprint::from_payload(
-                &identity,
-            ));
+            state.record_pushed_identity_fingerprint(IdentityFingerprint::from_payload(&identity));
             let server_first_seen = response.first_seen_at;
             let new_first_seen = if local.reconcile_with_server {
                 server_first_seen.min(local.first_seen_at)
@@ -2092,10 +2093,10 @@ mod tests {
     use super::{
         detect_plan_tier_from_profile, detect_tier_mismatch, evaluate_pricing_status_with_mismatch,
         is_identity_complete, merge_background_account_sync, plan_tier_header_value,
-        remote_account_to_profile, resolve_account_api_base_url, ClaudeOauthProfile, PricingPromo,
+        remote_account_to_profile, resolve_account_api_base_url, ClaudeOauthProfile,
         ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
-        IdentityFingerprint, IdentityPayload, LocalPricingState, RemoteAccountResponse,
-        RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
+        IdentityFingerprint, IdentityPayload, LocalPricingState, PricingPromo,
+        RemoteAccountResponse, RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier,
@@ -3036,11 +3037,7 @@ mod tests {
 
     #[test]
     fn detect_plan_tier_default_raven_is_max20x() {
-        let p = oauth_profile(
-            Some("default_raven"),
-            Some("claude_team"),
-            Some(Utc::now()),
-        );
+        let p = oauth_profile(Some("default_raven"), Some("claude_team"), Some(Utc::now()));
         assert!(matches!(
             detect_plan_tier_from_profile(&p).0,
             ClaudePlanTier::Max20x
@@ -3049,7 +3046,11 @@ mod tests {
 
     #[test]
     fn detect_plan_tier_raven_substring_is_max20x() {
-        let p = oauth_profile(Some("default_raven_x"), Some("claude_team"), Some(Utc::now()));
+        let p = oauth_profile(
+            Some("default_raven_x"),
+            Some("claude_team"),
+            Some(Utc::now()),
+        );
         assert!(matches!(
             detect_plan_tier_from_profile(&p).0,
             ClaudePlanTier::Max20x
@@ -3288,17 +3289,17 @@ mod tests {
     #[test]
     fn codex_usage_from_snapshot_builds_usage() {
         let snapshot = codex_snapshot_with_weekly(12.0);
-        let usage = super::codex_usage_from_snapshot(
-            snapshot,
-            crate::models::CodexPlanTier::Plus,
-            true,
-        );
+        let usage =
+            super::codex_usage_from_snapshot(snapshot, crate::models::CodexPlanTier::Plus, true);
         assert_eq!(usage.limit_name.as_deref(), Some("gpt-5.2-codex"));
         let primary = usage.primary.expect("primary window");
         assert_eq!(primary.used_percent, 42.5);
         assert_eq!(usage.credits_balance.as_deref(), Some("$5.00"));
         assert!(usage.optimization_allowed);
-        assert!(!usage.should_nudge, "12% weekly is below the first nudge threshold");
+        assert!(
+            !usage.should_nudge,
+            "12% weekly is below the first nudge threshold"
+        );
         assert_eq!(usage.weekly_used_percent, Some(12.0));
         assert_eq!(
             usage.recommended_subscription_tier,
@@ -3362,7 +3363,9 @@ mod tests {
 
     #[test]
     fn codex_plan_mapping_is_price_parity() {
-        use crate::models::{headroom_tier_for_codex_plan, CodexPlanTier, HeadroomSubscriptionTier};
+        use crate::models::{
+            headroom_tier_for_codex_plan, CodexPlanTier, HeadroomSubscriptionTier,
+        };
         assert_eq!(
             headroom_tier_for_codex_plan(&CodexPlanTier::Plus),
             Some(HeadroomSubscriptionTier::Pro)
@@ -3391,10 +3394,8 @@ mod tests {
     // ── headroom-web auth contract tests ────────────────────────────────────
 
     fn temp_app_state() -> (crate::state::AppState, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "headroom-pricing-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("headroom-pricing-test-{}", uuid::Uuid::new_v4()));
         let state = crate::state::AppState::new_in(dir.clone()).expect("app state");
         (state, dir)
     }
@@ -3488,7 +3489,8 @@ mod tests {
     #[test]
     fn request_auth_code_returns_error_on_5xx_response() {
         let body = serde_json::json!({"error": "internal"});
-        let (port, server) = spawn_canned_response_server(body, "HTTP/1.1 500 Internal Server Error");
+        let (port, server) =
+            spawn_canned_response_server(body, "HTTP/1.1 500 Internal Server Error");
         let (state, dir) = temp_app_state();
 
         let err = super::request_auth_code_with_base_url(
@@ -3512,10 +3514,7 @@ mod tests {
         let prev_xdg = std::env::var_os("XDG_DATA_HOME");
         let scratch = tempfile::tempdir().expect("scratch tempdir");
         std::env::set_var("HOME", scratch.path());
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            scratch.path().join(".local").join("share"),
-        );
+        std::env::set_var("XDG_DATA_HOME", scratch.path().join(".local").join("share"));
         crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
             .expect("ensure_data_dirs in scratch");
 
@@ -3604,10 +3603,7 @@ mod tests {
             let prev_home = std::env::var_os("HOME");
             let prev_xdg = std::env::var_os("XDG_DATA_HOME");
             std::env::set_var("HOME", scratch.path());
-            std::env::set_var(
-                "XDG_DATA_HOME",
-                scratch.path().join(".local").join("share"),
-            );
+            std::env::set_var("XDG_DATA_HOME", scratch.path().join(".local").join("share"));
             crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
                 .expect("ensure_data_dirs in scratch");
             crate::keychain::write_secret(
@@ -3658,18 +3654,13 @@ mod tests {
     #[serial_test::serial]
     fn activate_account_decodes_remote_envelope_and_returns_pricing_status() {
         let _env = AuthedTestEnv::new("session-xyz");
-        let (port, server) = spawn_canned_response_server(
-            sample_account_envelope_body(),
-            "HTTP/1.1 200 OK",
-        );
+        let (port, server) =
+            spawn_canned_response_server(sample_account_envelope_body(), "HTTP/1.1 200 OK");
         let (state, dir) = temp_app_state();
 
-        let result = super::activate_account_with_base_url(
-            &state,
-            42,
-            &format!("http://127.0.0.1:{port}"),
-        )
-        .expect("activate_account succeeds");
+        let result =
+            super::activate_account_with_base_url(&state, 42, &format!("http://127.0.0.1:{port}"))
+                .expect("activate_account succeeds");
 
         server.join().unwrap();
         assert!(result.authenticated);
@@ -3687,12 +3678,9 @@ mod tests {
             spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 401 Unauthorized");
         let (state, dir) = temp_app_state();
 
-        let err = super::activate_account_with_base_url(
-            &state,
-            0,
-            &format!("http://127.0.0.1:{port}"),
-        )
-        .expect_err("401 surfaces as expired session");
+        let err =
+            super::activate_account_with_base_url(&state, 0, &format!("http://127.0.0.1:{port}"))
+                .expect_err("401 surfaces as expired session");
         server.join().unwrap();
         assert!(err.contains("session expired"));
 
@@ -3716,10 +3704,7 @@ mod tests {
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("HOME", scratch.path());
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            scratch.path().join(".local").join("share"),
-        );
+        std::env::set_var("XDG_DATA_HOME", scratch.path().join(".local").join("share"));
         crate::storage::ensure_data_dirs(&crate::storage::app_data_dir()).unwrap();
         let (state, dir) = temp_app_state();
 
@@ -3824,10 +3809,8 @@ mod tests {
     #[serial_test::serial]
     fn reactivate_subscription_succeeds_on_200() {
         let _env = AuthedTestEnv::new("session-xyz");
-        let (port, server) = spawn_canned_response_server(
-            serde_json::json!({ "ok": true }),
-            "HTTP/1.1 200 OK",
-        );
+        let (port, server) =
+            spawn_canned_response_server(serde_json::json!({ "ok": true }), "HTTP/1.1 200 OK");
 
         super::reactivate_subscription_with_base_url(&format!("http://127.0.0.1:{port}"))
             .expect("reactivate succeeds");
@@ -3843,10 +3826,8 @@ mod tests {
             "HTTP/1.1 422 Unprocessable Entity",
         );
 
-        let err = super::reactivate_subscription_with_base_url(&format!(
-            "http://127.0.0.1:{port}"
-        ))
-        .expect_err("4xx surfaces as error");
+        let err = super::reactivate_subscription_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect_err("4xx surfaces as error");
         server.join().unwrap();
         assert_eq!(err, "Subscription is not scheduled for cancellation.");
     }
@@ -3858,10 +3839,8 @@ mod tests {
         let (port, server) =
             spawn_canned_response_server(serde_json::json!({}), "HTTP/1.1 401 Unauthorized");
 
-        let err = super::reactivate_subscription_with_base_url(&format!(
-            "http://127.0.0.1:{port}"
-        ))
-        .expect_err("401");
+        let err = super::reactivate_subscription_with_base_url(&format!("http://127.0.0.1:{port}"))
+            .expect_err("401");
         server.join().unwrap();
         assert!(err.contains("session expired"));
 
@@ -3882,11 +3861,9 @@ mod tests {
             "HTTP/1.1 200 OK",
         );
 
-        let url = super::get_billing_portal_url_with_base_url(
-            &format!("http://127.0.0.1:{port}"),
-            None,
-        )
-        .expect("billing portal succeeds");
+        let url =
+            super::get_billing_portal_url_with_base_url(&format!("http://127.0.0.1:{port}"), None)
+                .expect("billing portal succeeds");
         server.join().unwrap();
 
         assert_eq!(url, "https://billing.polar.sh/customer/abc");
@@ -3901,11 +3878,9 @@ mod tests {
             "HTTP/1.1 404 Not Found",
         );
 
-        let err = super::get_billing_portal_url_with_base_url(
-            &format!("http://127.0.0.1:{port}"),
-            None,
-        )
-        .expect_err("404 surfaces as error");
+        let err =
+            super::get_billing_portal_url_with_base_url(&format!("http://127.0.0.1:{port}"), None)
+                .expect_err("404 surfaces as error");
         server.join().unwrap();
 
         assert_eq!(err, "Customer not found");
@@ -3917,7 +3892,10 @@ mod tests {
         let claude = empty_claude_profile(ClaudePlanTier::Max20x);
         assert_eq!(
             detect_tier_mismatch(&account, &claude),
-            Some((HeadroomSubscriptionTier::Pro, HeadroomSubscriptionTier::Max20x))
+            Some((
+                HeadroomSubscriptionTier::Pro,
+                HeadroomSubscriptionTier::Max20x
+            ))
         );
     }
 
@@ -3925,11 +3903,16 @@ mod tests {
     fn detect_tier_mismatch_ignores_matching_or_higher_paid_tier() {
         let claude = empty_claude_profile(ClaudePlanTier::Pro);
         // Equal tiers.
-        assert!(detect_tier_mismatch(&active_subscriber(HeadroomSubscriptionTier::Pro), &claude)
-            .is_none());
+        assert!(
+            detect_tier_mismatch(&active_subscriber(HeadroomSubscriptionTier::Pro), &claude)
+                .is_none()
+        );
         // Paid higher than Claude plan.
-        assert!(detect_tier_mismatch(&active_subscriber(HeadroomSubscriptionTier::Max20x), &claude)
-            .is_none());
+        assert!(detect_tier_mismatch(
+            &active_subscriber(HeadroomSubscriptionTier::Max20x),
+            &claude
+        )
+        .is_none());
     }
 
     #[test]
@@ -3937,7 +3920,8 @@ mod tests {
         let account = active_subscriber(HeadroomSubscriptionTier::Pro);
         // Unknown and Free carry no recommended paid tier.
         assert!(
-            detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Unknown)).is_none()
+            detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Unknown))
+                .is_none()
         );
         assert!(
             detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Free)).is_none()
@@ -3999,5 +3983,4 @@ mod tests {
         ));
         assert!(status.tier_mismatch.is_some_and(|m| m.clamped));
     }
-
 }
