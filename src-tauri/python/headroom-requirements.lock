@@ -1,5 +1,5 @@
 # Reviewed known-good Headroom runtime lock.
-# Source: headroom-ai[all]==0.24.0 dependency resolution captured on 2026-06-09 for cp312.
+# Source: headroom-ai[all]==0.25.0 dependency resolution captured on 2026-06-12 for cp312.
 absl-py==2.4.0
 aiohappyeyeballs==2.6.2
 aiohttp==3.14.1
@@ -48,14 +48,14 @@ huggingface-hub==1.18.0
 humanfriendly==10.0
 hyperframe==6.1.0
 idna==3.18
-importlib-metadata==9.0.0
+importlib-metadata==8.9.0
 jinja2==3.1.6
 jiter==0.15.0
 joblib==1.5.3
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
 justext==3.0.2
-litellm==1.82.3
+litellm==1.88.1
 lm-eval==0.4.12
 loguru==0.7.3
 lxml==6.1.1

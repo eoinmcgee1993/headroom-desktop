@@ -24,18 +24,22 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// Pinned headroom-ai version. Upgrade logic is disabled; this exact version
 /// will be installed if the currently-installed version differs.
 ///
-/// Starting with 0.20.x upstream switched to a maturin/Rust-native single-wheel
-/// build (upstream #355), so the wheel URL is per-Python-version and per-platform.
-/// The pin below is for cp312 + macOS arm64 — the only target our release
-/// workflow builds today (release-macos.yml). If `PYTHON_STANDALONE_RELEASE`
-/// ever moves to a different cpython major (3.13+), re-pick the matching wheel
-/// from https://pypi.org/pypi/headroom-ai/<version>/json. If Linux is ever
-/// added to the release matrix, a per-platform wheel-picker (mirroring
-/// `python_distribution_artifact`) is required.
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.24.0";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/64/74/c487d1eae2603127b4b00e35e6d418daae5ed7f587f0da338e0829e230eb/headroom_ai-0.24.0-cp312-cp312-macosx_11_0_arm64.whl";
+/// 0.20.x–0.24.x upstream shipped a maturin/Rust-native wheel that was both
+/// per-Python-version and per-platform (e.g. `cp312-cp312-macosx_11_0_arm64`,
+/// upstream #355). Starting with 0.25.0 the native module is built against the
+/// CPython stable ABI (abi3, upstream #516), so a single `cp310-abi3` wheel per
+/// platform now covers every CPython >= 3.10 — the pin below
+/// (`cp310-abi3-macosx_11_0_arm64`) installs cleanly on our bundled cp312 and
+/// stays valid if `PYTHON_STANDALONE_RELEASE` later moves to 3.13+. Only the
+/// per-platform axis still matters: if Linux is ever added to the release matrix
+/// (release-macos.yml builds macOS arm64 only today), re-pick the matching
+/// `*-manylinux_*` abi3 wheel from
+/// https://pypi.org/pypi/headroom-ai/<version>/json and add a per-platform
+/// wheel-picker (mirroring `python_distribution_artifact`).
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.25.0";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/88/6f/190fbbddf5e3b501cddb02bc0fb58137a2fb237c95f5e2a24aa0f1a77f52/headroom_ai-0.25.0-cp310-abi3-macosx_11_0_arm64.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "f648ec7599d8ce60753c5a68a5463fb74b4a0542ba82c6ffc9d12158dff5bd2a";
+    "f0d4c24a5e6d86c2a6375833bbe3e47a87b7283ca82cf69d3df627448c2391ee";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
@@ -87,15 +91,17 @@ const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
 /// lock. Drop any entry that no longer matches — those users need a real
 /// reinstall.
 const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
-    // The 0.24.0 freeze bumps several transitive pins (onnxruntime, torch,
-    // scikit-learn, safetensors, py-rust-stemmers, lxml, numpy, jiter, rpds-py)
-    // and adds coloredlogs/humanfriendly/narwhals over the 0.21.39 freeze, so it
-    // is byte-incompatible with every prior shipment — no legacy sha can be
-    // treated as up-to-date. These are ordinary pip-managed deps, so the
-    // 0.20.x+ cohort still upgrades cleanly in place (no native restructuring
-    // like the 0.19->0.20 Python->Rust core move), and the floor stays at
-    // 0.20.0. The legacy migration list stays empty until the next no-op
-    // cosmetic lock change.
+    // The 0.25.0 freeze changes exactly two pins over the 0.24.0 freeze —
+    // litellm 1.82.3 -> 1.88.1 (upstream raised its floor to >=1.86.2 in #538)
+    // and the transitive importlib-metadata 9.0.0 -> 8.9.0 that litellm's new
+    // `<9.0` cap pulls back. Both are pure-Python; every native pin (torch,
+    // onnxruntime, transformers, scikit-learn, tokenizers, safetensors,
+    // fastembed, cryptography, lxml, pydantic-core, ...) is byte-identical to
+    // 0.24.0, so the 0.24.0 cohort's in-place upgrade re-fetches only those two
+    // small wheels plus the headroom-ai wheel — no big-wheel rebuilds. The
+    // 0.24.0 lock's stripped pins differ from the current lock, so it is not a
+    // legacy match: 0.24.0 receipts must take the (cheap) requirements repair.
+    // The list stays empty until the next no-op cosmetic lock change.
 ];
 
 /// Receipts strictly below this version cannot be safely upgraded in place to
@@ -137,6 +143,16 @@ const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
 ///   old lock, which is the exact segfault-on-import pattern this floor
 ///   exists to prevent. Atomic rebuild is the only safe path for the
 ///   0.10.x–0.19.x cohort on this bump.
+/// - 0.4.2 (0.24.0 → 0.25.0 bundle): floor stays at 0.20.0. The lock delta is
+///   two pure-Python pins (litellm, importlib-metadata); no native pin moves
+///   and no native dep is added or removed. The headroom-ai wheel itself goes
+///   from a per-version `cp312-cp312` native wheel to a stable-ABI `cp310-abi3`
+///   wheel (upstream #516), but pip uninstalls the old wheel (clearing its
+///   `cpython-312` `.so` via RECORD) before unpacking the new `abi3` `.so`, so
+///   no stale headroom_core extension is layered. The 0.20.x+ cohort — which
+///   includes every 0.24.0-shipping (desktop 0.4.1) user — upgrades in place
+///   with no big-wheel rebuilds. Raise the floor only if a future lock adds or
+///   ABI-bumps a native transitive dep.
 const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 20, 0);
 
 /// Parse the leading `major.minor.patch` from a version string, tolerating

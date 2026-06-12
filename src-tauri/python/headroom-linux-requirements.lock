@@ -3,15 +3,15 @@
 # because packages such as hnswlib do not ship broadly compatible Linux wheels
 # and cause bootstrap to fail on fresh machines.
 #
-# Versions kept in sync with headroom-requirements.lock (0.21.39 freeze on
-# 2026-05-18) where the package overlaps. We do not currently ship Linux from
+# Versions kept in sync with headroom-requirements.lock (0.25.0 freeze on
+# 2026-06-12) where the package overlaps. We do not currently ship Linux from
 # release-macos.yml; when Linux is added, re-validate this lock against a real
 # Linux minimal install before relying on it.
 ast-grep-cli==0.42.2
 click==8.4.0
 fastapi==0.136.1
 httpx[http2]==0.28.1
-litellm==1.82.3
+litellm==1.88.1
 magika==1.0.3
 mcp==1.27.1
 onnxruntime==1.26.0
