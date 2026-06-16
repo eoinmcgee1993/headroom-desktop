@@ -8,9 +8,9 @@ After installing a new beta (`-rc.N`) build, paste this file into Claude Code an
 2. Confirm the tray icon appears in the menu bar.
 3. Open the dashboard window once (so the proxy is fully booted).
 
-## Checks
+## Checks (Claude Code pass)
 
-Claude: run each block and report PASS / FAIL with the observed value.
+Run these from a Claude Code session and report PASS / FAIL with the observed value. Checks 1, 5, 8, 9, and 10 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `~/.claude/settings.json`, pay-per-token), so its equivalents of checks 6 and 7 live in the **Codex pass** below; run that whole section from a Codex session.
 
 ### 1. Version matches the new beta
 ```bash
@@ -26,13 +26,13 @@ stat -f '%Sm' ~/Library/Application\ Support/Headroom/config/activity-facts.json
 ```
 Expect: mtime within the last minute. `lastTransformation` inside the file is a "Recent large compression" tile pick (gated on >=1000 tokens saved and >20% savings, see `activity_facts.rs`), not a per-request heartbeat — don't use it as a liveness signal.
 
-### 3. RTK is on PATH and reports savings
+### 3. RTK is on PATH and reports savings (Claude Code only — RTK does not rewrite Codex)
 ```bash
 rtk --version && rtk gain | head -5
 ```
 Expect: a version line and a gain summary, no "command not found".
 
-### 4. MCP retrieve tool is available (only if memory tools are enabled)
+### 4. MCP retrieve tool is available (Claude Code only; only if memory tools are enabled)
 First check whether the proxy was started with memory tools:
 ```bash
 ls ~/Library/Application\ Support/Headroom/headroom/logs/ | grep -E 'no-memory-tools' >/dev/null && echo 'memory tools DISABLED — skip this check' || echo 'memory tools enabled — run check'
@@ -43,7 +43,7 @@ If enabled, have Claude call `mcp__headroom__headroom_retrieve` with any small q
 Click the tray icon, open the dashboard. Expect savings chart and per-client stats render without a blank/error state.
 
 ### 6. Pause / resume cleanly strips and restores interception
-In Settings, toggle Pause then Resume. After Pause, `cat ~/.claude/settings.json | grep -c headroom-rtk-rewrite` should return `0`; after Resume it should return `1`.
+In Settings, toggle Pause then Resume. After Pause, `cat ~/.claude/settings.json | grep -c headroom-rtk-rewrite` should return `0`; after Resume it should return `1`. This verifies the Claude Code config only — Pause clears *all* clients, so check C4 in the Codex pass confirms Codex's config is stripped and restored too.
 
 ### 7. Proxy is actively optimizing this conversation (not just a heartbeat)
 First check which mode the proxy is in — the right signal differs:
@@ -64,7 +64,7 @@ Timing matters either way: a `Read` result becomes part of Claude's *next* outgo
 
 Expect: `cache_savings_usd` is strictly greater, `prefix_frozen` increased by at least 1, and `total_tokens_before` jumped by roughly the size of the Read. A bumped mtime on `activity-facts.json` is not enough — interception alone would still touch that file without delivering cache savings.
 
-**If mode is `token`** (pay-per-token API-key traffic):
+**If mode is `token`** (pay-per-token API-key traffic — this is also the branch Codex hits; the Codex pass below adds a Codex-attributed version):
 1. Capture the baseline:
    ```bash
    rtk proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
@@ -119,6 +119,42 @@ security find-generic-password -s com.extraheadroom.headroom.account -a session-
 test -f ~/Library/Application\ Support/Headroom/config/headroom-pricing-state.json && jq -e '.first_seen_at' ~/Library/Application\ Support/Headroom/config/headroom-pricing-state.json
 ```
 Expect: if the build is supposed to be signed in, line 1 reports `signed in`; line 2 prints a non-null `first_seen_at` timestamp. A signed-in build that flips to `not signed in` after relaunch is a regression — keychain access is broken or the token was wiped.
+
+## Codex checks (Codex pass)
+
+Run these from a Codex CLI session (or with Codex configured and at least one Codex prompt sent this session). Codex routes through Headroom via an `OPENAI_BASE_URL` shell export plus a managed provider block in `~/.codex/config.toml` — not `~/.claude/settings.json` and not RTK — and its traffic is pay-per-token, so the proxy runs it in `token` mode.
+
+### C1. Codex is configured to route through Headroom
+```bash
+grep -q 'model_provider = "headroom"' ~/.codex/config.toml && \
+  grep -q 'openai_base_url = "http://127.0.0.1:6767/v1"' ~/.codex/config.toml && \
+  grep -qF '[model_providers.headroom]' ~/.codex/config.toml && \
+  grep -q 'export OPENAI_BASE_URL=http://127.0.0.1:6767/v1' ~/.zshrc ~/.zprofile 2>/dev/null && \
+  echo PASS || echo FAIL
+```
+Expect: `PASS`. `~/.codex/config.toml` carries both managed marker blocks — `# >>> headroom:codex_cli >>>` with the root `model_provider`/`openai_base_url` keys, and `# >>> headroom:codex_cli_provider >>>` with the `[model_providers.headroom]` table — and a managed shell block exports `OPENAI_BASE_URL`. A `FAIL` means setup didn't write one of them (see `configure_codex_provider_block` / `configure_shell_block` in `client_adapters.rs`).
+
+### C2. Codex traffic is actively optimized (token mode)
+Codex is billed per token, so unlike a Claude Code subscription it runs in `token` mode and `requests_compressed` *does* move. Run this from inside Codex.
+1. Capture the baseline:
+   ```bash
+   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{mode: .summary.mode, primary_model: .summary.primary_model, requests_compressed: .summary.compression.requests_compressed, total_tokens_removed: .summary.compression.total_tokens_removed}'
+   ```
+2. End the turn with a large file read in flight from Codex (~1300-1500 lines clears the compression threshold). As in check 7, the read lands in Codex's *next* prompt, so the re-check must be on a later turn.
+3. On the next turn, re-run the same command.
+
+Expect: `mode` is `token`, `primary_model` is a `gpt-*` model (confirms Codex — not Claude — is the traffic being measured), `requests_compressed` increased by at least 1, and `total_tokens_removed` is strictly greater. If `primary_model` is a `claude-*` model, the proxy is dominated by Claude traffic — confirm the prompt actually ran through Codex before trusting this check.
+
+### C3. Codex savings are attributed on the dashboard
+Open the dashboard and confirm a **Codex** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the Codex group (`mergeProviderSavingsForDisplay` in `dashboardHelpers.ts`); a missing Codex group after Codex traffic means per-provider attribution isn't tagging OpenAI requests.
+
+### C4. Pause / resume cleanly strips and restores Codex routing
+The Claude equivalent is check 6; Pause clears *all* client setups, so it must remove Codex's config too. In Settings, toggle Pause then Resume (restore runs on a background thread, so give it a second), checking after each:
+```bash
+grep -c 'headroom:codex_cli' ~/.codex/config.toml
+cat ~/.zshrc ~/.zprofile 2>/dev/null | grep -c 'OPENAI_BASE_URL=http://127.0.0.1:6767'
+```
+Expect: after Pause both print `0`; after Resume both are non-zero (config.toml back to `4` marker lines, shell back to one export per managed profile). Pause routes through `disable_codex_cli` — strips both TOML blocks, the `openai_base_url` root key, and the shell blocks; Resume re-applies them via `restore_client_setups`.
 
 ## Inspecting the proxy directly
 

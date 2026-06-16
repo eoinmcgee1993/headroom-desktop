@@ -4516,17 +4516,49 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
     }
 }
 
+/// True when the upstream stored history hit its point-count cap and older
+/// checkpoints were trimmed away. In that state the oldest surviving rollup
+/// bucket carries a spurious carried-over cumulative as its delta.
+fn upstream_history_trimmed(root: &Value) -> bool {
+    let stored = value_at_path_u64(root, &["history_summary", "stored_points"]);
+    let cap = value_at_path_u64(root, &["retention", "max_history_points"]);
+    matches!((stored, cap), (Some(stored), Some(cap)) if cap > 0 && stored >= cap)
+}
+
+/// Remove the oldest bucket (smallest timestamp) from a rollup series.
+fn drop_oldest_rollup_bucket(series: &mut Vec<HeadroomSavingsRollupPoint>) {
+    if let Some((idx, _)) = series
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, point)| point.timestamp)
+    {
+        series.remove(idx);
+    }
+}
+
 fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsHistoryResponse> {
     let root = serde_json::from_str::<Value>(body).ok()?;
     let lifetime_estimated_tokens_saved = value_at_path_u64(&root, &["lifetime", "tokens_saved"]);
     let lifetime_estimated_savings_usd =
         value_at_path_f64(&root, &["lifetime", "compression_savings_usd"]);
-    let hourly = value_at_path(&root, &["series", "hourly"])
+    let mut hourly = value_at_path(&root, &["series", "hourly"])
         .and_then(parse_savings_rollup_series)
         .unwrap_or_default();
-    let daily = value_at_path(&root, &["series", "daily"])
+    let mut daily = value_at_path(&root, &["series", "daily"])
         .and_then(parse_savings_rollup_series)
         .unwrap_or_default();
+
+    // When the upstream stored history has been trimmed (point-count cap
+    // reached), the backend's rollup diffs the oldest surviving checkpoint from
+    // a zero baseline, dumping its entire cumulative into the first bucket's
+    // delta. That produces a huge spurious spike at the window's leading edge
+    // that slides forward as old checkpoints age out. Drop that boundary bucket
+    // so the chart shows real per-bucket savings. Untrimmed histories (new
+    // users) keep their genuine first bucket. Lifetime totals are unaffected.
+    if upstream_history_trimmed(&root) {
+        drop_oldest_rollup_bucket(&mut daily);
+        drop_oldest_rollup_bucket(&mut hourly);
+    }
 
     if lifetime_estimated_tokens_saved.is_none()
         && lifetime_estimated_savings_usd.is_none()
@@ -6956,6 +6988,92 @@ mod tests {
         assert!((hourly_points[0].estimated_savings_usd - 0.15).abs() < 1e-9);
         // No by_provider in this fixture -> empty breakdown.
         assert!(hourly_points[0].by_provider.is_empty());
+    }
+
+    #[test]
+    fn parse_headroom_stats_history_drops_carryover_boundary_when_trimmed() {
+        // stored_points == max_history_points => the stored history was trimmed,
+        // so the oldest rollup bucket (10:00 / day-of) carries a spurious
+        // cumulative delta and must be dropped; the real 11:00 bucket stays.
+        let body = r#"{
+            "lifetime": { "tokens_saved": 1000, "compression_savings_usd": 10.0 },
+            "retention": { "max_history_points": 5000 },
+            "history_summary": { "stored_points": 5000 },
+            "series": {
+                "hourly": [
+                    {
+                        "timestamp": "2026-06-09T10:00:00Z",
+                        "tokens_saved": 900,
+                        "compression_savings_usd_delta": 9.0,
+                        "total_tokens_saved": 900,
+                        "compression_savings_usd": 9.0
+                    },
+                    {
+                        "timestamp": "2026-06-09T11:00:00Z",
+                        "tokens_saved": 100,
+                        "compression_savings_usd_delta": 1.0,
+                        "total_tokens_saved": 1000,
+                        "compression_savings_usd": 10.0
+                    }
+                ],
+                "daily": [
+                    {
+                        "timestamp": "2026-06-09T00:00:00Z",
+                        "tokens_saved": 900,
+                        "compression_savings_usd_delta": 9.0,
+                        "total_tokens_saved": 900,
+                        "compression_savings_usd": 9.0
+                    },
+                    {
+                        "timestamp": "2026-06-10T00:00:00Z",
+                        "tokens_saved": 100,
+                        "compression_savings_usd_delta": 1.0,
+                        "total_tokens_saved": 1000,
+                        "compression_savings_usd": 10.0
+                    }
+                ]
+            }
+        }"#;
+        let parsed = parse_headroom_stats_history_from_json(body).expect("parsed history");
+
+        // Boundary bucket dropped; lifetime totals untouched.
+        assert_eq!(parsed.lifetime_estimated_tokens_saved, Some(1000));
+        assert_eq!(parsed.daily.len(), 1);
+        assert_eq!(parsed.daily[0].tokens_saved, 100);
+        assert_eq!(parsed.hourly.len(), 1);
+        assert_eq!(parsed.hourly[0].tokens_saved, 100);
+    }
+
+    #[test]
+    fn parse_headroom_stats_history_keeps_first_bucket_when_not_trimmed() {
+        // stored_points < max_history_points => untrimmed (new user); the first
+        // bucket is the genuine origin and must be preserved.
+        let body = r#"{
+            "lifetime": { "tokens_saved": 1000, "compression_savings_usd": 10.0 },
+            "retention": { "max_history_points": 5000 },
+            "history_summary": { "stored_points": 12 },
+            "series": {
+                "daily": [
+                    {
+                        "timestamp": "2026-06-09T00:00:00Z",
+                        "tokens_saved": 900,
+                        "compression_savings_usd_delta": 9.0,
+                        "total_tokens_saved": 900,
+                        "compression_savings_usd": 9.0
+                    },
+                    {
+                        "timestamp": "2026-06-10T00:00:00Z",
+                        "tokens_saved": 100,
+                        "compression_savings_usd_delta": 1.0,
+                        "total_tokens_saved": 1000,
+                        "compression_savings_usd": 10.0
+                    }
+                ]
+            }
+        }"#;
+        let parsed = parse_headroom_stats_history_from_json(body).expect("parsed history");
+        assert_eq!(parsed.daily.len(), 2);
+        assert_eq!(parsed.daily[0].tokens_saved, 900);
     }
 
     #[test]

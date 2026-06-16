@@ -301,6 +301,17 @@ async fn handle(
         return;
     };
 
+    // Codex GUI/IDE clients don't send a `codex-cli/` User-Agent, so the
+    // backend's UA-based classifier can't tell they're Codex and treats a
+    // compression timeout as a fail-closed HTTP 413 instead of taking the
+    // codex fail-open path. Codex treats that 413 as a hard connection failure
+    // and stops connecting. We already know by request path that this is Codex
+    // traffic, so stamp `X-Client: codex` (which the backend honours over the
+    // User-Agent) to keep Codex GUI and Codex CLI on the same backend path.
+    if is_codex {
+        stamp_codex_client_header(&mut buf);
+    }
+
     if backend.write_all(&buf).await.is_err() {
         return;
     }
@@ -940,6 +951,39 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// Case-insensitive check for a header field name in an HTTP request head.
+/// `buf` is the full request including the `\r\n\r\n` terminator; only field
+/// names (the text before the first `:` on each header line) are matched.
+fn request_has_header(buf: &[u8], name: &str) -> bool {
+    let end = find_header_end(buf).unwrap_or(buf.len());
+    let Ok(text) = std::str::from_utf8(&buf[..end]) else {
+        return false;
+    };
+    text.split("\r\n")
+        .skip(1) // request line
+        .filter_map(|line| line.split_once(':'))
+        .any(|(field, _)| field.trim().eq_ignore_ascii_case(name))
+}
+
+/// Insert `X-Client: codex` into a request head so the Python backend's
+/// `classify_client` identifies Codex traffic even when the client's
+/// User-Agent isn't `codex-cli/` (e.g. the Codex GUI/IDE). A client that
+/// already self-identified via `X-Client` is left untouched. No-op if the
+/// header terminator is missing.
+fn stamp_codex_client_header(buf: &mut Vec<u8>) {
+    if request_has_header(buf, "x-client") {
+        return;
+    }
+    let Some(end) = find_header_end(buf) else {
+        return;
+    };
+    // `end` points at the first `\r` of the `\r\n\r\n` terminator. Inserting at
+    // `end + 2` (start of the blank line) appends a new last header line while
+    // preserving the terminating CRLF.
+    let insert_at = end + 2;
+    buf.splice(insert_at..insert_at, *b"X-Client: codex\r\n");
+}
+
 /// Paths served by the local Python proxy (not Anthropic). Matches the prefix
 /// so sub-paths (e.g. `/transformations/feed`) and query strings are covered,
 /// while preventing partial matches (e.g. `/healthcheck` does not match
@@ -1041,7 +1085,7 @@ mod tests {
         decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
         is_openai_path, parse_codex_rate_limit_headers, parse_request_head, read_http_headers,
-        request_is_loopback_safe, run, BypassFlag, SharedToken,
+        request_is_loopback_safe, run, stamp_codex_client_header, BypassFlag, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -1392,6 +1436,54 @@ mod tests {
         // Only one token before \r\n -> no path -> None.
         let buf = b"NOTHTTP\r\n\r\n";
         assert!(parse_request_head(buf).is_none());
+    }
+
+    #[test]
+    fn stamp_codex_client_header_inserts_last_header() {
+        let mut buf =
+            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: codex_vscode/1.0\r\n\r\n"
+                .to_vec();
+        stamp_codex_client_header(&mut buf);
+        let parsed = parse_request_head(&buf).expect("still a valid request head");
+        assert_eq!(parsed.path, "/v1/responses");
+        assert!(
+            parsed
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("x-client") && v == "codex"),
+            "X-Client: codex should be present: {:?}",
+            parsed.headers
+        );
+        // Header block stays well-formed (single blank-line terminator).
+        assert!(buf.ends_with(b"X-Client: codex\r\n\r\n"));
+        assert_eq!(buf.windows(4).filter(|w| *w == b"\r\n\r\n").count(), 1);
+    }
+
+    #[test]
+    fn stamp_codex_client_header_preserves_body_bytes() {
+        // The proxy only buffers the head, but a request may arrive with the
+        // body already appended; the insertion must not corrupt it.
+        let mut buf =
+            b"POST /v1/responses HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        stamp_codex_client_header(&mut buf);
+        assert!(buf.ends_with(b"\r\n\r\nhello"));
+    }
+
+    #[test]
+    fn stamp_codex_client_header_respects_explicit_client() {
+        let original =
+            b"POST /v1/responses HTTP/1.1\r\nX-Client: aider\r\n\r\n".to_vec();
+        let mut buf = original.clone();
+        stamp_codex_client_header(&mut buf);
+        assert_eq!(buf, original, "an explicit X-Client must be left untouched");
+    }
+
+    #[test]
+    fn stamp_codex_client_header_noop_without_terminator() {
+        let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: x".to_vec();
+        let original = buf.clone();
+        stamp_codex_client_header(&mut buf);
+        assert_eq!(buf, original);
     }
 
     #[test]
