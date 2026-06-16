@@ -4362,24 +4362,17 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
             ],
         )
     });
-    let total_before_compression =
-        value_at_path_u64(&root, &["tokens", "total_before_compression"]).or_else(|| {
-            find_u64_key_recursive(
-                &root,
-                &["totalBeforeCompression", "total_before_compression"],
-            )
-        });
-    let session_savings_pct = path_savings_pct.or_else(|| {
-        total_before_compression.and_then(|total_before| {
-            tokens.and_then(|saved| {
-                if total_before > 0 {
-                    Some(saved as f64 / total_before as f64 * 100.0)
-                } else {
-                    None
-                }
-            })
-        })
-    });
+    // Denominator for the savings ratio = "new (uncached) input" only.
+    // Claude Code re-sends the entire conversation every turn; the cached
+    // prefix (cache_read tokens) is forwarded but Headroom deliberately never
+    // compresses it -- doing so would bust the provider prefix cache for a net
+    // loss. Counting those re-sent cached tokens in the denominator drove the
+    // displayed ratio toward zero as sessions grew longer and caching got more
+    // effective. Measure compression against the uncached input we can act on.
+    let uncached_input_tokens =
+        value_at_path_u64(&root, &["prefix_cache", "totals", "uncached_input_tokens"]).or_else(
+            || find_u64_key_recursive(&root, &["uncachedInputTokens", "uncached_input_tokens"]),
+        );
     let total_after_compression = value_at_path_u64(&root, &["tokens", "input"])
         .or_else(|| value_at_path_u64(&root, &["cost", "total_input_tokens"]))
         .or_else(|| value_at_path_u64(&root, &["tokens", "actual_input_tokens"]))
@@ -4406,7 +4399,26 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
                 ],
             )
         });
-    let session_total_tokens_sent = total_after_compression.filter(|value| *value > 0);
+    // Prefer uncached input; fall back to total forwarded tokens for proxy
+    // builds that do not report prefix-cache totals (back-compat).
+    let session_total_tokens_sent = uncached_input_tokens
+        .or(total_after_compression)
+        .filter(|value| *value > 0);
+    // Ratio against new input: saved / (saved + uncached_forwarded). The
+    // proxy's own `tokens.savings_percent` is computed against the cache-
+    // polluted denominator, so it is only a last-resort fallback.
+    let session_savings_pct = tokens
+        .and_then(|saved| {
+            session_total_tokens_sent.and_then(|sent| {
+                let total_before = saved.saturating_add(sent);
+                if total_before > 0 {
+                    Some(saved as f64 / total_before as f64 * 100.0)
+                } else {
+                    None
+                }
+            })
+        })
+        .or(path_savings_pct);
     let actual_cost_usd = path_actual_cost_usd.or_else(|| {
         find_f64_key_recursive(
             &root,
@@ -6793,6 +6805,36 @@ mod tests {
         assert_eq!(parsed.session_actual_cost_usd, Some(1.23));
         assert_eq!(parsed.session_total_tokens_sent, Some(3_600));
         assert_eq!(parsed.savings_history.len(), 1);
+    }
+
+    #[test]
+    fn parse_headroom_stats_ratio_uses_uncached_input_not_cached_prefix() {
+        // The cached prefix (cache_read) is re-sent every turn but never
+        // compressed; it must not inflate the savings denominator. Here the
+        // forwarded input is 100_000 tokens but only 8_000 are new (uncached),
+        // so the ratio is measured against new input: 2000 / (2000 + 8000).
+        let parsed = parse_headroom_stats_from_json(
+            r#"{
+                "requests": { "total": 7 },
+                "tokens": {
+                    "saved": 2000,
+                    "input": 100000
+                },
+                "prefix_cache": {
+                    "totals": {
+                        "cache_read_tokens": 92000,
+                        "uncached_input_tokens": 8000
+                    }
+                }
+            }"#,
+        )
+        .expect("parsed stats");
+
+        assert_eq!(parsed.session_estimated_tokens_saved, Some(2_000));
+        // Denominator is uncached input, not the 100_000 forwarded total.
+        assert_eq!(parsed.session_total_tokens_sent, Some(8_000));
+        let pct = parsed.session_savings_pct.expect("savings pct");
+        assert!((pct - 20.0).abs() < 1e-9, "expected 20%, got {pct}");
     }
 
     #[test]
