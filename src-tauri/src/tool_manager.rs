@@ -641,6 +641,17 @@ impl ToolManager {
                     // were removed; cache mode contributed no measurable savings over
                     // Claude Code's native prefix caching.)
                     .env("HEADROOM_MODE", "token")
+                    // Enable plain user-message text compression in addition to
+                    // tool results. Primary motive is Codex/OpenAI: with a 0.5
+                    // read-discount and 0.0 write-penalty, compressing user text
+                    // clears the force-compress threshold and yields real savings.
+                    // This is the only desktop-side lever (the `headroom proxy`
+                    // entrypoint reads this env only; it exposes no CLI flag), and
+                    // it is process-global on the single shared proxy. Anthropic
+                    // blast radius is small: its 0.9 read-discount means already-
+                    // cached content almost never busts the frozen prefix, and
+                    // protect_recent/min_tokens guard the just-typed prompt.
+                    .env("HEADROOM_COMPRESS_USER_MESSAGES", "1")
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(
                         log_file
