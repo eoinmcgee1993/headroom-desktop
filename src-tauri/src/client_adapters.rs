@@ -283,12 +283,16 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                         .into(),
                 );
             }
-            if !rtk_path_ok {
+            // RTK is a separate, user-toggleable integration (`set_rtk_enabled`
+            // tears it down without touching ANTHROPIC_BASE_URL routing). When
+            // the user has deliberately disabled RTK, its absence must not fail
+            // Claude Code verification — routing is what "connected" means here.
+            if !state.rtk_disabled && !rtk_path_ok {
                 failures.push(
                     "Headroom-managed RTK PATH export was not found in shell profiles.".into(),
                 );
             }
-            if !rtk_hook_ok {
+            if !state.rtk_disabled && !rtk_hook_ok {
                 failures.push(
                     "Headroom-managed RTK Claude hook was not found in ~/.claude/settings.json."
                         .into(),
@@ -3448,6 +3452,51 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .any(|c| c.contains("RTK Claude hook")),
             "verification reports the hook check, got: {:?}",
             verification.checks
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn verify_claude_code_passes_when_rtk_deliberately_disabled() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"hooks": {}}"#,
+        )
+        .unwrap();
+
+        super::apply_client_setup("claude_code").expect("apply_client_setup succeeds");
+
+        // User turns RTK off: this strips the RTK PATH block + hook but leaves
+        // ANTHROPIC_BASE_URL routing intact, and persists the opt-out.
+        super::set_rtk_enabled(false, home.path(), home.path()).expect("disable RTK");
+
+        let hook_path = home
+            .path()
+            .join(".claude")
+            .join("hooks")
+            .join("headroom-rtk-rewrite.sh");
+        assert!(!hook_path.exists(), "RTK hook removed when RTK disabled");
+
+        // Routing config is still present, so Claude Code must verify green
+        // even though the RTK pieces are gone.
+        let verification =
+            super::verify_client_setup("claude_code").expect("verify_client_setup succeeds");
+        assert!(
+            verification.verified,
+            "claude_code verifies on routing alone when RTK is disabled, failures: {:?}",
+            verification.failures
+        );
+        assert!(
+            verification
+                .failures
+                .iter()
+                .all(|f| !f.contains("RTK")),
+            "no RTK failures reported when RTK is disabled, got: {:?}",
+            verification.failures
         );
     }
 
