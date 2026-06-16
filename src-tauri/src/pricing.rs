@@ -9,9 +9,9 @@ use crate::keychain;
 use crate::models::{
     headroom_tier_for_claude_plan, headroom_tier_for_codex_plan, BillingPeriod,
     ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, ClaudeUsage, ClaudeUsageWindow,
-    CodexPlanTier, CodexRateLimitSnapshot, CodexUsage, HeadroomAccountProfile,
+    CodexAccountProfile, CodexPlanTier, CodexRateLimitSnapshot, CodexUsage, HeadroomAccountProfile,
     HeadroomAuthCodeRequest, HeadroomPricingStatus, HeadroomSubscriptionTier, PricingCohort,
-    PricingGateReason, TierMismatch,
+    PricingGateReason, TierMismatch, TierRecommendationSource,
 };
 use crate::state::AppState;
 use crate::storage::{app_data_dir, config_file};
@@ -59,6 +59,21 @@ struct IdentityPayload {
     claude_rate_limit_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_billing_type: Option<String>,
+    // Codex identity, mirroring the Claude fields one-for-one. Sourced from
+    // `~/.codex/auth.json` + the live access-token capture
+    // (`detect_codex_profile`). Same audit rationale as the raw Claude fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_account_uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_plan_tier: Option<CodexPlanTier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_organization_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_rate_limit_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_billing_type: Option<String>,
     /// Highest Terms-of-Service version the user has accepted locally. Rides
     /// along on every grace/start so the server's device-keyed trial record
     /// captures acceptance. `None` (omitted) when nothing accepted yet.
@@ -87,17 +102,18 @@ fn plan_tier_header_value(tier: &ClaudePlanTier) -> &'static str {
 impl IdentityPayload {
     fn for_state(state: &AppState) -> Self {
         let claude = state.cached_claude_profile();
-        let mut payload = Self::build(Some(&claude));
+        let codex = state.cached_codex_profile();
+        let mut payload = Self::build(Some(&claude), codex.as_ref());
         let accepted = state.accepted_terms_version();
         payload.accepted_terms_version = (accepted > 0).then_some(accepted);
         payload
     }
 
     fn device_only() -> Self {
-        Self::build(None)
+        Self::build(None, None)
     }
 
-    fn build(claude: Option<&ClaudeAccountProfile>) -> Self {
+    fn build(claude: Option<&ClaudeAccountProfile>, codex: Option<&CodexAccountProfile>) -> Self {
         let device = device::current();
         Self {
             device_id: device.machine_id_digest,
@@ -108,6 +124,12 @@ impl IdentityPayload {
             claude_organization_type: claude.and_then(|p| p.organization_type.clone()),
             claude_rate_limit_tier: claude.and_then(|p| p.rate_limit_tier.clone()),
             claude_billing_type: claude.and_then(|p| p.billing_type.clone()),
+            codex_account_uuid: codex.and_then(|p| p.account_uuid.clone()),
+            codex_email: codex.and_then(|p| p.email.clone()),
+            codex_plan_tier: codex.and_then(|p| p.plan_tier),
+            codex_organization_type: codex.and_then(|p| p.organization_type.clone()),
+            codex_rate_limit_tier: codex.and_then(|p| p.rate_limit_tier.clone()),
+            codex_billing_type: codex.and_then(|p| p.billing_type.clone()),
             accepted_terms_version: None,
         }
     }
@@ -139,6 +161,24 @@ impl IdentityPayload {
         if let Some(value) = self.claude_billing_type.as_deref() {
             builder = builder.header("X-Headroom-Claude-Billing-Type", value);
         }
+        if let Some(value) = self.codex_account_uuid.as_deref() {
+            builder = builder.header("X-Headroom-Codex-Uuid", value);
+        }
+        if let Some(value) = self.codex_email.as_deref() {
+            builder = builder.header("X-Headroom-Codex-Email", value);
+        }
+        if let Some(tier) = self.codex_plan_tier.as_ref() {
+            builder = builder.header("X-Headroom-Codex-Plan", tier.as_header_str());
+        }
+        if let Some(value) = self.codex_organization_type.as_deref() {
+            builder = builder.header("X-Headroom-Codex-Organization-Type", value);
+        }
+        if let Some(value) = self.codex_rate_limit_tier.as_deref() {
+            builder = builder.header("X-Headroom-Codex-Rate-Limit-Tier", value);
+        }
+        if let Some(value) = self.codex_billing_type.as_deref() {
+            builder = builder.header("X-Headroom-Codex-Billing-Type", value);
+        }
         if let Some(version) = self.accepted_terms_version {
             builder = builder.header("X-Headroom-Terms-Version", version.to_string());
         }
@@ -168,6 +208,10 @@ pub struct IdentityFingerprint {
     claude_organization_type: Option<String>,
     claude_rate_limit_tier: Option<String>,
     claude_billing_type: Option<String>,
+    // Codex plan/account, so an account switch or plan change on the Codex side
+    // also forces a fresh `desktop/grace/start` even when Claude is unchanged.
+    codex_account_uuid: Option<String>,
+    codex_plan_tier: Option<CodexPlanTier>,
 }
 
 impl IdentityFingerprint {
@@ -179,14 +223,20 @@ impl IdentityFingerprint {
             claude_organization_type: p.claude_organization_type.clone(),
             claude_rate_limit_tier: p.claude_rate_limit_tier.clone(),
             claude_billing_type: p.claude_billing_type.clone(),
+            codex_account_uuid: p.codex_account_uuid.clone(),
+            codex_plan_tier: p.codex_plan_tier,
         }
     }
 
     /// True when there is nothing meaningful to report — no UUID and no real
-    /// plan tier. This is the bearer-not-yet-captured shape.
+    /// plan tier on either side. This is the bearer-not-yet-captured shape.
+    /// Codex-only users (ChatGPT seat, no Claude) still report via the codex
+    /// signal, so we don't gate solely on Claude.
     fn is_empty(&self) -> bool {
         self.claude_account_uuid.is_none()
             && matches!(self.claude_plan_tier, None | Some(ClaudePlanTier::Unknown))
+            && self.codex_account_uuid.is_none()
+            && matches!(self.codex_plan_tier, None | Some(CodexPlanTier::Unknown))
     }
 }
 
@@ -462,7 +512,8 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
 
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
-    let tier_mismatch = resolve_tier_mismatch(account.as_ref(), &claude);
+    let codex_plan = crate::client_adapters::is_codex_enabled().then(|| state.codex_plan_tier());
+    let tier_mismatch = resolve_tier_mismatch(account.as_ref(), &claude, codex_plan);
 
     let mut status = evaluate_pricing_status_with_mismatch(
         authenticated,
@@ -735,7 +786,8 @@ pub(crate) fn verify_auth_code_with_base_url(
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
     let account = remote_account_to_profile(body.account);
-    let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude);
+    let codex_plan = crate::client_adapters::is_codex_enabled().then(|| state.codex_plan_tier());
+    let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude, codex_plan);
 
     Ok(evaluate_pricing_status_with_mismatch(
         true,
@@ -811,7 +863,8 @@ pub(crate) fn activate_account_with_base_url(
     let claude = detect_claude_profile(state);
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
     let account = remote_account_to_profile(body.account);
-    let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude);
+    let codex_plan = crate::client_adapters::is_codex_enabled().then(|| state.codex_plan_tier());
+    let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude, codex_plan);
 
     Ok(evaluate_pricing_status_with_mismatch(
         true,
@@ -1238,13 +1291,29 @@ fn evaluate_pricing_status_with_mismatch(
 fn detect_tier_mismatch(
     account: &HeadroomAccountProfile,
     claude: &ClaudeAccountProfile,
-) -> Option<(HeadroomSubscriptionTier, HeadroomSubscriptionTier)> {
+    codex_plan: Option<CodexPlanTier>,
+) -> Option<(
+    HeadroomSubscriptionTier,
+    HeadroomSubscriptionTier,
+    TierRecommendationSource,
+)> {
     if !account.subscription_active {
         return None;
     }
     let paid = account.subscription_tier?;
-    let recommended = headroom_tier_for_claude_plan(&claude.plan_tier)?;
-    (recommended.rank() > paid.rank()).then_some((paid, recommended))
+    // Take the higher-ranked of the Claude- and Codex-implied tiers so a user
+    // who routes both is recommended the plan that covers their bigger account.
+    let claude_rec = headroom_tier_for_claude_plan(&claude.plan_tier);
+    let codex_rec = codex_plan.and_then(|plan| headroom_tier_for_codex_plan(&plan));
+    let (recommended, source) = match (claude_rec, codex_rec) {
+        (Some(c), Some(x)) if c.rank() > x.rank() => (c, TierRecommendationSource::Claude),
+        (Some(c), Some(x)) if x.rank() > c.rank() => (x, TierRecommendationSource::Codex),
+        (Some(c), Some(_)) => (c, TierRecommendationSource::Both),
+        (Some(c), None) => (c, TierRecommendationSource::Claude),
+        (None, Some(x)) => (x, TierRecommendationSource::Codex),
+        (None, None) => return None,
+    };
+    (recommended.rank() > paid.rank()).then_some((paid, recommended, source))
 }
 
 /// Detects the mismatch and manages the persisted grace clock. Sets
@@ -1253,20 +1322,21 @@ fn detect_tier_mismatch(
 fn resolve_tier_mismatch(
     account: Option<&HeadroomAccountProfile>,
     claude: &ClaudeAccountProfile,
+    codex_plan: Option<CodexPlanTier>,
 ) -> Option<TierMismatch> {
-    let (paid_tier, recommended_tier) = match account.and_then(|a| detect_tier_mismatch(a, claude))
-    {
-        Some(pair) => pair,
-        None => {
-            if let Ok(mut local) = load_or_initialize_local_state() {
-                if local.mismatch_since.is_some() {
-                    local.mismatch_since = None;
-                    let _ = write_local_state(&local);
+    let (paid_tier, recommended_tier, recommended_source) =
+        match account.and_then(|a| detect_tier_mismatch(a, claude, codex_plan)) {
+            Some(triple) => triple,
+            None => {
+                if let Ok(mut local) = load_or_initialize_local_state() {
+                    if local.mismatch_since.is_some() {
+                        local.mismatch_since = None;
+                        let _ = write_local_state(&local);
+                    }
                 }
+                return None;
             }
-            return None;
-        }
-    };
+        };
 
     let mut local = load_or_initialize_local_state().ok()?;
     let since = match local.mismatch_since {
@@ -1283,6 +1353,7 @@ fn resolve_tier_mismatch(
     Some(TierMismatch {
         paid_tier,
         recommended_tier,
+        recommended_source,
         grace_ends_at,
         clamped: Utc::now() > grace_ends_at,
     })
@@ -1406,6 +1477,121 @@ fn format_nudge_message(weekly_usage: f64, disable: f64, level: u8) -> String {
 
 pub fn detect_claude_profile(state: &AppState) -> ClaudeAccountProfile {
     state.cached_claude_profile()
+}
+
+/// Decode a JWT's payload segment (no signature verification) into JSON. Codex
+/// id/access tokens are base64url without padding; tolerate either form.
+fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
+    use base64::Engine;
+    let payload_b64 = token.split('.').nth(1)?;
+    let trimmed = payload_b64.trim_end_matches('=');
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(trimmed)
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+/// Codex billing-type derivation, mirroring Claude's raw `billing_type` slot.
+/// Free/Unknown carry nothing; paid personal plans are `"subscription"`; org
+/// seats report the plan string so the server can distinguish Business seats.
+fn codex_billing_type(plan: &CodexPlanTier, has_org: bool) -> Option<String> {
+    match plan {
+        CodexPlanTier::Free | CodexPlanTier::Unknown => None,
+        CodexPlanTier::Team
+        | CodexPlanTier::Business
+        | CodexPlanTier::Enterprise
+        | CodexPlanTier::Edu => Some(plan.as_header_str().to_string()),
+        CodexPlanTier::Plus | CodexPlanTier::Pro => Some(if has_org {
+            plan.as_header_str().to_string()
+        } else {
+            "subscription".to_string()
+        }),
+    }
+}
+
+/// Build a [`CodexAccountProfile`] from `~/.codex/auth.json`. `plan_tier` and
+/// `account_uuid` are also available from live traffic (`state.codex_plan_tier`
+/// + the access-token bearer), so this prefers a live, classified plan tier
+/// over the on-disk id_token when present. `email` and `organization_type` only
+/// exist in the id_token, so they require the file. Returns `None` only when
+/// nothing at all is known (no file and no live capture).
+pub fn detect_codex_profile(state: &AppState) -> Option<CodexAccountProfile> {
+    let live_tier = state.codex_plan_tier();
+    let path = dirs::home_dir()?.join(".codex").join("auth.json");
+    let on_disk = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+
+    // No file: fall back to whatever the live access-token decode captured.
+    let Some(root) = on_disk else {
+        if matches!(live_tier, CodexPlanTier::Unknown) {
+            return None;
+        }
+        return Some(CodexAccountProfile {
+            plan_tier: Some(live_tier),
+            plan_detection_source: Some("access_token".to_string()),
+            ..Default::default()
+        });
+    };
+
+    let tokens = root.get("tokens");
+    let id_token = tokens
+        .and_then(|t| t.get("id_token"))
+        .and_then(|v| v.as_str());
+    let payload = id_token.and_then(decode_jwt_payload);
+    let auth = payload
+        .as_ref()
+        .and_then(|p| p.get("https://api.openai.com/auth"));
+
+    let email = payload
+        .as_ref()
+        .and_then(|p| p.get("email"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let account_uuid = auth
+        .and_then(|a| a.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            tokens
+                .and_then(|t| t.get("account_id"))
+                .and_then(|v| v.as_str())
+        })
+        .map(str::to_string);
+
+    let organization_type = auth
+        .and_then(|a| a.get("organizations"))
+        .and_then(|v| v.as_array())
+        .and_then(|orgs| orgs.first())
+        .and_then(|o| o.get("role"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // Prefer the live, classified tier; fall back to the id_token claim.
+    let (plan_tier, source) = if !matches!(live_tier, CodexPlanTier::Unknown) {
+        (live_tier, "access_token")
+    } else {
+        let claim = auth
+            .and_then(|a| a.get("chatgpt_plan_type"))
+            .and_then(|v| v.as_str())
+            .map(CodexPlanTier::from_claim);
+        match claim {
+            Some(tier) => (tier, "id_token"),
+            None => (CodexPlanTier::Unknown, "none"),
+        }
+    };
+
+    let billing_type = codex_billing_type(&plan_tier, organization_type.is_some());
+
+    Some(CodexAccountProfile {
+        email,
+        account_uuid,
+        plan_tier: Some(plan_tier),
+        organization_type,
+        rate_limit_tier: None,
+        billing_type,
+        plan_detection_source: Some(source.to_string()),
+    })
 }
 
 /// Result of a live profile detection. `error_is_transient` is true when the
@@ -2091,16 +2277,18 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::{
-        detect_plan_tier_from_profile, detect_tier_mismatch, evaluate_pricing_status_with_mismatch,
-        is_identity_complete, merge_background_account_sync, plan_tier_header_value,
-        remote_account_to_profile, resolve_account_api_base_url, ClaudeOauthProfile,
-        ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
-        IdentityFingerprint, IdentityPayload, LocalPricingState, PricingPromo,
-        RemoteAccountResponse, RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
+        codex_billing_type, decode_jwt_payload, detect_plan_tier_from_profile,
+        detect_tier_mismatch, evaluate_pricing_status_with_mismatch, is_identity_complete,
+        merge_background_account_sync, plan_tier_header_value, remote_account_to_profile,
+        resolve_account_api_base_url, ClaudeOauthProfile, ClaudeOauthProfileAccount,
+        ClaudeOauthProfileOrganization, HeadroomSubscriptionTier, IdentityFingerprint,
+        IdentityPayload, LocalPricingState, PricingPromo, RemoteAccountResponse,
+        RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
     };
     use crate::models::{
-        BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier,
+        BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, CodexPlanTier,
         HeadroomAccountProfile, HeadroomPricingStatus, PricingGateReason, TierMismatch,
+        TierRecommendationSource,
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -2141,6 +2329,7 @@ mod tests {
         TierMismatch {
             paid_tier: HeadroomSubscriptionTier::Pro,
             recommended_tier: recommended,
+            recommended_source: TierRecommendationSource::Claude,
             grace_ends_at: Utc::now(),
             clamped,
         }
@@ -2260,6 +2449,109 @@ mod tests {
         assert!(req.headers().get("X-Headroom-Claude-Plan").is_none());
     }
 
+    #[test]
+    fn apply_headers_sets_codex_fields_when_present() {
+        let identity = IdentityPayload {
+            device_id: "abc123".into(),
+            codex_account_uuid: Some("acct_1".into()),
+            codex_email: Some("dev@example.com".into()),
+            codex_plan_tier: Some(CodexPlanTier::Business),
+            codex_organization_type: Some("owner".into()),
+            codex_billing_type: Some("business".into()),
+            ..Default::default()
+        };
+        let client = reqwest::blocking::Client::new();
+        let req = identity
+            .apply_headers(client.get("http://example.test"))
+            .build()
+            .unwrap();
+        let h = req.headers();
+        assert_eq!(h.get("X-Headroom-Codex-Plan").unwrap(), "business");
+        assert_eq!(h.get("X-Headroom-Codex-Uuid").unwrap(), "acct_1");
+        assert_eq!(h.get("X-Headroom-Codex-Email").unwrap(), "dev@example.com");
+        assert_eq!(
+            h.get("X-Headroom-Codex-Organization-Type").unwrap(),
+            "owner"
+        );
+        assert_eq!(h.get("X-Headroom-Codex-Billing-Type").unwrap(), "business");
+        // rate_limit_tier has no source today, so the header is omitted.
+        assert!(h.get("X-Headroom-Codex-Rate-Limit-Tier").is_none());
+    }
+
+    #[test]
+    fn apply_headers_omits_codex_when_none() {
+        let identity = IdentityPayload {
+            device_id: "abc123".into(),
+            ..Default::default()
+        };
+        let client = reqwest::blocking::Client::new();
+        let req = identity
+            .apply_headers(client.get("http://example.test"))
+            .build()
+            .unwrap();
+        assert!(req.headers().get("X-Headroom-Codex-Plan").is_none());
+        assert!(req.headers().get("X-Headroom-Codex-Uuid").is_none());
+    }
+
+    #[test]
+    fn codex_plan_header_value_covers_all_variants() {
+        assert_eq!(CodexPlanTier::Free.as_header_str(), "free");
+        assert_eq!(CodexPlanTier::Plus.as_header_str(), "plus");
+        assert_eq!(CodexPlanTier::Pro.as_header_str(), "pro");
+        assert_eq!(CodexPlanTier::Team.as_header_str(), "team");
+        assert_eq!(CodexPlanTier::Business.as_header_str(), "business");
+        assert_eq!(CodexPlanTier::Enterprise.as_header_str(), "enterprise");
+        assert_eq!(CodexPlanTier::Edu.as_header_str(), "edu");
+        assert_eq!(CodexPlanTier::Unknown.as_header_str(), "unknown");
+    }
+
+    #[test]
+    fn codex_billing_type_derivation() {
+        // Free/unknown carry nothing.
+        assert_eq!(codex_billing_type(&CodexPlanTier::Free, false), None);
+        assert_eq!(codex_billing_type(&CodexPlanTier::Unknown, true), None);
+        // Paid personal plans report "subscription" when no org.
+        assert_eq!(
+            codex_billing_type(&CodexPlanTier::Plus, false),
+            Some("subscription".into())
+        );
+        assert_eq!(
+            codex_billing_type(&CodexPlanTier::Pro, false),
+            Some("subscription".into())
+        );
+        // Org seats report the plan string.
+        assert_eq!(
+            codex_billing_type(&CodexPlanTier::Plus, true),
+            Some("plus".into())
+        );
+        assert_eq!(
+            codex_billing_type(&CodexPlanTier::Business, false),
+            Some("business".into())
+        );
+        assert_eq!(
+            codex_billing_type(&CodexPlanTier::Enterprise, true),
+            Some("enterprise".into())
+        );
+    }
+
+    #[test]
+    fn decode_jwt_payload_extracts_codex_claims() {
+        use base64::Engine;
+        let payload_json = r#"{"email":"dev@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acct_9","chatgpt_plan_type":"business","organizations":[{"role":"owner","is_default":true}]}}"#;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+        let token = format!("header.{b64}.sig");
+
+        let payload = decode_jwt_payload(&token).expect("decodes");
+        assert_eq!(payload["email"], "dev@example.com");
+        let auth = &payload["https://api.openai.com/auth"];
+        assert_eq!(auth["chatgpt_plan_type"], "business");
+        assert_eq!(
+            CodexPlanTier::from_claim(auth["chatgpt_plan_type"].as_str().unwrap()),
+            CodexPlanTier::Business
+        );
+        assert_eq!(auth["organizations"][0]["role"], "owner");
+    }
+
     fn complete_profile() -> ClaudeAccountProfile {
         ClaudeAccountProfile {
             auth_method: ClaudeAuthMethod::ClaudeAiOauth,
@@ -2314,7 +2606,10 @@ mod tests {
             claude_organization_type: Some("claude_max".into()),
             claude_rate_limit_tier: Some("default_claude_max_x20".into()),
             claude_billing_type: Some("personal".into()),
+            codex_account_uuid: Some("acct_1".into()),
+            codex_plan_tier: Some(CodexPlanTier::Business),
             accepted_terms_version: Some(1),
+            ..Default::default()
         };
         let fp = IdentityFingerprint::from_payload(&payload);
 
@@ -2325,6 +2620,11 @@ mod tests {
         let mut other = payload.clone();
         other.claude_plan_tier = Some(ClaudePlanTier::Pro);
         assert_ne!(fp, IdentityFingerprint::from_payload(&other));
+
+        // Mutating a fingerprinted Codex field also changes the fingerprint.
+        let mut codex_change = payload.clone();
+        codex_change.codex_plan_tier = Some(CodexPlanTier::Plus);
+        assert_ne!(fp, IdentityFingerprint::from_payload(&codex_change));
 
         // device_id / chopratejas_instance_id are not part of the fingerprint.
         let mut device_only_diff = payload.clone();
@@ -3891,10 +4191,11 @@ mod tests {
         let account = active_subscriber(HeadroomSubscriptionTier::Pro);
         let claude = empty_claude_profile(ClaudePlanTier::Max20x);
         assert_eq!(
-            detect_tier_mismatch(&account, &claude),
+            detect_tier_mismatch(&account, &claude, None),
             Some((
                 HeadroomSubscriptionTier::Pro,
-                HeadroomSubscriptionTier::Max20x
+                HeadroomSubscriptionTier::Max20x,
+                TierRecommendationSource::Claude
             ))
         );
     }
@@ -3903,14 +4204,17 @@ mod tests {
     fn detect_tier_mismatch_ignores_matching_or_higher_paid_tier() {
         let claude = empty_claude_profile(ClaudePlanTier::Pro);
         // Equal tiers.
-        assert!(
-            detect_tier_mismatch(&active_subscriber(HeadroomSubscriptionTier::Pro), &claude)
-                .is_none()
-        );
+        assert!(detect_tier_mismatch(
+            &active_subscriber(HeadroomSubscriptionTier::Pro),
+            &claude,
+            None
+        )
+        .is_none());
         // Paid higher than Claude plan.
         assert!(detect_tier_mismatch(
             &active_subscriber(HeadroomSubscriptionTier::Max20x),
-            &claude
+            &claude,
+            None
         )
         .is_none());
     }
@@ -3919,12 +4223,60 @@ mod tests {
     fn detect_tier_mismatch_requires_confident_paid_claude_plan() {
         let account = active_subscriber(HeadroomSubscriptionTier::Pro);
         // Unknown and Free carry no recommended paid tier.
+        assert!(detect_tier_mismatch(
+            &account,
+            &empty_claude_profile(ClaudePlanTier::Unknown),
+            None
+        )
+        .is_none());
         assert!(
-            detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Unknown))
+            detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Free), None)
                 .is_none()
         );
-        assert!(
-            detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Free)).is_none()
+    }
+
+    #[test]
+    fn detect_tier_mismatch_uses_codex_plan_when_claude_has_none() {
+        // Codex Pro -> Max x20; Claude Free carries no recommendation.
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        let claude = empty_claude_profile(ClaudePlanTier::Free);
+        assert_eq!(
+            detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::Pro)),
+            Some((
+                HeadroomSubscriptionTier::Pro,
+                HeadroomSubscriptionTier::Max20x,
+                TierRecommendationSource::Codex
+            ))
+        );
+    }
+
+    #[test]
+    fn detect_tier_mismatch_takes_higher_of_claude_and_codex() {
+        // Claude Pro -> Pro, Codex Pro -> Max x20; the higher (Codex) wins.
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        let claude = empty_claude_profile(ClaudePlanTier::Pro);
+        assert_eq!(
+            detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::Pro)),
+            Some((
+                HeadroomSubscriptionTier::Pro,
+                HeadroomSubscriptionTier::Max20x,
+                TierRecommendationSource::Codex
+            ))
+        );
+    }
+
+    #[test]
+    fn detect_tier_mismatch_reports_both_when_tiers_match() {
+        // Claude Max x20 and Codex Pro both imply Max x20.
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        let claude = empty_claude_profile(ClaudePlanTier::Max20x);
+        assert_eq!(
+            detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::Pro)),
+            Some((
+                HeadroomSubscriptionTier::Pro,
+                HeadroomSubscriptionTier::Max20x,
+                TierRecommendationSource::Both
+            ))
         );
     }
 
@@ -3933,7 +4285,7 @@ mod tests {
         let mut account = active_subscriber(HeadroomSubscriptionTier::Pro);
         account.subscription_active = false;
         let claude = empty_claude_profile(ClaudePlanTier::Max20x);
-        assert!(detect_tier_mismatch(&account, &claude).is_none());
+        assert!(detect_tier_mismatch(&account, &claude, None).is_none());
     }
 
     #[test]

@@ -1463,16 +1463,14 @@ mod tests {
     fn stamp_codex_client_header_preserves_body_bytes() {
         // The proxy only buffers the head, but a request may arrive with the
         // body already appended; the insertion must not corrupt it.
-        let mut buf =
-            b"POST /v1/responses HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        let mut buf = b"POST /v1/responses HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
         stamp_codex_client_header(&mut buf);
         assert!(buf.ends_with(b"\r\n\r\nhello"));
     }
 
     #[test]
     fn stamp_codex_client_header_respects_explicit_client() {
-        let original =
-            b"POST /v1/responses HTTP/1.1\r\nX-Client: aider\r\n\r\n".to_vec();
+        let original = b"POST /v1/responses HTTP/1.1\r\nX-Client: aider\r\n\r\n".to_vec();
         let mut buf = original.clone();
         stamp_codex_client_header(&mut buf);
         assert_eq!(buf, original, "an explicit X-Client must be left untouched");

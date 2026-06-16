@@ -2459,6 +2459,23 @@ fn codex_user_state_exists(home: &Path) -> bool {
         || codex_root.join("sessions").exists()
 }
 
+/// Locate the Codex CLI binary the same way [`detect_codex_client`] does: known
+/// install locations first, then a PATH lookup. Used as the Headroom Learn
+/// analysis backend (`codex exec`) for Codex sessions.
+pub(crate) fn detect_codex_cli() -> Option<PathBuf> {
+    codex_candidate_paths()
+        .into_iter()
+        .find(|path| path.exists())
+        .or_else(|| find_on_path(&["codex"]))
+}
+
+/// True once the user has signed in to Codex with their ChatGPT account — the
+/// OAuth token lands in `~/.codex/auth.json`. Required for the keyless
+/// `codex exec` analysis backend.
+pub(crate) fn codex_logged_in() -> bool {
+    home_dir().join(".codex").join("auth.json").is_file()
+}
+
 fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, Value>> {
     let value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
@@ -2535,10 +2552,9 @@ mod tests {
         default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
         remove_managed_block, retag_codex_thread_providers, retag_codex_threads_to_headroom,
-        retag_one_codex_db, serialize_paths,
-        shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
-        strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
-        ClientSetupState, ShellFamily,
+        retag_one_codex_db, serialize_paths, shell_block_contains_in_files,
+        shell_block_contains_text_in_files, shell_double_quote, strip_headroom_hook_from_settings,
+        upsert_managed_block, write_file_if_changed, ClientSetupState, ShellFamily,
     };
     use rusqlite::Connection;
 
@@ -3491,10 +3507,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             verification.failures
         );
         assert!(
-            verification
-                .failures
-                .iter()
-                .all(|f| !f.contains("RTK")),
+            verification.failures.iter().all(|f| !f.contains("RTK")),
             "no RTK failures reported when RTK is disabled, got: {:?}",
             verification.failures
         );

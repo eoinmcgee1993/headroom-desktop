@@ -2,6 +2,7 @@ import type {
   BillingPeriod,
   HeadroomPricingStatus,
   HeadroomSubscriptionTier,
+  TierRecommendationSource,
 } from "./types";
 
 export type PricingAudience = "individual" | "teamEnterprise";
@@ -180,6 +181,19 @@ export function upgradePlanIntentLabel(planId: UpgradePlanId | null) {
   }
 }
 
+// Connector(s) whose detected plan drives a tier-mismatch recommendation, for
+// the upgrade banner copy.
+export function tierRecommendationSourceLabel(source: TierRecommendationSource) {
+  switch (source) {
+    case "codex":
+      return "Codex";
+    case "both":
+      return "Claude and Codex";
+    default:
+      return "Claude";
+  }
+}
+
 export function describeInvokeError(error: unknown, fallback: string) {
   if (error instanceof Error && error.message.trim()) {
     return error.message;
@@ -252,14 +266,14 @@ export function getUpgradePlans(
     const freePlan: UpgradePlan = {
       id: "free",
       name: "Free",
-      tagline: "Limited usage with Claude",
+      tagline: "Limited usage with Claude or Codex",
       price: "$0",
       billingLines: ["/ month", "free"],
       featureIntro: "Includes:",
       features: [
         "Unlocks cost savings and stats",
-        "Use with 25% of your Claude plan",
-        "Optimize Claude Code practices"
+        "Use with 50% of your Claude or Codex plan",
+        "Optimize Claude Code or Codex"
       ],
       ctaLabel: downgradeEndsOn ? "Downgrade scheduled" : "Stay on Free plan",
       ctaVariant: "secondary",
@@ -377,18 +391,18 @@ export function getUpgradePlans(
 
     const paidPlans: Record<"pro" | "max5x" | "max20x", UpgradePlan> = {
       pro: paidPlan("pro", "Pro", "Unlock unlimited savings", "Everything in Free, plus:", [
-        "Unlimited use with Claude Pro",
-        "Track sessions across devices",
+        "Unlimited use with Claude Pro or ChatGPT Plus",
+        "Use on all your devices with one account",
         "Email-based support"
       ], "Get Pro"),
-      max5x: paidPlan("max5x", "Max x5", "For Claude Max x5 accounts", "Includes:", [
-        "Unlimited use with Claude Max x5",
-        "Track sessions across devices",
+      max5x: paidPlan("max5x", "Max x5", "For Claude Max x5 or ChatGPT Pro x5 accounts", "Includes:", [
+        "Unlimited use with Claude Max x5 or ChatGPT Pro x5",
+        "Use on all your devices with one account",
         "Email-based support"
       ], "Get Max x5"),
-      max20x: paidPlan("max20x", "Max x20", "For Claude Max x20 accounts", "Includes:", [
-        "Unlimited use with Claude Max x20",
-        "Track sessions across devices",
+      max20x: paidPlan("max20x", "Max x20", "For Claude Max x20 or ChatGPT Pro x20 accounts", "Includes:", [
+        "Unlimited use with Claude Max x20 or ChatGPT Pro x20",
+        "Use on all your devices with one account",
         "Priority support"
       ], "Get Max x20"),
     };

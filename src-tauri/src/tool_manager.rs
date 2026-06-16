@@ -375,10 +375,7 @@ fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
         "no output"
     } else if t.contains("sigabrt") || t.contains("aborted") {
         "native abort"
-    } else if t.contains("no space left")
-        || t.contains("disk full")
-        || t.contains("errno 28")
-    {
+    } else if t.contains("no space left") || t.contains("disk full") || t.contains("errno 28") {
         "disk full"
     } else if t.contains("connection")
         || t.contains("timed out")
@@ -551,8 +548,12 @@ impl ToolManager {
 
             // Pre-flight: 6768 may already be held. Three cases:
             //   * Free → spawn on 6768.
-            //   * HeadroomRunning → bail (a previous headroom proxy is alive;
-            //     we want a fresh one).
+            //   * HeadroomRunning → an orphaned proxy from a prior session is
+            //     squatting on the port (a healthy one would have satisfied
+            //     `is_headroom_proxy_reachable` upstream, so `ensure_headroom_running`
+            //     would never have reached the spawn path). Reclaim the port by
+            //     terminating it, then spawn the fresh runtime. Only bail if it
+            //     turns out to be genuinely health-serving or we can't free it.
             //   * ForeignOccupant → try to fall back to a port in
             //     6769..=6790. Only bail if every fallback is also taken.
             // The chosen port is stored in `backend_port` so the intercept,
@@ -563,10 +564,8 @@ impl ToolManager {
                     backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
                 }
                 PortState::HeadroomRunning => {
-                    bail!(
-                        "{}",
-                        format_already_running_bail(backend_port::DEFAULT_BACKEND_PORT)
-                    );
+                    reclaim_orphan_proxy(backend_port::DEFAULT_BACKEND_PORT)?;
+                    backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
                 }
                 PortState::ForeignOccupant(detail) => {
                     let pid = parse_pid_from_lsof_detail(&detail);
@@ -1609,19 +1608,16 @@ impl ToolManager {
         });
 
         // Try direct wheel download (with retries). If it fails, fall back to PyPI index.
-        let use_wheel = match download_to_path(
-            &release.wheel_url,
-            &wheel_path,
-            Some(&release.sha256),
-        ) {
-            Ok(()) => true,
-            Err(download_err) => {
-                log::warn!(
+        let use_wheel =
+            match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
+                Ok(()) => true,
+                Err(download_err) => {
+                    log::warn!(
                     "headroom wheel download failed (will fall back to pip index): {download_err}"
                 );
-                false
-            }
-        };
+                    false
+                }
+            };
 
         progress(BootstrapStepUpdate {
             step: "Updating dependencies",
@@ -2518,19 +2514,16 @@ impl ToolManager {
             .runtime
             .downloads_dir
             .join(format!("headroom_ai-{}-py3-none-any.whl", release.version));
-        let use_wheel = match download_to_path(
-            &release.wheel_url,
-            &wheel_path,
-            Some(&release.sha256),
-        ) {
-            Ok(()) => true,
-            Err(download_err) => {
-                log::warn!(
+        let use_wheel =
+            match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
+                Ok(()) => true,
+                Err(download_err) => {
+                    log::warn!(
                     "headroom wheel download failed (will fall back to pip index): {download_err}"
                 );
-                false
-            }
-        };
+                    false
+                }
+            };
 
         progress(BootstrapStepUpdate {
             step: "Applying update",
@@ -3360,6 +3353,88 @@ fn format_already_running_bail(port: u16) -> String {
         "headroom proxy already running on port {port} (likely a stale process from a prior session). \
          Run `lsof -iTCP:{port} -sTCP:LISTEN` to find and kill it, then retry."
     )
+}
+
+/// True when `/readyz` on the backend `port` answers with a 2xx — i.e. a
+/// genuinely healthy headroom proxy is serving there. Used to avoid killing a
+/// live backend during port reclaim. Short timeout: a hung orphan won't answer
+/// in time and a healthy one answers in milliseconds.
+fn probe_backend_readyz_ok(port: u16) -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+    else {
+        return false;
+    };
+    matches!(
+        client.get(format!("http://127.0.0.1:{port}/readyz")).send(),
+        Ok(resp) if resp.status().is_success()
+    )
+}
+
+/// Poll until `port` is bindable or `timeout` elapses. Returns true once the
+/// port is free. A killed listener's socket is released as soon as the owning
+/// process dies, so this normally returns within a couple of poll intervals.
+fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Reclaim `port` from an orphaned headroom proxy left behind by a prior
+/// session. We only get here from the `HeadroomRunning` spawn pre-flight, which
+/// is unreachable when a healthy proxy is up (its `/readyz` would have
+/// satisfied `is_headroom_proxy_reachable` and short-circuited
+/// `ensure_headroom_running`). Still, re-confirm health on the backend port
+/// directly before killing — if it answers 2xx the backend is live (e.g. the
+/// 6767 intercept is wedged while 6768 is fine) and we leave it alone. On any
+/// failure to reclaim (no pid, refuses to die, healthy) we fall back to the
+/// original bail so the caller's classification and user guidance are
+/// unchanged.
+fn reclaim_orphan_proxy(port: u16) -> Result<()> {
+    if probe_backend_readyz_ok(port) {
+        bail!("{}", format_already_running_bail(port));
+    }
+    let Some(pid) = lsof_listener(port)
+        .as_deref()
+        .and_then(parse_pid_from_lsof_detail)
+    else {
+        bail!("{}", format_already_running_bail(port));
+    };
+
+    log::warn!("[backend_port] reclaiming orphaned headroom proxy pid {pid} on port {port}");
+    let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
+    if !wait_for_port_free(port, Duration::from_secs(3)) {
+        let _ = Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+        if !wait_for_port_free(port, Duration::from_secs(2)) {
+            bail!("{}", format_already_running_bail(port));
+        }
+    }
+
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("flow", "orphan_proxy_reclaimed");
+            scope.set_extra("port", port.into());
+            scope.set_extra("occupant_pid", pid.into());
+        },
+        || {
+            sentry::capture_message(
+                &format!("orphan_proxy_reclaimed: killed pid {pid} holding port {port}"),
+                sentry::Level::Info,
+            );
+        },
+    );
+    Ok(())
 }
 
 /// Bail message when 6768 is foreign-held AND every port in the fallback
@@ -4693,17 +4768,19 @@ mod tests {
 
     use super::{
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
-        extract_required_pydantic_core_version, format_all_foreign_bail, format_already_running_bail,
-        headroom_entrypoint_startup_args, headroom_python_startup_args, looks_like_corrupt_venv_error,
-        parse_major_minor_patch, parse_pid_from_lsof_detail, proxy_argv_contains_expected_flags,
+        extract_required_pydantic_core_version, format_all_foreign_bail,
+        format_already_running_bail, headroom_entrypoint_startup_args,
+        headroom_python_startup_args, looks_like_corrupt_venv_error, parse_major_minor_patch,
+        parse_pid_from_lsof_detail, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        sha256_bytes, summarize_kompress_prefetch_failure, verify_sha256_file, CommandFailure,
-        HeadroomRelease, ManagedRuntime, PipOutputCapture, ToolManager, UpgradeOutcome,
-        ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
+        sha256_bytes, summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
+    use std::net::TcpListener;
 
     #[test]
     fn classify_kompress_prefetch_failure_buckets_known_causes() {
@@ -5338,6 +5415,32 @@ mod tests {
         // But the lib.rs port-conflict-failure classifier (which fingerprints
         // both shapes the same way) still catches it via its second condition.
         assert!(crate::is_port_conflict_failure(&bail));
+    }
+
+    #[test]
+    fn wait_for_port_free_detects_release() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            !wait_for_port_free(port, Duration::from_millis(200)),
+            "port held by a live listener must not report free"
+        );
+        drop(listener);
+        assert!(
+            wait_for_port_free(port, Duration::from_secs(2)),
+            "port must report free shortly after the listener is dropped"
+        );
+    }
+
+    #[test]
+    fn probe_backend_readyz_ok_false_when_nothing_listening() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(
+            !probe_backend_readyz_ok(port),
+            "no server listening means /readyz is not healthy"
+        );
     }
 
     #[test]

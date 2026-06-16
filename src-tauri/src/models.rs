@@ -347,6 +347,9 @@ pub struct HeadroomLearnStatus {
 pub struct HeadroomLearnPrereqStatus {
     pub claude_cli_available: bool,
     pub claude_cli_path: Option<String>,
+    pub codex_cli_available: bool,
+    pub codex_cli_path: Option<String>,
+    pub codex_logged_in: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -695,6 +698,22 @@ impl CodexPlanTier {
             _ => CodexPlanTier::Unknown,
         }
     }
+
+    /// Stable wire value for the `X-Headroom-Codex-Plan` header, mirroring
+    /// `pricing::plan_tier_header_value` for Claude. Kept in sync with the
+    /// server's `TrialIdentity::CODEX_PLAN_TIERS`.
+    pub fn as_header_str(&self) -> &'static str {
+        match self {
+            CodexPlanTier::Free => "free",
+            CodexPlanTier::Plus => "plus",
+            CodexPlanTier::Pro => "pro",
+            CodexPlanTier::Team => "team",
+            CodexPlanTier::Business => "business",
+            CodexPlanTier::Enterprise => "enterprise",
+            CodexPlanTier::Edu => "edu",
+            CodexPlanTier::Unknown => "unknown",
+        }
+    }
 }
 
 /// Price-parity map from an OpenAI plan to the recommended Headroom upgrade
@@ -711,6 +730,35 @@ pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubs
         CodexPlanTier::Pro => Some(HeadroomSubscriptionTier::Max20x),
         CodexPlanTier::Free | CodexPlanTier::Unknown => None,
     }
+}
+
+/// Codex (OpenAI/ChatGPT) account identity, the Codex analog of
+/// [`ClaudeAccountProfile`]. `plan_tier` + `account_uuid` are available from the
+/// live access-token bearer the intercept proxy sees; `email` and
+/// `organization_type` only exist in the on-disk `~/.codex/auth.json` id_token,
+/// so they require reading that file (see `pricing::detect_codex_profile`). All
+/// fields ride along to headroom-web on the `X-Headroom-Codex-*` identity
+/// headers, mirroring the Claude fields one-for-one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountProfile {
+    pub email: Option<String>,
+    /// `chatgpt_account_id` from the OAuth JWT (or `tokens.account_id`).
+    pub account_uuid: Option<String>,
+    pub plan_tier: Option<CodexPlanTier>,
+    /// Raw org signal: the user's `role` in their default org
+    /// (`organizations[0].role`, e.g. owner/admin/member). Present for
+    /// Business/Enterprise/Team seats. No Codex analog to Claude's
+    /// `organization_type` taxonomy string exists, so role is the raw value.
+    pub organization_type: Option<String>,
+    /// Reserved: Codex exposes no rate-limit-tier claim today.
+    pub rate_limit_tier: Option<String>,
+    /// Derived: `None` for free/unknown, `"subscription"` for paid personal
+    /// plans, the plan string (`"business"`/`"enterprise"`) when an org seat.
+    pub billing_type: Option<String>,
+    /// Where `plan_tier` came from (`"id_token"`, `"access_token"`, `"none"`),
+    /// for server-side auditing of sparse captures.
+    pub plan_detection_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -871,14 +919,27 @@ pub struct PricingCohort {
     pub spots_left: Option<i64>,
 }
 
+/// Which provider's detected plan drives a [`TierMismatch`] recommendation, so
+/// the upgrade banner can name the right connector. `Both` when the Claude and
+/// Codex plans imply the same recommended tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierRecommendationSource {
+    Claude,
+    Codex,
+    Both,
+}
+
 /// Set when an active subscriber's paid Headroom tier is lower than the tier
-/// implied by their detected Claude plan. `clamped` flips true once the grace
-/// window has elapsed, at which point standard paid-plan usage gating applies.
+/// implied by their detected Claude or Codex plan. `clamped` flips true once the
+/// grace window has elapsed, at which point standard paid-plan usage gating
+/// applies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TierMismatch {
     pub paid_tier: HeadroomSubscriptionTier,
     pub recommended_tier: HeadroomSubscriptionTier,
+    pub recommended_source: TierRecommendationSource,
     pub grace_ends_at: DateTime<Utc>,
     pub clamped: bool,
 }

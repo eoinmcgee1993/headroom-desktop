@@ -23,7 +23,7 @@ use crate::client_adapters::{
 use crate::insights::generate_daily_insights;
 use crate::models::{
     ActivityEvent, BootstrapProgress, ClaudeAccountProfile, ClaudeCodeProject, ClientStatus,
-    CodexRateLimitSnapshot, DailyInsight, DailySavingsPoint, DashboardState,
+    CodexAccountProfile, CodexRateLimitSnapshot, DailyInsight, DailySavingsPoint, DashboardState,
     HeadroomLearnPrereqStatus, HeadroomLearnStatus, HourlySavingsPoint, LaunchExperience,
     RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure, RuntimeUpgradeProgress,
     TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
@@ -494,11 +494,15 @@ pub struct AppState {
     /// `(history, fetched_at, fresh)` — `fresh` is false when `history` is a
     /// retained last-good value served because the latest fetch failed (proxy
     /// paused/unreachable), so it re-probes on the short miss TTL.
-    cached_headroom_history:
-        Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant, bool)>>,
+    cached_headroom_history: Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant, bool)>>,
     cached_rtk_gain_summary: Mutex<Option<(Option<RtkGainSummary>, Instant)>>,
     cached_rtk_today_stats: Mutex<Option<(Option<crate::models::RtkTodayStats>, Instant)>>,
     cached_claude_profile: Mutex<Option<(Option<String>, ClaudeAccountProfile, Instant)>>,
+    /// TTL-cached Codex identity profile, the Codex analog of
+    /// `cached_claude_profile`. Built by `pricing::detect_codex_profile` from
+    /// `~/.codex/auth.json` + the live `codex_plan_tier` slot; no network fetch,
+    /// so the cache is a plain value + timestamp.
+    cached_codex_profile: Mutex<Option<(Option<CodexAccountProfile>, Instant)>>,
     /// When the current run of transient profile-fetch failures began. Set the
     /// first time we suppress a transient error (and serve the last good
     /// profile), cleared on the next successful fetch. Once the run exceeds
@@ -633,6 +637,7 @@ impl AppState {
             cached_rtk_gain_summary: Mutex::new(None),
             cached_rtk_today_stats: Mutex::new(None),
             cached_claude_profile: Mutex::new(None),
+            cached_codex_profile: Mutex::new(None),
             stale_profile_since: Mutex::new(None),
             last_pushed_identity_fingerprint: Mutex::new(None),
             last_complete_identity_fetch_at: Mutex::new(None),
@@ -3041,6 +3046,24 @@ impl AppState {
     #[cfg(test)]
     pub fn set_codex_plan_tier_for_test(&self, tier: crate::models::CodexPlanTier) {
         *self.codex_plan_tier.lock() = Some(tier);
+    }
+
+    /// TTL-cached Codex identity profile, the Codex analog of
+    /// `cached_claude_profile`. Reads `~/.codex/auth.json` at most once per TTL.
+    /// `None` when nothing is known yet (no auth.json and no live capture).
+    pub fn cached_codex_profile(&self) -> Option<CodexAccountProfile> {
+        const TTL: Duration = Duration::from_secs(300);
+        {
+            let cache = self.cached_codex_profile.lock();
+            if let Some((profile, at)) = &*cache {
+                if at.elapsed() < TTL {
+                    return profile.clone();
+                }
+            }
+        }
+        let profile = pricing::detect_codex_profile(self);
+        *self.cached_codex_profile.lock() = Some((profile.clone(), Instant::now()));
+        profile
     }
 
     /// Codex-only parallel to `apply_pricing_gate_status`. Flips `codex_bypass`

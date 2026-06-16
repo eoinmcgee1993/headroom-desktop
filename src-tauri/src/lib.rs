@@ -44,9 +44,9 @@ use crate::models::{
     ActivityFeedResponse, BillingPeriod, BootstrapProgress, ClaudeAccountProfile,
     ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
     ClientSetupVerification, DailySavingsPoint, DashboardState, HeadroomAuthCodeRequest,
-    HeadroomLearnPrereqStatus,
-    HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, ResearchCandidate,
-    RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
+    HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
+    HeadroomSubscriptionTier, ResearchCandidate, RuntimeStatus, RuntimeUpgradeProgress,
+    TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -1155,6 +1155,27 @@ fn probe_backend_readyz_outcome_with_timeout(timeout: std::time::Duration) -> St
             let status = response.status();
             if status.is_success() {
                 "ok".to_string()
+            } else if status.as_u16() == 503 {
+                // 503 = readiness failure: the process is alive and answering,
+                // but a component check is false. Parse the body's per-check
+                // breakdown so the watchdog can tell a transient upstream blip
+                // (`http_503:upstream`) apart from a wedged core component and
+                // route them differently. Falls back to bare "http_503" when the
+                // body can't be read or parsed.
+                match response.text() {
+                    Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                        Ok(json) => {
+                            let csv = readyz_failed_checks_csv(&json);
+                            if csv.is_empty() {
+                                "http_503".to_string()
+                            } else {
+                                format!("http_503:{csv}")
+                            }
+                        }
+                        Err(_) => "http_503".to_string(),
+                    },
+                    Err(_) => "http_503".to_string(),
+                }
             } else {
                 format!("http_{}", status.as_u16())
             }
@@ -1169,6 +1190,50 @@ fn probe_backend_readyz_outcome_with_timeout(timeout: std::time::Duration) -> St
             }
         }
     }
+}
+
+/// Comma-joined, sorted names of the unhealthy components in a `/readyz`
+/// payload — those whose `checks.<name>.ready` is `false`. Empty when the body
+/// has no `checks` object or every check is ready.
+fn readyz_failed_checks_csv(body: &serde_json::Value) -> String {
+    let Some(checks) = body.get("checks").and_then(|c| c.as_object()) else {
+        return String::new();
+    };
+    let mut failed: Vec<&str> = checks
+        .iter()
+        .filter(|(_, v)| v.get("ready").and_then(|r| r.as_bool()) == Some(false))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    failed.sort_unstable();
+    failed.join(",")
+}
+
+/// Failing-check names parsed out of a `http_503:<a>,<b>` outcome string.
+/// `None` for any other outcome (including a bare `http_503` whose body
+/// couldn't be parsed), so callers treat unknown 503s as the conservative
+/// give-up default.
+fn parse_readyz_failed_checks(outcome: &str) -> Option<Vec<&str>> {
+    outcome
+        .strip_prefix("http_503:")
+        .map(|rest| rest.split(',').filter(|s| !s.is_empty()).collect())
+}
+
+/// True when `/readyz` returned 503 and the *only* unhealthy component is the
+/// upstream-connectivity probe. The proxy process is healthy; this is a
+/// transient network/upstream blip (the upstream check is cached 30s) that
+/// self-heals on the next refresh. Tearing Python down and bypassing routes to
+/// the same unreachable upstream, so it buys nothing.
+fn readyz_failure_is_upstream_only(outcome: &str) -> bool {
+    matches!(parse_readyz_failed_checks(outcome), Some(checks) if checks == ["upstream"])
+}
+
+/// True when `/readyz` returned 503 with at least one *core* component
+/// (startup, http_client, cache, rate_limiter, memory) unhealthy — a wedged
+/// backend that a restart may clear, distinct from a pure upstream blip.
+fn readyz_failure_has_core_unhealthy(outcome: &str) -> bool {
+    parse_readyz_failed_checks(outcome)
+        .map(|checks| checks.iter().any(|c| *c != "upstream"))
+        .unwrap_or(false)
 }
 
 /// Capture once per "down episode" when the watchdog gives up on restarting
@@ -1204,6 +1269,22 @@ fn capture_watchdog_give_up(
         .map(|child| child.id());
     let port_accepts_tcp = crate::state::proxy_port_accepts_connection();
     let process_cpu_secs = tracked_pid.and_then(crate::state::tracked_process_cpu_time_secs);
+    // CPU *rate*, not cumulative. `process_cpu_secs` is lifetime CPU
+    // (`ps -o time=`); any long-lived-but-now-idle process carries a large
+    // cumulative value, so using it as a deadlock proxy mislabels a healthy
+    // idle process as a deadlock (Sentry proxy_unreachable_post_boot showed 12s
+    // cumulative + 28min silent flagged as Error). Re-sample after a short
+    // window and treat the process as actively burning CPU only if the counter
+    // moved — a spinning deadlock keeps climbing, an idle process stays flat.
+    let cpu_actively_burning = match (tracked_pid, process_cpu_secs) {
+        (Some(pid), Some(before)) => {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            crate::state::tracked_process_cpu_time_secs(pid)
+                .map(|after| after > before)
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
     let log_silent_secs = crate::state::newest_proxy_log_mtime(&logs_dir).and_then(|mtime| {
         std::time::SystemTime::now()
             .duration_since(mtime)
@@ -1227,12 +1308,11 @@ fn capture_watchdog_give_up(
 
     // Default to Warning: give-up is the documented recovery path, not a
     // bug. Escalate to Error only when there's a real signal something is
-    // stuck — spawn keeps erroring, or the child is alive and burning CPU
-    // (likely deadlock) while the log has gone quiet. Plain network/restart
-    // blips stay at Warning so they don't pollute the Error inbox.
-    let cpu_deadlock_signal = report.tracked_pid.is_some()
-        && report.process_cpu_secs.unwrap_or(0) >= 5
-        && report.log_silent_secs.unwrap_or(0) >= 30;
+    // stuck — spawn keeps erroring, or the child is alive and *actively*
+    // burning CPU (likely deadlock) while the log has gone quiet. Plain
+    // network/restart blips stay at Warning so they don't pollute the Error
+    // inbox.
+    let cpu_deadlock_signal = cpu_actively_burning && report.log_silent_secs.unwrap_or(0) >= 30;
     let level = if report.last_startup_error.is_some() || cpu_deadlock_signal {
         sentry::Level::Error
     } else {
@@ -2356,21 +2436,35 @@ fn pattern_matches_project(content: &str, entity_refs: &[String], project_path: 
 }
 
 #[tauri::command]
-fn start_headroom_learn(app: AppHandle, project_path: String) -> Result<(), String> {
+fn start_headroom_learn(
+    app: AppHandle,
+    agent: String,
+    project_path: Option<String>,
+) -> Result<(), String> {
+    let agent = LearnAgent::parse(&agent)?;
+    if matches!(agent, LearnAgent::Claude) && project_path.is_none() {
+        return Err("A project path is required for Claude Headroom Learn.".into());
+    }
     check_headroom_learn_prereqs(
+        agent,
         crate::state::headroom_learn_platform_message().as_deref(),
         &detect_headroom_learn_prereq_status(),
     )?;
 
+    // Codex isn't project-organized, so its run-status is keyed on a stable id.
+    let run_key = match agent {
+        LearnAgent::Claude => project_path.clone().unwrap_or_default(),
+        LearnAgent::Codex => "codex".to_string(),
+    };
     {
         let state: tauri::State<'_, AppState> = app.state();
-        state.begin_headroom_learn_run(&project_path)?;
+        state.begin_headroom_learn_run(&run_key)?;
     }
 
     let app_handle = app.clone();
     std::thread::spawn(move || {
         let state: tauri::State<'_, AppState> = app_handle.state();
-        let run = execute_headroom_learn_run(&state, &project_path);
+        let run = execute_headroom_learn_run(&state, agent, project_path.as_deref());
         state.complete_headroom_learn_run(run.success, run.summary, run.error, run.output_tail);
     });
 
@@ -3272,23 +3366,62 @@ pub fn headroom_memory_db_path() -> std::path::PathBuf {
     crate::storage::memory_db_path(&crate::storage::app_data_dir())
 }
 
+/// Which coding agent a Headroom Learn run targets. Determines the session
+/// source, the analysis backend, and which context/memory files get written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LearnAgent {
+    Claude,
+    Codex,
+}
+
+impl LearnAgent {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "claude" => Ok(LearnAgent::Claude),
+            "codex" => Ok(LearnAgent::Codex),
+            other => Err(format!("Unknown Headroom Learn agent: {other}")),
+        }
+    }
+}
+
 pub(crate) fn detect_headroom_learn_prereq_status() -> HeadroomLearnPrereqStatus {
-    let path = claude_cli::detect_claude_cli();
+    let claude_path = claude_cli::detect_claude_cli();
+    let codex_path = client_adapters::detect_codex_cli();
     HeadroomLearnPrereqStatus {
-        claude_cli_available: path.is_some(),
-        claude_cli_path: path.map(|p| p.display().to_string()),
+        claude_cli_available: claude_path.is_some(),
+        claude_cli_path: claude_path.map(|p| p.display().to_string()),
+        codex_cli_available: codex_path.is_some(),
+        codex_cli_path: codex_path.map(|p| p.display().to_string()),
+        codex_logged_in: client_adapters::codex_logged_in(),
     }
 }
 
 fn check_headroom_learn_prereqs(
+    agent: LearnAgent,
     platform_disabled_reason: Option<&str>,
     prereq: &HeadroomLearnPrereqStatus,
 ) -> Result<(), String> {
     if let Some(reason) = platform_disabled_reason {
         return Err(reason.to_string());
     }
-    if !prereq.claude_cli_available {
-        return Err("Install the Claude Code CLI (`claude`) to enable Headroom Learn.".into());
+    match agent {
+        LearnAgent::Claude => {
+            if !prereq.claude_cli_available {
+                return Err(
+                    "Install the Claude Code CLI (`claude`) to enable Headroom Learn.".into(),
+                );
+            }
+        }
+        LearnAgent::Codex => {
+            if !prereq.codex_cli_available {
+                return Err(
+                    "Install the Codex CLI (`codex`) to enable Headroom Learn for Codex.".into(),
+                );
+            }
+            if !prereq.codex_logged_in {
+                return Err("Sign in to the Codex CLI with your ChatGPT account to enable Headroom Learn for Codex.".into());
+            }
+        }
     }
     Ok(())
 }
@@ -3395,11 +3528,25 @@ fn extract_llm_failure_warnings(stderr: &str) -> Option<String> {
     }
 }
 
-fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomLearnRunResult {
-    let project_name = Path::new(project_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(project_path);
+fn execute_headroom_learn_run(
+    state: &AppState,
+    agent: LearnAgent,
+    project_path: Option<&str>,
+) -> HeadroomLearnRunResult {
+    // `run_id` keys the run-status + log file; `project_name` is the user-facing
+    // label. Codex isn't project-organized, so it uses a stable "codex" id.
+    let (run_id, project_name): (&str, String) = match agent {
+        LearnAgent::Claude => {
+            let path = project_path.unwrap_or("");
+            let name = Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(path)
+                .to_string();
+            (path, name)
+        }
+        LearnAgent::Codex => ("codex", "Codex sessions".to_string()),
+    };
     let entrypoint = state.tool_manager.headroom_entrypoint();
     if !entrypoint.exists() {
         return HeadroomLearnRunResult {
@@ -3413,57 +3560,72 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
         };
     }
 
+    let cli_path = match agent {
+        LearnAgent::Claude => claude_cli::detect_claude_cli(),
+        LearnAgent::Codex => client_adapters::detect_codex_cli(),
+    };
+
     let mut command = Command::new(&entrypoint);
+    command.arg("learn").arg("--apply");
+    match agent {
+        LearnAgent::Claude => {
+            // Per-project Claude scan; writes CLAUDE.md / MEMORY.md for the
+            // passed --project.
+            command
+                .arg("--project")
+                .arg(project_path.unwrap_or_default())
+                .arg("--agent")
+                .arg("claude")
+                .env("HEADROOM_LEARN_CLI", "claude");
+        }
+        LearnAgent::Codex => {
+            // Codex scans all of ~/.codex/sessions (no --project) and writes
+            // ~/.codex/AGENTS.md + instructions.md. Force --model codex-cli so
+            // analysis runs through `codex exec` on the user's ChatGPT
+            // subscription rather than auto-detecting an API key or the claude CLI.
+            command
+                .arg("--agent")
+                .arg("codex")
+                .arg("--model")
+                .arg("codex-cli")
+                .env("HEADROOM_LEARN_CLI", "codex");
+        }
+    }
     command
-        .arg("learn")
-        .arg("--project")
-        .arg(project_path)
-        .arg("--apply")
-        // Headroom-desktop only manages CLAUDE.md / MEMORY.md for Claude Code.
-        // Skip codex / gemini analysis so we don't burn LLM budget producing
-        // recommendations the desktop won't apply anywhere.
-        .arg("--agent")
-        .arg("claude")
-        // Run from an app-owned directory, not project_path. The project is
-        // passed explicitly via --project, so CWD is irrelevant to the analysis.
-        // If project_path lives in a TCC-protected location, getcwd() in the
-        // spawned `claude -p` shells fails with EPERM ("shell-init: error
-        // retrieving current directory ... Operation not permitted"), which the
-        // tool surfaces as an exit-1 failure. The entrypoint's parent dir
-        // (inside Application Support) is always accessible.
+        // Run from an app-owned directory. For Claude the project is passed
+        // explicitly via --project, so CWD is irrelevant; running elsewhere also
+        // avoids getcwd() EPERM in spawned CLI shells when the project lives in a
+        // TCC-protected location. The entrypoint's parent (inside Application
+        // Support) is always accessible.
         .current_dir(
             entrypoint
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| project_path.into()),
+                .unwrap_or_else(|| std::path::PathBuf::from("/")),
         )
         .env("PYTHONNOUSERSITE", "1")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         .env("PIP_NO_INPUT", "1")
-        .env("HEADROOM_LEARN_CLI", "claude")
-        // Force the claude CLI backend: the analyzer picks LiteLLM over
-        // HEADROOM_LEARN_CLI when any of these keys is set in the parent env.
+        // Force the selected CLI backend: the analyzer picks LiteLLM over
+        // HEADROOM_LEARN_CLI / --model codex-cli when any of these keys is set
+        // in the parent env.
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("OPENAI_API_KEY")
         .env_remove("GEMINI_API_KEY")
         // Don't pin ANTHROPIC_MODEL here: it's a LiteLLM identifier that the
-        // analyzer never reads on the CLI path (litellm is skipped when
-        // API keys are stripped above). Worse, it's inherited by the spawned
-        // `claude -p` subprocess, where Claude Code's CLI does honor it —
+        // analyzer never reads on the CLI path. Worse, it's inherited by the
+        // spawned `claude -p` subprocess, where Claude Code's CLI does honor it —
         // and "claude-sonnet-4-6" is not a valid Claude Code model alias,
-        // which routes the call to a slow/hung path past 120s. Letting
-        // claude -p use its default model fixes the hang.
+        // routing the call to a slow/hung path past 120s.
         .env_remove("ANTHROPIC_MODEL");
-    if let Some(claude_path) = claude_cli::detect_claude_cli() {
-        if let Some(dir) = claude_path.parent() {
-            let existing = std::env::var("PATH").unwrap_or_default();
-            let augmented = if existing.is_empty() {
-                dir.display().to_string()
-            } else {
-                format!("{}:{}", dir.display(), existing)
-            };
-            command.env("PATH", augmented);
-        }
+    if let Some(dir) = cli_path.as_ref().and_then(|p| p.parent()) {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let augmented = if existing.is_empty() {
+            dir.display().to_string()
+        } else {
+            format!("{}:{}", dir.display(), existing)
+        };
+        command.env("PATH", augmented);
     }
     let output = command.output();
 
@@ -3543,7 +3705,8 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
                     .collect();
                 let stderr_head: String = stderr.chars().take(2000).collect();
                 let stdout_head: String = stdout.chars().take(2000).collect();
-                let claude_cli_path = claude_cli::detect_claude_cli()
+                let cli_path_str = cli_path
+                    .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "not_found".into());
                 let summary_msg =
@@ -3553,6 +3716,13 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
                 sentry::with_scope(
                     |scope| {
                         scope.set_tag("flow", "headroom_learn");
+                        scope.set_tag(
+                            "learn_agent",
+                            match agent {
+                                LearnAgent::Claude => "claude",
+                                LearnAgent::Codex => "codex",
+                            },
+                        );
                         scope.set_tag("exit_code", &exit_code_str);
                         scope.set_extra("exit_status", output.status.to_string().into());
                         scope.set_extra(
@@ -3564,7 +3734,7 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
                         scope.set_extra("output_tail", fail_tail.clone().into());
                         scope.set_extra("stderr_head", stderr_head.into());
                         scope.set_extra("stdout_head", stdout_head.into());
-                        scope.set_extra("claude_cli_path", claude_cli_path.into());
+                        scope.set_extra("cli_path", cli_path_str.into());
                         scope.set_extra("project_name", project_name.to_string().into());
                         scope.set_fingerprint(Some(fingerprint.as_slice()));
                     },
@@ -3603,11 +3773,15 @@ fn execute_headroom_learn_run(state: &AppState, project_path: &str) -> HeadroomL
         }
     };
 
-    let log_path = state.tool_manager.headroom_learn_log_path(project_path);
+    let log_path = state.tool_manager.headroom_learn_log_path(run_id);
     let log_content = format!(
-        "[{}] headroom learn --project {}\nstatus: {}\n\n--- stdout ---\n{}\n\n--- stderr ---\n{}\n",
+        "[{}] headroom learn --agent {} (target={})\nstatus: {}\n\n--- stdout ---\n{}\n\n--- stderr ---\n{}\n",
         Utc::now().to_rfc3339(),
-        project_path,
+        match agent {
+            LearnAgent::Claude => "claude",
+            LearnAgent::Codex => "codex",
+        },
+        run_id,
         status_copy,
         stdout,
         stderr
@@ -3752,15 +3926,18 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut last_connector_check = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
             .unwrap_or_else(std::time::Instant::now);
-        let mut cached_connector_enabled: bool = client_adapters::is_claude_code_enabled();
+        let mut cached_connector_enabled: bool =
+            client_adapters::is_claude_code_enabled() || client_adapters::is_codex_enabled();
 
         loop {
-            // Re-check the Claude connector at most every ~2s, regardless of
-            // whether the tick rate is booting-fast (260ms) or idle-slow
-            // (1500ms). Time-based instead of tick-count based so the cadence
-            // stays correct across the adaptive sleep below.
+            // Re-check connectors at most every ~2s, regardless of whether the
+            // tick rate is booting-fast (260ms) or idle-slow (1500ms). Time-based
+            // instead of tick-count based so the cadence stays correct across the
+            // adaptive sleep below. "Connected" means any supported connector
+            // (Claude Code or Codex) is routing through Headroom.
             if last_connector_check.elapsed() >= std::time::Duration::from_secs(2) {
-                cached_connector_enabled = client_adapters::is_claude_code_enabled();
+                cached_connector_enabled = client_adapters::is_claude_code_enabled()
+                    || client_adapters::is_codex_enabled();
                 last_connector_check = std::time::Instant::now();
             }
 
@@ -3793,11 +3970,15 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 let tooltip = match visual {
                     TrayRuntimeVisual::Booting => "Headroom — starting",
                     TrayRuntimeVisual::Running => "Headroom — active",
-                    TrayRuntimeVisual::Paused => "Headroom — paused (Claude Code running normally)",
+                    TrayRuntimeVisual::Paused => {
+                        "Headroom — paused (Claude Code or Codex running normally)"
+                    }
                     TrayRuntimeVisual::Unhealthy => {
                         "Headroom — proxy unreachable, attempting restart"
                     }
-                    TrayRuntimeVisual::Disconnected => "Headroom — Claude Code not connected",
+                    TrayRuntimeVisual::Disconnected => {
+                        "Headroom — Claude Code or Codex not connected"
+                    }
                     TrayRuntimeVisual::Off => "Headroom — off",
                 };
 
@@ -3867,7 +4048,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
-                                    "Claude Code is disconnected — open Headroom to re-enable.",
+                                    "Claude Code or Codex is disconnected — open Headroom to re-enable.",
                                     Some("connectors".into()),
                                 );
                             }
@@ -4097,10 +4278,22 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             // perfectly healthy proxy can miss that window. Re-probe the
             // backend's /readyz directly with a 5s budget — if it answers, the
             // process is alive and merely busy, so don't count it as down.
-            if probe_backend_readyz_outcome_with_timeout(std::time::Duration::from_secs(5)) == "ok"
-            {
+            let tolerant_outcome =
+                probe_backend_readyz_outcome_with_timeout(std::time::Duration::from_secs(5));
+            if tolerant_outcome == "ok" {
                 log::info!(
                     "watchdog: backend /readyz answered on tolerant 5s re-probe; not counting failure"
+                );
+                consecutive_failures = 0;
+                continue;
+            }
+            // A 503 whose only failing check is upstream connectivity means the
+            // process itself is alive and healthy — only the cached upstream
+            // probe is down (network blip / sleep-wake). /readyz is a readiness
+            // signal, not a liveness one; don't count it as the process dying.
+            if readyz_failure_is_upstream_only(&tolerant_outcome) {
+                log::info!(
+                    "watchdog: backend /readyz 503 with only upstream unhealthy (transient connectivity); not counting failure"
                 );
                 consecutive_failures = 0;
                 continue;
@@ -4131,17 +4324,35 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     consecutive_failures = 0;
                     continue;
                 }
-                // Hung process: TCP port is accepting connections (the process
-                // is alive) but /readyz never responds. ensure_headroom_running
-                // returns Ok immediately when try_wait says the child is still
-                // alive, so the three restart attempts above were all no-ops.
-                // Kill the stuck process and start fresh before giving up
-                // permanently. We only do this once per down episode
-                // (hung_kill_attempted) so a persistently-hung new process
-                // doesn't loop; it falls through to the give-up path below.
-                if backend_readyz_outcome == "timeout" && !hung_kill_attempted {
+                // Upstream-only 503: process alive and answering, only the
+                // cached upstream-connectivity probe is failing. Bypassing to
+                // Anthropic routes to the same unreachable upstream and buys
+                // nothing, and the process self-heals on the next 30s upstream
+                // re-check — so keep it up instead of auto-pausing. Backstops
+                // the same guard at the tolerant re-probe above.
+                if readyz_failure_is_upstream_only(&backend_readyz_outcome) {
                     log::info!(
-                        "watchdog: backend /readyz hung (timeout) after {consecutive_failures} failures; force-killing and restarting"
+                        "watchdog: backend /readyz 503 (upstream-only) after {consecutive_failures} failures; process healthy, skipping auto-pause"
+                    );
+                    consecutive_failures = 0;
+                    continue;
+                }
+                // Wedged backend: either /readyz never responds ("timeout", the
+                // event loop is held) or it 503s with a *core* component
+                // unhealthy (startup/cache/memory/etc. failed to initialize).
+                // Both are states a clean restart may clear, and
+                // ensure_headroom_running returns Ok immediately when try_wait
+                // says the child is still alive, so the three restart attempts
+                // above were all no-ops. Kill the stuck process and start fresh
+                // before giving up permanently. Once per down episode
+                // (hung_kill_attempted) so a persistently-wedged new process
+                // doesn't loop; it falls through to the give-up path below.
+                if (backend_readyz_outcome == "timeout"
+                    || readyz_failure_has_core_unhealthy(&backend_readyz_outcome))
+                    && !hung_kill_attempted
+                {
+                    log::info!(
+                        "watchdog: backend wedged ({backend_readyz_outcome}) after {consecutive_failures} failures; force-killing and restarting"
                     );
                     hung_kill_attempted = true;
                     state.stop_headroom();
@@ -4754,22 +4965,23 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
-        beta_channel_enabled_from, build_release_updater_config, build_watchdog_give_up_report,
-        check_headroom_learn_prereqs, classify_bootstrap_failure, classify_upgrade_error,
-        compute_tray_window_position, count_memories_created_today, debounced_tray_runtime_visual,
-        delete_applied_pattern, empty_live_learnings_for_projects, extract_llm_failure_warnings,
-        fetch_transformations_feed_from, install_pending_update, is_disk_full_signal,
-        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
-        is_prerelease_version, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        parse_live_learnings, parse_request_count_from_stats_body, parse_updater_endpoint_list,
-        pattern_matches_project, physical_rect_from_rect, read_applied_patterns_for_project,
-        auto_resume_backoff, resolve_release_updater_config, select_updater_endpoints,
-        store_checked_update,
-        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter,
-        AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
-        InstallableAppUpdate, MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual,
-        DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
+        build_watchdog_give_up_report, check_headroom_learn_prereqs, classify_bootstrap_failure,
+        classify_upgrade_error, compute_tray_window_position, count_memories_created_today,
+        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
+        extract_llm_failure_warnings, fetch_transformations_feed_from, install_pending_update,
+        is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
+        is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, parse_live_learnings,
+        parse_request_count_from_stats_body, parse_updater_endpoint_list, pattern_matches_project,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
+        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -5476,22 +5688,30 @@ mod tests {
         assert_eq!(lifetime_token_milestone_kind(20_000_000), "repeating_10m");
     }
 
+    fn learn_prereq(
+        claude: bool,
+        codex_cli: bool,
+        codex_logged_in: bool,
+    ) -> HeadroomLearnPrereqStatus {
+        HeadroomLearnPrereqStatus {
+            claude_cli_available: claude,
+            claude_cli_path: claude.then(|| "/usr/bin/claude".to_string()),
+            codex_cli_available: codex_cli,
+            codex_cli_path: codex_cli.then(|| "/usr/bin/codex".to_string()),
+            codex_logged_in,
+        }
+    }
+
     #[test]
     fn check_headroom_learn_prereqs_passes_when_cli_available() {
-        let prereq = HeadroomLearnPrereqStatus {
-            claude_cli_available: true,
-            claude_cli_path: Some("/usr/bin/claude".into()),
-        };
-        assert!(check_headroom_learn_prereqs(None, &prereq).is_ok());
+        let prereq = learn_prereq(true, false, false);
+        assert!(check_headroom_learn_prereqs(LearnAgent::Claude, None, &prereq).is_ok());
     }
 
     #[test]
     fn check_headroom_learn_prereqs_returns_install_message_when_cli_missing() {
-        let prereq = HeadroomLearnPrereqStatus {
-            claude_cli_available: false,
-            claude_cli_path: None,
-        };
-        let err = check_headroom_learn_prereqs(None, &prereq).unwrap_err();
+        let prereq = learn_prereq(false, false, false);
+        let err = check_headroom_learn_prereqs(LearnAgent::Claude, None, &prereq).unwrap_err();
         assert!(
             err.contains("Install the Claude Code CLI"),
             "expected install hint, got: {err}"
@@ -5500,12 +5720,37 @@ mod tests {
 
     #[test]
     fn check_headroom_learn_prereqs_prefers_platform_message_over_cli_check() {
-        let prereq = HeadroomLearnPrereqStatus {
-            claude_cli_available: false,
-            claude_cli_path: None,
-        };
-        let err = check_headroom_learn_prereqs(Some("Linux not supported"), &prereq).unwrap_err();
+        let prereq = learn_prereq(false, false, false);
+        let err =
+            check_headroom_learn_prereqs(LearnAgent::Claude, Some("Linux not supported"), &prereq)
+                .unwrap_err();
         assert_eq!(err, "Linux not supported");
+    }
+
+    #[test]
+    fn check_headroom_learn_prereqs_codex_passes_when_cli_present_and_logged_in() {
+        let prereq = learn_prereq(false, true, true);
+        assert!(check_headroom_learn_prereqs(LearnAgent::Codex, None, &prereq).is_ok());
+    }
+
+    #[test]
+    fn check_headroom_learn_prereqs_codex_requires_cli_install() {
+        let prereq = learn_prereq(true, false, false);
+        let err = check_headroom_learn_prereqs(LearnAgent::Codex, None, &prereq).unwrap_err();
+        assert!(
+            err.contains("Install the Codex CLI"),
+            "expected codex install hint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_headroom_learn_prereqs_codex_requires_login_when_cli_present() {
+        let prereq = learn_prereq(false, true, false);
+        let err = check_headroom_learn_prereqs(LearnAgent::Codex, None, &prereq).unwrap_err();
+        assert!(
+            err.contains("Sign in to the Codex CLI"),
+            "expected codex sign-in hint, got: {err}"
+        );
     }
 
     #[test]
@@ -6240,6 +6485,52 @@ Some unrelated content.
         assert_eq!(report.process_cpu_secs, Some(120));
         assert_eq!(report.log_silent_secs, Some(30));
         assert_eq!(report.backend_readyz_outcome, "timeout");
+    }
+
+    #[test]
+    fn readyz_failed_checks_csv_lists_only_unhealthy_sorted() {
+        let body = serde_json::json!({
+            "checks": {
+                "startup": { "ready": true },
+                "upstream": { "ready": false },
+                "memory": { "ready": false },
+                "cache": { "ready": true },
+            }
+        });
+        assert_eq!(readyz_failed_checks_csv(&body), "memory,upstream");
+    }
+
+    #[test]
+    fn readyz_failed_checks_csv_empty_when_all_ready_or_no_checks() {
+        let all_ready = serde_json::json!({ "checks": { "upstream": { "ready": true } } });
+        assert_eq!(readyz_failed_checks_csv(&all_ready), "");
+        let no_checks = serde_json::json!({ "ready": false });
+        assert_eq!(readyz_failed_checks_csv(&no_checks), "");
+    }
+
+    #[test]
+    fn readyz_failure_is_upstream_only_matches_only_upstream() {
+        assert!(readyz_failure_is_upstream_only("http_503:upstream"));
+        assert!(!readyz_failure_is_upstream_only("http_503:upstream,memory"));
+        assert!(!readyz_failure_is_upstream_only("http_503:memory"));
+        assert!(!readyz_failure_is_upstream_only("http_503"));
+        assert!(!readyz_failure_is_upstream_only("ok"));
+        assert!(!readyz_failure_is_upstream_only("timeout"));
+    }
+
+    #[test]
+    fn readyz_failure_has_core_unhealthy_ignores_upstream_only() {
+        assert!(readyz_failure_has_core_unhealthy("http_503:memory"));
+        assert!(readyz_failure_has_core_unhealthy(
+            "http_503:upstream,memory"
+        ));
+        assert!(readyz_failure_has_core_unhealthy(
+            "http_503:startup,upstream"
+        ));
+        assert!(!readyz_failure_has_core_unhealthy("http_503:upstream"));
+        assert!(!readyz_failure_has_core_unhealthy("http_503"));
+        assert!(!readyz_failure_has_core_unhealthy("ok"));
+        assert!(!readyz_failure_has_core_unhealthy("timeout"));
     }
 
     #[test]

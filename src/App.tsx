@@ -68,6 +68,7 @@ import {
   getUpgradePlans,
   getFounderStepPricing,
   isTierDowngrade,
+  tierRecommendationSourceLabel,
   upgradePlanIntentLabel,
   type BillingPeriod,
   type PricingAudience,
@@ -243,11 +244,16 @@ const idleHeadroomLearnStatus: HeadroomLearnStatus = {
 
 const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
   claudeCliAvailable: false,
-  claudeCliPath: null
+  claudeCliPath: null,
+  codexCliAvailable: false,
+  codexCliPath: null,
+  codexLoggedIn: false
 };
 
 const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
 const CLAUDE_CODE_INSTALL_CURL_CMD = "curl -fsSL https://claude.ai/install.sh | bash";
+const CODEX_CLI_INSTALL_CMD = "npm install -g @openai/codex";
+const CODEX_CLI_LOGIN_CMD = "codex login";
 const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
 const CODEX_INSTALL_NPM_CMD = "npm i -g @openai/codex";
 
@@ -956,9 +962,10 @@ export default function App() {
     }
     const paidLabel = upgradePlanIntentLabel(mismatch.paidTier);
     const recommendedLabel = upgradePlanIntentLabel(mismatch.recommendedTier);
+    const sourceLabel = tierRecommendationSourceLabel(mismatch.recommendedSource);
     void invoke("show_notification", {
       title: "Upgrade your Headroom plan",
-      body: `Your Claude ${recommendedLabel} plan is above your Headroom ${paidLabel} plan. Upgrade to keep unlimited optimization.`,
+      body: `Your ${sourceLabel} usage needs the Headroom ${recommendedLabel} plan, above your current ${paidLabel} plan. Upgrade to keep unlimited optimization.`,
     }).catch(() => {});
     window.localStorage.setItem(STORAGE_KEY, mismatch.recommendedTier);
   }, [pricingStatus?.tierMismatch?.recommendedTier, pricingStatus?.tierMismatch]);
@@ -1802,6 +1809,18 @@ export default function App() {
   // Any supported connector (Claude Code, Codex, ...) being enabled counts as
   // "connected" — the request-count poller below is connector-agnostic.
   const anyConnectorEnabled = hasEnabledConnector(connectors);
+
+  // Which agents Headroom Learn should offer, driven by the enabled connectors.
+  const claudeLearnEnabled = getClaudeConnector(connectors)?.enabled ?? false;
+  const codexLearnEnabled = aggregateClientConnectors(connectors).some(
+    (connector) => connector.clientId === "codex" && connector.enabled
+  );
+  const learnBlurb =
+    claudeLearnEnabled && codexLearnEnabled
+      ? "Headroom learns from your Claude Code and Codex sessions. When an agent repeats a mistake, Headroom updates that agent's memory — CLAUDE.md / MEMORY.md for Claude Code, AGENTS.md / instructions.md for Codex — so it doesn't happen again."
+      : codexLearnEnabled
+        ? "Headroom learns from your Codex sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
+        : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.md.";
   useEffect(() => {
     setConnectorPhase((prev) => {
       if (!anyConnectorEnabled) return "disabled";
@@ -2378,7 +2397,7 @@ export default function App() {
     await autoConfigureConnectorsForLauncher();
   }
 
-  async function runHeadroomLearn(projectPath: string) {
+  async function runHeadroomLearn(agent: "claude" | "codex", projectPath?: string) {
     if (runtimeStatus?.headroomLearnSupported === false) {
       setHeadroomLearnStatus((current) => ({
         ...current,
@@ -2391,15 +2410,20 @@ export default function App() {
       return;
     }
 
-    const selectedProject =
-      claudeProjects.find((project) => project.projectPath === projectPath) ?? null;
-    const displayName = selectedProject?.displayName ?? projectPath;
+    // Codex isn't project-organized, so it shares a stable run key.
+    const runKey = agent === "codex" ? "codex" : (projectPath ?? "");
+    const displayName =
+      agent === "codex"
+        ? "Codex sessions"
+        : (claudeProjects.find((project) => project.projectPath === projectPath)?.displayName ??
+          projectPath ??
+          "");
     const startupSummary = `Running headroom learn for ${displayName}.`;
     setHeadroomLearnBusy(true);
     setHeadroomLearnStatus((current) => ({
       ...current,
       running: true,
-      projectPath,
+      projectPath: runKey,
       projectDisplayName: displayName,
       startedAt: new Date().toISOString(),
       finishedAt: null,
@@ -2409,11 +2433,11 @@ export default function App() {
       error: null
     }));
     try {
-      await invoke("start_headroom_learn", { projectPath });
+      await invoke("start_headroom_learn", { agent, projectPath: projectPath ?? null });
       for (const waitMs of [180, 350, 650, 900, 1200, 1800, 2400]) {
         await delay(waitMs);
         const status = await invoke<HeadroomLearnStatus>("get_headroom_learn_status", {
-          projectPath
+          projectPath: runKey
         });
         setHeadroomLearnStatus(status);
         if (!status.running) {
@@ -2432,19 +2456,25 @@ export default function App() {
     }
   }
 
-  async function handleRunHeadroomLearn(projectPath: string) {
-    setSelectedClaudeProjectPath(projectPath);
+  async function handleRunHeadroomLearn(agent: "claude" | "codex", projectPath?: string) {
+    if (agent === "claude" && projectPath) {
+      setSelectedClaudeProjectPath(projectPath);
+    }
     try {
       const status = await invoke<HeadroomLearnPrereqStatus>("get_headroom_learn_prereq_status");
       setHeadroomLearnPrereq(status);
-      if (!status.claudeCliAvailable) {
+      const ready =
+        agent === "codex"
+          ? status.codexCliAvailable && status.codexLoggedIn
+          : status.claudeCliAvailable;
+      if (!ready) {
         return;
       }
     } catch {
       setHeadroomLearnPrereq(idleHeadroomLearnPrereqStatus);
       return;
     }
-    await runHeadroomLearn(projectPath);
+    await runHeadroomLearn(agent, projectPath);
   }
 
   async function openExternalLink(url: string) {
@@ -4176,8 +4206,8 @@ export default function App() {
                   <h2 className="tier-mismatch-banner__title">Upgrade your Headroom plan</h2>
                   <p className="tier-mismatch-banner__message">
                     {tierMismatch.clamped
-                      ? `Your Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan no longer matches your Claude ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} usage, so weekly usage limits now apply. Upgrade to restore unlimited optimization.`
-                      : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your Claude account is ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}. Upgrade to match your Claude plan.`}
+                      ? `Your Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan no longer matches your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage, which needs ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}, so weekly usage limits now apply. Upgrade to restore unlimited optimization.`
+                      : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}. Upgrade to match.`}
                   </p>
                   {upgradeActionError && upgradeActionBusy === null ? (
                     <p className="tier-mismatch-banner__error" role="status">
@@ -4361,9 +4391,7 @@ export default function App() {
                   </span>
                   <h1>Project learnings</h1>
                 </div>
-                <p className="optimize-card__blurb">
-                  Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.md.
-                </p>
+                <p className="optimize-card__blurb">{learnBlurb}</p>
               </header>
               <div className="optimize-card__body">
                 {!headroomLearnSupported ? (
@@ -4376,12 +4404,18 @@ export default function App() {
                       Claude Code routing, and RTK activity tracking.
                     </p>
                   </div>
-                ) : claudeProjectsBusy && claudeProjects.length === 0 ? (
-                  <p className="loading-copy">Loading projects…</p>
-                ) : claudeProjects.length === 0 ? (
-                  <p className="loading-copy">No Claude Code projects found in <code>~/.claude/projects</code>.</p>
+                ) : !claudeLearnEnabled && !codexLearnEnabled ? (
+                  <p className="loading-copy">
+                    Enable the Claude Code or Codex connector to scan sessions for learnings.
+                  </p>
                 ) : (
                   <div className="optimize-minimal">
+                    {claudeLearnEnabled && claudeProjectsBusy && claudeProjects.length === 0 ? (
+                      <p className="loading-copy">Loading projects…</p>
+                    ) : claudeLearnEnabled && claudeProjects.length === 0 ? (
+                      <p className="loading-copy">No Claude Code projects found in <code>~/.claude/projects</code>.</p>
+                    ) : claudeLearnEnabled ? (
+                      <>
                     {!headroomLearnPrereq.claudeCliAvailable ? (
                       <div className="install-prompt" role="status">
                         <header className="install-prompt__head">
@@ -4489,7 +4523,7 @@ export default function App() {
                                     <button
                                       type="button"
                                       className={`optimize-project-row__refresh${isRunning ? " is-spinning" : ""}`}
-                                      onClick={() => void handleRunHeadroomLearn(project.projectPath)}
+                                      onClick={() => void handleRunHeadroomLearn("claude", project.projectPath)}
                                       disabled={disableLearn}
                                       aria-label={refreshLabel}
                                       title={refreshLabel}
@@ -4544,12 +4578,170 @@ export default function App() {
                         {showAllClaudeProjects ? "fewer projects" : "more projects"}
                       </button>
                     ) : null}
+                      </>
+                    ) : null}
+                    {codexLearnEnabled
+                      ? (() => {
+                          const codexReady =
+                            headroomLearnPrereq.codexCliAvailable &&
+                            headroomLearnPrereq.codexLoggedIn;
+                          const codexRunning =
+                            headroomLearnStatus.running &&
+                            headroomLearnStatus.projectPath === "codex";
+                          const codexIsLatest = headroomLearnStatus.projectPath === "codex";
+                          const codexDisable =
+                            !codexReady ||
+                            headroomLearnBusy ||
+                            (headroomLearnStatus.running && !codexRunning);
+                          const codexShowResult =
+                            codexIsLatest &&
+                            !headroomLearnStatus.running &&
+                            (headroomLearnStatus.success !== null ||
+                              Boolean(headroomLearnStatus.error) ||
+                              headroomLearnStatus.outputTail.length > 0);
+                          const codexResultTone =
+                            headroomLearnStatus.success === true
+                              ? "success"
+                              : headroomLearnStatus.success === false ||
+                                  headroomLearnStatus.error
+                                ? "failure"
+                                : "idle";
+                          const codexResultLabel =
+                            headroomLearnStatus.success === true
+                              ? "Run succeeded"
+                              : headroomLearnStatus.success === false ||
+                                  headroomLearnStatus.error
+                                ? "Last run failed"
+                                : "No completed run yet";
+                          if (!codexReady) {
+                            const codexCmd = headroomLearnPrereq.codexCliAvailable
+                              ? CODEX_CLI_LOGIN_CMD
+                              : CODEX_CLI_INSTALL_CMD;
+                            return (
+                              <div className="install-prompt" role="status">
+                                <header className="install-prompt__head">
+                                  <span className="install-prompt__icon" aria-hidden="true">
+                                    <Terminal weight="duotone" />
+                                  </span>
+                                  <div className="install-prompt__head-text">
+                                    <h2 className="install-prompt__title">
+                                      {headroomLearnPrereq.codexCliAvailable
+                                        ? "Sign in to the Codex CLI"
+                                        : "Install the Codex CLI"}
+                                    </h2>
+                                    <p className="install-prompt__body">
+                                      Headroom Learn analyzes your Codex sessions with the{" "}
+                                      <code>codex</code> CLI on your ChatGPT subscription.
+                                      {headroomLearnPrereq.codexCliAvailable
+                                        ? " Sign in to continue."
+                                        : ""}
+                                    </p>
+                                  </div>
+                                </header>
+                                <div className="install-prompt__cmd">
+                                  <code className="install-prompt__cmd-text">{codexCmd}</code>
+                                  <button
+                                    className="install-prompt__cmd-copy"
+                                    type="button"
+                                    onClick={() => void copyLearnInstallCommand(codexCmd)}
+                                  >
+                                    Copy
+                                  </button>
+                                </div>
+                                <div className="install-prompt__foot">
+                                  <button
+                                    className="install-prompt__link"
+                                    type="button"
+                                    onClick={() => void openExternalLink(CODEX_INSTALL_DOCS_URL)}
+                                  >
+                                    Open install docs
+                                  </button>
+                                  <span className="install-prompt__foot-sep" aria-hidden="true">
+                                    ·
+                                  </span>
+                                  <button
+                                    className="install-prompt__link install-prompt__link--recheck"
+                                    type="button"
+                                    onClick={() => void refreshHeadroomLearnPrereq(true)}
+                                  >
+                                    <ArrowClockwise weight="bold" size={12} aria-hidden="true" />
+                                    Re-check
+                                  </button>
+                                  {learnInstallCopyNotice ? (
+                                    <span className="install-prompt__notice">
+                                      {learnInstallCopyNotice}
+                                    </span>
+                                  ) : null}
+                                </div>
+                              </div>
+                            );
+                          }
+                          return (
+                            <div className="optimize-projects">
+                              <div
+                                className={`optimize-project-row${codexRunning || codexShowResult ? " optimize-project-row--active" : ""}`}
+                              >
+                                <div className="optimize-project-row__main">
+                                  <span className="optimize-project-row__name">
+                                    <strong>Codex sessions</strong>
+                                    <small>
+                                      <span
+                                        className="optimize-project-row__training"
+                                        aria-live="polite"
+                                      >
+                                        {codexRunning
+                                          ? `Scanning sessions${
+                                              typeof headroomLearnStatus.elapsedSeconds === "number"
+                                                ? ` · ${headroomLearnStatus.elapsedSeconds}s`
+                                                : ""
+                                            }`
+                                          : "Scans ~/.codex/sessions into AGENTS.md"}
+                                        <button
+                                          type="button"
+                                          className={`optimize-project-row__refresh${codexRunning ? " is-spinning" : ""}`}
+                                          onClick={() => void handleRunHeadroomLearn("codex")}
+                                          disabled={codexDisable}
+                                          aria-label={codexRunning ? "Scanning…" : "Scan now"}
+                                          title={codexRunning ? "Scanning…" : "Scan now"}
+                                        >
+                                          <ArrowClockwise
+                                            weight="bold"
+                                            size={12}
+                                            aria-hidden="true"
+                                          />
+                                        </button>
+                                      </span>
+                                    </small>
+                                  </span>
+                                  <div className="optimize-project-row__actions">
+                                    {codexShowResult ? (
+                                      <span
+                                        className={`optimize-project-row__status optimize-minimal__result--${codexResultTone}`}
+                                      >
+                                        {codexResultLabel}
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                </div>
+                                {codexShowResult && headroomLearnStatus.error ? (
+                                  <div className="optimize-project-row__result">
+                                    <p className="install-progress__error">
+                                      {headroomLearnStatus.error}
+                                    </p>
+                                  </div>
+                                ) : null}
+                              </div>
+                            </div>
+                          );
+                        })()
+                      : null}
                   </div>
                 )}
                 {claudeProjectsError ? (
                   <p className="install-progress__error">{claudeProjectsError}</p>
                 ) : null}
                 {headroomLearnStatus.error &&
+                headroomLearnStatus.projectPath !== "codex" &&
                 !claudeProjects.some((project) => project.projectPath === headroomLearnStatus.projectPath) ? (
                   <p className="install-progress__error">{headroomLearnStatus.error}</p>
                 ) : null}
@@ -4573,7 +4765,7 @@ export default function App() {
 
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
           <section className="upgrade-hero">
-            <h1>Plans based on your Claude subscription</h1>
+            <h1>Plans based on your Claude or Codex subscription</h1>
             <div className="upgrade-toggle" aria-label="Upgrade audiences" role="tablist">
               {[
                 { id: "individual" as const, label: "Individual" },
@@ -5298,7 +5490,7 @@ export default function App() {
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                 <h3>How savings are calculated</h3>
-                <p>Headroom intercepts and prunes all inputs before sending them to Claude.</p>
+                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
                 <p>This is an optimistic estimate.</p>
                 <p>Without Headroom, when tokens are sent to Claude for the first time they would be stored in their cache. Once in the cache, whenever these same tokens are sent again Claude applies a 90% discount to their cost. In our testing, this can reduce the actual savings by at most 50%.</p>

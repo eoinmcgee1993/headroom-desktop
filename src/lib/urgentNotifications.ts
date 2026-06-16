@@ -8,10 +8,22 @@ const OPTIMIZATION_BLOCKED_KEY = "headroom_urgent_opt_blocked_date";
 const RUNTIME_DOWN_KEY = "headroom_urgent_runtime_down_date";
 const NUDGE_KEY_PREFIX = "headroom_urgent_nudge_level";
 
+// Codex uses storage keys distinct from the Claude gate so a Claude
+// notification firing in the same window can't suppress the Codex one.
+const CODEX_OPTIMIZATION_BLOCKED_KEY = "headroom_urgent_codex_opt_blocked_date";
+const CODEX_NUDGE_KEY_PREFIX = "headroom_urgent_codex_nudge_level";
+
 const NUDGE_TITLES: Record<number, string> = {
   1: "Heads up: 25% of your weekly Claude usage",
   2: "Halfway there: 35% of your weekly Claude usage",
   3: "Almost paused: 45% of your weekly Claude usage",
+};
+
+// Codex shares the same nudge ladder (25/35/45%) as the Claude gate.
+const CODEX_NUDGE_TITLES: Record<number, string> = {
+  1: "Heads up: 25% of your weekly Codex usage",
+  2: "Halfway there: 35% of your weekly Codex usage",
+  3: "Almost paused: 45% of your weekly Codex usage",
 };
 
 export async function maybeFireUrgentPricingNotifications(
@@ -48,6 +60,36 @@ export async function maybeFireUrgentPricingNotifications(
       NUDGE_TITLES[level] ?? "Heads up: weekly Claude usage rising",
       status.gateMessage ||
         "Headroom will pause optimization at your weekly usage cap. Upgrade to keep going.",
+      "billing"
+    );
+  }
+
+  // Codex gate fires independently of the Claude gate above, with its own
+  // storage keys and provider wording, so a Codex-routing user gets the same
+  // nudge/pause notifications a Claude user does. needs-auth (account-wide) and
+  // a blocked Claude plan returned above already cover the user, so they take
+  // precedence; the daily/weekly throttle keeps a dual-routing user from spam.
+  const codex = status.codex;
+  if (!codex) return;
+
+  if (!codex.optimizationAllowed) {
+    await fireOncePerDay(
+      CODEX_OPTIMIZATION_BLOCKED_KEY,
+      "Headroom optimization is off",
+      codex.gateMessage ||
+        "Codex optimization is paused. Open Headroom to review.",
+      "billing"
+    );
+    return;
+  }
+
+  if (codex.shouldNudge && codex.nudgeLevel > 0) {
+    const level = Math.min(codex.nudgeLevel, 3);
+    await fireOncePerWeek(
+      `${CODEX_NUDGE_KEY_PREFIX}_${level}`,
+      CODEX_NUDGE_TITLES[level] ?? "Heads up: weekly Codex usage rising",
+      codex.gateMessage ||
+        "Headroom will pause Codex optimization at your weekly cap. Upgrade to keep going.",
       "billing"
     );
   }

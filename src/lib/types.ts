@@ -262,6 +262,9 @@ export interface HeadroomLearnStatus {
 export interface HeadroomLearnPrereqStatus {
   claudeCliAvailable: boolean;
   claudeCliPath?: string | null;
+  codexCliAvailable: boolean;
+  codexCliPath?: string | null;
+  codexLoggedIn: boolean;
 }
 
 // A single entry in `requestMessages`. Intentionally loose — the proxy passes
@@ -505,9 +508,12 @@ export interface PricingCohort {
   spotsLeft?: number | null;
 }
 
+export type TierRecommendationSource = "claude" | "codex" | "both";
+
 export interface TierMismatch {
   paidTier: HeadroomSubscriptionTier;
   recommendedTier: HeadroomSubscriptionTier;
+  recommendedSource: TierRecommendationSource;
   graceEndsAt: string;
   clamped: boolean;
 }

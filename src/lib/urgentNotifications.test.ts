@@ -66,6 +66,26 @@ function makePricing(
   };
 }
 
+function makeCodex(
+  overrides: Partial<NonNullable<HeadroomPricingStatus["codex"]>> = {}
+): NonNullable<HeadroomPricingStatus["codex"]> {
+  return {
+    limitName: null,
+    primary: null,
+    secondary: null,
+    creditsBalance: null,
+    creditsUnlimited: false,
+    optimizationAllowed: true,
+    shouldNudge: false,
+    nudgeLevel: 0,
+    gateReason: null,
+    recommendedSubscriptionTier: null,
+    weeklyUsedPercent: null,
+    gateMessage: "",
+    ...overrides,
+  };
+}
+
 function makeRuntime(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
   return {
     platform: "darwin",
@@ -315,6 +335,107 @@ describe("maybeFireUrgentPricingNotifications", () => {
     );
 
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("fires a Codex optimization-blocked notification when the Codex gate is off", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({
+        codex: makeCodex({
+          optimizationAllowed: false,
+          gateMessage:
+            "Headroom is paused because you've reached 50.0% of weekly Codex usage.",
+        }),
+      })
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+      title: "Headroom optimization is off",
+      body: "Headroom is paused because you've reached 50.0% of weekly Codex usage.",
+      action: "billing",
+    });
+  });
+
+  it("fires the Codex level-1 nudge with Codex wording", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({
+        codex: makeCodex({
+          shouldNudge: true,
+          nudgeLevel: 1,
+          gateMessage: "You're at 27.0% of weekly Codex usage.",
+        }),
+      })
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+      title: "Heads up: 25% of your weekly Codex usage",
+      body: "You're at 27.0% of weekly Codex usage.",
+      action: "billing",
+    });
+  });
+
+  it("fires both the Claude and Codex nudges in the same window", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({
+        shouldNudge: true,
+        nudgeLevel: 1,
+        gateMessage: "Claude 27%",
+        codex: makeCodex({
+          shouldNudge: true,
+          nudgeLevel: 2,
+          gateMessage: "Codex 36%",
+        }),
+      })
+    );
+
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    const titles = invokeMock.mock.calls.map((c) => c[1].title);
+    expect(titles).toEqual([
+      "Heads up: 25% of your weekly Claude usage",
+      "Halfway there: 35% of your weekly Codex usage",
+    ]);
+  });
+
+  it("keys the Codex nudge separately so a Claude nudge the same week can't suppress it", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    const store = installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({
+        codex: makeCodex({ shouldNudge: true, nudgeLevel: 1, gateMessage: "Codex 27%" }),
+      })
+    );
+
+    const codexKey = [...store.keys()].find((k) =>
+      k.startsWith("headroom_urgent_codex_nudge_level")
+    );
+    expect(codexKey).toBeDefined();
+  });
+
+  it("prefers the needs-auth notification over a Codex nudge", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await maybeFireUrgentPricingNotifications(
+      makePricing({
+        needsAuthentication: true,
+        codex: makeCodex({ shouldNudge: true, nudgeLevel: 3, gateMessage: "Codex 46%" }),
+      })
+    );
+
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "show_notification",
+      expect.objectContaining({ action: "signin" })
+    );
   });
 });
 
