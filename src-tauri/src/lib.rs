@@ -863,8 +863,10 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
         BootstrapFailureKind::NetworkDownload => {
             "Couldn't reach the download server. This is usually a temporary \
              network or server hiccup, not a problem with your Mac. Check your \
-             internet connection and click Try again. If it keeps failing, \
-             contact support@extraheadroom.com."
+             internet connection and click Try again. If it keeps failing, a \
+             firewall, VPN, or corporate proxy may be blocking pypi.org and \
+             files.pythonhosted.org - try another network or contact \
+             support@extraheadroom.com."
         }
         BootstrapFailureKind::Other => {
             "Installation failed: Headroom couldn't download a required file. \
@@ -1273,14 +1275,21 @@ fn capture_watchdog_give_up(
     // (`ps -o time=`); any long-lived-but-now-idle process carries a large
     // cumulative value, so using it as a deadlock proxy mislabels a healthy
     // idle process as a deadlock (Sentry proxy_unreachable_post_boot showed 12s
-    // cumulative + 28min silent flagged as Error). Re-sample after a short
-    // window and treat the process as actively burning CPU only if the counter
-    // moved — a spinning deadlock keeps climbing, an idle process stays flat.
+    // cumulative + 28min silent flagged as Error). Re-sample over a window and
+    // treat the process as actively burning CPU only if the rate clears half a
+    // core. `ps` reports whole seconds, so a single incidental tick at a second
+    // boundary reads as +1; over a 2s window that is rate 0.5 and would
+    // false-flag an idle process. Sample ~4s and require >0.5 CPU-sec/sec so a
+    // real spin (~1.0) passes while a lone boundary tick (~0.25) does not.
     let cpu_actively_burning = match (tracked_pid, process_cpu_secs) {
         (Some(pid), Some(before)) => {
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            let started = std::time::Instant::now();
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            let elapsed = started.elapsed().as_secs_f64();
             crate::state::tracked_process_cpu_time_secs(pid)
-                .map(|after| after > before)
+                .map(|after| {
+                    elapsed > 0.0 && (after.saturating_sub(before) as f64) / elapsed > 0.5
+                })
                 .unwrap_or(false)
         }
         _ => false,
@@ -3559,6 +3568,27 @@ fn execute_headroom_learn_run(
             output_tail: Vec::new(),
         };
     }
+    // Pre-flight: the Claude scan passes --project to the CLI, where Click's
+    // Path(readable=True) rejects a missing/unreadable dir with exit 2. That's a
+    // user-environment condition (project moved/deleted, or macOS TCC blocking
+    // ~/Documents et al.), not an app bug, so short-circuit here instead of
+    // spawning and reporting the failure to Sentry. read_dir mirrors Click's
+    // readability check and surfaces both the missing-path and TCC-denied cases.
+    if let LearnAgent::Claude = agent {
+        let path = project_path.unwrap_or_default();
+        if path.is_empty() || std::fs::read_dir(path).is_err() {
+            return HeadroomLearnRunResult {
+                success: false,
+                summary: format!("headroom learn failed for {project_name}."),
+                error: Some(format!(
+                    "Project path is not readable: {path}\n\
+                     It may have been moved or deleted, or Headroom needs \
+                     Files & Folders / Full Disk Access to read it."
+                )),
+                output_tail: Vec::new(),
+            };
+        }
+    }
 
     let cli_path = match agent {
         LearnAgent::Claude => claude_cli::detect_claude_cli(),
@@ -3713,35 +3743,42 @@ fn execute_headroom_learn_run(
                     format!("headroom learn failed (exit={exit_code_str}) {signature}");
                 let fingerprint: [&str; 3] =
                     ["headroom_learn", exit_code_str.as_str(), signature.as_str()];
-                sentry::with_scope(
-                    |scope| {
-                        scope.set_tag("flow", "headroom_learn");
-                        scope.set_tag(
-                            "learn_agent",
-                            match agent {
-                                LearnAgent::Claude => "claude",
-                                LearnAgent::Codex => "codex",
-                            },
-                        );
-                        scope.set_tag("exit_code", &exit_code_str);
-                        scope.set_extra("exit_status", output.status.to_string().into());
-                        scope.set_extra(
-                            "signal",
-                            signal_num
-                                .map(|s| s.to_string().into())
-                                .unwrap_or(serde_json::Value::Null),
-                        );
-                        scope.set_extra("output_tail", fail_tail.clone().into());
-                        scope.set_extra("stderr_head", stderr_head.into());
-                        scope.set_extra("stdout_head", stdout_head.into());
-                        scope.set_extra("cli_path", cli_path_str.into());
-                        scope.set_extra("project_name", project_name.to_string().into());
-                        scope.set_fingerprint(Some(fingerprint.as_slice()));
-                    },
-                    || {
-                        sentry::capture_message(&summary_msg, sentry::Level::Error);
-                    },
-                );
+                // Defense in depth against a TOCTOU race: the path can become
+                // unreadable between the pre-flight read_dir check and the CLI
+                // run. Click reports that as exit 2 with "is not readable" — a
+                // user-environment condition, not an app bug, so don't report it.
+                let user_env_condition = signature.contains("is not readable");
+                if !user_env_condition {
+                    sentry::with_scope(
+                        |scope| {
+                            scope.set_tag("flow", "headroom_learn");
+                            scope.set_tag(
+                                "learn_agent",
+                                match agent {
+                                    LearnAgent::Claude => "claude",
+                                    LearnAgent::Codex => "codex",
+                                },
+                            );
+                            scope.set_tag("exit_code", &exit_code_str);
+                            scope.set_extra("exit_status", output.status.to_string().into());
+                            scope.set_extra(
+                                "signal",
+                                signal_num
+                                    .map(|s| s.to_string().into())
+                                    .unwrap_or(serde_json::Value::Null),
+                            );
+                            scope.set_extra("output_tail", fail_tail.clone().into());
+                            scope.set_extra("stderr_head", stderr_head.into());
+                            scope.set_extra("stdout_head", stdout_head.into());
+                            scope.set_extra("cli_path", cli_path_str.into());
+                            scope.set_extra("project_name", project_name.to_string().into());
+                            scope.set_fingerprint(Some(fingerprint.as_slice()));
+                        },
+                        || {
+                            sentry::capture_message(&summary_msg, sentry::Level::Error);
+                        },
+                    );
+                }
                 (
                     format!("headroom learn failed for {project_name}."),
                     false,
@@ -4337,17 +4374,21 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     consecutive_failures = 0;
                     continue;
                 }
-                // Wedged backend: either /readyz never responds ("timeout", the
-                // event loop is held) or it 503s with a *core* component
-                // unhealthy (startup/cache/memory/etc. failed to initialize).
-                // Both are states a clean restart may clear, and
-                // ensure_headroom_running returns Ok immediately when try_wait
-                // says the child is still alive, so the three restart attempts
-                // above were all no-ops. Kill the stuck process and start fresh
-                // before giving up permanently. Once per down episode
-                // (hung_kill_attempted) so a persistently-wedged new process
-                // doesn't loop; it falls through to the give-up path below.
+                // Wedged backend: /readyz never responds ("timeout", the event
+                // loop is held), or it 503s with a *core* component unhealthy
+                // (startup/cache/memory/etc. failed to initialize), or it 503s
+                // with a body we couldn't read/parse (bare "http_503" — the
+                // status line came back but the body read timed out under load).
+                // All three mean the process is alive and answering HTTP but not
+                // ready, a state a clean restart may clear. ensure_headroom_running
+                // returns Ok immediately when try_wait says the child is still
+                // alive, so the three restart attempts above were all no-ops.
+                // Kill the stuck process and start fresh before giving up
+                // permanently. Once per down episode (hung_kill_attempted) so a
+                // persistently-wedged new process doesn't loop; it falls through
+                // to the give-up path below.
                 if (backend_readyz_outcome == "timeout"
+                    || backend_readyz_outcome == "http_503"
                     || readyz_failure_has_core_unhealthy(&backend_readyz_outcome))
                     && !hung_kill_attempted
                 {

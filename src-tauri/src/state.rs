@@ -2629,7 +2629,13 @@ impl AppState {
         } // release lock before the blocking start
 
         self.set_runtime_starting(true);
-        let started = self.tool_manager.start_headroom_background();
+        // During upgrade boot validation, reclaim 6768 even from a still-healthy
+        // old proxy — we're replacing it, so leaving it alone would strand the
+        // new venv unable to bind and roll the upgrade back as `not_started`.
+        let reclaim_healthy_orphan = *self.runtime_upgrade_in_progress.lock();
+        let started = self
+            .tool_manager
+            .start_headroom_background(reclaim_healthy_orphan);
         self.set_runtime_starting(false);
 
         match started {

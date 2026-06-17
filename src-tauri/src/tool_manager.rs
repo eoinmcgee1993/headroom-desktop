@@ -531,7 +531,10 @@ impl ToolManager {
         }
     }
 
-    pub fn start_headroom_background(&self) -> Result<Child> {
+    /// `reclaim_healthy_orphan`: forwarded to `reclaim_orphan_proxy` so an
+    /// upgrade boot validation replaces even a still-healthy old proxy squatting
+    /// on 6768. Pass `false` for normal launch (leave a live backend alone).
+    pub fn start_headroom_background(&self, reclaim_healthy_orphan: bool) -> Result<Child> {
         let mut allow_repair = true;
         'attempt: loop {
             let python = self.managed_python();
@@ -564,7 +567,10 @@ impl ToolManager {
                     backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
                 }
                 PortState::HeadroomRunning => {
-                    reclaim_orphan_proxy(backend_port::DEFAULT_BACKEND_PORT)?;
+                    reclaim_orphan_proxy(
+                        backend_port::DEFAULT_BACKEND_PORT,
+                        reclaim_healthy_orphan,
+                    )?;
                     backend_port::set(backend_port::DEFAULT_BACKEND_PORT);
                 }
                 PortState::ForeignOccupant(detail) => {
@@ -3398,8 +3404,14 @@ fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
 /// failure to reclaim (no pid, refuses to die, healthy) we fall back to the
 /// original bail so the caller's classification and user guidance are
 /// unchanged.
-fn reclaim_orphan_proxy(port: u16) -> Result<()> {
-    if probe_backend_readyz_ok(port) {
+///
+/// `force_unhealthy_too`: during upgrade boot validation the orphan on 6768 is
+/// the *old* version we are replacing — a still-healthy old worker (left when
+/// `stop_headroom`'s argv pattern-kill missed the real socket holder) must be
+/// killed anyway, or the new venv can't bind and the upgrade rolls back as
+/// `not_started`. When set, skip the readyz health guard and reclaim regardless.
+fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
+    if !force_unhealthy_too && probe_backend_readyz_ok(port) {
         bail!("{}", format_already_running_bail(port));
     }
     let Some(pid) = lsof_listener(port)
