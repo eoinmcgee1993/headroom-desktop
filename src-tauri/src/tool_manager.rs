@@ -36,10 +36,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// `*-manylinux_*` abi3 wheel from
 /// https://pypi.org/pypi/headroom-ai/<version>/json and add a per-platform
 /// wheel-picker (mirroring `python_distribution_artifact`).
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.25.0";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/88/6f/190fbbddf5e3b501cddb02bc0fb58137a2fb237c95f5e2a24aa0f1a77f52/headroom_ai-0.25.0-cp310-abi3-macosx_11_0_arm64.whl";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.26.0";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/be/14/4ba140f4899832a4fb868b3bfff81925d8e4fc8cb2c1522cb1d344b4925b/headroom_ai-0.26.0-cp310-abi3-macosx_11_0_arm64.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "f0d4c24a5e6d86c2a6375833bbe3e47a87b7283ca82cf69d3df627448c2391ee";
+    "f1696770d2388cba99c567130968730daf5add69c7e38499fccdc6d0c85386cf";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
@@ -91,17 +91,16 @@ const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
 /// lock. Drop any entry that no longer matches — those users need a real
 /// reinstall.
 const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
-    // The 0.25.0 freeze changes exactly two pins over the 0.24.0 freeze —
-    // litellm 1.82.3 -> 1.88.1 (upstream raised its floor to >=1.86.2 in #538)
-    // and the transitive importlib-metadata 9.0.0 -> 8.9.0 that litellm's new
-    // `<9.0` cap pulls back. Both are pure-Python; every native pin (torch,
-    // onnxruntime, transformers, scikit-learn, tokenizers, safetensors,
-    // fastembed, cryptography, lxml, pydantic-core, ...) is byte-identical to
-    // 0.24.0, so the 0.24.0 cohort's in-place upgrade re-fetches only those two
-    // small wheels plus the headroom-ai wheel — no big-wheel rebuilds. The
-    // 0.24.0 lock's stripped pins differ from the current lock, so it is not a
-    // legacy match: 0.24.0 receipts must take the (cheap) requirements repair.
-    // The list stays empty until the next no-op cosmetic lock change.
+    // The 0.26.0 bundle reuses the 0.25.0 lock byte-for-byte: headroom-ai's
+    // `requires_dist` is identical between 0.25.0 and 0.26.0 (verified against
+    // pypi.org/pypi/headroom-ai/<v>/json), so the 0.25.0 resolution remains a
+    // valid resolution for 0.26.0 and no pin — pure-Python or native — moves.
+    // headroom-ai itself is not in this lock (it installs from the pinned
+    // wheel), so the stripped lock sha is unchanged and the entire 0.25.0
+    // cohort's lock receipt is already current: the upgrade swaps only the
+    // headroom-ai wheel in place. The list stays empty until a real lock pin
+    // changes; add a sha here only when a future no-op cosmetic lock edit needs
+    // to be treated as up-to-date.
 ];
 
 /// Receipts strictly below this version cannot be safely upgraded in place to
@@ -153,6 +152,12 @@ const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
 ///   includes every 0.24.0-shipping (desktop 0.4.1) user — upgrades in place
 ///   with no big-wheel rebuilds. Raise the floor only if a future lock adds or
 ///   ABI-bumps a native transitive dep.
+/// - 0.4.x (0.25.0 → 0.26.0 bundle): floor stays at 0.20.0. headroom-ai's
+///   `requires_dist` is byte-identical between 0.25.0 and 0.26.0, so the lock
+///   is reused unchanged — no pin moves at all. pip uninstalls the 0.25.0 abi3
+///   wheel (clearing its `.so` via RECORD) and unpacks the 0.26.0 abi3 wheel;
+///   no stale native extension is layered. The 0.20.x+ cohort upgrades in
+///   place with no wheel rebuilds.
 const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 20, 0);
 
 /// Parse the leading `major.minor.patch` from a version string, tolerating

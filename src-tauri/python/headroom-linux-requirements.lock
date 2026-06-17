@@ -4,7 +4,7 @@
 # and cause bootstrap to fail on fresh machines.
 #
 # Versions kept in sync with headroom-requirements.lock (0.25.0 freeze on
-# 2026-06-12) where the package overlaps. We do not currently ship Linux from
+# 2026-06-12, reused unchanged for 0.26.0) where the package overlaps. We do not currently ship Linux from
 # release-macos.yml; when Linux is added, re-validate this lock against a real
 # Linux minimal install before relying on it.
 ast-grep-cli==0.42.2

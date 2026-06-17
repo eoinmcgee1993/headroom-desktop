@@ -1,5 +1,7 @@
 # Reviewed known-good Headroom runtime lock.
 # Source: headroom-ai[all]==0.25.0 dependency resolution captured on 2026-06-12 for cp312.
+# Reused unchanged for headroom-ai 0.26.0: its requires_dist is byte-identical
+# to 0.25.0, so this resolution remains valid and no pin moves.
 absl-py==2.4.0
 aiohappyeyeballs==2.6.2
 aiohttp==3.14.1

@@ -1394,7 +1394,7 @@ fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
 }
 
 fn codex_config_toml_path() -> PathBuf {
-    home_dir().join(".codex").join("config.toml")
+    codex_home().join("config.toml")
 }
 
 // The managed Codex config is split across two marker blocks so each lands in
@@ -1423,14 +1423,50 @@ const CODEX_TABLE_BLOCK_ID: &str = "codex_cli_provider";
 const CODEX_HEADROOM_PROVIDER: &str = "headroom";
 const CODEX_NATIVE_PROVIDER: &str = "openai";
 
-/// Both known Codex state stores: the v148 GUI reads
-/// `~/.codex/sqlite/state_5.sqlite`, the CLI/TUI uses `~/.codex/state_5.sqlite`.
-fn codex_state_db_paths() -> Vec<PathBuf> {
-    let codex = home_dir().join(".codex");
-    vec![
-        codex.join("sqlite").join("state_5.sqlite"),
-        codex.join("state_5.sqlite"),
-    ]
+/// Codex store-schema versions this build has been verified against. Discovered
+/// stores with a version outside this set are still retagged (best-effort) but
+/// logged, so a Codex store bump is visible before it can silently split the
+/// history menu for everyone.
+const KNOWN_CODEX_STORE_VERSIONS: &[u32] = &[5];
+
+/// Directories Codex is known to keep its state store in: the v148 GUI uses
+/// `<codex_home>/sqlite/`, the CLI/TUI uses `<codex_home>/`.
+fn codex_state_dirs() -> Vec<PathBuf> {
+    let codex = codex_home();
+    vec![codex.join("sqlite"), codex]
+}
+
+/// Parse `N` from a `state_<N>.sqlite` filename (`state_5.sqlite` -> `Some(5)`).
+/// Anything else -> `None`.
+fn codex_store_version(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("state_")?.strip_suffix(".sqlite")?.parse().ok()
+}
+
+/// Discover every `state_<N>.sqlite` store under the known Codex dirs, with the
+/// version parsed from its name. Scanning the directories (rather than probing a
+/// hardcoded `state_5.sqlite`) means a future Codex store-version bump keeps
+/// working without a release instead of silently no-opping for every user at
+/// once. A missing dir (`read_dir` error) is skipped. Paths are deduped in case
+/// the two dirs ever resolve to the same place.
+fn discover_codex_state_dbs() -> Vec<(PathBuf, u32)> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for dir in codex_state_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(version) = codex_store_version(&path) else {
+                continue;
+            };
+            if seen.insert(path.clone()) {
+                out.push((path, version));
+            }
+        }
+    }
+    out
 }
 
 /// Best-effort retag of Codex thread provider tags so the history menu stays
@@ -1439,9 +1475,30 @@ fn codex_state_db_paths() -> Vec<PathBuf> {
 /// and skipped. Only rows whose `model_provider` equals `from` are touched, so
 /// third-party providers are left alone.
 fn retag_codex_thread_providers(from: &str, to: &str) {
-    for path in codex_state_db_paths() {
-        if !path.exists() {
-            continue;
+    let stores = discover_codex_state_dbs();
+    if stores.is_empty() {
+        // Only a signal when Codex is actually present: the launch/quit
+        // lifecycle hooks call this for every user, so a clean machine with no
+        // Codex install must stay silent.
+        if codex_user_state_exists() {
+            log::warn!(
+                "codex retag {from}->{to}: Codex is present but no state_<N>.sqlite \
+                 store was found under {dirs:?}; the history menu may split. Codex \
+                 may have moved or renamed its store.",
+                dirs = codex_state_dirs(),
+            );
+        }
+        return;
+    }
+    for (path, version) in stores {
+        if !KNOWN_CODEX_STORE_VERSIONS.contains(&version) {
+            log::warn!(
+                "codex retag: store version {version} at {} is outside the known \
+                 set {KNOWN_CODEX_STORE_VERSIONS:?}; retagging anyway. Verify the \
+                 history menu still works and add {version} to \
+                 KNOWN_CODEX_STORE_VERSIONS.",
+                path.display(),
+            );
         }
         match retag_one_codex_db(&path, from, to) {
             Ok(0) => {}
@@ -1507,7 +1564,7 @@ fn codex_root_keys_body() -> String {
 /// key), read from `~/.codex/auth.json`. Drives whether the managed provider
 /// block carries `requires_openai_auth = true` (see [`codex_provider_table_body`]).
 fn codex_uses_chatgpt_auth() -> bool {
-    let path = home_dir().join(".codex").join("auth.json");
+    let path = codex_home().join("auth.json");
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return false;
     };
@@ -2258,6 +2315,17 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir())
 }
 
+/// Codex's home directory. Mirrors the Codex CLI and the upstream Headroom
+/// proxy: honor `$CODEX_HOME` when set, else `~/.codex`. Staying in sync with
+/// the proxy matters — if the two layers disagree on where Codex lives, the
+/// provider retag rewrites a different store than the config it edited.
+fn codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".codex"))
+}
+
 fn detect_claude_code_client(configured: bool) -> ClientStatus {
     let executable = claude_code_candidate_paths()
         .into_iter()
@@ -2410,7 +2478,8 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
         .as_ref()
         .map(|path| format!("Detected at {}", path.display()))
         .or_else(|| {
-            codex_user_state_exists(&home_dir()).then(|| "Detected Codex data in ~/.codex.".into())
+            codex_user_state_exists()
+                .then(|| format!("Detected Codex data in {}.", codex_home().display()))
         });
 
     if let Some(detected_note) = detected {
@@ -2471,8 +2540,8 @@ fn codex_candidate_paths() -> Vec<PathBuf> {
     dedupe_paths(candidates)
 }
 
-fn codex_user_state_exists(home: &Path) -> bool {
-    let codex_root = home.join(".codex");
+fn codex_user_state_exists() -> bool {
+    let codex_root = codex_home();
     codex_root.join("config.toml").exists()
         || codex_root.join("auth.json").exists()
         || codex_root.join("sessions").exists()
@@ -2492,7 +2561,7 @@ pub(crate) fn detect_codex_cli() -> Option<PathBuf> {
 /// OAuth token lands in `~/.codex/auth.json`. Required for the keyless
 /// `codex exec` analysis backend.
 pub(crate) fn codex_logged_in() -> bool {
-    home_dir().join(".codex").join("auth.json").is_file()
+    codex_home().join("auth.json").is_file()
 }
 
 fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, Value>> {
@@ -2559,7 +2628,7 @@ fn windows_path_extensions() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2570,8 +2639,9 @@ mod tests {
         build_headroom_rtk_hook, claude_code_user_state_exists, claude_hook_present_in_value,
         default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
-        remove_managed_block, retag_codex_thread_providers, retag_codex_threads_to_headroom,
-        retag_one_codex_db, serialize_paths, shell_block_contains_in_files,
+        codex_home, codex_store_version, discover_codex_state_dbs, remove_managed_block,
+        retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
+        serialize_paths, shell_block_contains_in_files,
         shell_block_contains_text_in_files, shell_double_quote, strip_headroom_hook_from_settings,
         upsert_managed_block, write_file_if_changed, ClientSetupState, ShellFamily,
     };
@@ -3358,6 +3428,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         prev_home: Option<std::ffi::OsString>,
         prev_xdg: Option<std::ffi::OsString>,
         prev_shell: Option<std::ffi::OsString>,
+        prev_codex: Option<std::ffi::OsString>,
     }
 
     impl TestHome {
@@ -3367,11 +3438,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let prev_home = std::env::var_os("HOME");
             let prev_xdg = std::env::var_os("XDG_DATA_HOME");
             let prev_shell = std::env::var_os("SHELL");
+            let prev_codex = std::env::var_os("CODEX_HOME");
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
             // Force a deterministic shell family so tests don't depend on the
             // dev's login shell.
             std::env::set_var("SHELL", "/bin/zsh");
+            // Clear any real CODEX_HOME so codex_home() falls back to the temp
+            // $HOME/.codex and the Codex tests stay hermetic on dev machines.
+            std::env::remove_var("CODEX_HOME");
             // Mirror what the app does at startup so write_setup_state has a
             // config dir to land in.
             crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
@@ -3382,6 +3457,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 prev_home,
                 prev_xdg,
                 prev_shell,
+                prev_codex,
             }
         }
 
@@ -3403,6 +3479,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             match self.prev_shell.take() {
                 Some(v) => std::env::set_var("SHELL", v),
                 None => std::env::remove_var("SHELL"),
+            }
+            match self.prev_codex.take() {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
             }
         }
     }
@@ -4077,6 +4157,68 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(provider_count(&db, "headroom"), 2);
         assert_eq!(provider_count(&db, "openai"), 0);
         // Third-party threads are untouched.
+        assert_eq!(provider_count(&db, "anthropic"), 1);
+    }
+
+    #[test]
+    fn codex_store_version_parses_state_filename() {
+        assert_eq!(codex_store_version(Path::new("/x/state_5.sqlite")), Some(5));
+        assert_eq!(codex_store_version(Path::new("/x/state_42.sqlite")), Some(42));
+        assert_eq!(codex_store_version(Path::new("/x/config.toml")), None);
+        assert_eq!(codex_store_version(Path::new("/x/state_.sqlite")), None);
+        assert_eq!(codex_store_version(Path::new("/x/state_x.sqlite")), None);
+        assert_eq!(codex_store_version(Path::new("/x/state_5.db")), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_home_honors_env_else_default() {
+        let home = TestHome::new();
+        // TestHome clears CODEX_HOME, so we fall back to $HOME/.codex.
+        assert_eq!(codex_home(), home.path().join(".codex"));
+
+        let custom = home.path().join("custom-codex");
+        std::env::set_var("CODEX_HOME", &custom);
+        assert_eq!(codex_home(), custom);
+
+        // An empty value is ignored (treated as unset).
+        std::env::set_var("CODEX_HOME", "");
+        assert_eq!(codex_home(), home.path().join(".codex"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn discover_codex_state_dbs_finds_versioned_stores() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(codex.join("sqlite")).unwrap();
+        // GUI store under sqlite/, CLI store at the root, on different versions.
+        std::fs::File::create(codex.join("sqlite").join("state_6.sqlite")).unwrap();
+        std::fs::File::create(codex.join("state_5.sqlite")).unwrap();
+        // A non-store file in the same dir must be ignored.
+        std::fs::File::create(codex.join("config.toml")).unwrap();
+
+        let versions: BTreeSet<u32> = discover_codex_state_dbs()
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(versions, BTreeSet::from([5, 6]));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retag_handles_unknown_store_version() {
+        // Future-proofing: a Codex store-version bump (here state_99) must still
+        // retag, not silently no-op for every user at once.
+        let home = TestHome::new();
+        let db = home.path().join(".codex").join("state_99.sqlite");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
+
+        retag_codex_threads_to_headroom();
+
+        assert_eq!(provider_count(&db, "headroom"), 2);
+        assert_eq!(provider_count(&db, "openai"), 0);
         assert_eq!(provider_count(&db, "anthropic"), 1);
     }
 }
