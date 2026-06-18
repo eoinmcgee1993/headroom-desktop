@@ -943,9 +943,9 @@ select {
   font-family: Georgia, "Times New Roman", serif;
   font-size: clamp(1.9rem, 4vw, 2.8rem);
   line-height: 0.96;
-  max-width: none;
+  max-width: 100%;
   text-align: center;
-  white-space: nowrap;
+  text-wrap: balance;
 }
 
 .upgrade-toggle,

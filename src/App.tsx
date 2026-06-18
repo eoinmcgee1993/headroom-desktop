@@ -4765,7 +4765,7 @@ export default function App() {
 
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
           <section className="upgrade-hero">
-            <h1>Plans based on your Claude or Codex subscription</h1>
+            <h1>Plans based on your AI subscription</h1>
             <div className="upgrade-toggle" aria-label="Upgrade audiences" role="tablist">
               {[
                 { id: "individual" as const, label: "Individual" },
