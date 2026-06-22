@@ -1203,10 +1203,11 @@ fn evaluate_pricing_status_with_mismatch(
                     // profile came back sparse. Free usage requires a live
                     // Free signal; cached Free is not enough to grant it
                     // post-trial. Fall back to cached paid tier when present,
-                    // otherwise Pro as the default upgrade path.
+                    // otherwise Max x20 — these are paying org customers we
+                    // couldn't decode, so apply top-plan thresholds.
                     let effective_tier = match last_known_good_plan_tier.as_ref() {
                         Some(tier) if !matches!(tier, ClaudePlanTier::Free) => tier.clone(),
-                        _ => ClaudePlanTier::Pro,
+                        _ => ClaudePlanTier::Max20x,
                     };
                     let gate = paid_plan_gate(
                         &effective_tier,
@@ -1499,9 +1500,11 @@ fn codex_billing_type(plan: &CodexPlanTier, has_org: bool) -> Option<String> {
         CodexPlanTier::Free | CodexPlanTier::Unknown => None,
         CodexPlanTier::Team
         | CodexPlanTier::Business
+        | CodexPlanTier::SelfServeBusinessUsageBased
         | CodexPlanTier::Enterprise
+        | CodexPlanTier::EnterpriseCbpUsageBased
         | CodexPlanTier::Edu => Some(plan.as_header_str().to_string()),
-        CodexPlanTier::Plus | CodexPlanTier::Pro => Some(if has_org {
+        CodexPlanTier::Go | CodexPlanTier::Plus | CodexPlanTier::Pro => Some(if has_org {
             plan.as_header_str().to_string()
         } else {
             "subscription".to_string()
@@ -1858,9 +1861,13 @@ fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTie
                     Some("oauth_profile.organization.organizationType".into()),
                 );
             }
-            if organization_type.eq_ignore_ascii_case("claude_pro")
-                || organization_type.eq_ignore_ascii_case("claude_enterprise")
-            {
+            if organization_type.eq_ignore_ascii_case("claude_enterprise") {
+                return (
+                    ClaudePlanTier::Max20x,
+                    Some("oauth_profile.organization.organizationType".into()),
+                );
+            }
+            if organization_type.eq_ignore_ascii_case("claude_pro") {
                 return (
                     ClaudePlanTier::Pro,
                     Some("oauth_profile.organization.organizationType".into()),
@@ -1877,7 +1884,13 @@ fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTie
                 Some("oauth_profile.organization.organizationType".into()),
             );
         }
-        if normalized == "claude_pro" || normalized == "claude_enterprise" {
+        if normalized == "claude_enterprise" {
+            return (
+                ClaudePlanTier::Max20x,
+                Some("oauth_profile.organization.organizationType".into()),
+            );
+        }
+        if normalized == "claude_pro" {
             return (
                 ClaudePlanTier::Pro,
                 Some("oauth_profile.organization.organizationType".into()),
@@ -2903,9 +2916,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tier_without_cache_falls_back_to_pro_thresholds() {
+    fn unknown_tier_without_cache_falls_back_to_max20x_thresholds() {
         // No last-known-good cache, no weekly usage signal — fallback applies
-        // Pro thresholds but the user keeps optimization on (no gating yet).
+        // Max x20 thresholds but the user keeps optimization on (no gating yet).
         let (start, end) = grace();
         let status = evaluate_pricing_status(
             true,
@@ -2920,9 +2933,9 @@ mod tests {
         );
         assert!(status.optimization_allowed);
         assert!(!status.should_nudge);
-        // Pro pricing policy is exposed even though classifier returned Unknown.
-        assert_eq!(status.disable_threshold_percent, Some(50.0));
-        assert!(status.gate_message.contains("Pro"));
+        // Max x20 pricing policy is exposed even though classifier returned Unknown.
+        assert_eq!(status.disable_threshold_percent, Some(25.0));
+        assert!(status.gate_message.contains("Max x20"));
     }
 
     #[test]
@@ -3061,7 +3074,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tier_with_cached_free_falls_back_to_pro_not_free() {
+    fn unknown_tier_with_cached_free_falls_back_to_max20x_not_free() {
         // Free usage is granted only when the live classifier currently
         // returns Free. A cached known-good Free is stale and must not
         // re-open the no-gating path once the live signal goes Unknown.
@@ -3082,8 +3095,8 @@ mod tests {
             status.gate_reason,
             Some(PricingGateReason::WeeklyUsageLimitReached)
         ));
-        assert_eq!(status.disable_threshold_percent, Some(50.0));
-        assert!(status.gate_message.contains("Pro"));
+        assert_eq!(status.disable_threshold_percent, Some(25.0));
+        assert!(status.gate_message.contains("Max x20"));
     }
 
     #[test]
@@ -3719,20 +3732,40 @@ mod tests {
         use crate::models::{
             headroom_tier_for_codex_plan, CodexPlanTier, HeadroomSubscriptionTier,
         };
+        for plan in [CodexPlanTier::Go, CodexPlanTier::Plus] {
+            assert_eq!(
+                headroom_tier_for_codex_plan(&plan),
+                Some(HeadroomSubscriptionTier::Pro)
+            );
+        }
+        for plan in [
+            CodexPlanTier::Team,
+            CodexPlanTier::Business,
+            CodexPlanTier::SelfServeBusinessUsageBased,
+            CodexPlanTier::Edu,
+        ] {
+            assert_eq!(
+                headroom_tier_for_codex_plan(&plan),
+                Some(HeadroomSubscriptionTier::Max5x)
+            );
+        }
+        for plan in [
+            CodexPlanTier::Pro,
+            CodexPlanTier::Enterprise,
+            CodexPlanTier::EnterpriseCbpUsageBased,
+        ] {
+            assert_eq!(
+                headroom_tier_for_codex_plan(&plan),
+                Some(HeadroomSubscriptionTier::Max20x)
+            );
+        }
+        assert_eq!(headroom_tier_for_codex_plan(&CodexPlanTier::Free), None);
         assert_eq!(
-            headroom_tier_for_codex_plan(&CodexPlanTier::Plus),
-            Some(HeadroomSubscriptionTier::Pro)
-        );
-        assert_eq!(
-            headroom_tier_for_codex_plan(&CodexPlanTier::Business),
-            Some(HeadroomSubscriptionTier::Max5x)
-        );
-        assert_eq!(
-            headroom_tier_for_codex_plan(&CodexPlanTier::Pro),
+            headroom_tier_for_codex_plan(&CodexPlanTier::Unknown),
             Some(HeadroomSubscriptionTier::Max20x)
         );
-        assert_eq!(headroom_tier_for_codex_plan(&CodexPlanTier::Free), None);
-        // Free/Unknown fall back to Pro as the entry upgrade path in the usage.
+        // Free has no mapping, so the usage path falls back to Pro as the entry
+        // upgrade.
         let usage = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(10.0),
             CodexPlanTier::Free,
@@ -4275,17 +4308,20 @@ mod tests {
     #[test]
     fn detect_tier_mismatch_requires_confident_paid_claude_plan() {
         let account = active_subscriber(HeadroomSubscriptionTier::Pro);
-        // Unknown and Free carry no recommended paid tier.
-        assert!(detect_tier_mismatch(
-            &account,
-            &empty_claude_profile(ClaudePlanTier::Unknown),
-            None
-        )
-        .is_none());
+        // Free carries no recommended paid tier.
         assert!(
             detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Free), None)
                 .is_none()
         );
+        // Unknown is treated as a paying org customer -> Max x20, so a Pro
+        // subscriber is under-tiered and a mismatch is surfaced.
+        let mismatch = detect_tier_mismatch(
+            &account,
+            &empty_claude_profile(ClaudePlanTier::Unknown),
+            None,
+        )
+        .expect("unknown maps to Max x20");
+        assert_eq!(mismatch.1, HeadroomSubscriptionTier::Max20x);
     }
 
     #[test]
