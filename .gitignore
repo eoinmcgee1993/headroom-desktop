@@ -8,3 +8,4 @@ target
 .env
 src-tauri/target
 src-tauri/gen
+announcement-recordings

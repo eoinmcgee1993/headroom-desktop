@@ -269,20 +269,30 @@ function workspaceBasename(path: string | null | undefined): string | null {
 // shown as a short `[type]` marker rather than dropped, so the reader sees
 // that something was there.
 function messageText(msg: TransformationRequestMessage): string {
-  const c = msg.content;
+  return flattenContent(msg.content);
+}
+
+// Flatten a message/block `content` value to text. `tool_result` blocks carry
+// their (compressible) payload in `block.content` — a string or a nested block
+// list — not in `block.text`, so without recursing here both the original and
+// compressed sides render as a bare `[tool_result]` and the diff sees no change.
+function flattenContent(c: unknown): string {
   if (typeof c === "string") return c;
-  if (Array.isArray(c)) {
-    return c
-      .map((block) => {
-        if (!block || typeof block !== "object") return "";
-        if (typeof block.text === "string") return block.text;
-        if (typeof block.type === "string") return `[${block.type}]`;
-        return "";
-      })
-      .filter((s) => s.length > 0)
-      .join("\n");
-  }
-  return "";
+  if (!Array.isArray(c)) return "";
+  return c
+    .map((block) => {
+      if (!block || typeof block !== "object") return "";
+      const b = block as { type?: unknown; text?: unknown; content?: unknown };
+      if (typeof b.text === "string") return b.text;
+      if (b.content !== undefined) {
+        const inner = flattenContent(b.content);
+        if (inner.length > 0) return inner;
+      }
+      if (typeof b.type === "string") return `[${b.type}]`;
+      return "";
+    })
+    .filter((s) => s.length > 0)
+    .join("\n");
 }
 
 export function formatRequestMessages(messages: TransformationRequestMessage[]): string {

@@ -826,6 +826,40 @@ describe("formatRequestMessages", () => {
     ).toBe("assistant:\ndone, running it:\n[tool_use]");
   });
 
+  it("surfaces tool_result payload from block.content so compression is diffable", () => {
+    // kompress shrinks the *content* of tool_result blocks. That payload lives
+    // in `block.content` (string or nested text blocks), not `block.text`, so
+    // it must be flattened — otherwise both diff sides render a bare
+    // [tool_result] and the diff shows no change.
+    expect(
+      formatRequestMessages([
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "x", content: "huge tool output here" }
+          ]
+        }
+      ])
+    ).toBe("user:\nhuge tool output here");
+    expect(
+      formatRequestMessages([
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "x",
+              content: [
+                { type: "text", text: "line one" },
+                { type: "text", text: "line two" }
+              ]
+            }
+          ]
+        }
+      ])
+    ).toBe("user:\nline one\nline two");
+  });
+
   it("labels a missing role as (unknown) instead of rendering a bare newline", () => {
     expect(formatRequestMessages([{ content: "orphan content" }])).toBe(
       "(unknown):\norphan content"

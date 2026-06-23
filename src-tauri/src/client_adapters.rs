@@ -413,7 +413,13 @@ pub fn list_client_connectors(
                 .find(|client| client.id == spec.id)
                 .map(|client| client.installed)
                 .unwrap_or(false);
-            let enabled = is_configured(&setup_state, spec.id);
+            // Fall back to the remembered snapshot while restore_client_setups
+            // is still re-applying on launch, so the connector doesn't flash
+            // "disabled" during the async restore window after a restart.
+            let enabled = is_configured(&setup_state, spec.id)
+                || setup_state
+                    .remembered_clients
+                    .contains_key(normalized_setup_id(spec.id));
             let verified = if enabled {
                 verify_client_setup(spec.id)
                     .map(|result| result.verified)
