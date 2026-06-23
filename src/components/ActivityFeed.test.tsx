@@ -837,8 +837,19 @@ describe("diffLines", () => {
     ]);
   });
 
-  it("returns null when either side exceeds the line cap", () => {
-    const huge = Array.from({ length: 601 }, (_, i) => String(i)).join("\n");
-    expect(diffLines(huge, "x")).toBeNull();
+  it("diffs large inputs that the old per-side line cap would have rejected", () => {
+    const original = Array.from({ length: 2000 }, (_, i) => String(i)).join("\n");
+    const compressed = Array.from({ length: 2000 }, (_, i) =>
+      i === 1000 ? "CHANGED" : String(i)
+    ).join("\n");
+    const diff = diffLines(original, compressed);
+    expect(diff).not.toBeNull();
+    expect(diff!.some((l) => l.type === "del" && l.text === "1000")).toBe(true);
+    expect(diff!.some((l) => l.type === "add" && l.text === "CHANGED")).toBe(true);
+  });
+
+  it("returns null only when the cell product exceeds the memory cap", () => {
+    const huge = Array.from({ length: 6000 }, (_, i) => String(i)).join("\n");
+    expect(diffLines(huge, huge)).toBeNull(); // 6001^2 ≈ 36M > 30M cap
   });
 });

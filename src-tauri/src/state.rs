@@ -3072,11 +3072,6 @@ impl AppState {
         (*self.codex_plan_tier.lock()).unwrap_or(crate::models::CodexPlanTier::Unknown)
     }
 
-    #[cfg(test)]
-    pub fn set_codex_plan_tier_for_test(&self, tier: crate::models::CodexPlanTier) {
-        *self.codex_plan_tier.lock() = Some(tier);
-    }
-
     /// TTL-cached Codex identity profile, the Codex analog of
     /// `cached_claude_profile`. Reads `~/.codex/auth.json` at most once per TTL.
     /// `None` when nothing is known yet (no auth.json and no live capture).

@@ -4310,7 +4310,7 @@ export default function App() {
   const pendingUpgradePlanLabel = upgradePlanIntentLabel(pendingUpgradePlanId);
   const upgradeAuthMessage = pendingUpgradePlanLabel
     ? `Sign in with email to upgrade to the ${pendingUpgradePlanLabel} plan`
-    : "Sign in with email to unlock your 14-day Headroom trial";
+    : "Sign in with email to unlock your 7-day Headroom trial";
   const accountDisplayEmail = (() => {
     const enteredEmail = authEmail.trim();
     return (
@@ -4332,7 +4332,7 @@ export default function App() {
       if (trialDaysRemaining != null) {
         return `${trialDaysRemaining} day${trialDaysRemaining === 1 ? "" : "s"} left in trial`;
       }
-      return "14-day trial";
+      return "7-day trial";
     }
     return "Trial expired";
   })();
@@ -4353,7 +4353,7 @@ export default function App() {
       if (!pricingStatus.localGraceActive) {
         return {
           tone: "expired" as const,
-          message: "Your 72-hour Headroom access expired. Create an account to extend to 14 days.",
+          message: "Your 72-hour Headroom access expired. Create an account to extend to 7 days.",
           actionLabel: "Sign up",
           onAction: openUpgradeAuthView
         };
@@ -4364,7 +4364,7 @@ export default function App() {
           : "72 hours";
       return {
         tone: "warning" as const,
-        message: `${hoursLabel} left in your 72-hour trial. Create an account to extend trial to 14 days.`,
+        message: `${hoursLabel} left in your 72-hour trial. Create an account to extend trial to 7 days.`,
         actionLabel: "Sign up",
         onAction: openUpgradeAuthView
       };
@@ -4387,7 +4387,7 @@ export default function App() {
       const daysLabel =
         trialDaysRemaining != null
           ? `${trialDaysRemaining} day${trialDaysRemaining === 1 ? "" : "s"}`
-          : "14 days";
+          : "7 days";
       return {
         tone: "warning" as const,
         message: `${daysLabel} of trial to go. Upgrade to continue using Headroom without limits.`,

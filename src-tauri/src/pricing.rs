@@ -1163,7 +1163,7 @@ fn evaluate_pricing_status_with_mismatch(
         optimization_allowed = false;
         gate_reason = Some(PricingGateReason::SignInRequired);
         gate_message =
-            "Create a Headroom account to unlock your 14-day trial and keep optimization enabled."
+            "Create a Headroom account to unlock your 7-day trial and keep optimization enabled."
                 .into();
     } else if let Some(account) = account.as_ref() {
         if account.subscription_active {
@@ -1190,7 +1190,7 @@ fn evaluate_pricing_status_with_mismatch(
             }
         } else if account.trial_active {
             gate_message =
-                "Your 14-day Headroom trial is active with unlimited optimization.".into();
+                "Your Headroom trial is active with unlimited optimization.".into();
         } else {
             match claude.plan_tier {
                 ClaudePlanTier::Free => {
@@ -1254,7 +1254,7 @@ fn evaluate_pricing_status_with_mismatch(
                 .into();
     } else {
         gate_message =
-            "Headroom is active during your first 72 hours. Create an account to unlock the 14-day trial before this grace period ends."
+            "Headroom is active during your first 72 hours. Create an account to unlock the 7-day trial before this grace period ends."
                 .into();
     }
 

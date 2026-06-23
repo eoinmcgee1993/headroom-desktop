@@ -51,8 +51,8 @@ async function maybeFireGraceNotification(
   const hoursLeft = Math.max(0, Math.round((graceEndsAt - now) / (60 * 60 * 1000)));
   const body =
     hoursLeft <= 2
-      ? `Less than ${hoursLeft + 1} hour(s) left. Create a Headroom account to start your 14-day trial.`
-      : `${hoursLeft} hours left in your 72-hour access window. Create an account to unlock a 14-day trial.`;
+      ? `Less than ${hoursLeft + 1} hour(s) left. Create a Headroom account to start your 7-day trial.`
+      : `${hoursLeft} hours left in your 72-hour access window. Create an account to unlock a 7-day trial.`;
 
   await sendNotification("Start Your Headroom Trial", body, "signup");
   localStorage.setItem(GRACE_THRESHOLD_KEY, String(nextIndex));

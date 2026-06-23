@@ -296,22 +296,28 @@ export function formatRequestMessages(messages: TransformationRequestMessage[]):
 
 export type DiffLine = { type: "same" | "add" | "del"; text: string };
 
-// LCS line diff. ponytail: O(n*m) table — capped at MAX_DIFF_LINES per side so a
-// giant tool-result dump can't allocate a huge matrix; over the cap we fall back
-// to the side-by-side dumps. Upgrade to Myers/chunked diff if the cap bites.
-const MAX_DIFF_LINES = 600;
+// LCS line diff. ponytail: O(n*m) flat Uint16 table. Large compressions — the
+// whole point of this view — routinely run to thousands of lines, so the cap is
+// on the cell product (memory), not per-side line count. ~30M cells = 60MB,
+// computed once on expand. Over that we fall back to side-by-side dumps.
+// Upgrade to Hirschberg/Myers if the cap ever bites.
+const MAX_DIFF_CELLS = 30_000_000;
 
 export function diffLines(a: string, b: string): DiffLine[] | null {
   const oldL = a.split("\n");
   const newL = b.split("\n");
   const n = oldL.length;
   const m = newL.length;
-  if (n > MAX_DIFF_LINES || m > MAX_DIFF_LINES) return null;
-  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  // Uint16 caps LCS values at 65535; the cell cap keeps n,m well under that.
+  if ((n + 1) * (m + 1) > MAX_DIFF_CELLS) return null;
+  const w = m + 1;
+  const dp = new Uint16Array((n + 1) * w);
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {
-      dp[i][j] =
-        oldL[i] === newL[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      dp[i * w + j] =
+        oldL[i] === newL[j]
+          ? dp[(i + 1) * w + (j + 1)] + 1
+          : Math.max(dp[(i + 1) * w + j], dp[i * w + (j + 1)]);
     }
   }
   const out: DiffLine[] = [];
@@ -322,7 +328,7 @@ export function diffLines(a: string, b: string): DiffLine[] | null {
       out.push({ type: "same", text: oldL[i] });
       i++;
       j++;
-    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+    } else if (dp[(i + 1) * w + j] >= dp[i * w + (j + 1)]) {
       out.push({ type: "del", text: oldL[i] });
       i++;
     } else {
