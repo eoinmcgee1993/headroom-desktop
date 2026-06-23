@@ -8,25 +8,33 @@ const SHELL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn detect_claude_cli() -> Option<PathBuf> {
-    if let Some(path) = probe_known_paths() {
+    detect_cli("claude")
+}
+
+pub fn detect_codex_cli() -> Option<PathBuf> {
+    detect_cli("codex")
+}
+
+fn detect_cli(name: &str) -> Option<PathBuf> {
+    if let Some(path) = probe_known_paths(name) {
         return Some(path);
     }
-    probe_via_login_shell()
+    probe_via_login_shell(name)
 }
 
-fn probe_known_paths() -> Option<PathBuf> {
-    first_runnable(known_path_candidates(home_dir()).into_iter())
+fn probe_known_paths(name: &str) -> Option<PathBuf> {
+    first_runnable(known_path_candidates(home_dir(), name).into_iter())
 }
 
-fn known_path_candidates(home: PathBuf) -> Vec<PathBuf> {
+fn known_path_candidates(home: PathBuf, name: &str) -> Vec<PathBuf> {
     vec![
-        home.join(".claude").join("local").join("claude"),
-        PathBuf::from("/opt/homebrew/bin/claude"),
-        PathBuf::from("/usr/local/bin/claude"),
-        home.join(".npm-global").join("bin").join("claude"),
-        home.join(".volta").join("bin").join("claude"),
-        home.join(".bun").join("bin").join("claude"),
-        PathBuf::from("/usr/bin/claude"),
+        home.join(".claude").join("local").join(name),
+        PathBuf::from(format!("/opt/homebrew/bin/{name}")),
+        PathBuf::from(format!("/usr/local/bin/{name}")),
+        home.join(".npm-global").join("bin").join(name),
+        home.join(".volta").join("bin").join(name),
+        home.join(".bun").join("bin").join(name),
+        PathBuf::from(format!("/usr/bin/{name}")),
     ]
 }
 
@@ -36,7 +44,7 @@ fn first_runnable<I: Iterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf>
         .find(|candidate| is_runnable(candidate))
 }
 
-fn probe_via_login_shell() -> Option<PathBuf> {
+fn probe_via_login_shell(name: &str) -> Option<PathBuf> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let shell_name = Path::new(&shell)
         .file_name()
@@ -48,7 +56,7 @@ fn probe_via_login_shell() -> Option<PathBuf> {
     };
 
     let mut command = Command::new(&shell);
-    command.arg(flags).arg("command -v claude");
+    command.arg(flags).arg(format!("command -v {name}"));
     read_path_from_shell(command, SHELL_LOOKUP_TIMEOUT)
 }
 
@@ -332,7 +340,7 @@ mod tests {
         // Intel-only `claude` left behind in /usr/local/bin reach the working
         // arm64 binary first. The bug we fixed only surfaced because all
         // earlier candidates were missing.
-        let candidates = known_path_candidates(PathBuf::from("/Users/test"));
+        let candidates = known_path_candidates(PathBuf::from("/Users/test"), "claude");
         let opt = candidates
             .iter()
             .position(|p| p == Path::new("/opt/homebrew/bin/claude"));

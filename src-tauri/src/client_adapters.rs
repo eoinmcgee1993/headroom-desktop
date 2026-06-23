@@ -84,8 +84,10 @@ fn ensure_rtk_integrations_for_targets(
 ) -> Result<(Vec<String>, Vec<String>)> {
     // Respect the user's opt-out so bootstrap, restore, and client setup don't
     // silently re-add the PATH export and Claude Code hook after they've been
-    // turned off via the tool status toggle.
-    if is_rtk_disabled() {
+    // turned off via the tool status toggle. Also skip when the binary is absent
+    // (not installed / uninstalled) so we never write integrations pointing at a
+    // missing rtk.
+    if is_rtk_disabled() || !managed_rtk_path.exists() {
         return Ok((Vec::new(), Vec::new()));
     }
 
@@ -99,7 +101,40 @@ fn ensure_rtk_integrations_for_targets(
     changed_files.append(&mut hook_updates.0);
     backup_files.append(&mut hook_updates.1);
 
+    // Codex has no PreToolUse-style hook, so the auto-rewrite can't be wired the
+    // way it is for Claude Code. Mirror the MarkItDown approach: drop a managed
+    // `~/.codex/AGENTS.md` nudge telling Codex to route shell commands through
+    // the managed `rtk` binary (which is already on PATH via the block above).
+    if is_codex_enabled() {
+        let agents = rtk_codex_agents_path();
+        let (codex_changed, codex_backup) =
+            upsert_managed_block(&agents, "rtk", &build_rtk_codex_nudge(managed_rtk_path))?;
+        if codex_changed {
+            changed_files.push(agents.display().to_string());
+        }
+        if let Some(path) = codex_backup {
+            backup_files.push(path.display().to_string());
+        }
+    }
+
     Ok((changed_files, backup_files))
+}
+
+fn rtk_codex_agents_path() -> PathBuf {
+    codex_home().join("AGENTS.md")
+}
+
+/// Codex nudge: Codex has no command-rewrite hook, so it routes shell commands
+/// through the managed `rtk` binary by being told to prefix them with it.
+fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
+    let bin = managed_rtk_path.display();
+    format!(
+        "## Token-saving shell commands (Headroom RTK)\n\
+         Run shell commands through RTK to get compact, token-optimized output:\n\
+         prefix the command with `{bin} ` (for example `{bin} git status`,\n\
+         `{bin} ls -la`, `{bin} cargo build`). RTK passes through anything it\n\
+         does not optimize, so it is safe to use as a prefix for any command."
+    )
 }
 
 pub fn rtk_integration_status() -> Result<(bool, bool)> {
@@ -119,9 +154,9 @@ pub fn is_rtk_disabled() -> bool {
 }
 
 /// Enable or disable RTK from the tool status toggle. Disabling tears down the
-/// RTK PATH export and Claude Code hook (without touching `ANTHROPIC_BASE_URL`
-/// routing) and persists the opt-out so bootstrap won't re-add them. Enabling
-/// clears the flag and re-applies the integrations.
+/// RTK PATH export, the Claude Code hook, and the Codex AGENTS.md nudge (without
+/// touching `ANTHROPIC_BASE_URL` routing) and persists the opt-out so bootstrap
+/// won't re-add them. Enabling clears the flag and re-applies the integrations.
 pub fn set_rtk_enabled(
     enabled: bool,
     managed_rtk_path: &Path,
@@ -143,6 +178,7 @@ pub fn set_rtk_enabled(
         if hook_path.exists() {
             let _ = std::fs::remove_file(&hook_path);
         }
+        let _ = remove_managed_block(&rtk_codex_agents_path(), "rtk");
     }
 
     Ok(())
@@ -547,6 +583,12 @@ pub fn perform_full_cleanup() -> Vec<String> {
                 Err(err) => log::warn!("cleanup: removing {} failed: {err}", hook_path.display()),
             }
         }
+    }
+
+    // Drop the managed RTK nudge from ~/.codex/AGENTS.md (clear_client_setups
+    // handles env/shell blocks but not these managed Markdown blocks).
+    if let Err(err) = remove_managed_block(&rtk_codex_agents_path(), "rtk") {
+        log::warn!("cleanup: removing rtk AGENTS.md block failed: {err}");
     }
 
     // Also wipe the per-client setup-state file so a reinstall starts clean.
@@ -1094,6 +1136,12 @@ fn markitdown_claude_md_path() -> PathBuf {
     home_dir().join(".claude").join("CLAUDE.md")
 }
 
+fn markitdown_codex_agents_path() -> PathBuf {
+    codex_home().join("AGENTS.md")
+}
+
+/// Office-only nudge for Claude Code, where PDFs are already handled by the
+/// PreToolUse(Read) hook.
 fn build_markitdown_office_nudge(shim_path: &Path) -> String {
     let bin = shim_path.display();
     format!(
@@ -1104,55 +1152,87 @@ fn build_markitdown_office_nudge(shim_path: &Path) -> String {
     )
 }
 
-/// Enables the MarkItDown addon integration: the PDF Read hook, plus the Office
-/// nudge (a managed `~/.claude/CLAUDE.md` block and a scoped Bash permission for
-/// the `markitdown` shim). Reuses the marker-based settings writer used by RTK.
+/// Codex nudge: Codex has no PreToolUse-style hook, so it covers PDF *and*
+/// Office formats through the `markitdown` CLI.
+fn build_markitdown_codex_nudge(shim_path: &Path) -> String {
+    let bin = shim_path.display();
+    format!(
+        "## Reading documents (Headroom MarkItDown)\n\
+         To read a .pdf, .docx, .doc, .pptx, .ppt, .xlsx, or .xls file, run\n\
+         `{bin} <path>` in the shell and use the Markdown it prints, rather than\n\
+         opening the raw file. This keeps large documents cheap to read."
+    )
+}
+
+/// Enables the MarkItDown addon integration for whichever coding clients are
+/// configured through Headroom: Claude Code gets the PDF Read hook plus an
+/// Office nudge (managed `~/.claude/CLAUDE.md` block + scoped Bash permission);
+/// Codex gets a managed `~/.codex/AGENTS.md` nudge covering PDF and Office (it
+/// has no hook mechanism). Idempotent and safe to re-run.
 pub fn enable_markitdown_integration(
     markitdown_entrypoint: &Path,
     markitdown_shim: &Path,
     python_path: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
-    let hook_path = headroom_markitdown_hook_path();
-    let hook_body = build_headroom_markitdown_hook(markitdown_entrypoint, python_path);
-    let (hook_changed, hook_backup) = write_file_if_changed(&hook_path, &hook_body, true)?;
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
 
-    if hook_changed {
-        changed_files.push(hook_path.display().to_string());
-    }
-    if let Some(path) = hook_backup {
-        backup_files.push(path.display().to_string());
+    if is_claude_code_enabled() {
+        let hook_path = headroom_markitdown_hook_path();
+        let hook_body = build_headroom_markitdown_hook(markitdown_entrypoint, python_path);
+        let (hook_changed, hook_backup) = write_file_if_changed(&hook_path, &hook_body, true)?;
+        if hook_changed {
+            changed_files.push(hook_path.display().to_string());
+        }
+        if let Some(path) = hook_backup {
+            backup_files.push(path.display().to_string());
+        }
+
+        let (settings_changed, settings_backups) =
+            ensure_claude_settings_hook(&hook_path, "Read", "headroom-markitdown-read.sh")?;
+        changed_files.extend(settings_changed);
+        backup_files.extend(settings_backups);
+
+        let claude_md = markitdown_claude_md_path();
+        let (md_changed, md_backup) = upsert_managed_block(
+            &claude_md,
+            "markitdown_office",
+            &build_markitdown_office_nudge(markitdown_shim),
+        )?;
+        if md_changed {
+            changed_files.push(claude_md.display().to_string());
+        }
+        if let Some(path) = md_backup {
+            backup_files.push(path.display().to_string());
+        }
+
+        if set_markitdown_bash_permission(markitdown_shim, true)? {
+            changed_files.push(claude_settings_path().display().to_string());
+        }
     }
 
-    let (settings_changed, settings_backups) =
-        ensure_claude_settings_hook(&hook_path, "Read", "headroom-markitdown-read.sh")?;
-    changed_files.extend(settings_changed);
-    backup_files.extend(settings_backups);
-
-    // Office nudge: managed CLAUDE.md block + scoped Bash permission.
-    let claude_md = markitdown_claude_md_path();
-    let (md_changed, md_backup) = upsert_managed_block(
-        &claude_md,
-        "markitdown_office",
-        &build_markitdown_office_nudge(markitdown_shim),
-    )?;
-    if md_changed {
-        changed_files.push(claude_md.display().to_string());
-    }
-    if let Some(path) = md_backup {
-        backup_files.push(path.display().to_string());
-    }
-
-    if set_markitdown_bash_permission(markitdown_shim, true)? {
-        changed_files.push(claude_settings_path().display().to_string());
+    if is_codex_enabled() {
+        let agents = markitdown_codex_agents_path();
+        let (codex_changed, codex_backup) = upsert_managed_block(
+            &agents,
+            "markitdown",
+            &build_markitdown_codex_nudge(markitdown_shim),
+        )?;
+        if codex_changed {
+            changed_files.push(agents.display().to_string());
+        }
+        if let Some(path) = codex_backup {
+            backup_files.push(path.display().to_string());
+        }
     }
 
     Ok((changed_files, backup_files))
 }
 
-/// Removes the MarkItDown Read hook, hook script, Office nudge block, and the
-/// scoped Bash permission, leaving any RTK hook untouched.
+/// Removes every MarkItDown integration artifact for all clients (Claude Read
+/// hook + script + Office nudge + Bash permission, and the Codex AGENTS.md
+/// nudge), leaving any RTK hook untouched. Cleanup runs unconditionally so a
+/// client that was later disconnected is still scrubbed.
 pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
     let mut changed =
         remove_pre_tool_use_markers(&claude_settings_path(), &["headroom-markitdown-read.sh"])?;
@@ -1162,6 +1242,7 @@ pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
     }
     changed |= remove_managed_block(&markitdown_claude_md_path(), "markitdown_office")?;
     changed |= set_markitdown_bash_permission(markitdown_shim, false)?;
+    changed |= remove_managed_block(&markitdown_codex_agents_path(), "markitdown")?;
     Ok(changed)
 }
 
@@ -2862,8 +2943,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_headroom_markitdown_hook, build_markitdown_office_nudge, build_headroom_rtk_hook,
-        claude_code_user_state_exists,
+        build_headroom_markitdown_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
+        build_headroom_rtk_hook, claude_code_user_state_exists,
         claude_hook_present_in_value, remove_pre_tool_use_markers,
         default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
@@ -3059,6 +3140,15 @@ mod tests {
         assert!(nudge.contains("/h/bin/markitdown <path>"));
         assert!(nudge.contains(".docx"));
         assert!(nudge.contains("PDFs are handled automatically"));
+    }
+
+    #[test]
+    fn markitdown_codex_nudge_covers_pdf_and_office() {
+        let nudge = build_markitdown_codex_nudge(Path::new("/h/bin/markitdown"));
+        assert!(nudge.contains("/h/bin/markitdown <path>"));
+        // Codex has no hook, so PDF is covered by the CLI nudge too.
+        assert!(nudge.contains(".pdf"));
+        assert!(nudge.contains(".docx"));
     }
 
     #[test]
@@ -3772,6 +3862,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         }
     }
 
+    /// RTK is opt-in: its PATH block and Claude Code hook are only wired when the
+    /// managed binary exists on disk. Drop a fake one at the default location so
+    /// tests covering a fully-configured environment exercise the RTK wiring.
+    fn seed_installed_rtk() {
+        let rtk = super::default_headroom_rtk_path();
+        fs::create_dir_all(rtk.parent().unwrap()).unwrap();
+        fs::write(&rtk, "#!/bin/sh\n").unwrap();
+    }
+
     fn read_settings_json(path: &Path) -> serde_json::Value {
         let raw = fs::read_to_string(path).expect("read settings.json");
         serde_json::from_str(&raw).expect("parse settings.json")
@@ -3791,6 +3890,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             r#"{"hooks": {}}"#,
         )
         .unwrap();
+        seed_installed_rtk();
 
         let result = super::apply_client_setup("claude_code").expect("apply_client_setup succeeds");
         assert!(result.applied);
@@ -3899,6 +3999,49 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn ensure_rtk_integrations_writes_codex_nudge_and_disable_removes_it() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::write(home.path().join(".claude").join("settings.json"), "{}").unwrap();
+
+        // Mark Codex as a configured client so the AGENTS.md nudge path runs.
+        let mut state = super::load_setup_state();
+        state
+            .configured_clients
+            .insert("codex_cli".into(), "now".into());
+        super::write_setup_state(&state).unwrap();
+
+        // Fake managed rtk + python binaries so the binary-present guard passes.
+        let bin_dir = home.path().join("managed-bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let rtk = bin_dir.join("rtk");
+        fs::write(&rtk, "#!/bin/sh\n").unwrap();
+        let python = bin_dir.join("python3");
+        fs::write(&python, "#!/bin/sh\n").unwrap();
+
+        super::ensure_rtk_integrations(&rtk, &python).expect("ensure_rtk_integrations");
+
+        let agents = home.path().join(".codex").join("AGENTS.md");
+        let body = fs::read_to_string(&agents).expect("AGENTS.md written");
+        assert!(body.contains("Headroom RTK"), "nudge heading present: {body}");
+        assert!(
+            body.contains(&rtk.display().to_string()),
+            "nudge references the managed rtk path: {body}"
+        );
+
+        // Disabling RTK must remove the managed block.
+        super::set_rtk_enabled(false, &rtk, &python).expect("disable rtk");
+        let after = fs::read_to_string(&agents).unwrap_or_default();
+        assert!(
+            !after.contains("Headroom RTK"),
+            "nudge removed on disable: {after}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn apply_claude_code_is_byte_idempotent() {
         // Regression: a second apply used to add blank-line padding between
         // managed blocks, so byte-exact idempotency now holds and is
@@ -3906,6 +4049,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
         fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
 
         super::apply_client_setup("claude_code").expect("first apply");
         let zshrc_after_first = fs::read_to_string(home.path().join(".zshrc")).unwrap();
@@ -3965,6 +4109,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
         fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
 
         super::apply_client_setup("claude_code").expect("apply");
         let hook_path = home

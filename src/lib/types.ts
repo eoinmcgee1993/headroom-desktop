@@ -4,7 +4,7 @@ export interface ManagedTool {
   id: string;
   name: string;
   description: string;
-  runtime: "python";
+  runtime: "python" | "binary" | "plugin";
   required: boolean;
   enabled: boolean;
   status: ToolStatus;

@@ -648,6 +648,26 @@ fn install_addon(state: State<'_, AppState>, id: String) -> Result<DashboardStat
             .map_err(|err| format!("markitdown installed but enabling integration failed: {err:#}"))?;
             Ok(state.dashboard())
         }
+        "rtk" => {
+            state
+                .tool_manager
+                .install_rtk()
+                .map_err(|err| err.to_string())?;
+            client_adapters::set_rtk_enabled(
+                true,
+                &state.tool_manager.rtk_entrypoint(),
+                &state.tool_manager.managed_python(),
+            )
+            .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
+            Ok(state.dashboard())
+        }
+        "ponytail" => {
+            state
+                .tool_manager
+                .install_ponytail()
+                .map_err(|err| err.to_string())?;
+            Ok(state.dashboard())
+        }
         other => Err(format!("unknown addon: {other}")),
     }
 }
@@ -679,6 +699,13 @@ fn set_addon_enabled(
             }
             Ok(state.dashboard())
         }
+        "ponytail" => {
+            state
+                .tool_manager
+                .set_ponytail_enabled(enabled)
+                .map_err(|err| err.to_string())?;
+            Ok(state.dashboard())
+        }
         other => Err(format!("unknown addon: {other}")),
     }
 }
@@ -693,6 +720,26 @@ fn uninstall_addon(state: State<'_, AppState>, id: String) -> Result<DashboardSt
             state
                 .tool_manager
                 .uninstall_markitdown()
+                .map_err(|err| err.to_string())?;
+            Ok(state.dashboard())
+        }
+        "rtk" => {
+            client_adapters::set_rtk_enabled(
+                false,
+                &state.tool_manager.rtk_entrypoint(),
+                &state.tool_manager.managed_python(),
+            )
+            .map_err(|err| err.to_string())?;
+            state
+                .tool_manager
+                .uninstall_rtk()
+                .map_err(|err| err.to_string())?;
+            Ok(state.dashboard())
+        }
+        "ponytail" => {
+            state
+                .tool_manager
+                .uninstall_ponytail()
                 .map_err(|err| err.to_string())?;
             Ok(state.dashboard())
         }
@@ -2900,6 +2947,12 @@ fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     {
         let state: tauri::State<'_, AppState> = app.state();
         state.stop_headroom();
+        // Ponytail lives in Claude Code's plugin registry, outside Headroom's
+        // own footprint that perform_full_cleanup() wipes, so remove it here
+        // while we still have the ToolManager. Best-effort.
+        if let Err(err) = state.tool_manager.uninstall_ponytail() {
+            log::warn!("uninstall: removing ponytail plugin failed: {err:#}");
+        }
     }
 
     // Turn off the login item if it was ever enabled, so the system stops

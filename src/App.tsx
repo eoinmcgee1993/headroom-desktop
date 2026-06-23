@@ -195,23 +195,27 @@ interface AddonCopy {
 const addonCopy: Record<string, AddonCopy> = {
   rtk: {
     whatItDoes:
-      "Enabling RTK adds it to your shell PATH and turns on the Claude Code bash auto-rewrite hook. Shell commands Claude runs are routed through RTK, which compacts their output so it costs far fewer tokens. Removed cleanly when you uninstall Headroom.",
+      "Installing downloads the RTK binary into Headroom's managed runtime, adds it to your shell PATH, and turns on the bash auto-rewrite hook. Shell commands your agent runs are routed through RTK, which compacts their output so it costs far fewer tokens. Removed cleanly when you uninstall it or Headroom.",
+    installing: "Downloading RTK and registering the bash hook...",
+    installed:
+      "RTK is installed and on. Your agent's bash commands now route through RTK and return token-optimized output.",
+    uninstalling: "Removing RTK, its PATH entry, and the bash hook...",
+    uninstalled: "RTK removed. Shell commands run normally, without output rewriting.",
     enabling: "Enabling RTK and registering the bash hook...",
     enabled:
-      "RTK is on. Claude Code's bash commands now route through RTK and return token-optimized output.",
+      "RTK is on. Your agent's bash commands now route through RTK and return token-optimized output.",
     disabling: "Disabling RTK and removing the bash hook...",
-    disabled: "RTK is off. Shell commands run normally, without output rewriting."
+    disabled: "RTK is off but still installed. Re-enable any time without re-downloading."
   },
   markitdown: {
     whatItDoes:
-      "Installing adds the MarkItDown converter to Headroom's managed Python runtime and registers a Claude Code Read hook. Nothing is installed system-wide - it all lives under Headroom's app data and is removed when you uninstall Headroom.",
+      "Installing adds the MarkItDown converter to Headroom's managed Python runtime and registers a document Read hook. Nothing is installed system-wide - it all lives under Headroom's app data and is removed when you uninstall Headroom.",
     installing: "Installing MarkItDown and registering the Read hook...",
     installed:
-      "MarkItDown is active. When Claude reads a PDF or Office file, Headroom converts it to Markdown first so it costs far fewer tokens.",
+      "MarkItDown is active. When your agent reads a PDF or Office file, Headroom converts it to Markdown first so it costs far fewer tokens.",
     uninstalling: "Removing MarkItDown and its Read hook...",
-    uninstalled: "MarkItDown removed. Claude reads documents in their original format again.",
+    uninstalled: "MarkItDown removed. Your agent reads documents in their original format again.",
     enabling: "Enabling MarkItDown...",
-    enabled: "MarkItDown is active again. Documents are converted to Markdown before Claude reads them.",
     disabling: "Disabling MarkItDown...",
     disabled: "MarkItDown is off. It stays installed but no longer converts documents."
   }
@@ -736,6 +740,38 @@ function DailySavingsChart({
 
 function renderConnectorLogo(clientId: string) {
   return <Sparkle className="client-logo__glyph" size={20} weight="duotone" />;
+}
+
+function AddonClientChips({
+  connectors
+}: {
+  connectors: ClientConnectorStatus[];
+}) {
+  const clients = sortClientConnectors(aggregateClientConnectors(connectors));
+  if (clients.length === 0) {
+    return null;
+  }
+  return (
+    <div className="addon-card__clients">
+      {clients.map((connector) => {
+        const status = connectorDashboardStatus(connector);
+        return (
+          <span
+            className="callout-banner__chip"
+            key={connector.clientId}
+            title={status.label}
+          >
+            <span
+              className={`callout-banner__chip-dot callout-banner__chip-dot--${status.tone}`}
+              aria-hidden="true"
+            />
+            <span className="callout-banner__chip-name">{connector.name}</span>
+            <span className="visually-hidden">{status.label}</span>
+          </span>
+        );
+      })}
+    </div>
+  );
 }
 
 function buildUpgradeIssueMailto(failure: RuntimeUpgradeFailure): string {
@@ -2168,8 +2204,6 @@ export default function App() {
         return 17;
       case "Installing Headroom":
         return 20;
-      case "Installing RTK":
-        return 11;
       case "Finalizing":
         return 4;
       default:
@@ -2636,6 +2670,9 @@ export default function App() {
     try {
       const next = await invoke<DashboardState>(command, { id, enabled });
       setDashboard(next);
+      if (id === "rtk") {
+        await refreshRuntimeStatus();
+      }
       const message =
         command === "install_addon"
           ? copy?.installed
@@ -4945,7 +4982,7 @@ export default function App() {
             <header className="addons__header">
               <h1>Addons</h1>
               <p className="addons__subtitle">
-                Optional tools that reduce token usage. Install one to enable it in Claude Code.
+                Additional tools that reduce token usage. Install to enable.
               </p>
             </header>
             {addonError ? <p className="addons__error">{addonError}</p> : null}
@@ -4979,69 +5016,97 @@ export default function App() {
                     <p className="addon-card__info-text">{addonCopy.rtk.whatItDoes}</p>
                   ) : null}
                   <p className="addon-card__description">
-                    Token-optimizing proxy that auto-rewrites Claude Code bash commands.
+                    Token-optimizing proxy that auto-rewrites your agent's bash commands.
                     {rtkAvgSavingsPct !== null
                       ? ` ${percent1(rtkAvgSavingsPct)}% avg savings.`
                       : ""}
                   </p>
+                  {runtimeStatus?.rtk.installed && runtimeStatus.rtk.enabled ? (
+                    <AddonClientChips connectors={connectors} />
+                  ) : null}
                   {addonBusyId === "rtk" && addonBusyLabel ? (
                     <p className="addon-card__progress">{addonBusyLabel}</p>
                   ) : addonResult?.id === "rtk" ? (
                     <p className="addon-card__result">{addonResult.message}</p>
                   ) : null}
-                  <div className="runtime-status__grid runtime-status__grid--3">
-                    {[
-                      { name: "Binary", ok: runtimeStatus?.rtk.installed === true },
-                      { name: "PATH", ok: runtimeStatus?.rtk.pathConfigured === true },
-                      { name: "Hook", ok: runtimeStatus?.rtk.hookConfigured === true }
-                    ].map((s) => (
-                      <span key={s.name} className="runtime-status__item">
-                        <span className="runtime-status__label">{s.name}:</span>
-                        <span
-                          className={`runtime-status__indicator ${s.ok ? "runtime-status__indicator--ok" : "runtime-status__indicator--off"}`}
-                        >
-                          {s.ok ? "✔" : "✖"}
-                        </span>
-                      </span>
-                    ))}
-                  </div>
-                  <button
-                    type="button"
-                    className="addon-card__link"
-                    onClick={async () => {
-                      const next = !showRtkDetails;
-                      setShowRtkDetails(next);
-                      if (next) {
-                        try {
-                          const lines = await invoke<string[]>("get_rtk_activity", { maxLines: 80 });
-                          setRtkActivityLines(lines);
-                        } catch {
-                          setRtkActivityLines(["Failed to load RTK activity."]);
-                        }
-                      }
-                    }}
-                  >
-                    {showRtkDetails ? "Hide RTK activity" : "Show RTK activity"}
-                  </button>
-                  {showRtkDetails ? (
-                    <pre className="runtime-log" ref={rtkActivityRef}>
-                      {rtkActivityLines.length > 0 ? rtkActivityLines.join("\n") : "No RTK activity yet."}
-                    </pre>
+                  {runtimeStatus?.rtk.installed ? (
+                    <>
+                      <div className="runtime-status__grid runtime-status__grid--3">
+                        {[
+                          { name: "Binary", ok: runtimeStatus?.rtk.installed === true },
+                          { name: "PATH", ok: runtimeStatus?.rtk.pathConfigured === true },
+                          { name: "Hook", ok: runtimeStatus?.rtk.hookConfigured === true }
+                        ].map((s) => (
+                          <span key={s.name} className="runtime-status__item">
+                            <span className="runtime-status__label">{s.name}:</span>
+                            <span
+                              className={`runtime-status__indicator ${s.ok ? "runtime-status__indicator--ok" : "runtime-status__indicator--off"}`}
+                            >
+                              {s.ok ? "✔" : "✖"}
+                            </span>
+                          </span>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        className="addon-card__link"
+                        onClick={async () => {
+                          const next = !showRtkDetails;
+                          setShowRtkDetails(next);
+                          if (next) {
+                            try {
+                              const lines = await invoke<string[]>("get_rtk_activity", { maxLines: 80 });
+                              setRtkActivityLines(lines);
+                            } catch {
+                              setRtkActivityLines(["Failed to load RTK activity."]);
+                            }
+                          }
+                        }}
+                      >
+                        {showRtkDetails ? "Hide RTK activity" : "Show RTK activity"}
+                      </button>
+                      {showRtkDetails ? (
+                        <pre className="runtime-log" ref={rtkActivityRef}>
+                          {rtkActivityLines.length > 0 ? rtkActivityLines.join("\n") : "No RTK activity yet."}
+                        </pre>
+                      ) : null}
+                    </>
                   ) : null}
                 </div>
                 <div className="addon-card__actions">
-                  <button
-                    type="button"
-                    className="addon-card__action"
-                    disabled={rtkBusy || !runtimeStatus}
-                    onClick={() => void handleRtkToggle(!runtimeStatus?.rtk.enabled)}
-                  >
-                    {runtimeStatus?.rtk.enabled ? "Disable" : "Enable"}
-                  </button>
+                  {runtimeStatus?.rtk.installed ? (
+                    <>
+                      <button
+                        type="button"
+                        className="addon-card__action"
+                        disabled={rtkBusy || addonBusyId === "rtk" || !runtimeStatus}
+                        onClick={() => void handleRtkToggle(!runtimeStatus?.rtk.enabled)}
+                      >
+                        {runtimeStatus?.rtk.enabled ? "Disable" : "Enable"}
+                      </button>
+                      <button
+                        type="button"
+                        className="addon-card__action addon-card__action--danger"
+                        disabled={rtkBusy || addonBusyId === "rtk" || !runtimeStatus}
+                        onClick={() => void runAddonAction("uninstall_addon", "rtk")}
+                      >
+                        Uninstall
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className="addon-card__action addon-card__action--primary"
+                      disabled={rtkBusy || addonBusyId === "rtk" || !runtimeStatus}
+                      onClick={() => void runAddonAction("install_addon", "rtk")}
+                    >
+                      Install
+                    </button>
+                  )}
                 </div>
               </li>
               {dashboard.tools
-                .filter((tool) => !tool.required)
+                .filter((tool) => !tool.required && tool.id !== "rtk")
                 .map((tool) => {
                   const busy = addonBusyId === tool.id;
                   const installed = tool.status !== "not_installed";
@@ -5078,6 +5143,9 @@ export default function App() {
                           <p className="addon-card__info-text">{info.whatItDoes}</p>
                         ) : null}
                         <p className="addon-card__description">{tool.description}</p>
+                        {installed && tool.enabled ? (
+                          <AddonClientChips connectors={connectors} />
+                        ) : null}
                         <button
                           type="button"
                           className="addon-card__link"

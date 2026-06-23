@@ -5711,6 +5711,15 @@ html.window-hiding {
   margin: 6px 0 0;
 }
 
+.addon-card__clients {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 8px;
+}
+
 .addon-card__link {
   margin: 8px 0 0;
   padding: 0;
