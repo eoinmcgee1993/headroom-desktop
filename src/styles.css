@@ -5168,6 +5168,13 @@ html.window-hiding {
   color: var(--accent-strong);
 }
 
+.activity-feed__diff-line--skip {
+  color: var(--text-muted);
+  font-style: italic;
+  text-align: center;
+  user-select: none;
+}
+
 .activity-feed__detail-list {
   list-style: none;
   margin: 0;

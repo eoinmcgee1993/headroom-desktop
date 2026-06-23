@@ -341,6 +341,102 @@ export function diffLines(a: string, b: string): DiffLine[] | null {
   return out;
 }
 
+export type CollapsedDiffLine = DiffLine | { type: "skip"; text: string };
+
+// Keep `context` unchanged lines around each change and collapse the rest, so
+// the removed (red) / added (green) lines are visible the moment the row opens
+// instead of buried under hundreds of identical context lines.
+const DIFF_CONTEXT = 3;
+
+export function collapseDiff(diff: DiffLine[], context = DIFF_CONTEXT): CollapsedDiffLine[] {
+  const keep = new Array(diff.length).fill(false);
+  for (let i = 0; i < diff.length; i++) {
+    if (diff[i].type === "same") continue;
+    for (let j = Math.max(0, i - context); j <= Math.min(diff.length - 1, i + context); j++) {
+      keep[j] = true;
+    }
+  }
+  const out: CollapsedDiffLine[] = [];
+  let i = 0;
+  while (i < diff.length) {
+    if (diff[i].type !== "same" || keep[i]) {
+      out.push(diff[i]);
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < diff.length && diff[j].type === "same" && !keep[j]) j++;
+    const n = j - i;
+    out.push({ type: "skip", text: `... ${n} unchanged line${n === 1 ? "" : "s"}` });
+    i = j;
+  }
+  return out;
+}
+
+// Unified line diff of original vs compressed request bodies, so pruned content
+// (red) and inserted truncation markers (green) pop instead of two near-identical
+// dumps. Returns dt/dd fragment for the detail grid. Shared by the transformation
+// and record rows.
+function CompressionDiff({
+  requestMessages,
+  compressedMessages,
+  inputTokensOriginal,
+  inputTokensOptimized
+}: {
+  requestMessages: TransformationRequestMessage[];
+  compressedMessages: TransformationRequestMessage[];
+  inputTokensOriginal?: number | null;
+  inputTokensOptimized?: number | null;
+}) {
+  const original = formatRequestMessages(requestMessages);
+  const compressed = formatRequestMessages(compressedMessages);
+  const diff = diffLines(original, compressed);
+  if (!diff) {
+    // Too large to diff — fall back to side-by-side dumps.
+    return (
+      <>
+        <dt>Request (original)</dt>
+        <dd>
+          <pre className="activity-feed__message-dump">{original}</pre>
+        </dd>
+        <dt>Request (compressed)</dt>
+        <dd>
+          <pre className="activity-feed__message-dump">{compressed}</pre>
+        </dd>
+      </>
+    );
+  }
+  return (
+    <>
+      <dt>
+        Compression diff
+        {inputTokensOriginal != null && inputTokensOptimized != null
+          ? ` (${inputTokensOriginal.toLocaleString()} → ${inputTokensOptimized.toLocaleString()} tokens)`
+          : ""}
+      </dt>
+      <dd>
+        <pre className="activity-feed__message-dump activity-feed__diff">
+          {collapseDiff(diff).map((line, idx) => (
+            <div
+              key={idx}
+              className={`activity-feed__diff-line activity-feed__diff-line--${line.type}`}
+            >
+              {line.type === "del"
+                ? "- "
+                : line.type === "add"
+                  ? "+ "
+                  : line.type === "skip"
+                    ? ""
+                    : "  "}
+              {line.text}
+            </div>
+          ))}
+        </pre>
+      </dd>
+    </>
+  );
+}
+
 function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const saved = event.tokensSaved ?? 0;
   const pct = event.savingsPercent ?? 0;
@@ -409,55 +505,12 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
         </>
       ) : null}
       {hasRequestMessages && hasCompressedMessages ? (
-        // New proxy shape: both sides present. Render a unified line diff so
-        // pruned content (red) and inserted truncation markers (green) pop —
-        // the two near-identical dumps were hard to tell apart at a glance.
-        (() => {
-          const original = formatRequestMessages(event.requestMessages!);
-          const compressed = formatRequestMessages(event.compressedMessages!);
-          const diff = diffLines(original, compressed);
-          const label = (
-            <dt>
-              Compression diff
-              {event.inputTokensOriginal != null && event.inputTokensOptimized != null
-                ? ` (${event.inputTokensOriginal.toLocaleString()} → ${event.inputTokensOptimized.toLocaleString()} tokens)`
-                : ""}
-            </dt>
-          );
-          if (!diff) {
-            // Too large to diff — fall back to side-by-side dumps.
-            return (
-              <>
-                <dt>Request (original)</dt>
-                <dd>
-                  <pre className="activity-feed__message-dump">{original}</pre>
-                </dd>
-                <dt>Request (compressed)</dt>
-                <dd>
-                  <pre className="activity-feed__message-dump">{compressed}</pre>
-                </dd>
-              </>
-            );
-          }
-          return (
-            <>
-              {label}
-              <dd>
-                <pre className="activity-feed__message-dump activity-feed__diff">
-                  {diff.map((line, idx) => (
-                    <div
-                      key={idx}
-                      className={`activity-feed__diff-line activity-feed__diff-line--${line.type}`}
-                    >
-                      {line.type === "del" ? "- " : line.type === "add" ? "+ " : "  "}
-                      {line.text}
-                    </div>
-                  ))}
-                </pre>
-              </dd>
-            </>
-          );
-        })()
+        <CompressionDiff
+          requestMessages={event.requestMessages!}
+          compressedMessages={event.compressedMessages!}
+          inputTokensOriginal={event.inputTokensOriginal}
+          inputTokensOptimized={event.inputTokensOptimized}
+        />
       ) : hasRequestMessages ? (
         // Legacy proxy shape: only `requestMessages` exists. Its content may
         // actually be the post-compression list (field was inconsistent
@@ -785,20 +838,12 @@ function RecordRow({ event }: { event: RecordEvent }) {
         </>
       ) : null}
       {hasRequestMessages && hasCompressedMessages ? (
-        <>
-          <dt>Request (original)</dt>
-          <dd>
-            <pre className="activity-feed__message-dump">
-              {formatRequestMessages(event.requestMessages!)}
-            </pre>
-          </dd>
-          <dt>Request (compressed)</dt>
-          <dd>
-            <pre className="activity-feed__message-dump">
-              {formatRequestMessages(event.compressedMessages!)}
-            </pre>
-          </dd>
-        </>
+        <CompressionDiff
+          requestMessages={event.requestMessages!}
+          compressedMessages={event.compressedMessages!}
+          inputTokensOriginal={event.inputTokensOriginal}
+          inputTokensOptimized={event.inputTokensOptimized}
+        />
       ) : hasRequestMessages ? (
         <>
           <dt>Request</dt>

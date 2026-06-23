@@ -1,6 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
-import { ActivityFeed, diffLines, formatRequestMessages, groupTransforms } from "./ActivityFeed";
+import {
+  ActivityFeed,
+  collapseDiff,
+  diffLines,
+  formatRequestMessages,
+  groupTransforms
+} from "./ActivityFeed";
 import type {
   ActivityFeedResponse,
   ActivityFeedSnapshot,
@@ -851,5 +857,25 @@ describe("diffLines", () => {
   it("returns null only when the cell product exceeds the memory cap", () => {
     const huge = Array.from({ length: 6000 }, (_, i) => String(i)).join("\n");
     expect(diffLines(huge, huge)).toBeNull(); // 6001^2 ≈ 36M > 30M cap
+  });
+});
+
+describe("collapseDiff", () => {
+  it("collapses long unchanged runs while keeping context around changes", () => {
+    const original = Array.from({ length: 2000 }, (_, i) => String(i)).join("\n");
+    const compressed = Array.from({ length: 2000 }, (_, i) =>
+      i === 1000 ? "CHANGED" : String(i)
+    ).join("\n");
+    const collapsed = collapseDiff(diffLines(original, compressed)!, 3);
+    // The removed line survives and sits near the top of the collapsed output.
+    const delIdx = collapsed.findIndex((l) => l.type === "del" && l.text === "1000");
+    expect(delIdx).toBeGreaterThanOrEqual(0);
+    expect(delIdx).toBeLessThan(10);
+    // Thousands of identical lines are reduced to two skip markers.
+    expect(collapsed.filter((l) => l.type === "skip").length).toBe(2);
+    expect(collapsed.some((l) => l.type === "same" && l.text === "0")).toBe(false);
+    // Context lines immediately around the change are preserved.
+    expect(collapsed.some((l) => l.type === "same" && l.text === "999")).toBe(true);
+    expect(collapsed.some((l) => l.type === "same" && l.text === "1001")).toBe(true);
   });
 });
