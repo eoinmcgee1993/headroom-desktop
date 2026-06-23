@@ -1991,6 +1991,23 @@ impl ToolManager {
         Ok(())
     }
 
+    /// Verifies the managed `markitdown` console script actually executes (its
+    /// base converters and their dependencies import). No-op when the addon
+    /// isn't installed, so it can be called unconditionally from a smoke pass.
+    pub fn smoke_test_markitdown(&self) -> Result<()> {
+        self.smoke_test_markitdown_with_timeout(HEADROOM_SMOKE_TEST_TIMEOUT)
+    }
+
+    fn smoke_test_markitdown_with_timeout(&self, timeout: Duration) -> Result<()> {
+        if !self.markitdown_installed() {
+            return Ok(());
+        }
+        let bin = self.markitdown_entrypoint();
+        run_command_with_timeout(&bin, &["--help"], &self.runtime.root_dir, timeout)
+            .with_context(|| format!("running markitdown smoke test with {}", bin.display()))?;
+        Ok(())
+    }
+
     /// Apply an ad-hoc codesign signature to every native extension (.so /
     /// .dylib) under the venv's site-packages. PyPI wheels arrive unsigned,
     /// and some endpoint protection (EDR) tooling either blocks unsigned
@@ -2716,6 +2733,13 @@ impl ToolManager {
             };
         }
 
+        // Optional addon: an in-place upgrade keeps the venv, so markitdown
+        // should still run. Warn-only — a broken optional addon must not fail
+        // the core Headroom upgrade.
+        if let Err(err) = self.smoke_test_markitdown() {
+            log::warn!("markitdown smoke test failed after upgrade: {err:#}");
+        }
+
         progress(BootstrapStepUpdate {
             step: "Configuring integrations",
             message: "Setting up Headroom MCP integration.".into(),
@@ -3342,6 +3366,23 @@ impl ToolManager {
         self.runtime.venv_dir.join("bin").join("markitdown")
     }
 
+    /// Symlink in the Headroom-managed bin dir (already exported onto PATH by the
+    /// RTK integration) so Claude Code can run `markitdown` for the Office nudge.
+    pub fn markitdown_shim_path(&self) -> PathBuf {
+        self.runtime.bin_dir.join("markitdown")
+    }
+
+    fn ensure_markitdown_shim(&self) -> Result<()> {
+        let shim = self.markitdown_shim_path();
+        if shim.exists() || shim.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_file(&shim);
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(self.markitdown_entrypoint(), &shim)
+            .with_context(|| format!("symlinking markitdown shim {}", shim.display()))?;
+        Ok(())
+    }
+
     pub fn markitdown_installed(&self) -> bool {
         self.runtime.tools_dir.join("markitdown.json").exists() && self.markitdown_entrypoint().exists()
     }
@@ -3368,6 +3409,14 @@ impl ToolManager {
                 self.markitdown_entrypoint().display()
             );
         }
+        run_command_with_timeout(
+            &self.markitdown_entrypoint(),
+            &["--help"],
+            &self.runtime.root_dir,
+            HEADROOM_SMOKE_TEST_TIMEOUT,
+        )
+        .context("markitdown installed but failed its smoke test")?;
+        self.ensure_markitdown_shim()?;
         self.write_tool_receipt(
             "markitdown",
             json!({ "version": MARKITDOWN_PINNED_VERSION, "enabled": true }),
@@ -3393,6 +3442,10 @@ impl ToolManager {
             &self.runtime.root_dir,
             &mut |line: &str| log::info!("markitdown pip uninstall: {line}"),
         );
+        let shim = self.markitdown_shim_path();
+        if shim.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_file(&shim);
+        }
         let receipt = self.runtime.tools_dir.join("markitdown.json");
         if receipt.exists() {
             std::fs::remove_file(&receipt)
@@ -6916,6 +6969,49 @@ after
         assert_eq!(failure.exit_code, Some(7));
         assert!(failure.stdout.contains("failure-stdout"));
         assert!(failure.stderr.contains("failure-stderr"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smoke_test_markitdown_is_noop_when_not_installed() {
+        let (root, _runtime, manager) = seed_test_runtime("markitdown-smoke-absent");
+        manager
+            .smoke_test_markitdown_with_timeout(Duration::from_secs(2))
+            .expect("no-op when markitdown is absent");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smoke_test_markitdown_succeeds_when_entrypoint_runs() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-smoke-ok");
+        fs::write(
+            runtime.tools_dir.join("markitdown.json"),
+            br#"{"version":"0.1.6","enabled":true}"#,
+        )
+        .expect("receipt");
+        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 0\n");
+
+        manager
+            .smoke_test_markitdown_with_timeout(Duration::from_secs(2))
+            .expect("smoke test succeeds");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smoke_test_markitdown_fails_on_nonzero_exit() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-smoke-fail");
+        fs::write(
+            runtime.tools_dir.join("markitdown.json"),
+            br#"{"version":"0.1.6","enabled":true}"#,
+        )
+        .expect("receipt");
+        write_executable(&manager.markitdown_entrypoint(), "#!/bin/sh\nexit 3\n");
+
+        manager
+            .smoke_test_markitdown_with_timeout(Duration::from_secs(2))
+            .expect_err("smoke test should fail");
 
         let _ = fs::remove_dir_all(root);
     }

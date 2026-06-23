@@ -640,11 +640,12 @@ fn install_addon(state: State<'_, AppState>, id: String) -> Result<DashboardStat
                 .tool_manager
                 .install_markitdown()
                 .map_err(|err| err.to_string())?;
-            client_adapters::enable_markitdown_read_hook(
+            client_adapters::enable_markitdown_integration(
                 &state.tool_manager.markitdown_entrypoint(),
+                &state.tool_manager.markitdown_shim_path(),
                 &state.tool_manager.managed_python(),
             )
-            .map_err(|err| format!("markitdown installed but enabling Read hook failed: {err:#}"))?;
+            .map_err(|err| format!("markitdown installed but enabling integration failed: {err:#}"))?;
             Ok(state.dashboard())
         }
         other => Err(format!("unknown addon: {other}")),
@@ -664,13 +665,17 @@ fn set_addon_enabled(
                 .set_markitdown_enabled(enabled)
                 .map_err(|err| err.to_string())?;
             if enabled {
-                client_adapters::enable_markitdown_read_hook(
+                client_adapters::enable_markitdown_integration(
                     &state.tool_manager.markitdown_entrypoint(),
+                    &state.tool_manager.markitdown_shim_path(),
                     &state.tool_manager.managed_python(),
                 )
                 .map_err(|err| err.to_string())?;
             } else {
-                client_adapters::disable_markitdown_read_hook().map_err(|err| err.to_string())?;
+                client_adapters::disable_markitdown_integration(
+                    &state.tool_manager.markitdown_shim_path(),
+                )
+                .map_err(|err| err.to_string())?;
             }
             Ok(state.dashboard())
         }
@@ -682,7 +687,9 @@ fn set_addon_enabled(
 fn uninstall_addon(state: State<'_, AppState>, id: String) -> Result<DashboardState, String> {
     match id.as_str() {
         "markitdown" => {
-            let _ = client_adapters::disable_markitdown_read_hook();
+            let _ = client_adapters::disable_markitdown_integration(
+                &state.tool_manager.markitdown_shim_path(),
+            );
             state
                 .tool_manager
                 .uninstall_markitdown()

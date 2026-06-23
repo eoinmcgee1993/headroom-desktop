@@ -540,11 +540,12 @@ pub fn perform_full_cleanup() -> Vec<String> {
         }
     }
 
-    let hook_path = headroom_rtk_hook_path();
-    if hook_path.exists() {
-        match std::fs::remove_file(&hook_path) {
-            Ok(_) => removed.push(hook_path.display().to_string()),
-            Err(err) => log::warn!("cleanup: removing {} failed: {err}", hook_path.display()),
+    for hook_path in [headroom_rtk_hook_path(), headroom_markitdown_hook_path()] {
+        if hook_path.exists() {
+            match std::fs::remove_file(&hook_path) {
+                Ok(_) => removed.push(hook_path.display().to_string()),
+                Err(err) => log::warn!("cleanup: removing {} failed: {err}", hook_path.display()),
+            }
         }
     }
 
@@ -588,6 +589,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
     // shell rc directory after uninstall.
     let mut backup_targets: Vec<PathBuf> = claude_settings_candidates();
     backup_targets.push(headroom_rtk_hook_path());
+    backup_targets.push(headroom_markitdown_hook_path());
     backup_targets.push(codex_config_toml_path());
     backup_targets.push(
         home_dir()
@@ -1088,15 +1090,30 @@ fn ensure_claude_code_rtk_hook(
     Ok((changed_files, backup_files))
 }
 
-/// Installs the MarkItDown PreToolUse(Read) hook: writes the hook script and
-/// registers it in `~/.claude/settings.json`. Reuses the same marker-based
-/// settings writer as the RTK hook.
-pub fn enable_markitdown_read_hook(
-    markitdown_path: &Path,
+fn markitdown_claude_md_path() -> PathBuf {
+    home_dir().join(".claude").join("CLAUDE.md")
+}
+
+fn build_markitdown_office_nudge(shim_path: &Path) -> String {
+    let bin = shim_path.display();
+    format!(
+        "## Reading Office documents (Headroom MarkItDown)\n\
+         The Read tool cannot open .docx, .doc, .pptx, .ppt, .xlsx, or .xls files.\n\
+         To read one, run `{bin} <path>` via Bash and use the Markdown it prints.\n\
+         (PDFs are handled automatically and need no special step.)"
+    )
+}
+
+/// Enables the MarkItDown addon integration: the PDF Read hook, plus the Office
+/// nudge (a managed `~/.claude/CLAUDE.md` block and a scoped Bash permission for
+/// the `markitdown` shim). Reuses the marker-based settings writer used by RTK.
+pub fn enable_markitdown_integration(
+    markitdown_entrypoint: &Path,
+    markitdown_shim: &Path,
     python_path: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let hook_path = headroom_markitdown_hook_path();
-    let hook_body = build_headroom_markitdown_hook(markitdown_path, python_path);
+    let hook_body = build_headroom_markitdown_hook(markitdown_entrypoint, python_path);
     let (hook_changed, hook_backup) = write_file_if_changed(&hook_path, &hook_body, true)?;
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
@@ -1113,19 +1130,95 @@ pub fn enable_markitdown_read_hook(
     changed_files.extend(settings_changed);
     backup_files.extend(settings_backups);
 
+    // Office nudge: managed CLAUDE.md block + scoped Bash permission.
+    let claude_md = markitdown_claude_md_path();
+    let (md_changed, md_backup) = upsert_managed_block(
+        &claude_md,
+        "markitdown_office",
+        &build_markitdown_office_nudge(markitdown_shim),
+    )?;
+    if md_changed {
+        changed_files.push(claude_md.display().to_string());
+    }
+    if let Some(path) = md_backup {
+        backup_files.push(path.display().to_string());
+    }
+
+    if set_markitdown_bash_permission(markitdown_shim, true)? {
+        changed_files.push(claude_settings_path().display().to_string());
+    }
+
     Ok((changed_files, backup_files))
 }
 
-/// Removes the MarkItDown Read hook from settings and deletes the hook script,
-/// leaving any RTK hook untouched.
-pub fn disable_markitdown_read_hook() -> Result<bool> {
-    let changed =
+/// Removes the MarkItDown Read hook, hook script, Office nudge block, and the
+/// scoped Bash permission, leaving any RTK hook untouched.
+pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
+    let mut changed =
         remove_pre_tool_use_markers(&claude_settings_path(), &["headroom-markitdown-read.sh"])?;
     let hook_path = headroom_markitdown_hook_path();
     if hook_path.exists() {
         let _ = std::fs::remove_file(&hook_path);
     }
+    changed |= remove_managed_block(&markitdown_claude_md_path(), "markitdown_office")?;
+    changed |= set_markitdown_bash_permission(markitdown_shim, false)?;
     Ok(changed)
+}
+
+/// Adds or removes a `Bash(<shim> *)` entry in `permissions.allow` so the Office
+/// nudge can run `markitdown` without prompting. Returns whether settings changed.
+fn set_markitdown_bash_permission(shim_path: &Path, present: bool) -> Result<bool> {
+    let settings_path = claude_settings_path();
+    let entry = format!("Bash({} *)", shim_path.display());
+
+    let mut content = if settings_path.exists() {
+        let raw = std::fs::read_to_string(&settings_path)
+            .with_context(|| format!("reading {}", settings_path.display()))?;
+        if raw.trim().is_empty() {
+            Value::Object(Default::default())
+        } else {
+            Value::Object(parse_json_object(&raw, &settings_path)?)
+        }
+    } else if present {
+        Value::Object(Default::default())
+    } else {
+        return Ok(false);
+    };
+
+    let root = content
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("unable to write Claude permissions settings"))?;
+    let allow = root
+        .entry("permissions")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("permissions is not an object"))?
+        .entry("allow")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("permissions.allow is not an array"))?;
+
+    let already = allow.iter().any(|v| v.as_str() == Some(entry.as_str()));
+    if present == already {
+        return Ok(false);
+    }
+    if present {
+        allow.push(Value::String(entry));
+    } else {
+        allow.retain(|v| v.as_str() != Some(entry.as_str()));
+    }
+
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let _ = backup_if_exists(&settings_path)?;
+    std::fs::write(
+        &settings_path,
+        serde_json::to_vec_pretty(&content).context("serializing Claude permissions settings")?,
+    )
+    .with_context(|| format!("writing {}", settings_path.display()))?;
+    Ok(true)
 }
 
 fn disable_codex_cli() -> Result<()> {
@@ -2309,10 +2402,15 @@ fn headroom_markitdown_hook_path() -> PathBuf {
         .join("headroom-markitdown-read.sh")
 }
 
-/// PreToolUse(Read) hook: when Claude reads a document format, convert it to
-/// Markdown via the managed `markitdown` and redirect the read at the converted
-/// file through `updatedInput.file_path`. Fails open at every step so a missing
-/// binary, oversized file, or conversion error falls through to a native Read.
+/// PreToolUse(Read) hook: when Claude reads a PDF, convert it to Markdown via
+/// the managed `markitdown` and redirect the read at the converted file through
+/// `updatedInput.file_path`. Fails open at every step so a missing binary,
+/// oversized file, or conversion error falls through to a native Read.
+///
+/// Scoped to PDF deliberately: Claude Code's Read tool rejects unsupported
+/// binary types (docx/pptx/xlsx) at input validation *before* PreToolUse hooks
+/// run, so a hook can never intercept them. Office formats are handled instead
+/// by the managed CLAUDE.md nudge that points Claude at the `markitdown` CLI.
 fn build_headroom_markitdown_hook(markitdown_path: &Path, python_path: &Path) -> String {
     let markitdown = shell_double_quote(&markitdown_path.to_string_lossy());
     let python = shell_double_quote(&python_path.to_string_lossy());
@@ -2337,7 +2435,7 @@ HEADROOM_MD_CACHE="${{TMPDIR:-/tmp}}/headroom-markitdown"
 mkdir -p "$HEADROOM_MD_CACHE" 2>/dev/null || exit 0
 
 HEADROOM_MARKITDOWN_BIN="$HEADROOM_MARKITDOWN" HEADROOM_MD_CACHE="$HEADROOM_MD_CACHE" "$HEADROOM_PYTHON" -c 'import json, os, sys, subprocess, hashlib
-ALLOWED = {{".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls"}}
+ALLOWED = {{".pdf"}}
 MAX_BYTES = 25 * 1024 * 1024
 try:
     data = json.load(sys.stdin)
@@ -2764,7 +2862,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_headroom_markitdown_hook, build_headroom_rtk_hook, claude_code_user_state_exists,
+        build_headroom_markitdown_hook, build_markitdown_office_nudge, build_headroom_rtk_hook,
+        claude_code_user_state_exists,
         claude_hook_present_in_value, remove_pre_tool_use_markers,
         default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
@@ -2914,9 +3013,10 @@ mod tests {
 
         assert!(hook.contains("HEADROOM_MARKITDOWN=\"/tmp/head room/venv/bin/markitdown\""));
         assert!(hook.contains("HEADROOM_PYTHON=\"/tmp/head room/venv/bin/\\$python\""));
-        // Scoped to document formats, redirects via updatedInput, and fails open.
-        assert!(hook.contains(".pdf"));
-        assert!(hook.contains(".docx"));
+        // Scoped to PDF only (Office is handled by the nudge, not the hook),
+        // redirects via updatedInput, and fails open.
+        assert!(hook.contains("ALLOWED = {\".pdf\"}"));
+        assert!(!hook.contains(".docx"));
         assert!(hook.contains("updated[\"file_path\"] = out"));
         assert!(hook.contains("\"updatedInput\": updated"));
         assert!(hook.contains("Headroom MarkItDown conversion"));
@@ -2951,6 +3051,14 @@ mod tests {
         let entries = after["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entry_contains_hook(&entries[0], "headroom-rtk-rewrite.sh"));
+    }
+
+    #[test]
+    fn markitdown_office_nudge_points_at_the_shim_and_skips_pdf() {
+        let nudge = build_markitdown_office_nudge(Path::new("/h/bin/markitdown"));
+        assert!(nudge.contains("/h/bin/markitdown <path>"));
+        assert!(nudge.contains(".docx"));
+        assert!(nudge.contains("PDFs are handled automatically"));
     }
 
     #[test]
