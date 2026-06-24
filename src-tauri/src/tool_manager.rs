@@ -4961,12 +4961,34 @@ fn project_cwd_from_transcript_dir(dir: &Path) -> Option<String> {
     None
 }
 
+/// Prepend a binary's own directory to PATH so an `#!/usr/bin/env node`
+/// shebang (or similar) resolves the interpreter that nvm installs alongside
+/// it. Falls back to the existing PATH when the binary has no parent.
+fn path_with_binary_dir(binary: &Path) -> String {
+    let existing = std::env::var("PATH").unwrap_or_default();
+    match binary.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            if existing.is_empty() {
+                dir.display().to_string()
+            } else {
+                format!("{}:{}", dir.display(), existing)
+            }
+        }
+        _ => existing,
+    }
+}
+
 fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
     let mut command = Command::new(binary);
     command
         .args(args)
         .current_dir(cwd)
         .env_remove("PYTHONHOME")
+        // GUI apps inherit a minimal PATH lacking the nvm/homebrew bin dir, so a
+        // CLI with a `#!/usr/bin/env node` shebang (e.g. codex) fails with exit
+        // 127 / "env: node: No such file or directory". node lives alongside the
+        // CLI in nvm's bin, so prepend the binary's own dir to PATH.
+        .env("PATH", path_with_binary_dir(binary))
         .env_remove("PYTHONPATH")
         .env_remove("PYTHONSTARTUP")
         .env("PYTHONNOUSERSITE", "1")
@@ -5430,7 +5452,7 @@ mod tests {
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, looks_like_corrupt_venv_error, parse_major_minor_patch,
         parse_pid_from_lsof_detail, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
-        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
+        path_with_binary_dir, read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
         sha256_bytes, summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
@@ -5440,6 +5462,16 @@ mod tests {
     use crate::backend_port;
     use crate::port_conflict;
     use std::net::TcpListener;
+
+    #[test]
+    fn path_with_binary_dir_prepends_parent() {
+        let path =
+            path_with_binary_dir(&PathBuf::from("/Users/x/.nvm/versions/node/v22/bin/codex"));
+        assert!(path.starts_with("/Users/x/.nvm/versions/node/v22/bin:"));
+        // A bare binary name has no usable parent; PATH is left unchanged.
+        let existing = std::env::var("PATH").unwrap_or_default();
+        assert_eq!(path_with_binary_dir(&PathBuf::from("codex")), existing);
+    }
 
     #[test]
     fn classify_kompress_prefetch_failure_buckets_known_causes() {
