@@ -3538,7 +3538,12 @@ impl ToolManager {
         Ok(())
     }
 
-    pub fn install_ponytail(&self) -> Result<()> {
+    /// Installs ponytail into every host that has a CLI on PATH. Returns
+    /// `Ok(true)` when at least one host succeeded but Codex was skipped because
+    /// it is too old to support `plugin add` -- the caller nudges the user to
+    /// update Codex. A too-old Codex is not a real error (no Sentry warning); it
+    /// is a version skew the user can only fix by updating Codex.
+    pub fn install_ponytail(&self) -> Result<bool> {
         let hosts: Vec<PluginHost> = PluginHost::ALL
             .into_iter()
             .filter(|host| host.cli().is_some())
@@ -3550,13 +3555,22 @@ impl ToolManager {
         }
         let mut errors: Vec<String> = Vec::new();
         let mut installed_any = false;
+        let mut codex_outdated = false;
         for host in hosts {
             match self.install_ponytail_into(host) {
                 Ok(()) => installed_any = true,
+                Err(err) if matches!(host, PluginHost::Codex) && is_outdated_codex(&err) => {
+                    codex_outdated = true;
+                }
                 Err(err) => errors.push(format!("{}: {err:#}", host.label())),
             }
         }
         if !installed_any {
+            if codex_outdated && errors.is_empty() {
+                bail!(
+                    "Your Codex CLI is too old to install the ponytail plugin. Update Codex, then try again."
+                );
+            }
             bail!("installing the ponytail plugin failed: {}", errors.join("; "));
         }
         if !errors.is_empty() {
@@ -3564,7 +3578,7 @@ impl ToolManager {
         }
         let version = installed_ponytail_version().unwrap_or_else(|| PONYTAIL_DISPLAY_VERSION.into());
         self.write_tool_receipt("ponytail", json!({ "version": version, "enabled": true }))?;
-        Ok(())
+        Ok(codex_outdated)
     }
 
     pub fn set_ponytail_enabled(&self, enabled: bool) -> Result<()> {
@@ -5376,6 +5390,14 @@ impl std::fmt::Display for CommandFailure {
 
 impl std::error::Error for CommandFailure {}
 
+/// True when a failure is an older Codex CLI that predates `codex plugin add`
+/// (`error: unrecognized subcommand 'add'`). Not retryable -- the user must
+/// update Codex -- so install treats it as a soft skip + nudge, not an error.
+fn is_outdated_codex(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CommandFailure>()
+        .is_some_and(|failure| failure.stderr.contains("unrecognized subcommand"))
+}
+
 /// Extract the Unix signal number that killed a child, or `None` on non-Unix
 /// or when the process exited normally. Used to populate `CommandFailure.signal`
 /// so failure reports distinguish SIGKILL from SIGTERM.
@@ -5450,7 +5472,8 @@ mod tests {
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
         extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
-        headroom_python_startup_args, looks_like_corrupt_venv_error, parse_major_minor_patch,
+        headroom_python_startup_args, is_outdated_codex, looks_like_corrupt_venv_error,
+        parse_major_minor_patch,
         parse_pid_from_lsof_detail, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         path_with_binary_dir, read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         reclaim_orphan_proxy, redact_sensitive,
@@ -7391,6 +7414,32 @@ after
         smoke_while_installed.expect("smoke_test_ponytail should pass while installed");
         uninstall.expect("uninstall_ponytail should succeed");
         assert!(gone, "ponytail_installed() should be false after uninstall");
+    }
+
+    #[test]
+    fn is_outdated_codex_detects_unrecognized_subcommand() {
+        let outdated = anyhow::Error::new(CommandFailure {
+            program: "codex".into(),
+            args: vec!["plugin".into(), "add".into()],
+            stdout: String::new(),
+            stderr: "error: unrecognized subcommand 'add'\n".into(),
+            exit_code: Some(2),
+            signal: None,
+        });
+        assert!(is_outdated_codex(&outdated));
+
+        let other = anyhow::Error::new(CommandFailure {
+            program: "codex".into(),
+            args: vec!["plugin".into(), "add".into()],
+            stdout: String::new(),
+            stderr: "error: network unreachable\n".into(),
+            exit_code: Some(1),
+            signal: None,
+        });
+        assert!(!is_outdated_codex(&other));
+
+        // A non-CommandFailure error must not be misclassified.
+        assert!(!is_outdated_codex(&anyhow::anyhow!("unrecognized subcommand")));
     }
 
     #[test]

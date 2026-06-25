@@ -627,7 +627,11 @@ fn show_notification_impl(
 }
 
 #[tauri::command]
-async fn install_addon(state: State<'_, AppState>, id: String) -> Result<DashboardState, String> {
+async fn install_addon(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<DashboardState, String> {
     match id.as_str() {
         "markitdown" => {
             state
@@ -656,10 +660,18 @@ async fn install_addon(state: State<'_, AppState>, id: String) -> Result<Dashboa
             Ok(state.dashboard())
         }
         "ponytail" => {
-            state
+            let codex_outdated = state
                 .tool_manager
                 .install_ponytail()
                 .map_err(|err| err.to_string())?;
+            if codex_outdated {
+                let _ = show_notification_impl(
+                    &app,
+                    "Update Codex to finish Ponytail setup",
+                    "Ponytail is installed for Claude Code. Your Codex CLI is too old to add it -- update Codex, then re-install Ponytail to enable it there too.",
+                    None,
+                );
+            }
             Ok(state.dashboard())
         }
         other => Err(format!("unknown addon: {other}")),
@@ -2827,7 +2839,10 @@ async fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientS
             // the same class of bug as the MCP fallback silent-success —
             // subprocess/file-write succeeded yet the integration is not
             // actually in place. Capture to Sentry so we see it.
-            if !result.verification.verified {
+            // An unwritable shell profile is an expected, environmental
+            // degradation (core routing still works via app-owned config), so
+            // don't alert on the verification miss it causes.
+            if !result.verification.verified && !result.shell_profile_unwritable {
                 sentry::with_scope(
                     |scope| {
                         scope.set_extra(
@@ -2852,7 +2867,12 @@ async fn apply_client_setup(app: AppHandle, client_id: String) -> Result<ClientS
         }
         Err(err) => {
             let msg = err.to_string();
-            if !msg.starts_with("Automatic setup is not supported yet") {
+            // Permission-denied writes (os error 13) are an unwritable-file
+            // environment issue, not an app bug -- surface to the user but keep
+            // them out of Sentry.
+            if !msg.starts_with("Automatic setup is not supported yet")
+                && !client_adapters::is_permission_denied(&err)
+            {
                 sentry::capture_message(
                     &format!("client setup failed for {client_id}: {err:#}"),
                     sentry::Level::Error,

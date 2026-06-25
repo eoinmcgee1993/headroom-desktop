@@ -66,6 +66,9 @@ import {
   getUpgradePlans,
   getFounderStepPricing,
   isTierDowngrade,
+  forgoneSavingsLabel,
+  paybackLabel,
+  recentDailySavingsUsd,
   tierRecommendationSourceLabel,
   upgradePlanIntentLabel,
   type BillingPeriod,
@@ -4249,6 +4252,47 @@ export default function App() {
           upgradePlansState.featuredPlanId)
       : "enterprise";
   const upgradeDefaultPlan = upgradePlansState.plans.find((plan) => plan.id === upgradeDefaultPlanId) ?? null;
+
+  // Upgrade-ask copy anchored on the user's own savings (items 1 & 2). Shown
+  // only at a gate/nudge moment, and only when there's enough realized savings
+  // for the numbers to land (helpers return null otherwise).
+  const recentDailySavings = recentDailySavingsUsd(dashboard.dailySavings);
+  const inUpgradeMoment =
+    !!pricingStatus &&
+    !pricingStatus.needsAuthentication &&
+    !pricingStatus.account?.subscriptionActive &&
+    (!pricingStatus.optimizationAllowed ||
+      pricingStatus.shouldNudge ||
+      pricingStatus.codex?.optimizationAllowed === false ||
+      !!pricingStatus.codex?.shouldNudge);
+  const paybackPlanId =
+    upgradeDefaultPlanId === "pro" ||
+    upgradeDefaultPlanId === "max5x" ||
+    upgradeDefaultPlanId === "max20x"
+      ? upgradeDefaultPlanId
+      : null;
+  // Item 1 - "pays for itself" anchor (recent monthly savings rate vs price).
+  const upgradePaybackLabel =
+    inUpgradeMoment && paybackPlanId
+      ? paybackLabel(recentDailySavings * 30, paybackPlanId, billingPeriod)
+      : null;
+  // Item 2 - forgone-savings counterfactual until the active weekly limit resets.
+  const weeklyGateForgoneLabel = (() => {
+    if (!inUpgradeMoment || !pricingStatus) return null;
+    const claudeWeeklyActive =
+      !pricingStatus.optimizationAllowed || pricingStatus.shouldNudge;
+    if (claudeWeeklyActive && pricingStatus.claude.weeklyResetsAt) {
+      const days =
+        (new Date(pricingStatus.claude.weeklyResetsAt).getTime() - Date.now()) / 86_400_000;
+      return forgoneSavingsLabel(recentDailySavings, days);
+    }
+    const codexResetSecs = pricingStatus.codex?.secondary?.secondsUntilReset ?? null;
+    if (codexResetSecs && codexResetSecs > 0) {
+      return forgoneSavingsLabel(recentDailySavings, codexResetSecs / 86_400);
+    }
+    return null;
+  })();
+
   const activeHeadroomPlanId =
     pricingAudience === "individual" && pricingStatus?.account?.subscriptionActive
       ? pricingStatus.account.subscriptionTier ?? null
@@ -4559,6 +4603,12 @@ export default function App() {
                 <h1>{calloutTitle}</h1>
                 {platformPreviewNotice ? (
                   <p className="callout-banner__subtitle">{platformPreviewNotice}</p>
+                ) : null}
+                {weeklyGateForgoneLabel ? (
+                  <p className="callout-banner__subtitle">{weeklyGateForgoneLabel}</p>
+                ) : null}
+                {upgradePaybackLabel ? (
+                  <p className="callout-banner__subtitle">{upgradePaybackLabel}</p>
                 ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
                   <p className="callout-banner__subtitle">Now use your connected tools as normal, and check back later to see how much you are saving by using Headroom.</p>

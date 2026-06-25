@@ -1627,6 +1627,7 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
                 organization_type: None,
                 rate_limit_tier: None,
                 weekly_utilization_pct: None,
+                weekly_resets_at: None,
                 five_hour_utilization_pct: None,
                 extra_usage_monthly_limit: None,
                 profile_fetch_error: None,
@@ -1691,6 +1692,9 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
         weekly_utilization_pct: usage
             .as_ref()
             .and_then(|u| u.seven_day.as_ref().map(|w| w.utilization)),
+        weekly_resets_at: usage
+            .as_ref()
+            .and_then(|u| u.seven_day.as_ref().map(|w| w.resets_at)),
         five_hour_utilization_pct: usage
             .as_ref()
             .and_then(|u| u.five_hour.as_ref().map(|w| w.utilization)),
@@ -2588,6 +2592,7 @@ mod tests {
             organization_type: Some("claude_pro".into()),
             rate_limit_tier: Some("default_claude_ai".into()),
             weekly_utilization_pct: None,
+            weekly_resets_at: None,
             five_hour_utilization_pct: None,
             extra_usage_monthly_limit: None,
             profile_fetch_error: None,
@@ -2786,6 +2791,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             weekly_utilization_pct: None,
+            weekly_resets_at: None,
             five_hour_utilization_pct: None,
             extra_usage_monthly_limit: None,
             profile_fetch_error: None,

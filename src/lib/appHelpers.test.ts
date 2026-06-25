@@ -2,12 +2,24 @@ import { describe, expect, it } from "vitest";
 
 import {
   describeInvokeError,
+  forgoneSavingsLabel,
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   isTierDowngrade,
+  paybackLabel,
+  recentDailySavingsUsd,
   upgradePlanIntentLabel,
 } from "./appHelpers";
+import type { DailySavingsPoint } from "./types";
+
+const daily = (usd: number): DailySavingsPoint => ({
+  date: "2026-06-01",
+  estimatedSavingsUsd: usd,
+  estimatedTokensSaved: 0,
+  actualCostUsd: 0,
+  totalTokensSent: 0,
+});
 
 describe("app helpers", () => {
   it("formats upgrade intent labels for paid plans only", () => {
@@ -16,6 +28,32 @@ describe("app helpers", () => {
     expect(upgradePlanIntentLabel("max20x")).toBe("Max x20");
     expect(upgradePlanIntentLabel("free")).toBeNull();
     expect(upgradePlanIntentLabel(null)).toBeNull();
+  });
+
+  it("averages savings over the trailing window only", () => {
+    expect(recentDailySavingsUsd([])).toBe(0);
+    // 9 days present, default window 7 -> mean of the last 7 ($2 each).
+    const points = [daily(100), daily(100), ...Array(7).fill(daily(2))];
+    expect(recentDailySavingsUsd(points)).toBe(2);
+  });
+
+  it("shows the payback anchor only once savings cover the plan", () => {
+    // Pro annual is $5/mo. $50/mo savings -> 10x.
+    expect(paybackLabel(50, "pro", "annual")).toContain("10x");
+    // Just over price: covers but under 2x -> generic copy, no multiple.
+    expect(paybackLabel(6, "pro", "annual")).toContain("pays for itself");
+    expect(paybackLabel(6, "pro", "annual")).not.toContain("x over");
+    // Below price -> null (never show a weak number).
+    expect(paybackLabel(3, "pro", "annual")).toBeNull();
+    // No em dashes in user-facing copy.
+    expect(paybackLabel(50, "pro", "annual")).not.toContain("—");
+  });
+
+  it("projects forgone savings until reset, suppressing trivial sums", () => {
+    expect(forgoneSavingsLabel(10, 3)).toContain("$30.00");
+    expect(forgoneSavingsLabel(0, 3)).toBeNull();
+    expect(forgoneSavingsLabel(10, 0)).toBeNull();
+    expect(forgoneSavingsLabel(0.1, 3)).toBeNull(); // $0.30 < $1 floor
   });
 
   it("extracts invoke errors from common shapes before falling back", () => {
