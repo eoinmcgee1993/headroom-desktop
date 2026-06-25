@@ -4292,6 +4292,15 @@ export default function App() {
     }
     return null;
   })();
+  // Show a single, strongest savings line: at a hard gate (optimization paused,
+  // pain is live) lead with the forgone-savings loss; at a nudge lead with the
+  // "pays for itself" gain. Fall back to the other only if the primary is null.
+  const isHardGate =
+    !!pricingStatus &&
+    (!pricingStatus.optimizationAllowed || pricingStatus.codex?.optimizationAllowed === false);
+  const upgradeSavingsLine = isHardGate
+    ? (weeklyGateForgoneLabel ?? upgradePaybackLabel)
+    : (upgradePaybackLabel ?? weeklyGateForgoneLabel);
 
   const activeHeadroomPlanId =
     pricingAudience === "individual" && pricingStatus?.account?.subscriptionActive
@@ -4604,11 +4613,8 @@ export default function App() {
                 {platformPreviewNotice ? (
                   <p className="callout-banner__subtitle">{platformPreviewNotice}</p>
                 ) : null}
-                {weeklyGateForgoneLabel ? (
-                  <p className="callout-banner__subtitle">{weeklyGateForgoneLabel}</p>
-                ) : null}
-                {upgradePaybackLabel ? (
-                  <p className="callout-banner__subtitle">{upgradePaybackLabel}</p>
+                {upgradeSavingsLine ? (
+                  <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
                 ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
                   <p className="callout-banner__subtitle">Now use your connected tools as normal, and check back later to see how much you are saving by using Headroom.</p>

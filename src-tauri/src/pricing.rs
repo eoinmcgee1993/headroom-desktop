@@ -551,7 +551,11 @@ fn maybe_apply_fake_weekly_gate(status: &mut HeadroomPricingStatus) {
     };
     status.needs_authentication = false;
     status.claude.weekly_resets_at = Some(Utc::now() + Duration::days(3));
-    status.recommended_subscription_tier = Some(HeadroomSubscriptionTier::Pro);
+    // Preserve the account's real recommendation (so the payback anchors to the
+    // tier the user would actually buy); only seed a default when none exists.
+    if status.recommended_subscription_tier.is_none() {
+        status.recommended_subscription_tier = Some(HeadroomSubscriptionTier::Pro);
+    }
     if mode == "gate" {
         status.optimization_allowed = false;
         status.should_nudge = false;

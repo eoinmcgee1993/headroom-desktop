@@ -96,19 +96,19 @@ export function recentDailySavingsUsd(daily: DailySavingsPoint[], days = 7): num
 }
 
 /// Item 1 - "pays for itself" anchor. Compares the user's recent monthly
-/// savings rate against the per-month price of `planId`. Returns null when
-/// savings don't yet cover the plan, so we never show a weak number.
+/// savings rate against the per-month price of `planId`. Only surfaces at a
+/// genuine value-add (>= 2x the price); returns null below that so a weak claim
+/// never deters an upgrade. Floors the multiple so it never overstates.
 export function paybackLabel(
   recentMonthlySavingsUsd: number,
   planId: HeadroomSubscriptionTier,
   billingPeriod: BillingPeriod
 ): string | null {
   const monthly = PLAN_PRICES[planId][billingPeriod].fullCents / 100;
-  if (monthly <= 0 || recentMonthlySavingsUsd < monthly) return null;
+  if (monthly <= 0) return null;
   const multiple = recentMonthlySavingsUsd / monthly;
-  return multiple >= 2
-    ? `You're saving about ${currencyExact(recentMonthlySavingsUsd)} a month - this plan pays for itself ${multiple.toFixed(0)}x over.`
-    : `You're already saving more than this plan costs - it pays for itself.`;
+  if (multiple < 2) return null;
+  return `You're saving about ${currencyExact(recentMonthlySavingsUsd)} a month - this plan pays for itself ${Math.floor(multiple)}x over.`;
 }
 
 /// Item 2 - counterfactual for the weekly gate. Projects the savings forgone
@@ -121,7 +121,7 @@ export function forgoneSavingsLabel(
   if (recentDailySavingsUsd <= 0 || daysUntilReset <= 0) return null;
   const forgone = recentDailySavingsUsd * daysUntilReset;
   if (forgone < 1) return null;
-  return `At your recent rate, that's about ${currencyExact(forgone)} in savings you'll miss before your limit resets.`;
+  return `You'd miss out on about ${currencyExact(forgone)} in savings this week before the limit resets.`;
 }
 
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
@@ -489,26 +489,16 @@ export function getUpgradePlans(
       };
     }
 
-    if (claudePlanTier === "unknown") {
-      return {
-        plans: [
-          freePlan,
-          paidPlans.max5x,
-          paidPlans.pro,
-          paidPlans.max20x
-        ],
-        featuredPlanId: "max5x"
-      };
-    }
-
+    // No recommendation (e.g. not signed in yet) or an unknown Claude plan:
+    // default to Max x5 as the featured plan.
     return {
       plans: [
         freePlan,
-        paidPlans.pro,
         paidPlans.max5x,
+        paidPlans.pro,
         paidPlans.max20x
       ],
-      featuredPlanId: "pro"
+      featuredPlanId: "max5x"
     };
   }
 

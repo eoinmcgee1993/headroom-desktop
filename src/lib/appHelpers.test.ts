@@ -37,13 +37,18 @@ describe("app helpers", () => {
     expect(recentDailySavingsUsd(points)).toBe(2);
   });
 
-  it("shows the payback anchor only once savings cover the plan", () => {
+  it("shows the payback anchor only at a genuine value-add (>= 2x)", () => {
     // Pro annual is $5/mo. $50/mo savings -> 10x.
     expect(paybackLabel(50, "pro", "annual")).toContain("10x");
-    // Just over price: covers but under 2x -> generic copy, no multiple.
-    expect(paybackLabel(6, "pro", "annual")).toContain("pays for itself");
-    expect(paybackLabel(6, "pro", "annual")).not.toContain("x over");
-    // Below price -> null (never show a weak number).
+    // Exactly 2x -> shown.
+    expect(paybackLabel(10, "pro", "annual")).toContain("2x");
+    // Floors, never overstates: 2.8x -> "2x", not "3x".
+    expect(paybackLabel(14, "pro", "annual")).toContain("2x");
+    expect(paybackLabel(14, "pro", "annual")).not.toContain("3x");
+    // Under 2x (covers price but weak) -> null, so it never deters.
+    expect(paybackLabel(9, "pro", "annual")).toBeNull();
+    expect(paybackLabel(6, "pro", "annual")).toBeNull();
+    // Below price -> null.
     expect(paybackLabel(3, "pro", "annual")).toBeNull();
     // No em dashes in user-facing copy.
     expect(paybackLabel(50, "pro", "annual")).not.toContain("—");
@@ -133,10 +138,11 @@ describe("app helpers", () => {
   it("shows full annual prices when launch discount is inactive", () => {
     const result = getUpgradePlans("individual");
 
+    expect(result.featuredPlanId).toBe("max5x");
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$5"],
       ["max5x", "$20"],
+      ["pro", "$5"],
       ["max20x", "$40"],
     ]);
   });
@@ -146,8 +152,8 @@ describe("app helpers", () => {
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$2.50"],
       ["max5x", "$10"],
+      ["pro", "$2.50"],
       ["max20x", "$20"],
     ]);
   });
@@ -157,8 +163,8 @@ describe("app helpers", () => {
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$7.50"],
       ["max5x", "$30"],
+      ["pro", "$7.50"],
       ["max20x", "$60"],
     ]);
   });
@@ -168,8 +174,8 @@ describe("app helpers", () => {
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$3.75"],
       ["max5x", "$15"],
+      ["pro", "$3.75"],
       ["max20x", "$30"],
     ]);
   });
@@ -195,8 +201,8 @@ describe("app helpers", () => {
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$3.75"],
       ["max5x", "$15"],
+      ["pro", "$3.75"],
       ["max20x", "$30"],
     ]);
   });
