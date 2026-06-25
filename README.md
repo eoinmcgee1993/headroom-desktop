@@ -1,6 +1,6 @@
-# Headroom Desktop
+# Headroom Desktop — cut Claude Code & Codex token costs by ~50%
 
-**Cut your LLM API bills by ~50% without changing how you code.**
+**Headroom is a macOS menu bar app that cuts [Claude Code](https://www.anthropic.com/claude-code) and [OpenAI Codex](https://openai.com/codex/) token costs by ~50% — without changing how you code.** It runs a local-first optimization pipeline that reversibly compresses the tool output, logs, and boilerplate that bloat every prompt, so the AI plan you already pay for stretches about 2x further. Nothing the model needs is lost — it can pull the original content back on demand.
 
 > **Pricing:** Headroom has a free tier and paid plans — see [pricing](https://extraheadroom.com/pricing). The desktop shell in this repo is MIT-licensed; account features and paid plans are opt-in.
 
