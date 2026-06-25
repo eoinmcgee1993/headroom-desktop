@@ -2,12 +2,24 @@ import { describe, expect, it } from "vitest";
 
 import {
   describeInvokeError,
+  forgoneSavingsLabel,
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   isTierDowngrade,
+  paybackLabel,
+  recentDailySavingsUsd,
   upgradePlanIntentLabel,
 } from "./appHelpers";
+import type { DailySavingsPoint } from "./types";
+
+const daily = (usd: number): DailySavingsPoint => ({
+  date: "2026-06-01",
+  estimatedSavingsUsd: usd,
+  estimatedTokensSaved: 0,
+  actualCostUsd: 0,
+  totalTokensSent: 0,
+});
 
 describe("app helpers", () => {
   it("formats upgrade intent labels for paid plans only", () => {
@@ -16,6 +28,37 @@ describe("app helpers", () => {
     expect(upgradePlanIntentLabel("max20x")).toBe("Max x20");
     expect(upgradePlanIntentLabel("free")).toBeNull();
     expect(upgradePlanIntentLabel(null)).toBeNull();
+  });
+
+  it("averages savings over the trailing window only", () => {
+    expect(recentDailySavingsUsd([])).toBe(0);
+    // 9 days present, default window 7 -> mean of the last 7 ($2 each).
+    const points = [daily(100), daily(100), ...Array(7).fill(daily(2))];
+    expect(recentDailySavingsUsd(points)).toBe(2);
+  });
+
+  it("shows the payback anchor only at a genuine value-add (>= 2x)", () => {
+    // Pro annual is $5/mo. $50/mo savings -> 10x.
+    expect(paybackLabel(50, "pro", "annual")).toContain("10x");
+    // Exactly 2x -> shown.
+    expect(paybackLabel(10, "pro", "annual")).toContain("2x");
+    // Floors, never overstates: 2.8x -> "2x", not "3x".
+    expect(paybackLabel(14, "pro", "annual")).toContain("2x");
+    expect(paybackLabel(14, "pro", "annual")).not.toContain("3x");
+    // Under 2x (covers price but weak) -> null, so it never deters.
+    expect(paybackLabel(9, "pro", "annual")).toBeNull();
+    expect(paybackLabel(6, "pro", "annual")).toBeNull();
+    // Below price -> null.
+    expect(paybackLabel(3, "pro", "annual")).toBeNull();
+    // No em dashes in user-facing copy.
+    expect(paybackLabel(50, "pro", "annual")).not.toContain("—");
+  });
+
+  it("projects forgone savings until reset, suppressing trivial sums", () => {
+    expect(forgoneSavingsLabel(10, 3)).toContain("$30.00");
+    expect(forgoneSavingsLabel(0, 3)).toBeNull();
+    expect(forgoneSavingsLabel(10, 0)).toBeNull();
+    expect(forgoneSavingsLabel(0.1, 3)).toBeNull(); // $0.30 < $1 floor
   });
 
   it("extracts invoke errors from common shapes before falling back", () => {
@@ -95,10 +138,11 @@ describe("app helpers", () => {
   it("shows full annual prices when launch discount is inactive", () => {
     const result = getUpgradePlans("individual");
 
+    expect(result.featuredPlanId).toBe("max5x");
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$5"],
       ["max5x", "$20"],
+      ["pro", "$5"],
       ["max20x", "$40"],
     ]);
   });
@@ -108,8 +152,8 @@ describe("app helpers", () => {
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$2.50"],
       ["max5x", "$10"],
+      ["pro", "$2.50"],
       ["max20x", "$20"],
     ]);
   });
@@ -119,8 +163,8 @@ describe("app helpers", () => {
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$7.50"],
       ["max5x", "$30"],
+      ["pro", "$7.50"],
       ["max20x", "$60"],
     ]);
   });
@@ -130,8 +174,8 @@ describe("app helpers", () => {
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$3.75"],
       ["max5x", "$15"],
+      ["pro", "$3.75"],
       ["max20x", "$30"],
     ]);
   });
@@ -157,8 +201,8 @@ describe("app helpers", () => {
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
       ["free", "$0"],
-      ["pro", "$3.75"],
       ["max5x", "$15"],
+      ["pro", "$3.75"],
       ["max20x", "$30"],
     ]);
   });

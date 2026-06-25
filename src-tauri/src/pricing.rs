@@ -528,7 +528,48 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         tier_mismatch,
     );
     status.codex = fetch_codex_usage(state, status.account.as_ref());
+    maybe_apply_fake_weekly_gate(&mut status);
     Ok(status)
+}
+
+/// Debug-only: force the weekly-limit nudge or gate so the savings-counterfactual
+/// upgrade banner can be eyeballed without burning real weekly usage. Set
+/// `HEADROOM_FAKE_WEEKLY_GATE=nudge` or `=gate`. No-op in release builds and when
+/// the env var is unset/empty. Also seeds a reset 3 days out and a recommended
+/// tier so the "pays for itself" anchor (item 1) and reset countdown (item 2)
+/// both have inputs. Dollar figures additionally need `maybe_inject_fake_daily_savings`
+/// (same env var) since the labels suppress $0. Opt-in via env, so it stays
+/// dormant in shipped RC builds unless a tester sets the var.
+fn maybe_apply_fake_weekly_gate(status: &mut HeadroomPricingStatus) {
+    // Inert in stable: only RC versions (X.Y.Z-rc.N) honor the override env var.
+    if !env!("CARGO_PKG_VERSION").contains("-rc") {
+        return;
+    }
+    let mode = match std::env::var("HEADROOM_FAKE_WEEKLY_GATE") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_lowercase(),
+        _ => return,
+    };
+    status.needs_authentication = false;
+    status.claude.weekly_resets_at = Some(Utc::now() + Duration::days(3));
+    // Preserve the account's real recommendation (so the payback anchors to the
+    // tier the user would actually buy); only seed a default when none exists.
+    if status.recommended_subscription_tier.is_none() {
+        status.recommended_subscription_tier = Some(HeadroomSubscriptionTier::Pro);
+    }
+    if mode == "gate" {
+        status.optimization_allowed = false;
+        status.should_nudge = false;
+        status.gate_reason = Some(PricingGateReason::WeeklyUsageLimitReached);
+        status.gate_message = "Weekly limit reached (forced for testing).".to_string();
+        status.claude.weekly_utilization_pct = Some(60.0);
+    } else {
+        status.optimization_allowed = true;
+        status.should_nudge = true;
+        status.nudge_level = 1;
+        status.gate_message = "Approaching your weekly limit (forced for testing).".to_string();
+        status.claude.weekly_utilization_pct = Some(30.0);
+    }
+    log::debug!("[maybe_apply_fake_weekly_gate] forced weekly {mode}");
 }
 
 /// Weekly (secondary-window) utilization (%) at which the Codex gate pauses
@@ -1627,6 +1668,7 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
                 organization_type: None,
                 rate_limit_tier: None,
                 weekly_utilization_pct: None,
+                weekly_resets_at: None,
                 five_hour_utilization_pct: None,
                 extra_usage_monthly_limit: None,
                 profile_fetch_error: None,
@@ -1691,6 +1733,9 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
         weekly_utilization_pct: usage
             .as_ref()
             .and_then(|u| u.seven_day.as_ref().map(|w| w.utilization)),
+        weekly_resets_at: usage
+            .as_ref()
+            .and_then(|u| u.seven_day.as_ref().map(|w| w.resets_at)),
         five_hour_utilization_pct: usage
             .as_ref()
             .and_then(|u| u.five_hour.as_ref().map(|w| w.utilization)),
@@ -2588,6 +2633,7 @@ mod tests {
             organization_type: Some("claude_pro".into()),
             rate_limit_tier: Some("default_claude_ai".into()),
             weekly_utilization_pct: None,
+            weekly_resets_at: None,
             five_hour_utilization_pct: None,
             extra_usage_monthly_limit: None,
             profile_fetch_error: None,
@@ -2786,6 +2832,7 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             weekly_utilization_pct: None,
+            weekly_resets_at: None,
             five_hour_utilization_pct: None,
             extra_usage_monthly_limit: None,
             profile_fetch_error: None,

@@ -150,6 +150,7 @@ export interface ClientSetupResult {
   backupFiles: string[];
   nextSteps: string[];
   verification: ClientSetupVerification;
+  shellProfileUnwritable?: boolean;
 }
 
 export interface ClientSetupVerification {
@@ -438,6 +439,7 @@ export interface ClaudeAccountProfile {
   planTier: ClaudePlanTier;
   planDetectionSource?: string | null;
   weeklyUtilizationPct?: number | null;
+  weeklyResetsAt?: string | null;
   fiveHourUtilizationPct?: number | null;
   extraUsageMonthlyLimit?: number | null;
   profileFetchError?: string | null;

@@ -1,9 +1,11 @@
 import type {
   BillingPeriod,
+  DailySavingsPoint,
   HeadroomPricingStatus,
   HeadroomSubscriptionTier,
   TierRecommendationSource,
 } from "./types";
+import { currencyExact } from "./dashboardHelpers";
 
 export type PricingAudience = "individual" | "teamEnterprise";
 export type { BillingPeriod };
@@ -82,6 +84,44 @@ export function getFounderStepPricing(
     now: discountedPriceLabel(fullCents, nowPercentOff),
     next: discountedPriceLabel(fullCents, nextPercentOff),
   };
+}
+
+/// Average daily savings over the trailing `days` window (default 7), used to
+/// project realized/forgone savings for upgrade copy. Returns 0 with no history.
+export function recentDailySavingsUsd(daily: DailySavingsPoint[], days = 7): number {
+  if (daily.length === 0) return 0;
+  const window = daily.slice(-days);
+  const total = window.reduce((sum, p) => sum + p.estimatedSavingsUsd, 0);
+  return total / window.length;
+}
+
+/// Item 1 - "pays for itself" anchor. Compares the user's recent monthly
+/// savings rate against the per-month price of `planId`. Only surfaces at a
+/// genuine value-add (>= 2x the price); returns null below that so a weak claim
+/// never deters an upgrade. Floors the multiple so it never overstates.
+export function paybackLabel(
+  recentMonthlySavingsUsd: number,
+  planId: HeadroomSubscriptionTier,
+  billingPeriod: BillingPeriod
+): string | null {
+  const monthly = PLAN_PRICES[planId][billingPeriod].fullCents / 100;
+  if (monthly <= 0) return null;
+  const multiple = recentMonthlySavingsUsd / monthly;
+  if (multiple < 2) return null;
+  return `You're saving about ${currencyExact(recentMonthlySavingsUsd)} a month. Upgrading pays for itself ${Math.floor(multiple)}x over.`;
+}
+
+/// Item 2 - counterfactual for the weekly gate. Projects the savings forgone
+/// while optimization is paused until the weekly limit resets. `daysUntilReset`
+/// may be fractional. Returns null below $1 so we don't nag over trivial sums.
+export function forgoneSavingsLabel(
+  recentDailySavingsUsd: number,
+  daysUntilReset: number
+): string | null {
+  if (recentDailySavingsUsd <= 0 || daysUntilReset <= 0) return null;
+  const forgone = recentDailySavingsUsd * daysUntilReset;
+  if (forgone < 1) return null;
+  return `You'll miss out on about ${currencyExact(forgone)} in savings this week unless you upgrade.`;
 }
 
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";
@@ -359,7 +399,7 @@ export function getUpgradePlans(
         return plan;
       }
 
-      // Free card during a scheduled downgrade is the pending target — its
+      // Free card during a scheduled downgrade is the pending target - its
       // CTA was set to "Downgrade scheduled" above and must not be overridden.
       if (plan.purchaseInfo?.cancelAtPeriodEnd && plan.id !== activeHeadroomPlanId) {
         return plan;
@@ -449,26 +489,16 @@ export function getUpgradePlans(
       };
     }
 
-    if (claudePlanTier === "unknown") {
-      return {
-        plans: [
-          freePlan,
-          paidPlans.max5x,
-          paidPlans.pro,
-          paidPlans.max20x
-        ],
-        featuredPlanId: "max5x"
-      };
-    }
-
+    // No recommendation (e.g. not signed in yet) or an unknown Claude plan:
+    // default to Max x5 as the featured plan.
     return {
       plans: [
         freePlan,
-        paidPlans.pro,
         paidPlans.max5x,
+        paidPlans.pro,
         paidPlans.max20x
       ],
-      featuredPlanId: "pro"
+      featuredPlanId: "max5x"
     };
   }
 

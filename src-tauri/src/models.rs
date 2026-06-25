@@ -226,6 +226,11 @@ pub struct ClientSetupResult {
     pub backup_files: Vec<String>,
     pub next_steps: Vec<String>,
     pub verification: ClientSetupVerification,
+    // True when a shell profile (e.g. ~/.zshrc) couldn't be written because it
+    // isn't writable. Core routing still works via the client's own config, so
+    // this is a soft, expected degradation -- callers use it to avoid alerting.
+    #[serde(default)]
+    pub shell_profile_unwritable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -806,6 +811,9 @@ pub struct ClaudeAccountProfile {
     /// Raw `rate_limit_tier` — same purpose as `organization_type`.
     pub rate_limit_tier: Option<String>,
     pub weekly_utilization_pct: Option<f64>,
+    /// When the Claude seven-day usage window resets (RFC3339). Drives the
+    /// "savings you'll miss before reset" counterfactual on the weekly gate.
+    pub weekly_resets_at: Option<DateTime<Utc>>,
     pub five_hour_utilization_pct: Option<f64>,
     pub extra_usage_monthly_limit: Option<f64>,
     pub profile_fetch_error: Option<String>,

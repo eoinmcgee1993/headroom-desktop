@@ -66,6 +66,9 @@ import {
   getUpgradePlans,
   getFounderStepPricing,
   isTierDowngrade,
+  forgoneSavingsLabel,
+  paybackLabel,
+  recentDailySavingsUsd,
   tierRecommendationSourceLabel,
   upgradePlanIntentLabel,
   type BillingPeriod,
@@ -977,13 +980,6 @@ export default function App() {
   const [connectorsBusy, setConnectorsBusy] = useState(false);
   const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">("healthy");
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
-  const [codexNudgeDismissed, setCodexNudgeDismissed] = useState(() => {
-    try {
-      return window.localStorage.getItem("headroom:codexNudgeDismissed") === "1";
-    } catch {
-      return false;
-    }
-  });
   const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
   const [proxyVerificationHint, setProxyVerificationHint] = useState<string | null>(null);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
@@ -3197,16 +3193,6 @@ export default function App() {
   }
 
 
-  function dismissCodexNudge() {
-    setCodexNudgeDismissed(true);
-    try {
-      window.localStorage.setItem("headroom:codexNudgeDismissed", "1");
-    } catch {
-      // localStorage unavailable (private mode); the nudge stays dismissed for
-      // this session via state, which is good enough.
-    }
-  }
-
   function handleLauncherSurfaceMouseDown(event: MouseEvent<HTMLElement>) {
     if (event.button !== 0) {
       return;
@@ -4249,6 +4235,64 @@ export default function App() {
           upgradePlansState.featuredPlanId)
       : "enterprise";
   const upgradeDefaultPlan = upgradePlansState.plans.find((plan) => plan.id === upgradeDefaultPlanId) ?? null;
+
+  // Upgrade-ask copy anchored on the user's own savings (items 1 & 2). Shown
+  // only at a gate/nudge moment, and only when there's enough realized savings
+  // for the numbers to land (helpers return null otherwise).
+  const recentDailySavings = recentDailySavingsUsd(dashboard.dailySavings);
+  const inUpgradeMoment =
+    !!pricingStatus &&
+    !pricingStatus.needsAuthentication &&
+    !pricingStatus.account?.subscriptionActive &&
+    (!pricingStatus.optimizationAllowed ||
+      pricingStatus.shouldNudge ||
+      pricingStatus.codex?.optimizationAllowed === false ||
+      !!pricingStatus.codex?.shouldNudge);
+  const paybackPlanId =
+    upgradeDefaultPlanId === "pro" ||
+    upgradeDefaultPlanId === "max5x" ||
+    upgradeDefaultPlanId === "max20x"
+      ? upgradeDefaultPlanId
+      : null;
+  // Item 1 - "pays for itself" anchor (recent monthly savings rate vs price).
+  const upgradePaybackLabel =
+    inUpgradeMoment && paybackPlanId
+      ? paybackLabel(recentDailySavings * 30, paybackPlanId, billingPeriod)
+      : null;
+  // Item 2 - forgone-savings counterfactual until the active weekly limit resets.
+  const weeklyGateForgoneLabel = (() => {
+    if (!inUpgradeMoment || !pricingStatus) return null;
+    const claudeWeeklyActive =
+      !pricingStatus.optimizationAllowed || pricingStatus.shouldNudge;
+    if (claudeWeeklyActive && pricingStatus.claude.weeklyResetsAt) {
+      const days =
+        (new Date(pricingStatus.claude.weeklyResetsAt).getTime() - Date.now()) / 86_400_000;
+      return forgoneSavingsLabel(recentDailySavings, days);
+    }
+    const codexResetSecs = pricingStatus.codex?.secondary?.secondsUntilReset ?? null;
+    if (codexResetSecs && codexResetSecs > 0) {
+      return forgoneSavingsLabel(recentDailySavings, codexResetSecs / 86_400);
+    }
+    return null;
+  })();
+  // Show a single, strongest savings line: at a hard gate (optimization paused,
+  // pain is live) lead with the forgone-savings loss; at a nudge lead with the
+  // "pays for itself" gain. Fall back to the other only if the primary is null.
+  const isHardGate =
+    !!pricingStatus &&
+    (!pricingStatus.optimizationAllowed || pricingStatus.codex?.optimizationAllowed === false);
+  const upgradeSavingsLine = isHardGate
+    ? (weeklyGateForgoneLabel ?? upgradePaybackLabel)
+    : (upgradePaybackLabel ?? weeklyGateForgoneLabel);
+  // Only show it when the pricing gate/nudge banner actually wins: a startup,
+  // paused, or disconnected banner takes precedence over the upsell, so the
+  // savings line must not leak under those titles.
+  const showUpgradeSavingsLine =
+    !!upgradeSavingsLine &&
+    !!runtimeStatus &&
+    !runtimeStatus.paused &&
+    !runtimeStatus.starting;
+
   const activeHeadroomPlanId =
     pricingAudience === "individual" && pricingStatus?.account?.subscriptionActive
       ? pricingStatus.account.subscriptionTier ?? null
@@ -4560,6 +4604,9 @@ export default function App() {
                 {platformPreviewNotice ? (
                   <p className="callout-banner__subtitle">{platformPreviewNotice}</p>
                 ) : null}
+                {showUpgradeSavingsLine ? (
+                  <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
+                ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
                   <p className="callout-banner__subtitle">Now use your connected tools as normal, and check back later to see how much you are saving by using Headroom.</p>
                 )}
@@ -4610,48 +4657,6 @@ export default function App() {
                 );
               })()}
             </section>
-
-            {(() => {
-              const codexConnector = aggregateClientConnectors(connectors).find(
-                (connector) => connector.clientId === "codex"
-              );
-              const showCodexNudge =
-                !codexNudgeDismissed &&
-                !!codexConnector &&
-                codexConnector.installed &&
-                !codexConnector.enabled &&
-                pricingStatus?.optimizationAllowed !== false;
-              if (!showCodexNudge || !codexConnector) {
-                return null;
-              }
-              return (
-                <section className="connector-nudge" aria-label="Codex now supported">
-                  <div className="connector-nudge__body">
-                    <p className="connector-nudge__title">Headroom now supports Codex</p>
-                    <p className="connector-nudge__message">
-                      Route Codex through Headroom to trim its token costs too, the same way it
-                      already does for Claude Code.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    className="connector-nudge__action"
-                    disabled={connectorsBusy}
-                    onClick={() => void toggleConnector(codexConnector, true)}
-                  >
-                    Turn on Codex
-                  </button>
-                  <button
-                    type="button"
-                    className="connector-nudge__dismiss"
-                    aria-label="Dismiss Codex suggestion"
-                    onClick={dismissCodexNudge}
-                  >
-                    Dismiss
-                  </button>
-                </section>
-              );
-            })()}
 
             <section className="stat-grid stat-grid--2col">
               <article

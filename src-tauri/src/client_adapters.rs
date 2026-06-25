@@ -184,31 +184,72 @@ pub fn set_rtk_enabled(
     Ok(())
 }
 
+/// True when the error chain contains a filesystem PermissionDenied (os error 13),
+/// i.e. an unwritable target -- an environment issue, not an app bug.
+pub fn is_permission_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+/// Runs a shell-profile write step, tolerating an unwritable profile (e.g. a
+/// read-only ~/.zshrc -> os error 13). The env that actually routes a client
+/// lives in app-owned config (~/.claude/settings.json, ~/.codex/config.toml), so
+/// a locked shell file costs terminal convenience, not core routing. Returns
+/// `Ok(None)` when the step was skipped for that reason.
+fn shell_step_best_effort(
+    step: Result<(Vec<String>, Vec<String>)>,
+) -> Result<Option<(Vec<String>, Vec<String>)>> {
+    match step {
+        Ok(updates) => Ok(Some(updates)),
+        Err(err) if is_permission_denied(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
     let mut state = load_setup_state();
     let state_id = normalized_setup_id(client_id).to_string();
+    let mut shell_unwritable = false;
 
     match client_id {
         "claude_code" => {
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
-            let mut rtk_updates = ensure_rtk_integrations_for_targets(
+            // Critical, app-owned writes first: the ~/.claude/settings.json env is
+            // what actually routes Claude Code through Headroom. Do it before the
+            // shell profile so a locked ~/.zshrc can't block core setup.
+            let mut updates =
+                configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+            let mut legacy_updates = remove_legacy_vscode_base_url_keys()?;
+            updates.0.append(&mut legacy_updates.0);
+            updates.1.append(&mut legacy_updates.1);
+
+            // Shell profile (RTK PATH + env export) is convenience; tolerate an
+            // unwritable profile rather than failing the whole setup.
+            let env_block = format!("export ANTHROPIC_BASE_URL={}", HEADROOM_ANTHROPIC_BASE_URL);
+            let shell_step = ensure_rtk_integrations_for_targets(
                 &default_headroom_rtk_path(),
                 &default_headroom_managed_python_path(),
                 &shell_targets,
-            )?;
-            let env_block = format!("export ANTHROPIC_BASE_URL={}", HEADROOM_ANTHROPIC_BASE_URL);
-            let mut updates = configure_shell_block(&shell_targets, "claude_code", &env_block)?;
-            let mut claude_updates =
-                configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
-            let mut legacy_updates = remove_legacy_vscode_base_url_keys()?;
-            updates.0.append(&mut rtk_updates.0);
-            updates.1.append(&mut rtk_updates.1);
-            updates.0.append(&mut claude_updates.0);
-            updates.1.append(&mut claude_updates.1);
-            updates.0.append(&mut legacy_updates.0);
-            updates.1.append(&mut legacy_updates.1);
+            )
+            .and_then(|mut rtk| {
+                let mut env = configure_shell_block(&shell_targets, "claude_code", &env_block)?;
+                rtk.0.append(&mut env.0);
+                rtk.1.append(&mut env.1);
+                Ok(rtk)
+            });
+            match shell_step_best_effort(shell_step)? {
+                Some(mut shell) => {
+                    updates.0.append(&mut shell.0);
+                    updates.1.append(&mut shell.1);
+                }
+                None => shell_unwritable = true,
+            }
+
             changed_files.extend(updates.0);
             backup_files.extend(updates.1);
             state
@@ -222,11 +263,22 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
         }
         "codex" | "codex_cli" => {
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
+            // Critical, app-owned write first: the ~/.codex/config.toml provider
+            // block is what routes Codex through Headroom.
+            let mut updates = configure_codex_provider_block()?;
+
             let env_block = format!("export OPENAI_BASE_URL={}", HEADROOM_OPENAI_BASE_URL);
-            let mut updates = configure_shell_block(&shell_targets, "codex_cli", &env_block)?;
-            let mut toml_updates = configure_codex_provider_block()?;
-            updates.0.append(&mut toml_updates.0);
-            updates.1.append(&mut toml_updates.1);
+            match shell_step_best_effort(configure_shell_block(
+                &shell_targets,
+                "codex_cli",
+                &env_block,
+            ))? {
+                Some(mut shell) => {
+                    updates.0.append(&mut shell.0);
+                    updates.1.append(&mut shell.1);
+                }
+                None => shell_unwritable = true,
+            }
             changed_files.extend(updates.0);
             backup_files.extend(updates.1);
             state
@@ -259,17 +311,28 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
         summary,
         changed_files,
         backup_files,
-        next_steps: vec![
-            "Restart your terminal/editor session to pick up environment changes.".into(),
-            format!(
+        next_steps: {
+            let mut steps = Vec::new();
+            if shell_unwritable {
+                steps.push(
+                    "Your shell profile (e.g. ~/.zshrc) isn't writable, so the PATH/export couldn't be added. Core routing still works via the client's own config; to launch the client from a terminal, fix the file's permissions and re-run setup, or add the export manually."
+                        .into(),
+                );
+            }
+            steps.push(
+                "Restart your terminal/editor session to pick up environment changes.".into(),
+            );
+            steps.push(format!(
                 "Run one {} prompt and verify activity appears in Headroom.",
                 match normalized_setup_id(client_id) {
                     "codex_cli" => "Codex",
                     _ => "Claude Code",
                 }
-            ),
-        ],
+            ));
+            steps
+        },
         verification,
+        shell_profile_unwritable: shell_unwritable,
     })
 }
 
@@ -2997,11 +3060,24 @@ mod tests {
         codex_home, codex_sqlite_store_expected, codex_store_version,
         discover_codex_state_dbs, remove_managed_block,
         retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
-        serialize_paths, shell_block_contains_in_files,
+        is_permission_denied, serialize_paths, shell_block_contains_in_files,
         shell_block_contains_text_in_files, shell_double_quote, strip_headroom_hook_from_settings,
         upsert_managed_block, write_file_if_changed, ClientSetupState, ShellFamily,
     };
     use rusqlite::Connection;
+
+    #[test]
+    fn is_permission_denied_matches_only_permission_errors() {
+        let denied = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
+            .context("writing /Users/x/.zshrc");
+        assert!(is_permission_denied(&denied));
+
+        let not_found = anyhow::Error::new(std::io::Error::from_raw_os_error(2))
+            .context("writing /Users/x/.zshrc");
+        assert!(!is_permission_denied(&not_found));
+
+        assert!(!is_permission_denied(&anyhow::anyhow!("Permission denied")));
+    }
 
     #[test]
     fn normalize_setup_state_keeps_codex_but_drops_legacy_codex_gui() {

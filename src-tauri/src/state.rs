@@ -5444,11 +5444,31 @@ fn merge_daily_savings(
     cutoff_date: &str,
 ) -> Vec<DailySavingsPoint> {
     use std::collections::BTreeMap;
+    // Index the local tracker by date so a desynced history point can fall back
+    // to it (see the zero-spend guard below).
+    let tracker_by_date: BTreeMap<String, DailySavingsPoint> =
+        tracker.iter().map(|p| (p.date.clone(), p.clone())).collect();
+
     let mut by_date: BTreeMap<String, DailySavingsPoint> = BTreeMap::new();
     // Post-cutoff: history wins, tracker fills gaps so today's local activity still shows.
     // Pre-cutoff: tracker-only; history is ignored to avoid pulling in pre-v6 schema drift.
     for p in history {
         if p.date.as_str() >= cutoff_date {
+            // The backend rollup transiently reports compression savings with zero
+            // tokens/cost when its cost counter lags the savings accumulator (a
+            // desync that self-heals; see RUST-3S/3V). When that happens and the
+            // local tracker recorded real spend that day, prefer the tracker point
+            // rather than surfacing a savings-with-zero-spend day.
+            let history_desynced =
+                p.estimated_savings_usd > 0.000_001 && p.actual_cost_usd == 0.0 && p.total_tokens_sent == 0;
+            if history_desynced {
+                if let Some(t) = tracker_by_date.get(p.date.as_str()) {
+                    if t.total_tokens_sent > 0 {
+                        by_date.insert(p.date.clone(), t.clone());
+                        continue;
+                    }
+                }
+            }
             by_date.insert(p.date.clone(), p);
         }
     }
@@ -6346,6 +6366,7 @@ mod tests {
                 organization_type: None,
                 rate_limit_tier: None,
                 weekly_utilization_pct: None,
+                weekly_resets_at: None,
                 five_hour_utilization_pct: None,
                 extra_usage_monthly_limit: None,
                 profile_fetch_error: None,
@@ -8117,6 +8138,35 @@ mod tests {
         assert_eq!(result.len(), 1);
         // history wins on cutoff date
         assert_eq!(result[0].estimated_tokens_saved, 800);
+    }
+
+    #[test]
+    fn merge_daily_prefers_tracker_when_history_has_savings_but_zero_spend() {
+        // Backend rollup desync: savings recorded, tokens/cost zero (RUST-3S/3V).
+        let history = vec![daily("2026-04-21", 800, 2.0)];
+        let tracker = vec![DailySavingsPoint {
+            date: "2026-04-21".to_string(),
+            estimated_tokens_saved: 400,
+            estimated_savings_usd: 1.5,
+            actual_cost_usd: 9.0,
+            total_tokens_sent: 123_456,
+        }];
+        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        assert_eq!(result.len(), 1);
+        // Tracker point (with real spend) wins over the desynced history point.
+        assert_eq!(result[0].total_tokens_sent, 123_456);
+        assert_eq!(result[0].actual_cost_usd, 9.0);
+    }
+
+    #[test]
+    fn merge_daily_keeps_history_when_zero_spend_but_tracker_also_lacks_spend() {
+        // No real spend anywhere -> nothing to fall back to; history is kept as-is.
+        let history = vec![daily("2026-04-21", 800, 2.0)];
+        let tracker = vec![daily("2026-04-21", 100, 0.5)];
+        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].estimated_tokens_saved, 800);
+        assert_eq!(result[0].total_tokens_sent, 0);
     }
 
     #[test]
