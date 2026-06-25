@@ -108,7 +108,7 @@ export function paybackLabel(
   if (monthly <= 0) return null;
   const multiple = recentMonthlySavingsUsd / monthly;
   if (multiple < 2) return null;
-  return `You're saving about ${currencyExact(recentMonthlySavingsUsd)} a month - this plan pays for itself ${Math.floor(multiple)}x over.`;
+  return `You're saving about ${currencyExact(recentMonthlySavingsUsd)} a month. Upgrading pays for itself ${Math.floor(multiple)}x over.`;
 }
 
 /// Item 2 - counterfactual for the weekly gate. Projects the savings forgone
@@ -121,7 +121,7 @@ export function forgoneSavingsLabel(
   if (recentDailySavingsUsd <= 0 || daysUntilReset <= 0) return null;
   const forgone = recentDailySavingsUsd * daysUntilReset;
   if (forgone < 1) return null;
-  return `You'd miss out on about ${currencyExact(forgone)} in savings this week before the limit resets.`;
+  return `You'll miss out on about ${currencyExact(forgone)} in savings this week unless you upgrade.`;
 }
 
 export type UpgradePlanId = "free" | "pro" | "max5x" | "max20x" | "team" | "enterprise";

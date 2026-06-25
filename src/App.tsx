@@ -4301,6 +4301,14 @@ export default function App() {
   const upgradeSavingsLine = isHardGate
     ? (weeklyGateForgoneLabel ?? upgradePaybackLabel)
     : (upgradePaybackLabel ?? weeklyGateForgoneLabel);
+  // Only show it when the pricing gate/nudge banner actually wins: a startup,
+  // paused, or disconnected banner takes precedence over the upsell, so the
+  // savings line must not leak under those titles.
+  const showUpgradeSavingsLine =
+    !!upgradeSavingsLine &&
+    !!runtimeStatus &&
+    !runtimeStatus.paused &&
+    !runtimeStatus.starting;
 
   const activeHeadroomPlanId =
     pricingAudience === "individual" && pricingStatus?.account?.subscriptionActive
@@ -4613,7 +4621,7 @@ export default function App() {
                 {platformPreviewNotice ? (
                   <p className="callout-banner__subtitle">{platformPreviewNotice}</p>
                 ) : null}
-                {upgradeSavingsLine ? (
+                {showUpgradeSavingsLine ? (
                   <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
                 ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
