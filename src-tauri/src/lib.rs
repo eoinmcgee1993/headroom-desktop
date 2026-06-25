@@ -241,11 +241,43 @@ fn check_zero_spend_anomaly(dashboard: &DashboardState) {
     );
 }
 
+/// Test affordance (opt-in via env, works in release/RC builds): when
+/// HEADROOM_FAKE_WEEKLY_GATE is set, overwrite daily savings with a synthetic
+/// 7-day history so the upgrade-banner dollar figures render on a fresh machine
+/// with no real usage. Per-day USD from HEADROOM_FAKE_DAILY_SAVINGS (default 5).
+/// Dormant (no-op) unless the env var is explicitly set.
+fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
+    // Inert in stable: only RC versions (X.Y.Z-rc.N) honor the override env var.
+    if !env!("CARGO_PKG_VERSION").contains("-rc") {
+        return;
+    }
+    if std::env::var("HEADROOM_FAKE_WEEKLY_GATE")
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let per_day: f64 = std::env::var("HEADROOM_FAKE_DAILY_SAVINGS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(5.0);
+    let today = Utc::now();
+    dashboard.daily_savings = (0..7)
+        .map(|i| DailySavingsPoint {
+            date: (today - chrono::Duration::days(i)).format("%Y-%m-%d").to_string(),
+            estimated_savings_usd: per_day,
+            estimated_tokens_saved: 0,
+            actual_cost_usd: 0.0,
+            total_tokens_sent: 0,
+        })
+        .collect();
+}
+
 #[tauri::command]
 async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state: State<'_, AppState> = app.state();
-        let (dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
+        let (mut dashboard, pending_milestones) = state.dashboard_with_pending_milestones();
 
         for milestone_tokens_saved in &pending_milestones.token {
             analytics::track_event(
@@ -265,6 +297,8 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         }
 
         check_zero_spend_anomaly(&dashboard);
+
+        maybe_inject_fake_daily_savings(&mut dashboard);
 
         dashboard
     })
