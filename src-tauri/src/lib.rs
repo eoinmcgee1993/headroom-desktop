@@ -417,7 +417,7 @@ where
 }
 
 #[tauri::command]
-fn restart_app(app: AppHandle) {
+async fn restart_app(app: AppHandle) {
     // Tauri 2.x has an open bug on macOS (tauri-apps/tauri#13923, #11392)
     // where `request_restart()` and `restart()` exit the process but never
     // relaunch — especially with `tauri-plugin-single-instance` loaded.
@@ -2290,11 +2290,11 @@ async fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedRespo
 /// That keeps the IPC hot path short: one in-memory lock + a cheap /readyz
 /// ping to the local proxy.
 #[tauri::command]
-fn get_activity_feed(state: State<'_, AppState>) -> ActivityFeedResponse {
-    ActivityFeedResponse {
+async fn get_activity_feed(state: State<'_, AppState>) -> Result<ActivityFeedResponse, String> {
+    Ok(ActivityFeedResponse {
         tiles: state.activity_feed_snapshot(),
         proxy_reachable: crate::state::headroom_proxy_reachable(),
-    }
+    })
 }
 
 /// Observation cadence for background activity milestones. A modest delay is
@@ -3030,7 +3030,7 @@ async fn set_rtk_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
 }
 
 #[tauri::command]
-fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
+async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     {
         let state: tauri::State<'_, AppState> = app.state();
         state.stop_headroom();
@@ -3078,7 +3078,7 @@ fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-fn quit_headroom(app: AppHandle) {
+async fn quit_headroom(app: AppHandle) {
     exit_headroom(&app, QuitSource::SettingsButton);
 }
 

@@ -5574,9 +5574,7 @@ html.window-hiding {
 }
 
 .addons__request {
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border-subtle);
+  margin-top: 8px;
   display: flex;
   align-items: center;
   gap: 8px;
