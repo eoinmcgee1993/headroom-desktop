@@ -371,6 +371,33 @@ pub enum KompressPrefetchOutcome {
 /// Build a short, Sentry-friendly cause from the tail of the prefetch log.
 /// The leading `[category]` keeps related failures grouped; the trailing line
 /// carries the specific error for triage.
+/// httpx (used by huggingface_hub 1.x) reads `SSL_CERT_FILE`/`SSL_CERT_DIR` but
+/// ignores `REQUESTS_CA_BUNDLE`. When a user behind TLS inspection has set
+/// `REQUESTS_CA_BUNDLE` but not `SSL_CERT_FILE`, mirror it so the model download
+/// trusts their corporate root. No-op if `SSL_CERT_FILE` is already set or no
+/// bundle is configured -- the child otherwise inherits the parent env unchanged.
+fn httpx_ca_bundle_bridge() -> Vec<(String, String)> {
+    httpx_ca_bundle_bridge_from(
+        std::env::var_os("SSL_CERT_FILE").is_some(),
+        std::env::var("REQUESTS_CA_BUNDLE").ok().as_deref(),
+    )
+}
+
+fn httpx_ca_bundle_bridge_from(
+    ssl_cert_file_set: bool,
+    requests_ca_bundle: Option<&str>,
+) -> Vec<(String, String)> {
+    if ssl_cert_file_set {
+        return Vec::new();
+    }
+    match requests_ca_bundle {
+        Some(bundle) if !bundle.trim().is_empty() => {
+            vec![("SSL_CERT_FILE".to_string(), bundle.to_string())]
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
     let contents = std::fs::read_to_string(log_path).unwrap_or_default();
     let lines: Vec<&str> = contents.lines().collect();
@@ -1248,6 +1275,12 @@ impl ToolManager {
             // Same xet guard as the proxy spawn: the native hf_xet downloader
             // can SIGABRT mid-pull; the HTTPS fallback is stable.
             .env("HF_HUB_DISABLE_XET", "1")
+            // huggingface_hub 1.x downloads over httpx, which reads SSL_CERT_FILE
+            // but NOT REQUESTS_CA_BUNDLE. Users behind corporate TLS inspection
+            // who set REQUESTS_CA_BUNDLE (per our bootstrap remediation) got pip
+            // working but the model pull still failed cert verification (Sentry
+            // RUST-3C). Bridge their bundle into SSL_CERT_FILE so httpx honors it.
+            .envs(httpx_ca_bundle_bridge())
             .stdin(Stdio::null())
             .stdout(Stdio::from(
                 log_file
@@ -5475,7 +5508,7 @@ mod tests {
     use super::{
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
         extract_required_pydantic_core_version, format_all_foreign_bail,
-        format_already_running_bail, headroom_entrypoint_startup_args,
+        format_already_running_bail, headroom_entrypoint_startup_args, httpx_ca_bundle_bridge_from,
         headroom_python_startup_args, is_outdated_codex, looks_like_corrupt_venv_error,
         parse_major_minor_patch,
         parse_pid_from_lsof_detail, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
@@ -5489,6 +5522,20 @@ mod tests {
     use crate::backend_port;
     use crate::port_conflict;
     use std::net::TcpListener;
+
+    #[test]
+    fn httpx_ca_bundle_bridge_mirrors_requests_bundle() {
+        // Bundle set, SSL_CERT_FILE unset -> mirror it for httpx.
+        assert_eq!(
+            httpx_ca_bundle_bridge_from(false, Some("/etc/corp/ca.pem")),
+            vec![("SSL_CERT_FILE".to_string(), "/etc/corp/ca.pem".to_string())]
+        );
+        // SSL_CERT_FILE already set -> don't override.
+        assert!(httpx_ca_bundle_bridge_from(true, Some("/etc/corp/ca.pem")).is_empty());
+        // No bundle, or blank -> nothing to bridge.
+        assert!(httpx_ca_bundle_bridge_from(false, None).is_empty());
+        assert!(httpx_ca_bundle_bridge_from(false, Some("  ")).is_empty());
+    }
 
     #[test]
     fn path_with_binary_dir_prepends_parent() {

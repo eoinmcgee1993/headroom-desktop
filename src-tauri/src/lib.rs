@@ -1023,10 +1023,11 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
             "Installation failed: your network is intercepting secure connections \
              (self-signed certificate in the TLS chain), so Headroom can't verify \
              pypi.org or github.com. This usually means a corporate proxy, VPN, or \
-             antivirus is inspecting HTTPS traffic. Set the REQUESTS_CA_BUNDLE \
-             environment variable to your organization's CA bundle, or disable TLS \
-             inspection for pypi.org, files.pythonhosted.org, and github.com, then \
-             restart the app. Contact support@extraheadroom.com if you need help."
+             antivirus is inspecting HTTPS traffic. Set both the REQUESTS_CA_BUNDLE \
+             and SSL_CERT_FILE environment variables to your organization's CA \
+             bundle, or disable TLS inspection for pypi.org, \
+             files.pythonhosted.org, github.com, and huggingface.co, then restart \
+             the app. Contact support@extraheadroom.com if you need help."
         }
         BootstrapFailureKind::NoUsableTempDir => {
             "Installation failed: Headroom can't create temporary files on this Mac. \

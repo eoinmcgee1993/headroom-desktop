@@ -1739,17 +1739,14 @@ fn codex_state_dirs() -> Vec<PathBuf> {
 
 /// True when Codex keeps (or kept) a sqlite-backed thread store on this machine,
 /// so a *missing* recognized `state_<N>.sqlite` means the store moved/renamed --
-/// the case worth a signal. Two store shapes exist: the GUI uses the
-/// `<codex_home>/sqlite/` dir, the CLI/TUI drops `state_<N>.sqlite` loose in
-/// `<codex_home>/`. Evidence of either: the `sqlite/` dir, or any
-/// `state_*.sqlite`-shaped file (incl. a renamed one whose version no longer
-/// parses, which is exactly the relocation we want to catch). CLI-only or
-/// pre-sqlite installs with just `config.toml`/`sessions/` match neither and
-/// stay silent -- they have no thread store to split.
+/// the case worth a signal. The only evidence we trust is a `state_*.sqlite`-shaped
+/// file in `<codex_home>/sqlite/` (GUI) or `<codex_home>/` (CLI/TUI), including a
+/// renamed one whose version no longer parses -- exactly the relocation we want to
+/// catch. The bare `sqlite/` dir is NOT evidence: it also holds unrelated stores
+/// (logs/goals/memories), so a fresh install with those but no thread store would
+/// otherwise false-fire "store moved" (Sentry RUST-3R). CLI-only or pre-sqlite
+/// installs with just `config.toml`/`sessions/` stay silent -- nothing to split.
 fn codex_sqlite_store_expected() -> bool {
-    if codex_home().join("sqlite").is_dir() {
-        return true;
-    }
     codex_state_dirs().iter().any(|dir| {
         std::fs::read_dir(dir)
             .map(|entries| {
@@ -4800,7 +4797,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
-    fn codex_sqlite_store_expected_gates_on_sqlite_dir_not_config() {
+    fn codex_sqlite_store_expected_gates_on_state_file_not_dir() {
         let home = TestHome::new();
         let codex = home.path().join(".codex");
         // CLI-only / pre-sqlite Codex: config + sessions but no sqlite/ store.
@@ -4810,13 +4807,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !codex_sqlite_store_expected(),
             "config/sessions alone must not trigger the moved-store warning"
         );
+        // sqlite/ dir holding only unrelated stores (logs/goals/memories) but no
+        // thread store must NOT fire -- the false positive behind Sentry RUST-3R.
+        std::fs::create_dir_all(codex.join("sqlite")).unwrap();
+        std::fs::write(codex.join("sqlite").join("logs_2.sqlite"), "").unwrap();
+        std::fs::write(codex.join("sqlite").join("goals_1.sqlite"), "").unwrap();
+        assert!(
+            !codex_sqlite_store_expected(),
+            "unrelated sqlite stores must not trigger the moved-store warning"
+        );
         // CLI store renamed loose in codex_home (version no longer parses) ->
         // expected, so the relocation gets flagged.
         std::fs::write(codex.join("state_5x.sqlite"), "").unwrap();
         assert!(codex_sqlite_store_expected());
         std::fs::remove_file(codex.join("state_5x.sqlite")).unwrap();
-        // GUI store dir present -> a missing state_<N>.sqlite is worth flagging.
-        std::fs::create_dir_all(codex.join("sqlite")).unwrap();
+        // GUI thread store present under sqlite/ -> expected.
+        std::fs::write(codex.join("sqlite").join("state_6.sqlite"), "").unwrap();
         assert!(codex_sqlite_store_expected());
     }
 

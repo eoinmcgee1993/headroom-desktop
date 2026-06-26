@@ -5385,6 +5385,20 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
                 .into(),
         );
     }
+    // Incomplete/corrupted runtime: a headroom.* module is missing from the
+    // installed venv (interrupted upgrade or partial extraction left an import
+    // dangling -- e.g. registry.py importing headroom.providers.claude that was
+    // never laid down; see Sentry RUST-3Y). Must precede the generic
+    // exited-before-port branch, whose message is vaguer. A full reinstall is
+    // the reliable fix, so name it directly.
+    if raw.contains("ModuleNotFoundError: No module named 'headroom") {
+        return Some(
+            "Headroom's runtime is missing some of its own files, so it can't start \
+             -- the install looks incomplete or was interrupted. \
+             Reinstall the runtime from Settings > Advanced to fix it."
+                .into(),
+        );
+    }
     if raw.contains("exited with status") && raw.contains("before opening port") {
         return Some(
             "The Headroom Python runtime crashed at startup. \
@@ -5898,6 +5912,22 @@ mod tests {
         let hint = classify_startup_error(raw).expect("crash should classify");
         assert!(hint.contains("crashed at startup"), "got: {hint}");
         assert!(hint.contains("logs"));
+    }
+
+    #[test]
+    fn classify_startup_error_missing_headroom_module() {
+        // RUST-3Y: corrupted/incomplete install -- a headroom.* module is gone.
+        // The full err chain carries the proxy log tail with the traceback.
+        let raw = "unable to keep headroom running in background: \
+            /h/venv/bin/python3 -m headroom.proxy.server --port 6768 exited with status exit status: 1 \
+            before opening port 6768\n--- log tail ---\nTraceback (most recent call last):\n  \
+            File registry.py, line 11\n    from headroom.providers.claude import DEFAULT_API_URL\n\
+            ModuleNotFoundError: No module named 'headroom.providers.claude'\n--- end log ---";
+        let hint = classify_startup_error(raw).expect("missing module should classify");
+        assert!(hint.contains("missing some of its own files"), "got: {hint}");
+        assert!(hint.contains("Reinstall"));
+        // Must win over the generic crash branch (which also matches this raw).
+        assert!(!hint.contains("crashed at startup"), "got: {hint}");
     }
 
     #[test]
