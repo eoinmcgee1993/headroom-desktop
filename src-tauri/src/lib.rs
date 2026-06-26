@@ -3092,7 +3092,14 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         let state: tauri::State<'_, AppState> = app.state();
         let runtime_paused = state.runtime_is_paused();
         state.stop_headroom();
-        let _ = client_adapters::clear_client_setups();
+        // Mark the quit-time clear as done so the RunEvent::Exit handler skips
+        // its redundant clear_client_setups(). A second call would wipe the
+        // remembered_clients snapshot we just saved (configured_clients is now
+        // empty, so the re-save is skipped while the disable loop still removes
+        // remembered entries), leaving connectors disabled on next launch.
+        if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+            let _ = client_adapters::clear_client_setups();
+        }
         runtime_paused
     };
 
