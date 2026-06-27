@@ -1951,22 +1951,31 @@ fn strip_codex_managed_toml(content: &str) -> String {
         .join("\n")
 }
 
-/// Pure-text removal of a single `# >>> headroom:<id> >>> ... <<<` block.
+/// Pure-text removal of every `# >>> headroom:<id> >>> ... <<<` block. Loops so
+/// a config that already holds duplicate managed blocks (interrupted write,
+/// older build) is fully cleaned, not left with one survivor that regenerates.
 fn strip_marker_block(content: &str, block_id: &str) -> String {
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
-    let (Some(start_idx), Some(end_idx)) = (content.find(&start), content.find(&end)) else {
-        return content.to_string();
-    };
-    let tail = content[end_idx + end.len()..].trim_start_matches('\n');
-    let head = content[..start_idx].trim_end();
-    let mut rebuilt = String::with_capacity(content.len());
-    rebuilt.push_str(head);
-    if !rebuilt.is_empty() && !tail.is_empty() {
-        rebuilt.push('\n');
+    let mut out = content.to_string();
+    loop {
+        let (Some(start_idx), Some(end_idx)) = (out.find(&start), out.find(&end)) else {
+            break;
+        };
+        if end_idx < start_idx {
+            break; // malformed (stray end before start) — leave it alone
+        }
+        let tail = out[end_idx + end.len()..].trim_start_matches('\n').to_string();
+        let head = out[..start_idx].trim_end().to_string();
+        let mut rebuilt = String::with_capacity(out.len());
+        rebuilt.push_str(&head);
+        if !rebuilt.is_empty() && !tail.is_empty() {
+            rebuilt.push('\n');
+        }
+        rebuilt.push_str(&tail);
+        out = rebuilt;
     }
-    rebuilt.push_str(tail);
-    rebuilt
+    out
 }
 
 /// Reconstruct `config.toml` with the managed root keys pinned to the top and
@@ -2413,6 +2422,72 @@ fn is_headroom_proxy_reachable() -> bool {
             .map(|response| response.status().is_success())
             .unwrap_or(false)
     })
+}
+
+/// Pure core for `detect_oss_remnants`: given the environment facts, produce the
+/// operator-facing warnings. Stale open-source-install remnants coexisting with
+/// the paid desktop app are the root cause of instability under concurrent
+/// agents (duplicate `mcp serve`, `:8787` vs Cursor OAuth callback conflicts,
+/// hooks pointing at a non-app binary). Kept pure so it is unit-testable.
+fn oss_remnant_warnings(
+    local_headroom_exists: bool,
+    local_rtk_exists: bool,
+    port_8787_listening: bool,
+    claude_hook_points_at_local_bin: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if port_8787_listening {
+        warnings.push(
+            "An open-source Headroom proxy is listening on :8787. It conflicts with the paid \
+             desktop proxy (:6767/:6768) and Cursor MCP OAuth callbacks. Stop it and remove the \
+             open-source install."
+                .into(),
+        );
+    }
+    if local_headroom_exists {
+        warnings.push(
+            "Found a stale open-source binary at ~/.local/bin/headroom. Remove it so only the \
+             app-owned runtime serves MCP."
+                .into(),
+        );
+    }
+    if local_rtk_exists {
+        warnings.push(
+            "Found a stale open-source binary at ~/.local/bin/rtk. Remove it so the Claude hook \
+             uses the app-owned RTK binary."
+                .into(),
+        );
+    }
+    if claude_hook_points_at_local_bin {
+        warnings.push(
+            "The Claude hook in ~/.claude/settings.json points at ~/.local/bin (open-source \
+             install) instead of the app-owned binary. Re-run client setup to repair it."
+                .into(),
+        );
+    }
+    warnings
+}
+
+/// Gather real environment facts and return OSS-remnant warnings, empty when the
+/// install is clean.
+pub fn detect_oss_remnants() -> Vec<String> {
+    let local_bin = home_dir().join(".local").join("bin");
+    let hook_points_at_local_bin = std::fs::read_to_string(claude_settings_path())
+        .map(|raw| raw.contains(".local/bin/rtk") || raw.contains(".local/bin/headroom"))
+        .unwrap_or(false);
+    oss_remnant_warnings(
+        local_bin.join("headroom").exists(),
+        local_bin.join("rtk").exists(),
+        port_listening(8787),
+        hook_points_at_local_bin,
+    )
+}
+
+/// True when something accepts a TCP connection on `127.0.0.1:<port>`.
+fn port_listening(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
 fn resolve_default_shell_targets() -> Vec<PathBuf> {
@@ -3057,7 +3132,8 @@ mod tests {
         codex_home, codex_sqlite_store_expected, codex_store_version,
         discover_codex_state_dbs, remove_managed_block,
         retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
-        is_permission_denied, serialize_paths, shell_block_contains_in_files,
+        is_permission_denied, oss_remnant_warnings, render_codex_config, serialize_paths,
+        shell_block_contains_in_files,
         shell_block_contains_text_in_files, shell_double_quote, strip_headroom_hook_from_settings,
         upsert_managed_block, write_file_if_changed, ClientSetupState, ShellFamily,
     };
@@ -4584,6 +4660,54 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .and_then(|v| v.as_bool()),
             Some(false),
             "existing [features] table preserved, got:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn oss_remnant_warnings_clean_install_is_silent() {
+        assert!(oss_remnant_warnings(false, false, false, false).is_empty());
+    }
+
+    #[test]
+    fn oss_remnant_warnings_flags_each_remnant() {
+        let w = oss_remnant_warnings(true, true, true, true);
+        assert_eq!(w.len(), 4, "one warning per remnant, got: {w:?}");
+        assert!(w.iter().any(|m| m.contains(":8787")));
+        assert!(w.iter().any(|m| m.contains("~/.local/bin/headroom")));
+        assert!(w.iter().any(|m| m.contains("~/.local/bin/rtk")));
+        assert!(w.iter().any(|m| m.contains("settings.json")));
+    }
+
+    #[test]
+    fn render_codex_config_collapses_duplicate_managed_blocks() {
+        // Regression: a config left with TWO managed provider blocks (interrupted
+        // write / older build) used to keep one survivor that regenerated forever,
+        // surfacing as a duplicate [model_providers.headroom] the user deleted by
+        // hand. render must collapse all duplicates down to exactly one.
+        let dup = "# >>> headroom:codex_cli_provider >>>\n\
+                   [model_providers.headroom]\n\
+                   base_url = \"http://stale/v1\"\n\
+                   # <<< headroom:codex_cli_provider <<<\n\
+                   model = \"gpt-5.4\"\n\
+                   # >>> headroom:codex_cli_provider >>>\n\
+                   [model_providers.headroom]\n\
+                   base_url = \"http://stale2/v1\"\n\
+                   # <<< headroom:codex_cli_provider <<<\n";
+
+        let rendered = render_codex_config(dup);
+
+        assert_eq!(
+            rendered.matches("[model_providers.headroom]").count(),
+            1,
+            "exactly one managed provider table after render, got:\n{rendered}"
+        );
+        assert!(
+            rendered.parse::<toml::Value>().is_ok(),
+            "rendered config is valid toml, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("model = \"gpt-5.4\""),
+            "user content between the duplicates is preserved, got:\n{rendered}"
         );
     }
 

@@ -2928,6 +2928,11 @@ async fn verify_client_setup(client_id: String) -> Result<ClientSetupVerificatio
 }
 
 #[tauri::command]
+async fn detect_oss_remnants() -> Result<Vec<String>, String> {
+    Ok(client_adapters::detect_oss_remnants())
+}
+
+#[tauri::command]
 async fn get_client_connectors(state: State<'_, AppState>) -> Result<Vec<ClientConnectorStatus>, String> {
     client_adapters::list_client_connectors(&state.cached_clients()).map_err(|err| err.to_string())
 }
@@ -3407,6 +3412,7 @@ pub fn run() {
             start_headroom_learn,
             apply_client_setup,
             verify_client_setup,
+            detect_oss_remnants,
             get_client_connectors,
             disable_client_setup,
             clear_client_setups,
