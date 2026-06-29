@@ -2093,6 +2093,67 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>)> {
     Ok((vec![path.display().to_string()], backup_files))
 }
 
+/// Rewrite the `command` of the `[mcp_servers.headroom]` table in
+/// `~/.codex/config.toml` to the absolute `entrypoint`. The upstream Python
+/// registrar writes a bare `command = "headroom"` that relies on PATH; when
+/// the managed runtime relocates, `~/.local/bin/headroom` dangles and Codex
+/// fails to start the MCP server with `No such file or directory`. Desktop
+/// re-runs `mcp install` on every launch, so pinning the absolute path here
+/// self-heals the config. No-op when the config or table is absent. Targets
+/// the table by header rather than the Headroom marker block, which the
+/// upstream registrar can mis-place around unrelated user tables.
+pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
+    let path = codex_config_toml_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+
+    let target_line = format!("command = {}", toml_basic_string(&entrypoint.to_string_lossy()));
+
+    let mut in_headroom_table = false;
+    let mut replaced = false;
+    let mut out: Vec<String> = Vec::with_capacity(content.lines().count());
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_headroom_table = trimmed == "[mcp_servers.headroom]";
+            out.push(line.to_string());
+            continue;
+        }
+        if in_headroom_table
+            && !replaced
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "command")
+        {
+            out.push(target_line.clone());
+            replaced = true;
+            continue;
+        }
+        out.push(line.to_string());
+    }
+
+    if !replaced {
+        return Ok(None);
+    }
+    let mut rebuilt = out.join("\n");
+    if content.ends_with('\n') {
+        rebuilt.push('\n');
+    }
+    if rebuilt == content {
+        return Ok(None);
+    }
+    let _ = backup_if_exists(&path)?;
+    std::fs::write(&path, rebuilt).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
+fn toml_basic_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn codex_provider_block_matches() -> Result<bool> {
     let path = codex_config_toml_path();
     if !path.exists() {
@@ -3673,7 +3734,8 @@ mod tests {
         codex_home, codex_sqlite_store_expected, codex_store_version,
         discover_codex_state_dbs, remove_managed_block,
         retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
-        is_permission_denied, oss_remnant_warnings, render_codex_config, serialize_paths,
+        is_permission_denied, oss_remnant_warnings, pin_codex_mcp_command, render_codex_config,
+        serialize_paths,
         shell_block_contains_in_files,
         shell_block_contains_text_in_files, shell_double_quote, strip_headroom_hook_from_settings,
         upsert_managed_block, write_file_if_changed, ClientSetupState, ShellFamily,
@@ -5702,6 +5764,47 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // An empty value is ignored (treated as unset).
         std::env::set_var("CODEX_HOME", "");
         assert_eq!(codex_home(), home.path().join(".codex"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pin_codex_mcp_command_rewrites_only_headroom_table() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        std::fs::write(
+            &config,
+            "# --- Headroom MCP server ---\n\
+             [mcp_servers.headroom]\n\
+             command = \"headroom\"\n\
+             args = [\"mcp\", \"serve\"]\n\
+             \n\
+             [mcp_servers.headroom.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n\
+             \n\
+             [mcp_servers.node_repl]\n\
+             command = \"/Applications/Codex.app/node_repl\"\n",
+        )
+        .unwrap();
+
+        let entrypoint = home.path().join("App Support/venv/bin/headroom");
+        let changed = pin_codex_mcp_command(&entrypoint).unwrap();
+        assert!(changed.is_some(), "config should have been rewritten");
+
+        let after = std::fs::read_to_string(&config).unwrap();
+        let abs = entrypoint.display().to_string();
+        assert!(
+            after.contains(&format!("command = \"{abs}\"")),
+            "headroom command pinned to absolute path, got:\n{after}"
+        );
+        // The unrelated server's command must be untouched.
+        assert!(after.contains("command = \"/Applications/Codex.app/node_repl\""));
+        // The headroom env sub-table has no `command`; nothing spurious added.
+        assert_eq!(after.matches("command = ").count(), 2);
+
+        // Idempotent: a second run with the same entrypoint is a no-op.
+        assert!(pin_codex_mcp_command(&entrypoint).unwrap().is_none());
     }
 
     #[test]

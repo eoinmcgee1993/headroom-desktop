@@ -279,6 +279,12 @@ async fn handle(
     // Throttled and fire-and-forget, so the request hot path is untouched.
     if is_codex {
         maybe_spawn_codex_usage_poll(&buf, &codex_slot);
+        // Codex (Plus tier) stamps `X-OpenAI-Internal-Codex-Responses-Lite` on
+        // the `/responses` request; OpenAI's backend then rejects high-reasoning
+        // models on some accounts with "This model is not supported when using
+        // X-OpenAI-Internal-Codex-Responses-Lite." We never want the lite path,
+        // so drop the header before any forwarding branch (backend or direct).
+        strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
     }
 
     // When the pricing gate has bypassed Headroom, the Python proxy on
@@ -338,7 +344,10 @@ async fn handle(
     // response path that sees those headers. Every other client (Claude) keeps
     // the untouched zero-copy splice.
     if is_codex {
-        splice_with_codex_capture(client, backend, &codex_slot).await;
+        let req_path = parse_request_head(&buf)
+            .map(|p| p.path)
+            .unwrap_or_default();
+        splice_with_codex_capture(client, backend, &codex_slot, &req_path).await;
     } else {
         let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
     }
@@ -354,6 +363,7 @@ async fn splice_with_codex_capture(
     mut client: TcpStream,
     mut backend: TcpStream,
     codex_slot: &CodexRateLimitSlot,
+    req_path: &str,
 ) {
     let (mut client_rd, mut client_wr) = client.split();
     let (mut backend_rd, mut backend_wr) = backend.split();
@@ -379,10 +389,34 @@ async fn splice_with_codex_capture(
             }
         }
 
-        // Forward the head bytes we read (full head on success, partial on
-        // timeout/EOF — `read_http_headers` may also include leading body bytes
-        // it over-read), then splice the rest of the response through.
-        if client_wr.write_all(&head).await.is_err() {
+        // On an upstream error status, buffer one bounded chunk of the error
+        // body for a Sentry report. Codex error responses are small JSON (not
+        // the SSE stream), so this never delays the streaming happy path — that
+        // path takes the `else` and is byte-for-byte identical to before.
+        if let Some(status) = parse_response_status(&head).filter(is_reportable_codex_error) {
+            let mut chunk = vec![0u8; MAX_ERROR_BODY];
+            let n = match tokio::time::timeout(
+                ERROR_BODY_READ_TIMEOUT,
+                backend_rd.read(&mut chunk),
+            )
+            .await
+            {
+                Ok(Ok(n)) => n,
+                _ => 0,
+            };
+            chunk.truncate(n);
+            report_codex_upstream_error(status, req_path, &head, &chunk);
+            // Forward head + the chunk we peeked, then splice any remainder.
+            if client_wr.write_all(&head).await.is_err() {
+                return;
+            }
+            if client_wr.write_all(&chunk).await.is_err() {
+                return;
+            }
+        } else if client_wr.write_all(&head).await.is_err() {
+            // Forward the head bytes we read (full head on success, partial on
+            // timeout/EOF — `read_http_headers` may also include leading body
+            // bytes it over-read), then splice the rest of the response through.
             return;
         }
         let _ = tokio::io::copy(&mut backend_rd, &mut client_wr).await;
@@ -390,6 +424,51 @@ async fn splice_with_codex_capture(
     };
 
     tokio::join!(upstream, downstream);
+}
+
+/// Bound on the error-body slice we peek for a Sentry report (and forward).
+const MAX_ERROR_BODY: usize = 8192;
+const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Parse the status code from an HTTP response head's status line
+/// (`HTTP/1.1 400 Bad Request` -> `400`).
+fn parse_response_status(head: &[u8]) -> Option<u16> {
+    let text = std::str::from_utf8(head).ok()?;
+    let first = text.split("\r\n").next()?;
+    first.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Whether an upstream status is worth a Sentry event. 429 (rate limit) is
+/// routine and handled by the usage gauge, so it is excluded to avoid noise;
+/// everything >= 400 otherwise is a real client/server failure we want to see.
+fn is_reportable_codex_error(status: &u16) -> bool {
+    *status >= 400 && *status != 429
+}
+
+/// Report a Codex upstream error to Sentry with the status, request path and a
+/// truncated error body (head's over-read body bytes + the peeked chunk).
+fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: &[u8]) {
+    let head_body = find_header_end(head)
+        .map(|e| &head[(e + 4).min(head.len())..])
+        .unwrap_or(&[]);
+    let mut body: Vec<u8> = Vec::with_capacity(head_body.len() + chunk.len());
+    body.extend_from_slice(head_body);
+    body.extend_from_slice(chunk);
+    let snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
+    let path = req_path.to_string();
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("codex_upstream_status", status);
+            scope.set_tag("codex_request_path", &path);
+            scope.set_extra("error_body", snippet.clone().into());
+        },
+        || {
+            sentry::capture_message(
+                &format!("codex upstream error {status} on {path}"),
+                sentry::Level::Warning,
+            );
+        },
+    );
 }
 
 /// Parse the `x-codex-*` rate-limit headers out of a raw HTTP response head
@@ -980,6 +1059,44 @@ fn request_has_header(buf: &[u8], name: &str) -> bool {
         .any(|(field, _)| field.trim().eq_ignore_ascii_case(name))
 }
 
+/// Remove a header line (case-insensitive field name) from an HTTP request
+/// head, preserving the request line, every other header, the `\r\n\r\n`
+/// terminator and the body. No-op if the header is absent or the terminator is
+/// missing. `Content-Length` is unaffected: it counts body bytes, untouched here.
+fn strip_request_header(buf: &mut Vec<u8>, name: &str) {
+    let range = {
+        let Some(end) = find_header_end(buf) else {
+            return;
+        };
+        let Ok(head) = std::str::from_utf8(&buf[..end]) else {
+            return;
+        };
+        let mut offset = match head.find("\r\n") {
+            Some(p) => p + 2, // skip the request line
+            None => return,
+        };
+        let mut found = None;
+        while offset < head.len() {
+            let rest = &head[offset..];
+            let line_len = rest.find("\r\n").unwrap_or(rest.len());
+            if rest[..line_len]
+                .split_once(':')
+                .map(|(field, _)| field.trim().eq_ignore_ascii_case(name))
+                .unwrap_or(false)
+            {
+                found = Some(offset..offset + line_len + 2);
+                break;
+            }
+            offset += line_len + 2;
+        }
+        found
+    };
+    if let Some(r) = range {
+        let stop = r.end.min(buf.len());
+        buf.splice(r.start..stop, std::iter::empty());
+    }
+}
+
 /// Insert `X-Client: codex` into a request head so the Python backend's
 /// `classify_client` identifies Codex traffic even when the client's
 /// User-Agent isn't `codex-cli/` (e.g. the Codex GUI/IDE). A client that
@@ -1100,7 +1217,9 @@ mod tests {
         decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
         is_openai_path, parse_codex_rate_limit_headers, parse_request_head, read_http_headers,
-        request_is_loopback_safe, run, stamp_codex_client_header, BypassFlag, SharedToken,
+        is_reportable_codex_error, parse_response_status, request_has_header,
+        request_is_loopback_safe, run, stamp_codex_client_header, strip_request_header, BypassFlag,
+        SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -1498,6 +1617,44 @@ mod tests {
         let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: x".to_vec();
         let original = buf.clone();
         stamp_codex_client_header(&mut buf);
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn parse_response_status_reads_status_line() {
+        assert_eq!(
+            parse_response_status(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"),
+            Some(400)
+        );
+        assert_eq!(parse_response_status(b"HTTP/1.1 200 OK\r\n\r\n"), Some(200));
+        assert_eq!(parse_response_status(b"garbage"), None);
+    }
+
+    #[test]
+    fn is_reportable_codex_error_excludes_2xx_and_429() {
+        assert!(is_reportable_codex_error(&400));
+        assert!(is_reportable_codex_error(&500));
+        assert!(!is_reportable_codex_error(&200));
+        assert!(!is_reportable_codex_error(&429));
+    }
+
+    #[test]
+    fn strip_request_header_removes_lite_header_and_preserves_body() {
+        let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nX-OpenAI-Internal-Codex-Responses-Lite: 1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
+        strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
+        assert!(!request_has_header(&buf, "X-OpenAI-Internal-Codex-Responses-Lite"));
+        // Surrounding headers, terminator and body intact.
+        assert!(request_has_header(&buf, "host"));
+        assert!(request_has_header(&buf, "content-length"));
+        assert!(buf.ends_with(b"\r\n\r\nhello"));
+        assert_eq!(buf.windows(4).filter(|w| *w == b"\r\n\r\n").count(), 1);
+    }
+
+    #[test]
+    fn strip_request_header_noop_when_absent() {
+        let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        let original = buf.clone();
+        strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
         assert_eq!(buf, original);
     }
 

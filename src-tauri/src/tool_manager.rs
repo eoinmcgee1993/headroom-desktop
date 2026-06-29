@@ -3295,6 +3295,13 @@ impl ToolManager {
             }
         }
 
+        // Codex stores the MCP server command as a bare `headroom` (PATH-based,
+        // via ~/.local/bin/headroom). When the managed runtime relocates that
+        // symlink dangles and Codex fails to start the server. Pin it to the
+        // absolute entrypoint so it survives runtime moves. Best-effort: a
+        // failure here must not break the Claude integration below.
+        let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
+
         // Ground truth: did Claude Code actually see the server? The Python
         // CLI's fallback branch writes ~/.claude/mcp.json (legacy, ignored by
         // Claude Code ≥2.x) and exits 0, so the subprocess succeeding is not
