@@ -228,6 +228,12 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
             updates.0.append(&mut legacy_updates.0);
             updates.1.append(&mut legacy_updates.1);
 
+            // Loud-fail guard so a closed app or lost ANTHROPIC_BASE_URL routing
+            // surfaces in Claude instead of silently hitting Anthropic directly.
+            let mut guard = ensure_claude_guard_hook()?;
+            updates.0.append(&mut guard.0);
+            updates.1.append(&mut guard.1);
+
             // Shell profile (RTK PATH + env export) is convenience; tolerate an
             // unwritable profile rather than failing the whole setup.
             let env_block = format!("export ANTHROPIC_BASE_URL={}", HEADROOM_ANTHROPIC_BASE_URL);
@@ -266,6 +272,12 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
             // Critical, app-owned write first: the ~/.codex/config.toml provider
             // block is what routes Codex through Headroom.
             let mut updates = configure_codex_provider_block()?;
+
+            // Loud-fail guard so a closed app or clobbered config surfaces in
+            // Codex instead of silently routing direct to OpenAI.
+            let mut guard = ensure_codex_guard_hook()?;
+            updates.0.append(&mut guard.0);
+            updates.1.append(&mut guard.1);
 
             let env_block = format!("export OPENAI_BASE_URL={}", HEADROOM_OPENAI_BASE_URL);
             match shell_step_best_effort(configure_shell_block(
@@ -322,6 +334,12 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
             steps.push(
                 "Restart your terminal/editor session to pick up environment changes.".into(),
             );
+            if normalized_setup_id(client_id) == "codex_cli" {
+                steps.push(
+                    "In Codex, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard)."
+                        .into(),
+                );
+            }
             steps.push(format!(
                 "Run one {} prompt and verify activity appears in Headroom.",
                 match normalized_setup_id(client_id) {
@@ -400,6 +418,16 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                         .into(),
                 );
             }
+
+            if claude_guard_hook_path().exists() && claude_guard_registered()? {
+                checks.push(
+                    "Found Headroom routing guard registered in ~/.claude/settings.json.".into(),
+                );
+            } else {
+                failures.push(
+                    "Headroom routing guard was not found in ~/.claude/settings.json.".into(),
+                );
+            }
         }
         "vscode" => {
             let mut delegated = verify_client_setup("claude_code")?;
@@ -433,6 +461,29 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 failures
                     .push("Codex OPENAI_BASE_URL export was not found in shell profiles.".into());
             }
+
+            if codex_guard_hook_path().exists() && codex_guard_registered()? {
+                checks.push(
+                    "Found Headroom routing guard registered in ~/.codex/hooks.json.".into(),
+                );
+            } else {
+                failures.push(
+                    "Headroom routing guard was not found in ~/.codex/hooks.json.".into(),
+                );
+            }
+
+            // Independent confirmation from Codex itself, run off-thread: the
+            // `codex doctor` call takes seconds and `verify` is awaited by the
+            // setup UI, so block it there and we stall the flow. Detached and
+            // logged (its output isn't surfaced in the result today); never a
+            // `verified` failure (doctor can flag unrelated issues, and an
+            // untrusted-but-installed guard is expected until the user runs
+            // /hooks).
+            std::thread::spawn(|| {
+                if let Some(summary) = codex_doctor_summary() {
+                    log::info!("codex doctor: {summary}");
+                }
+            });
         }
         other => return Err(anyhow!("Verification is not supported yet for {other}.",)),
     }
@@ -537,6 +588,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             if hook_path.exists() {
                 let _ = std::fs::remove_file(&hook_path);
             }
+            let _ = remove_claude_guard_hook();
         }
         "vscode" => remove_vscode_connector_keys()?,
         other => {
@@ -704,7 +756,10 @@ pub fn perform_full_cleanup() -> Vec<String> {
     let mut backup_targets: Vec<PathBuf> = claude_settings_candidates();
     backup_targets.push(headroom_rtk_hook_path());
     backup_targets.push(headroom_markitdown_hook_path());
+    backup_targets.push(claude_guard_hook_path());
     backup_targets.push(codex_config_toml_path());
+    backup_targets.push(codex_hooks_json_path());
+    backup_targets.push(codex_guard_hook_path());
     backup_targets.push(
         home_dir()
             .join("Library")
@@ -1377,6 +1432,7 @@ fn set_markitdown_bash_permission(shim_path: &Path, present: bool) -> Result<boo
 fn disable_codex_cli() -> Result<()> {
     remove_codex_provider_block()?;
     let _ = remove_codex_toml_key("openai_base_url", HEADROOM_OPENAI_BASE_URL);
+    let _ = remove_codex_guard_hook();
     let shell_targets = all_shell_paths();
     let _ = remove_shell_block(&shell_targets, "codex_cli");
     let _ = remove_shell_block(&shell_targets, "codex");
@@ -2112,6 +2168,474 @@ fn remove_codex_toml_key(key: &str, expected_value: &str) -> Result<()> {
     }
     std::fs::write(&path, result).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+const CODEX_GUARD_STATUS_MESSAGE: &str = "Verifying Headroom route";
+
+fn codex_hooks_json_path() -> PathBuf {
+    codex_home().join("hooks.json")
+}
+
+fn codex_guard_hook_path() -> PathBuf {
+    codex_home().join("hooks").join("headroom-codex-guard.py")
+}
+
+fn codex_guard_command() -> String {
+    format!("/usr/bin/python3 {}", codex_guard_hook_path().display())
+}
+
+/// Loud-fail guard that Codex runs at session start and on every prompt: it
+/// checks that `~/.codex/config.toml` still routes through Headroom and that the
+/// desktop app is reachable, so a closed app or a clobbered provider block
+/// surfaces as a visible error instead of Codex silently falling back to a
+/// direct OpenAI route. Runs under system `/usr/bin/python3` (>=3.9), so it
+/// carries a tiny TOML fallback parser for the pre-3.11 interpreters that lack
+/// `tomllib`. Deliberately does NOT inspect auth mode or `OPENAI_API_KEY`:
+/// routing is decided by `base_url`, so an OpenAI-API-key Codex user is a valid
+/// Headroom setup, not a failure.
+fn build_codex_guard_script() -> String {
+    format!(
+        r##"#!/usr/bin/env python3
+"""Headroom Codex routing guard (managed by Headroom Desktop -- do not edit)."""
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
+CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or (pathlib.Path.home() / ".codex"))
+CONFIG = CODEX_HOME / "config.toml"
+BASE_URL = "{base}"
+READYZ = "{readyz}"
+
+
+def notify(message):
+    try:
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                'display notification ' + json.dumps(message) + ' with title "Headroom Codex guard"',
+            ],
+            check=False,
+            timeout=5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def toml_fallback(text):
+    result, current = {{}}, []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = [p.strip() for p in line.strip("[]").split(".") if p.strip()]
+            continue
+        if "=" not in line:
+            continue
+        key, value = (p.strip() for p in line.split("=", 1))
+        if value[:1] == '"' and value[-1:] == '"':
+            value = value[1:-1]
+        target = result
+        for part in current:
+            target = target.setdefault(part, {{}})
+        target[key] = value
+    return result
+
+
+def load_config():
+    try:
+        text = CONFIG.read_text()
+    except OSError:
+        return None
+    if tomllib is not None:
+        try:
+            return tomllib.loads(text)
+        except Exception:
+            return toml_fallback(text)
+    return toml_fallback(text)
+
+
+def reachable():
+    try:
+        with urllib.request.urlopen(READYZ, timeout=2) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as exc:
+        return exc.code == 404
+    except Exception:
+        return False
+
+
+def main():
+    issues = []
+    config = load_config()
+    if config is None:
+        issues.append("~/.codex/config.toml is missing or unreadable")
+    else:
+        if config.get("model_provider") != "headroom":
+            issues.append('Codex model_provider is not "headroom"; it is not routing through Headroom')
+        provider = (config.get("model_providers") or {{}}).get("headroom") or {{}}
+        if provider.get("base_url") != BASE_URL:
+            issues.append("Headroom provider base_url is not " + BASE_URL)
+    if not reachable():
+        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- open the app")
+
+    if issues:
+        notify("; ".join(issues))
+        sys.stderr.write("Headroom Codex guard failed:\n")
+        for issue in issues:
+            sys.stderr.write("- " + issue + "\n")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"##,
+        base = HEADROOM_OPENAI_BASE_URL,
+        readyz = "http://127.0.0.1:6767/readyz",
+    )
+}
+
+/// Merge the SessionStart + UserPromptSubmit guard entries into a hooks file.
+/// Codex `hooks.json` and Claude `settings.json` share the identical
+/// `{{"hooks": {{event: [{{matcher?, hooks: [...]}}]}}}}` shape, so both clients
+/// use this. Preserves every other key in the file. Idempotent: an
+/// already-registered guard command is left untouched.
+fn register_guard_hook_entries(
+    hooks_path: &Path,
+    command: &str,
+    status_message: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut content = if hooks_path.exists() {
+        let raw = std::fs::read_to_string(hooks_path)
+            .with_context(|| format!("reading {}", hooks_path.display()))?;
+        Value::Object(parse_json_object(&raw, hooks_path)?)
+    } else {
+        Value::Object(Default::default())
+    };
+
+    let root = content
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("unable to write hooks settings"))?;
+    if !root.get("hooks").map(Value::is_object).unwrap_or(false) {
+        root.insert("hooks".into(), Value::Object(Default::default()));
+    }
+    let hooks_obj = root
+        .get_mut("hooks")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("unable to write hooks settings"))?;
+
+    let mut mutated = false;
+    let events: [(&str, Option<&str>); 2] = [
+        ("SessionStart", Some("startup|resume|clear|compact")),
+        ("UserPromptSubmit", None),
+    ];
+    for (event, matcher) in events {
+        if !hooks_obj.get(event).map(Value::is_array).unwrap_or(false) {
+            hooks_obj.insert(event.to_string(), Value::Array(Vec::new()));
+        }
+        let entries = hooks_obj
+            .get_mut(event)
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| anyhow!("unable to write hooks settings"))?;
+        if entries.iter().any(|entry| entry_contains_hook(entry, command)) {
+            continue;
+        }
+        let handler = serde_json::json!({
+            "type": "command",
+            "command": command,
+            "timeout": 10,
+            "statusMessage": status_message,
+        });
+        let mut entry = serde_json::Map::new();
+        if let Some(matcher) = matcher {
+            entry.insert("matcher".into(), Value::String(matcher.to_string()));
+        }
+        entry.insert("hooks".into(), Value::Array(vec![handler]));
+        entries.push(Value::Object(entry));
+        mutated = true;
+    }
+
+    if !mutated {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let backup = backup_if_exists(hooks_path)?;
+    if let Some(parent) = hooks_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(
+        hooks_path,
+        serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
+    )
+    .with_context(|| format!("writing {}", hooks_path.display()))?;
+
+    let mut backups = Vec::new();
+    if let Some(backup) = backup {
+        backups.push(backup.display().to_string());
+    }
+    Ok((vec![hooks_path.display().to_string()], backups))
+}
+
+/// Whether `command` is registered under any event in a hooks file.
+fn guard_registered_in_hooks(hooks_path: &Path, command: &str) -> Result<bool> {
+    if !hooks_path.exists() {
+        return Ok(false);
+    }
+    let raw = std::fs::read_to_string(hooks_path)
+        .with_context(|| format!("reading {}", hooks_path.display()))?;
+    let content = Value::Object(parse_json_object(&raw, hooks_path)?);
+    Ok(content
+        .get("hooks")
+        .and_then(Value::as_object)
+        .map(|hooks| {
+            hooks.values().any(|entries| {
+                entries
+                    .as_array()
+                    .map(|arr| arr.iter().any(|entry| entry_contains_hook(entry, command)))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false))
+}
+
+/// Strip the guard entries for `command` from a hooks file. Leaves any
+/// user-authored hooks intact and drops now-empty event arrays. `delete_if_empty`
+/// removes the whole file when nothing remains -- correct for Codex's standalone
+/// `hooks.json`, but never for Claude's shared `settings.json`.
+fn remove_guard_hook_entries(hooks_path: &Path, command: &str, delete_if_empty: bool) -> Result<()> {
+    if !hooks_path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(hooks_path)
+        .with_context(|| format!("reading {}", hooks_path.display()))?;
+    let mut content = Value::Object(parse_json_object(&raw, hooks_path)?);
+    let mut changed = false;
+    let mut hooks_empty = false;
+    if let Some(hooks_obj) = content.get_mut("hooks").and_then(Value::as_object_mut) {
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            if let Some(entries) = hooks_obj.get_mut(event).and_then(Value::as_array_mut) {
+                let before = entries.len();
+                entries.retain(|entry| !entry_contains_hook(entry, command));
+                if entries.len() != before {
+                    changed = true;
+                }
+            }
+        }
+        hooks_obj.retain(|_, value| !value.as_array().map(|arr| arr.is_empty()).unwrap_or(false));
+        hooks_empty = hooks_obj.is_empty();
+    }
+    if hooks_empty {
+        if let Some(root) = content.as_object_mut() {
+            root.remove("hooks");
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    let _ = backup_if_exists(hooks_path)?;
+    let root_empty = content.as_object().map(|o| o.is_empty()).unwrap_or(false);
+    if delete_if_empty && root_empty {
+        let _ = std::fs::remove_file(hooks_path);
+    } else {
+        std::fs::write(
+            hooks_path,
+            serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
+        )
+        .with_context(|| format!("writing {}", hooks_path.display()))?;
+    }
+    Ok(())
+}
+
+/// Write the guard script and register it in `~/.codex/hooks.json` for the
+/// SessionStart and UserPromptSubmit events. `hooks.json` is auto-discovered by
+/// Codex (no `config.toml` flag needed). The user must trust the hook once via
+/// Codex's `/hooks` command before it runs (re-trust after any guard update).
+fn ensure_codex_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
+    let script_path = codex_guard_hook_path();
+    let (script_changed, script_backup) =
+        write_file_if_changed(&script_path, &build_codex_guard_script(), true)?;
+    let (mut changed, mut backups) = register_guard_hook_entries(
+        &codex_hooks_json_path(),
+        &codex_guard_command(),
+        CODEX_GUARD_STATUS_MESSAGE,
+    )?;
+    if script_changed {
+        changed.insert(0, script_path.display().to_string());
+    }
+    if let Some(backup) = script_backup {
+        backups.insert(0, backup.display().to_string());
+    }
+    Ok((changed, backups))
+}
+
+fn codex_guard_registered() -> Result<bool> {
+    guard_registered_in_hooks(&codex_hooks_json_path(), &codex_guard_command())
+}
+
+fn remove_codex_guard_hook() -> Result<()> {
+    remove_guard_hook_entries(&codex_hooks_json_path(), &codex_guard_command(), true)?;
+    let script_path = codex_guard_hook_path();
+    if script_path.exists() {
+        let _ = std::fs::remove_file(&script_path);
+    }
+    Ok(())
+}
+
+const CLAUDE_GUARD_STATUS_MESSAGE: &str = "Verifying Headroom route";
+
+fn claude_guard_hook_path() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("hooks")
+        .join("headroom-claude-guard.py")
+}
+
+fn claude_guard_command() -> String {
+    format!("/usr/bin/python3 {}", claude_guard_hook_path().display())
+}
+
+/// Loud-fail guard that Claude Code runs at session start and on every prompt.
+/// Because the hook inherits Claude's environment, it checks the *effective*
+/// routing -- `ANTHROPIC_BASE_URL` as Claude actually sees it -- rather than a
+/// config file, plus that the desktop app is reachable. Pure stdlib so it runs
+/// on the system `/usr/bin/python3`. Unlike Codex, Claude Code runs app-written
+/// `settings.json` hooks without a manual trust step.
+fn build_claude_guard_script() -> String {
+    format!(
+        r##"#!/usr/bin/env python3
+"""Headroom Claude routing guard (managed by Headroom Desktop -- do not edit)."""
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+BASE_URL = "{base}"
+READYZ = "{readyz}"
+
+
+def notify(message):
+    try:
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                'display notification ' + json.dumps(message) + ' with title "Headroom Claude guard"',
+            ],
+            check=False,
+            timeout=5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def reachable():
+    try:
+        with urllib.request.urlopen(READYZ, timeout=2) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as exc:
+        return exc.code == 404
+    except Exception:
+        return False
+
+
+def main():
+    issues = []
+    if os.environ.get("ANTHROPIC_BASE_URL") != BASE_URL:
+        issues.append("ANTHROPIC_BASE_URL is not " + BASE_URL + "; Claude is not routing through Headroom")
+    if not reachable():
+        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- open the app")
+
+    if issues:
+        notify("; ".join(issues))
+        sys.stderr.write("Headroom Claude guard failed:\n")
+        for issue in issues:
+            sys.stderr.write("- " + issue + "\n")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"##,
+        base = HEADROOM_ANTHROPIC_BASE_URL,
+        readyz = "http://127.0.0.1:6767/readyz",
+    )
+}
+
+/// Write the Claude guard script and register it in `~/.claude/settings.json`
+/// for SessionStart and UserPromptSubmit. No trust step required.
+fn ensure_claude_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
+    let script_path = claude_guard_hook_path();
+    let (script_changed, script_backup) =
+        write_file_if_changed(&script_path, &build_claude_guard_script(), true)?;
+    let (mut changed, mut backups) = register_guard_hook_entries(
+        &claude_settings_path(),
+        &claude_guard_command(),
+        CLAUDE_GUARD_STATUS_MESSAGE,
+    )?;
+    if script_changed {
+        changed.insert(0, script_path.display().to_string());
+    }
+    if let Some(backup) = script_backup {
+        backups.insert(0, backup.display().to_string());
+    }
+    Ok((changed, backups))
+}
+
+fn claude_guard_registered() -> Result<bool> {
+    guard_registered_in_hooks(&claude_settings_path(), &claude_guard_command())
+}
+
+/// Strip the Claude guard from every settings candidate and delete the script.
+/// Never deletes settings.json (it carries other keys), so `delete_if_empty` is
+/// false.
+fn remove_claude_guard_hook() -> Result<()> {
+    let command = claude_guard_command();
+    for settings_path in claude_settings_candidates() {
+        let _ = remove_guard_hook_entries(&settings_path, &command, false);
+    }
+    let script_path = claude_guard_hook_path();
+    if script_path.exists() {
+        let _ = std::fs::remove_file(&script_path);
+    }
+    Ok(())
+}
+
+/// Run `codex doctor` as an independent confirmation that Codex itself accepts
+/// the route (stronger than our "is the text in the file" checks). Best-effort
+/// and never a hard failure: a missing CLI or a doctor error for unrelated
+/// reasons must not flip `verified`.
+fn codex_doctor_summary() -> Option<String> {
+    let codex = find_on_path(&["codex"])?;
+    let output = Command::new(codex).arg("doctor").output().ok()?;
+    if output.status.success() {
+        Some("`codex doctor` reports the Codex install is healthy.".into())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("run `codex doctor` for details");
+        Some(format!("`codex doctor` reported issues: {}", first.trim()))
+    }
 }
 
 fn remove_launchctl_env(keys: &[&str]) -> Result<()> {
@@ -4233,6 +4757,78 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn apply_claude_writes_guard_and_disable_preserves_env_and_user_hooks() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        // Pre-existing user-authored hook that must survive apply and disable.
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}"#,
+        )
+        .unwrap();
+        seed_installed_rtk();
+
+        super::apply_client_setup("claude_code").expect("first apply");
+        super::apply_client_setup("claude_code").expect("second apply");
+
+        let script = home
+            .path()
+            .join(".claude")
+            .join("hooks")
+            .join("headroom-claude-guard.py");
+        assert!(script.exists(), "guard script written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&script).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "guard script is executable, got {mode:o}");
+        }
+
+        let settings_path = home.path().join(".claude").join("settings.json");
+        let settings = read_settings_json(&settings_path);
+        let command = format!("/usr/bin/python3 {}", script.display());
+        // Guard registered exactly once on each event despite the double-apply.
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            let count = settings["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| {
+                    entry["hooks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|h| h["command"] == serde_json::Value::String(command.clone()))
+                })
+                .count();
+            assert_eq!(count, 1, "guard registered once for {event}, got:\n{settings:#}");
+        }
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["matcher"],
+            "startup|resume|clear|compact"
+        );
+
+        super::disable_client_setup("claude_code").expect("disable");
+
+        assert!(!script.exists(), "guard script removed on disable");
+        let after = read_settings_json(&settings_path);
+        let after_str = serde_json::to_string(&after).unwrap();
+        assert!(
+            !after_str.contains("headroom-claude-guard.py"),
+            "guard stripped from settings.json, got:\n{after:#}"
+        );
+        assert!(
+            after_str.contains("echo mine"),
+            "user-authored hook preserved, got:\n{after:#}"
+        );
+        // settings.json must NOT be deleted even if it were otherwise empty.
+        assert!(settings_path.exists(), "settings.json preserved on disable");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn verify_claude_code_passes_when_rtk_deliberately_disabled() {
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
@@ -4574,6 +5170,103 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             toml_second.matches("# >>> headroom:codex_cli >>>").count(),
             1,
             "managed block appears exactly once"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_writes_and_registers_guard() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+
+        super::apply_client_setup("codex").expect("apply");
+
+        let script = home
+            .path()
+            .join(".codex")
+            .join("hooks")
+            .join("headroom-codex-guard.py");
+        assert!(script.exists(), "guard script written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&script).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "guard script is executable, got {mode:o}");
+        }
+
+        let hooks: serde_json::Value =
+            read_settings_json(&home.path().join(".codex").join("hooks.json"));
+        let command = format!("/usr/bin/python3 {}", script.display());
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            let registered = hooks["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry["hooks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|h| h["command"] == serde_json::Value::String(command.clone()))
+                });
+            assert!(registered, "guard registered for {event}, got:\n{hooks:#}");
+        }
+        // SessionStart carries the lifecycle matcher; UserPromptSubmit does not.
+        assert_eq!(hooks["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_guard_is_idempotent_and_disable_preserves_user_hooks() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        // Pre-existing user-authored hook that must survive apply and disable.
+        fs::create_dir_all(home.path().join(".codex")).unwrap();
+        fs::write(
+            home.path().join(".codex").join("hooks.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}"#,
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("first apply");
+        super::apply_client_setup("codex").expect("second apply");
+
+        let hooks_path = home.path().join(".codex").join("hooks.json");
+        let hooks = read_settings_json(&hooks_path);
+        let guard_count = hooks["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry["hooks"].as_array().unwrap().iter().any(|h| {
+                    h["command"]
+                        .as_str()
+                        .map(|c| c.contains("headroom-codex-guard.py"))
+                        .unwrap_or(false)
+                })
+            })
+            .count();
+        assert_eq!(guard_count, 1, "guard registered exactly once, got:\n{hooks:#}");
+
+        super::disable_client_setup("codex").expect("disable");
+
+        let script = home
+            .path()
+            .join(".codex")
+            .join("hooks")
+            .join("headroom-codex-guard.py");
+        assert!(!script.exists(), "guard script removed on disable");
+        let after = read_settings_json(&hooks_path);
+        let after_str = serde_json::to_string(&after).unwrap();
+        assert!(
+            !after_str.contains("headroom-codex-guard.py"),
+            "guard stripped from hooks.json, got:\n{after:#}"
+        );
+        assert!(
+            after_str.contains("echo mine"),
+            "user-authored hook preserved, got:\n{after:#}"
         );
     }
 

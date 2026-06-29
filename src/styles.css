@@ -1818,6 +1818,14 @@ select {
   margin-bottom: 10px;
 }
 
+.callout-banner--clickable {
+  cursor: pointer;
+}
+
+.callout-banner--clickable:hover {
+  filter: brightness(0.98);
+}
+
 .callout-banner--healthy {
   background: #FAF3E9;
 }

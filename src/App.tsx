@@ -230,7 +230,7 @@ const connectorSetupDetails: Record<string, string> = {
   claude_code:
     "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Token-saving add-ons like RTK are optional: install them from the add-ons list and Headroom wires up the PATH entry and auto-rewrite hook only then.",
   codex:
-    "Headroom writes a managed provider block to ~/.codex/config.toml and exports OPENAI_BASE_URL in your shell profiles so Codex connects through Headroom."
+    "Headroom writes a managed provider block to ~/.codex/config.toml and exports OPENAI_BASE_URL in your shell profiles so Codex connects through Headroom. It also installs a guard hook that warns you inside Codex if routing ever breaks - run /hooks in Codex once to trust it (re-trust after a Headroom update)."
 };
 
 const connectorSupportWarnings: Record<string, string> = {};
@@ -4300,6 +4300,28 @@ export default function App() {
     !!runtimeStatus &&
     !runtimeStatus.paused &&
     !runtimeStatus.starting;
+  // Launch-promotion nudge for unsubscribed users: surface the active discount
+  // (and remaining cohort spots) alongside the savings line so the upgrade
+  // moment carries the urgency the pricing page already shows.
+  const launchPromoLine = (() => {
+    if (!inUpgradeMoment || !pricingStatus?.launchDiscountActive) return null;
+    const active = (pricingStatus.pricingCohorts ?? []).find((c) => c.status === "active");
+    const pct = pricingStatus.activePercentOff ?? active?.percentOff ?? 0;
+    if (pct <= 0) return null;
+    const spots =
+      active?.spotsLeft != null && active.spotsLeft > 0
+        ? ` Only ${active.spotsLeft} ${(active.label ?? "Founder").toLowerCase()} spots left.`
+        : "";
+    return `Launch promotion: ${pct}% off, locked in for good.${spots}`;
+  })();
+  // When the banner is carrying an upgrade nudge (and isn't showing the Resume
+  // control), let clicking the card jump straight to the upgrade view.
+  const calloutIsUpgradeNudge =
+    inUpgradeMoment &&
+    !!runtimeStatus &&
+    !runtimeStatus.paused &&
+    !runtimeStatus.starting &&
+    (showUpgradeSavingsLine || !!launchPromoLine);
 
   const activeHeadroomPlanId =
     pricingAudience === "individual" && pricingStatus?.account?.subscriptionActive
@@ -4605,7 +4627,24 @@ export default function App() {
                 </button>
               </section>
             ) : null}
-            <section className={`callout-banner callout-banner--${calloutBanner.tone}`}>
+            <section
+              className={`callout-banner callout-banner--${calloutBanner.tone}${
+                calloutIsUpgradeNudge ? " callout-banner--clickable" : ""
+              }`}
+              {...(calloutIsUpgradeNudge
+                ? {
+                    role: "button",
+                    tabIndex: 0,
+                    onClick: () => setActiveView("upgrade"),
+                    onKeyDown: (e: React.KeyboardEvent) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setActiveView("upgrade");
+                      }
+                    },
+                  }
+                : {})}
+            >
               <span className={`callout-banner__dot callout-banner__dot--${calloutBanner.tone}`} aria-hidden="true" />
               <div className="callout-banner__body">
                 <h1>{calloutTitle}</h1>
@@ -4614,6 +4653,9 @@ export default function App() {
                 ) : null}
                 {showUpgradeSavingsLine ? (
                   <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
+                ) : null}
+                {launchPromoLine ? (
+                  <p className="callout-banner__subtitle">{launchPromoLine}</p>
                 ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
                   <p className="callout-banner__subtitle">Now use your connected tools as normal, and check back later to see how much you are saving by using Headroom.</p>
@@ -5234,26 +5276,6 @@ export default function App() {
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
           <section className="upgrade-hero">
             <h1>Plans based on your AI subscription</h1>
-            <div className="upgrade-toggle" aria-label="Upgrade audiences" role="tablist">
-              {[
-                { id: "individual" as const, label: "Individual" },
-                { id: "teamEnterprise" as const, label: "Team & Enterprise" }
-              ].map((audience) => (
-                <button
-                  key={audience.id}
-                  aria-selected={pricingAudience === audience.id}
-                  className={`upgrade-toggle__item${pricingAudience === audience.id ? " is-active" : ""}`}
-                  onClick={() => {
-                    setPricingAudience(audience.id);
-                    setUpgradeActionError(null);
-                  }}
-                  role="tab"
-                  type="button"
-                >
-                  {audience.label}
-                </button>
-              ))}
-            </div>
             {pricingAudience === "individual" ? (
               <div className="upgrade-billing-toggle" role="group" aria-label="Billing period">
                 {(["annual", "monthly"] as const).map((period) => (

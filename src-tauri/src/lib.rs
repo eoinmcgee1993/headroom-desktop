@@ -286,6 +286,12 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
             total_tokens_sent: 0,
         })
         .collect();
+    // Keep the headline card in sync with the buckets it derives from.
+    dashboard.lifetime_estimated_savings_usd = dashboard
+        .daily_savings
+        .iter()
+        .map(|point| point.estimated_savings_usd)
+        .sum();
 }
 
 #[tauri::command]
@@ -2167,7 +2173,7 @@ async fn get_headroom_pricing_status(
     // "Headroom optimization actually resumes" — without this, the pricing
     // gate's bypass flag would stay set and Python would stay down until
     // the next app launch.
-    state.apply_pricing_gate_status(&status);
+    state.apply_pricing_gate_status(&status, crate::client_adapters::is_codex_enabled());
     state.apply_codex_pricing_gate_status(status.codex.as_ref());
     Ok(status)
 }
@@ -2199,7 +2205,7 @@ async fn verify_headroom_auth_code(
     // `get_headroom_pricing_status` so a user who signs up after grace
     // expiry doesn't have to wait for the next 60s pricing poll for
     // Python to come back online.
-    state.apply_pricing_gate_status(&status);
+    state.apply_pricing_gate_status(&status, crate::client_adapters::is_codex_enabled());
     state.apply_codex_pricing_gate_status(status.codex.as_ref());
     analytics::track_event(
         &app,
@@ -3289,6 +3295,7 @@ pub fn run() {
                 std::sync::Arc::clone(&state.codex_rate_limits),
                 std::sync::Arc::clone(&state.codex_plan_tier),
                 std::sync::Arc::clone(&state.proxy_bypass),
+                std::sync::Arc::clone(&state.claude_only_bypass),
                 std::sync::Arc::clone(&state.codex_bypass),
                 fresh_bearer_tx,
             );
@@ -3351,7 +3358,10 @@ pub fn run() {
                                 let state: tauri::State<'_, AppState> = app_handle.state();
                                 match pricing::get_pricing_status(&state) {
                                     Ok(status) => {
-                                        state.apply_pricing_gate_status(&status);
+                                        state.apply_pricing_gate_status(
+                                            &status,
+                                            crate::client_adapters::is_codex_enabled(),
+                                        );
                                         state
                                             .apply_codex_pricing_gate_status(status.codex.as_ref());
                                         let _ = app_handle.emit("pricing-refreshed", &status);

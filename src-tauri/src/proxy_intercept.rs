@@ -80,6 +80,7 @@ pub fn spawn(
     codex_slot: CodexRateLimitSlot,
     codex_plan_slot: CodexPlanSlot,
     bypass: BypassFlag,
+    claude_only_bypass: BypassFlag,
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
 ) {
@@ -99,6 +100,7 @@ pub fn spawn(
                     codex_slot,
                     codex_plan_slot,
                     bypass,
+                    claude_only_bypass,
                     codex_bypass,
                     fresh_bearer_tx,
                     upstream_base,
@@ -148,6 +150,7 @@ async fn run(
     codex_slot: CodexRateLimitSlot,
     codex_plan_slot: CodexPlanSlot,
     bypass: BypassFlag,
+    claude_only_bypass: BypassFlag,
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
     upstream_base: Arc<String>,
@@ -161,6 +164,7 @@ async fn run(
                 let codex_slot = codex_slot.clone();
                 let codex_plan_slot = codex_plan_slot.clone();
                 let bypass = bypass.clone();
+                let claude_only_bypass = claude_only_bypass.clone();
                 let codex_bypass = codex_bypass.clone();
                 let upstream_base = upstream_base.clone();
                 let tx = fresh_bearer_tx.clone();
@@ -170,6 +174,7 @@ async fn run(
                     codex_slot,
                     codex_plan_slot,
                     bypass,
+                    claude_only_bypass,
                     codex_bypass,
                     tx,
                     upstream_base,
@@ -204,6 +209,7 @@ async fn handle(
     codex_slot: CodexRateLimitSlot,
     codex_plan_slot: CodexPlanSlot,
     bypass: BypassFlag,
+    claude_only_bypass: BypassFlag,
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
     upstream_base: Arc<String>,
@@ -279,6 +285,15 @@ async fn handle(
     // `backend_addr` is intentionally stopped. Forward direct to Anthropic so
     // already-running CC sessions stay alive while optimization is off.
     if bypass.load(Ordering::Acquire) {
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        return;
+    }
+
+    // Claude-only bypass: the pricing gate paused Claude optimization but Codex
+    // is still enabled, so the Python backend is kept alive for Codex. Forward
+    // only Claude (non-Codex) traffic direct; Codex falls through to the backend
+    // below. This keeps a Claude overage from pausing Codex optimization.
+    if !is_codex && claude_only_bypass.load(Ordering::Acquire) {
         forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     }
@@ -1273,6 +1288,7 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 bypass_for_run,
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
             )
@@ -1358,6 +1374,7 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
                 bypass_for_run,
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,
@@ -1617,6 +1634,7 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 bypass,
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base_arc,
             )
@@ -1760,6 +1778,7 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 bypass,
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base_arc,
             )
@@ -1854,6 +1873,7 @@ mod tests {
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
                 bypass_for_run,
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 fresh_bearer_tx,
                 upstream_base,

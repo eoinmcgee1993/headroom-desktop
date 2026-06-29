@@ -474,6 +474,14 @@ pub struct AppState {
     /// once a free user crosses the weekly Codex disable threshold, so Codex
     /// gating never pauses Claude optimization for mixed users.
     pub codex_bypass: Arc<AtomicBool>,
+    /// Set when the Claude pricing gate trips but Codex is still enabled, so the
+    /// Python backend is kept alive for Codex. The intercept forwards only
+    /// non-Codex (Claude) traffic direct in this mode; Codex keeps routing
+    /// through the backend. Mutually exclusive with `proxy_bypass` (which tears
+    /// the backend down and forwards everything direct). This keeps a Claude
+    /// overage from pausing Codex optimization for mixed users, the symmetric
+    /// counterpart to `codex_bypass`.
+    pub claude_only_bypass: Arc<AtomicBool>,
     /// Debounce streak for `codex_bypass`, mirroring `pricing_gate_violation_streak`.
     codex_gate_violation_streak: Arc<AtomicU32>,
     /// Number of consecutive `apply_pricing_gate_status` calls that reported
@@ -612,6 +620,7 @@ impl AppState {
             codex_rate_limits: Arc::new(Mutex::new(None)),
             codex_plan_tier: Arc::new(Mutex::new(None)),
             proxy_bypass: Arc::new(AtomicBool::new(false)),
+            claude_only_bypass: Arc::new(AtomicBool::new(false)),
             codex_bypass: Arc::new(AtomicBool::new(false)),
             codex_gate_violation_streak: Arc::new(AtomicU32::new(0)),
             pricing_gate_violation_streak: Arc::new(AtomicU32::new(0)),
@@ -2129,13 +2138,12 @@ impl AppState {
         }
 
         if let Some(stats) = stats.as_ref() {
-            if let Some((updated, updated_daily, updated_hourly, milestones)) =
-                self.record_savings_snapshot(stats, drain_pending_milestones)
+            if let Some((updated, updated_daily, updated_hourly)) =
+                self.record_savings_snapshot(stats)
             {
                 snapshot = updated;
                 daily_savings = updated_daily;
                 hourly_savings = updated_hourly;
-                pending_milestones = milestones;
             }
         }
 
@@ -2167,12 +2175,6 @@ impl AppState {
                 });
 
         if let Some(history) = history.as_ref() {
-            if let Some(saved_usd) = history.lifetime_estimated_savings_usd {
-                snapshot.lifetime_estimated_savings_usd = saved_usd;
-            }
-            if let Some(saved_tokens) = history.lifetime_estimated_tokens_saved {
-                snapshot.lifetime_estimated_tokens_saved = saved_tokens;
-            }
             let cutoff_date = savings_history_cutoff_date();
             let cutoff_hour = format!("{cutoff_date}T00:00");
             let native_daily = history.daily_savings();
@@ -2206,6 +2208,29 @@ impl AppState {
             )
         };
 
+        // Lifetime totals are derived from the same per-day buckets the history
+        // chart renders, so the headline card and the chart can never disagree.
+        let lifetime_estimated_savings_usd = daily_savings
+            .iter()
+            .map(|point| point.estimated_savings_usd)
+            .sum();
+        let lifetime_estimated_tokens_saved: u64 = daily_savings
+            .iter()
+            .map(|point| point.estimated_tokens_saved)
+            .sum();
+
+        // Token milestones fire off the displayed lifetime total via a persisted
+        // high-water mark, so they can't double-fire when a day's bucket is
+        // re-rolled downward by the backend.
+        if drain_pending_milestones {
+            let mut tracker = self.savings_tracker.lock();
+            let crossed = tracker.note_lifetime_token_total(lifetime_estimated_tokens_saved);
+            if !crossed.is_empty() {
+                let _ = tracker.persist_state();
+                pending_milestones.token.extend(crossed);
+            }
+        }
+
         (
             DashboardState {
                 app_version: env!("CARGO_PKG_VERSION").into(),
@@ -2213,8 +2238,8 @@ impl AppState {
                 bootstrap_complete: self.tool_manager.python_runtime_installed(),
                 python_runtime_installed: self.tool_manager.python_runtime_installed(),
                 lifetime_requests: snapshot.lifetime_requests,
-                lifetime_estimated_savings_usd: snapshot.lifetime_estimated_savings_usd,
-                lifetime_estimated_tokens_saved: snapshot.lifetime_estimated_tokens_saved,
+                lifetime_estimated_savings_usd,
+                lifetime_estimated_tokens_saved,
                 session_requests: snapshot.session_requests,
                 session_estimated_savings_usd: snapshot.session_estimated_savings_usd,
                 session_estimated_tokens_saved: snapshot.session_estimated_tokens_saved,
@@ -2488,25 +2513,16 @@ impl AppState {
     fn record_savings_snapshot(
         &self,
         stats: &HeadroomDashboardStats,
-        drain_pending_milestones: bool,
     ) -> Option<(
         SavingsTotalsSnapshot,
         Vec<DailySavingsPoint>,
         Vec<HourlySavingsPoint>,
-        PendingMilestones,
     )> {
         let mut tracker = self.savings_tracker.lock();
         let snapshot = tracker.observe(stats)?;
         let daily_savings = tracker.daily_savings();
         let hourly_savings = tracker.hourly_savings();
-        let milestones = if drain_pending_milestones {
-            PendingMilestones {
-                token: tracker.take_pending_lifetime_token_milestones(),
-            }
-        } else {
-            PendingMilestones::default()
-        };
-        Some((snapshot, daily_savings, hourly_savings, milestones))
+        Some((snapshot, daily_savings, hourly_savings))
     }
 
     pub fn should_present_on_launch(&self) -> bool {
@@ -2823,6 +2839,8 @@ impl AppState {
         // and traffic flows through optimization again.
         self.proxy_bypass
             .store(false, std::sync::atomic::Ordering::Release);
+        self.claude_only_bypass
+            .store(false, std::sync::atomic::Ordering::Release);
         self.ensure_headroom_running()
     }
 
@@ -2985,14 +3003,26 @@ impl AppState {
     /// bypass flag alone is enough to make the Rust intercept pass traffic
     /// straight through to api.anthropic.com while Python is down.
     fn enforce_pricing_gate(&self) {
+        use std::sync::atomic::Ordering::Release;
         match pricing::get_pricing_status(self) {
             Ok(status) if !status.optimization_allowed => {
-                self.proxy_bypass
-                    .store(true, std::sync::atomic::Ordering::Release);
+                // Gated. When Codex is still enabled, use the Claude-only
+                // bypass (Python stays up for Codex) instead of the full
+                // bypass, so a Claude overage doesn't pause Codex. Mirrors
+                // `apply_pricing_gate_status`. Python lifecycle is handled by
+                // `stop_python_if_gated` / `ensure_headroom_running` — this
+                // only flips the flags (lock-safe).
+                if crate::client_adapters::is_codex_enabled() {
+                    self.claude_only_bypass.store(true, Release);
+                    self.proxy_bypass.store(false, Release);
+                } else {
+                    self.proxy_bypass.store(true, Release);
+                    self.claude_only_bypass.store(false, Release);
+                }
             }
             Ok(_) => {
-                self.proxy_bypass
-                    .store(false, std::sync::atomic::Ordering::Release);
+                self.proxy_bypass.store(false, Release);
+                self.claude_only_bypass.store(false, Release);
             }
             Err(_) => {}
         }
@@ -3001,7 +3031,9 @@ impl AppState {
     /// Stop the Python proxy when pricing currently disallows optimization.
     /// Acquires `lifecycle_lock`, so callers MUST NOT already hold it.
     fn stop_python_if_gated(&self) {
-        if !self.pricing_allows_optimization() {
+        // Only tear Python down on a FULL bypass. When Codex is enabled the gate
+        // is Claude-only and Python must stay up to keep optimizing Codex.
+        if !self.pricing_allows_optimization() && !crate::client_adapters::is_codex_enabled() {
             self.stop_headroom();
         }
     }
@@ -3019,51 +3051,87 @@ impl AppState {
     ///
     /// Acquires `lifecycle_lock` (via `stop_headroom` / `ensure_headroom_running`),
     /// so callers MUST NOT already hold it.
-    pub fn apply_pricing_gate_status(&self, status: &crate::models::HeadroomPricingStatus) {
-        let was_bypassed = self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire);
+    /// `codex_keep_alive` tells the gate that Codex is still enabled and
+    /// entitled, so a Claude overage must not pause Codex optimization. When
+    /// set, a tripped Claude gate enters `claude_only_bypass` (Python stays up,
+    /// only Claude traffic forwards direct) instead of the full `proxy_bypass`
+    /// (Python torn down, everything direct). Computed at the call site via
+    /// `client_adapters::is_codex_enabled()` so this method stays pure for tests.
+    pub fn apply_pricing_gate_status(
+        &self,
+        status: &crate::models::HeadroomPricingStatus,
+        codex_keep_alive: bool,
+    ) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let was_bypassed =
+            self.proxy_bypass.load(Acquire) || self.claude_only_bypass.load(Acquire);
         let should_bypass = !status.optimization_allowed;
 
         if should_bypass {
-            // Once bypassed, the streak is moot — keep it pinned at the
-            // threshold so a future gated→ungated→gated re-flip still
-            // requires a full debounce window.
-            if was_bypassed {
-                return;
+            if !was_bypassed {
+                // Debounce the ungated → gated transition: only flip once we've
+                // seen `PRICING_GATE_DEBOUNCE_POLLS` consecutive gated readings.
+                let prev = self
+                    .pricing_gate_violation_streak
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let streak = prev.saturating_add(1);
+                if streak < PRICING_GATE_DEBOUNCE_POLLS {
+                    log::info!(
+                        "pricing_gate: gated reading {streak}/{PRICING_GATE_DEBOUNCE_POLLS} — debouncing before bypass flip"
+                    );
+                    return;
+                }
             }
-            let prev = self
-                .pricing_gate_violation_streak
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let streak = prev.saturating_add(1);
-            if streak < PRICING_GATE_DEBOUNCE_POLLS {
-                log::info!(
-                    "pricing_gate: gated reading {streak}/{PRICING_GATE_DEBOUNCE_POLLS} — debouncing before bypass flip"
-                );
-                return;
-            }
-            // Transition: ungated → gated. Flip bypass FIRST so the Rust
-            // intercept passes new requests straight through to Anthropic
-            // while we're tearing Python down — otherwise there's a window
-            // where 6767 → 6768 connect fails and Claude Code sees 502.
-            self.proxy_bypass
-                .store(true, std::sync::atomic::Ordering::Release);
-            self.stop_headroom();
+            // Enter (or re-sync) the Claude gate. Idempotent: the swap guards
+            // below only fire stop_headroom/ensure_headroom_running on a real
+            // mode transition, so calling this on every gated poll is cheap and
+            // also flips us between full and Claude-only bypass if Codex's
+            // enable state changed while already gated.
+            self.enter_claude_gate(codex_keep_alive);
         } else {
             // Any ungated reading clears the violation streak so a later
             // gated reading starts the debounce window over.
-            self.pricing_gate_violation_streak
-                .store(0, std::sync::atomic::Ordering::Release);
+            self.pricing_gate_violation_streak.store(0, Release);
             if was_bypassed {
-                // Transition: gated → ungated (e.g., user just upgraded or
-                // weekly usage rolled over). Clear bypass and bring Python
-                // back online. No client_setups restore needed — gating
-                // never tore them down.
-                self.proxy_bypass
-                    .store(false, std::sync::atomic::Ordering::Release);
+                self.exit_claude_gate();
+            }
+        }
+    }
+
+    /// Apply the gated state. `codex_keep_alive=false` → full bypass: tear Python
+    /// down and forward everything direct. `true` → Claude-only bypass: keep
+    /// Python up for Codex, forward only Claude traffic direct. Idempotent.
+    fn enter_claude_gate(&self, codex_keep_alive: bool) {
+        use std::sync::atomic::Ordering::{AcqRel, Release};
+        if codex_keep_alive {
+            self.claude_only_bypass.store(true, Release);
+            // If we had fully torn Python down before Codex became eligible,
+            // bring it back so Codex keeps getting optimized.
+            if self.proxy_bypass.swap(false, AcqRel) {
                 if let Err(err) = self.ensure_headroom_running() {
-                    log::warn!(
-                        "apply_pricing_gate_status: ensure_headroom_running failed: {err:#}"
-                    );
+                    log::warn!("enter_claude_gate: ensure_headroom_running failed: {err:#}");
                 }
+            }
+        } else {
+            self.claude_only_bypass.store(false, Release);
+            // Flip bypass FIRST so the intercept passes new requests straight
+            // through while we tear Python down — otherwise there's a window
+            // where 6767 → 6768 connect fails and Claude Code sees 502.
+            if !self.proxy_bypass.swap(true, AcqRel) {
+                self.stop_headroom();
+            }
+        }
+    }
+
+    /// Transition: gated → ungated (user upgraded, or weekly usage rolled over).
+    /// Clear both bypass flags and, if Python was torn down, bring it back. No
+    /// client_setups restore needed — gating never tore them down.
+    fn exit_claude_gate(&self) {
+        use std::sync::atomic::Ordering::{AcqRel, Release};
+        self.claude_only_bypass.store(false, Release);
+        if self.proxy_bypass.swap(false, AcqRel) {
+            if let Err(err) = self.ensure_headroom_running() {
+                log::warn!("exit_claude_gate: ensure_headroom_running failed: {err:#}");
             }
         }
     }
@@ -3464,15 +3532,10 @@ struct SavingsTotalsSnapshot {
     session_estimated_tokens_saved: u64,
     session_savings_pct: f64,
     lifetime_requests: usize,
-    lifetime_estimated_savings_usd: f64,
-    lifetime_estimated_tokens_saved: u64,
 }
 
 const FIRST_LIFETIME_TOKEN_MILESTONES: [u64; 3] = [100_000, 1_000_000, 5_000_000];
 const REPEATING_LIFETIME_TOKEN_MILESTONE_STEP: u64 = 10_000_000;
-
-const FIRST_LIFETIME_USD_MILESTONES: [u64; 3] = [10, 50, 100];
-const REPEATING_LIFETIME_USD_MILESTONE_STEP: u64 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -3537,8 +3600,12 @@ struct PersistedSavingsState {
     session_estimated_tokens_saved: u64,
     session_savings_pct: f64,
     lifetime_requests: usize,
-    lifetime_estimated_savings_usd: f64,
-    lifetime_estimated_tokens_saved: u64,
+    /// High-water mark of the lifetime token total (summed from `daily_savings`)
+    /// at which token milestones were last fired. `None` on profiles written
+    /// before this field existed, so milestones for already-earned savings are
+    /// seeded (suppressed) on first load rather than firing all at once.
+    #[serde(default)]
+    lifetime_token_milestone_high_water: Option<u64>,
     last_observation: Option<SavingsObservation>,
     display_session_baseline: Option<SavingsObservation>,
     session_savings_history: Vec<HeadroomSavingsHistoryPoint>,
@@ -3555,16 +3622,16 @@ struct SavingsTracker {
     session_estimated_tokens_saved: u64,
     session_savings_pct: f64,
     lifetime_requests: usize,
-    lifetime_estimated_savings_usd: f64,
-    lifetime_estimated_tokens_saved: u64,
+    /// High-water mark of the lifetime token total at which token milestones
+    /// were last fired. Seeded from the current bucket sum on first load after
+    /// upgrade so already-earned savings don't re-fire every milestone.
+    lifetime_token_milestone_high_water: u64,
     last_observation: Option<SavingsObservation>,
     display_session_baseline: Option<SavingsObservation>,
     session_savings_history: Vec<HeadroomSavingsHistoryPoint>,
     session_hourly_buckets: BTreeMap<String, DailySavingsBucket>,
     daily_savings: BTreeMap<String, DailySavingsBucket>,
     hourly_savings: BTreeMap<String, DailySavingsBucket>,
-    pending_lifetime_token_milestones: Vec<u64>,
-    pending_lifetime_usd_milestones: Vec<u64>,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
 }
@@ -3583,6 +3650,22 @@ impl SavingsTracker {
 
         let persisted_state = load_persisted_savings_state(&state_path).ok().flatten();
 
+        // Seed the milestone high-water from the persisted value, or (on first
+        // load after upgrade) from the current bucket sum so already-earned
+        // savings don't re-fire every milestone at once.
+        let lifetime_token_milestone_high_water = persisted_state
+            .as_ref()
+            .and_then(|state| state.lifetime_token_milestone_high_water)
+            .unwrap_or_else(|| {
+                persisted_state.as_ref().map_or(0, |state| {
+                    state
+                        .daily_savings
+                        .values()
+                        .map(|bucket| bucket.estimated_tokens_saved)
+                        .sum()
+                })
+            });
+
         let mut tracker = Self {
             records_path,
             state_path,
@@ -3593,12 +3676,7 @@ impl SavingsTracker {
             lifetime_requests: persisted_state
                 .as_ref()
                 .map_or(0, |state| state.lifetime_requests),
-            lifetime_estimated_savings_usd: persisted_state
-                .as_ref()
-                .map_or(0.0, |state| state.lifetime_estimated_savings_usd),
-            lifetime_estimated_tokens_saved: persisted_state
-                .as_ref()
-                .map_or(0, |state| state.lifetime_estimated_tokens_saved),
+            lifetime_token_milestone_high_water,
             last_observation: persisted_state
                 .as_ref()
                 .and_then(|state| state.last_observation.clone()),
@@ -3617,8 +3695,6 @@ impl SavingsTracker {
             hourly_savings: persisted_state
                 .as_ref()
                 .map_or_else(BTreeMap::new, |state| state.hourly_savings.clone()),
-            pending_lifetime_token_milestones: Vec::new(),
-            pending_lifetime_usd_milestones: Vec::new(),
             last_written_at: None,
         };
         tracker.persist_state()?;
@@ -3664,8 +3740,6 @@ impl SavingsTracker {
             session_estimated_tokens_saved,
             session_savings_pct,
             lifetime_requests: self.lifetime_requests,
-            lifetime_estimated_savings_usd: self.lifetime_estimated_savings_usd,
-            lifetime_estimated_tokens_saved: self.lifetime_estimated_tokens_saved,
         }
     }
 
@@ -3748,13 +3822,19 @@ impl SavingsTracker {
         changed
     }
 
-    fn take_pending_lifetime_token_milestones(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.pending_lifetime_token_milestones)
-    }
-
-    #[cfg(test)]
-    fn take_pending_lifetime_usd_milestones(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.pending_lifetime_usd_milestones)
+    /// Advance the milestone high-water mark to `total` and return any lifetime
+    /// token milestones crossed in the process. Never fires on a decrease, so a
+    /// backend re-roll that lowers a day's bucket can't double-fire.
+    fn note_lifetime_token_total(&mut self, total: u64) -> Vec<u64> {
+        if total <= self.lifetime_token_milestone_high_water {
+            return Vec::new();
+        }
+        let crossed = lifetime_token_milestones_crossed(
+            self.lifetime_token_milestone_high_water,
+            total,
+        );
+        self.lifetime_token_milestone_high_water = total;
+        crossed
     }
 
     fn observe(&mut self, stats: &HeadroomDashboardStats) -> Option<SavingsTotalsSnapshot> {
@@ -3868,25 +3948,9 @@ impl SavingsTracker {
             || delta_usd > 0.000_001
             || delta_actual_cost_usd > 0.000_001
             || session_buckets_changed;
-        let previous_lifetime_tokens_saved = self.lifetime_estimated_tokens_saved;
-        let previous_lifetime_estimated_savings_usd = self.lifetime_estimated_savings_usd;
         if delta_requests > 0 || delta_tokens > 0 || delta_usd > 0.0 {
             self.lifetime_requests = self.lifetime_requests.saturating_add(delta_requests);
-            self.lifetime_estimated_savings_usd += delta_usd;
-            self.lifetime_estimated_tokens_saved = self
-                .lifetime_estimated_tokens_saved
-                .saturating_add(delta_tokens);
         }
-        self.pending_lifetime_token_milestones
-            .extend(lifetime_token_milestones_crossed(
-                previous_lifetime_tokens_saved,
-                self.lifetime_estimated_tokens_saved,
-            ));
-        self.pending_lifetime_usd_milestones
-            .extend(lifetime_usd_milestones_crossed(
-                previous_lifetime_estimated_savings_usd,
-                self.lifetime_estimated_savings_usd,
-            ));
 
         let baseline_hourly_buckets = if (first_observation || reset_detected)
             && (session_requests > 0
@@ -4161,8 +4225,7 @@ impl SavingsTracker {
             session_estimated_tokens_saved: self.session_estimated_tokens_saved,
             session_savings_pct: self.session_savings_pct,
             lifetime_requests: self.lifetime_requests,
-            lifetime_estimated_savings_usd: self.lifetime_estimated_savings_usd,
-            lifetime_estimated_tokens_saved: self.lifetime_estimated_tokens_saved,
+            lifetime_token_milestone_high_water: Some(self.lifetime_token_milestone_high_water),
             last_observation: self.last_observation.clone(),
             display_session_baseline: self.display_session_baseline.clone(),
             session_savings_history: self.session_savings_history.clone(),
@@ -4214,30 +4277,6 @@ fn aggregate_weekly_totals(
         total_savings_usd,
         active_days,
     }
-}
-
-fn lifetime_usd_milestones_crossed(previous_usd: f64, current_usd: f64) -> Vec<u64> {
-    let previous = previous_usd.max(0.0).floor() as u64;
-    let current = current_usd.max(0.0).floor() as u64;
-    if current <= previous {
-        return Vec::new();
-    }
-
-    let mut milestones = FIRST_LIFETIME_USD_MILESTONES
-        .into_iter()
-        .filter(|threshold| previous < *threshold && current >= *threshold)
-        .collect::<Vec<_>>();
-
-    let first_repeating_index = previous / REPEATING_LIFETIME_USD_MILESTONE_STEP + 1;
-    let last_repeating_index = current / REPEATING_LIFETIME_USD_MILESTONE_STEP;
-    for index in first_repeating_index..=last_repeating_index {
-        let dollars = index.saturating_mul(REPEATING_LIFETIME_USD_MILESTONE_STEP);
-        if !milestones.contains(&dollars) {
-            milestones.push(dollars);
-        }
-    }
-
-    milestones
 }
 
 fn lifetime_token_milestones_crossed(previous_total: u64, current_total: u64) -> Vec<u64> {
@@ -4369,8 +4408,6 @@ struct HeadroomSavingsRollupPoint {
 
 #[derive(Debug, Default, Clone)]
 struct HeadroomSavingsHistoryResponse {
-    lifetime_estimated_savings_usd: Option<f64>,
-    lifetime_estimated_tokens_saved: Option<u64>,
     hourly: Vec<HeadroomSavingsRollupPoint>,
     daily: Vec<HeadroomSavingsRollupPoint>,
 }
@@ -4712,9 +4749,6 @@ fn drop_oldest_rollup_bucket(series: &mut Vec<HeadroomSavingsRollupPoint>) {
 
 fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsHistoryResponse> {
     let root = serde_json::from_str::<Value>(body).ok()?;
-    let lifetime_estimated_tokens_saved = value_at_path_u64(&root, &["lifetime", "tokens_saved"]);
-    let lifetime_estimated_savings_usd =
-        value_at_path_f64(&root, &["lifetime", "compression_savings_usd"]);
     let mut hourly = value_at_path(&root, &["series", "hourly"])
         .and_then(parse_savings_rollup_series)
         .unwrap_or_default();
@@ -4734,20 +4768,10 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
         drop_oldest_rollup_bucket(&mut hourly);
     }
 
-    if lifetime_estimated_tokens_saved.is_none()
-        && lifetime_estimated_savings_usd.is_none()
-        && hourly.is_empty()
-        && daily.is_empty()
-    {
+    if hourly.is_empty() && daily.is_empty() {
         None
     } else {
-        Some(HeadroomSavingsHistoryResponse {
-            lifetime_estimated_savings_usd: lifetime_estimated_savings_usd
-                .map(|value| value.max(0.0)),
-            lifetime_estimated_tokens_saved,
-            hourly,
-            daily,
-        })
+        Some(HeadroomSavingsHistoryResponse { hourly, daily })
     }
 }
 
@@ -5630,7 +5654,7 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, bootstrap_complete_state, bootstrap_failed_state,
         classify_startup_error, cpu_time_advanced, hf_cache_grew,
-        lifetime_token_milestones_crossed, lifetime_usd_milestones_crossed, log_mtime_advanced,
+        lifetime_token_milestones_crossed, log_mtime_advanced,
         merge_daily_savings, merge_hourly_savings, most_recent_monday,
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_status_is_reachable, tcp_port_accepts_connection, total_dir_size_bytes,
@@ -6145,16 +6169,13 @@ mod tests {
             session_estimated_tokens_saved: 0,
             session_savings_pct: 0.0,
             lifetime_requests: 0,
-            lifetime_estimated_savings_usd: 0.0,
-            lifetime_estimated_tokens_saved: 0,
+            lifetime_token_milestone_high_water: 0,
             last_observation: None,
             display_session_baseline: None,
             session_savings_history: Vec::new(),
             session_hourly_buckets: std::collections::BTreeMap::new(),
             daily_savings: std::collections::BTreeMap::new(),
             hourly_savings: std::collections::BTreeMap::new(),
-            pending_lifetime_token_milestones: Vec::new(),
-            pending_lifetime_usd_milestones: Vec::new(),
             last_written_at: None,
         }
     }
@@ -6196,40 +6217,19 @@ mod tests {
     }
 
     #[test]
-    fn lifetime_usd_milestones_first_and_repeating() {
-        assert_eq!(lifetime_usd_milestones_crossed(0.0, 5.0), Vec::<u64>::new());
-        assert_eq!(lifetime_usd_milestones_crossed(9.99, 10.01), vec![10]);
-        assert_eq!(
-            lifetime_usd_milestones_crossed(5.0, 120.0),
-            vec![10, 50, 100]
-        );
-        assert_eq!(
-            lifetime_usd_milestones_crossed(200.0, 205.0),
-            Vec::<u64>::new()
-        );
-        assert_eq!(
-            lifetime_usd_milestones_crossed(199.5, 301.0),
-            vec![200, 300]
-        );
-    }
-
-    #[test]
-    fn savings_tracker_queues_pending_usd_milestones_on_observe() {
+    fn note_lifetime_token_total_fires_high_water_milestones_once() {
         let mut tracker = make_tracker();
-        tracker.lifetime_estimated_savings_usd = 7.5;
-        let stats = HeadroomDashboardStats {
-            output_reduction: None,
-            session_requests: Some(1),
-            session_estimated_savings_usd: Some(60.0),
-            session_estimated_tokens_saved: Some(1),
-            session_savings_pct: Some(1.0),
-            session_actual_cost_usd: Some(0.0),
-            session_total_tokens_sent: Some(0),
-            savings_history: Vec::new(),
-        };
-        tracker.observe(&stats);
-        let milestones = tracker.take_pending_lifetime_usd_milestones();
-        assert_eq!(milestones, vec![10, 50]);
+        // First crossing past 100k fires; staying flat or dipping fires nothing.
+        assert_eq!(tracker.note_lifetime_token_total(150_000), vec![100_000]);
+        assert_eq!(tracker.note_lifetime_token_total(120_000), Vec::<u64>::new());
+        assert_eq!(tracker.note_lifetime_token_total(150_000), Vec::<u64>::new());
+        // Advancing past the next thresholds fires each crossed milestone once.
+        assert_eq!(
+            tracker.note_lifetime_token_total(5_500_000),
+            vec![1_000_000, 5_000_000]
+        );
+        // Repeating 10M-step milestones fire as the total climbs past them.
+        assert_eq!(tracker.note_lifetime_token_total(21_000_000), vec![10_000_000, 20_000_000]);
     }
 
     #[test]
@@ -6452,7 +6452,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Debounce: first gated reading just bumps the streak.
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(
             !state
                 .proxy_bypass
@@ -6461,13 +6461,48 @@ mod tests {
         );
 
         // Second consecutive gated reading crosses the debounce threshold.
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(
             state
                 .proxy_bypass
                 .load(std::sync::atomic::Ordering::Acquire),
             "second consecutive gated reading must flip bypass=true"
         );
+        fs::remove_dir_all(base_dir).ok();
+    }
+
+    #[test]
+    fn apply_pricing_gate_status_uses_claude_only_bypass_when_codex_kept_alive() {
+        let base_dir = temp_test_dir("headroom-claude-only-bypass");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        // Two consecutive gated readings cross the debounce threshold, but with
+        // codex_keep_alive=true the gate must use the Claude-only bypass so the
+        // Python backend stays up for Codex.
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), true);
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), true);
+        assert!(
+            state
+                .claude_only_bypass
+                .load(std::sync::atomic::Ordering::Acquire),
+            "Claude-only bypass must flip on when Codex is kept alive"
+        );
+        assert!(
+            !state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire),
+            "full bypass must stay off so Python keeps serving Codex"
+        );
+
+        // An ungated reading clears both flags.
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(true), true);
+        assert!(!state
+            .claude_only_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(!state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+
         fs::remove_dir_all(base_dir).ok();
     }
 
@@ -6551,17 +6586,17 @@ mod tests {
         let state = AppState::new_in(base_dir.clone()).expect("app state");
 
         // One gated reading bumps the streak to 1.
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(!state
             .proxy_bypass
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Ungated reading resets the streak — a single-poll spike clears.
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(true));
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(true), false);
 
         // Now another gated reading is the first of a new window, not the
         // second of the old one. Bypass must still be off.
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(
             !state
                 .proxy_bypass
@@ -6580,7 +6615,7 @@ mod tests {
             .proxy_bypass
             .store(true, std::sync::atomic::Ordering::Release);
 
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(true));
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(true), false);
 
         assert!(
             !state
@@ -6597,20 +6632,20 @@ mod tests {
         let state = AppState::new_in(base_dir.clone()).expect("app state");
 
         // Already off + ungated status → still off (no transition triggered).
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(true));
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(true), false);
         assert!(!state
             .proxy_bypass
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Two consecutive gated readings cross the debounce threshold and flip.
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(state
             .proxy_bypass
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Already on + gated status → still on.
-        state.apply_pricing_gate_status(&pricing_status_with_optimization(false));
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(state
             .proxy_bypass
             .load(std::sync::atomic::Ordering::Acquire));
@@ -6806,58 +6841,18 @@ mod tests {
     }
 
     #[test]
-    fn tracker_queues_new_lifetime_token_milestones_once() {
-        let mut tracker = make_tracker();
-
-        tracker
-            .observe(&HeadroomDashboardStats {
-                output_reduction: None,
-                session_requests: Some(1),
-                session_estimated_savings_usd: Some(1.0),
-                session_estimated_tokens_saved: Some(12_000_000),
-                session_savings_pct: Some(50.0),
-                session_actual_cost_usd: Some(0.5),
-                session_total_tokens_sent: Some(12_000_000),
-                savings_history: Vec::new(),
-            })
-            .expect("snapshot");
-
-        assert_eq!(
-            tracker.take_pending_lifetime_token_milestones(),
-            vec![100_000, 1_000_000, 5_000_000, 10_000_000]
-        );
-        assert!(tracker.take_pending_lifetime_token_milestones().is_empty());
-
-        tracker
-            .observe(&HeadroomDashboardStats {
-                output_reduction: None,
-                session_requests: Some(2),
-                session_estimated_savings_usd: Some(2.0),
-                session_estimated_tokens_saved: Some(21_000_000),
-                session_savings_pct: Some(50.0),
-                session_actual_cost_usd: Some(1.0),
-                session_total_tokens_sent: Some(21_000_000),
-                savings_history: Vec::new(),
-            })
-            .expect("snapshot");
-
-        assert_eq!(
-            tracker.take_pending_lifetime_token_milestones(),
-            vec![20_000_000]
-        );
-    }
-
-    #[test]
     fn dashboard_read_path_preserves_pending_milestones_for_analytics() {
         // Regression guard: `state.dashboard()` (tray updater, bootstrap
-        // finalize, account activation) must not drain pending milestones.
-        // Only `dashboard_with_pending_milestones()` — the path that actually
-        // fires the aptabase event, pricing report, and in-app notification —
-        // may consume them. A prior refactor drained on every call, so the
-        // tray updater's 5s heartbeat silently ate ~50-100% of crossings.
+        // finalize, account activation) must not advance the milestone
+        // high-water mark. Only `dashboard_with_pending_milestones()` — the
+        // path that fires the aptabase event, pricing report, and in-app
+        // notification — may consume crossings. A prior refactor drained on
+        // every call, so the tray updater's 5s heartbeat silently ate crossings.
         let base_dir = temp_test_dir("headroom-milestone-preservation");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
 
+        // savings_history backfills the daily buckets the lifetime total (and
+        // hence milestones) is derived from; a cumulative 1.5M crosses 100k+1M.
         let stats = HeadroomDashboardStats {
             output_reduction: None,
             session_requests: Some(1),
@@ -6866,29 +6861,30 @@ mod tests {
             session_savings_pct: Some(50.0),
             session_actual_cost_usd: Some(0.5),
             session_total_tokens_sent: Some(1_500_000),
-            savings_history: Vec::new(),
+            savings_history: vec![
+                history_point_at(2026, 3, 20, 11, 0),
+                history_point_at(2026, 3, 20, 12, 1_500_000),
+            ],
         };
+        *state.cached_headroom_stats.lock() =
+            Some((Some(stats), std::time::Instant::now()));
+        // Pin the history cache to a fresh miss so build_dashboard doesn't try
+        // to fetch native rollups over the network during the test.
+        *state.cached_headroom_history.lock() =
+            Some((None, std::time::Instant::now(), true));
 
-        let (_, _, _, read_only) = state
-            .record_savings_snapshot(&stats, false)
-            .expect("snapshot");
-        assert!(
-            read_only.token.is_empty(),
-            "read-only path must not surface milestones"
-        );
+        // Read-only path observes (building buckets) but must not surface or
+        // consume milestones.
+        let _ = state.dashboard();
 
-        let (_, _, _, drained) = state
-            .record_savings_snapshot(&stats, true)
-            .expect("snapshot");
+        let (_, drained) = state.dashboard_with_pending_milestones();
         assert_eq!(
             drained.token,
             vec![100_000, 1_000_000],
-            "drain=true must surface milestones queued by the earlier read-only observe"
+            "drain path must surface milestones for the accrued lifetime total"
         );
 
-        let (_, _, _, drained_again) = state
-            .record_savings_snapshot(&stats, true)
-            .expect("snapshot");
+        let (_, drained_again) = state.dashboard_with_pending_milestones();
         assert!(
             drained_again.token.is_empty(),
             "second drain finds nothing: milestones fire exactly once"
@@ -6918,8 +6914,6 @@ mod tests {
         assert!((first.session_estimated_savings_usd - 1.2).abs() < 1e-9);
         assert!((first.session_savings_pct - 24.0).abs() < 1e-9);
         assert_eq!(first.lifetime_requests, 10);
-        assert_eq!(first.lifetime_estimated_tokens_saved, 1_200);
-        assert!((first.lifetime_estimated_savings_usd - 1.2).abs() < 1e-9);
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
@@ -6937,8 +6931,6 @@ mod tests {
         assert_eq!(second.session_estimated_tokens_saved, 1_500);
         assert!((second.session_estimated_savings_usd - 1.5).abs() < 1e-9);
         assert_eq!(second.lifetime_requests, 12);
-        assert_eq!(second.lifetime_estimated_tokens_saved, 1_500);
-        assert!((second.lifetime_estimated_savings_usd - 1.5).abs() < 1e-9);
     }
 
     #[test]
@@ -6974,8 +6966,6 @@ mod tests {
         assert_eq!(reset.session_estimated_tokens_saved, 200);
         assert!((reset.session_estimated_savings_usd - 0.2).abs() < 1e-9);
         assert_eq!(reset.lifetime_requests, 12);
-        assert_eq!(reset.lifetime_estimated_tokens_saved, 1_200);
-        assert!((reset.lifetime_estimated_savings_usd - 1.2).abs() < 1e-9);
     }
 
     #[test]
@@ -7326,8 +7316,6 @@ mod tests {
         )
         .expect("parsed history");
 
-        assert_eq!(parsed.lifetime_estimated_tokens_saved, Some(205));
-        assert_eq!(parsed.lifetime_estimated_savings_usd, Some(0.205));
         assert_eq!(parsed.hourly.len(), 2);
         assert_eq!(parsed.hourly[0].tokens_saved, 150);
         assert!((parsed.hourly[0].compression_savings_usd_delta - 0.15).abs() < 1e-9);
@@ -7403,8 +7391,7 @@ mod tests {
         }"#;
         let parsed = parse_headroom_stats_history_from_json(body).expect("parsed history");
 
-        // Boundary bucket dropped; lifetime totals untouched.
-        assert_eq!(parsed.lifetime_estimated_tokens_saved, Some(1000));
+        // Boundary bucket dropped.
         assert_eq!(parsed.daily.len(), 1);
         assert_eq!(parsed.daily[0].tokens_saved, 100);
         assert_eq!(parsed.hourly.len(), 1);
@@ -7966,8 +7953,6 @@ mod tests {
             })
             .expect("second snapshot");
 
-        assert!((second.lifetime_estimated_savings_usd - 1.2).abs() < 1e-9);
-        assert_eq!(second.lifetime_estimated_tokens_saved, 1_200);
         assert_eq!(second.lifetime_requests, 11);
     }
 
@@ -8001,8 +7986,6 @@ mod tests {
         tracker.session_estimated_tokens_saved = 1_000;
         tracker.session_savings_pct = 20.0;
         tracker.lifetime_requests = 10;
-        tracker.lifetime_estimated_savings_usd = 5.0;
-        tracker.lifetime_estimated_tokens_saved = 1_000;
 
         let snapshot = tracker
             .observe(&HeadroomDashboardStats {
@@ -8022,7 +8005,6 @@ mod tests {
         assert!((snapshot.session_estimated_savings_usd - 0.5).abs() < 1e-9);
         assert!((snapshot.session_savings_pct - 20.0).abs() < 1e-9);
         assert_eq!(snapshot.lifetime_requests, 11);
-        assert_eq!(snapshot.lifetime_estimated_tokens_saved, 1_100);
     }
 
     #[test]
@@ -8042,8 +8024,7 @@ mod tests {
             session_estimated_tokens_saved: 900,
             session_savings_pct: 18.0,
             lifetime_requests: 12,
-            lifetime_estimated_savings_usd: 2.4,
-            lifetime_estimated_tokens_saved: 2_400,
+            lifetime_token_milestone_high_water: None,
             last_observation: Some(SavingsObservation {
                 observed_at: Utc::now(),
                 last_activity_at: Some(Utc::now()),
@@ -8066,8 +8047,7 @@ mod tests {
         .expect("write persisted state");
 
         let tracker = SavingsTracker::load_or_create(&base_dir).expect("load tracker");
-        assert!((tracker.lifetime_estimated_savings_usd - 0.0).abs() < 1e-9);
-        assert_eq!(tracker.lifetime_estimated_tokens_saved, 0);
+        assert_eq!(tracker.lifetime_token_milestone_high_water, 0);
         assert_eq!(tracker.lifetime_requests, 0);
 
         let _ = std::fs::remove_dir_all(base_dir);
