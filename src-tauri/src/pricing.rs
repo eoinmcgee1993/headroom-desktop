@@ -4389,15 +4389,26 @@ mod tests {
             detect_tier_mismatch(&account, &empty_claude_profile(ClaudePlanTier::Free), None)
                 .is_none()
         );
-        // Unknown is treated as a paying org customer -> Max x20, so a Pro
-        // subscriber is under-tiered and a mismatch is surfaced.
-        let mismatch = detect_tier_mismatch(
-            &account,
-            &empty_claude_profile(ClaudePlanTier::Unknown),
-            None,
-        )
-        .expect("unknown maps to Max x20");
-        assert_eq!(mismatch.1, HeadroomSubscriptionTier::Max20x);
+        // Unknown is undecodable, not a confident plan -> no recommendation, so
+        // a Pro subscriber with no other signal sees no mismatch nudge.
+        assert!(
+            detect_tier_mismatch(
+                &account,
+                &empty_claude_profile(ClaudePlanTier::Unknown),
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn detect_tier_mismatch_unknown_claude_defers_to_codex_plan() {
+        // George's case: Headroom Pro + Codex Plus (-> Pro) + Claude Unknown.
+        // Unknown must not push Max x20; the Codex Plus -> Pro recommendation
+        // matches the paid tier, so no mismatch fires.
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        let claude = empty_claude_profile(ClaudePlanTier::Unknown);
+        assert!(detect_tier_mismatch(&account, &claude, Some(CodexPlanTier::Plus)).is_none());
     }
 
     #[test]

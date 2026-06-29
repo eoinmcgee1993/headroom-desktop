@@ -651,7 +651,13 @@ pub fn headroom_tier_for_claude_plan(plan: &ClaudePlanTier) -> Option<HeadroomSu
     match plan {
         ClaudePlanTier::Pro => Some(HeadroomSubscriptionTier::Pro),
         ClaudePlanTier::Max5x => Some(HeadroomSubscriptionTier::Max5x),
-        ClaudePlanTier::Max20x | ClaudePlanTier::Unknown => Some(HeadroomSubscriptionTier::Max20x),
+        ClaudePlanTier::Max20x => Some(HeadroomSubscriptionTier::Max20x),
+        // Undecodable plan: don't drive a confident upsell off a guess. Returning
+        // None lets a known Codex plan supply the recommendation instead (and
+        // fires no mismatch when Claude is the only signal). Honors the contract
+        // in `pricing::detect_tier_mismatch`. The pricing gate's separate
+        // Unknown -> Max x20 *threshold* fallback is unaffected.
+        ClaudePlanTier::Unknown => None,
         ClaudePlanTier::Free => None,
     }
 }
