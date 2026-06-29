@@ -1807,10 +1807,22 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
         // state_<N>.sqlite -- must stay silent. A present sqlite/ dir with no
         // recognized store is the genuine moved/renamed case worth flagging.
         if codex_sqlite_store_expected() {
+            // We only reach here when no state_<integer>.sqlite parsed, so any
+            // state_*.sqlite still present is the unrecognized scheme. Log the
+            // actual names: a future occurrence reveals what Codex renamed the
+            // store to so codex_store_version can be extended instead of guessed
+            // at (Sentry RUST-43).
+            let unrecognized: Vec<String> = codex_state_dirs()
+                .iter()
+                .filter_map(|dir| std::fs::read_dir(dir).ok())
+                .flat_map(|entries| entries.flatten())
+                .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                .filter(|n| n.starts_with("state_") && n.ends_with(".sqlite"))
+                .collect();
             log::warn!(
-                "codex retag {from}->{to}: Codex is present but no state_<N>.sqlite \
-                 store was found under {dirs:?}; the history menu may split. Codex \
-                 may have moved or renamed its store.",
+                "codex retag {from}->{to}: Codex store present but unrecognized naming \
+                 {unrecognized:?} under {dirs:?}; the history menu may split. Extend \
+                 codex_store_version to parse it.",
                 dirs = codex_state_dirs(),
             );
         }
