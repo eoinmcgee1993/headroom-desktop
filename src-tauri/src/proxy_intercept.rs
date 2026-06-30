@@ -279,11 +279,15 @@ async fn handle(
     // Throttled and fire-and-forget, so the request hot path is untouched.
     if is_codex {
         maybe_spawn_codex_usage_poll(&buf, &codex_slot);
-        // Codex (Plus tier) stamps `X-OpenAI-Internal-Codex-Responses-Lite` on
-        // the `/responses` request; OpenAI's backend then rejects high-reasoning
-        // models on some accounts with "This model is not supported when using
-        // X-OpenAI-Internal-Codex-Responses-Lite." We never want the lite path,
-        // so drop the header before any forwarding branch (backend or direct).
+        // Codex stamps `X-OpenAI-Internal-Codex-Responses-Lite` on the
+        // `/responses` WS handshake. OpenAI tightened enforcement on 2026-06-26
+        // for gpt-5.5/gpt-5.4/gpt-5.4-mini, so the same Codex setup fails through
+        // Headroom with "This model is not supported ..." while succeeding when
+        // bypassed. Drop the header before any forwarding branch (backend/direct).
+        //
+        // STOPGAP: redundant with upstream headroom PR #1543, which strips this
+        // in the backend's `handle_openai_responses_ws` (covers OSS-direct users
+        // too). Remove this line once the bundled package includes that fix.
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
     }
 
@@ -438,11 +442,12 @@ fn parse_response_status(head: &[u8]) -> Option<u16> {
     first.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Whether an upstream status is worth a Sentry event. 429 (rate limit) is
-/// routine and handled by the usage gauge, so it is excluded to avoid noise;
-/// everything >= 400 otherwise is a real client/server failure we want to see.
+/// Whether an upstream status is worth a Sentry event. 429 (rate limit) and 401
+/// (the client's own API key is invalid/expired — RUST-46) are routine and not
+/// actionable on our side, so they are excluded to avoid noise; everything
+/// >= 400 otherwise is a real client/server failure we want to see.
 fn is_reportable_codex_error(status: &u16) -> bool {
-    *status >= 400 && *status != 429
+    *status >= 400 && *status != 429 && *status != 401
 }
 
 /// Report a Codex upstream error to Sentry with the status, request path and a
@@ -1631,11 +1636,12 @@ mod tests {
     }
 
     #[test]
-    fn is_reportable_codex_error_excludes_2xx_and_429() {
+    fn is_reportable_codex_error_excludes_2xx_429_and_401() {
         assert!(is_reportable_codex_error(&400));
         assert!(is_reportable_codex_error(&500));
         assert!(!is_reportable_codex_error(&200));
         assert!(!is_reportable_codex_error(&429));
+        assert!(!is_reportable_codex_error(&401));
     }
 
     #[test]

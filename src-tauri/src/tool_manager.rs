@@ -36,10 +36,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// `*-manylinux_*` abi3 wheel from
 /// https://pypi.org/pypi/headroom-ai/<version>/json and add a per-platform
 /// wheel-picker (mirroring `python_distribution_artifact`).
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.27.0";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/10/95/928bfb645df23025fb375de19c7d57ec21a0991712236d7748ce456139e3/headroom_ai-0.27.0-cp310-abi3-macosx_11_0_arm64.whl";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.28.0";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/b7/ad/a8e3a083851304e94707e305efcd9d94fac8bd605a31118ec18926211c1a/headroom_ai-0.28.0-cp310-abi3-macosx_11_0_arm64.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "00b54b70533c841f4702fffaf215eff84bafed7612c07a56d675ef8a1ffab543";
+    "31d3b280e7366a23f54034de15f525c3676e185464caa4e8696cd8ce2bad9fa6";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Upper bound on the one-time `learn --verbosity` baseline seed run before
 /// proxy start. Typical runs are a few seconds (a ~100MB transcript project
@@ -96,11 +96,10 @@ const HEADROOM_LINUX_REQUIREMENTS_LOCK: &str =
 /// lock. Drop any entry that no longer matches — those users need a real
 /// reinstall.
 const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
-    // The 0.25.0 and 0.26.0 bundles shared one lock byte-for-byte (identical
-    // requires_dist). 0.27.0 actually moves pins (tree-sitter-language-pack
-    // 1.8.1 -> 0.13.0 plus the spreadsheet extra: et-xmlfile/openpyxl/xlrd), so
-    // the stripped lock sha changes. The 0.25.0/0.26.0 cohort's lock receipt is
-    // now genuinely stale and SHOULD trigger a reinstall — do not whitelist the
+    // 0.28.0 re-resolved the lock from scratch ([all,vector], torch 2.12.1,
+    // benchmark tail dropped, broad point-version churn), so its stripped sha
+    // differs from every prior shipment. The 0.27.0 cohort's lock receipt is now
+    // genuinely stale and SHOULD trigger a dep reinstall — do not whitelist the
     // old sha here. The list stays empty until a future no-op cosmetic lock edit
     // (comments/blank lines only, no pin moves) needs to be treated as
     // up-to-date.
@@ -171,6 +170,16 @@ const LEGACY_REQUIREMENTS_LOCK_SHAS: &[&str] = &[
 ///   abi3 wheel is likewise uninstalled-then-reinstalled. The 0.20.x+ cohort
 ///   upgrades in place. Raise the floor only if a future lock adds or
 ///   ABI-bumps a native transitive dep without a version bump.
+/// - 0.5.x (0.27.0 → 0.28.0 bundle): floor stays at 0.20.0. Native pin moves are
+///   all version *changes* (torch 2.11.0 → 2.12.1, onnxruntime 1.23.2 → 1.27.0),
+///   so pip uninstalls the old wheel via RECORD (clearing its `.so`) before
+///   unpacking the new one — no same-version relayering. The new tree-sitter
+///   grammar packages (tree-sitter-c-sharp/embedded-template/yaml) are fresh
+///   installs, not in-place rebuilds, so they carry no stale-`.so` risk either.
+///   hnswlib stays pinned at 0.8.0 (unchanged). The benchmark-tail packages
+///   dropped from the lock are pure-Python orphans left on disk by the in-place
+///   `--upgrade` (pip does not prune removed requirements); harmless. The
+///   0.20.x+ cohort upgrades in place.
 const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 20, 0);
 
 /// Parse the leading `major.minor.patch` from a version string, tolerating

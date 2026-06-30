@@ -3485,11 +3485,14 @@ impl LaunchProfile {
             current.launch_experience = LaunchExperience::Resume;
         }
 
-        std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&current).context("serializing launch profile")?,
-        )
-        .with_context(|| format!("writing {}", path.display()))?;
+        // Best-effort persist: a failed write here (e.g. EPERM from locked-down
+        // Application Support perms, RUST-1P) must not crash startup. The profile
+        // is telemetry; degrade to the in-memory copy and continue.
+        if let Ok(bytes) = serde_json::to_vec_pretty(&current) {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                log::warn!("could not persist {}: {e}", path.display());
+            }
+        }
 
         Ok((current, path))
     }
