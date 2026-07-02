@@ -399,10 +399,11 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
 
     // `read_http_headers` may over-read leading body bytes past the terminator.
     let head_end = find_header_end(&head).map(|e| e + 4).unwrap_or(head.len());
+    let status = parse_response_status(&head);
     let content_length =
         extract_header_value(&head, "content-length").and_then(|v| v.parse::<usize>().ok());
     let compressed = extract_header_value(&head, "content-encoding").is_some();
-    let rewritable = matches!(parse_response_status(&head), Some(200))
+    let rewritable = matches!(status, Some(200))
         && !compressed
         && content_length.is_some_and(|n| n <= MAX_MODELS_BODY);
 
@@ -423,59 +424,130 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
             Vec::new()
         };
         if body.len() == total {
-            if let Some(rewritten) = rewrite_use_responses_lite(&body) {
-                set_response_content_length(&mut head, rewritten.len());
-                body = rewritten;
+            match rewrite_use_responses_lite(&body) {
+                ModelsRewrite::Rewritten {
+                    body: rewritten,
+                    flags_flipped,
+                } => {
+                    set_response_content_length(&mut head, rewritten.len());
+                    body = rewritten;
+                    report_models_rewrite(
+                        "applied",
+                        sentry::Level::Info,
+                        &format!("flipped {flags_flipped} use_responses_lite flag(s)"),
+                    );
+                }
+                ModelsRewrite::Unchanged => {}
+                ModelsRewrite::Unparseable => {
+                    report_models_rewrite(
+                        "unparseable_json",
+                        sentry::Level::Warning,
+                        &format!("200 models response, {} bytes, not JSON", body.len()),
+                    );
+                }
             }
+        } else {
+            report_models_rewrite(
+                "truncated_body",
+                sentry::Level::Warning,
+                &format!("read {} of {total} body bytes", body.len()),
+            );
         }
         for part in [&head, &body, &extra] {
             if !part.is_empty() && client.write_all(part).await.is_err() {
                 return;
             }
         }
-    } else if client.write_all(&head).await.is_err() {
-        return;
+    } else {
+        // A 200 catalog we could not inspect means an affected user silently
+        // keeps `use_responses_lite: true` — exactly the failure this rewrite
+        // exists to prevent, so surface it. Non-200s are routine (auth errors,
+        // upstream hiccups) and already covered by client-side retries.
+        if status == Some(200) {
+            let reason = if compressed {
+                "compressed"
+            } else if content_length.is_none() {
+                "no_content_length"
+            } else {
+                "oversize"
+            };
+            report_models_rewrite(
+                reason,
+                sentry::Level::Warning,
+                &format!("200 models response skipped (content_length={content_length:?})"),
+            );
+        }
+        if client.write_all(&head).await.is_err() {
+            return;
+        }
     }
     // Remainder: body of a non-rewritable response and/or keep-alive reuse.
     let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
 }
 
+/// Outcome of attempting the lite-flag rewrite on a models-catalog body.
+enum ModelsRewrite {
+    /// Body is not JSON (or re-serialization failed) — forwarded untouched.
+    Unparseable,
+    /// Valid JSON with no `use_responses_lite: true` — forwarded untouched.
+    Unchanged,
+    /// One or more flags flipped; `body` is the re-serialized payload.
+    Rewritten { body: Vec<u8>, flags_flipped: usize },
+}
+
 /// Force every `use_responses_lite: true` in a models-catalog JSON payload to
-/// `false`. Returns the re-serialized body only when something changed;
-/// `None` (leave the response untouched) for non-JSON bodies or when no flag
-/// was set.
-fn rewrite_use_responses_lite(body: &[u8]) -> Option<Vec<u8>> {
-    fn force_false(v: &mut serde_json::Value) -> bool {
+/// `false`.
+fn rewrite_use_responses_lite(body: &[u8]) -> ModelsRewrite {
+    fn force_false(v: &mut serde_json::Value) -> usize {
         match v {
             serde_json::Value::Object(map) => {
-                let mut changed = false;
+                let mut flipped = 0;
                 for (key, val) in map.iter_mut() {
                     if key == "use_responses_lite" && *val == serde_json::Value::Bool(true) {
                         *val = serde_json::Value::Bool(false);
-                        changed = true;
+                        flipped += 1;
                     } else {
-                        changed |= force_false(val);
+                        flipped += force_false(val);
                     }
                 }
-                changed
+                flipped
             }
-            serde_json::Value::Array(items) => {
-                let mut changed = false;
-                for item in items.iter_mut() {
-                    changed |= force_false(item);
-                }
-                changed
-            }
-            _ => false,
+            serde_json::Value::Array(items) => items.iter_mut().map(force_false).sum(),
+            _ => 0,
         }
     }
 
-    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    if force_false(&mut value) {
-        serde_json::to_vec(&value).ok()
-    } else {
-        None
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ModelsRewrite::Unparseable;
+    };
+    let flags_flipped = force_false(&mut value);
+    if flags_flipped == 0 {
+        return ModelsRewrite::Unchanged;
     }
+    match serde_json::to_vec(&value) {
+        Ok(body) => ModelsRewrite::Rewritten {
+            body,
+            flags_flipped,
+        },
+        Err(_) => ModelsRewrite::Unparseable,
+    }
+}
+
+/// Report a models-rewrite event to Sentry. `kind` is one of `applied`,
+/// `unparseable_json`, `truncated_body`, `compressed`, `no_content_length`,
+/// `oversize` — fingerprinted per kind so each failure class is its own issue
+/// (mirrors report_codex_upstream_error's grouping rationale).
+fn report_models_rewrite(kind: &str, level: sentry::Level, detail: &str) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("models_rewrite", kind);
+            scope.set_extra("detail", detail.to_string().into());
+            scope.set_fingerprint(Some(&["codex-models-rewrite", kind]));
+        },
+        || {
+            sentry::capture_message(&format!("codex models rewrite {kind}: {detail}"), level);
+        },
+    );
 }
 
 /// Replace (or insert) the `Content-Length` header in a response head after a
@@ -1363,7 +1435,7 @@ mod tests {
         is_openai_path, is_reportable_codex_error, parse_codex_rate_limit_headers,
         parse_request_head, parse_response_status, read_http_headers, request_has_header,
         request_is_loopback_safe, rewrite_use_responses_lite, run, set_response_content_length,
-        stamp_codex_client_header, strip_request_header, BypassFlag, SharedToken,
+        stamp_codex_client_header, strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -2419,10 +2491,21 @@ mod tests {
         assert_eq!(codex_window_label(90), "1h30m");
     }
 
+    fn expect_rewritten(result: ModelsRewrite) -> (Vec<u8>, usize) {
+        match result {
+            ModelsRewrite::Rewritten {
+                body,
+                flags_flipped,
+            } => (body, flags_flipped),
+            _ => panic!("expected Rewritten"),
+        }
+    }
+
     #[test]
     fn rewrite_use_responses_lite_forces_false() {
         let body = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true},{"slug":"gpt-5.4","use_responses_lite":false}]}"#;
-        let rewritten = rewrite_use_responses_lite(body).expect("should rewrite");
+        let (rewritten, flipped) = expect_rewritten(rewrite_use_responses_lite(body));
+        assert_eq!(flipped, 1);
         let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         for model in value["models"].as_array().unwrap() {
             assert_eq!(model["use_responses_lite"], serde_json::Value::Bool(false));
@@ -2434,7 +2517,8 @@ mod tests {
     #[test]
     fn rewrite_use_responses_lite_handles_nested_flag() {
         let body = br#"{"data":{"items":[{"info":{"use_responses_lite":true}}]}}"#;
-        let rewritten = rewrite_use_responses_lite(body).expect("should rewrite");
+        let (rewritten, flipped) = expect_rewritten(rewrite_use_responses_lite(body));
+        assert_eq!(flipped, 1);
         let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
         assert_eq!(
             value["data"]["items"][0]["info"]["use_responses_lite"],
@@ -2445,14 +2529,22 @@ mod tests {
     #[test]
     fn rewrite_use_responses_lite_noop_when_nothing_to_change() {
         // All-false catalog: no rewrite, response stays byte-identical.
-        assert!(rewrite_use_responses_lite(
-            br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":false}]}"#
-        )
-        .is_none());
-        // Non-JSON body: fail-open.
-        assert!(rewrite_use_responses_lite(b"<html>challenge</html>").is_none());
+        assert!(matches!(
+            rewrite_use_responses_lite(
+                br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":false}]}"#
+            ),
+            ModelsRewrite::Unchanged
+        ));
         // Non-boolean value is left alone.
-        assert!(rewrite_use_responses_lite(br#"{"use_responses_lite":"true"}"#).is_none());
+        assert!(matches!(
+            rewrite_use_responses_lite(br#"{"use_responses_lite":"true"}"#),
+            ModelsRewrite::Unchanged
+        ));
+        // Non-JSON body: fail-open, reported as unparseable.
+        assert!(matches!(
+            rewrite_use_responses_lite(b"<html>challenge</html>"),
+            ModelsRewrite::Unparseable
+        ));
     }
 
     #[tokio::test]
