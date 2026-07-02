@@ -248,9 +248,23 @@ async fn handle(
     // Whether this is a Codex (OpenAI-path) request. Parsed once here and
     // reused for the Codex plan capture, the Codex-only bypass, and the
     // response-head sniff below.
-    let is_codex = find_header_end(&buf)
-        .and_then(|end| parse_request_head(&buf[..end + 4]))
+    let parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
+    let is_codex = parsed_head
+        .as_ref()
         .is_some_and(|head| is_openai_path(&head.path));
+
+    // Codex fetches its model catalog via `GET <base_url>/models` and caches it
+    // in ~/.codex/models_cache.json. When OpenAI serves `use_responses_lite:
+    // true` for a model, Codex switches to the "responses lite" transport,
+    // which OpenAI rejects for proxied traffic ("This model is not supported
+    // when using X-OpenAI-Internal-Codex-Responses-Lite", enforcement tightened
+    // 2026-06-26). Detect the catalog fetch here so the response splice below
+    // can force the flag to false, keeping Codex on the full Responses path —
+    // which works through the proxy.
+    let is_models_fetch = parsed_head.as_ref().is_some_and(|head| {
+        head.method.eq_ignore_ascii_case("GET")
+            && (head.path == "/v1/models" || head.path.starts_with("/v1/models?"))
+    });
 
     // Scan headers for a Bearer token and capture it. When the token's
     // value differs from what was previously in the slot — or the slot was
@@ -350,8 +364,131 @@ async fn handle(
     if is_codex {
         let req_path = parse_request_head(&buf).map(|p| p.path).unwrap_or_default();
         splice_with_codex_capture(client, backend, &codex_slot, &req_path).await;
+    } else if is_models_fetch {
+        splice_with_models_lite_rewrite(client, backend).await;
     } else {
         let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+    }
+}
+
+/// Upper bound on a `/v1/models` response body we're willing to buffer for the
+/// lite-flag rewrite. Real model catalogs are a few KB.
+const MAX_MODELS_BODY: usize = 2 * 1024 * 1024;
+const MODELS_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Splice client <-> backend for a Codex `GET /v1/models` catalog fetch,
+/// rewriting `"use_responses_lite": true` to `false` in the JSON response so
+/// Codex stays on the full Responses transport (the lite transport is rejected
+/// by OpenAI when re-originated by a proxy). Fail-open: on non-200, compressed
+/// or chunked bodies, oversize payloads, truncated reads, or non-JSON content,
+/// the response is forwarded byte-for-byte untouched.
+async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: TcpStream) {
+    let mut head = Vec::with_capacity(4096);
+    let read_head = tokio::time::timeout(
+        HEADER_READ_TIMEOUT,
+        read_http_headers(&mut backend, &mut head),
+    )
+    .await;
+    if !matches!(read_head, Ok(Ok(()))) {
+        if !head.is_empty() && client.write_all(&head).await.is_err() {
+            return;
+        }
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+        return;
+    }
+
+    // `read_http_headers` may over-read leading body bytes past the terminator.
+    let head_end = find_header_end(&head).map(|e| e + 4).unwrap_or(head.len());
+    let content_length =
+        extract_header_value(&head, "content-length").and_then(|v| v.parse::<usize>().ok());
+    let compressed = extract_header_value(&head, "content-encoding").is_some();
+    let rewritable = matches!(parse_response_status(&head), Some(200))
+        && !compressed
+        && content_length.is_some_and(|n| n <= MAX_MODELS_BODY);
+
+    if rewritable {
+        let total = content_length.unwrap_or(0);
+        let mut body = head.split_off(head_end);
+        while body.len() < total {
+            let mut tmp = [0u8; 4096];
+            match tokio::time::timeout(MODELS_BODY_READ_TIMEOUT, backend.read(&mut tmp)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
+            }
+        }
+        // Bytes past `total` belong to the next keep-alive response.
+        let extra = if body.len() > total {
+            body.split_off(total)
+        } else {
+            Vec::new()
+        };
+        if body.len() == total {
+            if let Some(rewritten) = rewrite_use_responses_lite(&body) {
+                set_response_content_length(&mut head, rewritten.len());
+                body = rewritten;
+            }
+        }
+        for part in [&head, &body, &extra] {
+            if !part.is_empty() && client.write_all(part).await.is_err() {
+                return;
+            }
+        }
+    } else if client.write_all(&head).await.is_err() {
+        return;
+    }
+    // Remainder: body of a non-rewritable response and/or keep-alive reuse.
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+}
+
+/// Force every `use_responses_lite: true` in a models-catalog JSON payload to
+/// `false`. Returns the re-serialized body only when something changed;
+/// `None` (leave the response untouched) for non-JSON bodies or when no flag
+/// was set.
+fn rewrite_use_responses_lite(body: &[u8]) -> Option<Vec<u8>> {
+    fn force_false(v: &mut serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut changed = false;
+                for (key, val) in map.iter_mut() {
+                    if key == "use_responses_lite" && *val == serde_json::Value::Bool(true) {
+                        *val = serde_json::Value::Bool(false);
+                        changed = true;
+                    } else {
+                        changed |= force_false(val);
+                    }
+                }
+                changed
+            }
+            serde_json::Value::Array(items) => {
+                let mut changed = false;
+                for item in items.iter_mut() {
+                    changed |= force_false(item);
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if force_false(&mut value) {
+        serde_json::to_vec(&value).ok()
+    } else {
+        None
+    }
+}
+
+/// Replace (or insert) the `Content-Length` header in a response head after a
+/// body rewrite changed its size. `head` must end with the `\r\n\r\n`
+/// terminator and contain no body bytes.
+fn set_response_content_length(head: &mut Vec<u8>, len: usize) {
+    strip_request_header(head, "content-length");
+    if let Some(end) = find_header_end(head) {
+        let insert_at = end + 2;
+        head.splice(
+            insert_at..insert_at,
+            format!("Content-Length: {len}\r\n").into_bytes(),
+        );
     }
 }
 
@@ -1225,8 +1362,8 @@ mod tests {
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
         is_openai_path, is_reportable_codex_error, parse_codex_rate_limit_headers,
         parse_request_head, parse_response_status, read_http_headers, request_has_header,
-        request_is_loopback_safe, run, stamp_codex_client_header, strip_request_header, BypassFlag,
-        SharedToken,
+        request_is_loopback_safe, rewrite_use_responses_lite, run, set_response_content_length,
+        stamp_codex_client_header, strip_request_header, BypassFlag, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -2280,5 +2417,159 @@ mod tests {
         assert_eq!(codex_window_label(300), "5h");
         assert_eq!(codex_window_label(10080), "168h");
         assert_eq!(codex_window_label(90), "1h30m");
+    }
+
+    #[test]
+    fn rewrite_use_responses_lite_forces_false() {
+        let body = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true},{"slug":"gpt-5.4","use_responses_lite":false}]}"#;
+        let rewritten = rewrite_use_responses_lite(body).expect("should rewrite");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        for model in value["models"].as_array().unwrap() {
+            assert_eq!(model["use_responses_lite"], serde_json::Value::Bool(false));
+        }
+        // Other fields survive.
+        assert_eq!(value["models"][0]["slug"], "gpt-5.5");
+    }
+
+    #[test]
+    fn rewrite_use_responses_lite_handles_nested_flag() {
+        let body = br#"{"data":{"items":[{"info":{"use_responses_lite":true}}]}}"#;
+        let rewritten = rewrite_use_responses_lite(body).expect("should rewrite");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(
+            value["data"]["items"][0]["info"]["use_responses_lite"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn rewrite_use_responses_lite_noop_when_nothing_to_change() {
+        // All-false catalog: no rewrite, response stays byte-identical.
+        assert!(rewrite_use_responses_lite(
+            br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":false}]}"#
+        )
+        .is_none());
+        // Non-JSON body: fail-open.
+        assert!(rewrite_use_responses_lite(b"<html>challenge</html>").is_none());
+        // Non-boolean value is left alone.
+        assert!(rewrite_use_responses_lite(br#"{"use_responses_lite":"true"}"#).is_none());
+    }
+
+    #[tokio::test]
+    #[serial(backend_port)]
+    async fn intercept_rewrites_use_responses_lite_in_models_response() {
+        let models_json = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true}]}"#.to_vec();
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            let _ = read_until_header_end(&mut sock).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                models_json.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.write_all(&models_json).await;
+            // Keep the connection open briefly so the splice can finish.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        backend_port::set(backend_addr.port());
+
+        let token_slot: SharedToken = Arc::new(Mutex::new(None));
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let slot_for_run = token_slot.clone();
+        let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
+        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                slot_for_run,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                bypass_for_run,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                upstream_base,
+            )
+            .await;
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(c) = TcpStream::connect(intercept_addr).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("intercept reachable");
+
+        let request = format!(
+            "GET /v1/models?client_version=1.0.0 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer test-token-123\r\n\r\n",
+            intercept_addr.port()
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+
+        // Read head + body of the (rewritten) response.
+        let mut response = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut tmp = [0u8; 4096];
+            let n = match tokio::time::timeout_at(deadline, client.read(&mut tmp)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => break,
+            };
+            response.extend_from_slice(&tmp[..n]);
+            if let Some(end) = find_header_end(&response) {
+                let head = std::str::from_utf8(&response[..end + 4]).expect("utf8 head");
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .expect("content-length present")
+                    .trim()
+                    .parse()
+                    .expect("numeric content-length");
+                if response.len() >= end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+
+        let end = find_header_end(&response).expect("response head complete");
+        let body: serde_json::Value =
+            serde_json::from_slice(&response[end + 4..]).expect("json body");
+        assert_eq!(
+            body["models"][0]["use_responses_lite"],
+            serde_json::Value::Bool(false),
+            "lite flag rewritten to false: {body}"
+        );
+        assert_eq!(body["models"][0]["slug"], "gpt-5.5");
+
+        run_task.abort();
+        backend_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    #[test]
+    fn set_response_content_length_replaces_existing() {
+        let mut head =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n"
+                .to_vec();
+        set_response_content_length(&mut head, 12345);
+        let text = String::from_utf8(head).unwrap();
+        assert!(text.contains("Content-Length: 12345\r\n"));
+        assert!(!text.contains("Content-Length: 10\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+        assert!(text.contains("Content-Type: application/json\r\n"));
     }
 }
