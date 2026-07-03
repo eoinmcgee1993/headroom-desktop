@@ -3859,32 +3859,14 @@ fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, V
                 )
             })?;
             // Writers re-serialize with serde_json, which strips the
-            // comments/relaxed syntax that forced the JSON5 fallback. Say so
-            // instead of silently normalizing the user's file.
-            //
-            // Captured explicitly with a fixed fingerprint instead of via the
-            // log::warn! Sentry bridge: attach_stacktrace grouping split this
-            // one warning across three issues (RUST-4K/4N/4P). Constant
-            // message, path as extra. Local log stays at info so the bridge
-            // doesn't double-send.
+            // comments/relaxed syntax that forced the JSON5 fallback. Log it
+            // locally so the .headroom-backup is discoverable, but do NOT
+            // capture to Sentry: this is expected, benign behavior (user keeps
+            // comments in their settings), and the capture just inflated
+            // RUST-4R with 120+ no-action events. Local info only.
             log::info!(
                 "{} contains JSON5 syntax (comments/trailing commas); a Headroom rewrite will normalize it to strict JSON — the original is kept as a .headroom-backup file",
                 path.display()
-            );
-            sentry::with_scope(
-                |scope| {
-                    scope.set_fingerprint(Some(&["client-settings-json5-normalized"]));
-                    scope.set_extra(
-                        "path",
-                        crate::logging::scrub_home(&path.display().to_string()).into(),
-                    );
-                },
-                || {
-                    sentry::capture_message(
-                        "client settings file contains JSON5 syntax (comments/trailing commas); a Headroom rewrite will normalize it to strict JSON — the original is kept as a .headroom-backup file",
-                        sentry::Level::Warning,
-                    );
-                },
             );
             value
         }
