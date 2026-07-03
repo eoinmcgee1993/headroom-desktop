@@ -26,6 +26,24 @@ pub fn config_file(base_dir: &Path, name: &str) -> PathBuf {
     base_dir.join("config").join(name)
 }
 
+/// The user-facing calendar day ("YYYY-MM-DD", local timezone) for an
+/// instant. Canonical: every "today"/day-bucket decision that the user can
+/// see goes through this, regardless of the instant's source timezone —
+/// mixed UTC/local day keys gave US users mid-afternoon daily resets. UTC-
+/// bucketed data from the backend is the one exception (keyed by its UTC
+/// date, labeled as such). See the Persistence Rules in CLAUDE.md.
+pub fn user_day_key<Tz: chrono::TimeZone>(instant: chrono::DateTime<Tz>) -> String {
+    instant
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// Local `NaiveDate` counterpart of [`user_day_key`].
+pub fn user_day<Tz: chrono::TimeZone>(instant: chrono::DateTime<Tz>) -> chrono::NaiveDate {
+    instant.with_timezone(&chrono::Local).date_naive()
+}
+
 pub fn memory_db_path(base_dir: &Path) -> PathBuf {
     base_dir.join("memory.db")
 }

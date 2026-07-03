@@ -5185,7 +5185,7 @@ fn parse_history_timestamp(text: &str) -> Option<chrono::DateTime<Utc>> {
 }
 
 fn local_day_key(timestamp: chrono::DateTime<Local>) -> String {
-    timestamp.format("%Y-%m-%d").to_string()
+    crate::storage::user_day_key(timestamp)
 }
 
 // Boundary between local tracker (pre-cutoff, authoritative) and /stats-history

@@ -416,8 +416,10 @@ impl ActivityFacts {
                 }
             }
 
-            let today = now.format("%Y-%m-%d").to_string();
-            let event_day = observed_at.format("%Y-%m-%d").to_string();
+            // Local calendar days: UTC keys reset the daily record at
+            // mid-afternoon for US users and disagreed with the savings chart.
+            let today = crate::storage::user_day_key(now);
+            let event_day = crate::storage::user_day_key(observed_at);
             let mut emit_tags: Vec<RecordTag> = Vec::new();
             let mut tile_tags: Vec<RecordTag> = Vec::new();
             let mut all_time_previous: Option<u64> = None;
@@ -560,11 +562,11 @@ impl ActivityFacts {
         active_project_path: Option<&str>,
         observed_at: DateTime<Utc>,
     ) -> LearningsMilestoneEvent {
-        let today = observed_at.date_naive();
+        let today = crate::storage::user_day(observed_at);
         let day_changed = self.learnings_snapshot_day != Some(today);
 
         if day_changed {
-            // New UTC day — drop yesterday's snapshots and re-baseline against
+            // New local day — drop yesterday's snapshots and re-baseline against
             // whatever the caller just observed. Today's diffs against this
             // set start at zero.
             self.learnings_snapshots.clear();

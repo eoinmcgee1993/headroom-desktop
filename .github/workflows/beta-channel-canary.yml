@@ -1,0 +1,21 @@
+name: Beta channel canary
+
+# The desktop updater's noise filter suppresses exactly the 404s that would
+# reveal a broken staging-rolling release in Sentry, so nothing else watches
+# this endpoint. A red run here means beta users cannot update.
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  check-updater-endpoints:
+    runs-on: ubuntu-latest
+    steps:
+      - name: staging-rolling latest.json answers 200 with a version
+        run: |
+          set -euo pipefail
+          url="https://github.com/${{ github.repository }}/releases/download/staging-rolling/latest.json"
+          body=$(curl -sfL --max-time 30 "$url")
+          echo "$body" | head -c 400
+          echo "$body" | grep -q '"version"' || { echo "::error::latest.json has no version field"; exit 1; }
