@@ -5438,6 +5438,38 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn clear_client_setups_twice_preserves_remembered_snapshot() {
+        // Regression: pause (first clear) moves configured -> remembered; the
+        // quit-time second clear used to wipe remembered_clients because the
+        // re-save was skipped while configured was empty — so a pause
+        // followed by Cmd-Q permanently lost every connector.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+
+        super::apply_client_setup("claude_code").expect("apply");
+
+        super::clear_client_setups().expect("first clear (pause)");
+        let state = super::load_setup_state();
+        assert!(state.configured_clients.is_empty());
+        assert!(
+            state.remembered_clients.contains_key("claude_code"),
+            "pause snapshots the configured client, got: {:?}",
+            state.remembered_clients
+        );
+
+        super::clear_client_setups().expect("second clear (quit)");
+        let state = super::load_setup_state();
+        assert!(
+            state.remembered_clients.contains_key("claude_code"),
+            "quit-time clear after a pause must keep the restore snapshot, got: {:?}",
+            state.remembered_clients
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn apply_then_verify_then_disable_codex_round_trip() {
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();

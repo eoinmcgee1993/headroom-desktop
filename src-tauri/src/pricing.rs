@@ -1481,10 +1481,17 @@ fn resolve_tier_mismatch(
         match account.and_then(|a| detect_tier_mismatch(a, claude, codex_plan)) {
             Some(triple) => triple,
             None => {
-                if let Ok(mut local) = load_or_initialize_local_state() {
-                    if local.mismatch_since.is_some() {
-                        local.mismatch_since = None;
-                        let _ = write_local_state(&local);
+                // Clear the grace clock only on an affirmative "no mismatch"
+                // (account profile present). A failed account fetch also lands
+                // here, and clearing on those used to restart the 14-day clamp
+                // window on every transient blip — one flaky poll per two
+                // weeks meant under-subscribed users were never clamped.
+                if account.is_some() {
+                    if let Ok(mut local) = load_or_initialize_local_state() {
+                        if local.mismatch_since.is_some() {
+                            local.mismatch_since = None;
+                            let _ = write_local_state(&local);
+                        }
                     }
                 }
                 return None;
@@ -2176,10 +2183,20 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
     }
 }
 
+/// Consecutive background polls answered 401. Tolerating a single 401 keeps a
+/// user signed in through server blips, but a *revoked* session answers 401
+/// forever — without an escalation path the app showed "authenticated" with a
+/// permanent confusing banner until reinstall.
+static CONSECUTIVE_UNAUTHORIZED_SYNCS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+const MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS: u32 = 3;
+
 fn merge_background_account_sync(
     session_token: Option<&str>,
     sync_result: Result<RemoteAccountResponse, RemoteAccountSyncError>,
 ) -> (bool, Option<HeadroomAccountProfile>, Option<String>) {
+    use std::sync::atomic::Ordering;
+
     if session_token.is_none() {
         return (false, None, None);
     }
@@ -2188,16 +2205,34 @@ fn merge_background_account_sync(
         // Background polling should not silently drop the locally stored session.
         // Explicit auth-required actions still clear the token if the server says it
         // is expired, but passive refreshes keep the user signed in locally.
-        Ok(account) => (true, Some(remote_account_to_profile(account)), None),
-        Err(RemoteAccountSyncError::Unauthorized) => (
-            true,
-            None,
-            Some("Headroom account connected, but your plan details could not be refreshed. Sign in again if this keeps happening.".into()),
-        ),
+        Ok(account) => {
+            CONSECUTIVE_UNAUTHORIZED_SYNCS.store(0, Ordering::Relaxed);
+            (true, Some(remote_account_to_profile(account)), None)
+        }
+        Err(RemoteAccountSyncError::Unauthorized) => {
+            let unauthorized = CONSECUTIVE_UNAUTHORIZED_SYNCS.fetch_add(1, Ordering::Relaxed) + 1;
+            if unauthorized >= MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS {
+                return (
+                    false,
+                    None,
+                    Some("Your Headroom session has expired. Please sign in again.".into()),
+                );
+            }
+            (
+                true,
+                None,
+                Some("Headroom account connected, but your plan details could not be refreshed. Sign in again if this keeps happening.".into()),
+            )
+        }
+        // Network failures carry no evidence about the session; never count
+        // them toward escalation.
         Err(RemoteAccountSyncError::Other) => (
             true,
             None,
-            Some("Headroom account connected, but your plan details are unavailable right now.".into()),
+            Some(
+                "Headroom account connected, but your plan details are unavailable right now."
+                    .into(),
+            ),
         ),
     }
 }
@@ -2461,7 +2496,8 @@ mod tests {
         resolve_account_api_base_url, ClaudeOauthProfile, ClaudeOauthProfileAccount,
         ClaudeOauthProfileOrganization, HeadroomSubscriptionTier, IdentityFingerprint,
         IdentityPayload, LocalPricingState, PricingPromo, RemoteAccountResponse,
-        RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
+        RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
+        MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, CodexPlanTier,
@@ -2878,15 +2914,38 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_background_sync_keeps_local_session_authenticated() {
-        let (authenticated, account, error) = merge_background_account_sync(
+    #[serial_test::serial(unauth_sync_counter)]
+    fn unauthorized_background_sync_tolerates_blips_then_escalates() {
+        CONSECUTIVE_UNAUTHORIZED_SYNCS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Transient 401s keep the local session authenticated...
+        for _ in 0..(MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS - 1) {
+            let (authenticated, account, error) = merge_background_account_sync(
+                Some("session-token"),
+                Err(RemoteAccountSyncError::Unauthorized),
+            );
+            assert!(authenticated);
+            assert!(account.is_none());
+            assert!(error.is_some());
+        }
+
+        // ...but a revoked session (consecutive 401s) escalates to signed-out.
+        let (authenticated, _, error) = merge_background_account_sync(
             Some("session-token"),
             Err(RemoteAccountSyncError::Unauthorized),
         );
-
-        assert!(authenticated);
-        assert!(account.is_none());
+        assert!(!authenticated);
         assert!(error.is_some());
+
+        // A single success resets the tolerance window.
+        let (authenticated, _, _) =
+            merge_background_account_sync(Some("session-token"), Ok(sample_remote_account()));
+        assert!(authenticated);
+        let (authenticated, _, _) = merge_background_account_sync(
+            Some("session-token"),
+            Err(RemoteAccountSyncError::Unauthorized),
+        );
+        assert!(authenticated);
     }
 
     #[test]
@@ -2902,6 +2961,9 @@ mod tests {
     }
 
     #[test]
+    // Ok resets the unauthorized counter, so keep it off the escalation
+    // test's timeline.
+    #[serial_test::serial(unauth_sync_counter)]
     fn successful_background_sync_returns_remote_account_profile() {
         let (authenticated, account, error) =
             merge_background_account_sync(Some("session-token"), Ok(sample_remote_account()));

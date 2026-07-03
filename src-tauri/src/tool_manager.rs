@@ -1615,7 +1615,7 @@ impl ToolManager {
         } else {
             return Ok(());
         }
-        std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?)
+        crate::client_adapters::atomic_write(&receipt_path, &serde_json::to_vec(&receipt)?)
             .with_context(|| format!("writing {}", receipt_path.display()))?;
         Ok(())
     }
@@ -2123,7 +2123,7 @@ impl ToolManager {
                     );
                 }
                 receipt["mcp"] = mcp_install;
-                std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?)
+                crate::client_adapters::atomic_write(&receipt_path, &serde_json::to_vec(&receipt)?)
                     .with_context(|| format!("writing {}", receipt_path.display()))?;
             }
         }
@@ -2349,7 +2349,7 @@ impl ToolManager {
         if let Some(backup) = in_place_previous_lock_backup {
             body["previous_lock_backup"] = json!(backup);
         }
-        std::fs::write(&marker, serde_json::to_vec_pretty(&body)?)
+        crate::client_adapters::atomic_write(&marker, &serde_json::to_vec_pretty(&body)?)
             .with_context(|| format!("writing {}", marker.display()))?;
         Ok(())
     }
@@ -2894,30 +2894,27 @@ impl ToolManager {
             .runtime
             .downloads_dir
             .join(format!("headroom_ai-{}-py3-none-any.whl", release.version));
-        let use_wheel = match download_to_path(
-            &release.wheel_url,
-            &wheel_path,
-            Some(&release.sha256),
-        ) {
-            Ok(()) => true,
-            Err(download_err) if is_checksum_mismatch(&download_err) => {
-                // Never downgrade a failed integrity check to an
-                // unverified pip-index install.
-                let restored = self.rollback_in_place_upgrade_inner(&ctx);
-                return UpgradeOutcome::InstallFailed {
+        let use_wheel =
+            match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
+                Ok(()) => true,
+                Err(download_err) if is_checksum_mismatch(&download_err) => {
+                    // Never downgrade a failed integrity check to an
+                    // unverified pip-index install.
+                    let restored = self.rollback_in_place_upgrade_inner(&ctx);
+                    return UpgradeOutcome::InstallFailed {
                     restored,
                     error: download_err.context(
                         "Headroom wheel failed checksum verification; refusing unverified fallback",
                     ),
                 };
-            }
-            Err(download_err) => {
-                log::warn!(
+                }
+                Err(download_err) => {
+                    log::warn!(
                     "headroom wheel download failed (will fall back to pip index): {download_err}"
                 );
-                false
-            }
-        };
+                    false
+                }
+            };
 
         progress(BootstrapStepUpdate {
             step: "Applying update",
@@ -3196,7 +3193,7 @@ impl ToolManager {
             );
         }
         receipt["mcp"] = mcp_install;
-        std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)
+        crate::client_adapters::atomic_write(&receipt_path, &serde_json::to_vec_pretty(&receipt)?)
             .with_context(|| format!("writing {}", receipt_path.display()))?;
         Ok(())
     }
@@ -3327,7 +3324,10 @@ impl ToolManager {
                     "proxyUrl": HEADROOM_PROXY_URL,
                     "installMethod": method.as_str(),
                 });
-                let _ = std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?);
+                let _ = crate::client_adapters::atomic_write(
+                    &receipt_path,
+                    &serde_json::to_vec(&receipt)?,
+                );
             }
         }
         Ok(())
@@ -3571,16 +3571,19 @@ impl ToolManager {
             .runtime
             .downloads_dir
             .join("headroom-requirements.lock");
-        std::fs::write(&lock_path, contents)
+        crate::client_adapters::atomic_write(&lock_path, contents.as_bytes())
             .with_context(|| format!("writing {}", lock_path.display()))?;
         Ok(lock_path)
     }
 
     fn write_bootstrap_receipt(&self) -> Result<()> {
         let receipt = self.runtime.root_dir.join("bootstrap-receipt.json");
-        std::fs::write(
+        // Receipts/flags gate bootstrap and upgrade decisions: a truncated one
+        // reads as "not installed" and triggers a multi-minute rebuild, so all
+        // of them go through tmp+rename.
+        crate::client_adapters::atomic_write(
             &receipt,
-            serde_json::to_vec_pretty(&json!({
+            &serde_json::to_vec_pretty(&json!({
                 "managedBy": "Headroom",
                 "runtime": "python",
                 "scope": "self-contained",
@@ -3599,14 +3602,15 @@ impl ToolManager {
 
     fn write_ready_flag(&self) -> Result<()> {
         let ready_flag = self.runtime.ready_flag();
-        std::fs::write(
+        crate::client_adapters::atomic_write(
             &ready_flag,
             json!({
                 "managedPython": self.runtime.managed_python(),
                 "managedPip": self.runtime.managed_pip(),
                 "scope": "self-contained"
             })
-            .to_string(),
+            .to_string()
+            .as_bytes(),
         )
         .with_context(|| format!("writing {}", ready_flag.display()))?;
         Ok(())
@@ -3614,9 +3618,9 @@ impl ToolManager {
 
     fn write_tool_receipt(&self, tool_id: &str, payload: serde_json::Value) -> Result<()> {
         let path = self.runtime.tools_dir.join(format!("{tool_id}.json"));
-        std::fs::write(
+        crate::client_adapters::atomic_write(
             &path,
-            serde_json::to_vec_pretty(&payload).context("serializing managed tool receipt")?,
+            &serde_json::to_vec_pretty(&payload).context("serializing managed tool receipt")?,
         )
         .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
@@ -4063,53 +4067,83 @@ fn write_headroom_to_claude_json(entrypoint: &Path, proxy_url: &str) -> Result<(
 }
 
 fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &str) -> Result<()> {
+    let desired = json!({
+        "command": entrypoint,
+        "args": ["mcp", "serve"],
+        "env": { "HEADROOM_PROXY_URL": proxy_url },
+    });
+
+    let modified_time = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+
     // ~/.claude.json holds OAuth state and per-project settings, and Claude
-    // Code rewrites it frequently. A read or parse failure here (e.g. a
-    // mid-write partial file) must never degrade to an empty object, or the
-    // write below replaces the user's entire config with just our entry.
-    let mut config: Value = if path.exists() {
-        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-            json!({})
+    // Code rewrites it frequently — often while this runs (bootstrap,
+    // upgrade, requirements repair). Two defenses against reverting a
+    // concurrent Claude Code write with our stale snapshot: skip the publish
+    // entirely when our entry is already present and correct (the common
+    // case on every repair), and re-check the file's mtime just before the
+    // rename, retrying the whole read-modify-write if it moved.
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 0..MAX_ATTEMPTS {
+        let seen_modified = modified_time(path);
+
+        // A read or parse failure (e.g. a mid-write partial file) must never
+        // degrade to an empty object, or the write below replaces the user's
+        // entire config with just our entry.
+        let mut config: Value = if path.exists() {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+                json!({})
+            } else {
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "parsing {} failed; refusing to overwrite potentially valid user config",
+                        path.display()
+                    )
+                })?
+            }
         } else {
-            serde_json::from_slice(&bytes).with_context(|| {
-                format!(
-                    "parsing {} failed; refusing to overwrite potentially valid user config",
-                    path.display()
-                )
-            })?
+            json!({})
+        };
+
+        if config
+            .get("mcpServers")
+            .and_then(|servers| servers.get("headroom"))
+            == Some(&desired)
+        {
+            return Ok(());
         }
-    } else {
-        json!({})
-    };
 
-    let root = config
-        .as_object_mut()
-        .context("~/.claude.json root is not a JSON object")?;
+        let root = config
+            .as_object_mut()
+            .context("~/.claude.json root is not a JSON object")?;
 
-    root.entry("mcpServers")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .context("~/.claude.json mcpServers is not a JSON object")?
-        .insert(
-            "headroom".into(),
-            json!({
-                "command": entrypoint,
-                "args": ["mcp", "serve"],
-                "env": { "HEADROOM_PROXY_URL": proxy_url },
-            }),
-        );
+        root.entry("mcpServers")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .context("~/.claude.json mcpServers is not a JSON object")?
+            .insert("headroom".into(), desired.clone());
 
-    let _ = crate::client_adapters::backup_if_exists(path)?;
+        let _ = crate::client_adapters::backup_if_exists(path)?;
 
-    // Publish atomically (tmp + rename) so a crash mid-write can never leave
-    // a truncated ~/.claude.json behind.
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".headroom-tmp");
-    let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming {} into place", tmp.display()))
+        // Publish atomically (tmp + rename) so a crash mid-write can never
+        // leave a truncated ~/.claude.json behind.
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".headroom-tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+
+        if modified_time(path) != seen_modified && attempt + 1 < MAX_ATTEMPTS {
+            // Claude Code wrote while we worked — merge against the new
+            // contents instead of reverting them.
+            let _ = std::fs::remove_file(&tmp);
+            continue;
+        }
+        return std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} into place", tmp.display()));
+    }
+    unreachable!("loop always returns")
 }
 
 fn is_local_proxy_reachable() -> bool {
@@ -4136,10 +4170,35 @@ fn diagnose_proxy_port(port: u16) -> PortState {
     // non-HTTP service (SSH, Redis, etc.) will not.
     let headroom_like = probe_headroom_http(port, Duration::from_millis(400));
     if headroom_like {
-        PortState::HeadroomRunning
+        // "Speaks HTTP" alone is not identity. HeadroomRunning occupants get
+        // killed by the reclaim path, so verify the pid's argv actually looks
+        // like our managed backend — an unrelated local HTTP server (dev
+        // server, docker forward) squatting the port must route to the
+        // foreign fallback-port path instead of being SIGKILLed.
+        let detail = lsof_listener(port).unwrap_or_else(|| "unknown process".into());
+        match parse_pid_from_lsof_detail(&detail) {
+            Some(pid) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
+            _ => PortState::ForeignOccupant(detail),
+        }
     } else {
         PortState::ForeignOccupant(lsof_listener(port).unwrap_or_else(|| "unknown process".into()))
     }
+}
+
+/// True when `pid`'s full command line looks like Headroom's managed backend
+/// (venv python under the Headroom app-support tree, or anything
+/// headroom-branded). Guards port reclaim from killing an unrelated process
+/// that merely answers HTTP on our port.
+fn pid_is_headroom_backend(pid: u32) -> bool {
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .to_lowercase()
+        .contains("headroom")
 }
 
 fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
@@ -4260,6 +4319,12 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     else {
         bail!("{}", format_already_running_bail(port));
     };
+    // Belt-and-braces identity gate (diagnose_proxy_port already filters, but
+    // the upgrade flow reaches here with force set): never kill a pid that
+    // doesn't look like our own backend.
+    if !pid_is_headroom_backend(pid) {
+        bail!("{}", format_already_running_bail(port));
+    }
 
     log::warn!("[backend_port] reclaiming orphaned headroom proxy pid {pid} on port {port}");
     let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
@@ -5795,7 +5860,7 @@ mod tests {
 
     use super::{
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
-        extract_required_pydantic_core_version, format_all_foreign_bail,
+        diagnose_proxy_port, extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, looks_like_corrupt_venv_error, parse_major_minor_patch,
@@ -5805,7 +5870,8 @@ mod tests {
         reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
         run_command, sanitize_log_variant, sha256_bytes, summarize_kompress_prefetch_failure,
         verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
-        PipOutputCapture, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
+        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
@@ -6561,10 +6627,14 @@ class H(http.server.BaseHTTPRequestHandler):
 S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 "#;
 
+        // The trailing marker arg makes the stand-in pass the
+        // pid_is_headroom_backend argv identity gate, like a real orphan
+        // running from the Headroom app-support venv path would.
         let mut child = std::process::Command::new("/usr/bin/python3")
             .arg("-c")
             .arg(script)
             .arg(port.to_string())
+            .arg("--headroom-test-standin")
             .spawn()
             .expect("spawn stand-in proxy");
 
@@ -6596,6 +6666,60 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             wait_for_port_free(port, Duration::from_secs(3)),
             "force=true must free the port"
         );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn reclaim_orphan_proxy_never_kills_foreign_http_server() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+
+        // An unrelated local HTTP server (no headroom marker in argv) that
+        // happens to hold the port: reclaim must bail — even with force — and
+        // leave the process alive.
+        let script = r#"
+import http.server, socketserver, sys
+class S(socketserver.TCPServer):
+    allow_reuse_address = True
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+    def log_message(self, *a):
+        pass
+S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+"#;
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(script)
+            .arg(port.to_string())
+            .spawn()
+            .expect("spawn foreign http server");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !probe_backend_readyz_ok(port) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "foreign server never came up on port {port}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        assert!(
+            reclaim_orphan_proxy(port, true).is_err(),
+            "reclaim must refuse to kill a non-headroom occupant"
+        );
+        assert!(
+            probe_backend_readyz_ok(port),
+            "foreign occupant must still be alive after reclaim bails"
+        );
+        assert!(matches!(
+            diagnose_proxy_port(port),
+            PortState::ForeignOccupant(_)
+        ));
 
         let _ = child.kill();
         let _ = child.wait();

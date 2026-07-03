@@ -302,11 +302,36 @@ jobs:
           set -euo pipefail
           workdir="$(mktemp -d)"
           gh release download "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir"
-          gh release delete staging-rolling --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
-          gh release create staging-rolling \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Headroom staging (rolling)" \
-            --notes "Rolling pointer to the latest build. Current: ${STABLE_TAG} (stable)." \
-            --prerelease \
-            --target "$GITHUB_SHA" \
-            "$workdir"/*
+          # Update in place instead of delete-then-recreate: a mid-step
+          # failure used to leave the release deleted, 404ing the beta
+          # updater endpoint until the next release. Binaries go up first
+          # and the updater manifest (latest.json) last, so the endpoint
+          # never points at assets that aren't there yet.
+          if gh release view staging-rolling --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            for f in "$workdir"/*; do
+              [ "$(basename "$f")" = "latest.json" ] && continue
+              gh release upload staging-rolling "$f" --clobber --repo "$GITHUB_REPOSITORY"
+            done
+            if [ -f "$workdir/latest.json" ]; then
+              gh release upload staging-rolling "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+            fi
+            gh release edit staging-rolling \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom staging (rolling)" \
+              --notes "Rolling pointer to the latest build. Current: ${STABLE_TAG} (stable)."
+            # Prune assets left over from previous versions (different
+            # per-version filenames) now that the manifest points elsewhere.
+            for asset in $(gh release view staging-rolling --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'); do
+              if [ ! -e "$workdir/$asset" ]; then
+                gh release delete-asset staging-rolling "$asset" --yes --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+          else
+            gh release create staging-rolling \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom staging (rolling)" \
+              --notes "Rolling pointer to the latest build. Current: ${STABLE_TAG} (stable)." \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              "$workdir"/*
+          fi
