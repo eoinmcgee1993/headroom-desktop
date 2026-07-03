@@ -259,7 +259,15 @@ impl ActivityFacts {
             }
         }
 
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        // An unreadable file (EACCES/EROFS) must not brick launch any more
+        // than a corrupt one — degrade to a fresh start.
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                log::warn!("activity-facts.json unreadable ({err}); starting fresh");
+                return Ok(Self::empty(path));
+            }
+        };
         // A corrupt file (e.g. truncated by a crash mid-write) must never
         // brick launch: an Err here propagates to AppState::new()'s expect()
         // and panics on every start until the user deletes the file by hand.

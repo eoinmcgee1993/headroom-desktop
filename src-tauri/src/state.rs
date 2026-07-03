@@ -2209,12 +2209,14 @@ impl AppState {
             // periods the app wasn't running.
             {
                 let today_key = local_day_key(Local::now());
+                let utc_today_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
                 let mut tracker = self.savings_tracker.lock();
                 if tracker.ingest_native_rollups(
                     &native_daily,
                     &native_hourly,
                     &cutoff_date,
                     &today_key,
+                    &utc_today_key,
                 ) {
                     let _ = tracker.persist_state();
                 }
@@ -3657,9 +3659,12 @@ struct DailySavingsBucket {
     total_tokens_sent: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 struct PersistedSavingsState {
+    // Container-level `default`: a field added (or removed) by another release
+    // must never fail the whole parse — that used to silently wipe all
+    // daily/hourly history and lifetime counters on upgrade/downgrade.
     schema_version: u8,
     session_requests: usize,
     session_estimated_savings_usd: f64,
@@ -3670,7 +3675,6 @@ struct PersistedSavingsState {
     /// at which token milestones were last fired. `None` on profiles written
     /// before this field existed, so milestones for already-earned savings are
     /// seeded (suppressed) on first load rather than firing all at once.
-    #[serde(default)]
     lifetime_token_milestone_high_water: Option<u64>,
     last_observation: Option<SavingsObservation>,
     display_session_baseline: Option<SavingsObservation>,
@@ -3707,14 +3711,30 @@ impl SavingsTracker {
         let records_path = telemetry_file(base_dir, "savings-records.jsonl");
         let state_path = config_file(base_dir, "savings-state.json");
         if !records_path.exists() {
-            let _ = std::fs::OpenOptions::new()
+            // Telemetry only — a full disk or locked Application Support must
+            // not abort AppState::new() and crash-loop launch (Sentry RUST-1P).
+            if let Err(err) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&records_path)
-                .with_context(|| format!("creating {}", records_path.display()))?;
+            {
+                log::warn!(
+                    "creating {} failed ({err}); savings records disabled",
+                    records_path.display()
+                );
+            }
         }
 
-        let persisted_state = load_persisted_savings_state(&state_path).ok().flatten();
+        // A corrupt file must not brick launch, but it must also not be
+        // silently replaced: back it up for recovery and say so in the log.
+        let persisted_state = match load_persisted_savings_state(&state_path) {
+            Ok(state) => state,
+            Err(err) => {
+                log::warn!("savings-state.json unreadable ({err}); backing up and starting fresh");
+                let _ = std::fs::rename(&state_path, state_path.with_extension("json.corrupt"));
+                None
+            }
+        };
 
         // Seed the milestone high-water from the persisted value, or (on first
         // load after upgrade) from the current bucket sum so already-earned
@@ -3763,7 +3783,11 @@ impl SavingsTracker {
                 .map_or_else(BTreeMap::new, |state| state.hourly_savings.clone()),
             last_written_at: None,
         };
-        tracker.persist_state()?;
+        // Best-effort: persistence failing (ENOSPC/EACCES) degrades to
+        // in-memory stats; it is retried on every observe tick anyway.
+        if let Err(err) = tracker.persist_state() {
+            log::warn!("initial savings-state persist failed: {err}");
+        }
         Ok(tracker)
     }
 
@@ -3850,11 +3874,15 @@ impl SavingsTracker {
         hourly: &[HourlySavingsPoint],
         cutoff_date: &str,
         today_key: &str,
+        utc_today_key: &str,
     ) -> bool {
         let cutoff_hour = format!("{cutoff_date}T00:00");
         let mut changed = false;
         for point in daily {
-            if point.date.as_str() < cutoff_date || point.date.as_str() >= today_key {
+            // Daily rollups are UTC-day keyed and settle at UTC midnight, so
+            // the live bucket is excluded by UTC today; hourly keys below stay
+            // local and are guarded by the local today_key.
+            if point.date.as_str() < cutoff_date || point.date.as_str() >= utc_today_key {
                 continue;
             }
             let bucket = DailySavingsBucket {
@@ -4302,7 +4330,9 @@ impl SavingsTracker {
     fn persist_state(&mut self) -> Result<()> {
         let serialized = serde_json::to_vec_pretty(&self.persisted_state())
             .context("serializing savings state")?;
-        std::fs::write(&self.state_path, serialized)
+        // Temp+rename: a crash/power loss mid-write used to leave truncated
+        // JSON that the next launch silently replaced with a fresh tracker.
+        crate::client_adapters::atomic_write(&self.state_path, &serialized)
             .with_context(|| format!("writing {}", self.state_path.display()))?;
         Ok(())
     }
@@ -4373,6 +4403,15 @@ fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsSt
     if persisted.schema_version == 3 {
         Ok(Some(persisted))
     } else {
+        // Unknown schema (e.g. downgrade after a bad update): preserve the
+        // file — the fresh tracker's first persist would otherwise overwrite
+        // the user's entire savings history with zeros.
+        log::warn!(
+            "{} has schema {} (expected 3); backing up and starting fresh",
+            path.display(),
+            persisted.schema_version
+        );
+        let _ = std::fs::rename(path, path.with_extension("json.schema-mismatch"));
         Ok(None)
     }
 }
@@ -4481,7 +4520,15 @@ impl HeadroomSavingsHistoryResponse {
         self.daily
             .iter()
             .map(|point| DailySavingsPoint {
-                date: local_day_key(point.timestamp.with_timezone(&Local)),
+                // The backend buckets daily rollups at UTC midnight, so the
+                // bucket's identity is its UTC date. Converting to Local here
+                // used to relabel every bucket as the *previous* local day for
+                // users west of UTC, shifting the chart and overwriting
+                // genuine local-day archive buckets with another period's
+                // totals.
+                // ponytail: labels are UTC days; exact local-day rollups need
+                // backend-side local bucketing (or reconstruction from hourly).
+                date: point.timestamp.format("%Y-%m-%d").to_string(),
                 estimated_savings_usd: point.compression_savings_usd_delta,
                 estimated_tokens_saved: point.tokens_saved,
                 actual_cost_usd: point.total_input_cost_usd_delta,
@@ -8196,7 +8243,7 @@ mod tests {
             hourly("2026-06-16T09:00", 60), // today -> skipped
         ];
 
-        assert!(tracker.ingest_native_rollups(&native_daily, &native_hourly, cutoff, today));
+        assert!(tracker.ingest_native_rollups(&native_daily, &native_hourly, cutoff, today, today));
 
         let daily_dates: Vec<String> = tracker
             .daily_savings()
@@ -8212,7 +8259,13 @@ mod tests {
         assert_eq!(hourly_keys, vec!["2026-06-10T09:00"]);
 
         // Re-ingesting identical data must not report a change (no needless persist).
-        assert!(!tracker.ingest_native_rollups(&native_daily, &native_hourly, cutoff, today));
+        assert!(!tracker.ingest_native_rollups(
+            &native_daily,
+            &native_hourly,
+            cutoff,
+            today,
+            today
+        ));
     }
 
     #[test]
@@ -8224,12 +8277,14 @@ mod tests {
             &[],
             "2026-06-02",
             "2026-06-16",
+            "2026-06-16",
         ));
         // Backend reports the authoritative (different) value -> overwrite + change.
         assert!(tracker.ingest_native_rollups(
             &[daily("2026-06-10", 100, 1.0)],
             &[],
             "2026-06-02",
+            "2026-06-16",
             "2026-06-16",
         ));
         let point = tracker
@@ -8251,6 +8306,7 @@ mod tests {
             &[],
             "2026-06-02",
             "2026-06-16",
+            "2026-06-16",
         ));
         // Next render: June 10 is now the dropped boundary (absent); only the
         // newer settled day arrives.
@@ -8258,6 +8314,7 @@ mod tests {
             &[daily("2026-06-11", 70, 0.7)],
             &[],
             "2026-06-02",
+            "2026-06-16",
             "2026-06-16",
         ));
         let by_date: std::collections::BTreeMap<String, u64> = tracker

@@ -632,8 +632,14 @@ pub fn clear_client_setups() -> Result<()> {
     // disable_client_setup also clears remembered_clients as a side effect,
     // which would otherwise erase the snapshot we need for restore_client_setups.
     let pre = load_setup_state();
-    let snapshot_clients = pre.configured_clients.clone();
-    let snapshot_shell_files = pre.managed_shell_files.clone();
+    // Merge with any prior snapshot so a second clear is idempotent: after a
+    // pause, configured_clients is already empty and only remembered_clients
+    // holds the restore set — a quit-time clear must not wipe it (pause then
+    // Cmd-Q used to permanently lose all connectors).
+    let mut snapshot_clients = pre.remembered_clients.clone();
+    snapshot_clients.extend(pre.configured_clients.clone());
+    let mut snapshot_shell_files = pre.remembered_shell_files.clone();
+    snapshot_shell_files.extend(pre.managed_shell_files.clone());
 
     for spec in MANAGED_CLIENT_SPECS {
         let _ = disable_client_setup(spec.id);
@@ -2353,6 +2359,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -2365,10 +2372,20 @@ CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or (pathlib.Path.home() /
 CONFIG = CODEX_HOME / "config.toml"
 BASE_URL = "{base}"
 READYZ = "{readyz}"
+# stderr fires every invocation; the macOS notification is rate-limited so an
+# app restart doesn't produce a storm of alerts.
+DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
+DEBOUNCE_SECONDS = 600
 
 
 def notify(message):
     try:
+        if time.time() - DEBOUNCE_PATH.stat().st_mtime < DEBOUNCE_SECONDS:
+            return
+    except OSError:
+        pass
+    try:
+        DEBOUNCE_PATH.touch()
         subprocess.run(
             [
                 "/usr/bin/osascript",
@@ -2418,7 +2435,7 @@ def load_config():
     return toml_fallback(text)
 
 
-def reachable():
+def probe():
     # Any HTTP response means our server answered -- the app is up. A 503 during
     # bypass mode is still "up", so only connection errors / timeouts count as down.
     try:
@@ -2428,6 +2445,14 @@ def reachable():
         return True
     except Exception:
         return False
+
+
+def reachable():
+    # One retry after a short pause so an app-relaunch blip doesn't read as "down".
+    if probe():
+        return True
+    time.sleep(2)
+    return probe()
 
 
 def main():
@@ -2444,7 +2469,7 @@ def main():
         if base != BASE_URL:
             issues.append("Headroom provider base_url is " + str(base) + " (expected " + BASE_URL + ")")
     if not reachable():
-        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- open the app")
+        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- it may be restarting; open the app if it isn't")
 
     if issues:
         notify("; ".join(issues))
@@ -2690,17 +2715,29 @@ fn build_claude_guard_script() -> String {
 """Headroom Claude routing guard (managed by Headroom Desktop -- do not edit)."""
 import json
 import os
+import pathlib
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
 BASE_URL = "{base}"
 READYZ = "{readyz}"
+# stderr fires every invocation; the macOS notification is rate-limited so an
+# app restart doesn't produce a storm of alerts.
+DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
+DEBOUNCE_SECONDS = 600
 
 
 def notify(message):
     try:
+        if time.time() - DEBOUNCE_PATH.stat().st_mtime < DEBOUNCE_SECONDS:
+            return
+    except OSError:
+        pass
+    try:
+        DEBOUNCE_PATH.touch()
         subprocess.run(
             [
                 "/usr/bin/osascript",
@@ -2716,7 +2753,7 @@ def notify(message):
         pass
 
 
-def reachable():
+def probe():
     # Any HTTP response means our server answered -- the app is up. A 503 during
     # bypass mode is still "up", so only connection errors / timeouts count as down.
     try:
@@ -2726,6 +2763,14 @@ def reachable():
         return True
     except Exception:
         return False
+
+
+def reachable():
+    # One retry after a short pause so an app-relaunch blip doesn't read as "down".
+    if probe():
+        return True
+    time.sleep(2)
+    return probe()
 
 
 def settings_base(path):
@@ -2767,7 +2812,7 @@ def main():
     if effective != BASE_URL:
         issues.append(diagnose_route(effective))
     if not reachable():
-        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- open the app")
+        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- it may be restarting; open the app if it isn't")
 
     if issues:
         notify("; ".join(issues))
@@ -6226,6 +6271,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(script.contains("did not inherit the Headroom shell env"));
         assert!(script.contains("overrides Headroom's route"));
         assert!(!script.contains("ANTHROPIC_BASE_URL is not \" + BASE_URL"));
+        // Notifications are debounced and reachability retries once, so an app
+        // relaunch doesn't produce a notification storm.
+        assert!(script.contains("DEBOUNCE_PATH.touch()"));
+        assert!(script.contains("time.sleep(2)\n    return probe()"));
     }
 
     #[test]
@@ -6236,5 +6285,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // Messages include the actual found value, not just "is not headroom".
         assert!(script.contains("(expected \"headroom\")"));
         assert!(script.contains("(expected \" + BASE_URL + \")"));
+        assert!(script.contains("DEBOUNCE_PATH.touch()"));
+        assert!(script.contains("time.sleep(2)\n    return probe()"));
     }
 }

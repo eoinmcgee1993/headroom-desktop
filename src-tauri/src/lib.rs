@@ -954,9 +954,10 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             port_conflict::note_proxy_started(&app_handle);
             // The intercept layer on 6767 is always bound by the Rust app, so
             // reachability really means "headroom's backend on 6768 is up".
-            // We probe it by hitting 6767/health — the intercept forwards to
-            // 6768 and returns 502 until the backend actually responds, so a
-            // 2xx confirms the full chain is live. Gatekeeper's first-launch
+            // We probe it by hitting 6767/readyz — the intercept forwards to
+            // 6768, answering 503 (local, no upstream fallback for proxy
+            // paths) until the backend actually responds, so a 2xx confirms
+            // the full chain is live. Gatekeeper's first-launch
             // scan of the bundled venv can take 30-60s, so we wait up to 60s
             // to match the ETA shown to the user.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -2087,18 +2088,33 @@ async fn get_headroom_logs(
 /// jump from 0 → N and falsely flip the badge to healthy.
 #[tauri::command]
 async fn get_headroom_request_count() -> Option<u64> {
-    fetch_proxy_request_count_stats()
+    // Blocking reqwest call — keep it off the async workers; the setup
+    // verification UI polls this while a connector is in 'verifying'.
+    tokio::task::spawn_blocking(fetch_proxy_request_count_stats)
+        .await
+        .ok()
+        .flatten()
 }
 
 fn fetch_proxy_request_count_stats() -> Option<u64> {
     parse_request_count_from_stats_body(&fetch_proxy_stats_body()?)
 }
 
+fn stats_client() -> Option<&'static reqwest::blocking::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_millis(500))
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
 fn fetch_proxy_stats_body() -> Option<String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_millis(500))
-        .build()
-        .ok()?;
+    let client = stats_client()?;
     for host in ["127.0.0.1", "localhost"] {
         let url = format!("http://{host}:6767/stats");
         let Ok(response) = client.get(&url).send() else {
@@ -2119,7 +2135,11 @@ fn fetch_proxy_stats_body() -> Option<String> {
 /// so a prompt sent to one client only flips that client's row, not all rows.
 #[tauri::command]
 async fn get_headroom_request_counts_by_agent() -> Option<std::collections::HashMap<String, u64>> {
-    parse_request_counts_by_agent(&fetch_proxy_stats_body()?)
+    let body = tokio::task::spawn_blocking(fetch_proxy_stats_body)
+        .await
+        .ok()
+        .flatten()?;
+    parse_request_counts_by_agent(&body)
 }
 
 pub(crate) fn parse_request_counts_by_agent(

@@ -200,6 +200,15 @@ mod platform {
     }
 
     pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
+        write_secret_inner(service, account, secret, true)
+    }
+
+    fn write_secret_inner(
+        service: &str,
+        account: &str,
+        secret: &str,
+        allow_retry: bool,
+    ) -> Result<(), String> {
         unsafe {
             let query = base_query(service, account);
             let data = CFDataCreate(std::ptr::null(), secret.as_ptr(), secret.len() as CFIndex);
@@ -243,10 +252,20 @@ mod platform {
             if add_status == ERR_SEC_DUPLICATE_ITEM {
                 // Update missed it (inaccessible/ghost item, e.g. created by a
                 // prior app signature) but Add sees the primary-key collision.
-                // Drop the stale item and re-add once. ponytail: single retry --
-                // a duplicate can't recur after a successful delete.
-                let _ = delete_secret(service, account);
-                return write_secret(service, account, secret);
+                // Drop the stale item and re-add ONCE: delete_secret maps
+                // not-found to Ok, so a truly undeletable ghost (iCloud sync
+                // residue, cross-signature ACL) would loop Update->notFound,
+                // Add->duplicate, Delete->notFound forever if we recursed
+                // unboundedly.
+                if allow_retry {
+                    let _ = delete_secret(service, account);
+                    return write_secret_inner(service, account, secret, false);
+                }
+                return Err(
+                    "write keychain secret failed: duplicate item persists after delete \
+                     (inaccessible keychain entry from another app signature?)"
+                        .to_string(),
+                );
             }
             check_status(add_status, "write keychain secret")
         }

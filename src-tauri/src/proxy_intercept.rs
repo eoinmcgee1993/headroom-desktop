@@ -314,17 +314,21 @@ async fn handle(
     // identity with headroom-web. The send is non-blocking; the actual
     // OAuth-profile fetch happens off the request hot path.
     if let Some(token) = extract_bearer(&buf) {
-        let changed = bearer_value_changed(&token_slot, &token);
         // For Codex requests the bearer is an OpenAI OAuth JWT carrying the
-        // ChatGPT plan; decode it so the Codex gate can recommend a tier.
+        // ChatGPT plan; decode it so the Codex gate can recommend a tier. It
+        // must never land in the Claude bearer slot: pricing would send it to
+        // Anthropic's OAuth profile/usage endpoints (cross-provider credential
+        // transmission) where it only earns 401s.
         if is_codex {
             if let Some(tier) = decode_codex_plan_tier(&token) {
                 *codex_plan_slot.lock() = Some(tier);
             }
-        }
-        *token_slot.lock() = Some(BearerToken::new(token));
-        if changed {
-            let _ = fresh_bearer_tx.send(());
+        } else {
+            let changed = bearer_value_changed(&token_slot, &token);
+            *token_slot.lock() = Some(BearerToken::new(token));
+            if changed {
+                let _ = fresh_bearer_tx.send(());
+            }
         }
     }
 
@@ -374,10 +378,17 @@ async fn handle(
 
     // Forward to the headroom backend.
     let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
-        // headroom not up yet — send a 502 so the client gets a clean error.
-        let _ = client
-            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            .await;
+        // Backend down or mid-restart (crash, gate transition, post-update
+        // cold boot — which deliberately holds the bypass flags off for up to
+        // 10 minutes): fall back per-request to the native provider instead
+        // of a bare 502, so in-flight Claude Code / Codex sessions keep
+        // working, merely unoptimized and unmetered, until the watchdog
+        // brings the backend back. A deliberately-stopped backend (pricing
+        // gate) never reaches here — the bypass branches above handle it.
+        // `forward_direct_to_anthropic` routes OpenAI paths to
+        // OPENAI_DIRECT_BASE, so Codex degrades identically to Claude.
+        log::warn!("backend {backend_addr} unreachable; forwarding request direct to provider");
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     };
 
@@ -1116,13 +1127,14 @@ async fn forward_direct_to_anthropic(
             .map(|(_, v)| v.as_str())
     };
 
-    // A WebSocket/upgrade handshake cannot work here: Upgrade/Connection are
-    // hop-by-hop (stripped below) and reqwest issues a plain request. A
-    // deliberate 501 beats forwarding a mangled non-upgrade request upstream.
+    // A WebSocket/upgrade handshake needs its own path: Upgrade/Connection are
+    // hop-by-hop for the plain forward below, and Codex's current transport is
+    // WS on /v1/responses — a 501 here would hard-break Codex in exactly the
+    // bypass modes meant to keep it alive. Tunnel the upgrade via hyper's
+    // connection takeover instead.
     if header_value("upgrade").is_some() {
-        let _ = client
-            .write_all(b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n")
-            .await;
+        let url = format!("{}{}", effective_base, parsed.path);
+        tunnel_upgrade_direct(client, &parsed, leftover_body, &url).await;
         return;
     }
 
@@ -1244,6 +1256,93 @@ async fn forward_direct_to_anthropic(
         }
     }
     let _ = client.write_all(b"0\r\n\r\n").await;
+}
+
+/// Tunnel a WebSocket/upgrade handshake to the upstream through the shared
+/// reqwest client. hyper keeps the connection on a 101 and hands it over via
+/// `Response::upgrade()`, after which both sockets are spliced verbatim. Used
+/// by the bypass forwarder so gated/bypassed Codex WS sessions keep working.
+async fn tunnel_upgrade_direct(
+    mut client: TcpStream,
+    parsed: &ParsedRequestHead,
+    leftover: &[u8],
+    url: &str,
+) {
+    let method = match reqwest::Method::from_bytes(parsed.method.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            let _ = client
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+
+    let mut req = upstream_client().request(method, url);
+    for (name, value) in &parsed.headers {
+        // Unlike the plain forward, Connection/Upgrade/Sec-WebSocket-* must
+        // survive: hyper needs the upgrade intent to keep the connection for
+        // takeover. Only strip what we rewrite ourselves.
+        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        req = req.header(name, value);
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("proxy_intercept bypass upgrade forward failed: {e}");
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
+    );
+    for (name, value) in resp.headers().iter() {
+        if name.as_str().eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            head.push_str(&format!("{}: {}\r\n", name.as_str(), v));
+        }
+    }
+    head.push_str("\r\n");
+
+    if status != reqwest::StatusCode::SWITCHING_PROTOCOLS {
+        // Handshake refused — relay the upstream's verdict and close.
+        let body = resp.bytes().await.unwrap_or_default();
+        if client.write_all(head.as_bytes()).await.is_ok() {
+            let _ = client.write_all(&body).await;
+        }
+        return;
+    }
+
+    let mut upstream = match resp.upgrade().await {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn!("proxy_intercept bypass upgrade takeover failed: {e}");
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+    if client.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    // Frames the client sent before the handshake completed.
+    if !leftover.is_empty() && upstream.write_all(leftover).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
 }
 
 struct ParsedRequestHead {
@@ -1870,12 +1969,29 @@ mod tests {
 
     #[tokio::test]
     #[serial(backend_port)]
-    async fn intercept_returns_502_when_backend_is_unreachable() {
+    async fn intercept_falls_back_direct_when_backend_is_unreachable() {
         // Pick a backend port that nothing is listening on. Bind+immediately
         // drop a listener to grab a free port, then connect attempts will fail.
         let (probe, dead_backend_addr) = bind_ephemeral().await;
         drop(probe);
         backend_port::set(dead_backend_addr.port());
+
+        // Mock upstream: answers 200 to whatever arrives. API traffic must
+        // land here (per-request direct fallback) instead of getting a 502.
+        let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
 
         let token_slot: SharedToken = Arc::new(Mutex::new(None));
         let intercept_listener = TcpListener::bind("127.0.0.1:0")
@@ -1885,7 +2001,7 @@ mod tests {
         drop(intercept_listener);
         let slot_for_run = token_slot.clone();
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let upstream_base = Arc::new(format!("http://127.0.0.1:{}", upstream_addr.port()));
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
             let _ = run(
@@ -1901,6 +2017,25 @@ mod tests {
             )
             .await;
         });
+
+        let read_response = |mut client: TcpStream| async move {
+            let mut response = Vec::new();
+            let mut tmp = [0u8; 256];
+            let _ = timeout(Duration::from_secs(5), async {
+                loop {
+                    let n = client.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    response.extend_from_slice(&tmp[..n]);
+                    if response.len() >= 16 {
+                        break;
+                    }
+                }
+            })
+            .await;
+            response
+        };
 
         let mut client = None;
         for _ in 0..50 {
@@ -1920,26 +2055,28 @@ mod tests {
             .write_all(request.as_bytes())
             .await
             .expect("write request");
-
-        let mut response = Vec::new();
-        let mut tmp = [0u8; 256];
-        let _ = timeout(Duration::from_secs(2), async {
-            loop {
-                let n = client.read(&mut tmp).await.unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                response.extend_from_slice(&tmp[..n]);
-                if response.len() >= 16 {
-                    break;
-                }
-            }
-        })
-        .await;
+        let response = read_response(client).await;
         let response_str = std::str::from_utf8(&response).unwrap_or("");
         assert!(
-            response_str.starts_with("HTTP/1.1 502"),
-            "expected 502 Bad Gateway, got: {response_str:?}"
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected direct-to-upstream 200 fallback, got: {response_str:?}"
+        );
+
+        // Local proxy paths (health probes, stats) must NOT leak upstream on
+        // fallback: the boot-time readyz poll would otherwise flap green and
+        // real probes would generate provider traffic every 250ms.
+        let mut probe_client = TcpStream::connect(intercept_addr)
+            .await
+            .expect("probe connect");
+        probe_client
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write probe");
+        let response = read_response(probe_client).await;
+        let response_str = std::str::from_utf8(&response).unwrap_or("");
+        assert!(
+            response_str.starts_with("HTTP/1.1 503"),
+            "expected local 503 for /readyz on fallback, got: {response_str:?}"
         );
 
         run_task.abort();

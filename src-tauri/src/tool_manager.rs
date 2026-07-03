@@ -193,6 +193,14 @@ const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 20, 0);
 /// pre-release/build suffixes (`-rc.1`, `+build`, `.dev0`, etc.). Returns
 /// None when the prefix isn't a numeric `major.minor`. `patch` defaults to
 /// 0 when missing or unparseable, so `"0.19"` and `"0.19.0"` compare equal.
+/// Pre-upstream concurrency passed to the backend: 2x logical cores,
+/// clamped to [8, 32]. See the spawn-site comment for why the proxy's own
+/// 8-cap is safe to exceed under the desktop's env.
+fn pre_upstream_concurrency() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (cores * 2).clamp(8, 32)
+}
+
 fn parse_major_minor_patch(s: &str) -> Option<(u32, u32, u32)> {
     let head = s.split(|c: char| c == '-' || c == '+').next()?;
     let mut parts = head.split('.');
@@ -937,6 +945,18 @@ impl ToolManager {
                     // baseline still feeds the /stats savings estimate. Level 2 =
                     // skip pre/postamble, don't restate in-context code/tool output.
                     .env("HEADROOM_VERBOSITY_LEVEL", "2")
+                    // Pre-upstream concurrency. The proxy's own auto is
+                    // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
+                    // event loop from CPU-bound compression. The desktop runs with
+                    // HEADROOM_BACKGROUND_COMPRESSION=1 (above), which moves that
+                    // CPU work off the request path, so the semaphore slots are
+                    // mostly I/O-bound and the 8-cap just queues heavy multi-agent
+                    // load (30+ sessions) until acquire timeouts degrade /readyz
+                    // and the watchdog force-kills. Scale with cores instead.
+                    .env(
+                        "HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY",
+                        pre_upstream_concurrency().to_string(),
+                    )
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(
                         log_file
@@ -5714,16 +5734,23 @@ mod tests {
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_outdated_codex,
         looks_like_corrupt_venv_error, parse_major_minor_patch, parse_pid_from_lsof_detail,
-        path_with_binary_dir, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
-        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, sha256_bytes, summarize_kompress_prefetch_failure,
-        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
-        PipOutputCapture, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
+        path_with_binary_dir, pre_upstream_concurrency, probe_backend_readyz_ok,
+        proxy_argv_contains_expected_flags, read_headroom_learn_metadata_from_path,
+        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
+        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
+        sha256_bytes, summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
     use std::net::TcpListener;
+
+    #[test]
+    fn pre_upstream_concurrency_stays_within_bounds() {
+        let value = pre_upstream_concurrency();
+        assert!((8..=32).contains(&value), "got {value}");
+    }
 
     #[test]
     fn httpx_ca_bundle_bridge_mirrors_requests_bundle() {

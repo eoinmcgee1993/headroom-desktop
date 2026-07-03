@@ -282,6 +282,8 @@ const idleRuntimeUpgradeProgress: RuntimeUpgradeProgress = {
 
 const MAX_UPGRADE_AUTO_RETRIES = 2;
 
+const GATE_AUTO_DISABLED_STORAGE_KEY = "headroom:gateAutoDisabledConnectors";
+
 const idleHeadroomLearnStatus: HeadroomLearnStatus = {
   running: false,
   progressPercent: 0,
@@ -1068,7 +1070,29 @@ export default function App() {
   const [showAllUpgradePlans, setShowAllUpgradePlans] = useState(false);
   const [checkoutPollingDeadline, setCheckoutPollingDeadline] = useState<number | null>(null);
   const desktopActivationSentRef = useRef(false);
-  const autoDisabledByGateRef = useRef<Set<string>>(new Set());
+  // Persisted: pricing gates last days, and an app restart mid-gate used to
+  // lose this set — the auto-disabled connectors then never re-enabled when
+  // the gate reopened, leaving users silently unoptimized until a manual
+  // toggle.
+  const [initialAutoDisabledByGate] = useState<Set<string>>(() => {
+    try {
+      const raw = window.localStorage.getItem(GATE_AUTO_DISABLED_STORAGE_KEY);
+      return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+    } catch {
+      return new Set<string>();
+    }
+  });
+  const autoDisabledByGateRef = useRef<Set<string>>(initialAutoDisabledByGate);
+  const persistAutoDisabledByGate = () => {
+    try {
+      window.localStorage.setItem(
+        GATE_AUTO_DISABLED_STORAGE_KEY,
+        JSON.stringify([...autoDisabledByGateRef.current])
+      );
+    } catch {
+      // best effort
+    }
+  };
   const [learnInstallCopyNotice, setLearnInstallCopyNotice] = useState<string | null>(null);
 
   const [stepSignature, setStepSignature] = useState("");
@@ -1257,7 +1281,14 @@ export default function App() {
     const STORAGE_KEY = "headroom:lastNotifiedMismatchTier";
     const mismatch = pricingStatus?.tierMismatch;
     if (!mismatch) {
-      window.localStorage.removeItem(STORAGE_KEY);
+      // tierMismatch is also null when the account fetch merely failed; only
+      // a definitive "no mismatch" (profile present, no sync error) clears
+      // the dedupe key. Clearing on a transient blip re-fired the same
+      // upgrade notification on the next successful poll — nagware on flaky
+      // wifi and sleep/wake cycles.
+      if (pricingStatus?.account && !pricingStatus.accountSyncError) {
+        window.localStorage.removeItem(STORAGE_KEY);
+      }
       return;
     }
     const rank: Record<string, number> = { pro: 1, max5x: 2, max20x: 3 };
@@ -2220,18 +2251,24 @@ export default function App() {
     }
   }, [checkoutPollingDeadline, pricingStatus?.account?.subscriptionActive]);
 
-  // When the pricing gate closes, pause optimization on every enabled
-  // connector (not just Claude Code) one at a time. Each disable refreshes
-  // `connectors`, re-running this effect until none remain enabled.
+  // When the pricing gate closes, pause optimization on enabled connectors
+  // one at a time. Each disable refreshes `connectors`, re-running this
+  // effect until none remain. Codex is exempt while authenticated:
+  // `optimizationAllowed` reflects the *Claude* paid-plan gate, and Codex has
+  // its own independent gate enforced proxy-side (codex_bypass) — a Claude
+  // weekly cap must not switch off a Codex-heavy user's optimization.
   useEffect(() => {
     if (!pricingStatus || pricingStatus.optimizationAllowed || connectorsBusy) {
       return;
     }
-    const target = getEnabledSupportedConnectors(connectors)[0];
+    const target = getEnabledSupportedConnectors(connectors).find(
+      (connector) => !pricingStatus.authenticated || connector.clientId !== "codex"
+    );
     if (!target) {
       return;
     }
     autoDisabledByGateRef.current.add(target.clientId);
+    persistAutoDisabledByGate();
     void toggleConnector(target, false);
   }, [connectors, connectorsBusy, pricingStatus]);
 
@@ -2253,6 +2290,7 @@ export default function App() {
     );
     if (!target) {
       autoDisabledByGateRef.current.clear();
+      persistAutoDisabledByGate();
       return;
     }
     void toggleConnector(target, true);
@@ -2285,29 +2323,38 @@ export default function App() {
     if (connectorPhase !== "verifying") return;
     let active = true;
     let anchor: number | null = null;
-    const interval = setInterval(() => {
-      void (async () => {
-        const count = await invoke<number | null>("get_headroom_request_count").catch(
-          () => null
-        );
-        if (!active) return;
-        // null = proxy unreachable. Don't anchor on transient
-        // unreachable readings — a later reachable reading would otherwise
-        // jump from 0 → N and flip the badge healthy without observing
-        // any new traffic.
-        if (count === null) return;
+    let attempts = 0;
+    let timer: number | undefined;
+    // Fast feedback for the first minute after setup, then back off:
+    // 'verifying' can last days if the user doesn't code, and a menubar app
+    // has no business polling the proxy at 1 Hz around the clock.
+    const schedule = () => {
+      timer = window.setTimeout(() => void tick(), attempts < 60 ? 1000 : 10000);
+    };
+    const tick = async () => {
+      const count = await invoke<number | null>("get_headroom_request_count").catch(
+        () => null
+      );
+      if (!active) return;
+      attempts += 1;
+      // null = proxy unreachable. Don't anchor on transient
+      // unreachable readings — a later reachable reading would otherwise
+      // jump from 0 → N and flip the badge healthy without observing
+      // any new traffic.
+      if (count !== null) {
         if (anchor === null) {
           anchor = count;
+        } else if (count > anchor) {
+          setConnectorPhase("healthy");
           return;
         }
-        if (count > anchor) {
-          setConnectorPhase("healthy");
-        }
-      })();
-    }, 1000);
+      }
+      schedule();
+    };
+    schedule();
     return () => {
       active = false;
-      clearInterval(interval);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [connectorPhase]);
 
