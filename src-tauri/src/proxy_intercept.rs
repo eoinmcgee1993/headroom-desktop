@@ -48,6 +48,44 @@ const CODEX_USAGE_POLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// GET to at most one per `CODEX_USAGE_POLL_MIN_INTERVAL_SECS`.
 static CODEX_USAGE_LAST_POLL: AtomicU64 = AtomicU64::new(0);
 
+/// Epoch-seconds of the last time the Python backend delivered response bytes
+/// through this intercept. Stamped by `StampReader` on every backend->client
+/// read; consumed by the watchdog to distinguish a busy backend (streams still
+/// flowing, event loop alive) from a wedged one before force-killing it.
+/// Direct-to-Anthropic bypass paths never stamp, so bypassed traffic can't
+/// mask a dead backend.
+static BACKEND_LAST_TRAFFIC_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// True when the backend delivered response bytes within `window`.
+pub fn backend_traffic_within(window: Duration) -> bool {
+    let last = BACKEND_LAST_TRAFFIC_EPOCH.load(Ordering::Acquire);
+    last != 0 && now_epoch_secs().saturating_sub(last) <= window.as_secs()
+}
+
+fn stamp_backend_traffic() {
+    BACKEND_LAST_TRAFFIC_EPOCH.store(now_epoch_secs(), Ordering::Release);
+}
+
+/// AsyncRead wrapper that stamps `BACKEND_LAST_TRAFFIC_EPOCH` whenever the
+/// inner reader yields bytes. Wrapped around the backend->client half of the
+/// splices below.
+struct StampReader<R>(R);
+
+impl<R: AsyncRead + Unpin> AsyncRead for StampReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.0).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            stamp_backend_traffic();
+        }
+        poll
+    }
+}
+
 /// Shared state written by the intercept layer.
 pub type SharedToken = Arc<Mutex<Option<BearerToken>>>;
 
@@ -378,7 +416,20 @@ async fn handle(
     } else if is_models_fetch {
         splice_with_models_lite_rewrite(client, backend).await;
     } else {
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+        // Same shape as copy_bidirectional, split so the backend->client half
+        // can stamp traffic liveness for the watchdog.
+        let (mut client_rd, mut client_wr) = client.split();
+        let (backend_rd, mut backend_wr) = backend.split();
+        let upstream = async {
+            let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
+            let _ = backend_wr.shutdown().await;
+        };
+        let downstream = async {
+            let mut stamped = StampReader(backend_rd);
+            let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
+            let _ = client_wr.shutdown().await;
+        };
+        tokio::join!(upstream, downstream);
     }
 }
 
@@ -442,10 +493,12 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
                 } => {
                     set_response_content_length(&mut head, rewritten.len());
                     body = rewritten;
-                    report_models_rewrite(
-                        "applied",
-                        sentry::Level::Info,
-                        &format!("flipped {flags_flipped} use_responses_lite flag(s)"),
+                    // Normal operation, not a signal: at Info this still went
+                    // to Sentry via capture_message and became the project's
+                    // highest-volume issue (RUST-4M, ~750 events/14d). Local
+                    // log only; the warning variants below still report.
+                    log::info!(
+                        "codex models rewrite applied: flipped {flags_flipped} use_responses_lite flag(s)"
                     );
                 }
                 ModelsRewrite::Unchanged => {}
@@ -606,6 +659,7 @@ async fn splice_with_codex_capture(
         .await;
 
         if matches!(read_head, Ok(Ok(()))) {
+            stamp_backend_traffic();
             if let Some(snapshot) = parse_codex_rate_limit_headers(&head) {
                 *codex_slot.lock() = Some(snapshot);
             }
@@ -638,7 +692,8 @@ async fn splice_with_codex_capture(
             // bytes it over-read), then splice the rest of the response through.
             return;
         }
-        let _ = tokio::io::copy(&mut backend_rd, &mut client_wr).await;
+        let mut stamped = StampReader(backend_rd);
+        let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
         let _ = client_wr.shutdown().await;
     };
 
@@ -1536,6 +1591,35 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    #[serial]
+    fn backend_traffic_window_tracks_stamps() {
+        use std::sync::atomic::Ordering;
+        super::BACKEND_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
+        assert!(!super::backend_traffic_within(Duration::from_secs(10)));
+        super::stamp_backend_traffic();
+        assert!(super::backend_traffic_within(Duration::from_secs(10)));
+        super::BACKEND_LAST_TRAFFIC_EPOCH.store(
+            super::now_epoch_secs().saturating_sub(11),
+            Ordering::Release,
+        );
+        assert!(!super::backend_traffic_within(Duration::from_secs(10)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stamp_reader_stamps_on_backend_bytes() {
+        use std::sync::atomic::Ordering;
+        super::BACKEND_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
+        let (mut writer, backend_side) = duplex(64);
+        writer.write_all(b"data: chunk\n\n").await.unwrap();
+        let mut reader = super::StampReader(backend_side);
+        let mut buf = [0u8; 32];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 13);
+        assert!(super::backend_traffic_within(Duration::from_secs(10)));
+    }
 
     #[test]
     fn finds_header_boundary() {

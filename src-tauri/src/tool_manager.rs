@@ -811,7 +811,12 @@ impl ToolManager {
             // -m double-import RuntimeWarning. Fall back to -m if missing.
             let startup_variants: Vec<(PathBuf, Vec<String>)> = if entrypoint.exists() {
                 vec![
-                    (entrypoint, headroom_entrypoint_startup_args()),
+                    (
+                        entrypoint,
+                        headroom_entrypoint_startup_args(
+                            self.installed_headroom_version().as_deref(),
+                        ),
+                    ),
                     (python.clone(), headroom_python_startup_args()),
                 ]
             } else {
@@ -1315,9 +1320,18 @@ impl ToolManager {
         // rather than restarting it. Retry only network-category failures
         // (RUST-3C): a dropped connection or TLS blip on the ~315MB model is
         // exactly what a second attempt fixes; permission/other failures won't
-        // improve on retry. ponytail: 3 attempts, linear backoff -- raise only
-        // if telemetry shows partials still not converging within a launch.
-        const MAX_ATTEMPTS: u32 = 3;
+        // improve on retry.
+        //
+        // Why retries at the subprocess level at all: huggingface_hub 1.21.0's
+        // own in-process backoff self-destructs on the first ConnectError --
+        // `_http_backoff_base` caches `client = get_session()` before its retry
+        // loop, the ConnectError handler calls `close_session()`, and the next
+        // iteration reuses the closed client, raising "RuntimeError: Cannot
+        // send a request, as the client has been closed" (the exact RUST-3C
+        // message). A fresh subprocess gets a fresh client and resumes the
+        // blob. ponytail: 5 attempts, linear backoff -- raised from 3 after
+        // 0.5.9 telemetry showed hosts burning all 3 (RUST-45 -> RUST-3C).
+        const MAX_ATTEMPTS: u32 = 5;
         for attempt in 1..=MAX_ATTEMPTS {
             match self.run_kompress_prefetch_once(&python, &log_path)? {
                 KompressPrefetchOutcome::Downloaded => {
@@ -4316,22 +4330,42 @@ fn headroom_python_startup_args() -> Vec<String> {
     ]
 }
 
-fn headroom_entrypoint_startup_args() -> Vec<String> {
+/// The `headroom proxy` click entrypoint only defines `--no-http2` from
+/// 0.28.0 (upstream e06b6167); 0.26.0/0.27.0 exit 2 with "No such option",
+/// which made boot validation on the 0.26.0 fallback runtime fail every
+/// attempt and time out (Sentry RUST-4A). Unknown/unparseable version means
+/// the receipt is from a current install, so assume the pinned (>= 0.28.0)
+/// runtime and keep the flag.
+fn runtime_supports_no_http2(installed_version: Option<&str>) -> bool {
+    let Some(version) = installed_version else {
+        return true;
+    };
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (0, 28),
+        _ => true,
+    }
+}
+
+fn headroom_entrypoint_startup_args(installed_version: Option<&str>) -> Vec<String> {
     // HTTP/2 to upstream is disabled both ways: the explicit --no-http2 flag
     // AND the HEADROOM_HTTP2=false env var (set in the spawn env). Either alone
     // suffices, but older bundled runtimes ignored the env var and ran HTTP/2
     // unconditionally, which surfaced as SSLV3_ALERT_BAD_RECORD_MAC under
     // multi-tab concurrency. The flag is belt-and-suspenders against a future
-    // runtime regressing on the env var. --log-messages stores full
-    // request/response bodies so the desktop's Activity tab can render the
-    // live transformations feed.
+    // runtime regressing on the env var — but only on runtimes whose click
+    // entrypoint defines it (see runtime_supports_no_http2). --log-messages
+    // stores full request/response bodies so the desktop's Activity tab can
+    // render the live transformations feed.
     let mut args = vec![
         "proxy".to_string(),
         "--port".to_string(),
         headroom_proxy_port(),
-        "--no-http2".to_string(),
-        "--log-messages".to_string(),
     ];
+    if runtime_supports_no_http2(installed_version) {
+        args.push("--no-http2".to_string());
+    }
+    args.push("--log-messages".to_string());
     args.extend(headroom_learn_startup_args());
     args
 }
@@ -6493,7 +6527,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     fn managed_headroom_startup_uses_supported_proxy_args() {
         backend_port::reset_for_tests();
         let default_port = backend_port::DEFAULT_BACKEND_PORT.to_string();
-        let entrypoint_args = headroom_entrypoint_startup_args();
+        let entrypoint_args = headroom_entrypoint_startup_args(Some("0.28.0"));
         assert!(entrypoint_args.starts_with(&[
             "proxy".to_string(),
             "--port".to_string(),
@@ -6528,6 +6562,36 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         backend_port::reset_for_tests();
     }
 
+    /// Regression (Sentry RUST-4A): the 0.26.0 fallback runtime's click
+    /// entrypoint has no `--no-http2` option, so passing it made every boot
+    /// validation attempt exit 2 and the upgrade time out. The flag must be
+    /// gated on runtime >= 0.28.0; unknown versions assume the pinned runtime.
+    #[test]
+    fn entrypoint_args_gate_no_http2_on_runtime_version() {
+        backend_port::reset_for_tests();
+
+        assert!(
+            !headroom_entrypoint_startup_args(Some("0.26.0")).contains(&"--no-http2".to_string())
+        );
+        assert!(
+            !headroom_entrypoint_startup_args(Some("0.27.0")).contains(&"--no-http2".to_string())
+        );
+        assert!(
+            headroom_entrypoint_startup_args(Some("0.28.0")).contains(&"--no-http2".to_string())
+        );
+        assert!(headroom_entrypoint_startup_args(Some("1.0.0")).contains(&"--no-http2".to_string()));
+        // Unknown or malformed receipt version: assume pinned runtime.
+        assert!(headroom_entrypoint_startup_args(None).contains(&"--no-http2".to_string()));
+        assert!(
+            headroom_entrypoint_startup_args(Some("garbage")).contains(&"--no-http2".to_string())
+        );
+        // The python -m argparse variant has defined --no-http2 since 0.10.0
+        // and must keep it unconditionally.
+        assert!(headroom_python_startup_args().contains(&"--no-http2".to_string()));
+
+        backend_port::reset_for_tests();
+    }
+
     /// Regression: `start_headroom_background` previously built `startup_variants`
     /// before pre-flight ran, so when fallback called `backend_port::set(6769)`
     /// the variants still spawned with `--port 6768` and both failed with
@@ -6539,7 +6603,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         backend_port::reset_for_tests();
         backend_port::set(6770);
 
-        let entrypoint_args = headroom_entrypoint_startup_args();
+        let entrypoint_args = headroom_entrypoint_startup_args(None);
         let port_idx = entrypoint_args
             .iter()
             .position(|a| a == "--port")

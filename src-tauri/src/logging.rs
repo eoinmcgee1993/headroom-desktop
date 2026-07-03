@@ -142,7 +142,7 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
 }
 
 /// Replace the user's home directory with `~` wherever it appears.
-fn scrub_home(msg: &str) -> String {
+pub(crate) fn scrub_home(msg: &str) -> String {
     match dirs::home_dir() {
         Some(home) => {
             let home = home.to_string_lossy();

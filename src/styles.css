@@ -2417,6 +2417,9 @@ select {
 }
 
 .savings-chart__nav-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   border: 1px solid var(--border-default);
   background: rgba(255, 255, 255, 0.78);
   color: #4d453f;

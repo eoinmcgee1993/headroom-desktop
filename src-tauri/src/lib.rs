@@ -219,7 +219,16 @@ const SPEND_SCHEMA_CUTOFF_DATE: &str = "2026-04-13";
 // filtering and prefix-cache discounts), so it is > 0 iff a real model request
 // was compressed -- which implies tokens were sent and a cost incurred. Zero
 // spend against it is the genuine pipeline anomaly.
-fn zero_spend_affected_days(daily_savings: &[DailySavingsPoint]) -> Vec<&str> {
+// `min_date` (inclusive) bounds the scan to recent days. Historical days are
+// immutable: a day written by a backend from before it reported spend fields
+// keeps savings-with-zero-spend forever, and since ZERO_SPEND_ALERT_FIRED is
+// per-process, alerting on the whole history re-fired the same June days on
+// every app launch (Sentry RUST-3S/3V, 125 events). Only a recent day can be
+// a live pipeline anomaly worth an alert.
+fn zero_spend_affected_days<'a>(
+    daily_savings: &'a [DailySavingsPoint],
+    min_date: &str,
+) -> Vec<&'a str> {
     // Only meaningful when the proxy actually reports spend. `total_tokens_sent`
     // and `actual_cost_usd` come from Option fields on /stats; a proxy build
     // that omits them lands every day at 0, indistinguishable from a real
@@ -239,6 +248,7 @@ fn zero_spend_affected_days(daily_savings: &[DailySavingsPoint]) -> Vec<&str> {
         .iter()
         .filter(|p| {
             p.date.as_str() >= SPEND_SCHEMA_CUTOFF_DATE
+                && p.date.as_str() >= min_date
                 && p.estimated_savings_usd > 0.000_001
                 && p.actual_cost_usd == 0.0
                 && p.total_tokens_sent == 0
@@ -251,17 +261,29 @@ fn check_zero_spend_anomaly(dashboard: &DashboardState) {
     if ZERO_SPEND_ALERT_FIRED.load(Ordering::Relaxed) {
         return;
     }
-    let affected_days = zero_spend_affected_days(&dashboard.daily_savings);
+    // Yesterday-or-later: a zero-spend day can only be acted on while the
+    // pipeline that produced it is still the running one.
+    let min_date = (chrono::Local::now().date_naive() - chrono::Days::new(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let affected_days = zero_spend_affected_days(&dashboard.daily_savings, &min_date);
     if affected_days.is_empty() {
         return;
     }
     ZERO_SPEND_ALERT_FIRED.store(true, Ordering::Relaxed);
-    sentry::capture_message(
-        &format!(
-            "graph shows compression savings but zero tokens spent on days: {}",
-            affected_days.join(", ")
-        ),
-        sentry::Level::Warning,
+    // Fixed fingerprint: the per-user date list in the message split this
+    // one probe across multiple Sentry issues (RUST-3S vs RUST-3V).
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["zero-spend-anomaly"]));
+            scope.set_extra("affected_days", affected_days.join(", ").into());
+        },
+        || {
+            sentry::capture_message(
+                "graph shows compression savings but zero tokens spent on recent day(s)",
+                sentry::Level::Warning,
+            );
+        },
     );
 }
 
@@ -1332,34 +1354,27 @@ pub(crate) fn build_watchdog_give_up_report(
     }
 }
 
-/// Probe `/readyz` on the backend port directly (bypassing the Rust
-/// intercept on 6767) and classify the outcome for inclusion in a
-/// give-up Sentry event. 1.5s timeout matches `is_headroom_proxy_reachable`
-/// so a `timeout` here corresponds to the same wait the watchdog already
-/// experienced.
-fn probe_backend_readyz_outcome() -> String {
-    probe_backend_readyz_outcome_with_timeout(std::time::Duration::from_millis(1500))
-}
-
-/// Same probe as [`probe_backend_readyz_outcome`] but with a caller-chosen
-/// timeout. The watchdog uses a longer (5s) budget to confirm a failure before
-/// counting a strike, so a niced backend that's merely slow under heavy
-/// compression load isn't mistaken for a dead one.
-fn probe_backend_readyz_outcome_with_timeout(timeout: std::time::Duration) -> String {
+/// Probe `/readyz` on the backend port directly (bypassing the Rust intercept
+/// on 6767) and classify the outcome, also returning the raw response body
+/// (truncated) for non-2xx responses so the give-up Sentry event carries the
+/// backend's own per-check breakdown instead of just our classification.
+/// The watchdog uses a 5s budget so a niced backend that's merely slow under
+/// heavy compression load isn't mistaken for a dead one.
+fn probe_backend_readyz_with_body(timeout: std::time::Duration) -> (String, Option<String>) {
     let port = crate::backend_port::get();
     let client = match reqwest::blocking::Client::builder()
         .timeout(timeout)
         .build()
     {
         Ok(c) => c,
-        Err(err) => return format!("error: {err}"),
+        Err(err) => return (format!("error: {err}"), None),
     };
     let url = format!("http://127.0.0.1:{port}/readyz");
     match client.get(&url).send() {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {
-                "ok".to_string()
+                ("ok".to_string(), None)
             } else if status.as_u16() == 503 {
                 // 503 = readiness failure: the process is alive and answering,
                 // but a component check is false. Parse the body's per-check
@@ -1368,33 +1383,58 @@ fn probe_backend_readyz_outcome_with_timeout(timeout: std::time::Duration) -> St
                 // route them differently. Falls back to bare "http_503" when the
                 // body can't be read or parsed.
                 match response.text() {
-                    Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
-                        Ok(json) => {
-                            let csv = readyz_failed_checks_csv(&json);
-                            if csv.is_empty() {
-                                "http_503".to_string()
-                            } else {
-                                format!("http_503:{csv}")
+                    Ok(body) => {
+                        let snippet: String = body.chars().take(500).collect();
+                        let outcome = match serde_json::from_str::<serde_json::Value>(&body) {
+                            Ok(json) => {
+                                let csv = readyz_failed_checks_csv(&json);
+                                if csv.is_empty() {
+                                    "http_503".to_string()
+                                } else {
+                                    format!("http_503:{csv}")
+                                }
                             }
-                        }
-                        Err(_) => "http_503".to_string(),
-                    },
-                    Err(_) => "http_503".to_string(),
+                            Err(_) => "http_503".to_string(),
+                        };
+                        (outcome, Some(snippet))
+                    }
+                    Err(_) => ("http_503".to_string(), None),
                 }
             } else {
-                format!("http_{}", status.as_u16())
+                (format!("http_{}", status.as_u16()), None)
             }
         }
         Err(err) => {
             if err.is_timeout() {
-                "timeout".to_string()
+                ("timeout".to_string(), None)
             } else if err.is_connect() {
-                "refused".to_string()
+                ("refused".to_string(), None)
             } else {
-                format!("error: {err}")
+                (format!("error: {err}"), None)
             }
         }
     }
+}
+
+fn probe_backend_readyz_outcome_with_timeout(timeout: std::time::Duration) -> String {
+    probe_backend_readyz_with_body(timeout).0
+}
+
+/// One retry on a bare `http_503`. Bare means the status line arrived but the
+/// body couldn't be read or parsed within budget — evidence of load, not of a
+/// wedged core. Without the retry, an upstream-only 503 whose body read ran
+/// past the deadline was classified wedged-core and got a healthy process
+/// force-killed (Sentry RUST-2X: bare http_503, port accepting TCP, low CPU).
+/// A second bare result stands: two failed body reads in ~10s is itself a
+/// wedge signal.
+fn classify_backend_readyz(
+    mut probe: impl FnMut() -> (String, Option<String>),
+) -> (String, Option<String>) {
+    let first = probe();
+    if first.0 == "http_503" {
+        return probe();
+    }
+    first
 }
 
 /// Comma-joined, sorted names of the unhealthy components in a `/readyz`
@@ -1463,6 +1503,12 @@ fn capture_watchdog_give_up(
     consecutive_failures: u32,
     bypass_active: bool,
     backend_readyz_outcome: String,
+    // Raw (truncated) /readyz response body, when one was readable.
+    readyz_body: Option<String>,
+    // (secs since the last wall-clock jump was observed, jump size in secs).
+    // Present when the machine slept at some point this app session — lets
+    // triage tell post-wake episodes apart from genuine wedges.
+    wall_jump: Option<(u64, u64)>,
 ) {
     if WATCHDOG_DOWN_CAPTURED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1572,6 +1618,13 @@ fn capture_watchdog_give_up(
                 "backend_readyz_outcome",
                 report.backend_readyz_outcome.clone().into(),
             );
+            if let Some(body) = &readyz_body {
+                scope.set_extra("readyz_body", body.clone().into());
+            }
+            if let Some((since, gap)) = wall_jump {
+                scope.set_extra("secs_since_wall_jump", (since as i64).into());
+                scope.set_extra("wall_jump_gap_secs", (gap as i64).into());
+            }
         },
         || {
             sentry::capture_message(&report.message, level);
@@ -4525,6 +4578,10 @@ fn spawn_proxy_watchdog(app: AppHandle) {
         // to the permanent give-up path instead. Resets when the proxy
         // recovers so a later hang triggers another rescue attempt.
         let mut hung_kill_attempted = false;
+        // Last observed wall-clock jump (sleep/suspend): when it was seen and
+        // how large it was. Carried into the give-up Sentry event so triage
+        // can tell post-wake episodes apart from genuine wedges.
+        let mut last_wall_jump: Option<(std::time::Instant, u64)> = None;
         // Fire the one-shot Kompress model prefetch the first time we observe a
         // healthy proxy this launch. `maybe_prefetch_kompress` is itself guarded
         // and no-ops when the model is already cached; this flag just avoids
@@ -4636,6 +4693,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 log::info!(
                     "watchdog: probe skipped (system resumed after {elapsed:?}); resetting failure counter"
                 );
+                last_wall_jump = Some((std::time::Instant::now(), elapsed.as_secs()));
                 consecutive_failures = 0;
                 continue;
             }
@@ -4674,6 +4732,22 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             );
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                // Busy, not wedged: if the backend delivered response bytes
+                // through the 6767 intercept within the last few seconds, its
+                // event loop is demonstrably alive — /readyz is just starving
+                // behind heavy streaming load (30+ concurrent Claude Code
+                // sessions saturate the pre-upstream semaphore and the probe
+                // misses its window). Force-killing here truncates every
+                // in-flight SSE stream ("Connection closed mid-response"), so
+                // hold off as long as bytes keep moving. A truly wedged or
+                // dead backend delivers nothing and ages past the window.
+                if proxy_intercept::backend_traffic_within(std::time::Duration::from_secs(10)) {
+                    log::info!(
+                        "watchdog: probes failing but backend streamed bytes within 10s; busy not wedged, resetting counter"
+                    );
+                    consecutive_failures = 0;
+                    continue;
+                }
                 // Before pausing, probe the backend directly on its loopback
                 // port. `is_headroom_proxy_reachable` goes through the Rust
                 // intercept on 6767, which forwards to Python on 6768 with a
@@ -4685,7 +4759,13 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 // process: reset the counter and keep probing. We're already
                 // 15s into the down episode, so one extra POLL of patience is
                 // cheap compared to auto-pausing a process that just came up.
-                let backend_readyz_outcome = probe_backend_readyz_outcome();
+                // 5s budget + one retry on bare http_503: this is the probe
+                // whose verdict decides a force-kill, so it gets the honest
+                // budget, not the 1.5s reachability one (see
+                // classify_backend_readyz / Sentry RUST-2X).
+                let (backend_readyz_outcome, readyz_body) = classify_backend_readyz(|| {
+                    probe_backend_readyz_with_body(std::time::Duration::from_secs(5))
+                });
                 if backend_readyz_outcome == "ok" {
                     log::info!(
                         "watchdog: backend /readyz answers ok after {consecutive_failures} intercept failures; skipping auto-pause and resetting counter"
@@ -4795,6 +4875,8 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     consecutive_failures,
                     bypass_active,
                     backend_readyz_outcome,
+                    readyz_body,
+                    last_wall_jump.map(|(at, gap)| (at.elapsed().as_secs(), gap)),
                 );
                 // Flip bypass FIRST so the Rust intercept passes new
                 // requests straight through to Anthropic instead of returning
@@ -5357,10 +5439,10 @@ mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
-        build_watchdog_give_up_report, check_headroom_learn_prereqs, classify_bootstrap_failure,
-        classify_upgrade_error, compute_tray_window_position, count_memories_created_today,
-        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
-        empty_live_learnings_for_projects, extract_llm_failure_warnings,
+        build_watchdog_give_up_report, check_headroom_learn_prereqs, classify_backend_readyz,
+        classify_bootstrap_failure, classify_upgrade_error, compute_tray_window_position,
+        count_memories_created_today, cpu_rate_indicates_burn, debounced_tray_runtime_visual,
+        delete_applied_pattern, empty_live_learnings_for_projects, extract_llm_failure_warnings,
         fetch_transformations_feed_from, install_pending_update, is_disk_full_signal,
         is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
         is_prerelease_version, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
@@ -5426,7 +5508,7 @@ mod tests {
         // dollar figure (those tokens never reach a model request), so a day with
         // token savings but zero compression-USD is not an anomaly.
         let days = vec![daily_point("2026-06-16", 0.0, 5_000, 0.0, 0)];
-        assert!(zero_spend_affected_days(&days).is_empty());
+        assert!(zero_spend_affected_days(&days, "2026-01-01").is_empty());
     }
 
     #[test]
@@ -5437,7 +5519,10 @@ mod tests {
             daily_point("2026-06-15", 0.20, 9_000, 0.50, 12_000),
             daily_point("2026-06-16", 0.12, 5_000, 0.0, 0),
         ];
-        assert_eq!(zero_spend_affected_days(&days), vec!["2026-06-16"]);
+        assert_eq!(
+            zero_spend_affected_days(&days, "2026-01-01"),
+            vec!["2026-06-16"]
+        );
     }
 
     #[test]
@@ -5448,13 +5533,13 @@ mod tests {
             daily_point("2026-06-15", 0.20, 9_000, 0.0, 0),
             daily_point("2026-06-16", 0.12, 5_000, 0.0, 0),
         ];
-        assert!(zero_spend_affected_days(&days).is_empty());
+        assert!(zero_spend_affected_days(&days, "2026-01-01").is_empty());
     }
 
     #[test]
     fn zero_spend_ignores_compression_days_that_recorded_spend() {
         let days = vec![daily_point("2026-06-16", 0.12, 5_000, 0.34, 8_000)];
-        assert!(zero_spend_affected_days(&days).is_empty());
+        assert!(zero_spend_affected_days(&days, "2026-01-01").is_empty());
     }
 
     #[test]
@@ -5465,7 +5550,23 @@ mod tests {
             daily_point("2026-06-16", 0.20, 9_000, 0.50, 12_000),
             daily_point("2026-04-12", 0.12, 5_000, 0.0, 0),
         ];
-        assert!(zero_spend_affected_days(&days).is_empty());
+        assert!(zero_spend_affected_days(&days, "2026-01-01").is_empty());
+    }
+
+    #[test]
+    fn zero_spend_ignores_days_older_than_min_date() {
+        // Regression (RUST-3S/3V): historical zero-spend days are immutable
+        // (written by a backend that predated spend reporting) and re-fired
+        // the alert on every launch. Only days >= min_date may flag.
+        let days = vec![
+            daily_point("2026-06-15", 0.20, 9_000, 0.50, 12_000),
+            daily_point("2026-06-16", 0.12, 5_000, 0.0, 0),
+            daily_point("2026-07-03", 0.08, 2_000, 0.0, 0),
+        ];
+        assert_eq!(
+            zero_spend_affected_days(&days, "2026-07-02"),
+            vec!["2026-07-03"]
+        );
     }
 
     #[test]
@@ -6943,6 +7044,45 @@ Some unrelated content.
         assert_eq!(readyz_failed_checks_csv(&all_ready), "");
         let no_checks = serde_json::json!({ "ready": false });
         assert_eq!(readyz_failed_checks_csv(&no_checks), "");
+    }
+
+    #[test]
+    fn classify_backend_readyz_retries_bare_503_once() {
+        // Bare http_503 = unreadable body under load; a second read that
+        // parses must win (RUST-2X: upstream-only blips were misclassified
+        // as wedged-core and force-killed).
+        let mut calls = 0;
+        let (outcome, body) = classify_backend_readyz(|| {
+            calls += 1;
+            if calls == 1 {
+                ("http_503".to_string(), None)
+            } else {
+                ("http_503:upstream".to_string(), Some("{...}".to_string()))
+            }
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(outcome, "http_503:upstream");
+        assert_eq!(body.as_deref(), Some("{...}"));
+
+        // Two bare results stand as a wedge signal.
+        let mut calls = 0;
+        let (outcome, _) = classify_backend_readyz(|| {
+            calls += 1;
+            ("http_503".to_string(), None)
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(outcome, "http_503");
+
+        // Anything other than bare http_503 is accepted on the first probe.
+        for first in ["ok", "http_503:upstream", "timeout", "refused"] {
+            let mut calls = 0;
+            let (outcome, _) = classify_backend_readyz(|| {
+                calls += 1;
+                (first.to_string(), None)
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(outcome, first);
+        }
     }
 
     #[test]

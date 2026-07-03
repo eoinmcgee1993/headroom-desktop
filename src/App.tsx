@@ -569,7 +569,7 @@ function DailySavingsChart({
                 onClick={() => setChartMode("usd")}
                 type="button"
               >
-                $
+                $ costs
               </button>
               <button
                 className={`savings-chart__toggle-button${chartMode === "tokens" ? " is-active" : ""}`}
@@ -607,6 +607,9 @@ function DailySavingsChart({
               }
               type="button"
             >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M10 3L5 8l5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
               Prev
             </button>
             <span className="savings-chart__range-label">{label}</span>
@@ -621,6 +624,9 @@ function DailySavingsChart({
               type="button"
             >
               Next
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M6 3l5 5-5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
             </button>
           </div>
         </div>
