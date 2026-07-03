@@ -284,7 +284,20 @@ impl ActivityFacts {
             // Best-effort delete so the next save replaces the stale file
             // outright rather than silently leaving the old payload behind.
             let _ = std::fs::remove_file(&path);
-            return Ok(Self::empty(path));
+            // Salvage the format-agnostic bookkeeping: schema bumps reshape
+            // the *tile slots*, but the record counters, recap dedupe keys,
+            // and fire-once sets are stable scalars — wiping them used to
+            // re-fire the weekly recap and reset all-time records for every
+            // user on every bump (four so far).
+            let mut carried = Self::empty(path);
+            carried.all_time_record_tokens = persisted.all_time_record_tokens;
+            carried.all_time_record_emitted_at = persisted.all_time_record_emitted_at;
+            carried.last_weekly_recap_week_key = persisted.last_weekly_recap_week_key;
+            carried.last_weekly_recap_check_at = persisted.last_weekly_recap_check_at;
+            carried.train_suggestions_fired = persisted.train_suggestions_fired;
+            carried.stale_train_suggestions_fired_at = persisted.stale_train_suggestions_fired_at;
+            carried.dirty = true;
+            return Ok(carried);
         }
 
         Ok(Self {
@@ -889,6 +902,33 @@ mod tests {
         let facts = ActivityFacts::load_or_create(&base).expect("corrupt file must not error");
         assert_eq!(facts.all_time_record_tokens, 0);
         assert!(!path.exists(), "corrupt file is removed for a fresh start");
+    }
+
+    #[test]
+    fn schema_mismatch_salvages_records_and_recap_dedupe() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        let path = base.join("config").join("activity-facts.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // An old-schema file: tile slots are stale, but the record counter and
+        // recap dedupe key must survive the bump instead of re-firing
+        // notifications and zeroing all-time records fleet-wide.
+        std::fs::write(
+            &path,
+            br#"{"schemaVersion": 3, "allTimeRecordTokens": 91234, "lastWeeklyRecapWeekKey": "2026-W26"}"#,
+        )
+        .unwrap();
+
+        let facts = ActivityFacts::load_or_create(&base).expect("mismatch must not error");
+        assert_eq!(facts.all_time_record_tokens, 91234);
+        assert_eq!(
+            facts.last_weekly_recap_week_key.as_deref(),
+            Some("2026-W26")
+        );
+        assert!(
+            facts.last_transformation.is_none(),
+            "tile slots from the old schema are dropped"
+        );
     }
 
     fn mk_transformation(

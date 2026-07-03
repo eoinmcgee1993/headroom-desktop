@@ -23,6 +23,7 @@ const SENTRY_MESSAGE_CHAR_CAP: usize = 400;
 struct FileLogger {
     file: Mutex<Option<File>>,
     path: PathBuf,
+    records_since_rotate_check: std::sync::atomic::AtomicU64,
 }
 
 impl FileLogger {
@@ -171,7 +172,17 @@ impl Log for FileLogger {
             record.level()
         };
 
-        if display_level <= Level::Warn {
+        // Rotation must not depend on level: an info-heavy session can blow
+        // past MAX_LOG_BYTES without ever logging a warning. Warn+ checks
+        // every record; info/debug check every 64th to keep the stat off the
+        // hot path.
+        if display_level <= Level::Warn
+            || self
+                .records_since_rotate_check
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % 64
+                == 0
+        {
             self.rotate_if_needed();
         }
         self.write_record(record, display_level);
@@ -216,6 +227,7 @@ pub fn init() -> Result<PathBuf, SetLoggerError> {
     let logger = FileLogger {
         file: Mutex::new(file),
         path: path.clone(),
+        records_since_rotate_check: std::sync::atomic::AtomicU64::new(0),
     };
     log::set_boxed_logger(Box::new(logger))?;
     log::set_max_level(log::LevelFilter::Debug);

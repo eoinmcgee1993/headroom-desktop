@@ -18,18 +18,27 @@ const NUDGE_REMINDER_BODY =
 // notification firing in the same window can't suppress the Codex one.
 const CODEX_OPTIMIZATION_BLOCKED_KEY = "headroom_urgent_codex_opt_blocked_date";
 
-const NUDGE_TITLES: Record<number, string> = {
-  1: "Heads up: 25% of your weekly Claude usage",
-  2: "Halfway there: 35% of your weekly Claude usage",
-  3: "Almost paused: 45% of your weekly Claude usage",
+const NUDGE_PREFIXES: Record<number, string> = {
+  1: "Heads up",
+  2: "Getting close",
+  3: "Almost paused",
 };
 
-// Codex shares the same nudge ladder (25/35/45%) as the Claude gate.
-const CODEX_NUDGE_TITLES: Record<number, string> = {
-  1: "Heads up: 25% of your weekly Codex usage",
-  2: "Halfway there: 35% of your weekly Codex usage",
-  3: "Almost paused: 45% of your weekly Codex usage",
-};
+// Titles quote the gate's actual tier-dependent ladder (10/15/20 -> 25 for
+// Max-like plans, 25/35/45 -> 50 for Pro-like) — hardcoded numbers here used
+// to tell Max users "25% of your weekly usage" when they were at 10%.
+function usageNudgeTitle(
+  product: "Claude" | "Codex",
+  level: number,
+  thresholds: number[] | null | undefined,
+  disableAt: number | null | undefined
+): string {
+  const prefix = NUDGE_PREFIXES[level] ?? "Heads up";
+  const pct = thresholds?.[level - 1];
+  if (pct == null) return `${prefix}: weekly ${product} usage rising`;
+  const pause = disableAt != null ? ` (Headroom pauses at ${disableAt}%)` : "";
+  return `${prefix}: ${pct}% of your weekly ${product} usage${pause}`;
+}
 
 export async function maybeFireUrgentPricingNotifications(
   status: HeadroomPricingStatus
@@ -103,7 +112,12 @@ function pickUsageNudge(
 
   if (codexLevel > claudeLevel) {
     return {
-      title: CODEX_NUDGE_TITLES[codexLevel] ?? "Heads up: weekly Codex usage rising",
+      title: usageNudgeTitle(
+        "Codex",
+        codexLevel,
+        codex!.effectiveNudgeThresholdsPercent,
+        codex!.effectiveDisableThresholdPercent
+      ),
       body:
         codex!.gateMessage ||
         "Headroom will pause Codex optimization at your weekly cap. Upgrade to keep going.",
@@ -111,7 +125,12 @@ function pickUsageNudge(
   }
 
   return {
-    title: NUDGE_TITLES[claudeLevel] ?? "Heads up: weekly Claude usage rising",
+    title: usageNudgeTitle(
+      "Claude",
+      claudeLevel,
+      status.effectiveNudgeThresholdsPercent,
+      status.effectiveDisableThresholdPercent
+    ),
     body:
       status.gateMessage ||
       "Headroom will pause optimization at your weekly usage cap. Upgrade to keep going.",

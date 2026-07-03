@@ -1837,9 +1837,43 @@ impl ToolManager {
             .with_context(|| format!("opening {}", archive_path.display()))?;
         let decoder = GzDecoder::new(file);
         let mut archive = Archive::new(decoder);
+        // Extract to a staging dir and rename into place. Unpacking straight
+        // into runtime_dir used to be a permanent trap: a crash mid-unpack
+        // after bin/python3 landed made every later launch's `exists()` gate
+        // read "installed" while the stdlib was incomplete — and no repair
+        // path covers runtime/python, so it stayed broken until manual
+        // deletion.
+        let staging_dir = self.runtime.runtime_dir.join("python.extracting");
+        if staging_dir.exists() {
+            std::fs::remove_dir_all(&staging_dir)
+                .with_context(|| format!("clearing stale {}", staging_dir.display()))?;
+        }
+        std::fs::create_dir_all(&staging_dir)
+            .with_context(|| format!("creating {}", staging_dir.display()))?;
         archive
-            .unpack(&self.runtime.runtime_dir)
-            .with_context(|| format!("extracting into {}", self.runtime.runtime_dir.display()))?;
+            .unpack(&staging_dir)
+            .with_context(|| format!("extracting into {}", staging_dir.display()))?;
+
+        // The tarball's single root is `python/`.
+        let extracted_root = staging_dir.join("python");
+        if !extracted_root.join("bin").join("python3").exists() {
+            bail!(
+                "standalone python extraction completed but {} was not found",
+                extracted_root.join("bin/python3").display()
+            );
+        }
+        if self.runtime.python_dir.exists() {
+            std::fs::remove_dir_all(&self.runtime.python_dir).with_context(|| {
+                format!("removing partial {}", self.runtime.python_dir.display())
+            })?;
+        }
+        std::fs::rename(&extracted_root, &self.runtime.python_dir).with_context(|| {
+            format!(
+                "publishing extracted python into {}",
+                self.runtime.python_dir.display()
+            )
+        })?;
+        let _ = std::fs::remove_dir_all(&staging_dir);
 
         if !self.runtime.standalone_python().exists() {
             bail!(
@@ -2402,12 +2436,33 @@ impl ToolManager {
                 "recover_from_interrupted_upgrade: in-place upgrade was in progress; \
                  reinstalling previous headroom-ai {previous_version}"
             );
+            // Both pip helpers need PyPI. Offline (laptop died mid-upgrade,
+            // reopened on a plane) they fail — and discarding those failures
+            // used to clear the marker anyway, leaving a mixed venv (new dep
+            // pins, unknown headroom-ai version) that the restored receipt
+            // declared healthy. On failure keep the marker AND the lock
+            // backup untouched so the next launch retries recovery; mirror
+            // `rollback_headroom_upgrade`, which propagates the same errors.
             if let Some(ref backup) = previous_lock_backup {
-                let _ = self.pip_restore_deps_from_backup(backup);
+                if let Err(err) = self.pip_restore_deps_from_backup(backup) {
+                    log::warn!(
+                        "recover_from_interrupted_upgrade: dep restore failed ({err:#}); \
+                         keeping upgrade marker for retry"
+                    );
+                    return false;
+                }
+            }
+            if let Err(err) = self.pip_force_reinstall_headroom_version(&previous_version) {
+                log::warn!(
+                    "recover_from_interrupted_upgrade: reinstalling headroom-ai \
+                     {previous_version} failed ({err:#}); keeping upgrade marker for retry"
+                );
+                return false;
+            }
+            if let Some(ref backup) = previous_lock_backup {
                 let _ = std::fs::copy(backup, self.active_lock_path());
                 let _ = std::fs::remove_file(backup);
             }
-            let _ = self.pip_force_reinstall_headroom_version(&previous_version);
             let receipt_backup = self.headroom_receipt_backup_path();
             let receipt_path = self.headroom_receipt_path();
             if receipt_backup.exists() {
@@ -7479,12 +7534,42 @@ after
     }
 
     #[test]
+    fn recover_from_interrupted_upgrade_keeps_marker_when_pip_fails() {
+        // Offline / broken-python recovery: pip fails, so the marker and the
+        // receipt backup must survive for a retry on the next launch —
+        // clearing them used to leave a mixed venv that the restored receipt
+        // declared healthy.
+        let (root, runtime, manager) = seed_test_runtime("recover-pip-fails");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 1\n");
+        manager
+            .write_upgrade_marker("0.10.8", Some("0.10.7"), None)
+            .expect("marker");
+        fs::write(
+            manager.headroom_receipt_backup_path(),
+            br#"{"version":"0.10.7"}"#,
+        )
+        .expect("receipt snapshot");
+
+        assert!(!manager.recover_from_interrupted_upgrade());
+        assert!(
+            manager.upgrade_marker_path().exists(),
+            "marker kept for retry when pip fails"
+        );
+        assert!(
+            manager.headroom_receipt_backup_path().exists(),
+            "receipt backup kept for retry when pip fails"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recover_from_interrupted_upgrade_handles_wheel_only_marker() {
         // In-place marker without a lock backup (wheel-only interrupted
-        // upgrade). The pip reinstall inside recovery fails harmlessly without
-        // a real python; we only assert the file-manipulation side: receipt
-        // restored, marker cleared.
+        // upgrade). A stub python stands in for a successful pip reinstall;
+        // we assert the file-manipulation side: receipt restored, marker
+        // cleared.
         let (root, runtime, manager) = seed_test_runtime("recover-wheel-only");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
         manager
             .write_upgrade_marker("0.10.8", Some("0.10.7"), None)
             .expect("marker");
@@ -7521,9 +7606,10 @@ after
     fn recover_from_interrupted_upgrade_handles_in_place_marker_with_lock_backup() {
         // In-place marker with a lock backup. Recovery should: copy the lock
         // backup back to the active lock path, remove the backup, restore the
-        // receipt, and clear the marker. Pip calls fail harmlessly without a
-        // real python.
+        // receipt, and clear the marker. A stub python stands in for
+        // successful pip calls.
         let (root, runtime, manager) = seed_test_runtime("recover-lock-backup");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
         let active_lock = manager.active_lock_path();
         let lock_backup = manager.lock_backup_path();
         fs::write(&active_lock, b"new-lock==2.0\n").expect("seed active lock");

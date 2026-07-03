@@ -640,7 +640,7 @@ fn codex_usage_from_snapshot(
         Some(headroom_tier_for_codex_plan(&plan_tier).unwrap_or(HeadroomSubscriptionTier::Pro));
     let weekly_used_percent = snapshot.secondary.as_ref().map(|w| w.used_percent);
 
-    let gate = codex_plan_gate(weekly_used_percent, gate_enabled);
+    let gate = codex_plan_gate(weekly_used_percent, &plan_tier, gate_enabled);
 
     CodexUsage {
         limit_name: snapshot.limit_name,
@@ -655,6 +655,8 @@ fn codex_usage_from_snapshot(
         recommended_subscription_tier,
         weekly_used_percent,
         gate_message: gate.gate_message,
+        effective_nudge_thresholds_percent: gate.nudge_thresholds_percent.to_vec(),
+        effective_disable_threshold_percent: gate.disable_threshold_percent,
     }
 }
 
@@ -664,15 +666,33 @@ struct CodexGate {
     nudge_level: u8,
     gate_reason: Option<PricingGateReason>,
     gate_message: String,
+    nudge_thresholds_percent: [f64; 3],
+    disable_threshold_percent: f64,
 }
 
-/// Codex weekly-usage gate, the Codex-only parallel to `paid_plan_gate`. Uses
-/// the same nudge thresholds and a 50% disable threshold against the weekly
-/// (secondary) window. Enforcement is scoped to Codex traffic via
-/// `AppState::codex_bypass`, so it never pauses Claude optimization.
-fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> CodexGate {
-    let disable = CODEX_WEEKLY_DISABLE_THRESHOLD_PCT;
-    let nudges = NUDGE_THRESHOLDS_PERCENT;
+/// Codex weekly-usage gate, the Codex-only parallel to `paid_plan_gate`.
+/// Tier-dependent, mirroring the Claude ladder: plans that map to a Max-like
+/// Headroom tier (ChatGPT Pro, Team, Business, Enterprise) nudge at 10/15/20%
+/// and pause at 25%; Go/Plus (Pro-like) nudge at 25/35/45% and pause at 50%.
+/// Enforcement is scoped to Codex traffic via `AppState::codex_bypass`, so it
+/// never pauses Claude optimization.
+fn codex_plan_gate(
+    weekly_used_percent: Option<f64>,
+    plan_tier: &CodexPlanTier,
+    gate_enabled: bool,
+) -> CodexGate {
+    let max_like = matches!(
+        crate::models::headroom_tier_for_codex_plan(plan_tier),
+        Some(HeadroomSubscriptionTier::Max5x | HeadroomSubscriptionTier::Max20x)
+    );
+    let (disable, nudges) = if max_like {
+        // Max-like tiers pause at 25%, so nudges sit below that cutoff to
+        // keep the warn-then-pause cadence — same rationale as
+        // MAX_TIER_NUDGE_THRESHOLDS_PERCENT on the Claude side.
+        (25.0, MAX_TIER_NUDGE_THRESHOLDS_PERCENT)
+    } else {
+        (CODEX_WEEKLY_DISABLE_THRESHOLD_PCT, NUDGE_THRESHOLDS_PERCENT)
+    };
 
     let Some(weekly_usage) = weekly_used_percent else {
         return CodexGate {
@@ -683,6 +703,8 @@ fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> Code
             gate_message:
                 "Send a Codex prompt through Headroom to sync your current weekly usage window."
                     .into(),
+            nudge_thresholds_percent: nudges,
+            disable_threshold_percent: disable,
         };
     };
 
@@ -695,6 +717,8 @@ fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> Code
             gate_message: format!(
                 "Codex weekly usage is at {weekly_usage:.0}% of the current window."
             ),
+            nudge_thresholds_percent: nudges,
+            disable_threshold_percent: disable,
         };
     }
 
@@ -707,6 +731,8 @@ fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> Code
             gate_message: format!(
                 "Headroom is paused because you've reached {weekly_usage:.1}% of weekly Codex usage. Upgrade to raise your limit."
             ),
+            nudge_thresholds_percent: nudges,
+            disable_threshold_percent: disable,
         };
     }
 
@@ -727,6 +753,8 @@ fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> Code
         nudge_level,
         gate_reason: None,
         gate_message,
+        nudge_thresholds_percent: nudges,
+        disable_threshold_percent: disable,
     }
 }
 
@@ -3941,28 +3969,65 @@ mod tests {
 
     #[test]
     fn codex_gate_nudges_then_pauses_for_free_account() {
-        // Below first threshold: no nudge, optimization allowed.
+        // Go/Plus (Pro-like) ladder: nudges 25/35/45, pause at 50.
         let low = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(20.0),
-            crate::models::CodexPlanTier::Pro,
+            crate::models::CodexPlanTier::Plus,
             true,
         );
         assert!(low.optimization_allowed);
         assert_eq!(low.nudge_level, 0);
+        assert_eq!(low.effective_disable_threshold_percent, 50.0);
 
-        // Crossing thresholds escalates the nudge level.
         let mid = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(36.0),
-            crate::models::CodexPlanTier::Pro,
+            crate::models::CodexPlanTier::Plus,
             true,
         );
         assert!(mid.optimization_allowed);
         assert_eq!(mid.nudge_level, 2, "36% crosses the 25% and 35% thresholds");
         assert!(mid.should_nudge);
 
-        // At/over the disable threshold: optimization paused with the Codex reason.
         let over = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(50.0),
+            crate::models::CodexPlanTier::Plus,
+            true,
+        );
+        assert!(!over.optimization_allowed);
+        assert!(matches!(
+            over.gate_reason,
+            Some(crate::models::PricingGateReason::CodexWeeklyUsageLimitReached)
+        ));
+    }
+
+    #[test]
+    fn codex_gate_uses_max_ladder_for_max_like_plans() {
+        // ChatGPT Pro maps to Max x20: nudges 10/15/20, pause at 25 — the
+        // same warn-then-pause cadence as Claude Max tiers.
+        let low = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(8.0),
+            crate::models::CodexPlanTier::Pro,
+            true,
+        );
+        assert!(low.optimization_allowed);
+        assert_eq!(low.nudge_level, 0);
+        assert_eq!(low.effective_disable_threshold_percent, 25.0);
+        assert_eq!(
+            low.effective_nudge_thresholds_percent,
+            vec![10.0, 15.0, 20.0]
+        );
+
+        let mid = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(20.0),
+            crate::models::CodexPlanTier::Pro,
+            true,
+        );
+        assert!(mid.optimization_allowed);
+        assert_eq!(mid.nudge_level, 3, "20% crosses all of 10/15/20");
+        assert!(mid.should_nudge);
+
+        let over = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(25.0),
             crate::models::CodexPlanTier::Pro,
             true,
         );

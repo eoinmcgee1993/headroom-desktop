@@ -49,9 +49,9 @@ function makePricing(
     gateReason: null,
     gateMessage: "",
     nudgeThresholdPercent: null,
-    effectiveNudgeThresholdsPercent: null,
+    effectiveNudgeThresholdsPercent: [25, 35, 45],
     disableThresholdPercent: null,
-    effectiveDisableThresholdPercent: null,
+    effectiveDisableThresholdPercent: 50,
     recommendedSubscriptionTier: null,
     claude: {
       authMethod: "claude_ai_oauth",
@@ -82,6 +82,8 @@ function makeCodex(
     recommendedSubscriptionTier: null,
     weeklyUsedPercent: null,
     gateMessage: "",
+    effectiveNudgeThresholdsPercent: [25, 35, 45],
+    effectiveDisableThresholdPercent: 50,
     ...overrides,
   };
 }
@@ -271,7 +273,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
     );
 
     expect(invokeMock).toHaveBeenCalledWith("show_notification", {
-      title: "Heads up: 25% of your weekly Claude usage",
+      title: "Heads up: 25% of your weekly Claude usage (Headroom pauses at 50%)",
       body: "You're at 27.0% of weekly Claude usage.",
       action: "billing",
     });
@@ -294,7 +296,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith(
       "show_notification",
-      expect.objectContaining({ title: "Heads up: 25% of your weekly Claude usage" })
+      expect.objectContaining({ title: "Heads up: 25% of your weekly Claude usage (Headroom pauses at 50%)" })
     );
   });
 
@@ -389,7 +391,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith(
       "show_notification",
-      expect.objectContaining({ title: "Heads up: 25% of your weekly Claude usage" })
+      expect.objectContaining({ title: "Heads up: 25% of your weekly Claude usage (Headroom pauses at 50%)" })
     );
   });
 
@@ -456,8 +458,34 @@ describe("maybeFireUrgentPricingNotifications", () => {
     );
 
     expect(invokeMock).toHaveBeenCalledWith("show_notification", {
-      title: "Heads up: 25% of your weekly Codex usage",
+      title: "Heads up: 25% of your weekly Codex usage (Headroom pauses at 50%)",
       body: "You're at 27.0% of weekly Codex usage.",
+      action: "billing",
+    });
+  });
+
+  it("quotes the Max-tier ladder in nudge titles instead of the hardcoded Pro one", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    // ChatGPT Pro / Claude Max users nudge at 10/15/20 and pause at 25 —
+    // the title must quote those numbers, not the 25/35/45 Pro ladder.
+    await maybeFireUrgentPricingNotifications(
+      makePricing({
+        account: gatedFreeAccount,
+        codex: makeCodex({
+          shouldNudge: true,
+          nudgeLevel: 1,
+          gateMessage: "You're at 12.0% of weekly Codex usage.",
+          effectiveNudgeThresholdsPercent: [10, 15, 20],
+          effectiveDisableThresholdPercent: 25,
+        }),
+      })
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+      title: "Heads up: 10% of your weekly Codex usage (Headroom pauses at 25%)",
+      body: "You're at 12.0% of weekly Codex usage.",
       action: "billing",
     });
   });
@@ -482,7 +510,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
 
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith("show_notification", {
-      title: "Halfway there: 35% of your weekly Codex usage",
+      title: "Getting close: 35% of your weekly Codex usage (Headroom pauses at 50%)",
       body: "Codex 36%",
       action: "billing",
     });
@@ -505,7 +533,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith(
       "show_notification",
-      expect.objectContaining({ title: "Heads up: 25% of your weekly Claude usage" })
+      expect.objectContaining({ title: "Heads up: 25% of your weekly Claude usage (Headroom pauses at 50%)" })
     );
   });
 

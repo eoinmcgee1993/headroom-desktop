@@ -465,6 +465,8 @@ export interface CodexUsage {
   recommendedSubscriptionTier?: HeadroomSubscriptionTier | null;
   weeklyUsedPercent?: number | null;
   gateMessage: string;
+  effectiveNudgeThresholdsPercent?: number[] | null;
+  effectiveDisableThresholdPercent?: number | null;
 }
 
 export interface HeadroomAccountProfile {

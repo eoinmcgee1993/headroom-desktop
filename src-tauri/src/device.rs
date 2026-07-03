@@ -90,6 +90,25 @@ fn read_hardware_uuid() -> Option<String> {
 }
 
 fn fallback_identifier() -> String {
+    // A hostname-derived id churns whenever DHCP renames the machine,
+    // fragmenting the server-side trial record across "devices". Persist a
+    // random id in app support instead; hostname remains only as the last
+    // resort when even that write fails.
+    let path = crate::storage::config_file(&crate::storage::app_data_dir(), "device-fallback-id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let fresh = format!("fallback:{}", uuid::Uuid::new_v4());
+    if crate::client_adapters::atomic_write(&path, fresh.as_bytes()).is_ok() {
+        sentry::capture_message(
+            "Device hardware UUID unavailable — using persisted random fallback id",
+            sentry::Level::Warning,
+        );
+        return fresh;
+    }
     sentry::capture_message(
         "Device hardware UUID unavailable — falling back to hostname-based identifier",
         sentry::Level::Warning,

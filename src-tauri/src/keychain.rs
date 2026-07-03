@@ -285,12 +285,23 @@ mod platform {
 
     fn check_status(status: OSStatus, action: &str) -> Result<(), String> {
         if status == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "{action} failed with macOS Security status {status}."
-            ))
+            return Ok(());
         }
+        // The common failure codes on managed (MDM) or locked-down machines
+        // get a hint the user can act on — a bare "status -25308" was the
+        // whole error message people saw at sign-in.
+        let hint = match status {
+            // errSecInteractionNotAllowed: keychain locked or UI not allowed.
+            -25308 => " Your macOS keychain appears to be locked — unlock it in Keychain Access (or log out and back in) and retry.",
+            // errSecAuthFailed
+            -25293 => " macOS denied keychain access for Headroom. If this Mac is company-managed, your MDM profile may restrict keychain use.",
+            // errSecMissingEntitlement
+            -34018 => " The app build is missing a keychain entitlement — reinstalling Headroom usually fixes this.",
+            _ => "",
+        };
+        Err(format!(
+            "{action} failed with macOS Security status {status}.{hint}"
+        ))
     }
 }
 

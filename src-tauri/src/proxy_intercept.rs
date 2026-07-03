@@ -135,50 +135,66 @@ pub fn spawn(
                 .expect("proxy intercept runtime");
             rt.block_on(async move {
                 let bind_addr: SocketAddr = ([127, 0, 0, 1], INTERCEPT_PORT).into();
-                match run(
-                    bind_addr,
-                    token_slot,
-                    codex_slot,
-                    codex_plan_slot,
-                    bypass,
-                    claude_only_bypass,
-                    codex_bypass,
-                    fresh_bearer_tx,
-                    upstream_base,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                        // Port is already bound. If /health responds over HTTP, an
-                        // existing Headroom proxy owns the port (single-instance
-                        // plugin should normally prevent this, but a crashed or
-                        // still-exiting prior process can leave it held). Treat
-                        // that as benign. Otherwise the port is foreign and we
-                        // escalate to Sentry.
-                        if probe_existing_intercept().await {
-                            log::info!(
-                                "[proxy_intercept] port {INTERCEPT_PORT} already owned by existing Headroom proxy; exiting thread"
-                            );
-                        } else {
-                            log::debug!(
-                                "[proxy_intercept] fatal: {e} (port {INTERCEPT_PORT} held by foreign process)"
-                            );
-                            sentry::capture_message(
-                                &format!(
-                                    "proxy_intercept fatal error: {e} (port {INTERCEPT_PORT} held by foreign process)"
-                                ),
-                                sentry::Level::Fatal,
-                            );
+                // The intercept is the app's front door: client configs point
+                // all traffic at this port, so a bind failure must never end
+                // the thread permanently — the squatter (a crashed prior
+                // instance mid-exit, or a foreign process) may release the
+                // port at any time, and giving up strands every client on a
+                // dead endpoint with no recovery until app relaunch. Retry
+                // forever; report each distinct error to Sentry once.
+                let mut reported_errors: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                loop {
+                    match run(
+                        bind_addr,
+                        token_slot.clone(),
+                        codex_slot.clone(),
+                        codex_plan_slot.clone(),
+                        bypass.clone(),
+                        claude_only_bypass.clone(),
+                        codex_bypass.clone(),
+                        fresh_bearer_tx.clone(),
+                        upstream_base.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => return,
+                        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                            // If /health responds over HTTP, an existing
+                            // Headroom proxy owns the port (single-instance
+                            // plugin should normally prevent this, but a
+                            // crashed or still-exiting prior process can leave
+                            // it held) — benign, just wait for it to go away.
+                            // Otherwise the port is foreign; escalate once.
+                            if probe_existing_intercept().await {
+                                log::info!(
+                                    "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
+                                );
+                            } else {
+                                log::warn!(
+                                    "[proxy_intercept] port {INTERCEPT_PORT} held by foreign process; retrying in 15s ({e})"
+                                );
+                                if reported_errors.insert(format!("foreign:{e}")) {
+                                    sentry::capture_message(
+                                        &format!(
+                                            "proxy_intercept bind failed: {e} (port {INTERCEPT_PORT} held by foreign process; retrying)"
+                                        ),
+                                        sentry::Level::Error,
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("[proxy_intercept] error: {e}; retrying in 15s");
+                            if reported_errors.insert(e.to_string()) {
+                                sentry::capture_message(
+                                    &format!("proxy_intercept error: {e} (retrying)"),
+                                    sentry::Level::Error,
+                                );
+                            }
                         }
                     }
-                    Err(e) => {
-                        log::debug!("[proxy_intercept] fatal: {e}");
-                        sentry::capture_message(
-                            &format!("proxy_intercept fatal error: {e}"),
-                            sentry::Level::Fatal,
-                        );
-                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 }
             });
         })

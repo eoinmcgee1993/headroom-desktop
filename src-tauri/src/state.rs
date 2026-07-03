@@ -3747,11 +3747,25 @@ impl SavingsTracker {
         let persisted_state = match load_persisted_savings_state(&state_path) {
             Ok(state) => state,
             Err(err) => {
-                log::warn!("savings-state.json unreadable ({err}); backing up and starting fresh");
+                log::warn!("savings-state.json unreadable ({err}); backing up");
                 let _ = std::fs::rename(&state_path, state_path.with_extension("json.corrupt"));
                 None
             }
-        };
+        }
+        // Missing/corrupt/schema-mismatched state used to mean starting the
+        // user's savings history from zero even though savings-records.jsonl
+        // holds every observation delta — rebuild the buckets from it instead.
+        // Approximate is fine: the backend's settled-day rollups overwrite
+        // these keys on the next stats poll anyway.
+        .or_else(|| {
+            let rebuilt = rebuild_persisted_savings_from_records(&records_path);
+            if rebuilt.is_some() {
+                log::warn!(
+                    "savings-state.json missing or unusable; rebuilt history from savings-records.jsonl"
+                );
+            }
+            rebuilt
+        });
 
         // Seed the milestone high-water from the persisted value, or (on first
         // load after upgrade) from the current bucket sum so already-earned
@@ -4356,9 +4370,42 @@ impl SavingsTracker {
         }
     }
 
+    /// Drop hourly buckets older than this many days before persisting. The
+    /// dashboard's hourly charts only look back days, not months, while the
+    /// map otherwise grows by up to 24 keys/day forever — and the whole file
+    /// is rewritten on every observe tick, so its size is a per-minute I/O
+    /// cost. Daily buckets are kept indefinitely (365/year is nothing).
+    const HOURLY_RETENTION_DAYS: i64 = 30;
+
+    fn prune_hourly_savings(&mut self) {
+        // Anchor retention to the newest bucket rather than the wall clock so
+        // a returning user's charts don't vanish before new data arrives.
+        let latest_day = self
+            .hourly_savings
+            .keys()
+            .chain(self.session_hourly_buckets.keys())
+            .filter_map(|key| key.get(..10))
+            .max()
+            .and_then(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok());
+        let Some(latest_day) = latest_day else {
+            return;
+        };
+        let cutoff = (latest_day - chrono::Duration::days(Self::HOURLY_RETENTION_DAYS))
+            .format("%Y-%m-%d")
+            .to_string();
+        // Keys are "YYYY-MM-DDTHH:00", so day-key prefix comparison is date order.
+        self.hourly_savings
+            .retain(|key, _| key.as_str() >= cutoff.as_str());
+        self.session_hourly_buckets
+            .retain(|key, _| key.as_str() >= cutoff.as_str());
+    }
+
     fn persist_state(&mut self) -> Result<()> {
-        let serialized = serde_json::to_vec_pretty(&self.persisted_state())
-            .context("serializing savings state")?;
+        self.prune_hourly_savings();
+        // Compact (not pretty) JSON: this is a machine-read file rewritten on
+        // every observe tick; pretty-printing roughly doubled the write.
+        let serialized =
+            serde_json::to_vec(&self.persisted_state()).context("serializing savings state")?;
         // Temp+rename: a crash/power loss mid-write used to leave truncated
         // JSON that the next launch silently replaced with a fresh tracker.
         crate::client_adapters::atomic_write(&self.state_path, &serialized)
@@ -4419,6 +4466,74 @@ fn lifetime_token_milestones_crossed(previous_total: u64, current_total: u64) ->
     }
 
     milestones
+}
+
+/// Rebuild a best-effort `PersistedSavingsState` from the append-only
+/// savings-records.jsonl (current + one rotated generation) by summing each
+/// record's observation deltas into day/hour buckets. Used when
+/// savings-state.json is missing, corrupt, or schema-mismatched. Session
+/// state is not recoverable (and doesn't matter across a restart); the
+/// milestone high-water is seeded from the rebuilt total so already-earned
+/// milestones don't re-fire.
+fn rebuild_persisted_savings_from_records(records_path: &Path) -> Option<PersistedSavingsState> {
+    let mut daily: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
+    let mut hourly: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
+    let mut lifetime_requests: usize = 0;
+    let mut any = false;
+
+    // Rotated generation first (older records), then the live file.
+    for path in [
+        records_path.with_extension("jsonl.1"),
+        records_path.to_path_buf(),
+    ] {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let Ok(record) = serde_json::from_str::<SavingsRecord>(line) else {
+                continue; // tolerate a torn tail line or legacy garbage
+            };
+            // Pre-v5 records lack hour keys and use older delta semantics.
+            if record.schema_version < 5 || record.day_key.is_empty() {
+                continue;
+            }
+            any = true;
+            lifetime_requests = lifetime_requests.saturating_add(record.delta_requests);
+            let bucket = daily.entry(record.day_key.clone()).or_default();
+            bucket.estimated_savings_usd += record.delta_estimated_savings_usd.max(0.0);
+            bucket.estimated_tokens_saved = bucket
+                .estimated_tokens_saved
+                .saturating_add(record.delta_estimated_tokens_saved);
+            bucket.actual_cost_usd += record.delta_actual_cost_usd.max(0.0);
+            bucket.total_tokens_sent = bucket
+                .total_tokens_sent
+                .saturating_add(record.delta_total_tokens_sent);
+            if !record.hour_key.is_empty() {
+                let bucket = hourly.entry(record.hour_key.clone()).or_default();
+                bucket.estimated_savings_usd += record.delta_estimated_savings_usd.max(0.0);
+                bucket.estimated_tokens_saved = bucket
+                    .estimated_tokens_saved
+                    .saturating_add(record.delta_estimated_tokens_saved);
+                bucket.actual_cost_usd += record.delta_actual_cost_usd.max(0.0);
+                bucket.total_tokens_sent = bucket
+                    .total_tokens_sent
+                    .saturating_add(record.delta_total_tokens_sent);
+            }
+        }
+    }
+
+    if !any {
+        return None;
+    }
+    let rebuilt_token_total: u64 = daily.values().map(|b| b.estimated_tokens_saved).sum();
+    Some(PersistedSavingsState {
+        schema_version: 3,
+        lifetime_requests,
+        lifetime_token_milestone_high_water: Some(rebuilt_token_total),
+        daily_savings: daily,
+        hourly_savings: hourly,
+        ..Default::default()
+    })
 }
 
 fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsState>> {
@@ -5807,10 +5922,10 @@ mod tests {
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
-        proxy_readyz_status_is_reachable, tcp_port_accepts_connection, total_dir_size_bytes,
-        AppState, BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, PersistedSavingsState,
-        SavingsObservation, SavingsTracker,
+        proxy_readyz_status_is_reachable, rebuild_persisted_savings_from_records,
+        tcp_port_accepts_connection, total_dir_size_bytes, AppState, BootValidationOutcome,
+        ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
+        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
     };
 
     #[test]
@@ -6310,6 +6425,65 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn rebuild_savings_from_records_sums_deltas_per_bucket() {
+        let id = uuid::Uuid::new_v4();
+        let records_path = std::env::temp_dir().join(format!("headroom-rebuild-test-{id}.jsonl"));
+        let mk = |day: &str, hour: &str, tokens: u64, requests: usize| {
+            serde_json::to_string(&SavingsRecord {
+                schema_version: 7,
+                id: "r".into(),
+                observed_at: Utc::now(),
+                day_key: day.into(),
+                hour_key: hour.into(),
+                delta_requests: requests,
+                delta_estimated_savings_usd: 0.5,
+                delta_estimated_tokens_saved: tokens,
+                delta_actual_cost_usd: 0.1,
+                delta_total_tokens_sent: tokens * 10,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let lines = [
+            mk("2026-06-10", "2026-06-10T09:00", 100, 2),
+            mk("2026-06-10", "2026-06-10T10:00", 50, 1),
+            mk("2026-06-11", "2026-06-11T09:00", 25, 1),
+            "not json at all".to_string(), // torn tail line is tolerated
+        ];
+        std::fs::write(&records_path, lines.join("\n")).unwrap();
+
+        let rebuilt =
+            rebuild_persisted_savings_from_records(&records_path).expect("rebuild from records");
+        assert_eq!(rebuilt.lifetime_requests, 4);
+        assert_eq!(
+            rebuilt.daily_savings["2026-06-10"].estimated_tokens_saved,
+            150
+        );
+        assert_eq!(
+            rebuilt.daily_savings["2026-06-11"].estimated_tokens_saved,
+            25
+        );
+        assert_eq!(
+            rebuilt.hourly_savings["2026-06-10T09:00"].estimated_tokens_saved,
+            100
+        );
+        // Milestones seeded from the rebuilt total so they don't re-fire.
+        assert_eq!(rebuilt.lifetime_token_milestone_high_water, Some(175));
+
+        let _ = std::fs::remove_file(&records_path);
+    }
+
+    #[test]
+    fn rebuild_savings_from_records_returns_none_without_usable_records() {
+        let id = uuid::Uuid::new_v4();
+        let records_path = std::env::temp_dir().join(format!("headroom-rebuild-none-{id}.jsonl"));
+        assert!(rebuild_persisted_savings_from_records(&records_path).is_none());
+        std::fs::write(&records_path, "garbage\n").unwrap();
+        assert!(rebuild_persisted_savings_from_records(&records_path).is_none());
+        let _ = std::fs::remove_file(&records_path);
+    }
+
     fn make_tracker() -> SavingsTracker {
         let id = uuid::Uuid::new_v4();
         let records_path = std::env::temp_dir().join(format!("headroom-savings-test-{}.jsonl", id));
@@ -6682,6 +6856,7 @@ mod tests {
             recommended_subscription_tier: None,
             weekly_used_percent: None,
             gate_message: String::new(),
+            ..Default::default()
         }
     }
 
