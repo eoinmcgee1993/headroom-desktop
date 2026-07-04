@@ -284,6 +284,10 @@ const MAX_UPGRADE_AUTO_RETRIES = 2;
 
 const GATE_AUTO_DISABLED_STORAGE_KEY = "headroom:gateAutoDisabledConnectors";
 
+function baseUrlTakeoverNotice(replaced: string): string {
+  return `Claude Code was routed through ${replaced}. Headroom now handles routing while enabled and restores this address when you disable the connector.`;
+}
+
 const idleHeadroomLearnStatus: HeadroomLearnStatus = {
   running: false,
   progressPercent: 0,
@@ -996,6 +1000,7 @@ export default function App() {
   const [connectorsBusy, setConnectorsBusy] = useState(false);
   const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">("healthy");
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
+  const [connectorsNotice, setConnectorsNotice] = useState<string | null>(null);
   const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
   const [proxyVerificationHint, setProxyVerificationHint] = useState<string | null>(null);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
@@ -2740,7 +2745,10 @@ export default function App() {
 
       if (step.kind === "apply") {
         for (const clientId of step.clientIds) {
-          await invoke<ClientSetupResult>("apply_client_setup", { clientId });
+          const result = await invoke<ClientSetupResult>("apply_client_setup", { clientId });
+          if (result.replacedBaseUrl) {
+            setConnectorsNotice(baseUrlTakeoverNotice(result.replacedBaseUrl));
+          }
         }
         latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
         applyConnectorsIfChanged(latestConnectors);
@@ -3238,9 +3246,15 @@ export default function App() {
     setConnectorsError(null);
     try {
       if (nextEnabled) {
-        await invoke<ClientSetupResult>("apply_client_setup", { clientId: connector.clientId });
+        const result = await invoke<ClientSetupResult>("apply_client_setup", {
+          clientId: connector.clientId,
+        });
+        setConnectorsNotice(
+          result.replacedBaseUrl ? baseUrlTakeoverNotice(result.replacedBaseUrl) : null
+        );
       } else {
         await invoke("disable_client_setup", { clientId: connector.clientId });
+        setConnectorsNotice(null);
       }
 
       const latestDashboard = await loadDashboard();
@@ -3912,6 +3926,9 @@ export default function App() {
           ) : null}
           {connectorsError ? (
             <p className="install-progress__error">{connectorsError}</p>
+          ) : null}
+          {connectorsNotice ? (
+            <p className="install-progress__notice">{connectorsNotice}</p>
           ) : null}
         </div>
         <div className="post-install__actions">
@@ -5773,6 +5790,9 @@ export default function App() {
                 </div>
                 {connectorsError ? (
                   <p className="install-progress__error">{connectorsError}</p>
+                ) : null}
+                {connectorsNotice ? (
+                  <p className="install-progress__notice">{connectorsNotice}</p>
                 ) : null}
               </article>
 

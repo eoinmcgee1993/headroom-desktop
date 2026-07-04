@@ -773,6 +773,14 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     // above may leave the machine via Sentry).
     let raw_snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
     log::warn!("codex upstream error {status} on {path}: {raw_snippet}");
+    // Upstream 5xx is a provider-side transient (502/503/504/500 proxy_error)
+    // that Headroom neither caused nor can fix. Capturing every one just burns
+    // Sentry quota (RUST-46/4G/4T were all this). Keep full detail in the local
+    // log::warn! above; only forward non-5xx classes (4xx auth/challenge, novel
+    // statuses) that can indicate an actionable request-construction bug.
+    if (500..600).contains(&status) {
+        return;
+    }
     // Group by status so each upstream failure class is its own Sentry issue.
     // Without an explicit fingerprint, Sentry parameterizes the message
     // ("codex upstream error {status} on {path}") and collapses 401 noise, 403

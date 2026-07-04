@@ -36,10 +36,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// `*-manylinux_*` abi3 wheel from
 /// https://pypi.org/pypi/headroom-ai/<version>/json and add a per-platform
 /// wheel-picker (mirroring `python_distribution_artifact`).
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.28.0";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/b7/ad/a8e3a083851304e94707e305efcd9d94fac8bd605a31118ec18926211c1a/headroom_ai-0.28.0-cp310-abi3-macosx_11_0_arm64.whl";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.30.0";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/d1/61/bd6495a33d1cb098da61c651f803fe309acaa5331e4b92381b825cf868b9/headroom_ai-0.30.0-cp310-abi3-macosx_11_0_arm64.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "31d3b280e7366a23f54034de15f525c3676e185464caa4e8696cd8ce2bad9fa6";
+    "9b10f4dec6451fce652fdb775e7dc7a999e98d3ee853d1eb569a7e2e550d79c5";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
@@ -948,17 +948,17 @@ impl ToolManager {
                     // returns policy_default_payg() when enforcement is off) -- a
                     // net loss on cache-billed subscription sessions.
                     .env("HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT", "enabled")
-                    // Enable plain user-message text compression in addition to
-                    // tool results. Primary motive is Codex/OpenAI: with a 0.5
-                    // read-discount and 0.0 write-penalty, compressing user text
-                    // clears the force-compress threshold and yields real savings.
-                    // This is the only desktop-side lever (the `headroom proxy`
-                    // entrypoint reads this env only; it exposes no CLI flag), and
-                    // it is process-global on the single shared proxy. Anthropic
-                    // blast radius is small: its 0.9 read-discount means already-
-                    // cached content almost never busts the frozen prefix, and
-                    // protect_recent/min_tokens guard the just-typed prompt.
-                    .env("HEADROOM_COMPRESS_USER_MESSAGES", "1")
+                    // User-message text compression is intentionally left OFF
+                    // (proxy default: user turns are protected). It's a single
+                    // process-global switch with no per-provider scoping, so the
+                    // choice is on-for-both-clients or off-for-both. We keep it off
+                    // to protect the coding working set carried in user turns (code,
+                    // errors, paths the model must see verbatim) and because the
+                    // token mass is tool_results, which compress regardless — this
+                    // also matches the "coding" savings persona, which sets
+                    // compress_user_messages=False. Trade-off: gives up the modest
+                    // Codex/OpenAI user-text savings (0.5 read-discount, 0.0
+                    // write-penalty) that HEADROOM_COMPRESS_USER_MESSAGES=1 enabled.
                     // Output-token shaping (new in headroom-ai 0.27.0). The proxy
                     // never emits output tokens, so this works request-side: it
                     // appends a byte-stable verbosity instruction to the TAIL of
@@ -979,6 +979,20 @@ impl ToolManager {
                     // baseline still feeds the /stats savings estimate. Level 2 =
                     // skip pre/postamble, don't restate in-context code/tool output.
                     .env("HEADROOM_VERBOSITY_LEVEL", "2")
+                    // Agent savings persona (new in headroom-ai 0.30.0). The
+                    // `proxy` entrypoint reads HEADROOM_SAVINGS_PROFILE into
+                    // config.savings_profile, and proxy_pipeline_kwargs() applies
+                    // the persona's compression knobs per request across all
+                    // handlers. The "coding" persona holds the active code working
+                    // set verbatim (protect_recent=2, protect_analysis_context,
+                    // smart_crusher_with_compaction) with a low min_tokens so
+                    // compression stays visible, and target_ratio unset so savings
+                    // emerge from lossless + relevance rather than a forced keep.
+                    // Note: the persona sets compress_user_messages=False to avoid
+                    // prompt mutation / prefix-cache busting, but our explicit
+                    // HEADROOM_COMPRESS_USER_MESSAGES=1 above wins in
+                    // proxy_pipeline_kwargs — kept on for Codex savings.
+                    .env("HEADROOM_SAVINGS_PROFILE", "coding")
                     // Pre-upstream concurrency. The proxy's own auto is
                     // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
                     // event loop from CPU-bound compression. The desktop runs with

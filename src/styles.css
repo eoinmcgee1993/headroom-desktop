@@ -601,6 +601,14 @@ select {
   color: #8a3d3d;
 }
 
+.install-progress__notice {
+  color: var(--warning);
+  background: var(--warning-tint);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: var(--text-sm);
+}
+
 .intro-shell__art {
   display: grid;
   place-items: center;

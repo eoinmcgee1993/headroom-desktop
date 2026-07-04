@@ -219,6 +219,7 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
     let mut state = load_setup_state();
     let state_id = normalized_setup_id(client_id).to_string();
     let mut shell_unwritable = false;
+    let mut replaced_base_url = None;
 
     match client_id {
         "claude_code" => {
@@ -226,8 +227,18 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
             // Critical, app-owned writes first: the ~/.claude/settings.json env is
             // what actually routes Claude Code through Headroom. Do it before the
             // shell profile so a locked ~/.zshrc can't block core setup.
-            let mut updates =
+            let (changed, backups, replaced) =
                 configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+            let mut updates = (changed, backups);
+            if let Some(original) = replaced {
+                // A custom gateway/proxy URL was routing Claude before us:
+                // remember it for restore-on-disable and tell the caller so
+                // the UI can inform the user their routing changed.
+                state
+                    .preserved_base_urls
+                    .insert(state_id.clone(), original.clone());
+                replaced_base_url = Some(original);
+            }
             let mut legacy_updates = remove_legacy_vscode_base_url_keys()?;
             updates.0.append(&mut legacy_updates.0);
             updates.1.append(&mut legacy_updates.1);
@@ -267,9 +278,15 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
                 .insert(state_id.clone(), serialize_paths(&shell_targets));
         }
         "vscode" => {
-            let updates = configure_vscode_settings()?;
-            changed_files.extend(updates.0);
-            backup_files.extend(updates.1);
+            let (changed, backups, replaced) = configure_vscode_settings()?;
+            changed_files.extend(changed);
+            backup_files.extend(backups);
+            if let Some(original) = replaced {
+                state
+                    .preserved_base_urls
+                    .insert(state_id.clone(), original.clone());
+                replaced_base_url = Some(original);
+            }
         }
         "codex" | "codex_cli" => {
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
@@ -355,6 +372,7 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
         },
         verification,
         shell_profile_unwritable: shell_unwritable,
+        replaced_base_url,
     })
 }
 
@@ -579,7 +597,18 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // shell profiles after quit — otherwise the user's next shell still
             // has Headroom binaries shadowing whatever's on PATH.
             remove_shell_block(&shell_targets, "managed_rtk")?;
-            remove_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+            // Restore any pre-Headroom gateway/proxy URL instead of deleting
+            // the key — deleting it pointed gateway users at api.anthropic.com
+            // where their credentials may not even work.
+            let preserved = state
+                .preserved_base_urls
+                .get(normalized_setup_id(client_id))
+                .cloned();
+            remove_claude_settings_env(
+                "ANTHROPIC_BASE_URL",
+                HEADROOM_ANTHROPIC_BASE_URL,
+                preserved.as_deref(),
+            )?;
             let _ = remove_legacy_vscode_base_url_keys()?;
             // Strip the PreToolUse hook entry and delete the hook script so CC
             // behaves exactly as it did before Headroom was launched.
@@ -592,7 +621,13 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             }
             let _ = remove_claude_guard_hook();
         }
-        "vscode" => remove_vscode_connector_keys()?,
+        "vscode" => {
+            let preserved = state
+                .preserved_base_urls
+                .get(normalized_setup_id(client_id))
+                .cloned();
+            remove_vscode_connector_keys(preserved.as_deref())?;
+        }
         other => {
             return Err(anyhow!(
                 "Automatic setup disable is not supported yet for {other}.",
@@ -621,6 +656,9 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             state.remembered_clients.remove(state_id);
             state.managed_shell_files.remove(state_id);
             state.remembered_shell_files.remove(state_id);
+            // Consumed: the URL is back in the user's config now. The next
+            // apply re-captures it if Headroom is re-enabled.
+            state.preserved_base_urls.remove(state_id);
         }
     }
     write_setup_state(&state)?;
@@ -1049,6 +1087,13 @@ struct ClientSetupState {
     managed_shell_files: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     remembered_shell_files: BTreeMap<String, Vec<String>>,
+    /// Pre-existing custom base URLs (corporate gateway, LiteLLM, Bedrock
+    /// proxy) that setup replaced with Headroom's, keyed by client state id.
+    /// Restored verbatim on disable/uninstall — setup used to clobber these
+    /// and never put them back, silently unrouting enterprise users from
+    /// their gateway.
+    #[serde(default)]
+    preserved_base_urls: BTreeMap<String, String>,
     /// User opted RTK out via the tool status toggle. When true, bootstrap and
     /// client setup skip re-adding the RTK PATH export and Claude Code hook.
     #[serde(default)]
@@ -1463,17 +1508,21 @@ fn clear_legacy_codex_gui_launch_env() -> Result<()> {
     Ok(())
 }
 
-fn configure_vscode_settings() -> Result<(Vec<String>, Vec<String>)> {
-    let (mut changed_files, mut backup_files) =
+fn configure_vscode_settings() -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+    let (mut changed_files, mut backup_files, replaced) =
         configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
     let (legacy_changed, legacy_backups) = remove_legacy_vscode_base_url_keys()?;
     changed_files.extend(legacy_changed);
     backup_files.extend(legacy_backups);
-    Ok((changed_files, backup_files))
+    Ok((changed_files, backup_files, replaced))
 }
 
-fn remove_vscode_connector_keys() -> Result<()> {
-    remove_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+fn remove_vscode_connector_keys(restore_value: Option<&str>) -> Result<()> {
+    remove_claude_settings_env(
+        "ANTHROPIC_BASE_URL",
+        HEADROOM_ANTHROPIC_BASE_URL,
+        restore_value,
+    )?;
     let _ = remove_legacy_vscode_base_url_keys()?;
     Ok(())
 }
@@ -1504,10 +1553,14 @@ fn remove_json_key_if_matches(
     }
 }
 
+/// Point `env.<env_key>` at Headroom. The third return element is a
+/// pre-existing *foreign* value this write replaced (a corporate gateway,
+/// LiteLLM, or Bedrock-proxy URL) — callers must preserve it and restore it
+/// on disable instead of just deleting the key.
 fn configure_claude_settings_env(
     env_key: &str,
     env_value: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
     let settings_path = claude_settings_path();
     let mut content = if settings_path.exists() {
         let raw = std::fs::read_to_string(&settings_path)
@@ -1537,9 +1590,15 @@ fn configure_claude_settings_env(
         return Err(anyhow!("unable to write Claude env settings"));
     };
 
+    let replaced_foreign_value = env_obj
+        .get(env_key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty() && *value != env_value)
+        .map(str::to_string);
+
     let changed = set_json_string(env_obj, env_key, env_value);
     if !changed {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), None));
     }
 
     if let Some(parent) = settings_path.parent() {
@@ -1560,6 +1619,7 @@ fn configure_claude_settings_env(
             .into_iter()
             .map(|path| path.display().to_string())
             .collect(),
+        replaced_foreign_value,
     ))
 }
 
@@ -1652,7 +1712,16 @@ fn ensure_claude_settings_hook(
     ))
 }
 
-fn remove_claude_settings_env(env_key: &str, expected_value: &str) -> Result<()> {
+/// Undo `configure_claude_settings_env`: if `env.<env_key>` still equals
+/// Headroom's value, put back `restore_value` (the user's pre-Headroom
+/// gateway URL) when one was preserved, otherwise delete the key. A key that
+/// no longer matches Headroom's value was changed by the user and is left
+/// alone.
+fn remove_claude_settings_env(
+    env_key: &str,
+    expected_value: &str,
+    restore_value: Option<&str>,
+) -> Result<()> {
     let settings_path = claude_settings_path();
     if !settings_path.exists() {
         return Ok(());
@@ -1664,7 +1733,17 @@ fn remove_claude_settings_env(env_key: &str, expected_value: &str) -> Result<()>
     let mut changed = false;
 
     if let Some(Value::Object(env_obj)) = root.get_mut("env") {
-        changed |= remove_json_key_if_matches(env_obj, env_key, expected_value);
+        match restore_value {
+            Some(original)
+                if env_obj.get(env_key).and_then(|v| v.as_str()) == Some(expected_value) =>
+            {
+                env_obj.insert(env_key.into(), Value::String(original.to_string()));
+                changed = true;
+            }
+            _ => {
+                changed |= remove_json_key_if_matches(env_obj, env_key, expected_value);
+            }
+        }
         if env_obj.is_empty() {
             root.remove("env");
             changed = true;
@@ -3982,6 +4061,7 @@ mod tests {
                 ("codex".into(), vec!["/Users/test/.bash_profile".into()]),
                 ("claude_code".into(), vec!["/Users/test/.bashrc".into()]),
             ]),
+            preserved_base_urls: BTreeMap::new(),
             rtk_disabled: false,
         };
 
@@ -5167,6 +5247,73 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         // settings.json must NOT be deleted even if it were otherwise empty.
         assert!(settings_path.exists(), "settings.json preserved on disable");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_preserves_and_disable_restores_custom_base_url() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        // A corporate gateway already routes Claude Code before Headroom.
+        let gateway = "https://gateway.corp.example/anthropic";
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"{gateway}"}}}}"#),
+        )
+        .unwrap();
+        seed_installed_rtk();
+
+        let result = super::apply_client_setup("claude_code").expect("apply");
+        // Setup captured the gateway and told the caller it took over routing.
+        assert_eq!(result.replaced_base_url.as_deref(), Some(gateway));
+        let settings_path = home.path().join(".claude").join("settings.json");
+        let after_apply = read_settings_json(&settings_path);
+        assert_eq!(
+            after_apply["env"]["ANTHROPIC_BASE_URL"],
+            serde_json::Value::String(super::HEADROOM_ANTHROPIC_BASE_URL.to_string())
+        );
+        assert_eq!(
+            super::load_setup_state().preserved_base_urls["claude_code"],
+            gateway
+        );
+
+        super::disable_client_setup("claude_code").expect("disable");
+        // The gateway URL is restored, not deleted.
+        let after_disable = read_settings_json(&settings_path);
+        assert_eq!(
+            after_disable["env"]["ANTHROPIC_BASE_URL"],
+            serde_json::Value::String(gateway.to_string()),
+            "custom base URL restored on disable, got:\n{after_disable:#}"
+        );
+        assert!(
+            !super::load_setup_state()
+                .preserved_base_urls
+                .contains_key("claude_code"),
+            "preserved entry consumed after restore"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_without_custom_base_url_does_not_report_takeover() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+
+        let result = super::apply_client_setup("claude_code").expect("apply");
+        assert!(result.replaced_base_url.is_none());
+        assert!(super::load_setup_state().preserved_base_urls.is_empty());
+
+        // Disable deletes the key (nothing to restore).
+        super::disable_client_setup("claude_code").expect("disable");
+        let settings_path = home.path().join(".claude").join("settings.json");
+        if settings_path.exists() {
+            let after = read_settings_json(&settings_path);
+            assert!(after["env"]["ANTHROPIC_BASE_URL"].is_null());
+        }
     }
 
     #[test]

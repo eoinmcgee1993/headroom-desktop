@@ -231,6 +231,11 @@ pub struct ClientSetupResult {
     // this is a soft, expected degradation -- callers use it to avoid alerting.
     #[serde(default)]
     pub shell_profile_unwritable: bool,
+    /// A pre-existing custom base URL (corporate gateway/proxy) that this
+    /// setup replaced. The UI must tell the user their routing changed and
+    /// that the original is restored on disable.
+    #[serde(default)]
+    pub replaced_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

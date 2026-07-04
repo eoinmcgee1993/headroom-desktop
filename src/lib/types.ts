@@ -151,6 +151,7 @@ export interface ClientSetupResult {
   nextSteps: string[];
   verification: ClientSetupVerification;
   shellProfileUnwritable?: boolean;
+  replacedBaseUrl?: string | null;
 }
 
 export interface ClientSetupVerification {
