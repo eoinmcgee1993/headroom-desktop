@@ -38,6 +38,29 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Max requests forwarded to the Python backend concurrently. Each forward
+/// holds a client + backend FD for the request's full lifetime (SSE streams
+/// run for minutes), so an unbounded spawn pile-up under 30+ Claude Code
+/// sessions can starve accept() with EMFILE even after the startup RLIMIT
+/// raise. When saturated, `handle` fails fast with 503 + Retry-After: CC/Codex
+/// retry transparently, unlike a dropped connect that kills the user's turn.
+/// Overridable via HEADROOM_INTERCEPT_MAX_INFLIGHT.
+const DEFAULT_MAX_INFLIGHT: usize = 512;
+
+static BACKEND_INFLIGHT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn backend_inflight() -> &'static Arc<tokio::sync::Semaphore> {
+    BACKEND_INFLIGHT.get_or_init(|| {
+        let cap = std::env::var("HEADROOM_INTERCEPT_MAX_INFLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_MAX_INFLIGHT);
+        Arc::new(tokio::sync::Semaphore::new(cap))
+    })
+}
+
 /// Dedicated Codex subscription-usage endpoint (ChatGPT OAuth/session auth).
 /// Current Codex no longer ships `x-codex-*` on the `/responses` handshake, so
 /// this is the only source left for the desktop gauge's rate-limit window.
@@ -398,6 +421,22 @@ async fn handle(
         forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     }
+
+    // Bound concurrent backend forwards. The bypass/direct paths above return
+    // before this point, so only backend-bound traffic is throttled. When the
+    // permit pool is exhausted, fail fast with 503 + Retry-After instead of
+    // connecting and holding another FD pair — a client that gets an immediate
+    // 503 retries transparently; a hung/dropped connect kills the turn. The
+    // permit is held in `_permit` until `handle` returns (through the splice).
+    let Ok(_permit) = backend_inflight().clone().try_acquire_owned() else {
+        log::warn!("[proxy_intercept] backend in-flight cap reached; returning 503");
+        let _ = client
+            .write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+        return;
+    };
 
     // Forward to the headroom backend.
     let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
@@ -3216,5 +3255,16 @@ mod tests {
         assert!(!text.contains("Content-Length: 10\r\n"));
         assert!(text.ends_with("\r\n\r\n"));
         assert!(text.contains("Content-Type: application/json\r\n"));
+    }
+
+    #[tokio::test]
+    async fn inflight_semaphore_fails_fast_when_exhausted() {
+        // A saturated pool must reject via try_acquire_owned so `handle` takes
+        // the 503 branch instead of connecting and holding another FD pair.
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = sem.clone().try_acquire_owned().expect("first permit");
+        assert!(sem.clone().try_acquire_owned().is_err(), "should be saturated");
+        drop(held);
+        assert!(sem.try_acquire_owned().is_ok(), "permit released on drop");
     }
 }

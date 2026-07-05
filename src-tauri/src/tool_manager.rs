@@ -216,11 +216,20 @@ except Exception:
 "#;
 
 /// Pre-upstream concurrency passed to the backend: 2x logical cores,
-/// clamped to [8, 32]. See the spawn-site comment for why the proxy's own
-/// 8-cap is safe to exceed under the desktop's env.
+/// clamped to [8, 64]. See the spawn-site comment for why the proxy's own
+/// 8-cap is safe to exceed under the desktop's env. An explicit
+/// `HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY` in the environment wins, so a
+/// power user with 30+ concurrent sessions can raise it without a rebuild.
 fn pre_upstream_concurrency() -> usize {
+    if let Some(n) = std::env::var("HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n;
+    }
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    (cores * 2).clamp(8, 32)
+    (cores * 2).clamp(8, 64)
 }
 
 fn parse_major_minor_patch(s: &str) -> Option<(u32, u32, u32)> {
