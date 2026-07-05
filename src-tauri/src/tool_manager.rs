@@ -906,6 +906,9 @@ impl ToolManager {
                     // back to the stable HTTPS download path.
                     .env("HF_HUB_DISABLE_XET", "1")
                     .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                    // Anonymous aggregate telemetry (opt-in in the package,
+                    // off by default). Desktop opts in on the user's behalf.
+                    .env("HEADROOM_TELEMETRY", "on")
                     .env("HEADROOM_HTTP2", "false")
                     // Disable the HTTP/1.1 keep-alive pool for the upstream
                     // (proxy -> api.anthropic.com) client. Claude Code cancels
