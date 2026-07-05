@@ -1188,15 +1188,23 @@ fn write_setup_state(state: &ClientSetupState) -> Result<()> {
 /// user-owned configs (settings.json, config.toml, shell rc files) breaks the
 /// user's shell or client startup.
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    // Per-writer unique tmp name. A fixed `<path>.tmp` is shared by concurrent
+    // writers to the same file: A renames tmp->path, then B's rename finds its
+    // tmp already consumed and fails ENOENT (Sentry RUST-3W / RUST-4W). pid +
+    // a process-local counter makes each write's tmp its own.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp_path = {
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut s = path.as_os_str().to_os_string();
-        s.push(".tmp");
+        s.push(format!(".tmp.{}.{}", std::process::id(), n));
         PathBuf::from(s)
     };
     std::fs::write(&tmp_path, contents)
         .with_context(|| format!("writing {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("renaming {} -> {}", tmp_path.display(), path.display()))
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
+        format!("renaming {} -> {}", tmp_path.display(), path.display())
+    })
 }
 
 fn setup_state_path() -> PathBuf {
@@ -1885,12 +1893,6 @@ const CODEX_TABLE_BLOCK_ID: &str = "codex_cli_provider";
 const CODEX_HEADROOM_PROVIDER: &str = "headroom";
 const CODEX_NATIVE_PROVIDER: &str = "openai";
 
-/// Codex store-schema versions this build has been verified against. Discovered
-/// stores with a version outside this set are still retagged (best-effort) but
-/// logged, so a Codex store bump is visible before it can silently split the
-/// history menu for everyone.
-const KNOWN_CODEX_STORE_VERSIONS: &[u32] = &[5];
-
 /// Directories Codex is known to keep its state store in: the v148 GUI uses
 /// `<codex_home>/sqlite/`, the CLI/TUI uses `<codex_home>/`.
 fn codex_state_dirs() -> Vec<PathBuf> {
@@ -1921,23 +1923,15 @@ fn codex_sqlite_store_expected() -> bool {
     })
 }
 
-/// Parse `N` from a `state_<N>.sqlite` filename (`state_5.sqlite` -> `Some(5)`).
-/// Anything else -> `None`.
-fn codex_store_version(path: &Path) -> Option<u32> {
-    let name = path.file_name()?.to_str()?;
-    name.strip_prefix("state_")?
-        .strip_suffix(".sqlite")?
-        .parse()
-        .ok()
-}
-
-/// Discover every `state_<N>.sqlite` store under the known Codex dirs, with the
-/// version parsed from its name. Scanning the directories (rather than probing a
-/// hardcoded `state_5.sqlite`) means a future Codex store-version bump keeps
-/// working without a release instead of silently no-opping for every user at
-/// once. A missing dir (`read_dir` error) is skipped. Paths are deduped in case
-/// the two dirs ever resolve to the same place.
-fn discover_codex_state_dbs() -> Vec<(PathBuf, u32)> {
+/// Discover every `*.sqlite` file under the known Codex dirs. The thread store's
+/// *filename* has changed across Codex versions (`state_5.sqlite`, and whatever
+/// comes next), so we no longer couple discovery to a name scheme: every sqlite
+/// candidate is handed to `retag_one_codex_db`, which identifies the real store
+/// by its `threads` table and no-ops on anything else (logs/goals/memories). A
+/// rename can no longer silently split the history menu. A missing dir
+/// (`read_dir` error) is skipped. Paths are deduped in case the two dirs ever
+/// resolve to the same place.
+fn discover_codex_state_dbs() -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for dir in codex_state_dirs() {
@@ -1946,11 +1940,10 @@ fn discover_codex_state_dbs() -> Vec<(PathBuf, u32)> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(version) = codex_store_version(&path) else {
-                continue;
-            };
-            if seen.insert(path.clone()) {
-                out.push((path, version));
+            if path.extension().and_then(|e| e.to_str()) == Some("sqlite")
+                && seen.insert(path.clone())
+            {
+                out.push(path);
             }
         }
     }
@@ -1963,60 +1956,43 @@ fn discover_codex_state_dbs() -> Vec<(PathBuf, u32)> {
 /// and skipped. Only rows whose `model_provider` equals `from` are touched, so
 /// third-party providers are left alone.
 fn retag_codex_thread_providers(from: &str, to: &str) {
-    let stores = discover_codex_state_dbs();
-    if stores.is_empty() {
-        // Only a signal when a sqlite thread store is actually expected: the
-        // launch/quit lifecycle hooks call this for every user, so a clean
-        // machine -- or a CLI-only / pre-sqlite Codex with config but no
-        // state_<N>.sqlite -- must stay silent. A present sqlite/ dir with no
-        // recognized store is the genuine moved/renamed case worth flagging.
-        if codex_sqlite_store_expected() {
-            // We only reach here when no state_<integer>.sqlite parsed, so any
-            // state_*.sqlite still present is the unrecognized scheme. Log the
-            // actual names: a future occurrence reveals what Codex renamed the
-            // store to so codex_store_version can be extended instead of guessed
-            // at (Sentry RUST-43).
-            let unrecognized: Vec<String> = codex_state_dirs()
-                .iter()
-                .filter_map(|dir| std::fs::read_dir(dir).ok())
-                .flat_map(|entries| entries.flatten())
-                .filter_map(|e| e.file_name().to_str().map(str::to_owned))
-                .filter(|n| n.starts_with("state_") && n.ends_with(".sqlite"))
-                .collect();
-            log::warn!(
-                "codex retag {from}->{to}: Codex store present but unrecognized naming \
-                 {unrecognized:?} under {dirs:?}; the history menu may split. Extend \
-                 codex_store_version to parse it.",
-                dirs = codex_state_dirs(),
-            );
-        }
-        return;
-    }
-    for (path, version) in stores {
-        if !KNOWN_CODEX_STORE_VERSIONS.contains(&version) {
-            log::warn!(
-                "codex retag: store version {version} at {} is outside the known \
-                 set {KNOWN_CODEX_STORE_VERSIONS:?}; retagging anyway. Verify the \
-                 history menu still works and add {version} to \
-                 KNOWN_CODEX_STORE_VERSIONS.",
-                path.display(),
-            );
-        }
+    let mut found_thread_store = false;
+    for path in discover_codex_state_dbs() {
         match retag_one_codex_db(&path, from, to) {
-            Ok(0) => {}
-            Ok(n) => log::info!(
-                "codex retag {from}->{to}: {n} thread(s) in {}",
-                path.display()
-            ),
+            // No `threads` table: unrelated sqlite store (logs/goals/memories).
+            Ok(None) => {}
+            Ok(Some(n)) => {
+                found_thread_store = true;
+                if n > 0 {
+                    log::info!(
+                        "codex retag {from}->{to}: {n} thread(s) in {}",
+                        path.display()
+                    );
+                }
+            }
             Err(e) => log::warn!(
                 "codex retag {from}->{to} skipped for {}: {e}",
                 path.display()
             ),
         }
     }
+    // A `state_*.sqlite`-shaped file with no `threads` table means Codex renamed
+    // the table itself (discovery already survives a file rename). Only flag when
+    // the store-shaped name is present, so a clean or CLI-only / pre-sqlite
+    // machine -- or one with just logs/goals/memories DBs -- stays silent
+    // (Sentry RUST-3R). This is the last remaining schema-drift signal worth a
+    // release (Sentry RUST-43).
+    if !found_thread_store && codex_sqlite_store_expected() {
+        log::warn!(
+            "codex retag {from}->{to}: a state_*.sqlite is present but has no \
+             `threads` table under {dirs:?}; the history menu may split. Codex \
+             likely renamed the table.",
+            dirs = codex_state_dirs(),
+        );
+    }
 }
 
-fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<usize> {
+fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<Option<usize>> {
     use rusqlite::OptionalExtension;
 
     let conn = rusqlite::Connection::open(path)?;
@@ -2031,12 +2007,13 @@ fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<usi
         .optional()?
         .is_some();
     if !has_table {
-        return Ok(0);
+        return Ok(None);
     }
     conn.execute(
         "UPDATE threads SET model_provider = ?2 WHERE model_provider = ?1",
         rusqlite::params![from, to],
     )
+    .map(Some)
 }
 
 /// Retag Codex threads back to the native provider. Exposed for the app-quit
@@ -4015,7 +3992,7 @@ mod tests {
         build_claude_guard_script, build_codex_guard_script, build_headroom_markitdown_hook,
         build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
         claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
-        codex_sqlite_store_expected, codex_store_version, default_shell_targets_for_family,
+        codex_sqlite_store_expected, default_shell_targets_for_family,
         discover_codex_state_dbs, entry_contains_hook, find_on_path_entries, is_permission_denied,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, oss_remnant_warnings,
         parse_json_object, pin_codex_mcp_command, remove_managed_block,
@@ -6096,18 +6073,45 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let path = super::setup_state_path();
         assert!(path.exists(), "setup state file written");
 
-        // The sibling .tmp file must not be left behind after a successful
-        // publish — its presence would mean the rename step never happened.
-        let tmp = {
-            let mut s = path.clone().into_os_string();
-            s.push(".tmp");
-            std::path::PathBuf::from(s)
-        };
-        assert!(!tmp.exists(), "tmp file cleaned up by rename, got: {tmp:?}");
+        // No sibling .tmp* file may be left behind after a successful publish —
+        // its presence would mean the rename step never happened.
+        let dir = path.parent().unwrap();
+        let stem = path.file_name().unwrap().to_string_lossy().into_owned();
+        let leftover: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&format!("{stem}.tmp")))
+            .collect();
+        assert!(leftover.is_empty(), "tmp files cleaned up by rename, got: {leftover:?}");
 
         // Round-trip survives.
         let reloaded = super::load_setup_state();
         assert!(reloaded.configured_clients.contains_key("claude_code"));
+    }
+
+    #[test]
+    fn atomic_write_concurrent_same_path_no_enoent() {
+        // Regression for Sentry RUST-3W / RUST-4W: a shared `<path>.tmp` made
+        // concurrent writers race — one rename consumed the tmp, the other hit
+        // ENOENT. Unique per-writer tmp names must let all writers succeed.
+        let dir = std::env::temp_dir().join(format!("aw_race_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let body = format!("{{\"n\":{i}}}");
+                    super::atomic_write(&p, body.as_bytes())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("concurrent atomic_write must not ENOENT");
+        }
+        assert!(path.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -6168,7 +6172,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
 
         let moved = retag_one_codex_db(&db, "openai", "headroom").unwrap();
-        assert_eq!(moved, 2);
+        assert_eq!(moved, Some(2));
         assert_eq!(provider_count(&db, "openai"), 0);
         assert_eq!(provider_count(&db, "headroom"), 3);
         // Third-party providers are untouched.
@@ -6176,7 +6180,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         // Reverse direction round-trips only the headroom rows.
         let back = retag_one_codex_db(&db, "headroom", "openai").unwrap();
-        assert_eq!(back, 3);
+        assert_eq!(back, Some(3));
         assert_eq!(provider_count(&db, "headroom"), 0);
         assert_eq!(provider_count(&db, "openai"), 3);
         assert_eq!(provider_count(&db, "anthropic"), 1);
@@ -6188,7 +6192,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let db = tmp.path().join("state_5.sqlite");
         // Open creates an empty DB with no `threads` table.
         Connection::open(&db).unwrap();
-        assert_eq!(retag_one_codex_db(&db, "openai", "headroom").unwrap(), 0);
+        assert_eq!(retag_one_codex_db(&db, "openai", "headroom").unwrap(), None);
     }
 
     #[test]
@@ -6246,19 +6250,6 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(provider_count(&db, "openai"), 0);
         // Third-party threads are untouched.
         assert_eq!(provider_count(&db, "anthropic"), 1);
-    }
-
-    #[test]
-    fn codex_store_version_parses_state_filename() {
-        assert_eq!(codex_store_version(Path::new("/x/state_5.sqlite")), Some(5));
-        assert_eq!(
-            codex_store_version(Path::new("/x/state_42.sqlite")),
-            Some(42)
-        );
-        assert_eq!(codex_store_version(Path::new("/x/config.toml")), None);
-        assert_eq!(codex_store_version(Path::new("/x/state_.sqlite")), None);
-        assert_eq!(codex_store_version(Path::new("/x/state_x.sqlite")), None);
-        assert_eq!(codex_store_version(Path::new("/x/state_5.db")), None);
     }
 
     #[test]
@@ -6387,21 +6378,31 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
-    fn discover_codex_state_dbs_finds_versioned_stores() {
+    fn discover_codex_state_dbs_finds_any_sqlite_regardless_of_name() {
         let home = TestHome::new();
         let codex = home.path().join(".codex");
         std::fs::create_dir_all(codex.join("sqlite")).unwrap();
-        // GUI store under sqlite/, CLI store at the root, on different versions.
+        // GUI store under sqlite/, CLI store at the root, plus a renamed store
+        // whose name no longer follows the `state_<N>` scheme -- discovery is
+        // content-based now, so it must still be picked up (the actual fix).
         std::fs::File::create(codex.join("sqlite").join("state_6.sqlite")).unwrap();
         std::fs::File::create(codex.join("state_5.sqlite")).unwrap();
-        // A non-store file in the same dir must be ignored.
+        std::fs::File::create(codex.join("sqlite").join("threads.sqlite")).unwrap();
+        // A non-sqlite file in the same dir must be ignored.
         std::fs::File::create(codex.join("config.toml")).unwrap();
 
-        let versions: BTreeSet<u32> = discover_codex_state_dbs()
+        let names: BTreeSet<String> = discover_codex_state_dbs()
             .into_iter()
-            .map(|(_, v)| v)
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
             .collect();
-        assert_eq!(versions, BTreeSet::from([5, 6]));
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "state_6.sqlite".to_owned(),
+                "state_5.sqlite".to_owned(),
+                "threads.sqlite".to_owned(),
+            ])
+        );
     }
 
     #[test]
@@ -6411,6 +6412,24 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // retag, not silently no-op for every user at once.
         let home = TestHome::new();
         let db = home.path().join(".codex").join("state_99.sqlite");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
+
+        retag_codex_threads_to_headroom();
+
+        assert_eq!(provider_count(&db, "headroom"), 2);
+        assert_eq!(provider_count(&db, "openai"), 0);
+        assert_eq!(provider_count(&db, "anthropic"), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retag_handles_store_renamed_off_state_scheme() {
+        // The regression this change fixes: Codex renames the store off the
+        // `state_<N>.sqlite` scheme entirely. Content-based discovery must still
+        // find and retag it by its `threads` table, not the filename.
+        let home = TestHome::new();
+        let db = home.path().join(".codex").join("sqlite").join("threads.sqlite");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
 

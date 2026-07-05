@@ -988,10 +988,10 @@ impl ToolManager {
                     // smart_crusher_with_compaction) with a low min_tokens so
                     // compression stays visible, and target_ratio unset so savings
                     // emerge from lossless + relevance rather than a forced keep.
-                    // Note: the persona sets compress_user_messages=False to avoid
-                    // prompt mutation / prefix-cache busting, but our explicit
-                    // HEADROOM_COMPRESS_USER_MESSAGES=1 above wins in
-                    // proxy_pipeline_kwargs — kept on for Codex savings.
+                    // The persona also sets compress_user_messages=False (avoids
+                    // prompt mutation / prefix-cache busting); this now applies
+                    // cleanly since we no longer force HEADROOM_COMPRESS_USER_MESSAGES
+                    // on, so user turns stay protected as the persona intends.
                     .env("HEADROOM_SAVINGS_PROFILE", "coding")
                     // Pre-upstream concurrency. The proxy's own auto is
                     // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
