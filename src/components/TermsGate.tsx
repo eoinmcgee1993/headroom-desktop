@@ -31,6 +31,7 @@ export function TermsGate({
   const [checked, setChecked] = useState(false);
   const [accepting, setAccepting] = useState(false);
   const authSatisfied = authSection === undefined || authComplete === true;
+  const signInPresentation = authSection !== undefined;
 
   async function handleAccept() {
     if (!checked || accepting || !authSatisfied) {
@@ -57,28 +58,33 @@ export function TermsGate({
       <div className="terms-gate__panel">
         <img className="terms-gate__logo" src={headroomLogo} alt="" aria-hidden="true" />
         <h1 id="terms-gate-title" className="terms-gate__title">
-          Terms of Service
+          {signInPresentation ? "Sign in" : "Terms of Service"}
         </h1>
-        <p className="terms-gate__copy">
-          Please review and accept our Terms of Service to continue using
-          Headroom.
-        </p>
-        <button
-          type="button"
-          className="terms-gate__link"
-          onClick={() => void invoke("open_external_link", { url: termsUrl })}
-        >
-          Read the full Terms
-        </button>
+        {!signInPresentation && (
+          <p className="terms-gate__copy">
+            Please review and accept our Terms of Service to continue using
+            Headroom.
+          </p>
+        )}
+        {authSection}
         <label className="terms-gate__consent">
           <input
             type="checkbox"
             checked={checked}
             onChange={(event) => setChecked(event.target.checked)}
           />
-          <span>I have read and accept the Terms of Service.</span>
+          <span>
+            I have read and accept the{" "}
+            <button
+              type="button"
+              className="link-button"
+              onClick={() => void invoke("open_external_link", { url: termsUrl })}
+            >
+              Terms of Service
+            </button>
+            .
+          </span>
         </label>
-        {authSection}
         <button
           type="button"
           className="primary-button primary-button--large terms-gate__accept"

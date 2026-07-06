@@ -5521,17 +5521,6 @@ html.window-hiding {
   color: var(--text-secondary);
 }
 
-.terms-gate__link {
-  border: 0;
-  padding: 0;
-  background: none;
-  cursor: pointer;
-  font-size: var(--text-sm);
-  font-weight: 600;
-  color: var(--accent);
-  text-decoration: underline;
-}
-
 .terms-gate__consent {
   display: flex;
   align-items: flex-start;

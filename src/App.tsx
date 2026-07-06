@@ -2856,8 +2856,11 @@ export default function App() {
   }
 
   async function handleInstallPrimaryAction() {
+    // Option-1 ordering: unentitled gated users go to the paywall; tools are
+    // connected AFTER checkout + install, same as the first-run path routed
+    // from the terms screen.
     if (paywallFirstFlow && pricingStatus?.account?.subscriptionActive !== true) {
-      await handleFirstLaunchContinue();
+      setLauncherStage("paywall");
       return;
     }
     await handleBootstrap();
@@ -3480,7 +3483,7 @@ export default function App() {
               </p>
             ) : (
               <AuthCodeForm
-                lead="Sign in with the email you used at checkout — or create your account now."
+                lead="Sign in with the email you used at checkout or create an account."
                 email={authEmail}
                 onEmailChange={setAuthEmail}
                 emailValid={authEmailValid}
@@ -3834,22 +3837,20 @@ export default function App() {
             {!bootstrapping && (
               <p className="install-pre-notice">
                 {routeToPaywallSetup
-                  ? "First, connect your coding tools. Headroom installs right after checkout."
+                  ? "Pick your plan to continue. Headroom installs right after checkout, then connects your coding tools."
                   : "Takes a minute or two to install."}
               </p>
             )}
             <button
               className="primary-button primary-button--large primary-button--install"
-              disabled={bootstrapping || (routeToPaywallSetup && connectorsBusy)}
+              disabled={bootstrapping}
               onClick={() => void handleInstallPrimaryAction()}
               type="button"
             >
               {bootstrapping
                 ? "Installing Headroom…"
-                : routeToPaywallSetup && connectorsBusy
-                  ? "Checking tools…"
                 : routeToPaywallSetup
-                  ? "Continue"
+                  ? "Choose your plan"
                   : bootstrapProgress.failed
                   ? "Try again"
                   : "Install Headroom"}

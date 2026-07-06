@@ -55,10 +55,21 @@ describe("TermsGate", () => {
 
   it("opens the Terms URL in the browser via open_external_link", async () => {
     renderGate({ termsUrl: "https://headroom.ai/legal/terms" });
-    await userEvent.click(screen.getByRole("button", { name: "Read the full Terms" }));
+    await userEvent.click(screen.getByRole("button", { name: "Terms of Service" }));
     expect(invokeMock).toHaveBeenCalledWith("open_external_link", {
       url: "https://headroom.ai/legal/terms"
     });
+  });
+
+  it("presents as Sign in when an auth section is provided", () => {
+    renderGate({ authSection: <p>auth form</p>, authComplete: false });
+    expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Terms of Service" })).toBeNull();
+  });
+
+  it("presents as Terms of Service without an auth section", () => {
+    renderGate();
+    expect(screen.getByRole("heading", { name: "Terms of Service" })).toBeInTheDocument();
   });
 
   it("shows a saving state and blocks repeat clicks while persistence is in flight", async () => {
