@@ -347,13 +347,10 @@ async fn handle(
         return;
     }
 
-    // Whether this is a Codex (OpenAI-path) request. Parsed once here and
-    // reused for the Codex plan capture, the Codex-only bypass, and the
-    // response-head sniff below.
+    // Whether this is a Codex request. Parsed once here and reused for the
+    // Codex plan capture, Codex-only bypass, counters, and response handling.
     let parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
-    let is_codex = parsed_head
-        .as_ref()
-        .is_some_and(|head| is_openai_path(&head.path));
+    let is_codex = parsed_head.as_ref().is_some_and(is_codex_request_head);
 
     // Count provider-bound requests only: local proxy paths (/readyz, /stats,
     // ...) are probes, not client traffic, and unparseable heads can't be
@@ -376,17 +373,7 @@ async fn handle(
     // 2026-06-26). Detect the catalog fetch here so the response splice below
     // can force the flag to false, keeping Codex on the full Responses path —
     // which works through the proxy.
-    let is_models_fetch = parsed_head.as_ref().is_some_and(|head| {
-        head.method.eq_ignore_ascii_case("GET")
-            && (head.path == "/v1/models" || head.path.starts_with("/v1/models?"))
-    })
-        // `/v1/models` exists on both providers, so the path alone can't
-        // attribute the fetch. Claude Code always sends Anthropic request
-        // markers; Codex never does. Without this gate every Anthropic
-        // catalog fetch paid the buffering / re-serialization / Sentry-warning
-        // cost of a rewrite that only exists for Codex.
-        && !request_has_header(&buf, "anthropic-version")
-        && !request_has_header(&buf, "x-api-key");
+    let is_models_fetch = parsed_head.as_ref().is_some_and(is_codex_models_fetch);
 
     // Scan headers for a Bearer token and capture it. When the token's
     // value differs from what was previously in the slot — or the slot was
@@ -1258,9 +1245,9 @@ async fn forward_direct_to_anthropic(
     // Codex points OPENAI_BASE_URL at this intercept proxy, so in bypass mode
     // OpenAI traffic (e.g. /v1/responses) lands here too. Codex billing is
     // OpenAI's, separate from Headroom's Claude account gate, so don't break
-    // Codex when the gate trips — forward OpenAI paths to OpenAI directly
+    // Codex when the gate trips — forward Codex requests to OpenAI directly
     // rather than (wrongly) to api.anthropic.com.
-    let effective_base: &str = if is_openai_path(&parsed.path) {
+    let effective_base: &str = if is_codex_request_head(&parsed) {
         OPENAI_DIRECT_BASE
     } else {
         upstream_base
@@ -1756,6 +1743,25 @@ fn is_openai_path(path: &str) -> bool {
     })
 }
 
+fn request_head_has_header(head: &ParsedRequestHead, name: &str) -> bool {
+    head.headers
+        .iter()
+        .any(|(field, _)| field.eq_ignore_ascii_case(name))
+}
+
+fn is_codex_models_fetch(head: &ParsedRequestHead) -> bool {
+    head.method.eq_ignore_ascii_case("GET")
+        && (head.path == "/v1/models" || head.path.starts_with("/v1/models?"))
+        // `/v1/models` exists on both providers. Claude Code sends Anthropic
+        // markers; Codex does not.
+        && !request_head_has_header(head, "anthropic-version")
+        && !request_head_has_header(head, "x-api-key")
+}
+
+fn is_codex_request_head(head: &ParsedRequestHead) -> bool {
+    is_openai_path(&head.path) || is_codex_models_fetch(head)
+}
+
 /// Return true if the request's Host header targets the loopback listener
 /// and no browser Origin header is present. Protects against DNS-rebinding
 /// attacks that aim the user's browser at 127.0.0.1 via an attacker domain.
@@ -1819,12 +1825,12 @@ mod tests {
     use super::{
         bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
         codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
-        find_header_end, intercept_request_counts, is_hop_by_hop_request_header,
-        is_hop_by_hop_response_header, is_local_proxy_path, is_openai_path,
-        is_reportable_codex_error, parse_codex_rate_limit_headers, parse_request_head,
-        parse_response_status, read_http_headers, request_has_header, request_is_loopback_safe,
-        rewrite_use_responses_lite, run, set_response_content_length, stamp_codex_client_header,
-        strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
+        find_header_end, intercept_request_counts, is_codex_request_head,
+        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
+        is_openai_path, is_reportable_codex_error, parse_codex_rate_limit_headers,
+        parse_request_head, parse_response_status, read_http_headers, request_has_header,
+        request_is_loopback_safe, rewrite_use_responses_lite, run, set_response_content_length,
+        stamp_codex_client_header, strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -1891,6 +1897,19 @@ mod tests {
         // Codex's own usage tracker endpoints stay local.
         assert!(is_local_proxy_path("/stats"));
         assert!(!is_openai_path("/stats"));
+    }
+
+    #[test]
+    fn models_fetch_is_codex_only_without_anthropic_markers() {
+        let codex =
+            parse_request_head(b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        assert!(is_codex_request_head(&codex));
+
+        let anthropic = parse_request_head(
+        b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nanthropic-version: 2023-06-01\r\nx-api-key: key\r\n\r\n",
+    )
+    .unwrap();
+        assert!(!is_codex_request_head(&anthropic));
     }
 
     #[test]

@@ -1669,23 +1669,28 @@ export default function App() {
     }
 
     let active = true;
-    const interval = window.setInterval(() => {
+    const poll = () => {
       void (async () => {
         try {
+          const countsCommand = paywallFirstFlow
+            ? "get_intercept_request_counts_by_agent"
+            : "get_headroom_request_counts_by_agent";
           const [runtime, counts] = await Promise.all([
-            invoke<RuntimeStatus>("get_runtime_status"),
-            invoke<Record<string, number> | null>(
-              "get_headroom_request_counts_by_agent"
-            ).catch(() => null)
+            paywallFirstFlow
+              ? Promise.resolve<RuntimeStatus | null>(null)
+              : invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
+            invoke<Record<string, number> | null>(countsCommand).catch(() => null)
           ]);
 
           if (!active) {
             return;
           }
 
-          if (!runtime.proxyReachable || counts === null) {
+          if ((!paywallFirstFlow && runtime?.proxyReachable !== true) || counts === null) {
             setProxyVerificationHint(
-              "Headroom proxy is not reachable yet. Start Headroom runtime, then send a test message."
+              paywallFirstFlow
+                ? "Waiting for setup traffic. Send a test message from your coding tool."
+                : "Headroom proxy is not reachable yet. Start Headroom runtime, then send a test message."
             );
             return;
           }
@@ -1723,13 +1728,15 @@ export default function App() {
           }
         }
       })();
-    }, 1000);
+    };
+    poll();
+    const interval = window.setInterval(poll, 1000);
 
     return () => {
       active = false;
       window.clearInterval(interval);
     };
-  }, [windowLabel, launcherStage]);
+  }, [windowLabel, launcherStage, paywallFirstFlow]);
 
   useEffect(() => {
     if (!showInstallProgress) {
@@ -2847,6 +2854,14 @@ export default function App() {
     await autoConfigureConnectorsForLauncher();
   }
 
+  async function handleInstallPrimaryAction() {
+    if (paywallFirstFlow && pricingStatus?.account?.subscriptionActive !== true) {
+      await handleFirstLaunchContinue();
+      return;
+    }
+    await handleBootstrap();
+  }
+
   async function runHeadroomLearn(agent: "claude" | "codex", projectPath?: string) {
     if (runtimeStatus?.headroomLearnSupported === false) {
       setHeadroomLearnStatus((current) => ({
@@ -3445,16 +3460,8 @@ export default function App() {
             ...prev,
             acceptedTermsVersion: prev.requiredTermsVersion
           }));
-          // Gated fresh install, signed in but no entitled plan: go straight
-          // to the in-app checkout. Entitled web purchasers fall through to
-          // the normal install landing.
-          if (
-            paywallFirstFlow &&
-            pricingStatus?.authenticated === true &&
-            pricingStatus?.account?.subscriptionActive !== true
-          ) {
-            setLauncherStage("paywall");
-          }
+          // Paywall-first users stay on the landing screen; the primary CTA
+          // routes them through connector setup before checkout.
         }}
         authSection={
           paywallFirstFlow && windowLabel === "launcher" ? (
@@ -3736,6 +3743,8 @@ export default function App() {
     const stepProgress = Math.round(getStepProgress(bootstrapProgress) * 100);
     const renderPercent = animatedOverallPercent(bootstrapProgress);
     const installComplete = bootstrapProgress.complete || dashboard.bootstrapComplete;
+    const routeToPaywallSetup =
+      paywallFirstFlow && pricingStatus?.account?.subscriptionActive !== true;
     const statusCopy = showInstallProgress
       ? `${bootstrapProgress.message} ${
           bootstrapProgress.running && !bootstrapProgress.complete
@@ -3809,22 +3818,28 @@ export default function App() {
           <>
             {!bootstrapping && (
               <p className="install-pre-notice">
-                Takes a minute or two to install.
+                {routeToPaywallSetup
+                  ? "First, connect your coding tools. Headroom installs right after checkout."
+                  : "Takes a minute or two to install."}
               </p>
             )}
             <button
               className="primary-button primary-button--large primary-button--install"
-              disabled={bootstrapping}
-              onClick={() => void handleBootstrap()}
+              disabled={bootstrapping || (routeToPaywallSetup && connectorsBusy)}
+              onClick={() => void handleInstallPrimaryAction()}
               type="button"
             >
               {bootstrapping
                 ? "Installing Headroom…"
-                : bootstrapProgress.failed
+                : routeToPaywallSetup && connectorsBusy
+                  ? "Checking tools…"
+                : routeToPaywallSetup
+                  ? "Continue"
+                  : bootstrapProgress.failed
                   ? "Try again"
                   : "Install Headroom"}
             </button>
-            {!bootstrapping && (
+            {!bootstrapping && !routeToPaywallSetup && (
               <div className="install-disclosure">
                 <p className="install-disclosure__lead">Clicking Install will:</p>
                 <ul className="install-disclosure__list">
@@ -4124,8 +4139,12 @@ export default function App() {
           <button
             className="primary-button primary-button--large primary-button--success"
             onClick={() => {
-              void invoke("complete_setup_wizard");
-              setLauncherStage("post_install");
+              if (paywallFirstFlow && pricingStatus?.account?.subscriptionActive !== true) {
+                setLauncherStage("paywall");
+              } else {
+                void invoke("complete_setup_wizard");
+                setLauncherStage("post_install");
+              }
             }}
             type="button"
           >

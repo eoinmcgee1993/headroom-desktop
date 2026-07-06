@@ -2284,10 +2284,23 @@ pub fn paywall_first_flag() -> bool {
         .unwrap_or(false)
 }
 
-/// Launch-time refresh of the paywall-first flag from the unauthenticated
-/// config endpoint. Called once from `setup()` on a background thread; the
-/// flag is deliberately NOT refreshed anywhere else so it stays stable for
-/// the lifetime of an onboarding session.
+/// Same cached flag, but on the first ever read waits for one bounded config
+/// fetch. Keeps cold launches from missing their server bucket just because the
+/// background warmer has not finished yet.
+pub fn paywall_first_flag_or_refresh() -> bool {
+    let Ok(local) = load_or_initialize_local_state() else {
+        return false;
+    };
+    if let Some(flag) = local.paywall_first {
+        return flag;
+    }
+    refresh_paywall_first_flag();
+    paywall_first_flag()
+}
+
+/// Refresh the paywall-first flag from the unauthenticated config endpoint.
+/// Called once from `setup()` on a background thread, and synchronously only
+/// when the frontend asks for launch flags before any cache exists.
 pub fn refresh_paywall_first_flag() {
     let Some(config) = fetch_public_config() else {
         return;

@@ -2237,12 +2237,12 @@ pub struct LaunchFlags {
     pub paywall_first: bool,
 }
 
-/// Cached-or-default launch flags; never blocks on the network. The cache is
-/// warmed by a background config fetch spawned in `setup()`.
+/// Cached launch flags. On a cold cache, performs one bounded config fetch so
+/// a fresh first launch does not miss its server bucket.
 #[tauri::command]
 fn get_launch_flags() -> LaunchFlags {
     LaunchFlags {
-        paywall_first: pricing::paywall_first_flag(),
+        paywall_first: pricing::paywall_first_flag_or_refresh(),
     }
 }
 
