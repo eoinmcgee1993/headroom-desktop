@@ -89,6 +89,28 @@ fn stamp_backend_traffic() {
     BACKEND_LAST_TRAFFIC_EPOCH.store(now_epoch_secs(), Ordering::Release);
 }
 
+/// Provider-bound requests seen by this intercept, per agent, regardless of
+/// whether they were forwarded to the backend or fell back direct-to-provider.
+/// Setup verification polls these in paywall-first onboarding, where the
+/// Python backend (and thus `/stats`) does not exist yet.
+static INTERCEPT_CLAUDE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static INTERCEPT_CODEX_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Same key shape as `/stats` `agent_usage.agents[]` (`claude-code`, `codex`)
+/// so the frontend verification anchor/delta logic works against either source.
+pub fn intercept_request_counts() -> std::collections::HashMap<String, u64> {
+    std::collections::HashMap::from([
+        (
+            "claude-code".to_string(),
+            INTERCEPT_CLAUDE_REQUESTS.load(Ordering::Acquire),
+        ),
+        (
+            "codex".to_string(),
+            INTERCEPT_CODEX_REQUESTS.load(Ordering::Acquire),
+        ),
+    ])
+}
+
 /// AsyncRead wrapper that stamps `BACKEND_LAST_TRAFFIC_EPOCH` whenever the
 /// inner reader yields bytes. Wrapped around the backend->client half of the
 /// splices below.
@@ -332,6 +354,19 @@ async fn handle(
     let is_codex = parsed_head
         .as_ref()
         .is_some_and(|head| is_openai_path(&head.path));
+
+    // Count provider-bound requests only: local proxy paths (/readyz, /stats,
+    // ...) are probes, not client traffic, and unparseable heads can't be
+    // attributed to an agent.
+    if let Some(head) = parsed_head.as_ref() {
+        if !is_local_proxy_path(&head.path) {
+            if is_codex {
+                INTERCEPT_CODEX_REQUESTS.fetch_add(1, Ordering::AcqRel);
+            } else {
+                INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
 
     // Codex fetches its model catalog via `GET <base_url>/models` and caches it
     // in ~/.codex/models_cache.json. When OpenAI serves `use_responses_lite:
@@ -1784,10 +1819,10 @@ mod tests {
     use super::{
         bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
         codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
-        find_header_end, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
-        is_local_proxy_path, is_openai_path, is_reportable_codex_error,
-        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        read_http_headers, request_has_header, request_is_loopback_safe,
+        find_header_end, intercept_request_counts, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_openai_path,
+        is_reportable_codex_error, parse_codex_rate_limit_headers, parse_request_head,
+        parse_response_status, read_http_headers, request_has_header, request_is_loopback_safe,
         rewrite_use_responses_lite, run, set_response_content_length, stamp_codex_client_header,
         strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
     };
@@ -2160,6 +2195,8 @@ mod tests {
         }
         let mut client = client.expect("intercept reachable");
 
+        let counts_before = intercept_request_counts();
+
         let request = format!(
             "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\n\r\n",
             intercept_addr.port()
@@ -2173,6 +2210,19 @@ mod tests {
         assert!(
             response_str.starts_with("HTTP/1.1 200"),
             "expected direct-to-upstream 200 fallback, got: {response_str:?}"
+        );
+
+        // The passthrough forward must still count as provider-bound traffic
+        // (paywall-first setup verification relies on this with no backend).
+        let counts_after_api = intercept_request_counts();
+        assert_eq!(
+            counts_after_api["claude-code"] - counts_before["claude-code"],
+            1,
+            "claude-code counter should increment on passthrough forward"
+        );
+        assert_eq!(
+            counts_after_api["codex"], counts_before["codex"],
+            "codex counter should not move for an Anthropic-path request"
         );
 
         // Local proxy paths (health probes, stats) must NOT leak upstream on
@@ -2190,6 +2240,13 @@ mod tests {
         assert!(
             response_str.starts_with("HTTP/1.1 503"),
             "expected local 503 for /readyz on fallback, got: {response_str:?}"
+        );
+
+        // Probes are not client traffic: local paths must not count.
+        let counts_after_probe = intercept_request_counts();
+        assert_eq!(
+            counts_after_probe["claude-code"], counts_after_api["claude-code"],
+            "/readyz probe must not increment the claude-code counter"
         );
 
         run_task.abort();
@@ -3263,7 +3320,10 @@ mod tests {
         // the 503 branch instead of connecting and holding another FD pair.
         let sem = Arc::new(tokio::sync::Semaphore::new(1));
         let held = sem.clone().try_acquire_owned().expect("first permit");
-        assert!(sem.clone().try_acquire_owned().is_err(), "should be saturated");
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "should be saturated"
+        );
         drop(held);
         assert!(sem.try_acquire_owned().is_ok(), "permit released on drop");
     }

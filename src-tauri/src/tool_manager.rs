@@ -1021,9 +1021,7 @@ impl ToolManager {
                     // Fall back to the runtime default that exists in every version.
                     .env(
                         "HEADROOM_SAVINGS_PROFILE",
-                        savings_profile_for_runtime(
-                            self.installed_headroom_version().as_deref(),
-                        ),
+                        savings_profile_for_runtime(self.installed_headroom_version().as_deref()),
                     )
                     // Pre-upstream concurrency. The proxy's own auto is
                     // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
@@ -5980,17 +5978,16 @@ mod tests {
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
         diagnose_proxy_port, extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
-        savings_profile_for_runtime,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, looks_like_corrupt_venv_error, parse_major_minor_patch,
         parse_pid_from_lsof_detail, path_with_binary_dir, pre_upstream_concurrency,
         probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, sha256_bytes, summarize_kompress_prefetch_failure,
-        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
-        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        RTK_VERSION,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, sha256_bytes,
+        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;

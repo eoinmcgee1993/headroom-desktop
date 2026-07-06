@@ -9,7 +9,8 @@ import {
   isValidEmailAddress,
   needsTermsAcceptance,
   nextAutoConfigureStep,
-  nextAutoConfigureStepAfterApply
+  nextAutoConfigureStepAfterApply,
+  recommendedHeadroomTier
 } from "./launcherHelpers";
 import type { ClientConnectorStatus } from "./types";
 
@@ -212,6 +213,39 @@ describe("launcher helpers", () => {
       expect(nextAutoConfigureStepAfterApply("apply_client_setup")).toEqual({
         kind: "show_client_setup"
       });
+    });
+  });
+
+  describe("recommendedHeadroomTier", () => {
+    it("maps Claude tiers directly", () => {
+      expect(recommendedHeadroomTier("pro", null)).toBe("pro");
+      expect(recommendedHeadroomTier("max5x", null)).toBe("max5x");
+      expect(recommendedHeadroomTier("max20x", null)).toBe("max20x");
+    });
+
+    it("maps Codex tiers per the models.rs table", () => {
+      expect(recommendedHeadroomTier(null, "go")).toBe("pro");
+      expect(recommendedHeadroomTier(null, "plus")).toBe("pro");
+      expect(recommendedHeadroomTier(null, "team")).toBe("max5x");
+      expect(recommendedHeadroomTier(null, "business")).toBe("max5x");
+      expect(recommendedHeadroomTier(null, "self_serve_business_usage_based")).toBe("max5x");
+      expect(recommendedHeadroomTier(null, "edu")).toBe("max5x");
+      expect(recommendedHeadroomTier(null, "pro")).toBe("max20x");
+      expect(recommendedHeadroomTier(null, "enterprise")).toBe("max20x");
+      expect(recommendedHeadroomTier(null, "enterprise_cbp_usage_based")).toBe("max20x");
+    });
+
+    it("takes the higher of the two detected tiers", () => {
+      expect(recommendedHeadroomTier("pro", "pro")).toBe("max20x");
+      expect(recommendedHeadroomTier("max20x", "plus")).toBe("max20x");
+      expect(recommendedHeadroomTier("max5x", "go")).toBe("max5x");
+    });
+
+    it("defaults to pro when nothing is confidently detected", () => {
+      expect(recommendedHeadroomTier(null, null)).toBe("pro");
+      expect(recommendedHeadroomTier(undefined, undefined)).toBe("pro");
+      expect(recommendedHeadroomTier("free", "free")).toBe("pro");
+      expect(recommendedHeadroomTier("unknown", "unknown")).toBe("pro");
     });
   });
 });

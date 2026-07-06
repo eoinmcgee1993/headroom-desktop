@@ -36,6 +36,11 @@ struct LocalPricingState {
     reconcile_with_server: bool,
     #[serde(default)]
     mismatch_since: Option<DateTime<Utc>>,
+    /// Server-bucketed paywall-first experiment flag. `None` = never fetched.
+    /// Refreshed only by the launch-time config fetch so a mid-onboarding
+    /// server flip can't strand a user halfway through the gated flow.
+    #[serde(default)]
+    paywall_first: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -528,6 +533,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         tier_mismatch,
     );
     status.codex = fetch_codex_usage(state, status.account.as_ref());
+    status.codex_plan_tier = Some(state.codex_plan_tier());
     maybe_apply_fake_weekly_gate(&mut status);
     // Attach the signed-in account to the Sentry scope so later captures from
     // anywhere in the process (notably the proxy watchdog's auto-pause event)
@@ -1101,6 +1107,9 @@ pub(crate) fn create_checkout_session_with_base_url(
     let response = http_client()?
         .post(join_url(base_url, "desktop/checkout"))
         .header("Authorization", format!("Bearer {token}"))
+        // Same device id the config fetch sends: the server uses it to decide
+        // whether this checkout is in the paywall-first cohort (7-day trial).
+        .header("X-Headroom-Device-Id", device::current().machine_id_digest)
         .json(&CheckoutSessionPayload {
             subscription_tier,
             billing_period,
@@ -1458,6 +1467,7 @@ fn evaluate_pricing_status_with_mismatch(
         tier_mismatch,
         claude,
         codex: None,
+        codex_plan_tier: None,
         account,
         launch_discount_active: promo.active_percent_off > 0,
         active_percent_off: promo.active_percent_off,
@@ -2265,6 +2275,31 @@ fn merge_background_account_sync(
     }
 }
 
+/// Cached paywall-first flag: false until a config fetch has ever said
+/// otherwise. False on any failure = exact legacy onboarding (revert path).
+pub fn paywall_first_flag() -> bool {
+    load_or_initialize_local_state()
+        .ok()
+        .and_then(|s| s.paywall_first)
+        .unwrap_or(false)
+}
+
+/// Launch-time refresh of the paywall-first flag from the unauthenticated
+/// config endpoint. Called once from `setup()` on a background thread; the
+/// flag is deliberately NOT refreshed anywhere else so it stays stable for
+/// the lifetime of an onboarding session.
+pub fn refresh_paywall_first_flag() {
+    let Some(config) = fetch_public_config() else {
+        return;
+    };
+    if let Ok(mut local) = load_or_initialize_local_state() {
+        if local.paywall_first != Some(config.paywall_first) {
+            local.paywall_first = Some(config.paywall_first);
+            let _ = write_local_state(&local);
+        }
+    }
+}
+
 fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
     let path = local_state_path();
     if let Ok(bytes) = std::fs::read(&path) {
@@ -2277,6 +2312,7 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
         first_seen_at: Utc::now(),
         reconcile_with_server: true,
         mismatch_since: None,
+        paywall_first: None,
     };
     write_local_state(&state)?;
     Ok(state)
@@ -2394,12 +2430,17 @@ struct PublicConfig {
     active_percent_off: i64,
     #[serde(default)]
     pricing_ladder: Option<PricingLadderPayload>,
+    #[serde(default)]
+    paywall_first: bool,
 }
 
 fn fetch_public_config() -> Option<PublicConfig> {
     let response = http_client()
         .ok()?
         .get(api_url("desktop/config"))
+        // Device id drives server-side bucketing of the paywall-first
+        // experiment; the endpoint stays unauthenticated.
+        .header("X-Headroom-Device-Id", device::current().machine_id_digest)
         .send()
         .ok()?;
     if !response.status().is_success() {
@@ -2537,6 +2578,33 @@ mod tests {
         HeadroomAccountProfile, HeadroomPricingStatus, PricingGateReason, TierMismatch,
         TierRecommendationSource,
     };
+
+    #[test]
+    fn public_config_parses_with_and_without_paywall_first() {
+        let with: super::PublicConfig =
+            serde_json::from_str(r#"{"activePercentOff":10,"paywallFirst":true}"#).unwrap();
+        assert!(with.paywall_first);
+        // Old server payload: field absent -> false (legacy flow).
+        let without: super::PublicConfig =
+            serde_json::from_str(r#"{"activePercentOff":10}"#).unwrap();
+        assert!(!without.paywall_first);
+    }
+
+    #[test]
+    fn local_pricing_state_round_trips_old_json_without_paywall_first() {
+        // Pre-experiment state file: missing field must parse as None, not
+        // wipe the trial/grace clocks.
+        let old = r#"{"first_seen_at":"2026-01-01T00:00:00Z"}"#;
+        let state: LocalPricingState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.paywall_first, None);
+
+        let mut state = state;
+        state.paywall_first = Some(true);
+        let json = serde_json::to_string(&state).unwrap();
+        let back: LocalPricingState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.paywall_first, Some(true));
+        assert_eq!(back.first_seen_at, state.first_seen_at);
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn evaluate_pricing_status(

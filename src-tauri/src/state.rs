@@ -6735,6 +6735,7 @@ mod tests {
         let now = chrono::Utc::now();
         HeadroomPricingStatus {
             authenticated: true,
+            codex_plan_tier: None,
             local_grace_started_at: now,
             local_grace_ends_at: now,
             local_grace_active: false,

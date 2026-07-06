@@ -1,15 +1,25 @@
 import { aggregateClientConnectors } from "./dashboardHelpers";
-import type { ClientConnectorStatus, LaunchExperience } from "./types";
+import type {
+  ClaudePlanTier,
+  ClientConnectorStatus,
+  CodexPlanTier,
+  HeadroomSubscriptionTier,
+  LaunchExperience,
+} from "./types";
 
 export const EMAIL_ADDRESS_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // Linear onboarding flow shown in the launcher window:
 // install → client_setup → proxy_verify → post_install. Back buttons can jump
 // backwards. The install step doubles as the pre-install landing.
+// Paywall-first experiment (server flag, fresh installs only) reorders to:
+// install(landing) → client_setup → proxy_verify(passthrough) → paywall →
+// install(bootstrap) → post_install.
 export type LauncherStage =
   | "install"
   | "client_setup"
   | "proxy_verify"
+  | "paywall"
   | "post_install";
 
 export type LauncherAutoConfigureDecision =
@@ -34,6 +44,46 @@ export interface ProxyVerificationRowState {
 
 export function isValidEmailAddress(email: string) {
   return EMAIL_ADDRESS_PATTERN.test(email.trim());
+}
+
+// Mirrors headroom_tier_for_claude_plan / headroom_tier_for_codex_plan in
+// models.rs, with one paywall-specific difference: undetected/free maps to
+// "pro" (the paywall always recommends something) instead of None.
+export function recommendedHeadroomTier(
+  claudeTier: ClaudePlanTier | null | undefined,
+  codexTier: CodexPlanTier | null | undefined
+): HeadroomSubscriptionTier {
+  const TIER_RANK: Record<HeadroomSubscriptionTier, number> = {
+    pro: 1,
+    max5x: 2,
+    max20x: 3,
+  };
+  const fromClaude: HeadroomSubscriptionTier | null =
+    claudeTier === "pro" ? "pro"
+    : claudeTier === "max5x" ? "max5x"
+    : claudeTier === "max20x" ? "max20x"
+    : null;
+  const fromCodex: HeadroomSubscriptionTier | null =
+    codexTier === "go" || codexTier === "plus" ? "pro"
+    : codexTier === "team" ||
+        codexTier === "business" ||
+        codexTier === "self_serve_business_usage_based" ||
+        codexTier === "edu"
+      ? "max5x"
+    : codexTier === "pro" ||
+        codexTier === "enterprise" ||
+        codexTier === "enterprise_cbp_usage_based"
+      ? "max20x"
+    : null;
+  const candidates = [fromClaude, fromCodex].filter(
+    (t): t is HeadroomSubscriptionTier => t !== null
+  );
+  if (candidates.length === 0) {
+    return "pro";
+  }
+  return candidates.reduce((best, t) =>
+    TIER_RANK[t] > TIER_RANK[best] ? t : best
+  );
 }
 
 /// True when the user must (re-)accept the Terms of Service before using the

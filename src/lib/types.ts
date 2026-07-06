@@ -420,6 +420,24 @@ export type ClaudePlanTier = "free" | "pro" | "max5x" | "max20x" | "unknown";
 
 export type HeadroomSubscriptionTier = "pro" | "max5x" | "max20x";
 
+export type CodexPlanTier =
+  | "free"
+  | "go"
+  | "plus"
+  | "pro"
+  | "team"
+  | "business"
+  | "self_serve_business_usage_based"
+  | "enterprise"
+  | "enterprise_cbp_usage_based"
+  | "edu"
+  | "unknown";
+
+// Mirrors `LaunchFlags` in lib.rs; served cached-or-default, never blocking.
+export interface LaunchFlags {
+  paywallFirst: boolean;
+}
+
 export type BillingPeriod = "annual" | "monthly";
 
 export type PricingGateReason =
@@ -510,6 +528,7 @@ export interface HeadroomPricingStatus {
   tierMismatch?: TierMismatch | null;
   claude: ClaudeAccountProfile;
   codex?: CodexUsage | null;
+  codexPlanTier?: CodexPlanTier | null;
   account?: HeadroomAccountProfile | null;
   launchDiscountActive: boolean;
   activePercentOff?: number;

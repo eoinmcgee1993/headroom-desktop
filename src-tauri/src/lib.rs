@@ -863,10 +863,57 @@ fn emit_bootstrap_progress(app: &AppHandle, state: &AppState) {
     let _ = app.emit("bootstrap_progress", state.bootstrap_progress());
 }
 
+/// Typed error surfaced when the paywall-first gate blocks an install; the
+/// frontend routes back to the paywall stage instead of the failure report.
+pub const BOOTSTRAP_PAYWALL_REQUIRED: &str = "paywall_required";
+
+/// Hard paywall for the gated cohort: fresh installs (no runtime on disk) with
+/// the paywall-first flag on must have an active subscription before the ~2GB
+/// bootstrap runs. `trial_active` deliberately does NOT count: headroom-web
+/// grants a trial on every sign-in, which would make the gate a no-op.
+/// Existing installs pass unconditionally (grandfathered, no network I/O).
+fn bootstrap_paywall_gate(state: &AppState) -> Result<(), String> {
+    let installed = state.tool_manager.python_runtime_installed();
+    let flag_on = pricing::paywall_first_flag();
+    // Only a gated fresh install pays for the network re-verify. It is
+    // authoritative: the frontend only calls start_bootstrap after observing
+    // subscriptionActive, so this is defense in depth against stale state.
+    let subscription_active = if !installed && flag_on {
+        // A status failure here is a connectivity problem, not a verdict:
+        // surface a retryable message instead of blocking as unentitled.
+        let status = pricing::get_pricing_status(state).map_err(|err| {
+            format!(
+                "Could not verify your subscription — check your connection and try again. ({err})"
+            )
+        })?;
+        status.account.as_ref().map(|a| a.subscription_active)
+    } else {
+        None
+    };
+    if paywall_gate_blocks(installed, flag_on, subscription_active) {
+        Err(BOOTSTRAP_PAYWALL_REQUIRED.into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Pure gate decision. Blocks only when: fresh install (grandfathering), flag
+/// on, and no active subscription. `None` = no account / signed out. Trials
+/// never pass (headroom-web grants one on every sign-in — counting it would
+/// void the hard paywall).
+pub(crate) fn paywall_gate_blocks(
+    installed: bool,
+    flag_on: bool,
+    subscription_active: Option<bool>,
+) -> bool {
+    !installed && flag_on && subscription_active != Some(true)
+}
+
 #[tauri::command]
 fn start_bootstrap(app: AppHandle) -> Result<(), String> {
     let already_installed = {
         let state: tauri::State<'_, AppState> = app.state();
+        bootstrap_paywall_gate(&state)?;
         let already_installed = state.tool_manager.python_runtime_installed();
         state.begin_bootstrap()?;
         emit_bootstrap_progress(&app, &state);
@@ -2176,6 +2223,29 @@ async fn get_headroom_request_counts_by_agent() -> Option<std::collections::Hash
     parse_request_counts_by_agent(&body)
 }
 
+/// In-process per-agent counters from the Rust intercept. Same key shape as
+/// `get_headroom_request_counts_by_agent`, but works with no Python backend —
+/// paywall-first setup verification polls this while in passthrough.
+#[tauri::command]
+fn get_intercept_request_counts_by_agent() -> std::collections::HashMap<String, u64> {
+    proxy_intercept::intercept_request_counts()
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchFlags {
+    pub paywall_first: bool,
+}
+
+/// Cached-or-default launch flags; never blocks on the network. The cache is
+/// warmed by a background config fetch spawned in `setup()`.
+#[tauri::command]
+fn get_launch_flags() -> LaunchFlags {
+    LaunchFlags {
+        paywall_first: pricing::paywall_first_flag(),
+    }
+}
+
 pub(crate) fn parse_request_counts_by_agent(
     body: &str,
 ) -> Option<std::collections::HashMap<String, u64>> {
@@ -3096,8 +3166,7 @@ async fn apply_client_setup(
                 let kind = client_setup_error_kind(&err);
                 sentry::with_scope(
                     |scope| {
-                        let fp: &[&str] =
-                            &["client_setup_failed", client_id.as_str(), kind];
+                        let fp: &[&str] = &["client_setup_failed", client_id.as_str(), kind];
                         scope.set_fingerprint(Some(fp));
                     },
                     || {
@@ -3433,6 +3502,13 @@ pub fn run() {
             // thread (which would leave bearer signals piling up in the
             // channel forever). On panic we log + report and resume the
             // recv loop on the next signal.
+            // Warm the paywall-first flag cache once per launch. Fire-and-forget:
+            // get_launch_flags serves cached-or-false immediately either way.
+            std::thread::Builder::new()
+                .name("paywall-flag-fetch".into())
+                .spawn(pricing::refresh_paywall_first_flag)
+                .ok();
+
             let (fresh_bearer_tx, fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
             let app_handle_for_pusher = app.handle().clone();
             std::thread::Builder::new()
@@ -3581,6 +3657,8 @@ pub fn run() {
             get_headroom_logs,
             get_headroom_request_count,
             get_headroom_request_counts_by_agent,
+            get_intercept_request_counts_by_agent,
+            get_launch_flags,
             get_rtk_activity,
             get_tool_logs,
             get_claude_code_projects,
@@ -5538,19 +5616,19 @@ mod tests {
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
         build_watchdog_give_up_report, check_headroom_learn_prereqs, classify_backend_readyz,
-        classify_bootstrap_failure, classify_upgrade_error, compute_tray_window_position,
-        count_memories_created_today, cpu_rate_indicates_burn, debounced_tray_runtime_visual,
-        delete_applied_pattern, empty_live_learnings_for_projects, extract_llm_failure_warnings,
-        fetch_transformations_feed_from, install_pending_update, is_disk_full_signal,
-        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
-        is_prerelease_version, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        parse_live_learnings, parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        classify_bootstrap_failure, classify_upgrade_error, client_setup_error_kind,
+        compute_tray_window_position, count_memories_created_today, cpu_rate_indicates_burn,
+        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
+        extract_llm_failure_warnings, fetch_transformations_feed_from, install_pending_update,
+        is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
+        is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, parse_live_learnings,
+        parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
-        client_setup_error_kind, read_applied_patterns_for_project,
-        readyz_failed_checks_csv, readyz_outcome_fingerprint_key,
+        read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
-        resolve_release_updater_config, select_updater_endpoints, store_checked_update,
-        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        readyz_outcome_fingerprint_key, resolve_release_updater_config, select_updater_endpoints,
+        store_checked_update, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
         AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
         HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
         MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
@@ -6952,6 +7030,20 @@ Some unrelated content.
     }
 
     #[test]
+    fn paywall_gate_matrix() {
+        use super::paywall_gate_blocks;
+        // Grandfathered: installed never blocks, whatever the flag/account say.
+        assert!(!paywall_gate_blocks(true, true, None));
+        assert!(!paywall_gate_blocks(true, true, Some(false)));
+        // Flag off: legacy flow.
+        assert!(!paywall_gate_blocks(false, false, None));
+        // Gated fresh install: only an active subscription passes.
+        assert!(!paywall_gate_blocks(false, true, Some(true)));
+        assert!(paywall_gate_blocks(false, true, Some(false))); // trial-only / lapsed
+        assert!(paywall_gate_blocks(false, true, None)); // signed out
+    }
+
+    #[test]
     fn parse_request_counts_by_agent_keys_by_agent_id() {
         let body = json!({
             "agent_usage": {
@@ -7147,18 +7239,15 @@ Some unrelated content.
 
     #[test]
     fn client_setup_error_kind_buckets_by_io_shape() {
-        let enospc = anyhow::Error::new(std::io::Error::from_raw_os_error(28))
-            .context("creating backup");
+        let enospc =
+            anyhow::Error::new(std::io::Error::from_raw_os_error(28)).context("creating backup");
         assert_eq!(client_setup_error_kind(&enospc), "no_space");
 
-        let exists = anyhow::Error::new(std::io::Error::from(
-            std::io::ErrorKind::AlreadyExists,
-        ))
-        .context("renaming codex config");
+        let exists = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            .context("renaming codex config");
         assert_eq!(client_setup_error_kind(&exists), "already_exists");
 
-        let not_found =
-            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let not_found = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert_eq!(client_setup_error_kind(&not_found), "not_found");
 
         // No io::Error in the chain -> "other".
@@ -7176,7 +7265,10 @@ Some unrelated content.
             readyz_outcome_fingerprint_key("http_503:memory,upstream"),
             "readyz_503"
         );
-        assert_eq!(readyz_outcome_fingerprint_key("http_500"), "readyz_http_other");
+        assert_eq!(
+            readyz_outcome_fingerprint_key("http_500"),
+            "readyz_http_other"
+        );
         assert_eq!(
             readyz_outcome_fingerprint_key("error: connection reset by peer"),
             "readyz_error"

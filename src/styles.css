@@ -5799,3 +5799,107 @@ html.window-hiding {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* Paywall-first onboarding stage (launcher) */
+.paywall {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+}
+
+.paywall__detection {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  margin: 0;
+}
+
+.paywall__auth {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+}
+
+.paywall__auth-lead {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  margin: 0;
+}
+
+.paywall__auth-row {
+  display: flex;
+  gap: 8px;
+}
+
+.paywall__auth-input {
+  background: var(--surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  color: var(--text-primary);
+  flex: 1;
+  font-size: var(--text-sm);
+  padding: 8px 10px;
+}
+
+.paywall__auth-success {
+  color: var(--accent);
+  font-size: var(--text-xs);
+  margin: 0;
+}
+
+.paywall__plans {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.paywall-card {
+  align-items: flex-start;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  position: relative;
+}
+
+.paywall-card--recommended {
+  border: 1px solid var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-tint);
+}
+
+.paywall-card__badge {
+  background: var(--accent-tint);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: var(--text-xxs);
+  font-weight: 600;
+  padding: 2px 8px;
+}
+
+.paywall-card__name {
+  color: var(--text-primary);
+  font-size: var(--text-base);
+}
+
+.paywall-card__price {
+  color: var(--text-primary);
+  font-size: var(--text-lg);
+  font-weight: 700;
+}
+
+.paywall-card__billing {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.paywall-card button {
+  margin-top: auto;
+  width: 100%;
+}
+
+.paywall__footnote {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  margin: 0;
+}

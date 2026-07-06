@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 
 import { invoke } from "@tauri-apps/api/core";
 
@@ -11,17 +11,29 @@ export interface TermsGateProps {
   termsUrl: string;
   /// Called after acceptance is persisted so the host can drop the gate.
   onAccepted: () => void;
+  /// Paywall-first onboarding: sign-in form rendered inside the gate. When
+  /// present, Continue also requires `authComplete`, and acceptance is only
+  /// persisted then — an abandoned sign-in re-shows the whole gate next launch.
+  authSection?: ReactNode;
+  authComplete?: boolean;
 }
 
 /// Full-window blocking gate shown until the user accepts the current Terms of
 /// Service. Rendered in both the launcher and the main window, so new installs
 /// and updating users alike must accept before reaching any other UI.
-export function TermsGate({ requiredVersion, termsUrl, onAccepted }: TermsGateProps) {
+export function TermsGate({
+  requiredVersion,
+  termsUrl,
+  onAccepted,
+  authSection,
+  authComplete
+}: TermsGateProps) {
   const [checked, setChecked] = useState(false);
   const [accepting, setAccepting] = useState(false);
+  const authSatisfied = authSection === undefined || authComplete === true;
 
   async function handleAccept() {
-    if (!checked || accepting) {
+    if (!checked || accepting || !authSatisfied) {
       return;
     }
     setAccepting(true);
@@ -66,10 +78,11 @@ export function TermsGate({ requiredVersion, termsUrl, onAccepted }: TermsGatePr
           />
           <span>I have read and accept the Terms of Service.</span>
         </label>
+        {authSection}
         <button
           type="button"
           className="primary-button primary-button--large terms-gate__accept"
-          disabled={!checked || accepting}
+          disabled={!checked || accepting || !authSatisfied}
           onClick={() => void handleAccept()}
         >
           {accepting ? "Saving…" : "Accept & Continue"}

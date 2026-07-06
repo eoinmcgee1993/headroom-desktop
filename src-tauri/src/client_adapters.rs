@@ -4007,9 +4007,8 @@ mod tests {
         build_claude_guard_script, build_codex_guard_script, build_headroom_markitdown_hook,
         build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
         claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
-        codex_sqlite_store_expected, default_shell_targets_for_family,
-        discover_codex_state_dbs, entry_contains_hook, find_on_path_entries, is_no_space,
-        is_permission_denied,
+        codex_sqlite_store_expected, default_shell_targets_for_family, discover_codex_state_dbs,
+        entry_contains_hook, find_on_path_entries, is_no_space, is_permission_denied,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, oss_remnant_warnings,
         parse_json_object, pin_codex_mcp_command, remove_managed_block,
         remove_pre_tool_use_markers, render_codex_config, retag_codex_thread_providers,
@@ -6112,7 +6111,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with(&format!("{stem}.tmp")))
             .collect();
-        assert!(leftover.is_empty(), "tmp files cleaned up by rename, got: {leftover:?}");
+        assert!(
+            leftover.is_empty(),
+            "tmp files cleaned up by rename, got: {leftover:?}"
+        );
 
         // Round-trip survives.
         let reloaded = super::load_setup_state();
@@ -6137,7 +6139,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             })
             .collect();
         for h in handles {
-            h.join().unwrap().expect("concurrent atomic_write must not ENOENT");
+            h.join()
+                .unwrap()
+                .expect("concurrent atomic_write must not ENOENT");
         }
         assert!(path.exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -6458,7 +6462,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // `state_<N>.sqlite` scheme entirely. Content-based discovery must still
         // find and retag it by its `threads` table, not the filename.
         let home = TestHome::new();
-        let db = home.path().join(".codex").join("sqlite").join("threads.sqlite");
+        let db = home
+            .path()
+            .join(".codex")
+            .join("sqlite")
+            .join("threads.sqlite");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
 

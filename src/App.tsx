@@ -121,6 +121,7 @@ import {
   needsTermsAcceptance,
   nextAutoConfigureStep,
   nextAutoConfigureStepAfterApply,
+  recommendedHeadroomTier,
   type LauncherStage
 } from "./lib/launcherHelpers";
 import { mockDashboard } from "./lib/mockData";
@@ -141,6 +142,7 @@ import {
 } from "./lib/trayHelpers";
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { ActivityFeed } from "./components/ActivityFeed";
+import { AuthCodeForm } from "./components/AuthCodeForm";
 import { LauncherShell } from "./components/LauncherShell";
 import { OptimizePanel } from "./components/OptimizePanel";
 import { TermsGate } from "./components/TermsGate";
@@ -151,6 +153,7 @@ import type {
   ClaudePlanTier,
   HeadroomAuthCodeRequest,
   HeadroomPricingStatus,
+  LaunchFlags,
   ClaudeCodeProject,
   ClientConnectorStatus,
   ClientSetupResult,
@@ -994,6 +997,10 @@ export default function App() {
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
   // flags cannot bypass the install step's readiness gate.
   const [launcherStage, setLauncherStage] = useState<LauncherStage>("install");
+  // Paywall-first experiment flag, served from the Rust-side cache (never
+  // blocks). Gated flow applies only to fresh installs: an installed runtime
+  // means the user is grandfathered and sees zero difference.
+  const [launchFlags, setLaunchFlags] = useState<LaunchFlags | null>(null);
   const [connectors, setConnectors] = useState<ClientConnectorStatus[]>([]);
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
@@ -1005,6 +1012,11 @@ export default function App() {
   const [proxyVerificationHint, setProxyVerificationHint] = useState<string | null>(null);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
+  // True only for a gated fresh install: paywall-first flag on AND no runtime
+  // on disk. Everything the experiment touches branches on this, so flag-off
+  // (or any fetch failure) renders the legacy flow untouched.
+  const paywallFirstFlow =
+    (launchFlags?.paywallFirst ?? false) && runtimeStatus?.installed === false;
   const [resuming, setResuming] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const [appUpdateConfig, setAppUpdateConfig] = useState<AppUpdateConfiguration | null>(null);
@@ -1408,9 +1420,13 @@ export default function App() {
       }
 
       updateStartup("runtime", 80, "Preparing Headroom runtime…");
-      const [runtimeResult, pricingResult] = await Promise.all([
+      const [runtimeResult, pricingResult, launchFlagsResult] = await Promise.all([
         invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
         invoke<HeadroomPricingStatus>("get_headroom_pricing_status").catch(() => null),
+        // Local cached read, never blocks on the network. Fetched before
+        // startupReady so TermsGate sees the paywall-first flag on its very
+        // first render (a late fetch would flicker the auth section in).
+        invoke<LaunchFlags>("get_launch_flags").catch(() => null),
         refreshConnectors(),
       ]);
       if (!active) {
@@ -1421,6 +1437,9 @@ export default function App() {
       }
       if (pricingResult) {
         setPricingStatus(pricingResult);
+      }
+      if (launchFlagsResult) {
+        setLaunchFlags(launchFlagsResult);
       }
 
       updateStartup(
@@ -1608,6 +1627,41 @@ export default function App() {
     }
     void refreshConnectors();
   }, [windowLabel, launcherStage]);
+
+  // Paywall stage: poll pricing status so the tier recommendation appears as
+  // soon as the first proxied request lands, and so a completed checkout
+  // (deep link or the 5-minute checkout poll) flips subscriptionActive here.
+  useEffect(() => {
+    if (windowLabel !== "launcher" || launcherStage !== "paywall") {
+      return;
+    }
+    let active = true;
+    const poll = () => {
+      invoke<HeadroomPricingStatus>("get_headroom_pricing_status")
+        .then((status) => {
+          if (active) setPricingStatus(status);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const interval = window.setInterval(poll, 3000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [windowLabel, launcherStage]);
+
+  // Post-checkout resume: the subscription is live, so move to the install
+  // stage and start the (now gate-passing) bootstrap automatically.
+  useEffect(() => {
+    if (windowLabel !== "launcher" || launcherStage !== "paywall") {
+      return;
+    }
+    if (pricingStatus?.account?.subscriptionActive) {
+      setLauncherStage("install");
+      void handleBootstrap();
+    }
+  }, [windowLabel, launcherStage, pricingStatus?.account?.subscriptionActive]);
 
   useEffect(() => {
     if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
@@ -2379,6 +2433,22 @@ export default function App() {
     try {
       await invoke("start_bootstrap");
     } catch (error) {
+      // Rust-side gate refused a gated install without a subscription:
+      // route back to the paywall instead of the failure report.
+      if (error === "paywall_required") {
+        setBootstrapping(false);
+        setBootstrapProgress({
+          running: false,
+          complete: false,
+          failed: false,
+          currentStep: "",
+          message: "",
+          currentStepEtaSeconds: 0,
+          overallPercent: 0
+        });
+        setLauncherStage("paywall");
+        return;
+      }
       const failureReport = buildBootstrapInvokeFailureReport(error);
       const failureSignature = bootstrapFailureSignature(failureReport);
       if (bootstrapFailureSignatureRef.current !== failureSignature) {
@@ -2965,7 +3035,11 @@ export default function App() {
       setAuthCodeRequestedFor(null);
       setAuthFlowSuccess("Headroom account connected.");
       setPendingUpgradePlanId(null);
-      setActiveView("upgrade");
+      // The launcher paywall renders its own sign-in inline; switching the
+      // (hidden) main-window view would be meaningless there.
+      if (windowLabel !== "launcher") {
+        setActiveView("upgrade");
+      }
       await refreshConnectors();
     } catch (error) {
       setAuthFlowError(describeInvokeError(error, "Could not verify sign-in code."));
@@ -3366,12 +3440,42 @@ export default function App() {
       <TermsGate
         requiredVersion={dashboard.requiredTermsVersion}
         termsUrl={dashboard.termsUrl}
-        onAccepted={() =>
+        onAccepted={() => {
           setDashboard((prev) => ({
             ...prev,
             acceptedTermsVersion: prev.requiredTermsVersion
-          }))
+          }));
+          // Gated fresh install, signed in but no entitled plan: go straight
+          // to the in-app checkout. Entitled web purchasers fall through to
+          // the normal install landing.
+          if (
+            paywallFirstFlow &&
+            pricingStatus?.authenticated === true &&
+            pricingStatus?.account?.subscriptionActive !== true
+          ) {
+            setLauncherStage("paywall");
+          }
+        }}
+        authSection={
+          paywallFirstFlow && windowLabel === "launcher" ? (
+            <AuthCodeForm
+              lead="Sign in with the email you used at checkout — or create your account now."
+              email={authEmail}
+              onEmailChange={setAuthEmail}
+              emailValid={authEmailValid}
+              code={authCode}
+              onCodeChange={setAuthCode}
+              codeRequested={authCodeRequestedFor !== null}
+              requestBusy={authRequestBusy}
+              verifyBusy={authVerifyBusy}
+              error={authFlowError}
+              success={authFlowSuccess}
+              onRequestCode={() => void handleRequestAuthCode()}
+              onVerify={() => void handleVerifyAuthCode()}
+            />
+          ) : undefined
         }
+        authComplete={pricingStatus?.authenticated === true}
       />
     );
   }
@@ -4027,6 +4131,91 @@ export default function App() {
           >
             Continue
           </button>
+        </div>
+      </LauncherShell>
+    );
+  }
+
+  if (windowLabel === "launcher" && launcherStage === "paywall") {
+    // Pre-install there is no proxied traffic, so detection normally yields
+    // nothing and the recommendation defaults to Pro — this is a self-select
+    // screen. Detected tiers still win if they happen to exist.
+    const recommendedTier = recommendedHeadroomTier(
+      pricingStatus?.claude?.planTier ?? null,
+      pricingStatus?.codexPlanTier ?? null
+    );
+    const paywallPlans = upgradePlansState.plans.filter(
+      (plan) => plan.id === "pro" || plan.id === "max5x" || plan.id === "max20x"
+    );
+    const signedIn = pricingStatus?.authenticated === true;
+    return (
+      <LauncherShell
+        shellClassName="intro-shell intro-shell--paywall"
+        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
+        copyClassName="intro-shell__copy intro-shell__copy--post-install"
+        onMouseDown={handleLauncherSurfaceMouseDown}
+        version={appSemver}
+      >
+        <div className="paywall">
+          <h1>Pick your Headroom plan</h1>
+          <p className="paywall__detection">
+            Pick the tier that matches your Claude or ChatGPT plan — every plan
+            starts with a 7-day free trial.
+          </p>
+          {!signedIn ? (
+            <AuthCodeForm
+              lead="Sign in to subscribe. We'll email you a one-time code."
+              email={authEmail}
+              onEmailChange={setAuthEmail}
+              emailValid={authEmailValid}
+              code={authCode}
+              onCodeChange={setAuthCode}
+              codeRequested={authCodeRequestedFor !== null}
+              requestBusy={authRequestBusy}
+              verifyBusy={authVerifyBusy}
+              error={authFlowError}
+              success={authFlowSuccess}
+              onRequestCode={() => void handleRequestAuthCode()}
+              onVerify={() => void handleVerifyAuthCode()}
+            />
+          ) : null}
+          <div className="paywall__plans">
+            {paywallPlans.map((plan) => {
+              const isRecommended = plan.id === recommendedTier;
+              return (
+                <article
+                  className={`soft-card paywall-card${isRecommended ? " paywall-card--recommended" : ""}`}
+                  key={plan.id}
+                >
+                  {isRecommended ? (
+                    <span className="paywall-card__badge">Most common</span>
+                  ) : null}
+                  <strong className="paywall-card__name">{plan.name}</strong>
+                  <span className="paywall-card__price">{plan.price}</span>
+                  <span className="paywall-card__billing">
+                    {plan.billingLines.join(" ")}
+                  </span>
+                  <button
+                    className={isRecommended ? "primary-button" : "secondary-button"}
+                    disabled={!signedIn || upgradeActionBusy !== null}
+                    onClick={() => void handleUpgradeAction(plan.id)}
+                    type="button"
+                  >
+                    {upgradeActionBusy === plan.id
+                      ? "Opening checkout…"
+                      : `Choose ${plan.name}`}
+                  </button>
+                </article>
+              );
+            })}
+          </div>
+          {upgradeActionError ? (
+            <p className="install-progress__error">{upgradeActionError}</p>
+          ) : null}
+          <p className="paywall__footnote">
+            Your coding tools keep working as-is in the meantime — Headroom
+            installs and starts optimizing right after checkout.
+          </p>
         </div>
       </LauncherShell>
     );

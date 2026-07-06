@@ -139,6 +139,16 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Codex thread retag is best-effort over every *.sqlite in the Codex dirs;
+    // a Codex-owned DB corrupted on the user's disk ("database disk image is
+    // malformed") is environmental and unfixable by a release. The retag
+    // already skips the file; keep the local log, drop the Sentry event.
+    if target.starts_with("headroom_desktop_lib::client_adapters")
+        && msg.starts_with("codex retag")
+        && msg.contains("database disk image is malformed")
+    {
+        return true;
+    }
     // The machine-id digest is a deterministic value (sha256 of the hardware
     // UUID); the keychain write is a best-effort cache whose failure changes
     // nothing (next launch recomputes the same value). Dominant cause is a ghost
@@ -310,6 +320,19 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::device",
             "hardware UUID unavailable"
+        ));
+    }
+
+    #[test]
+    fn skips_codex_retag_malformed_db() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "codex retag openai->headroom skipped for ~/.codex/logs_2.sqlite: database disk image is malformed"
+        ));
+        // Other retag skip causes (locked DB, schema drift) stay in Sentry.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "codex retag openai->headroom skipped for ~/.codex/state_5.sqlite: database is locked"
         ));
     }
 
