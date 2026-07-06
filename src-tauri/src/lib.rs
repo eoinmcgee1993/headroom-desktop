@@ -2990,6 +2990,29 @@ fn validate_contact_request_url(raw: &str) -> Option<reqwest::Url> {
     Some(parsed)
 }
 
+/// Coarse bucket for a client-setup failure, used in the Sentry fingerprint so
+/// the message-based grab-bag splits by failure shape. Walks the anyhow chain
+/// for the first io::Error and maps it to a stable category; permission-denied
+/// and no-space are filtered out before capture, so they normally won't reach
+/// this, but they stay mapped for completeness.
+pub(crate) fn client_setup_error_kind(err: &anyhow::Error) -> &'static str {
+    for cause in err.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::NotFound => "not_found",
+                std::io::ErrorKind::AlreadyExists => "already_exists",
+                std::io::ErrorKind::PermissionDenied => "permission_denied",
+                _ => match io.raw_os_error() {
+                    Some(28) => "no_space",
+                    Some(30) => "read_only_fs",
+                    _ => "io_other",
+                },
+            };
+        }
+    }
+    "other"
+}
+
 #[tauri::command]
 async fn apply_client_setup(
     app: AppHandle,
@@ -3057,15 +3080,32 @@ async fn apply_client_setup(
         }
         Err(err) => {
             let msg = err.to_string();
-            // Permission-denied writes (os error 13) are an unwritable-file
-            // environment issue, not an app bug -- surface to the user but keep
-            // them out of Sentry.
+            // Permission-denied (os error 13) and disk-full (ENOSPC, os error
+            // 28) writes are unwritable-file environment issues, not app bugs --
+            // surface to the user but keep them out of Sentry.
             if !msg.starts_with("Automatic setup is not supported yet")
                 && !client_adapters::is_permission_denied(&err)
+                && !client_adapters::is_no_space(&err)
             {
-                sentry::capture_message(
-                    &format!("client setup failed for {client_id}: {err:#}"),
-                    sentry::Level::Error,
+                // Split the grab-bag: a message-based fingerprint collapsed every
+                // client x every failure cause into one issue, so resolving one
+                // shape (e.g. the codex rename race) regressed the moment a
+                // sibling shape (ENOSPC on another client) reappeared. Key on
+                // client_id + a coarse error kind so real code failures separate
+                // from environmental noise and each stays independently resolvable.
+                let kind = client_setup_error_kind(&err);
+                sentry::with_scope(
+                    |scope| {
+                        let fp: &[&str] =
+                            &["client_setup_failed", client_id.as_str(), kind];
+                        scope.set_fingerprint(Some(fp));
+                    },
+                    || {
+                        sentry::capture_message(
+                            &format!("client setup failed for {client_id}: {err:#}"),
+                            sentry::Level::Error,
+                        );
+                    },
                 );
             }
             Err(msg)
@@ -5506,8 +5546,8 @@ mod tests {
         is_prerelease_version, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
         parse_live_learnings, parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
-        read_applied_patterns_for_project, readyz_failed_checks_csv,
-        readyz_outcome_fingerprint_key,
+        client_setup_error_kind, read_applied_patterns_for_project,
+        readyz_failed_checks_csv, readyz_outcome_fingerprint_key,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         resolve_release_updater_config, select_updater_endpoints, store_checked_update,
         watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
@@ -7103,6 +7143,26 @@ Some unrelated content.
         assert_eq!(readyz_failed_checks_csv(&all_ready), "");
         let no_checks = serde_json::json!({ "ready": false });
         assert_eq!(readyz_failed_checks_csv(&no_checks), "");
+    }
+
+    #[test]
+    fn client_setup_error_kind_buckets_by_io_shape() {
+        let enospc = anyhow::Error::new(std::io::Error::from_raw_os_error(28))
+            .context("creating backup");
+        assert_eq!(client_setup_error_kind(&enospc), "no_space");
+
+        let exists = anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::AlreadyExists,
+        ))
+        .context("renaming codex config");
+        assert_eq!(client_setup_error_kind(&exists), "already_exists");
+
+        let not_found =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(client_setup_error_kind(&not_found), "not_found");
+
+        // No io::Error in the chain -> "other".
+        assert_eq!(client_setup_error_kind(&anyhow::anyhow!("boom")), "other");
     }
 
     #[test]

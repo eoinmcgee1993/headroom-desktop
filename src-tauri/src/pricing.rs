@@ -2321,7 +2321,12 @@ fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingSta
                 local.reconcile_with_server = false;
                 if let Err(err) = write_local_state(&local) {
                     sentry::capture_message(
-                        &format!("Could not persist reconciled grace state: {err}"),
+                        // {err:#} not {err}: atomic_write puts the rename's os
+                        // error in the anyhow chain as a source, but {err} shows
+                        // only the top context ("renaming .tmp -> ...") and drops
+                        // the errno -- leaving RUST-4W events with no way to tell
+                        // a lingering race from environmental ENOSPC/read-only FS.
+                        &format!("Could not persist reconciled grace state: {err:#}"),
                         sentry::Level::Warning,
                     );
                 }

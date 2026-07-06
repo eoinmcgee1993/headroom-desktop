@@ -139,6 +139,18 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // The machine-id digest is a deterministic value (sha256 of the hardware
+    // UUID); the keychain write is a best-effort cache whose failure changes
+    // nothing (next launch recomputes the same value). Dominant cause is a ghost
+    // keychain entry from another app signature — environmental, unfixable here,
+    // identical every launch. Keep the local log, drop the Sentry event (RUST-3P
+    // / RUST-51: the earlier demote to log::warn still reached Sentry via this
+    // logger, so it needs the explicit skip here).
+    if target.starts_with("headroom_desktop_lib::device")
+        && msg.starts_with("Could not persist machine id digest")
+    {
+        return true;
+    }
     false
 }
 
@@ -285,6 +297,19 @@ mod tests {
         assert!(!skip_sentry(
             "tauri_plugin_updater",
             "invalid release manifest"
+        ));
+    }
+
+    #[test]
+    fn skips_machine_id_digest_persist_failures() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::device",
+            "Could not persist machine id digest (non-fatal, using computed value): duplicate item"
+        ));
+        // A different device.rs warning is not blanket-skipped.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::device",
+            "hardware UUID unavailable"
         ));
     }
 

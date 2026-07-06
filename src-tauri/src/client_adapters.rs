@@ -198,6 +198,18 @@ pub fn is_permission_denied(err: &anyhow::Error) -> bool {
     })
 }
 
+/// True when the error chain contains a filesystem "no space left on device"
+/// (ENOSPC, os error 28) -- a full disk, an environment issue not an app bug,
+/// same class as `is_permission_denied`. ErrorKind::StorageFull isn't stable, so
+/// match the raw errno (28 on macOS and Linux).
+pub fn is_no_space(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(28))
+    })
+}
+
 /// Runs a shell-profile write step, tolerating an unwritable profile (e.g. a
 /// read-only ~/.zshrc -> os error 13). The env that actually routes a client
 /// lives in app-owned config (~/.claude/settings.json, ~/.codex/config.toml), so
@@ -3996,7 +4008,8 @@ mod tests {
         build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
         claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
         codex_sqlite_store_expected, default_shell_targets_for_family,
-        discover_codex_state_dbs, entry_contains_hook, find_on_path_entries, is_permission_denied,
+        discover_codex_state_dbs, entry_contains_hook, find_on_path_entries, is_no_space,
+        is_permission_denied,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, oss_remnant_warnings,
         parse_json_object, pin_codex_mcp_command, remove_managed_block,
         remove_pre_tool_use_markers, render_codex_config, retag_codex_thread_providers,
@@ -4018,6 +4031,19 @@ mod tests {
         assert!(!is_permission_denied(&not_found));
 
         assert!(!is_permission_denied(&anyhow::anyhow!("Permission denied")));
+    }
+
+    #[test]
+    fn is_no_space_matches_only_enospc() {
+        let full = anyhow::Error::new(std::io::Error::from_raw_os_error(28))
+            .context("creating backup /Users/x/.claude/settings.json.headroom-backup");
+        assert!(is_no_space(&full));
+
+        let denied = anyhow::Error::new(std::io::Error::from_raw_os_error(13))
+            .context("writing /Users/x/.zshrc");
+        assert!(!is_no_space(&denied));
+
+        assert!(!is_no_space(&anyhow::anyhow!("No space left on device")));
     }
 
     #[test]
