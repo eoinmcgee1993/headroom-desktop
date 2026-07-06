@@ -507,11 +507,11 @@ async fn handle(
     // only) never fires for it — this proxy is the only component left in the
     // response path that sees those headers. Every other client (Claude) keeps
     // the untouched zero-copy splice.
-    if is_codex {
+    if is_models_fetch {
+        splice_with_models_lite_rewrite(client, backend).await;
+    } else if is_codex {
         let req_path = parse_request_head(&buf).map(|p| p.path).unwrap_or_default();
         splice_with_codex_capture(client, backend, &codex_slot, &req_path).await;
-    } else if is_models_fetch {
-        splice_with_models_lite_rewrite(client, backend).await;
     } else {
         // Same shape as copy_bidirectional, split so the backend->client half
         // can stamp traffic liveness for the watchdog.
