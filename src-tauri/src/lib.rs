@@ -1322,6 +1322,28 @@ pub(crate) struct WatchdogGiveUpReport {
     pub backend_readyz_outcome: String,
 }
 
+/// Coarse bucket for `backend_readyz_outcome` used in the Sentry fingerprint.
+/// Deliberately drops the high-cardinality tails (`http_503:<checks>`,
+/// `error: <msg>`) to a stable category so the issue splits by failure *shape*
+/// (dead port vs wedged vs failing-check vs intercept-layer) without
+/// re-fragmenting per machine.
+pub(crate) fn readyz_outcome_fingerprint_key(outcome: &str) -> &'static str {
+    if outcome == "ok" {
+        // Backend healthy -> the fault is in the Rust intercept layer, not Python.
+        "readyz_ok"
+    } else if outcome == "timeout" {
+        "readyz_timeout"
+    } else if outcome == "refused" {
+        "readyz_refused"
+    } else if outcome.starts_with("http_503") {
+        "readyz_503"
+    } else if outcome.starts_with("http_") {
+        "readyz_http_other"
+    } else {
+        "readyz_error"
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_watchdog_give_up_report(
     consecutive_failures: u32,
@@ -1584,7 +1606,19 @@ fn capture_watchdog_give_up(
 
     sentry::with_scope(
         |scope| {
-            let fp: &[&str] = &["proxy_unreachable_post_boot"];
+            // Split the grab-bag: one flat fingerprint collapsed every distinct
+            // failure mode (port refused vs alive-but-503 vs intercept-layer)
+            // across every release into a single issue that can never be
+            // resolved — a sibling shape always reappears. Key on the coarse
+            // readyz classification and whether the child is still alive so each
+            // genuinely-different wedge gets its own issue and lifecycle.
+            let readyz_key = readyz_outcome_fingerprint_key(&report.backend_readyz_outcome);
+            let child_key = if report.tracked_child_exit_status == "still_alive_or_untracked" {
+                "child_alive"
+            } else {
+                "child_exited"
+            };
+            let fp: &[&str] = &["proxy_unreachable_post_boot", readyz_key, child_key];
             scope.set_fingerprint(Some(fp));
             scope.set_extra(
                 "tracked_child_exit_status",
@@ -5473,6 +5507,7 @@ mod tests {
         parse_live_learnings, parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
         read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_outcome_fingerprint_key,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         resolve_release_updater_config, select_updater_endpoints, store_checked_update,
         watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
@@ -7068,6 +7103,24 @@ Some unrelated content.
         assert_eq!(readyz_failed_checks_csv(&all_ready), "");
         let no_checks = serde_json::json!({ "ready": false });
         assert_eq!(readyz_failed_checks_csv(&no_checks), "");
+    }
+
+    #[test]
+    fn readyz_fingerprint_key_buckets_shapes_and_drops_cardinality() {
+        assert_eq!(readyz_outcome_fingerprint_key("ok"), "readyz_ok");
+        assert_eq!(readyz_outcome_fingerprint_key("timeout"), "readyz_timeout");
+        assert_eq!(readyz_outcome_fingerprint_key("refused"), "readyz_refused");
+        // high-cardinality tails collapse to one bucket
+        assert_eq!(readyz_outcome_fingerprint_key("http_503"), "readyz_503");
+        assert_eq!(
+            readyz_outcome_fingerprint_key("http_503:memory,upstream"),
+            "readyz_503"
+        );
+        assert_eq!(readyz_outcome_fingerprint_key("http_500"), "readyz_http_other");
+        assert_eq!(
+            readyz_outcome_fingerprint_key("error: connection reset by peer"),
+            "readyz_error"
+        );
     }
 
     #[test]

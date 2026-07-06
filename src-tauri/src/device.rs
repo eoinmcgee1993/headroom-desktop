@@ -49,10 +49,15 @@ fn load_or_compute_machine_id_digest() -> String {
     if let Err(err) =
         keychain::write_secret(DEVICE_KEYCHAIN_SERVICE, MACHINE_ID_DIGEST_ACCOUNT, &digest)
     {
-        sentry::capture_message(
-            &format!("Could not persist machine id digest: {err}"),
-            sentry::Level::Warning,
-        );
+        // Best-effort cache only: `digest` is deterministic (sha256 of the
+        // hardware UUID, or a persisted fallback file), so the next launch
+        // recomputes the SAME value whether or not this write lands. The
+        // dominant failure is "duplicate item persists after delete" — a
+        // keychain entry owned by a different app signature that we can't
+        // read or delete but Add still collides with; that's the machine's
+        // environment, unfixable from here and identical every launch. Log
+        // locally instead of firing a fleet Sentry warning on every boot.
+        log::warn!("Could not persist machine id digest (non-fatal, using computed value): {err}");
     }
     digest
 }

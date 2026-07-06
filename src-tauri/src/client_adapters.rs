@@ -2844,8 +2844,11 @@ def settings_base(path):
 
 
 def diagnose_route(effective):
-    # Explain WHY the effective route is not Headroom: a higher-precedence settings
-    # scope, an unapplied env (GUI/IDE launch or needs restart), or missing config.
+    # A real routing break is (a) a higher-precedence project-local scope pointing
+    # elsewhere, or (b) neither user settings nor the session env routing to Headroom.
+    # settings.json's env is what Claude Code actually applies to its API calls, so
+    # a correct user settings + unset process env (GUI / `open` launch that didn't
+    # inherit the shell export) is HEALTHY, not a failure -- don't warn on it.
     shown = effective if effective else "unset"
     home = os.path.expanduser("~")
     user_val = settings_base(os.path.join(home, ".claude", "settings.json"))
@@ -2856,17 +2859,17 @@ def diagnose_route(effective):
     ):
         val = settings_base(path)
         if val is not None and val != BASE_URL:
-            return "ANTHROPIC_BASE_URL=" + shown + " -- " + path + " sets it to " + val + ", which overrides Headroom's route (" + BASE_URL + "). Remove or fix that entry."
-    if user_val == BASE_URL:
-        return "Headroom is configured (user settings = " + BASE_URL + ") but this session started with ANTHROPIC_BASE_URL=" + shown + ". If you launched Claude from an app/IDE it did not inherit the Headroom shell env -- restart Claude Code from a terminal, or reopen the Headroom app."
-    return "ANTHROPIC_BASE_URL is not routed to Headroom in ~/.claude/settings.json (session has " + shown + "). Reopen the Headroom app or re-run client setup."
+            return "ANTHROPIC_BASE_URL -- " + path + " sets it to " + val + ", which overrides Headroom's route (" + BASE_URL + "). Remove or fix that entry."
+    if user_val != BASE_URL and effective != BASE_URL:
+        return "ANTHROPIC_BASE_URL is not routed to Headroom (user settings: " + (str(user_val) if user_val else "no entry") + ", session env: " + shown + "). Reopen the Headroom app or re-run client setup."
+    return None
 
 
 def main():
     issues = []
-    effective = os.environ.get("ANTHROPIC_BASE_URL")
-    if effective != BASE_URL:
-        issues.append(diagnose_route(effective))
+    route_issue = diagnose_route(os.environ.get("ANTHROPIC_BASE_URL"))
+    if route_issue:
+        issues.append(route_issue)
     if not reachable():
         issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- it may be restarting; open the app if it isn't")
 
@@ -6448,9 +6451,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
         // main() explains WHY instead of the flat "is not" message.
         assert!(script.contains("def diagnose_route"));
-        assert!(script.contains("did not inherit the Headroom shell env"));
         assert!(script.contains("overrides Headroom's route"));
         assert!(!script.contains("ANTHROPIC_BASE_URL is not \" + BASE_URL"));
+        // A correct user settings + unset process env (GUI / `open` launch) is
+        // healthy and must NOT trigger the old "restart Claude Code" nag.
+        assert!(!script.contains("did not inherit the Headroom shell env"));
+        assert!(script.contains("user_val != BASE_URL and effective != BASE_URL"));
         // Notifications are debounced and reachability retries once, so an app
         // relaunch doesn't produce a notification storm.
         assert!(script.contains("DEBOUNCE_PATH.touch()"));

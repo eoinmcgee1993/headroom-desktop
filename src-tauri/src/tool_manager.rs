@@ -991,6 +991,15 @@ impl ToolManager {
                     // baseline still feeds the /stats savings estimate. Level 2 =
                     // skip pre/postamble, don't restate in-context code/tool output.
                     .env("HEADROOM_VERBOSITY_LEVEL", "2")
+                    // Output-shaper A/B holdout: route 1% of conversations UNSHAPED
+                    // as a control arm so `output-savings` reports a MEASURED
+                    // reduction (unbiased treatment-vs-control) instead of a
+                    // synthetic-control estimate. 1% (not the doc's 10%) keeps the
+                    // shaping sacrifice tiny; the ~36% effect + high request volume
+                    // still reach a usable CI, just over more calendar time.
+                    // assign_arm hashes the conversation key, so a conversation
+                    // stays in one arm across its turns.
+                    .env("HEADROOM_OUTPUT_HOLDOUT", "0.01")
                     // Agent savings persona (new in headroom-ai 0.30.0). The
                     // `proxy` entrypoint reads HEADROOM_SAVINGS_PROFILE into
                     // config.savings_profile, and proxy_pipeline_kwargs() applies
@@ -1004,7 +1013,18 @@ impl ToolManager {
                     // prompt mutation / prefix-cache busting); this now applies
                     // cleanly since we no longer force HEADROOM_COMPRESS_USER_MESSAGES
                     // on, so user turns stay protected as the persona intends.
-                    .env("HEADROOM_SAVINGS_PROFILE", "coding")
+                    // Version-gated: "coding" only exists in _PROFILES from 0.30.0.
+                    // When 0.30.0 boot-validation times out the app falls back to
+                    // 0.28.0, whose profile set is {agent-90, balanced} only —
+                    // passing "coding" there makes get_agent_savings_profile raise
+                    // and the proxy exit 1 before opening the port (Sentry RUST-1M).
+                    // Fall back to the runtime default that exists in every version.
+                    .env(
+                        "HEADROOM_SAVINGS_PROFILE",
+                        savings_profile_for_runtime(
+                            self.installed_headroom_version().as_deref(),
+                        ),
+                    )
                     // Pre-upstream concurrency. The proxy's own auto is
                     // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
                     // event loop from CPU-bound compression. The desktop runs with
@@ -4569,6 +4589,23 @@ fn runtime_supports_no_http2(installed_version: Option<&str>) -> bool {
     }
 }
 
+/// The "coding" savings persona only exists in `agent_savings._PROFILES` from
+/// headroom-ai 0.30.0. On the 0.28.0 fallback runtime (chosen when 0.30.0 boot
+/// validation times out) the set is {agent-90, balanced}, so `coding` makes the
+/// proxy raise on startup and exit before opening the port (Sentry RUST-1M).
+/// Below 0.30.0, fall back to "agent-90" — the runtime's own default, valid in
+/// every version. Unknown/unparseable version = current install, keep "coding".
+fn savings_profile_for_runtime(installed_version: Option<&str>) -> &'static str {
+    let Some(version) = installed_version else {
+        return "coding";
+    };
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) if (major, minor) < (0, 30) => "agent-90",
+        _ => "coding",
+    }
+}
+
 fn headroom_entrypoint_startup_args(installed_version: Option<&str>) -> Vec<String> {
     // HTTP/2 to upstream is disabled both ways: the explicit --no-http2 flag
     // AND the HEADROOM_HTTP2=false env var (set in the spawn env). Either alone
@@ -5943,6 +5980,7 @@ mod tests {
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
         diagnose_proxy_port, extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
+        savings_profile_for_runtime,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, looks_like_corrupt_venv_error, parse_major_minor_patch,
         parse_pid_from_lsof_detail, path_with_binary_dir, pre_upstream_concurrency,
@@ -6907,6 +6945,21 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         assert!(headroom_python_startup_args().contains(&"--no-http2".to_string()));
 
         backend_port::reset_for_tests();
+    }
+
+    /// Regression (Sentry RUST-1M): the "coding" savings persona only exists in
+    /// _PROFILES from 0.30.0. On the 0.28.0 fallback runtime, passing it makes
+    /// the proxy raise on startup and exit before opening the port. Must gate on
+    /// runtime >= 0.30.0; unknown versions assume the pinned (current) runtime.
+    #[test]
+    fn savings_profile_gated_on_runtime_version() {
+        assert_eq!(savings_profile_for_runtime(Some("0.28.0")), "agent-90");
+        assert_eq!(savings_profile_for_runtime(Some("0.29.9")), "agent-90");
+        assert_eq!(savings_profile_for_runtime(Some("0.30.0")), "coding");
+        assert_eq!(savings_profile_for_runtime(Some("1.0.0")), "coding");
+        // Unknown or malformed receipt version: assume pinned runtime.
+        assert_eq!(savings_profile_for_runtime(None), "coding");
+        assert_eq!(savings_profile_for_runtime(Some("garbage")), "coding");
     }
 
     /// Regression: `start_headroom_background` previously built `startup_variants`
