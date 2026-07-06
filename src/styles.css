@@ -5925,3 +5925,28 @@ html.window-hiding {
 .paywall .upgrade-billing-toggle {
   align-self: center;
 }
+
+/* Paywall stage must fit the fixed launcher window: tighter type/spacing than
+   the other intro stages, with scroll as the safety valve. */
+.intro-shell--paywall {
+  overflow-y: auto;
+}
+
+.paywall {
+  gap: 10px;
+}
+
+.paywall h1 {
+  font-size: var(--text-lg);
+  margin: 0;
+}
+
+.paywall-card {
+  gap: 4px;
+  padding: 12px;
+}
+
+.paywall-card__fit {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}

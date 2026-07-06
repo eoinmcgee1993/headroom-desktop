@@ -64,6 +64,7 @@ import {
   getNextLowerUpgradePlanId,
   getPlanRenewalPriceLabel,
   getUpgradePlans,
+  type UpgradePlan,
   getFounderStepPricing,
   isTierDowngrade,
   forgoneSavingsLabel,
@@ -4177,9 +4178,16 @@ export default function App() {
       pricingStatus?.claude?.planTier ?? null,
       pricingStatus?.codexPlanTier ?? null
     );
-    const paywallPlans = upgradePlansState.plans.filter(
-      (plan) => plan.id === "pro" || plan.id === "max5x" || plan.id === "max20x"
-    );
+    // Fixed cheapest-first order, independent of the upgrade view's
+    // recommended-first sorting; mirrors the website pricing page.
+    const paywallPlans = (["pro", "max5x", "max20x"] as const)
+      .map((id) => upgradePlansState.plans.find((plan) => plan.id === id))
+      .filter((plan): plan is UpgradePlan => plan !== undefined);
+    const paywallPlanFit: Record<string, string> = {
+      pro: "For Claude Pro or ChatGPT Plus",
+      max5x: "For Claude Max x5 or ChatGPT Pro x5",
+      max20x: "For Claude Max x20 or ChatGPT Pro x20"
+    };
     const signedIn = pricingStatus?.authenticated === true;
     return (
       <LauncherShell
@@ -4256,6 +4264,9 @@ export default function App() {
                     <span className="paywall-card__badge">Most common</span>
                   ) : null}
                   <strong className="paywall-card__name">{plan.name}</strong>
+                  <span className="paywall-card__fit">
+                    {paywallPlanFit[plan.id] ?? plan.tagline}
+                  </span>
                   {plan.originalPrice ? (
                     <span className="paywall-card__sale-row">
                       <s className="upgrade-plan-card__original-price">
