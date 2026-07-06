@@ -5939,3 +5939,23 @@ html.window-hiding {
   color: var(--text-secondary);
   font-size: var(--text-xs);
 }
+
+/* Paywall header: mid-size centered title so it outranks body copy without
+   reclaiming the hero scale that overflowed the window, and the intro copy
+   centered to match the banner/toggle/cards below it. */
+.paywall h1 {
+  font-size: 1.55rem;
+  margin: 6px 0 0;
+  text-align: center;
+}
+
+.paywall__detection {
+  margin: 0 auto;
+  max-width: 560px;
+  text-align: center;
+}
+
+.paywall__account-row {
+  margin: 0;
+  text-align: center;
+}
