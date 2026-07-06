@@ -3465,21 +3465,35 @@ export default function App() {
         }}
         authSection={
           paywallFirstFlow && windowLabel === "launcher" ? (
-            <AuthCodeForm
-              lead="Sign in with the email you used at checkout — or create your account now."
-              email={authEmail}
-              onEmailChange={setAuthEmail}
-              emailValid={authEmailValid}
-              code={authCode}
-              onCodeChange={setAuthCode}
-              codeRequested={authCodeRequestedFor !== null}
-              requestBusy={authRequestBusy}
-              verifyBusy={authVerifyBusy}
-              error={authFlowError}
-              success={authFlowSuccess}
-              onRequestCode={() => void handleRequestAuthCode()}
-              onVerify={() => void handleVerifyAuthCode()}
-            />
+            pricingStatus?.authenticated === true ? (
+              <p className="paywall__account-row">
+                Signed in as {pricingStatus?.account?.email ?? authEmail}
+                {" — "}
+                <button
+                  className="link-button"
+                  onClick={() => void handleSignOutHeadroomAccount()}
+                  type="button"
+                >
+                  use a different email
+                </button>
+              </p>
+            ) : (
+              <AuthCodeForm
+                lead="Sign in with the email you used at checkout — or create your account now."
+                email={authEmail}
+                onEmailChange={setAuthEmail}
+                emailValid={authEmailValid}
+                code={authCode}
+                onCodeChange={setAuthCode}
+                codeRequested={authCodeRequestedFor !== null}
+                requestBusy={authRequestBusy}
+                verifyBusy={authVerifyBusy}
+                error={authFlowError}
+                success={authFlowSuccess}
+                onRequestCode={() => void handleRequestAuthCode()}
+                onVerify={() => void handleVerifyAuthCode()}
+              />
+            )
           ) : undefined
         }
         authComplete={pricingStatus?.authenticated === true}
@@ -4181,6 +4195,26 @@ export default function App() {
             Pick the tier that matches your Claude or ChatGPT plan — every plan
             starts with a 7-day free trial.
           </p>
+          {pricingStatus?.launchDiscountActive ? (
+            <p className="paywall__sale-banner">
+              🎉 Launch discount: {pricingStatus.activePercentOff || 50}% off —
+              locked in forever, for as long as you stay subscribed
+            </p>
+          ) : null}
+          <div className="upgrade-billing-toggle" role="group" aria-label="Billing period">
+            {(["annual", "monthly"] as const).map((period) => (
+              <button
+                key={period}
+                className={`upgrade-billing-toggle__item${billingPeriod === period ? " is-active" : ""}`}
+                onClick={() => setBillingPeriod(period)}
+                type="button"
+              >
+                {period === "annual" ? (
+                  <>Annual <span className="upgrade-billing-toggle__save">Save 33%</span></>
+                ) : "Monthly"}
+              </button>
+            ))}
+          </div>
           {!signedIn ? (
             <AuthCodeForm
               lead="Sign in to subscribe. We'll email you a one-time code."
@@ -4197,7 +4231,19 @@ export default function App() {
               onRequestCode={() => void handleRequestAuthCode()}
               onVerify={() => void handleVerifyAuthCode()}
             />
-          ) : null}
+          ) : (
+            <p className="paywall__account-row">
+              Signed in as {pricingStatus?.account?.email ?? authEmail}
+              {" — "}
+              <button
+                className="link-button"
+                onClick={() => void handleSignOutHeadroomAccount()}
+                type="button"
+              >
+                use a different email
+              </button>
+            </p>
+          )}
           <div className="paywall__plans">
             {paywallPlans.map((plan) => {
               const isRecommended = plan.id === recommendedTier;
@@ -4210,6 +4256,16 @@ export default function App() {
                     <span className="paywall-card__badge">Most common</span>
                   ) : null}
                   <strong className="paywall-card__name">{plan.name}</strong>
+                  {plan.originalPrice ? (
+                    <span className="paywall-card__sale-row">
+                      <s className="upgrade-plan-card__original-price">
+                        {plan.originalPrice}
+                      </s>
+                      <span className="upgrade-plan-card__sale-badge">
+                        {(pricingStatus?.activePercentOff ?? 0) || 50}% off
+                      </span>
+                    </span>
+                  ) : null}
                   <span className="paywall-card__price">{plan.price}</span>
                   <span className="paywall-card__billing">
                     {plan.billingLines.join(" ")}

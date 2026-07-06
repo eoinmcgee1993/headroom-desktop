@@ -5903,3 +5903,25 @@ html.window-hiding {
   font-size: var(--text-xs);
   margin: 0;
 }
+
+.paywall__sale-banner {
+  align-self: center;
+  background: var(--accent-tint);
+  border: 1px solid var(--accent-tint-strong);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  margin: 0;
+  padding: 4px 14px;
+}
+
+.paywall-card__sale-row {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.paywall .upgrade-billing-toggle {
+  align-self: center;
+}

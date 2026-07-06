@@ -291,6 +291,20 @@ describe("app helpers", () => {
       });
     });
 
+    it("applies the account forever discount to upgrade-target cards without launch promo", () => {
+      // 3000 cents = $2.50/mo (50% off pro). Launch discount inactive.
+      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-12-01", "2025-12-01", "forever");
+      const max5x = result.plans.find((p) => p.id === "max5x");
+      expect(max5x?.originalPrice).toBeDefined();
+      expect(max5x?.price).not.toBe(max5x?.originalPrice);
+    });
+
+    it("does not discount upgrade-target cards for a once-off discount", () => {
+      const result = getUpgradePlans(...baseArgs, 3000, "annual", "2026-12-01", "2025-12-01", "once");
+      const max5x = result.plans.find((p) => p.id === "max5x");
+      expect(max5x?.originalPrice).toBeUndefined();
+    });
+
     it("shows discounted renewal price when repeating discount window has not expired", () => {
       // Started 2025-04-16, 12-month discount window → expires 2026-04-16
       // Renewal at 2026-01-01 is within window → discount applies

@@ -355,8 +355,15 @@ export function getUpgradePlans(
       // purchaseInfo (actual paid amount) instead of a generic discount badge.
       // Percent is driven live by the cohort ladder; fall back to 50% for legacy
       // callers that only signal launchDiscountActive without a percent.
-      const effectivePercentOff = activePercentOff > 0 ? activePercentOff : 50;
-      const showDiscount = launchDiscountActive && id !== activeHeadroomPlanId;
+      // Subscribers with a discount that survives renewal (forever, or repeating
+      // still in window) keep it on plan swaps (Polar carries it over), so their
+      // own percent wins over the cohort promo.
+      const accountDiscountPct = activePurchaseInfo?.discountPct ?? 0;
+      const effectivePercentOff = accountDiscountPct > 0
+        ? accountDiscountPct
+        : activePercentOff > 0 ? activePercentOff : 50;
+      const showDiscount =
+        (launchDiscountActive || accountDiscountPct > 0) && id !== activeHeadroomPlanId;
       const price = showDiscount
         ? discountedPriceLabel(prices.fullCents, effectivePercentOff)
         : prices.full;
