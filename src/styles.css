@@ -5944,6 +5944,9 @@ html.window-hiding {
    reclaiming the hero scale that overflowed the window, and the intro copy
    centered to match the banner/toggle/cards below it. */
 .paywall h1 {
+  /* align-self overrides the max-width:28ch cap from .intro-shell__copy h1,
+     which otherwise pins the title to a narrow left-sitting box. */
+  align-self: center;
   font-size: 1.55rem;
   margin: 6px 0 0;
   text-align: center;

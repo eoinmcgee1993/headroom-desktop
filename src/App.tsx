@@ -4191,8 +4191,8 @@ export default function App() {
       .filter((plan): plan is UpgradePlan => plan !== undefined);
     const paywallPlanFit: Record<string, string> = {
       pro: "For Claude Pro or ChatGPT Plus",
-      max5x: "For Claude Max x5 / ChatGPT Pro x5",
-      max20x: "For Claude Max x20 or ChatGPT Pro x20"
+      max5x: "Claude Max x5 & Codex Pro x5",
+      max20x: "Claude Max x20 & Codex Pro x20"
     };
     const signedIn = pricingStatus?.authenticated === true;
     return (
@@ -4219,22 +4219,15 @@ export default function App() {
               </button>
             ))}
           </div>
-          <p className="paywall__detection">
-            Pick the tier that matches your Claude or ChatGPT plan • <strong>7-day free trial</strong>.{" "}
-            <button
-              className="link-button"
-              onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com" })}
-              type="button"
-            >
-              Learn more
-            </button>
-          </p>
           {pricingStatus?.launchDiscountActive ? (
             <p className="paywall__sale-banner">
-              🎉 Launch discount: {pricingStatus.activePercentOff || 50}% off —
-              locked in forever, for as long as you stay subscribed
+              🎉 Launch discount: {pricingStatus.activePercentOff || 50}% off •
+              locked in forever
             </p>
           ) : null}
+          <p className="paywall__detection">
+            Pick the tier that matches your Claude or ChatGPT plan • <strong>7-day free trial</strong>.
+          </p>
           {!signedIn ? (
             <AuthCodeForm
               lead="Sign in to subscribe. We'll email you a one-time code."
@@ -4296,10 +4289,18 @@ export default function App() {
             <p className="install-progress__error">{upgradeActionError}</p>
           ) : null}
           <p className="paywall__footnote">
-            Headroom finalized installing and starts optimizing right after checkout.
+            <button
+              className="link-button"
+              onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/features" })}
+              type="button"
+            >
+              See all Headroom features
+            </button>
+            {" • "}
+            Headroom finalizes installing and starts optimizing right after checkout.
           </p>
           {signedIn ? (
-            <p className="paywall__account-row">
+            <p className="paywall__footnote">
               Signed in as {pricingStatus?.account?.email ?? authEmail}
               {" — "}
               <button
