@@ -1,6 +1,6 @@
 {
   "name": "headroom-desktop",
-  "version": "0.6.1",
+  "version": "0.6.2-rc.4",
   "private": true,
   "type": "module",
   "scripts": {
@@ -20,13 +20,13 @@
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
     "@sentry/react": "^10.47.0",
-    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/api": "2.11.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "recharts": "^3.8.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.0.0",
+    "@tauri-apps/cli": "2.11.4",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",

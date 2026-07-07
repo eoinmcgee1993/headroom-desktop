@@ -3476,13 +3476,13 @@ export default function App() {
             pricingStatus?.authenticated === true ? (
               <p className="paywall__account-row">
                 Signed in as {pricingStatus?.account?.email ?? authEmail}
-                {" — "}
+                {" • "}
                 <button
                   className="link-button"
                   onClick={() => void handleSignOutHeadroomAccount()}
                   type="button"
                 >
-                  use a different email
+                  or use a different email
                 </button>
               </p>
             ) : (
@@ -4177,11 +4177,12 @@ export default function App() {
 
   if (windowLabel === "launcher" && launcherStage === "paywall") {
     // Pre-install there is no proxied traffic, so detection normally yields
-    // nothing and the recommendation defaults to Pro — this is a self-select
+    // nothing and the recommendation defaults to Max x5 — this is a self-select
     // screen. Detected tiers still win if they happen to exist.
     const recommendedTier = recommendedHeadroomTier(
       pricingStatus?.claude?.planTier ?? null,
-      pricingStatus?.codexPlanTier ?? null
+      pricingStatus?.codexPlanTier ?? null,
+      "max5x"
     );
     // Fixed cheapest-first order, independent of the upgrade view's
     // recommended-first sorting; mirrors the website pricing page.
@@ -4190,8 +4191,8 @@ export default function App() {
       .filter((plan): plan is UpgradePlan => plan !== undefined);
     const paywallPlanFit: Record<string, string> = {
       pro: "For Claude Pro or ChatGPT Plus",
-      max5x: "For Claude Max x5 or ChatGPT Pro x5",
-      max20x: "For Claude Max x20 or ChatGPT Pro x20"
+      max5x: "Claude Max x5 & Codex Pro x5",
+      max20x: "Claude Max x20 & Codex Pro x20"
     };
     const signedIn = pricingStatus?.authenticated === true;
     return (
@@ -4204,16 +4205,6 @@ export default function App() {
       >
         <div className="paywall">
           <h1>Pick your Headroom plan</h1>
-          <p className="paywall__detection">
-            Pick the tier that matches your Claude or ChatGPT plan — every plan
-            starts with a 7-day free trial.
-          </p>
-          {pricingStatus?.launchDiscountActive ? (
-            <p className="paywall__sale-banner">
-              🎉 Launch discount: {pricingStatus.activePercentOff || 50}% off —
-              locked in forever, for as long as you stay subscribed
-            </p>
-          ) : null}
           <div className="upgrade-billing-toggle" role="group" aria-label="Billing period">
             {(["annual", "monthly"] as const).map((period) => (
               <button
@@ -4228,6 +4219,15 @@ export default function App() {
               </button>
             ))}
           </div>
+          {pricingStatus?.launchDiscountActive ? (
+            <p className="paywall__sale-banner">
+              🎉 Launch discount: {pricingStatus.activePercentOff || 50}% off •
+              locked in forever
+            </p>
+          ) : null}
+          <p className="paywall__detection">
+            Pick the tier that matches your Claude or ChatGPT plan • <strong>7-day free trial</strong>.
+          </p>
           {!signedIn ? (
             <AuthCodeForm
               lead="Sign in to subscribe. We'll email you a one-time code."
@@ -4244,19 +4244,7 @@ export default function App() {
               onRequestCode={() => void handleRequestAuthCode()}
               onVerify={() => void handleVerifyAuthCode()}
             />
-          ) : (
-            <p className="paywall__account-row">
-              Signed in as {pricingStatus?.account?.email ?? authEmail}
-              {" — "}
-              <button
-                className="link-button"
-                onClick={() => void handleSignOutHeadroomAccount()}
-                type="button"
-              >
-                use a different email
-              </button>
-            </p>
-          )}
+          ) : null}
           <div className="paywall__plans">
             {paywallPlans.map((plan) => {
               const isRecommended = plan.id === recommendedTier;
@@ -4265,9 +4253,6 @@ export default function App() {
                   className={`soft-card paywall-card${isRecommended ? " paywall-card--recommended" : ""}`}
                   key={plan.id}
                 >
-                  {isRecommended ? (
-                    <span className="paywall-card__badge">Most common</span>
-                  ) : null}
                   <strong className="paywall-card__name">{plan.name}</strong>
                   <span className="paywall-card__fit">
                     {paywallPlanFit[plan.id] ?? plan.tagline}
@@ -4294,7 +4279,7 @@ export default function App() {
                   >
                     {upgradeActionBusy === plan.id
                       ? "Opening checkout…"
-                      : `Choose ${plan.name}`}
+                      : `Start ${plan.name} trial`}
                   </button>
                 </article>
               );
@@ -4304,9 +4289,29 @@ export default function App() {
             <p className="install-progress__error">{upgradeActionError}</p>
           ) : null}
           <p className="paywall__footnote">
-            Your coding tools keep working as-is in the meantime — Headroom
-            installs and starts optimizing right after checkout.
+            <button
+              className="link-button"
+              onClick={() => void invoke("open_external_link", { url: "https://extraheadroom.com/features" })}
+              type="button"
+            >
+              See all Headroom features
+            </button>
+            {" • "}
+            Headroom finalizes installing and starts optimizing right after checkout.
           </p>
+          {signedIn ? (
+            <p className="paywall__footnote">
+              Signed in as {pricingStatus?.account?.email ?? authEmail}
+              {" • "}
+              <button
+                className="link-button"
+                onClick={() => void handleSignOutHeadroomAccount()}
+                type="button"
+              >
+                or use a different email
+              </button>
+            </p>
+          ) : null}
         </div>
       </LauncherShell>
     );
