@@ -3484,6 +3484,7 @@ pub fn tail_lines(text: &str, max_lines: usize) -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct LaunchProfile {
     launch_count: u64,
     launch_experience: LaunchExperience,
@@ -3505,7 +3506,13 @@ struct LaunchProfile {
 
 fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
     if let Ok(bytes) = serde_json::to_vec_pretty(profile) {
-        let _ = std::fs::write(path, bytes);
+        let _ = crate::client_adapters::atomic_write(path, &bytes);
+    }
+}
+
+impl Default for LaunchProfile {
+    fn default() -> Self {
+        Self::fresh()
     }
 }
 
@@ -3539,9 +3546,10 @@ impl LaunchProfile {
                 })
                 .unwrap_or_else(|err| {
                     log::warn!(
-                        "launch profile at {} unreadable ({err}); starting fresh",
+                        "launch profile at {} unreadable ({err}); backing up and starting fresh",
                         path.display()
                     );
+                    let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
                     Self::fresh()
                 })
         } else {
@@ -3571,8 +3579,8 @@ impl LaunchProfile {
         // Application Support perms, RUST-1P) must not crash startup. The profile
         // is telemetry; degrade to the in-memory copy and continue.
         if let Ok(bytes) = serde_json::to_vec_pretty(&current) {
-            if let Err(e) = std::fs::write(&path, bytes) {
-                log::warn!("could not persist {}: {e}", path.display());
+            if let Err(e) = crate::client_adapters::atomic_write(&path, &bytes) {
+                log::warn!("could not persist {}: {e:#}", path.display());
             }
         }
 
@@ -3606,7 +3614,7 @@ impl LastKnownGoodPlan {
 
 fn persist_last_known_good_plan(path: &std::path::Path, plan: &LastKnownGoodPlan) {
     if let Ok(bytes) = serde_json::to_vec_pretty(plan) {
-        let _ = std::fs::write(path, bytes);
+        let _ = crate::client_adapters::atomic_write(path, &bytes);
     }
 }
 

@@ -2767,7 +2767,8 @@ async fn delete_applied_pattern(
     if updated == content {
         return Ok(()); // no-op; nothing to write
     }
-    std::fs::write(&path, updated).map_err(|err| format!("write {}: {err}", path.display()))?;
+    crate::client_adapters::atomic_write(&path, updated.as_bytes())
+        .map_err(|err| format!("write {}: {err:#}", path.display()))?;
     Ok(())
 }
 

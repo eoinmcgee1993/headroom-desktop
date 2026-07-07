@@ -869,6 +869,7 @@ impl ToolManager {
                     sanitize_log_variant(&args.join("-"))
                 };
                 let log_path = logs_dir.join(format!("headroom-{variant}.log"));
+                rotate_log_if_large(&log_path);
                 let log_file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -1457,6 +1458,7 @@ impl ToolManager {
         python: &Path,
         log_path: &Path,
     ) -> Result<KompressPrefetchOutcome> {
+        rotate_log_if_large(log_path);
         let log_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -4725,6 +4727,21 @@ fn extract_required_pydantic_core_version(log_tail: &str) -> Option<String> {
     }
 }
 
+/// Child-process logs are opened append-mode on every launch and otherwise
+/// grow unbounded. Rename to `.log.old` (keeping one prior generation, same
+/// scheme as logging.rs) once the file exceeds the cap, before reopening.
+fn rotate_log_if_large(path: &Path) {
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    let too_big = std::fs::metadata(path)
+        .map(|m| m.len() > MAX_LOG_BYTES)
+        .unwrap_or(false);
+    if too_big {
+        let backup = path.with_extension("log.old");
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::rename(path, &backup);
+    }
+}
+
 /// Make a string safe to use as part of a filename: replace path separators
 /// (`/`, `\`) and other characters that have meaning to the filesystem with
 /// `_`, then truncate so absurdly long argv strings don't blow past
@@ -5974,6 +5991,7 @@ mod tests {
 
     use chrono::Local;
 
+    use super::rotate_log_if_large;
     use super::{
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
         diagnose_proxy_port, extract_required_pydantic_core_version, format_all_foreign_bail,
@@ -6626,6 +6644,27 @@ mod tests {
         let raw = "proxy---port-6768---log-messages---learn";
         let cleaned = sanitize_log_variant(raw);
         assert_eq!(cleaned, raw);
+    }
+
+    #[test]
+    fn rotate_log_if_large_rotates_only_past_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("headroom-default.log");
+
+        fs::write(&log, b"small").expect("write small log");
+        rotate_log_if_large(&log);
+        assert!(log.exists(), "small log must not rotate");
+        assert!(!log.with_extension("log.old").exists());
+
+        fs::write(&log, vec![b'x'; 5 * 1024 * 1024 + 1]).expect("write big log");
+        rotate_log_if_large(&log);
+        assert!(!log.exists(), "oversized log must be renamed away");
+        assert_eq!(
+            fs::metadata(log.with_extension("log.old"))
+                .expect("old gen")
+                .len(),
+            5 * 1024 * 1024 + 1
+        );
     }
 
     #[test]

@@ -2556,7 +2556,7 @@ if __name__ == "__main__":
     )
 }
 
-/// Merge the SessionStart + UserPromptSubmit guard entries into a hooks file.
+/// Merge guard entries for the given `events` into a hooks file.
 /// Codex `hooks.json` and Claude `settings.json` share the identical
 /// `{{"hooks": {{event: [{{matcher?, hooks: [...]}}]}}}}` shape, so both clients
 /// use this. Preserves every other key in the file. Idempotent: an
@@ -2565,6 +2565,7 @@ fn register_guard_hook_entries(
     hooks_path: &Path,
     command: &str,
     status_message: &str,
+    events: &[(&str, Option<&str>)],
 ) -> Result<(Vec<String>, Vec<String>)> {
     let mut content = if hooks_path.exists() {
         let raw = std::fs::read_to_string(hooks_path)
@@ -2586,11 +2587,7 @@ fn register_guard_hook_entries(
         .ok_or_else(|| anyhow!("unable to write hooks settings"))?;
 
     let mut mutated = false;
-    let events: [(&str, Option<&str>); 2] = [
-        ("SessionStart", Some("startup|resume|clear|compact")),
-        ("UserPromptSubmit", None),
-    ];
-    for (event, matcher) in events {
+    for &(event, matcher) in events {
         if !hooks_obj.get(event).map(Value::is_array).unwrap_or(false) {
             hooks_obj.insert(event.to_string(), Value::Array(Vec::new()));
         }
@@ -2665,11 +2662,13 @@ fn guard_registered_in_hooks(hooks_path: &Path, command: &str) -> Result<bool> {
 /// Strip the guard entries for `command` from a hooks file. Leaves any
 /// user-authored hooks intact and drops now-empty event arrays. `delete_if_empty`
 /// removes the whole file when nothing remains -- correct for Codex's standalone
-/// `hooks.json`, but never for Claude's shared `settings.json`.
+/// `hooks.json`, but never for Claude's shared `settings.json`. `only_events`
+/// limits the sweep to specific event names; `None` sweeps every event.
 fn remove_guard_hook_entries(
     hooks_path: &Path,
     command: &str,
     delete_if_empty: bool,
+    only_events: Option<&[&str]>,
 ) -> Result<()> {
     if !hooks_path.exists() {
         return Ok(());
@@ -2680,10 +2679,15 @@ fn remove_guard_hook_entries(
     let mut changed = false;
     let mut hooks_empty = false;
     if let Some(hooks_obj) = content.get_mut("hooks").and_then(Value::as_object_mut) {
-        // Sweep every event, not just the two we register, so a guard that Codex
+        // Sweep every event, not just the ones we register, so a guard that Codex
         // (or an older build) moved to another event is still stripped.
         let events: Vec<String> = hooks_obj.keys().cloned().collect();
         for event in events {
+            if let Some(filter) = only_events {
+                if !filter.contains(&event.as_str()) {
+                    continue;
+                }
+            }
             if let Some(entries) = hooks_obj.get_mut(&event).and_then(Value::as_array_mut) {
                 let before = entries.len();
                 entries.retain(|entry| !entry_contains_hook(entry, command));
@@ -2728,6 +2732,10 @@ fn ensure_codex_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
         &codex_hooks_json_path(),
         &codex_guard_command(),
         CODEX_GUARD_STATUS_MESSAGE,
+        &[
+            ("SessionStart", Some("startup|resume|clear|compact")),
+            ("UserPromptSubmit", None),
+        ],
     )?;
     if script_changed {
         changed.insert(0, script_path.display().to_string());
@@ -2751,6 +2759,7 @@ fn remove_codex_guard_hook() -> Result<()> {
         &codex_hooks_json_path(),
         &script_path.display().to_string(),
         true,
+        None,
     )?;
     if script_path.exists() {
         let _ = std::fs::remove_file(&script_path);
@@ -2771,7 +2780,10 @@ fn claude_guard_command() -> String {
     format!("/usr/bin/python3 {}", claude_guard_hook_path().display())
 }
 
-/// Loud-fail guard that Claude Code runs at session start and on every prompt.
+/// Loud-fail guard that Claude Code runs at session start (SessionStart only:
+/// exit 2 there surfaces a warning but cannot block, whereas on UserPromptSubmit
+/// it blocks every prompt -- which broke Claude Desktop / Cowork VM sessions
+/// that share `~/.claude/settings.json` but can never reach 127.0.0.1:6767).
 /// Because the hook inherits Claude's environment, it checks the *effective*
 /// routing -- `ANTHROPIC_BASE_URL` as Claude actually sees it -- rather than a
 /// config file, plus that the desktop app is reachable. Pure stdlib so it runs
@@ -2903,15 +2915,29 @@ if __name__ == "__main__":
 }
 
 /// Write the Claude guard script and register it in `~/.claude/settings.json`
-/// for SessionStart and UserPromptSubmit. No trust step required.
+/// for SessionStart only. No trust step required.
+///
+/// Never UserPromptSubmit: exit 2 there blocks the prompt, and Claude Desktop /
+/// Cowork VM sessions read the same settings.json but can never reach
+/// 127.0.0.1:6767 from inside the VM, so the guard bricked every prompt in the
+/// Claude desktop app while the routing it verifies didn't even apply there.
 fn ensure_claude_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
     let script_path = claude_guard_hook_path();
     let (script_changed, script_backup) =
         write_file_if_changed(&script_path, &build_claude_guard_script(), true)?;
+    // Migration: earlier builds also registered on UserPromptSubmit; strip that
+    // entry from existing installs. Match on the script path (see codex counterpart).
+    remove_guard_hook_entries(
+        &claude_settings_path(),
+        &script_path.display().to_string(),
+        false,
+        Some(&["UserPromptSubmit"]),
+    )?;
     let (mut changed, mut backups) = register_guard_hook_entries(
         &claude_settings_path(),
         &claude_guard_command(),
         CLAUDE_GUARD_STATUS_MESSAGE,
+        &[("SessionStart", Some("startup|resume|clear|compact"))],
     )?;
     if script_changed {
         changed.insert(0, script_path.display().to_string());
@@ -2934,7 +2960,7 @@ fn remove_claude_guard_hook() -> Result<()> {
     // Match on the script path, not the full interpreter command (see codex counterpart).
     let fragment = script_path.display().to_string();
     for settings_path in claude_settings_candidates() {
-        let _ = remove_guard_hook_entries(&settings_path, &fragment, false);
+        let _ = remove_guard_hook_entries(&settings_path, &fragment, false, None);
     }
     if script_path.exists() {
         let _ = std::fs::remove_file(&script_path);
@@ -5213,9 +5239,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let settings_path = home.path().join(".claude").join("settings.json");
         let settings = read_settings_json(&settings_path);
         let command = format!("/usr/bin/python3 {}", script.display());
-        // Guard registered exactly once on each event despite the double-apply.
-        for event in ["SessionStart", "UserPromptSubmit"] {
-            let count = settings["hooks"][event]
+        let guard_count = |event: &str| {
+            settings["hooks"][event]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -5226,12 +5251,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                         .iter()
                         .any(|h| h["command"] == serde_json::Value::String(command.clone()))
                 })
-                .count();
-            assert_eq!(
-                count, 1,
-                "guard registered once for {event}, got:\n{settings:#}"
-            );
-        }
+                .count()
+        };
+        // Guard registered exactly once on SessionStart despite the double-apply.
+        assert_eq!(
+            guard_count("SessionStart"),
+            1,
+            "guard registered once for SessionStart, got:\n{settings:#}"
+        );
+        // Never on UserPromptSubmit: exit 2 there blocks every prompt in Claude
+        // Desktop / Cowork VM sessions that can't reach the app.
+        assert_eq!(
+            guard_count("UserPromptSubmit"),
+            0,
+            "guard must not register on UserPromptSubmit, got:\n{settings:#}"
+        );
         assert_eq!(
             settings["hooks"]["SessionStart"][0]["matcher"],
             "startup|resume|clear|compact"
@@ -5252,6 +5286,56 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         // settings.json must NOT be deleted even if it were otherwise empty.
         assert!(settings_path.exists(), "settings.json preserved on disable");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_migrates_guard_off_user_prompt_submit() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        // An older build registered the guard on UserPromptSubmit, where exit 2
+        // blocks every prompt in Claude Desktop / Cowork VM sessions. A user
+        // hook on the same event must survive the migration.
+        let script = home
+            .path()
+            .join(".claude")
+            .join("hooks")
+            .join("headroom-claude-guard.py");
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            format!(
+                r#"{{"hooks":{{
+                    "SessionStart":[{{"matcher":"startup|resume|clear|compact","hooks":[{{"type":"command","command":"/usr/bin/python3 {script}"}}]}}],
+                    "UserPromptSubmit":[
+                        {{"hooks":[{{"type":"command","command":"/usr/bin/python3 {script}"}}]}},
+                        {{"hooks":[{{"type":"command","command":"echo mine"}}]}}
+                    ]
+                }}}}"#,
+                script = script.display()
+            ),
+        )
+        .unwrap();
+        seed_installed_rtk();
+
+        super::apply_client_setup("claude_code").expect("apply");
+
+        let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
+        let ups = serde_json::to_string(&settings["hooks"]["UserPromptSubmit"]).unwrap();
+        assert!(
+            !ups.contains("headroom-claude-guard.py"),
+            "guard stripped from UserPromptSubmit, got:\n{settings:#}"
+        );
+        assert!(
+            ups.contains("echo mine"),
+            "user-authored UserPromptSubmit hook preserved, got:\n{settings:#}"
+        );
+        let ss = serde_json::to_string(&settings["hooks"]["SessionStart"]).unwrap();
+        assert!(
+            ss.contains("headroom-claude-guard.py"),
+            "guard still registered on SessionStart, got:\n{settings:#}"
+        );
     }
 
     #[test]
@@ -5831,7 +5915,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         )
         .unwrap();
 
-        super::remove_guard_hook_entries(&hooks_path, script, true).unwrap();
+        super::remove_guard_hook_entries(&hooks_path, script, true, None).unwrap();
 
         let after = read_settings_json(&hooks_path);
         let after_str = serde_json::to_string(&after).unwrap();

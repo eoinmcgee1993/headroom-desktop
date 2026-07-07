@@ -45,12 +45,12 @@ fn read_at(path: &Path) -> Option<PortConflictMarker> {
     serde_json::from_slice(&raw).ok()
 }
 
-fn write_at(path: &Path, marker: &PortConflictMarker) -> std::io::Result<()> {
+fn write_at(path: &Path, marker: &PortConflictMarker) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_vec_pretty(marker)?;
-    fs::write(path, json)
+    crate::client_adapters::atomic_write(path, &json)
 }
 
 fn clear_at(path: &Path) -> Option<PortConflictMarker> {
@@ -108,7 +108,7 @@ fn record_failure_at(
     err_chain: &str,
     increment_launches: bool,
     now: DateTime<Utc>,
-) -> std::io::Result<PortConflictMarker> {
+) -> anyhow::Result<PortConflictMarker> {
     let (cmd, pid) = parse_occupant(err_chain);
     let prior = read_at(path);
 

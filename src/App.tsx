@@ -1636,6 +1636,7 @@ export default function App() {
     if (windowLabel !== "launcher" || launcherStage !== "paywall") {
       return;
     }
+    trackAnalyticsEvent("paywall_shown", {});
     let active = true;
     const poll = () => {
       invoke<HeadroomPricingStatus>("get_headroom_pricing_status")
@@ -1659,6 +1660,9 @@ export default function App() {
       return;
     }
     if (pricingStatus?.account?.subscriptionActive) {
+      trackAnalyticsEvent("paywall_checkout_completed", {
+        plan_id: pricingStatus.account.subscriptionTier ?? undefined
+      });
       setLauncherStage("install");
       void handleBootstrap();
     }
