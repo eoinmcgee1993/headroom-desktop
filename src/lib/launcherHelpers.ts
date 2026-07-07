@@ -51,7 +51,8 @@ export function isValidEmailAddress(email: string) {
 // "pro" (the paywall always recommends something) instead of None.
 export function recommendedHeadroomTier(
   claudeTier: ClaudePlanTier | null | undefined,
-  codexTier: CodexPlanTier | null | undefined
+  codexTier: CodexPlanTier | null | undefined,
+  fallback: HeadroomSubscriptionTier = "pro"
 ): HeadroomSubscriptionTier {
   const TIER_RANK: Record<HeadroomSubscriptionTier, number> = {
     pro: 1,
@@ -79,7 +80,7 @@ export function recommendedHeadroomTier(
     (t): t is HeadroomSubscriptionTier => t !== null
   );
   if (candidates.length === 0) {
-    return "pro";
+    return fallback;
   }
   return candidates.reduce((best, t) =>
     TIER_RANK[t] > TIER_RANK[best] ? t : best
