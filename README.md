@@ -2,7 +2,7 @@
 
 **Headroom is a macOS menu bar app that cuts [Claude Code](https://www.anthropic.com/claude-code) and [OpenAI Codex](https://openai.com/codex/) token costs by ~50% — without changing how you code.** It runs a local-first optimization pipeline that reversibly compresses the tool output, logs, and boilerplate that bloat every prompt, so the AI plan you already pay for stretches about 2x further. Nothing the model needs is lost — it can pull the original content back on demand.
 
-> **Pricing:** Headroom has a free tier and paid plans — see [pricing](https://extraheadroom.com/pricing). The desktop shell in this repo is MIT-licensed; account features and paid plans are opt-in.
+> **Paid product.** Headroom is a paid subscription app (7-day free trial, plans from $3/mo) — see [pricing](https://extraheadroom.com/pricing). The desktop shell in this repo is MIT-licensed and open source, but the app requires a Headroom account and an active plan to run.
 
 [![Website](https://img.shields.io/badge/extraheadroom.com-website-blue?style=for-the-badge)](https://extraheadroom.com)&nbsp;&nbsp;[![Download for macOS](https://img.shields.io/github/v/release/gglucass/headroom-desktop?label=Download%20for%20macOS&style=for-the-badge&logo=apple&logoColor=white&color=000000)](https://github.com/gglucass/headroom-desktop/releases/latest)
 
@@ -23,7 +23,13 @@ Linux preview artifacts are published on the same release page. Today they are b
 
 ---
 
-![Headroom dashboard showing $204 saved across 66.8M tokens](docs/screenshot-1.png)
+![Headroom dashboard showing savings across tokens processed](docs/app-dashboard.png)
+
+![Headroom activity feed showing per-request compression](docs/app-activity.png)
+
+![Headroom project learnings view](docs/app-learnings.png)
+
+![Headroom add-ons screen](docs/app-addons.png)
 
 ---
 
