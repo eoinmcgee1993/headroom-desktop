@@ -3476,13 +3476,13 @@ export default function App() {
             pricingStatus?.authenticated === true ? (
               <p className="paywall__account-row">
                 Signed in as {pricingStatus?.account?.email ?? authEmail}
-                {" — "}
+                {" • "}
                 <button
                   className="link-button"
                   onClick={() => void handleSignOutHeadroomAccount()}
                   type="button"
                 >
-                  use a different email
+                  or use a different email
                 </button>
               </p>
             ) : (
@@ -4302,13 +4302,13 @@ export default function App() {
           {signedIn ? (
             <p className="paywall__footnote">
               Signed in as {pricingStatus?.account?.email ?? authEmail}
-              {" — "}
+              {" • "}
               <button
                 className="link-button"
                 onClick={() => void handleSignOutHeadroomAccount()}
                 type="button"
               >
-                use a different email
+                or use a different email
               </button>
             </p>
           ) : null}

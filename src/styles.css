@@ -5891,6 +5891,7 @@ html.window-hiding {
   color: var(--text-muted);
   font-size: var(--text-xs);
   margin: 0;
+  text-align: center;
 }
 
 .paywall__sale-banner {
