@@ -214,7 +214,8 @@ export function getNextLowerUpgradePlanId(
 ): IndividualUpgradePlanId | null {
   switch (planId) {
     case "pro":
-      return "free";
+      // No free plan to downgrade to post-trial.
+      return null;
     case "max5x":
       return "pro";
     case "max20x":
@@ -246,38 +247,7 @@ export function getUpgradePlans(
   featuredPlanId: UpgradePlanId;
 } {
   if (audience === "individual") {
-    const downgradeEndsOn = subscriptionCancelAtPeriodEnd && subscriptionEndsAt
-      ? new Date(subscriptionEndsAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
-      : undefined;
-
-    const freePlan: UpgradePlan = {
-      id: "free",
-      name: "Free",
-      tagline: "Limited usage with Claude or Codex",
-      price: "$0",
-      billingLines: ["/ month", "free"],
-      featureIntro: "Includes:",
-      features: [
-        "Unlocks cost savings and stats",
-        "Use with 50% of your Claude or Codex plan",
-        "Optimize Claude Code or Codex"
-      ],
-      ctaLabel: downgradeEndsOn ? "Downgrade scheduled" : "Stay on Free plan",
-      ctaVariant: "secondary",
-      ctaTone: "default",
-      ...(downgradeEndsOn
-        ? {
-            purchaseInfo: {
-              renewsOn: downgradeEndsOn,
-              paidPerMonthLabel: "$0",
-              discountPct: 0,
-              cancelAtPeriodEnd: true,
-              endsOn: downgradeEndsOn
-            }
-          }
-        : {})
-    };
-
+    // No free plan post-trial: the upgrade sheet only offers paid plans.
     const billingLabel = billingPeriod === "annual" ? "billed annually" : "billed monthly";
 
     const activeHeadroomPlanId =
@@ -452,7 +422,7 @@ export function getUpgradePlans(
           .map((planId) => paidPlans[planId])
       ].map(withRelativeCta);
       return {
-        plans: [withRelativeCta(freePlan), ...orderedPaidPlans],
+        plans: orderedPaidPlans,
         featuredPlanId: activeHeadroomPlanId
       };
     }
@@ -478,7 +448,7 @@ export function getUpgradePlans(
           .map((planId) => paidPlans[planId])
       ];
       return {
-        plans: [freePlan, ...orderedPaidPlans],
+        plans: orderedPaidPlans,
         featuredPlanId: activePaidPlanId
       };
     }
@@ -491,7 +461,7 @@ export function getUpgradePlans(
           .map((planId) => paidPlans[planId])
       ];
       return {
-        plans: [freePlan, ...orderedPaidPlans],
+        plans: orderedPaidPlans,
         featuredPlanId: recommendedSubscriptionTier
       };
     }
@@ -499,12 +469,7 @@ export function getUpgradePlans(
     // No recommendation (e.g. not signed in yet) or an unknown Claude plan:
     // default to Max x5 as the featured plan.
     return {
-      plans: [
-        freePlan,
-        paidPlans.max5x,
-        paidPlans.pro,
-        paidPlans.max20x
-      ],
+      plans: [paidPlans.max5x, paidPlans.pro, paidPlans.max20x],
       featuredPlanId: "max5x"
     };
   }

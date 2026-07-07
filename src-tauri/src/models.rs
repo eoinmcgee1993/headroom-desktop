@@ -680,6 +680,7 @@ pub enum PricingGateReason {
     SignInRequired,
     WeeklyUsageLimitReached,
     CodexWeeklyUsageLimitReached,
+    TrialEnded,
 }
 
 /// The OpenAI/ChatGPT plan behind a Codex session, decoded best-effort from the

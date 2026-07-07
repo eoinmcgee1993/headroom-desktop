@@ -863,57 +863,10 @@ fn emit_bootstrap_progress(app: &AppHandle, state: &AppState) {
     let _ = app.emit("bootstrap_progress", state.bootstrap_progress());
 }
 
-/// Typed error surfaced when the paywall-first gate blocks an install; the
-/// frontend routes back to the paywall stage instead of the failure report.
-pub const BOOTSTRAP_PAYWALL_REQUIRED: &str = "paywall_required";
-
-/// Hard paywall for the gated cohort: fresh installs (no runtime on disk) with
-/// the paywall-first flag on must have an active subscription before the ~2GB
-/// bootstrap runs. `trial_active` deliberately does NOT count: headroom-web
-/// grants a trial on every sign-in, which would make the gate a no-op.
-/// Existing installs pass unconditionally (grandfathered, no network I/O).
-fn bootstrap_paywall_gate(state: &AppState) -> Result<(), String> {
-    let installed = state.tool_manager.python_runtime_installed();
-    let flag_on = pricing::paywall_first_flag();
-    // Only a gated fresh install pays for the network re-verify. It is
-    // authoritative: the frontend only calls start_bootstrap after observing
-    // subscriptionActive, so this is defense in depth against stale state.
-    let subscription_active = if !installed && flag_on {
-        // A status failure here is a connectivity problem, not a verdict:
-        // surface a retryable message instead of blocking as unentitled.
-        let status = pricing::get_pricing_status(state).map_err(|err| {
-            format!(
-                "Could not verify your subscription — check your connection and try again. ({err})"
-            )
-        })?;
-        status.account.as_ref().map(|a| a.subscription_active)
-    } else {
-        None
-    };
-    if paywall_gate_blocks(installed, flag_on, subscription_active) {
-        Err(BOOTSTRAP_PAYWALL_REQUIRED.into())
-    } else {
-        Ok(())
-    }
-}
-
-/// Pure gate decision. Blocks only when: fresh install (grandfathering), flag
-/// on, and no active subscription. `None` = no account / signed out. Trials
-/// never pass (headroom-web grants one on every sign-in — counting it would
-/// void the hard paywall).
-pub(crate) fn paywall_gate_blocks(
-    installed: bool,
-    flag_on: bool,
-    subscription_active: Option<bool>,
-) -> bool {
-    !installed && flag_on && subscription_active != Some(true)
-}
-
 #[tauri::command]
 fn start_bootstrap(app: AppHandle) -> Result<(), String> {
     let already_installed = {
         let state: tauri::State<'_, AppState> = app.state();
-        bootstrap_paywall_gate(&state)?;
         let already_installed = state.tool_manager.python_runtime_installed();
         state.begin_bootstrap()?;
         emit_bootstrap_progress(&app, &state);
@@ -7028,20 +6981,6 @@ Some unrelated content.
         let body = json!({ "tokens": { "saved": 100 } }).to_string();
         assert_eq!(parse_request_count_from_stats_body(&body), None);
         assert_eq!(parse_request_count_from_stats_body("not json"), None);
-    }
-
-    #[test]
-    fn paywall_gate_matrix() {
-        use super::paywall_gate_blocks;
-        // Grandfathered: installed never blocks, whatever the flag/account say.
-        assert!(!paywall_gate_blocks(true, true, None));
-        assert!(!paywall_gate_blocks(true, true, Some(false)));
-        // Flag off: legacy flow.
-        assert!(!paywall_gate_blocks(false, false, None));
-        // Gated fresh install: only an active subscription passes.
-        assert!(!paywall_gate_blocks(false, true, Some(true)));
-        assert!(paywall_gate_blocks(false, true, Some(false))); // trial-only / lapsed
-        assert!(paywall_gate_blocks(false, true, None)); // signed out
     }
 
     #[test]

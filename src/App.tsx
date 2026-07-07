@@ -129,7 +129,6 @@ import { mockDashboard } from "./lib/mockData";
 import {
   cachePricingStatus,
   type CachedPricing,
-  formatPercentValue,
   formatRemainingDays,
   readCachedPricing,
   subscriptionTierLabel,
@@ -1013,11 +1012,11 @@ export default function App() {
   const [proxyVerificationHint, setProxyVerificationHint] = useState<string | null>(null);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
-  // True only for a gated fresh install: paywall-first flag on AND no runtime
-  // on disk. Everything the experiment touches branches on this, so flag-off
-  // (or any fetch failure) renders the legacy flow untouched.
-  const paywallFirstFlow =
-    (launchFlags?.paywallFirst ?? false) && runtimeStatus?.installed === false;
+  // Fresh install (no runtime on disk yet). Drives the onboarding email-harvest
+  // step: every fresh install collects an email to start the card-free 7-day
+  // trial. The old paywall-first checkout gate has been retired, so this no
+  // longer depends on the launch flag.
+  const paywallFirstFlow = runtimeStatus?.installed === false;
   const [resuming, setResuming] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const [appUpdateConfig, setAppUpdateConfig] = useState<AppUpdateConfiguration | null>(null);
@@ -2445,22 +2444,6 @@ export default function App() {
     try {
       await invoke("start_bootstrap");
     } catch (error) {
-      // Rust-side gate refused a gated install without a subscription:
-      // route back to the paywall instead of the failure report.
-      if (error === "paywall_required") {
-        setBootstrapping(false);
-        setBootstrapProgress({
-          running: false,
-          complete: false,
-          failed: false,
-          currentStep: "",
-          message: "",
-          currentStepEtaSeconds: 0,
-          overallPercent: 0
-        });
-        setLauncherStage("paywall");
-        return;
-      }
       const failureReport = buildBootstrapInvokeFailureReport(error);
       const failureSignature = bootstrapFailureSignature(failureReport);
       if (bootstrapFailureSignatureRef.current !== failureSignature) {
@@ -2860,13 +2843,8 @@ export default function App() {
   }
 
   async function handleInstallPrimaryAction() {
-    // Option-1 ordering: unentitled gated users go to the paywall; tools are
-    // connected AFTER checkout + install, same as the first-run path routed
-    // from the terms screen.
-    if (paywallFirstFlow && pricingStatus?.account?.subscriptionActive !== true) {
-      setLauncherStage("paywall");
-      return;
-    }
+    // No checkout gate: the email-harvested trial user installs and uses
+    // Headroom directly. Upgrading happens later from the in-app upgrade sheet.
     await handleBootstrap();
   }
 
@@ -3487,7 +3465,7 @@ export default function App() {
               </p>
             ) : (
               <AuthCodeForm
-                lead="Sign in with the email you used at checkout or create an account."
+                lead="Enter your email to start your free 7-day trial. We'll send a one-time code — no credit card required."
                 email={authEmail}
                 onEmailChange={setAuthEmail}
                 emailValid={authEmailValid}
@@ -3765,8 +3743,6 @@ export default function App() {
     const stepProgress = Math.round(getStepProgress(bootstrapProgress) * 100);
     const renderPercent = animatedOverallPercent(bootstrapProgress);
     const installComplete = bootstrapProgress.complete || dashboard.bootstrapComplete;
-    const routeToPaywallSetup =
-      paywallFirstFlow && pricingStatus?.account?.subscriptionActive !== true;
     const statusCopy = showInstallProgress
       ? `${bootstrapProgress.message} ${
           bootstrapProgress.running && !bootstrapProgress.complete
@@ -3839,11 +3815,7 @@ export default function App() {
         ) : (
           <>
             {!bootstrapping && (
-              <p className="install-pre-notice">
-                {routeToPaywallSetup
-                  ? "Pick your plan to continue. Headroom installs right after checkout, then connects your coding tools."
-                  : "Takes a minute or two to install."}
-              </p>
+              <p className="install-pre-notice">Takes a minute or two to install.</p>
             )}
             <button
               className="primary-button primary-button--large primary-button--install"
@@ -3853,13 +3825,11 @@ export default function App() {
             >
               {bootstrapping
                 ? "Installing Headroom…"
-                : routeToPaywallSetup
-                  ? "Choose your plan"
-                  : bootstrapProgress.failed
+                : bootstrapProgress.failed
                   ? "Try again"
                   : "Install Headroom"}
             </button>
-            {!bootstrapping && !routeToPaywallSetup && (
+            {!bootstrapping && (
               <div className="install-disclosure">
                 <p className="install-disclosure__lead">Clicking Install will:</p>
                 <ul className="install-disclosure__list">
@@ -4159,12 +4129,8 @@ export default function App() {
           <button
             className="primary-button primary-button--large primary-button--success"
             onClick={() => {
-              if (paywallFirstFlow && pricingStatus?.account?.subscriptionActive !== true) {
-                setLauncherStage("paywall");
-              } else {
-                void invoke("complete_setup_wizard");
-                setLauncherStage("post_install");
-              }
+              void invoke("complete_setup_wizard");
+              setLauncherStage("post_install");
             }}
             type="button"
           >
@@ -4589,9 +4555,6 @@ export default function App() {
     }
     return Math.max(0, Math.ceil((target - Date.now()) / 3_600_000));
   })();
-  const weeklyLimitPercentLabel = formatPercentValue(
-    pricingStatus?.effectiveDisableThresholdPercent ?? pricingStatus?.disableThresholdPercent
-  );
   const upgradeDefaultPlanId =
     pricingAudience === "individual"
       ? (pricingStatus?.recommendedSubscriptionTier ??
@@ -4790,8 +4753,9 @@ export default function App() {
       };
     }
     return {
-      tone: pricingStatus.optimizationAllowed ? "warning" as const : "expired" as const,
-      message: `Trial expired. In the free plan you can only use Headroom for ${weeklyLimitPercentLabel} of your weekly Claude Code / Codex limits. Upgrade to use Headroom without limits.`,
+      tone: "expired" as const,
+      message:
+        "Your 7-day trial has ended. Upgrade to keep Headroom optimizing your prompts — there's no free plan.",
       actionLabel: "Upgrade",
       onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
     };

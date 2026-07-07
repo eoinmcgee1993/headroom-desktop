@@ -70,7 +70,7 @@ describe("app helpers", () => {
   });
 
   it("returns the next lower visible plan for paid subscriptions", () => {
-    expect(getNextLowerUpgradePlanId("pro")).toBe("free");
+    expect(getNextLowerUpgradePlanId("pro")).toBeNull();
     expect(getNextLowerUpgradePlanId("max5x")).toBe("pro");
     expect(getNextLowerUpgradePlanId("max20x")).toBe("max5x");
     expect(getNextLowerUpgradePlanId(null)).toBeNull();
@@ -81,7 +81,6 @@ describe("app helpers", () => {
 
     expect(result.featuredPlanId).toBe("max20x");
     expect(result.plans.map((plan) => plan.id)).toEqual([
-      "free",
       "max20x",
       "pro",
       "max5x",
@@ -93,7 +92,6 @@ describe("app helpers", () => {
 
     expect(result.featuredPlanId).toBe("max5x");
     expect(result.plans.map((plan) => plan.id)).toEqual([
-      "free",
       "max5x",
       "pro",
       "max20x",
@@ -105,7 +103,6 @@ describe("app helpers", () => {
 
     expect(result.featuredPlanId).toBe("max5x");
     expect(result.plans.map((plan) => plan.id)).toEqual([
-      "free",
       "max5x",
       "pro",
       "max20x",
@@ -128,7 +125,6 @@ describe("app helpers", () => {
 
     expect(result.featuredPlanId).toBe("pro");
     expect(result.plans.map((plan) => [plan.id, plan.ctaLabel])).toEqual([
-      ["free", "Downgrade to Free plan"],
       ["pro", "Stay on Pro plan"],
       ["max5x", "Upgrade to Max x5"],
       ["max20x", "Upgrade to Max x20"],
@@ -140,7 +136,6 @@ describe("app helpers", () => {
 
     expect(result.featuredPlanId).toBe("max5x");
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
-      ["free", "$0"],
       ["max5x", "$20"],
       ["pro", "$5"],
       ["max20x", "$40"],
@@ -151,7 +146,6 @@ describe("app helpers", () => {
     const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, true);
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
-      ["free", "$0"],
       ["max5x", "$10"],
       ["pro", "$2.50"],
       ["max20x", "$20"],
@@ -162,7 +156,6 @@ describe("app helpers", () => {
     const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, false, "monthly");
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
-      ["free", "$0"],
       ["max5x", "$30"],
       ["pro", "$7.50"],
       ["max20x", "$60"],
@@ -173,7 +166,6 @@ describe("app helpers", () => {
     const result = getUpgradePlans("individual", "free", undefined, undefined, undefined, true, "monthly");
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
-      ["free", "$0"],
       ["max5x", "$15"],
       ["pro", "$3.75"],
       ["max20x", "$30"],
@@ -200,7 +192,6 @@ describe("app helpers", () => {
     );
 
     expect(result.plans.map((plan) => [plan.id, plan.price])).toEqual([
-      ["free", "$0"],
       ["max5x", "$15"],
       ["pro", "$3.75"],
       ["max20x", "$30"],
@@ -367,25 +358,7 @@ describe("app helpers", () => {
       expect(active?.purchaseInfo?.endsOn).toBeDefined();
     });
 
-    it("stamps the free plan with the activation date and downgrade-scheduled CTA", () => {
-      const result = getUpgradePlans(
-        ...baseArgs,
-        12000,
-        "annual",
-        "2027-03-31",
-        "2026-03-31",
-        null,
-        null,
-        true,
-        "2027-03-31T20:31:45Z"
-      );
-      const free = planById(result, "free");
-      expect(free?.ctaLabel).toBe("Downgrade scheduled");
-      expect(free?.purchaseInfo?.cancelAtPeriodEnd).toBe(true);
-      expect(free?.purchaseInfo?.endsOn).toBeDefined();
-    });
-
-    it("leaves both cards untouched when no downgrade is scheduled", () => {
+    it("leaves the active plan card untouched when no downgrade is scheduled", () => {
       const result = getUpgradePlans(
         ...baseArgs,
         12000,
@@ -397,11 +370,7 @@ describe("app helpers", () => {
         false,
         null
       );
-      const free = planById(result, "free");
       const active = planById(result, "max20x");
-      // On Max x20, the Free card's natural relative-CTA is "Downgrade to Free plan".
-      expect(free?.ctaLabel).toBe("Downgrade to Free plan");
-      expect(free?.purchaseInfo).toBeUndefined();
       expect(active?.purchaseInfo?.cancelAtPeriodEnd).toBe(false);
       expect(active?.purchaseInfo?.endsOn).toBeUndefined();
     });

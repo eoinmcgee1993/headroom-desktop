@@ -443,7 +443,8 @@ export type BillingPeriod = "annual" | "monthly";
 export type PricingGateReason =
   | "sign_in_required"
   | "weekly_usage_limit_reached"
-  | "codex_weekly_usage_limit_reached";
+  | "codex_weekly_usage_limit_reached"
+  | "trial_ended";
 
 export interface ClaudeAccountProfile {
   authMethod: ClaudeAuthMethod;
