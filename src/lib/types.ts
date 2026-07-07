@@ -182,6 +182,11 @@ export interface RuntimeStatus {
    *  distinct from a deliberate user pause. Drives the "stopped unexpectedly"
    *  banner + Resume button. */
   autoPaused: boolean;
+  /** True when the proxy is intentionally bypassed (pricing gate on an
+   *  unentitled account, or watchdog give-up). The backend is deliberately not
+   *  started, so `running` will never become true — the first-run screen treats
+   *  this as a terminal state and lets the user into the app. */
+  bypassed: boolean;
   proxyReachable: boolean;
   headroomPid?: number | null;
   mcpConfigured?: boolean | null;

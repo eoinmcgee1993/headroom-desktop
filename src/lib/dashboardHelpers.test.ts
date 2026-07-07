@@ -41,6 +41,12 @@ describe("dashboard helpers", () => {
     expect(percent1(18)).toBe("18.0");
   });
 
+  it("renders near-zero negatives as clean zero, not -$0", () => {
+    expect(currency(-0.003)).toBe("$0");
+    expect(currencyExact(-0.003)).toBe("$0.00");
+    expect(currency(-1.5)).toBe("-$2"); // genuine negatives still show
+  });
+
   it("builds full monthly windows with zero-filled gaps", () => {
     const data: DailySavingsPoint[] = [
       {

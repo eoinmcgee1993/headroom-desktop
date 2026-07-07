@@ -20,6 +20,8 @@ export interface SavingsChartDatum {
 }
 
 export function currencyExact(value: number) {
+  // Avoid "-$0.00" from tiny negatives that round to zero at 2 decimals.
+  if (value > -0.005 && value <= 0) value = 0;
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
@@ -29,6 +31,8 @@ export function currencyExact(value: number) {
 }
 
 export function currency(value: number) {
+  // Avoid "-$0" from tiny negatives that round to zero at 0 decimals.
+  if (value > -0.5 && value <= 0) value = 0;
   if (value >= 10_000) {
     return new Intl.NumberFormat("en-US", {
       style: "currency",

@@ -1704,6 +1704,9 @@ impl AppState {
     }
 
     pub fn launch_experience_label(&self) -> &'static str {
+        if !self.setup_wizard_satisfied() {
+            return "first_run";
+        }
         match self.launch_profile.lock().launch_experience {
             LaunchExperience::FirstRun => "first_run",
             LaunchExperience::Resume => "resume",
@@ -1713,6 +1716,11 @@ impl AppState {
 
     pub fn setup_wizard_complete(&self) -> bool {
         self.launch_profile.lock().setup_wizard_complete
+    }
+
+    pub fn setup_wizard_satisfied(&self) -> bool {
+        let profile = self.launch_profile.lock().clone();
+        setup_wizard_satisfied_for_profile(&profile, configured_client_present())
     }
 
     pub fn mark_setup_wizard_complete(&self) {
@@ -2786,6 +2794,7 @@ impl AppState {
             starting: self.runtime_is_starting() && !effective_running,
             paused,
             auto_paused,
+            bypassed: self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire),
             proxy_reachable,
             headroom_pid,
             mcp_configured,
@@ -3586,6 +3595,17 @@ impl LaunchProfile {
 
         Ok((current, path))
     }
+}
+
+fn configured_client_present() -> bool {
+    crate::client_adapters::is_claude_code_enabled() || crate::client_adapters::is_codex_enabled()
+}
+
+fn setup_wizard_satisfied_for_profile(
+    profile: &LaunchProfile,
+    legacy_clients_configured: bool,
+) -> bool {
+    profile.setup_wizard_complete || (profile.launch_count > 1 && legacy_clients_configured)
 }
 
 /// Last classification that returned a non-Unknown tier. Persisted so the
@@ -6383,6 +6403,30 @@ mod tests {
         // Legacy profiles predate terms gating: default to 0 so the gate
         // re-prompts once REQUIRED_TERMS_VERSION > 0.
         assert_eq!(profile.accepted_terms_version, 0);
+    }
+
+    #[test]
+    fn setup_wizard_satisfied_requires_completion_or_legacy_configured_client() {
+        let mut profile = super::LaunchProfile {
+            launch_count: 2,
+            launch_experience: crate::models::LaunchExperience::Resume,
+            lifetime_requests: 0,
+            lifetime_estimated_savings_usd: 0.0,
+            lifetime_estimated_tokens_saved: 0,
+            setup_wizard_complete: false,
+            last_launched_app_version: None,
+            last_runtime_upgrade_failure: None,
+            accepted_terms_version: 0,
+        };
+
+        assert!(!super::setup_wizard_satisfied_for_profile(&profile, false));
+        assert!(super::setup_wizard_satisfied_for_profile(&profile, true));
+
+        profile.launch_count = 1;
+        assert!(!super::setup_wizard_satisfied_for_profile(&profile, true));
+
+        profile.setup_wizard_complete = true;
+        assert!(super::setup_wizard_satisfied_for_profile(&profile, false));
     }
 
     #[test]

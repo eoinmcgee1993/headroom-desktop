@@ -287,6 +287,11 @@ pub struct RuntimeStatus {
     /// distinct from a deliberate user pause. Drives the "stopped unexpectedly"
     /// banner + Resume button.
     pub auto_paused: bool,
+    /// True when the proxy is intentionally bypassed (pricing gate on an
+    /// unentitled account, or watchdog give-up). The backend is deliberately
+    /// not started, so `running` will never become true — the first-run screen
+    /// treats this as a terminal state and lets the user into the app.
+    pub bypassed: bool,
     pub proxy_reachable: bool,
     pub headroom_pid: Option<u32>,
     pub mcp_configured: Option<bool>,
