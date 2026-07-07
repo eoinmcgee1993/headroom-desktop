@@ -1795,7 +1795,7 @@ export default function App() {
     if (windowLabel !== "launcher" || launcherStage !== "install") {
       return;
     }
-    if (runtimeStatus?.running === true) {
+    if (runtimeStatus?.running === true || runtimeStatus?.bypassed === true) {
       return;
     }
 
@@ -1805,7 +1805,7 @@ export default function App() {
     }, 1000);
 
     return () => window.clearInterval(interval);
-  }, [windowLabel, launcherStage, runtimeStatus?.running]);
+  }, [windowLabel, launcherStage, runtimeStatus?.running, runtimeStatus?.bypassed]);
 
   useEffect(() => {
     if (windowLabel !== "main") {
@@ -3788,7 +3788,7 @@ export default function App() {
         </div>
         {installComplete ? (
           <>
-            {runtimeStatus?.running !== true ? (
+            {runtimeStatus?.running !== true && runtimeStatus?.bypassed !== true ? (
               <>
                 <p className="launcher-install-notice">Starting Headroom for the first time (this can take 1-2 minutes)…</p>
                 <button

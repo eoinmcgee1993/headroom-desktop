@@ -5365,9 +5365,7 @@ fn onboarding_complete(app: &AppHandle) -> bool {
     if !state.tool_manager.python_runtime_installed() {
         return false;
     }
-    // Only require wizard completion on the very first launch. Existing users
-    // (launch_count > 1) already went through setup before this flag existed.
-    state.setup_wizard_complete() || state.launch_count() > 1
+    state.setup_wizard_satisfied()
 }
 
 #[tauri::command]
