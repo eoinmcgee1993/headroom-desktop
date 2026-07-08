@@ -202,6 +202,56 @@ pub fn push_terms_acceptance(state: &AppState, version: u32) {
     let _ = fetch_grace_start(&identity);
 }
 
+/// Best-effort: tell the server the user reached install-wizard `step`.
+/// Piggybacks the existing `desktop/grace/start` POST (device identity already
+/// travels with it) via the `X-Headroom-Funnel-Step` header. Fire-and-forget on
+/// a detached thread so it never blocks the UI or gates the wizard; the server
+/// is first-write-wins, so repeats are harmless.
+pub fn report_funnel_step(state: &AppState, step: &str) {
+    spawn_funnel_step(IdentityPayload::for_state(state), step);
+}
+
+/// `report_funnel_step` for contexts without an `AppState` (e.g. the proxy
+/// intercept thread). Device identity alone keys the server's `TrialIdentity`.
+pub fn report_funnel_step_device_only(step: &str) {
+    spawn_funnel_step(IdentityPayload::device_only(), step);
+}
+
+fn spawn_funnel_step(identity: IdentityPayload, step: &str) {
+    let step = step.to_string();
+    std::thread::spawn(move || {
+        let _ = post_grace_start_with_step(&identity, &step);
+    });
+}
+
+fn post_grace_start_with_step(identity: &IdentityPayload, step: &str) -> Result<(), String> {
+    post_grace_start_with_step_to(identity, step, &api_base_url())
+}
+
+/// Test-only seam: like `post_grace_start_with_step` but against a parameterized
+/// base URL so a canned-response server can stand in for headroom-web.
+pub(crate) fn post_grace_start_with_step_to(
+    identity: &IdentityPayload,
+    step: &str,
+    base_url: &str,
+) -> Result<(), String> {
+    let builder = http_client()?
+        .post(join_url(base_url, "desktop/grace/start"))
+        .header("X-Headroom-Funnel-Step", step);
+    let response = identity
+        .apply_headers(builder)
+        .json(identity)
+        .send()
+        .map_err(|err| format!("grace/start funnel request failed: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "grace/start funnel returned {}",
+            response.status().as_u16()
+        ));
+    }
+    Ok(())
+}
+
 /// Stable comparison key for an `IdentityPayload`'s Claude fields. Used to
 /// skip redundant `desktop/grace/start` posts when the bearer-triggered
 /// worker fires for an account whose fingerprint has not changed.
@@ -3800,6 +3850,49 @@ mod tests {
             "expiry clamped to documented maximum"
         );
         drop_state(dir);
+    }
+
+    #[test]
+    fn funnel_step_post_sends_step_name_in_header() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let body = "{\"firstSeenAt\":\"2026-07-07T00:00:00Z\",\"graceEndsAt\":\"2026-07-10T00:00:00Z\"}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let identity = super::IdentityPayload::device_only();
+        super::post_grace_start_with_step_to(
+            &identity,
+            "signup_gate_shown",
+            &format!("http://127.0.0.1:{port}"),
+        )
+        .expect("funnel post succeeds");
+
+        server.join().unwrap();
+        let request = rx.recv().expect("captured request");
+        assert!(
+            request.contains("POST /desktop/grace/start"),
+            "wrong path:\n{request}"
+        );
+        assert!(
+            request
+                .to_lowercase()
+                .contains("x-headroom-funnel-step: signup_gate_shown"),
+            "missing funnel-step header:\n{request}"
+        );
     }
 
     #[test]

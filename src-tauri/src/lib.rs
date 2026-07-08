@@ -350,6 +350,10 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
             pricing::report_milestone(*milestone_tokens_saved);
         }
 
+        if let Some(total) = pending_milestones.cumulative_report {
+            pricing::report_milestone(total);
+        }
+
         check_zero_spend_anomaly(&dashboard);
 
         maybe_inject_fake_daily_savings(&mut dashboard);
@@ -881,6 +885,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         );
     } else {
         analytics::track_event(&app, "bootstrap_started", None);
+        pricing::report_funnel_step(&app.state::<AppState>(), "bootstrap_started");
     }
 
     let app_handle = app.clone();
@@ -902,6 +907,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                     "bootstrap_failed",
                     Some(json!({ "phase": "install_runtime", "kind": kind.as_str() })),
                 );
+                pricing::report_funnel_step(&state, "bootstrap_failed");
                 return;
             }
 
@@ -973,6 +979,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         state.mark_bootstrap_complete();
         emit_bootstrap_progress(&app_handle, &state);
         analytics::track_event(&app_handle, "bootstrap_completed", None);
+        pricing::report_funnel_step(&state, "bootstrap_completed");
     });
 
     Ok(())
@@ -2326,6 +2333,14 @@ async fn get_headroom_pricing_status(
     Ok(status)
 }
 
+/// Fire-and-forget install-wizard funnel beacon from the frontend. Returns
+/// immediately; `pricing::report_funnel_step` does the POST on a detached
+/// thread so a slow/offline network never blocks the wizard.
+#[tauri::command]
+fn report_funnel_step(state: State<'_, AppState>, step: String) {
+    pricing::report_funnel_step(&state, &step);
+}
+
 #[tauri::command]
 async fn request_headroom_auth_code(
     app: AppHandle,
@@ -3619,6 +3634,7 @@ pub fn run() {
             get_claude_usage,
             get_claude_profile,
             get_headroom_pricing_status,
+            report_funnel_step,
             request_headroom_auth_code,
             verify_headroom_auth_code,
             sign_out_headroom_account,

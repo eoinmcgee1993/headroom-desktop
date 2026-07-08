@@ -10,9 +10,32 @@ import {
   needsTermsAcceptance,
   nextAutoConfigureStep,
   nextAutoConfigureStepAfterApply,
-  recommendedHeadroomTier
+  recommendedHeadroomTier,
+  INSTALL_WIZARD_STEPS
 } from "./launcherHelpers";
 import type { ClientConnectorStatus } from "./types";
+
+describe("install-wizard funnel steps", () => {
+  // Pins the ordered step list. MUST stay in sync with DesktopFunnelStep::ORDER
+  // in the headroom-web repo — the server ignores any step not in its list, so a
+  // silent drift here means silently-dropped beacons.
+  it("matches the canonical order shared with the server", () => {
+    expect([...INSTALL_WIZARD_STEPS]).toEqual([
+      "signup_gate_shown",
+      "email_code_requested",
+      "email_code_verified",
+      "client_setup_shown",
+      "client_setup_applied",
+      "proxy_verify_started",
+      "proxy_verified",
+      "bootstrap_started",
+      "bootstrap_completed",
+      "bootstrap_failed",
+      "post_install_shown",
+      "first_proxy_request"
+    ]);
+  });
+});
 
 describe("launcher helpers", () => {
   it("validates trimmed email addresses for auth and contact flows", () => {

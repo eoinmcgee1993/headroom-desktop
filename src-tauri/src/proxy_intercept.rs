@@ -96,6 +96,10 @@ fn stamp_backend_traffic() {
 static INTERCEPT_CLAUDE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_CODEX_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
+/// One-shot guard: has the `first_proxy_request` funnel beacon been sent this
+/// process yet? See the fire site in `handle`.
+static FIRST_PROXY_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
+
 /// Same key shape as `/stats` `agent_usage.agents[]` (`claude-code`, `codex`)
 /// so the frontend verification anchor/delta logic works against either source.
 pub fn intercept_request_counts() -> std::collections::HashMap<String, u64> {
@@ -361,6 +365,13 @@ async fn handle(
                 INTERCEPT_CODEX_REQUESTS.fetch_add(1, Ordering::AcqRel);
             } else {
                 INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel);
+            }
+            // First real provider-bound request proves the client is actually
+            // routing through this intercept -- the funnel signal that separates
+            // "configured but silent" from "traffic flowing". Fire once per
+            // process; the server is first-write-wins so an extra send is cheap.
+            if !FIRST_PROXY_REQUEST_REPORTED.swap(true, Ordering::AcqRel) {
+                crate::pricing::report_funnel_step_device_only("first_proxy_request");
             }
         }
     }

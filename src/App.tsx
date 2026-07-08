@@ -123,7 +123,8 @@ import {
   nextAutoConfigureStep,
   nextAutoConfigureStepAfterApply,
   recommendedHeadroomTier,
-  type LauncherStage
+  type LauncherStage,
+  type InstallWizardStep
 } from "./lib/launcherHelpers";
 import { mockDashboard } from "./lib/mockData";
 import {
@@ -286,6 +287,23 @@ const idleRuntimeUpgradeProgress: RuntimeUpgradeProgress = {
 const MAX_UPGRADE_AUTO_RETRIES = 2;
 
 const GATE_AUTO_DISABLED_STORAGE_KEY = "headroom:gateAutoDisabledConnectors";
+
+// Fire-and-forget install-wizard funnel beacon. Errors (offline/mid-install)
+// are swallowed so tracking never affects the wizard. Dedup is server-side
+// (first-write-wins), so re-emitting a step on back-nav is harmless.
+function reportFunnelStep(step: InstallWizardStep): void {
+  void invoke("report_funnel_step", { step }).catch(() => {});
+}
+
+// Which funnel step each launcher stage's first paint represents. `install`
+// (the landing screen) and `paywall` have no beacon: for new users the
+// terms+email sign-up gate renders on top of the launcher, so the first real
+// screen is captured by `signup_gate_shown`, not a launcher stage.
+const LAUNCHER_STAGE_STEP: Partial<Record<LauncherStage, InstallWizardStep>> = {
+  client_setup: "client_setup_shown",
+  proxy_verify: "proxy_verify_started",
+  post_install: "post_install_shown"
+};
 
 function baseUrlTakeoverNotice(replaced: string): string {
   return `Claude Code was routed through ${replaced}. Headroom now handles routing while enabled and restores this address when you disable the connector.`;
@@ -1017,6 +1035,12 @@ export default function App() {
   // trial. The old paywall-first checkout gate has been retired, so this no
   // longer depends on the launch flag.
   const paywallFirstFlow = runtimeStatus?.installed === false;
+  // Verify against the always-up 6767 intercept (which counts passthrough
+  // traffic) instead of the backend whenever the backend won't be optimizing:
+  // pre-install, or when the pricing gate has bypassed it (e.g. ended trial).
+  // Otherwise proxy_verify waits forever on a backend that never comes up.
+  const interceptOnlyVerify =
+    paywallFirstFlow || runtimeStatus?.bypassed === true;
   const [resuming, setResuming] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const [appUpdateConfig, setAppUpdateConfig] = useState<AppUpdateConfiguration | null>(null);
@@ -1676,11 +1700,11 @@ export default function App() {
     const poll = () => {
       void (async () => {
         try {
-          const countsCommand = paywallFirstFlow
+          const countsCommand = interceptOnlyVerify
             ? "get_intercept_request_counts_by_agent"
             : "get_headroom_request_counts_by_agent";
           const [runtime, counts] = await Promise.all([
-            paywallFirstFlow
+            interceptOnlyVerify
               ? Promise.resolve<RuntimeStatus | null>(null)
               : invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
             invoke<Record<string, number> | null>(countsCommand).catch(() => null)
@@ -1690,9 +1714,9 @@ export default function App() {
             return;
           }
 
-          if ((!paywallFirstFlow && runtime?.proxyReachable !== true) || counts === null) {
+          if ((!interceptOnlyVerify && runtime?.proxyReachable !== true) || counts === null) {
             setProxyVerificationHint(
-              paywallFirstFlow
+              interceptOnlyVerify
                 ? "Waiting for setup traffic. Send a test message from your coding tool."
                 : "Headroom proxy is not reachable yet. Start Headroom runtime, then send a test message."
             );
@@ -1740,7 +1764,40 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [windowLabel, launcherStage, paywallFirstFlow]);
+  }, [windowLabel, launcherStage, interceptOnlyVerify]);
+
+  // One beacon per launcher stage the user reaches. Single source for the
+  // "stage shown" funnel steps; sub-steps (client_setup_applied, proxy_verified,
+  // email_code_*) fire from their own handlers.
+  useEffect(() => {
+    if (windowLabel !== "launcher") return;
+    const step = LAUNCHER_STAGE_STEP[launcherStage];
+    if (step) reportFunnelStep(step);
+  }, [windowLabel, launcherStage]);
+
+  // signup_gate_shown: a new (unauthenticated) user is looking at the
+  // terms + email sign-up gate -- the true top of the new-user funnel and the
+  // "saw it, never typed an email" bucket. Gated to the paywall-first launcher
+  // so existing users re-accepting terms in the main window don't count.
+  const signupGateVisible =
+    windowLabel === "launcher" &&
+    paywallFirstFlow &&
+    pricingStatus?.authenticated !== true &&
+    needsTermsAcceptance(dashboard.requiredTermsVersion, dashboard.acceptedTermsVersion);
+  useEffect(() => {
+    if (signupGateVisible) reportFunnelStep("signup_gate_shown");
+  }, [signupGateVisible]);
+
+  // proxy_verified: every enabled client's test traffic reached the proxy.
+  useEffect(() => {
+    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") return;
+    if (
+      proxyVerificationRows.length > 0 &&
+      proxyVerificationRows.every((row) => row.state === "verified")
+    ) {
+      reportFunnelStep("proxy_verified");
+    }
+  }, [windowLabel, launcherStage, proxyVerificationRows]);
 
   useEffect(() => {
     if (!showInstallProgress) {
@@ -2817,6 +2874,7 @@ export default function App() {
         }
         latestConnectors = await invoke<ClientConnectorStatus[]>("get_client_connectors");
         applyConnectorsIfChanged(latestConnectors);
+        reportFunnelStep("client_setup_applied");
 
         const postApplyStep = nextAutoConfigureStepAfterApply(
           getLauncherAutoConfigureDecision(latestConnectors)
@@ -3003,6 +3061,7 @@ export default function App() {
       const result = await invoke<HeadroomAuthCodeRequest>("request_headroom_auth_code", {
         email: authEmail.trim()
       });
+      reportFunnelStep("email_code_requested");
       setAuthCodeRequestedFor(result.email);
       setAuthCodeExpirySeconds(result.expiresInSeconds);
       setAuthFlowSuccess(`We sent a sign-in code to ${result.email}.`);
@@ -3034,6 +3093,7 @@ export default function App() {
       setPricingStatus(status);
       setAuthCode("");
       setAuthCodeRequestedFor(null);
+      reportFunnelStep("email_code_verified");
       setAuthFlowSuccess("Headroom account connected.");
       setPendingUpgradePlanId(null);
       // The launcher paywall renders its own sign-in inline; switching the

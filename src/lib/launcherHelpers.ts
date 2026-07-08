@@ -22,6 +22,27 @@ export type LauncherStage =
   | "paywall"
   | "post_install";
 
+// Canonical install-wizard funnel steps, in order. Single source of truth for
+// the per-user drop-off tracking; mirror of DesktopFunnelStep::ORDER in the
+// headroom-web repo. Emitted via the `report_funnel_step` Tauri command, which
+// piggybacks the name onto POST /desktop/grace/start. Keep the two lists in sync.
+export const INSTALL_WIZARD_STEPS = [
+  "signup_gate_shown",
+  "email_code_requested",
+  "email_code_verified",
+  "client_setup_shown",
+  "client_setup_applied",
+  "proxy_verify_started",
+  "proxy_verified",
+  "bootstrap_started",
+  "bootstrap_completed",
+  "bootstrap_failed",
+  "post_install_shown",
+  "first_proxy_request"
+] as const;
+
+export type InstallWizardStep = (typeof INSTALL_WIZARD_STEPS)[number];
+
 export type LauncherAutoConfigureDecision =
   | "show_client_setup"
   | "apply_client_setup"
