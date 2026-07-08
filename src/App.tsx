@@ -1715,9 +1715,20 @@ export default function App() {
           }
 
           if ((!interceptOnlyVerify && runtime?.proxyReachable !== true) || counts === null) {
+            // First launch synchronously downloads the compression/embedder
+            // models before the backend binds, so `proxyReachable` is false for
+            // a minute or more on a perfectly healthy install. Don't tell the
+            // user to "start the runtime" — it's already coming up.
+            const bootingFirstTime =
+              !interceptOnlyVerify &&
+              runtime?.installed === true &&
+              runtime?.running !== true &&
+              !runtime?.startupError;
             setProxyVerificationHint(
               interceptOnlyVerify
                 ? "Waiting for setup traffic. Send a test message from your coding tool."
+                : bootingFirstTime
+                ? "Headroom is starting up. First launch downloads models, which can take a minute."
                 : "Headroom proxy is not reachable yet. Start Headroom runtime, then send a test message."
             );
             return;

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { HeadroomPricingStatus, RuntimeStatus } from "./types";
 import {
+  __resetRuntimeNotificationState,
   maybeFireUrgentPricingNotifications,
   maybeFireUrgentRuntimeNotification,
 } from "./urgentNotifications";
@@ -561,12 +562,15 @@ describe("maybeFireUrgentRuntimeNotification", () => {
   afterEach(() => {
     invokeMock.mockReset();
     isVisibleMock.mockReset();
+    __resetRuntimeNotificationState();
   });
 
-  it("fires when the runtime is installed but not running", async () => {
+  it("fires when the runtime drops after having been reachable", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
+    // A healthy boot first, so this isn't the first-boot cold-start window.
+    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: true }));
     await maybeFireUrgentRuntimeNotification(
       makeRuntime({ running: false })
     );
@@ -576,6 +580,35 @@ describe("maybeFireUrgentRuntimeNotification", () => {
       body: "Headroom isn't running. Open the tray to restart it.",
       action: "runtime",
     });
+  });
+
+  it("stays quiet during the first-boot cold-start window", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    // Never reachable yet, no hard error: the /readyz warmup window.
+    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: false }));
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("fires on first boot once the grace window elapses", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+    const nowSpy = vi.spyOn(Date, "now");
+
+    nowSpy.mockReturnValue(0);
+    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: false }));
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    nowSpy.mockReturnValue(5 * 60 * 1000 + 1);
+    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: false }));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "show_notification",
+      expect.objectContaining({ action: "runtime" })
+    );
+
+    nowSpy.mockRestore();
   });
 
   it("surfaces the startup error when one is present", async () => {

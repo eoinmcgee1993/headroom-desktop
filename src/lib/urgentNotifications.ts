@@ -150,14 +150,43 @@ function isGatedFreeAccount(status: HeadroomPricingStatus): boolean {
   );
 }
 
+// On a clean install the first cold boot warms an ONNX embedder before
+// /readyz goes green, so `running` is briefly false on a perfectly healthy
+// launch and the runtime-down gate below would fire a false "stopped running"
+// notice. Stay quiet until the runtime has been reachable once this session; a
+// real crash after a good boot still fires. Fallback: if it never comes up
+// within the grace window (and there's no hard startup error to surface
+// sooner), notify anyway so a genuinely stuck first boot isn't silent forever.
+const RUNTIME_DOWN_GRACE_MS = 5 * 60 * 1000;
+let everReachable = false;
+let firstDownSeenAt: number | null = null;
+
+// Test-only: reset the cross-call first-boot state.
+export function __resetRuntimeNotificationState(): void {
+  everReachable = false;
+  firstDownSeenAt = null;
+}
+
 export async function maybeFireUrgentRuntimeNotification(
   runtime: RuntimeStatus
 ): Promise<void> {
+  if (runtime.running) {
+    everReachable = true;
+    firstDownSeenAt = null;
+  }
+
   if (await isWindowVisible()) return;
 
   const runtimeDown =
     runtime.installed && !runtime.running && !runtime.starting && !runtime.paused;
   if (!runtimeDown) return;
+
+  const hasHardError = !!(runtime.startupError || runtime.startupErrorHint);
+  if (!everReachable && !hasHardError) {
+    const now = Date.now();
+    if (firstDownSeenAt === null) firstDownSeenAt = now;
+    if (now - firstDownSeenAt < RUNTIME_DOWN_GRACE_MS) return;
+  }
 
   const body = runtime.startupErrorHint
     ? `Headroom isn't running. ${runtime.startupErrorHint}`
