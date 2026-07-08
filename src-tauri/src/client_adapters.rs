@@ -304,7 +304,18 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
             // Critical, app-owned write first: the ~/.codex/config.toml provider
             // block is what routes Codex through Headroom.
-            let mut updates = configure_codex_provider_block()?;
+            let (changed, backups, preserved_provider) = configure_codex_provider_block()?;
+            let mut updates = (changed, backups);
+            if let Some(original) = preserved_provider {
+                // A custom root `model_provider` (gateway/alternate provider) was
+                // routing Codex before us: remember it for restore-on-disable so
+                // we don't silently drop the user onto api.openai.com. Restored
+                // silently (no takeover notice — that copy is Claude/base_url
+                // specific).
+                state
+                    .preserved_base_urls
+                    .insert(state_id.clone(), original);
+            }
 
             // Loud-fail guard so a closed app or clobbered config surfaces in
             // Codex instead of silently routing direct to OpenAI.
@@ -491,10 +502,10 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                     "Headroom-managed provider block was not found in ~/.codex/config.toml.".into(),
                 );
             }
-            if !shell_ok {
-                failures
-                    .push("Codex OPENAI_BASE_URL export was not found in shell profiles.".into());
-            }
+            // Shell export is convenience, not routing: config.toml is what routes
+            // Codex (apply tolerates an unwritable shell profile). A missing export
+            // must not fail verification -- mirrors Claude, which only fails when
+            // *no* routing source is present.
 
             if codex_guard_hook_path().exists() && codex_guard_registered()? {
                 checks
@@ -593,7 +604,17 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
 
     match client_id {
         "codex" | "codex_cli" => {
+            let preserved_provider = state
+                .preserved_base_urls
+                .get(normalized_setup_id(client_id))
+                .cloned();
             disable_codex_cli()?;
+            // Restore any pre-Headroom root model_provider instead of leaving the
+            // key deleted -- deleting it silently drops a gateway user onto
+            // api.openai.com (mirrors the Claude base_url restore).
+            if let Some(provider) = preserved_provider {
+                let _ = restore_codex_model_provider(&provider);
+            }
             disable_codex_gui()?;
             // Hand the threads back to the native-provider menu so the full
             // history stays visible once Codex no longer routes through Headroom.
@@ -661,6 +682,9 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             state.remembered_shell_files.remove("codex");
             state.remembered_shell_files.remove("codex_cli");
             state.remembered_shell_files.remove("codex_gui");
+            // Consumed: the provider is back in the user's config now. The next
+            // apply re-captures it if Headroom is re-enabled.
+            state.preserved_base_urls.remove("codex_cli");
         }
         _ => {
             let state_id = normalized_setup_id(client_id);
@@ -2145,10 +2169,93 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
     out
 }
 
+/// The root-scope `model_provider` value in a Codex config, if set to something
+/// other than our managed `headroom`. Root scope only: a `model_provider` inside
+/// a `[profiles.x]`/`[model_providers.x]` table belongs to that table, not the
+/// global route. This is the Codex analog of a foreign `ANTHROPIC_BASE_URL` --
+/// captured on apply and restored on disable.
+fn codex_foreign_model_provider(content: &str) -> Option<String> {
+    let mut in_root = true;
+    for raw in content.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_root = false;
+            continue;
+        }
+        if !in_root {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "model_provider" {
+                let name = value.trim().trim_matches('"');
+                if !name.is_empty() && name != "headroom" {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Drop any root-scope `model_provider = ...` line so the managed block's
+/// `model_provider = "headroom"` isn't a duplicate root key (which is invalid
+/// TOML and makes Codex refuse to load its config). A `model_provider` inside a
+/// table is left untouched.
+fn strip_codex_root_model_provider(content: &str) -> String {
+    let mut in_root = true;
+    content
+        .lines()
+        .filter(|raw| {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                in_root = false;
+                return true;
+            }
+            !(in_root
+                && line
+                    .split_once('=')
+                    .map(|(key, _)| key.trim() == "model_provider")
+                    .unwrap_or(false))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Restore a preserved pre-Headroom root `model_provider` after teardown, so a
+/// gateway/alternate-provider user isn't silently left on api.openai.com. No-op
+/// if the config already has a root `model_provider` (user re-added their own).
+fn restore_codex_model_provider(provider: &str) -> Result<()> {
+    let path = codex_config_toml_path();
+    let existing = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        String::new()
+    };
+    if codex_foreign_model_provider(&existing).is_some() {
+        return Ok(());
+    }
+    let line = format!("model_provider = {}", toml_basic_string(provider));
+    let trimmed = existing.trim();
+    let rebuilt = if trimmed.is_empty() {
+        format!("{line}\n")
+    } else {
+        format!("{line}\n{trimmed}\n")
+    };
+    let _ = backup_if_exists(&path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    atomic_write(&path, rebuilt.as_bytes())?;
+    Ok(())
+}
+
 /// Reconstruct `config.toml` with the managed root keys pinned to the top and
 /// the provider table appended at the end, around the user's other content.
 fn render_codex_config(existing: &str) -> String {
     let mid = strip_codex_managed_toml(existing);
+    // Drop a foreign root model_provider too, else our managed
+    // `model_provider = "headroom"` collides with it as a duplicate root key.
+    let mid = strip_codex_root_model_provider(&mid);
     let mid = mid.trim();
 
     let mut out = codex_marker_block(CODEX_ROOT_BLOCK_ID, &codex_root_keys_body());
@@ -2165,7 +2272,11 @@ fn render_codex_config(existing: &str) -> String {
     out
 }
 
-fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>)> {
+/// Returns `(changed_files, backup_files, preserved_provider)`. The third
+/// element is a pre-existing *foreign* root `model_provider` this write replaced
+/// -- callers must preserve it and restore it on disable instead of dropping the
+/// user onto api.openai.com (mirrors [`configure_claude_settings_env`]).
+fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Option<String>)> {
     let path = codex_config_toml_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -2177,9 +2288,10 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>)> {
         String::new()
     };
 
+    let preserved = codex_foreign_model_provider(&existing);
     let updated = render_codex_config(&existing);
     if updated == existing {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), None));
     }
 
     let backup = backup_if_exists(&path)?;
@@ -2189,7 +2301,7 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>)> {
     if let Some(backup_path) = backup {
         backup_files.push(backup_path.display().to_string());
     }
-    Ok((vec![path.display().to_string()], backup_files))
+    Ok((vec![path.display().to_string()], backup_files, preserved))
 }
 
 /// Rewrite the `command` of the `[mcp_servers.headroom]` table in
@@ -3486,6 +3598,10 @@ fn shell_targets_from_state(serialized_paths: Option<&Vec<String>>) -> Vec<PathB
         .into_iter()
         .flatten()
         .map(PathBuf::from)
+        // A buggy build could persist an unexpanded, relative path (e.g.
+        // `$XDG_CONFIG_HOME/zsh/.zshrc`); re-using it would create files under
+        // the Finder-launch cwd `/`. Drop non-absolute stragglers.
+        .filter(|p| p.is_absolute())
         .collect::<Vec<_>>()
 }
 
@@ -3552,9 +3668,48 @@ fn shell_path(name: &str) -> PathBuf {
 /// conventional place users set ZDOTDIR.
 fn zsh_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("ZDOTDIR").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir);
+        let dir = PathBuf::from(dir);
+        // A relative ZDOTDIR would create files under the (Finder-launch) cwd
+        // of `/`. Only trust it if absolute; otherwise fall through to $HOME.
+        if dir.is_absolute() {
+            return dir;
+        }
     }
     zdotdir_from_zshenv(&home_dir()).unwrap_or_else(home_dir)
+}
+
+/// Expand `$VAR` / `${VAR}` from the process env. Unset vars are left as the
+/// literal `$VAR` so the caller can detect an unresolved (non-absolute) path
+/// and fall back rather than creating a bogus relative dir.
+fn expand_env_vars(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let (name, next) = if bytes.get(i + 1) == Some(&b'{') {
+            match raw[i + 2..].find('}') {
+                Some(end) => (&raw[i + 2..i + 2 + end], i + 2 + end + 1),
+                None => (&raw[i..i], i + 1), // unterminated `${` -> emit `$` literally
+            }
+        } else {
+            let end = raw[i + 1..]
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map(|o| i + 1 + o)
+                .unwrap_or(raw.len());
+            (&raw[i + 1..end], end)
+        };
+        match (!name.is_empty()).then(|| std::env::var(name).ok()).flatten() {
+            Some(val) => out.push_str(&val),
+            None => out.push_str(&raw[i..next]), // keep literal `$VAR` when unset
+        }
+        i = next;
+    }
+    out
 }
 
 fn zdotdir_from_zshenv(home: &Path) -> Option<PathBuf> {
@@ -3585,8 +3740,15 @@ fn zdotdir_from_zshenv(home: &Path) -> Option<PathBuf> {
         {
             home.join(tail)
         } else {
-            PathBuf::from(raw)
+            PathBuf::from(expand_env_vars(raw))
         };
+        // If expansion couldn't fully resolve the value (unset env var leaves a
+        // literal `$`, or it's otherwise relative), returning it would create a
+        // bogus dir relative to cwd (e.g. `$XDG_CONFIG_HOME/zsh` under `/`).
+        // Fall back to $HOME instead.
+        if !expanded.is_absolute() {
+            return None;
+        }
         return Some(expanded);
     }
     None
@@ -4665,6 +4827,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let empty = unique_temp_dir("headroom-zdotdir-none");
         fs::create_dir_all(&empty).unwrap();
         assert_eq!(super::zdotdir_from_zshenv(&empty), None);
+    }
+
+    #[test]
+    fn zdotdir_unresolved_env_var_falls_back_to_none() {
+        // Reproduces os error 30: `$XDG_CONFIG_HOME` unset under a Finder launch
+        // must NOT yield a relative `$XDG_CONFIG_HOME/zsh` path.
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let home = unique_temp_dir("headroom-zdotdir-unresolved");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join(".zshenv"),
+            "export ZDOTDIR=\"$XDG_CONFIG_HOME/zsh\"\n",
+        )
+        .unwrap();
+        assert_eq!(super::zdotdir_from_zshenv(&home), None);
     }
 
     #[test]
@@ -6268,6 +6445,99 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             rendered.contains("model = \"gpt-5.4\""),
             "user content between the duplicates is preserved, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn codex_foreign_model_provider_is_root_scope_only() {
+        assert_eq!(
+            super::codex_foreign_model_provider("model_provider = \"gateway\"\n").as_deref(),
+            Some("gateway"),
+        );
+        // Our own managed value is not "foreign".
+        assert_eq!(
+            super::codex_foreign_model_provider("model_provider = \"headroom\"\n"),
+            None,
+        );
+        // A model_provider inside a table belongs to that table, not the route.
+        assert_eq!(
+            super::codex_foreign_model_provider(
+                "[profiles.work]\nmodel_provider = \"gateway\"\n"
+            ),
+            None,
+        );
+        assert_eq!(super::codex_foreign_model_provider(""), None);
+    }
+
+    #[test]
+    fn render_codex_config_does_not_duplicate_a_foreign_root_model_provider() {
+        // Regression: a pre-existing root model_provider used to survive into the
+        // rendered body, colliding with the managed `model_provider = "headroom"`
+        // as a duplicate root key -> invalid TOML, Codex refuses to load config.
+        let existing = "model_provider = \"gateway\"\n\
+                        [model_providers.gateway]\n\
+                        base_url = \"http://gw/v1\"\n";
+        let rendered = render_codex_config(existing);
+        let parsed: toml::Value = rendered
+            .parse()
+            .unwrap_or_else(|e| panic!("rendered config is valid toml: {e}\n{rendered}"));
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some("headroom"),
+            "managed provider wins at root, got:\n{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("model_provider =").count(),
+            1,
+            "exactly one root model_provider, got:\n{rendered}"
+        );
+        // The user's own provider table is left untouched for the restore.
+        assert!(
+            rendered.contains("[model_providers.gateway]"),
+            "user provider table preserved, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_then_disable_codex_restores_a_foreign_model_provider() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "model_provider = \"gateway\"\n\n[model_providers.gateway]\nbase_url = \"http://gw/v1\"\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+
+        let after_apply = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = after_apply
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after apply: {e}\n{after_apply}"));
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some("headroom"),
+            "Headroom takes over routing while enabled, got:\n{after_apply}"
+        );
+
+        super::disable_client_setup("codex").expect("disable succeeds");
+
+        let after_disable = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = after_disable
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after disable: {e}\n{after_disable}"));
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some("gateway"),
+            "the pre-Headroom provider is restored on disable, got:\n{after_disable}"
+        );
+        assert!(
+            parsed.get("model_providers").and_then(|m| m.get("gateway")).is_some(),
+            "user provider table survives the round trip, got:\n{after_disable}"
         );
     }
 
