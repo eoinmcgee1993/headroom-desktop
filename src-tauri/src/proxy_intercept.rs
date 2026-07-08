@@ -96,9 +96,10 @@ fn stamp_backend_traffic() {
 static INTERCEPT_CLAUDE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_CODEX_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
-/// One-shot guard: has the `first_proxy_request` funnel beacon been sent this
-/// process yet? See the fire site in `handle`.
-static FIRST_PROXY_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
+/// One-shot guard: has the `first_optimized_request` funnel beacon been sent
+/// this process yet? Fires when a request is actually forwarded to the backend
+/// (optimized), not on bypass/passthrough. See the fire site in `handle`.
+static FIRST_OPTIMIZED_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Backend reachability, logged on transition only (0=unknown, 1=reachable,
 /// 2=unreachable). Without this the log records every direct-fallback request
@@ -396,13 +397,6 @@ async fn handle(
             } else {
                 INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel);
             }
-            // First real provider-bound request proves the client is actually
-            // routing through this intercept -- the funnel signal that separates
-            // "configured but silent" from "traffic flowing". Fire once per
-            // process; the server is first-write-wins so an extra send is cheap.
-            if !FIRST_PROXY_REQUEST_REPORTED.swap(true, Ordering::AcqRel) {
-                crate::pricing::report_funnel_step_device_only("first_proxy_request");
-            }
         }
     }
 
@@ -519,6 +513,16 @@ async fn handle(
         return;
     };
     note_backend_reachability(true, backend_addr);
+
+    // We've committed to forwarding this request to Headroom's backend (it's
+    // reachable and connected) -- i.e. it will actually be optimized, not passed
+    // straight through to the provider. This is the honest "Headroom is working"
+    // funnel signal: it can't fire on bypass/direct-to-provider or before the
+    // backend is up (e.g. during bootstrap). Once per process; server is
+    // first-write-wins so an extra send is cheap.
+    if !FIRST_OPTIMIZED_REQUEST_REPORTED.swap(true, Ordering::AcqRel) {
+        crate::pricing::report_funnel_step_device_only("first_optimized_request");
+    }
 
     // Codex GUI/IDE clients don't send a `codex-cli/` User-Agent, so the
     // backend's UA-based classifier can't tell they're Codex and treats a

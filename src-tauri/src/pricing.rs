@@ -230,7 +230,7 @@ fn post_grace_start_with_step(identity: &IdentityPayload, step: &str) -> Result<
 
 /// Test-only seam: like `post_grace_start_with_step` but against a parameterized
 /// base URL so a canned-response server can stand in for headroom-web.
-pub(crate) fn post_grace_start_with_step_to(
+fn post_grace_start_with_step_to(
     identity: &IdentityPayload,
     step: &str,
     base_url: &str,
@@ -445,6 +445,8 @@ struct RemoteAccountResponse {
     invite_code: Option<String>,
     accepted_invites_count: usize,
     invite_bonus_percent: f64,
+    #[serde(default)]
+    grandfathered: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -569,6 +571,9 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     let last_known_good_plan_tier = state.last_known_good_plan_tier();
     let codex_plan = crate::client_adapters::is_codex_enabled().then(|| state.codex_plan_tier());
     let tier_mismatch = resolve_tier_mismatch(account.as_ref(), &claude, codex_plan);
+    // Captured before the mismatch is moved into the Claude evaluator; the Codex
+    // gate meters an under-subscribed account exactly like the Claude side.
+    let subscription_clamped = tier_mismatch.as_ref().is_some_and(|m| m.clamped);
 
     let mut status = evaluate_pricing_status_with_mismatch(
         authenticated,
@@ -582,7 +587,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
         last_known_good_plan_tier,
         tier_mismatch,
     );
-    status.codex = fetch_codex_usage(state, status.account.as_ref());
+    status.codex = fetch_codex_usage(state, status.account.as_ref(), subscription_clamped);
     status.codex_plan_tier = Some(state.codex_plan_tier());
     maybe_apply_fake_weekly_gate(&mut status);
     // Attach the signed-in account to the Sentry scope so later captures from
@@ -668,35 +673,71 @@ const CODEX_WEEKLY_DISABLE_THRESHOLD_PCT: f64 = 50.0;
 /// accounts (no active subscription, no active trial), exactly like the Claude
 /// paid-plan gate. The plan tier behind the recommendation comes from the Codex
 /// OAuth JWT (`AppState::codex_plan_tier`).
+/// Why the Codex gate is (or isn't) enforcing this cycle. Mirrors the Claude
+/// branch activation exactly so the two surfaces gate under identical conditions.
+enum CodexActivation {
+    /// Grandfathered free account, or a clamped under-subscribed one: meter by
+    /// the Codex plan tier via the shared weekly gate.
+    Metered,
+    /// Trial ended, no subscription, not grandfathered: hard-block.
+    HardBlock,
+    /// Trial active, correctly subscribed, or no account: usage shown for
+    /// reference only, never gated.
+    Ungated,
+}
+
 fn fetch_codex_usage(
     state: &AppState,
     account: Option<&HeadroomAccountProfile>,
+    subscription_clamped: bool,
 ) -> Option<CodexUsage> {
     if !crate::client_adapters::is_codex_enabled() {
         return None;
     }
     let snapshot = state.codex_rate_limits.lock().clone()?;
     let plan_tier = state.codex_plan_tier();
-    let gate_enabled = account
-        .map(|a| !a.subscription_active && !a.trial_active)
-        .unwrap_or(false);
-    Some(codex_usage_from_snapshot(snapshot, plan_tier, gate_enabled))
+    // Identical activation ladder to the Claude branch: subscription (metered
+    // only when clamped) > active trial > grandfathered (metered) > hard block.
+    let (activation, invite_bonus) = match account {
+        Some(a) if a.subscription_active => (
+            if subscription_clamped {
+                CodexActivation::Metered
+            } else {
+                CodexActivation::Ungated
+            },
+            a.invite_bonus_percent,
+        ),
+        Some(a) if a.trial_active => (CodexActivation::Ungated, a.invite_bonus_percent),
+        Some(a) if a.grandfathered => (CodexActivation::Metered, a.invite_bonus_percent),
+        Some(a) => (CodexActivation::HardBlock, a.invite_bonus_percent),
+        None => (CodexActivation::Ungated, 0.0),
+    };
+    Some(codex_usage_from_snapshot(
+        snapshot,
+        plan_tier,
+        activation,
+        invite_bonus,
+    ))
 }
 
 /// Derive the display-facing `CodexUsage` (gate state + copy) from a captured
-/// snapshot. When `gate_enabled` is false (active subscription/trial, or no
-/// account), optimization stays allowed and no nudge fires — usage is shown for
-/// reference only.
+/// snapshot, applying the activation-scoped weekly gate.
 fn codex_usage_from_snapshot(
     snapshot: CodexRateLimitSnapshot,
     plan_tier: CodexPlanTier,
-    gate_enabled: bool,
+    activation: CodexActivation,
+    invite_bonus_percent: f64,
 ) -> CodexUsage {
     let recommended_subscription_tier =
         Some(headroom_tier_for_codex_plan(&plan_tier).unwrap_or(HeadroomSubscriptionTier::Pro));
     let weekly_used_percent = snapshot.secondary.as_ref().map(|w| w.used_percent);
 
-    let gate = codex_plan_gate(weekly_used_percent, &plan_tier, gate_enabled);
+    let gate = codex_plan_gate(
+        weekly_used_percent,
+        &plan_tier,
+        invite_bonus_percent,
+        activation,
+    );
 
     CodexUsage {
         limit_name: snapshot.limit_name,
@@ -726,35 +767,29 @@ struct CodexGate {
     disable_threshold_percent: f64,
 }
 
-/// Codex weekly-usage gate, the Codex-only parallel to `paid_plan_gate`.
-/// Tier-dependent, mirroring the Claude ladder: plans that map to a Max-like
-/// Headroom tier (ChatGPT Pro, Team, Business, Enterprise) nudge at 10/15/20%
-/// and pause at 25%; Go/Plus (Pro-like) nudge at 25/35/45% and pause at 50%.
-/// Enforcement is scoped to Codex traffic via `AppState::codex_bypass`, so it
-/// never pauses Claude optimization.
+/// Codex weekly-usage gate, the Codex-side wrapper around the shared
+/// `evaluate_weekly_gate`. Keyed off `pricing_policy_for_codex_plan` so its
+/// per-tier caps are identical to Claude's: Free ungated (100%), Go/Plus 50%,
+/// Team/Business/Pro/Enterprise and Unknown 25%. Enforcement is scoped to Codex
+/// traffic via `AppState::codex_bypass`, so it never pauses Claude optimization.
 fn codex_plan_gate(
     weekly_used_percent: Option<f64>,
     plan_tier: &CodexPlanTier,
-    gate_enabled: bool,
+    invite_bonus_percent: f64,
+    activation: CodexActivation,
 ) -> CodexGate {
-    let max_like = matches!(
-        crate::models::headroom_tier_for_codex_plan(plan_tier),
-        Some(HeadroomSubscriptionTier::Max5x | HeadroomSubscriptionTier::Max20x)
-    );
-    let (disable, nudges) = if max_like {
-        // Max-like tiers pause at 25%, so nudges sit below that cutoff to
-        // keep the warn-then-pause cadence — same rationale as
-        // MAX_TIER_NUDGE_THRESHOLDS_PERCENT on the Claude side.
-        (25.0, MAX_TIER_NUDGE_THRESHOLDS_PERCENT)
-    } else {
-        (CODEX_WEEKLY_DISABLE_THRESHOLD_PCT, NUDGE_THRESHOLDS_PERCENT)
+    let policy = pricing_policy_for_codex_plan(plan_tier);
+    // Reference thresholds for the UI even when ungated. Free has no policy, so
+    // fall back to the Pro ladder purely for display — it is never enforced.
+    let (disable_display, nudges_display) = match &policy {
+        Some(p) => (p.disable_threshold_percent, p.nudge_thresholds_percent),
+        None => (CODEX_WEEKLY_DISABLE_THRESHOLD_PCT, NUDGE_THRESHOLDS_PERCENT),
     };
 
-    // Post-trial free accounts (no subscription, no active trial) have no
-    // usable plan: hard-block Codex optimization and prompt an upgrade, the
-    // Codex-side mirror of the Claude gate. No weekly-metered free tier remains.
-    if gate_enabled {
-        return CodexGate {
+    match activation {
+        // Post-trial, no subscription, not grandfathered: hard-block, mirroring
+        // the Claude branch. No weekly-metered free tier for this cohort.
+        CodexActivation::HardBlock => CodexGate {
             optimization_allowed: false,
             should_nudge: true,
             nudge_level: u8::MAX,
@@ -762,29 +797,70 @@ fn codex_plan_gate(
             gate_message:
                 "Your 7-day Headroom trial has ended. Upgrade to keep Headroom optimizing Codex."
                     .into(),
-            nudge_thresholds_percent: nudges,
-            disable_threshold_percent: disable,
-        };
-    }
-
-    // Not gated (active subscription/trial): usage is shown for reference only.
-    let gate_message = match weekly_used_percent {
-        Some(weekly_usage) => {
-            format!("Codex weekly usage is at {weekly_usage:.0}% of the current window.")
+            nudge_thresholds_percent: nudges_display,
+            disable_threshold_percent: disable_display,
+        },
+        // Grandfathered free or clamped subscriber: meter by plan tier. Free
+        // (policy None) resolves to NoData and stays allowed (100%).
+        CodexActivation::Metered => {
+            let decision = evaluate_weekly_gate(policy, weekly_used_percent, invite_bonus_percent);
+            let gate_reason = matches!(decision.outcome, WeeklyGateOutcome::Paused { .. })
+                .then_some(PricingGateReason::CodexWeeklyUsageLimitReached);
+            let gate_message = match decision.outcome {
+                WeeklyGateOutcome::Paused { weekly_usage } => format!(
+                    "Headroom is paused because you've reached {:.1}% of weekly Codex usage. Upgrade to raise your limit.",
+                    weekly_usage
+                ),
+                WeeklyGateOutcome::Nudging {
+                    weekly_usage,
+                    disable,
+                    level,
+                } => format_nudge_message("Codex", weekly_usage, disable, level),
+                WeeklyGateOutcome::Active {
+                    first_nudge,
+                    disable,
+                } => format!(
+                    "Headroom is active. It will start nudging at {:.1}% and pause at {:.1}% of weekly Codex usage for your detected plan.",
+                    first_nudge, disable
+                ),
+                WeeklyGateOutcome::NoData => {
+                    "Send a Codex prompt through Headroom to sync your current weekly usage window."
+                        .into()
+                }
+            };
+            CodexGate {
+                optimization_allowed: decision.optimization_allowed,
+                should_nudge: decision.should_nudge,
+                nudge_level: decision.nudge_level,
+                gate_reason,
+                gate_message,
+                nudge_thresholds_percent: nudges_display,
+                disable_threshold_percent: decision
+                    .effective_disable_threshold_percent
+                    .unwrap_or(disable_display),
+            }
         }
-        None => {
-            "Send a Codex prompt through Headroom to sync your current weekly usage window.".into()
+        // Active trial / correctly subscribed / no account: reference only.
+        CodexActivation::Ungated => {
+            let gate_message = match weekly_used_percent {
+                Some(weekly_usage) => {
+                    format!("Codex weekly usage is at {weekly_usage:.0}% of the current window.")
+                }
+                None => {
+                    "Send a Codex prompt through Headroom to sync your current weekly usage window."
+                        .into()
+                }
+            };
+            CodexGate {
+                optimization_allowed: true,
+                should_nudge: false,
+                nudge_level: 0,
+                gate_reason: None,
+                gate_message,
+                nudge_thresholds_percent: nudges_display,
+                disable_threshold_percent: disable_display,
+            }
         }
-    };
-
-    CodexGate {
-        optimization_allowed: true,
-        should_nudge: false,
-        nudge_level: 0,
-        gate_reason: None,
-        gate_message,
-        nudge_thresholds_percent: nudges,
-        disable_threshold_percent: disable,
     }
 }
 
@@ -1390,9 +1466,29 @@ fn evaluate_pricing_status_with_mismatch(
             }
         } else if account.trial_active {
             gate_message = "Your Headroom trial is active with unlimited optimization.".into();
+        } else if account.grandfathered {
+            // Grandfathered early adopter: capped free tier instead of the hard
+            // block, metered by Claude plan tier via the shared gate (Free ->
+            // 100%, Pro -> 50%, Max/Unknown -> 25%). Same adoption as the
+            // clamped-subscriber path above.
+            let gate = paid_plan_gate(
+                &claude.plan_tier,
+                claude.weekly_utilization_pct,
+                account.invite_bonus_percent,
+            );
+            optimization_allowed = gate.optimization_allowed;
+            should_nudge = gate.should_nudge;
+            nudge_level = gate.nudge_level;
+            gate_reason = gate.gate_reason;
+            nudge_threshold_percent = gate.nudge_threshold_percent;
+            effective_nudge_thresholds_percent = gate.effective_nudge_thresholds_percent;
+            disable_threshold_percent = gate.disable_threshold_percent;
+            effective_disable_threshold_percent = gate.effective_disable_threshold_percent;
+            recommended_subscription_tier = gate.recommended_subscription_tier;
+            gate_message = gate.gate_message;
         } else {
-            // Trial ended with no active subscription: hard block. There is no
-            // usable free plan post-trial, so optimization stops for every
+            // Trial ended, no subscription, not grandfathered: hard block. There
+            // is no usable free plan post-trial, so optimization stops for every
             // Claude tier until the user upgrades.
             optimization_allowed = false;
             should_nudge = true;
@@ -1536,39 +1632,71 @@ struct PaidPlanGate {
     recommended_subscription_tier: Option<HeadroomSubscriptionTier>,
 }
 
-fn paid_plan_gate(
-    tier: &ClaudePlanTier,
+/// Which message a weekly gate should render, plus the numbers it needs. The
+/// numeric decision is surface-agnostic; each surface (Claude / Codex) formats
+/// its own copy from this so the threshold math can never drift between them.
+enum WeeklyGateOutcome {
+    /// No usable policy (Free tier) or no synced usage yet: allowed, "sync" copy.
+    NoData,
+    /// Below the first nudge: allowed, "will nudge at X, pause at Y" copy.
+    Active { first_nudge: f64, disable: f64 },
+    /// Between a nudge threshold and the disable cutoff: allowed, nudge copy.
+    Nudging {
+        weekly_usage: f64,
+        disable: f64,
+        level: u8,
+    },
+    /// At or past the disable cutoff: optimization paused.
+    Paused { weekly_usage: f64 },
+}
+
+struct WeeklyGateDecision {
+    optimization_allowed: bool,
+    should_nudge: bool,
+    nudge_level: u8,
+    nudge_threshold_percent: Option<f64>,
+    effective_nudge_thresholds_percent: Option<Vec<f64>>,
+    disable_threshold_percent: Option<f64>,
+    effective_disable_threshold_percent: Option<f64>,
+    recommended_subscription_tier: Option<HeadroomSubscriptionTier>,
+    outcome: WeeklyGateOutcome,
+}
+
+/// Shared weekly-usage gate math for both Claude and Codex. Applies the invite
+/// bonus, compares weekly utilization against the effective nudge/disable
+/// thresholds, and returns the numeric decision plus a copy-agnostic outcome.
+/// A `None` policy (Free tier) yields `NoData` and stays allowed (100%).
+fn evaluate_weekly_gate(
+    policy: Option<PricingPolicy>,
     weekly_utilization_pct: Option<f64>,
     invite_bonus_percent: f64,
-) -> PaidPlanGate {
-    let pricing = pricing_policy_for_plan(tier);
+) -> WeeklyGateDecision {
     let bonus = invite_bonus_percent.clamp(0.0, 50.0);
-    let nudge_threshold_percent = pricing
+    let nudge_threshold_percent = policy
         .as_ref()
         .map(|policy| policy.nudge_thresholds_percent[0]);
-    let effective_nudge_thresholds_percent: Option<Vec<f64>> = pricing.as_ref().map(|policy| {
+    let effective_nudge_thresholds_percent: Option<Vec<f64>> = policy.as_ref().map(|policy| {
         policy
             .nudge_thresholds_percent
             .iter()
             .map(|n| n + bonus)
             .collect()
     });
-    let disable_threshold_percent = pricing
+    let disable_threshold_percent = policy
         .as_ref()
         .map(|policy| policy.disable_threshold_percent);
-    let effective_disable_threshold_percent = pricing.as_ref().map(|policy| {
+    let effective_disable_threshold_percent = policy.as_ref().map(|policy| {
         (policy.disable_threshold_percent + invite_bonus_percent)
             .min(policy.disable_threshold_percent + 50.0)
     });
-    let recommended_subscription_tier = pricing
+    let recommended_subscription_tier = policy
         .as_ref()
         .map(|policy| policy.recommended_tier.clone());
 
     let mut optimization_allowed = true;
     let mut should_nudge = false;
     let mut nudge_level: u8 = 0;
-    let mut gate_reason = None;
-    let gate_message: String;
+    let outcome;
 
     if let (Some(weekly_usage), Some(nudges), Some(disable)) = (
         weekly_utilization_pct,
@@ -1577,53 +1705,98 @@ fn paid_plan_gate(
     ) {
         if weekly_usage >= disable {
             optimization_allowed = false;
-            gate_reason = Some(PricingGateReason::WeeklyUsageLimitReached);
-            gate_message = format!(
-                "Headroom is paused because you've reached {:.1}% of weekly Claude usage. Upgrade to raise your limit.",
-                weekly_usage
-            );
+            outcome = WeeklyGateOutcome::Paused { weekly_usage };
         } else {
             nudge_level = nudges.iter().filter(|t| weekly_usage >= **t).count() as u8;
             should_nudge = nudge_level > 0;
-            gate_message = if should_nudge {
-                format_nudge_message(weekly_usage, disable, nudge_level)
+            outcome = if should_nudge {
+                WeeklyGateOutcome::Nudging {
+                    weekly_usage,
+                    disable,
+                    level: nudge_level,
+                }
             } else {
-                format!(
-                    "Headroom is active. It will start nudging at {:.1}% and pause at {:.1}% of weekly Claude usage for your detected plan.",
-                    nudges[0], disable
-                )
+                WeeklyGateOutcome::Active {
+                    first_nudge: nudges[0],
+                    disable,
+                }
             };
         }
     } else {
-        gate_message = "Headroom is active. Send a Claude Code message through Headroom to sync your current weekly usage and pricing threshold.".into();
+        outcome = WeeklyGateOutcome::NoData;
     }
 
-    PaidPlanGate {
+    WeeklyGateDecision {
         optimization_allowed,
         should_nudge,
         nudge_level,
-        gate_reason,
-        gate_message,
         nudge_threshold_percent,
         effective_nudge_thresholds_percent,
         disable_threshold_percent,
         effective_disable_threshold_percent,
         recommended_subscription_tier,
+        outcome,
     }
 }
 
-fn format_nudge_message(weekly_usage: f64, disable: f64, level: u8) -> String {
+fn paid_plan_gate(
+    tier: &ClaudePlanTier,
+    weekly_utilization_pct: Option<f64>,
+    invite_bonus_percent: f64,
+) -> PaidPlanGate {
+    let decision = evaluate_weekly_gate(
+        pricing_policy_for_plan(tier),
+        weekly_utilization_pct,
+        invite_bonus_percent,
+    );
+    let gate_reason = matches!(decision.outcome, WeeklyGateOutcome::Paused { .. })
+        .then_some(PricingGateReason::WeeklyUsageLimitReached);
+    let gate_message = match decision.outcome {
+        WeeklyGateOutcome::Paused { weekly_usage } => format!(
+            "Headroom is paused because you've reached {:.1}% of weekly Claude usage. Upgrade to raise your limit.",
+            weekly_usage
+        ),
+        WeeklyGateOutcome::Nudging {
+            weekly_usage,
+            disable,
+            level,
+        } => format_nudge_message("Claude", weekly_usage, disable, level),
+        WeeklyGateOutcome::Active {
+            first_nudge,
+            disable,
+        } => format!(
+            "Headroom is active. It will start nudging at {:.1}% and pause at {:.1}% of weekly Claude usage for your detected plan.",
+            first_nudge, disable
+        ),
+        WeeklyGateOutcome::NoData => "Headroom is active. Send a Claude Code message through Headroom to sync your current weekly usage and pricing threshold.".into(),
+    };
+
+    PaidPlanGate {
+        optimization_allowed: decision.optimization_allowed,
+        should_nudge: decision.should_nudge,
+        nudge_level: decision.nudge_level,
+        gate_reason,
+        gate_message,
+        nudge_threshold_percent: decision.nudge_threshold_percent,
+        effective_nudge_thresholds_percent: decision.effective_nudge_thresholds_percent,
+        disable_threshold_percent: decision.disable_threshold_percent,
+        effective_disable_threshold_percent: decision.effective_disable_threshold_percent,
+        recommended_subscription_tier: decision.recommended_subscription_tier,
+    }
+}
+
+fn format_nudge_message(product: &str, weekly_usage: f64, disable: f64, level: u8) -> String {
     match level {
         1 => format!(
-            "You're at {:.1}% of weekly Claude usage. Upgrade Headroom to keep optimization through {:.1}% — invites also raise your limit.",
+            "You're at {:.1}% of weekly {product} usage. Upgrade Headroom to keep optimization through {:.1}% — invites also raise your limit.",
             weekly_usage, disable
         ),
         2 => format!(
-            "You're at {:.1}% of weekly Claude usage. Headroom pauses at {:.1}% on the free plan — upgrade now to keep going.",
+            "You're at {:.1}% of weekly {product} usage. Headroom pauses at {:.1}% on the free plan — upgrade now to keep going.",
             weekly_usage, disable
         ),
         _ => format!(
-            "You're at {:.1}% of weekly Claude usage. Headroom will pause at {:.1}% — upgrade now to avoid losing optimization.",
+            "You're at {:.1}% of weekly {product} usage. Headroom will pause at {:.1}% — upgrade now to avoid losing optimization.",
             weekly_usage, disable
         ),
     }
@@ -2174,6 +2347,7 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         invite_code: value.invite_code,
         accepted_invites_count: value.accepted_invites_count,
         invite_bonus_percent: value.invite_bonus_percent.min(50.0).max(0.0),
+        grandfathered: value.grandfathered,
     }
 }
 
@@ -2506,26 +2680,48 @@ struct PricingPolicy {
     recommended_tier: HeadroomSubscriptionTier,
 }
 
-fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
-    match plan {
-        ClaudePlanTier::Free => None,
-        ClaudePlanTier::Pro => Some(PricingPolicy {
+/// Shared per-tier threshold policy. Both the Claude and Codex gates route
+/// through this so their caps can never drift: Pro pauses at 50%, Max at 25%.
+/// The Free (ungated / 100%) case is handled by the plan->policy mappers
+/// returning `None`.
+fn policy_for_paid_tier(tier: HeadroomSubscriptionTier) -> PricingPolicy {
+    match tier {
+        HeadroomSubscriptionTier::Pro => PricingPolicy {
             nudge_thresholds_percent: NUDGE_THRESHOLDS_PERCENT,
             disable_threshold_percent: 50.0,
             recommended_tier: HeadroomSubscriptionTier::Pro,
-        }),
-        ClaudePlanTier::Max5x => Some(PricingPolicy {
+        },
+        HeadroomSubscriptionTier::Max5x => PricingPolicy {
             nudge_thresholds_percent: MAX_TIER_NUDGE_THRESHOLDS_PERCENT,
             disable_threshold_percent: 25.0,
             recommended_tier: HeadroomSubscriptionTier::Max5x,
-        }),
-        ClaudePlanTier::Max20x => Some(PricingPolicy {
+        },
+        HeadroomSubscriptionTier::Max20x => PricingPolicy {
             nudge_thresholds_percent: MAX_TIER_NUDGE_THRESHOLDS_PERCENT,
             disable_threshold_percent: 25.0,
             recommended_tier: HeadroomSubscriptionTier::Max20x,
-        }),
-        ClaudePlanTier::Unknown => None,
+        },
     }
+}
+
+fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
+    match plan {
+        // Free -> ungated (100%). Never metered.
+        ClaudePlanTier::Free => None,
+        ClaudePlanTier::Pro => Some(policy_for_paid_tier(HeadroomSubscriptionTier::Pro)),
+        ClaudePlanTier::Max5x => Some(policy_for_paid_tier(HeadroomSubscriptionTier::Max5x)),
+        ClaudePlanTier::Max20x => Some(policy_for_paid_tier(HeadroomSubscriptionTier::Max20x)),
+        // Undecodable plan is metered at the Max ceiling (25%) rather than left
+        // ungated, so an obscured plan can't buy unlimited free optimization.
+        ClaudePlanTier::Unknown => Some(policy_for_paid_tier(HeadroomSubscriptionTier::Max20x)),
+    }
+}
+
+/// Codex mirror of `pricing_policy_for_plan`, keyed off the same shared
+/// `policy_for_paid_tier`. Free -> ungated (100%); Unknown -> Max ceiling (25%)
+/// via `headroom_tier_for_codex_plan` (which already maps Unknown -> Max x20).
+fn pricing_policy_for_codex_plan(plan: &CodexPlanTier) -> Option<PricingPolicy> {
+    crate::models::headroom_tier_for_codex_plan(plan).map(policy_for_paid_tier)
 }
 
 #[cfg(test)]
@@ -2646,6 +2842,7 @@ mod tests {
             invite_code: Some("invite-code".into()),
             accepted_invites_count: 2,
             invite_bonus_percent: 10.0,
+            grandfathered: false,
         }
     }
 
@@ -3121,6 +3318,7 @@ mod tests {
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: 0.0,
+            grandfathered: false,
         }
     }
 
@@ -3143,6 +3341,16 @@ mod tests {
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: invite_bonus,
+            grandfathered: false,
+        }
+    }
+
+    /// Grandfathered early adopter: like `expired_account` (no sub, no trial) but
+    /// keeps the capped free tier instead of the hard block.
+    fn grandfathered_account() -> HeadroomAccountProfile {
+        HeadroomAccountProfile {
+            grandfathered: true,
+            ..expired_account(0.0)
         }
     }
 
@@ -3247,16 +3455,23 @@ mod tests {
     }
 
     #[test]
-    fn paid_plan_gate_free_and_unknown_are_never_gated() {
-        for tier in [ClaudePlanTier::Free, ClaudePlanTier::Unknown] {
-            let gate = super::paid_plan_gate(&tier, Some(99.0), 0.0);
-            assert!(
-                gate.optimization_allowed,
-                "{tier:?} has no weekly policy and must not be gated"
-            );
-            assert!(!gate.should_nudge);
-            assert!(gate.gate_reason.is_none());
-        }
+    fn paid_plan_gate_free_is_never_gated() {
+        // Free -> ungated (100%), even past any threshold.
+        let gate = super::paid_plan_gate(&ClaudePlanTier::Free, Some(99.0), 0.0);
+        assert!(gate.optimization_allowed);
+        assert!(!gate.should_nudge);
+        assert!(gate.gate_reason.is_none());
+    }
+
+    #[test]
+    fn paid_plan_gate_unknown_meters_at_max_ceiling() {
+        // Undecodable plan is metered at the Max ceiling (25%) so an obscured
+        // plan can't buy unlimited free optimization.
+        let below = super::paid_plan_gate(&ClaudePlanTier::Unknown, Some(20.0), 0.0);
+        assert!(below.optimization_allowed, "Unknown at 20% is below 25%");
+        let paused = super::paid_plan_gate(&ClaudePlanTier::Unknown, Some(30.0), 0.0);
+        assert!(!paused.optimization_allowed, "Unknown at 30% >= 25%");
+        assert_eq!(paused.effective_disable_threshold_percent, Some(25.0));
     }
 
     #[test]
@@ -3292,6 +3507,64 @@ mod tests {
                 Some(PricingGateReason::TrialEnded)
             ));
         }
+    }
+
+    #[test]
+    fn grandfathered_claude_gets_capped_free_tier() {
+        let (start, end) = grace();
+        // Pro plan: metered at 50% (not hard-blocked like a plain expired trial).
+        let ok = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(grandfathered_account()),
+            pro_profile_with_weekly(40.0),
+            false,
+            None,
+        );
+        assert!(ok.optimization_allowed, "grandfathered Pro at 40% stays on");
+        assert!(ok.gate_reason.is_none());
+
+        let paused = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(grandfathered_account()),
+            pro_profile_with_weekly(60.0),
+            false,
+            None,
+        );
+        assert!(
+            !paused.optimization_allowed,
+            "grandfathered Pro at 60% pauses at 50%"
+        );
+        assert!(matches!(
+            paused.gate_reason,
+            Some(PricingGateReason::WeeklyUsageLimitReached)
+        ));
+
+        // Free plan: ungated (100%) even past every threshold.
+        let mut free_profile = empty_claude_profile(ClaudePlanTier::Free);
+        free_profile.weekly_utilization_pct = Some(95.0);
+        let free = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(grandfathered_account()),
+            free_profile,
+            false,
+            None,
+        );
+        assert!(
+            free.optimization_allowed,
+            "grandfathered Free is never paused"
+        );
     }
 
     #[test]
@@ -3514,6 +3787,7 @@ mod tests {
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: 999.0,
+            grandfathered: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 50.0);
     }
@@ -3538,6 +3812,7 @@ mod tests {
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: -10.0,
+            grandfathered: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 0.0);
     }
@@ -3656,10 +3931,13 @@ mod tests {
     #[test]
     fn codex_usage_from_snapshot_builds_usage() {
         let snapshot = codex_snapshot_with_weekly(12.0);
-        // gate_enabled=false: active subscription/trial, so usage is shown for
-        // reference only (no gate).
-        let usage =
-            super::codex_usage_from_snapshot(snapshot, crate::models::CodexPlanTier::Plus, false);
+        // Ungated (active subscription/trial): usage is shown for reference only.
+        let usage = super::codex_usage_from_snapshot(
+            snapshot,
+            crate::models::CodexPlanTier::Plus,
+            super::CodexActivation::Ungated,
+            0.0,
+        );
         assert_eq!(usage.limit_name.as_deref(), Some("gpt-5.2-codex"));
         let primary = usage.primary.expect("primary window");
         assert_eq!(primary.used_percent, 42.5);
@@ -3686,7 +3964,8 @@ mod tests {
             let usage = super::codex_usage_from_snapshot(
                 codex_snapshot_with_weekly(weekly),
                 crate::models::CodexPlanTier::Pro,
-                true,
+                super::CodexActivation::HardBlock,
+                0.0,
             );
             assert!(
                 !usage.optimization_allowed,
@@ -3707,16 +3986,60 @@ mod tests {
 
     #[test]
     fn codex_gate_inactive_when_subscribed_or_trialing() {
-        // gate_enabled = false (active subscription / trial) → never paused or
-        // nudged, even past the disable threshold.
+        // Ungated (active subscription / trial) → never paused or nudged, even
+        // past the disable threshold.
         let usage = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(80.0),
             crate::models::CodexPlanTier::Plus,
-            false,
+            super::CodexActivation::Ungated,
+            0.0,
         );
         assert!(usage.optimization_allowed);
         assert!(!usage.should_nudge);
         assert!(usage.gate_reason.is_none());
+    }
+
+    #[test]
+    fn codex_gate_meters_by_tier_when_metered() {
+        // Grandfathered / clamped subscriber: metered identically to Claude.
+        // Plus (Pro-equiv) pauses at 50%, Team (Max-equiv) at 25%, Free never.
+        let plus_ok = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(40.0),
+            crate::models::CodexPlanTier::Plus,
+            super::CodexActivation::Metered,
+            0.0,
+        );
+        assert!(plus_ok.optimization_allowed, "Plus at 40% is below 50%");
+
+        let plus_paused = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(55.0),
+            crate::models::CodexPlanTier::Plus,
+            super::CodexActivation::Metered,
+            0.0,
+        );
+        assert!(!plus_paused.optimization_allowed, "Plus at 55% >= 50%");
+        assert!(matches!(
+            plus_paused.gate_reason,
+            Some(crate::models::PricingGateReason::CodexWeeklyUsageLimitReached)
+        ));
+
+        let team_paused = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(30.0),
+            crate::models::CodexPlanTier::Team,
+            super::CodexActivation::Metered,
+            0.0,
+        );
+        assert!(!team_paused.optimization_allowed, "Team at 30% >= 25%");
+
+        // Free is ungated (100%) even when metered and past any threshold.
+        let free = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(95.0),
+            crate::models::CodexPlanTier::Free,
+            super::CodexActivation::Metered,
+            0.0,
+        );
+        assert!(free.optimization_allowed, "Free Codex is never paused");
+        assert!(free.gate_reason.is_none());
     }
 
     #[test]
@@ -3761,7 +4084,8 @@ mod tests {
         let usage = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(10.0),
             CodexPlanTier::Free,
-            true,
+            super::CodexActivation::HardBlock,
+            0.0,
         );
         assert_eq!(
             usage.recommended_subscription_tier,

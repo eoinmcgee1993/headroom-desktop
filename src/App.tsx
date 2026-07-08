@@ -2646,6 +2646,28 @@ export default function App() {
     return connectorSupportWarnings[connector.clientId] ?? null;
   }
 
+  // Pricing gate: enabling a connector while optimization is disallowed just
+  // triggers the auto-disable effect (the ON->OFF flash). Mirror that effect's
+  // exemption exactly -- Codex is exempt while authenticated (its own
+  // proxy-side gate). Only blocks *enabling*; an already-on connector is left
+  // to the auto-disable effect.
+  function connectorGateBlocksEnable(connector: ClientConnectorStatus) {
+    return (
+      pricingStatus != null &&
+      !pricingStatus.optimizationAllowed &&
+      !connector.enabled &&
+      (!pricingStatus.authenticated || connector.clientId !== "codex")
+    );
+  }
+
+  function connectorGateCta() {
+    if (pricingStatus?.authenticated) {
+      setActiveView("upgrade");
+    } else {
+      openUpgradeAuthView();
+    }
+  }
+
   function getConnectorDetectionWarning(connector: ClientConnectorStatus) {
     if (connector.installed) {
       return null;
@@ -3989,6 +4011,7 @@ export default function App() {
               const detectionWarning = getConnectorDetectionWarning(connector);
               const supportWarning = getConnectorSupportWarning(connector);
               const needsRestart = connector.enabled && !connector.verified;
+              const gateBlocksEnable = connectorGateBlocksEnable(connector);
               return (
                 <article className="connector-item" key={connector.clientId}>
                   <div>
@@ -4047,13 +4070,25 @@ export default function App() {
                         {detectionWarning ?? unavailableReason}
                       </p>
                     ) : null}
+                    {gateBlocksEnable ? (
+                      <p className="connector-item__reason">
+                        {pricingStatus?.gateMessage}{" "}
+                        <button
+                          className="addon-card__link"
+                          type="button"
+                          onClick={connectorGateCta}
+                        >
+                          {pricingStatus?.authenticated ? "Upgrade" : "Sign in"}
+                        </button>
+                      </p>
+                    ) : null}
                   </div>
                   <div className="connector-item__controls">
                     <button
                       aria-checked={connector.enabled}
                       aria-label={`${connector.enabled ? "Disable" : "Enable"} ${connector.name} connector`}
                       className={`connector-switch${connector.enabled ? " is-on" : ""}`}
-                      disabled={connectorsBusy}
+                      disabled={connectorsBusy || gateBlocksEnable}
                       onClick={() =>
                         void toggleConnector(connector, !connector.enabled)
                       }
@@ -6055,8 +6090,11 @@ export default function App() {
                           : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
+                    const gateBlocksEnable = connectorGateBlocksEnable(connector);
                     const toggleDisabled =
-                      connectorsBusy || !canConfigureConnectorWithoutDetection(connector);
+                      connectorsBusy ||
+                      !canConfigureConnectorWithoutDetection(connector) ||
+                      gateBlocksEnable;
                     return (
                       <article className="connector-item" key={connector.clientId}>
                         <div>
@@ -6093,6 +6131,18 @@ export default function App() {
                           {(detectionWarning ?? unavailableReason) ? (
                             <p className="connector-item__reason">
                               {detectionWarning ?? unavailableReason}
+                            </p>
+                          ) : null}
+                          {gateBlocksEnable ? (
+                            <p className="connector-item__reason">
+                              {pricingStatus?.gateMessage}{" "}
+                              <button
+                                className="addon-card__link"
+                                type="button"
+                                onClick={connectorGateCta}
+                              >
+                                {pricingStatus?.authenticated ? "Upgrade" : "Sign in"}
+                              </button>
                             </p>
                           ) : null}
                         </div>

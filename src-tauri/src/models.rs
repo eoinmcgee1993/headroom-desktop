@@ -921,6 +921,11 @@ pub struct HeadroomAccountProfile {
     pub invite_code: Option<String>,
     pub accepted_invites_count: usize,
     pub invite_bonus_percent: f64,
+    // Early adopters whose earliest trial identity predates the paywall keep a
+    // capped free tier instead of the post-trial hard block. serde default so
+    // older cached payloads (no field) still deserialize.
+    #[serde(default)]
+    pub grandfathered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
