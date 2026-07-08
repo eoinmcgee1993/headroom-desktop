@@ -1757,6 +1757,10 @@ impl ToolManager {
     where
         F: FnMut(BootstrapStepUpdate),
     {
+        // Milestone logs mirror the UI progress steps into the file log. The
+        // bootstrap is otherwise near-silent on disk (only the codesign line),
+        // so a stuck/slow first install is hard to diagnose from logs alone.
+        log::info!("bootstrap: starting managed runtime install");
         progress(BootstrapStepUpdate {
             step: "Preparing install",
             message: "Setting up managed directories.".into(),
@@ -1766,6 +1770,7 @@ impl ToolManager {
         self.runtime.ensure_layout()?;
 
         if !self.runtime.standalone_python().exists() {
+            log::info!("bootstrap: downloading standalone Python runtime");
             progress(BootstrapStepUpdate {
                 step: "Downloading Python",
                 message: "Fetching pinned standalone Python runtime.".into(),
@@ -1783,6 +1788,7 @@ impl ToolManager {
         }
 
         if !self.runtime.managed_python().exists() {
+            log::info!("bootstrap: creating managed virtualenv");
             progress(BootstrapStepUpdate {
                 step: "Creating environment",
                 message: "Creating isolated Headroom virtual environment.".into(),
@@ -1799,6 +1805,7 @@ impl ToolManager {
             });
         }
 
+        log::info!("bootstrap: installing Headroom + dependencies via pip");
         progress(BootstrapStepUpdate {
             step: "Installing Headroom",
             message: "Installing Headroom and required dependencies.".into(),
@@ -1817,6 +1824,7 @@ impl ToolManager {
         });
         self.write_ready_flag()?;
         self.write_bootstrap_receipt()?;
+        log::info!("bootstrap: managed runtime install complete (ready flag written)");
         progress(BootstrapStepUpdate {
             step: "Install complete",
             message: "Headroom runtime installed successfully.".into(),

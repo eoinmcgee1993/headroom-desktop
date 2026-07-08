@@ -12,7 +12,7 @@
 /// captured into `AppState::claude_bearer_token` so the usage-stats feature
 /// can call the Anthropic OAuth usage endpoint without touching the keychain.
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,6 +99,36 @@ static INTERCEPT_CODEX_REQUESTS: AtomicU64 = AtomicU64::new(0);
 /// One-shot guard: has the `first_proxy_request` funnel beacon been sent this
 /// process yet? See the fire site in `handle`.
 static FIRST_PROXY_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Backend reachability, logged on transition only (0=unknown, 1=reachable,
+/// 2=unreachable). Without this the log records every direct-fallback request
+/// but nothing when the backend finally comes up, so "did the runtime finish
+/// installing, and when" is only answerable as the *absence* of the unreachable
+/// line — miserable to read. Transition logging gives a positive "reachable"
+/// line (with how long it was down) and collapses the per-request spam.
+static BACKEND_REACHABILITY_STATE: AtomicU8 = AtomicU8::new(0);
+static BACKEND_DOWN_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Record the backend's reachability and log only when it changes. Called on
+/// every request from both the connect-failed and connect-succeeded paths.
+fn note_backend_reachability(reachable: bool, backend_addr: SocketAddr) {
+    let new_state = if reachable { 1u8 } else { 2u8 };
+    if BACKEND_REACHABILITY_STATE.swap(new_state, Ordering::Relaxed) == new_state {
+        return;
+    }
+    if reachable {
+        match BACKEND_DOWN_SINCE.lock().take() {
+            Some(since) => log::info!(
+                "backend {backend_addr} reachable (after {:.0}s unreachable)",
+                since.elapsed().as_secs_f64()
+            ),
+            None => log::info!("backend {backend_addr} reachable"),
+        }
+    } else {
+        *BACKEND_DOWN_SINCE.lock() = Some(std::time::Instant::now());
+        log::info!("backend {backend_addr} unreachable; forwarding requests direct to provider");
+    }
+}
 
 /// Same key shape as `/stats` `agent_usage.agents[]` (`claude-code`, `codex`)
 /// so the frontend verification anchor/delta logic works against either source.
@@ -484,10 +514,11 @@ async fn handle(
         // OPENAI_DIRECT_BASE, so Codex degrades identically to Claude.
         // info, not warn: warn would ship to Sentry per request; the watchdog's
         // capture_watchdog_give_up already reports genuine down episodes.
-        log::info!("backend {backend_addr} unreachable; forwarding request direct to provider");
+        note_backend_reachability(false, backend_addr);
         forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     };
+    note_backend_reachability(true, backend_addr);
 
     // Codex GUI/IDE clients don't send a `codex-cli/` User-Agent, so the
     // backend's UA-based classifier can't tell they're Codex and treats a
