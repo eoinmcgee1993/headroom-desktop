@@ -3978,6 +3978,23 @@ impl SavingsTracker {
             if point.date.as_str() < cutoff_date || point.date.as_str() >= utc_today_key {
                 continue;
             }
+            // A desynced backend rollup (compression savings but zero
+            // tokens/cost, because its cost counter lags the savings
+            // accumulator; see RUST-4S/3S/3V) must not clobber a local bucket
+            // that recorded real spend that day. The display-time fallback in
+            // merge_daily_savings relies on the tracker still holding that
+            // ground truth; overwriting it here made the fallback fail and the
+            // zero-spend anomaly probe fire.
+            let history_desynced = point.estimated_savings_usd > 0.000_001
+                && point.actual_cost_usd == 0.0
+                && point.total_tokens_sent == 0;
+            if history_desynced {
+                if let Some(existing) = self.daily_savings.get(&point.date) {
+                    if existing.total_tokens_sent > 0 {
+                        continue;
+                    }
+                }
+            }
             let bucket = DailySavingsBucket {
                 estimated_savings_usd: point.estimated_savings_usd,
                 estimated_tokens_saved: point.estimated_tokens_saved,
@@ -8584,6 +8601,33 @@ mod tests {
             .find(|p| p.date == "2026-06-10")
             .expect("settled day present");
         assert_eq!(point.estimated_tokens_saved, 100);
+    }
+
+    #[test]
+    fn ingest_native_rollups_keeps_local_spend_when_backend_rollup_desynced() {
+        // RUST-4S: a backend rollup that reports savings but zero tokens/cost
+        // must not overwrite a settled local bucket that recorded real spend,
+        // or the zero-spend anomaly probe fires on a false positive.
+        let mut tracker = make_tracker();
+        tracker.add_daily_delta("2026-06-10", 1.0, 100, 2.5, 5000);
+
+        // Desynced backend point for the same day: savings, no spend.
+        let desynced = tracker.ingest_native_rollups(
+            &[daily("2026-06-10", 200, 3.0)],
+            &[],
+            "2026-06-02",
+            "2026-06-16",
+            "2026-06-16",
+        );
+        assert!(!desynced, "desynced rollup must be skipped, not applied");
+
+        let point = tracker
+            .daily_savings()
+            .into_iter()
+            .find(|p| p.date == "2026-06-10")
+            .expect("local spend day preserved");
+        assert_eq!(point.total_tokens_sent, 5000);
+        assert_eq!(point.actual_cost_usd, 2.5);
     }
 
     #[test]
