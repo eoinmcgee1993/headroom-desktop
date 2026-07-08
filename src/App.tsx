@@ -1181,6 +1181,9 @@ export default function App() {
   const dashboardSignatureRef = useRef(serializeState(mockDashboard));
   const connectorsSignatureRef = useRef(serializeState([] as ClientConnectorStatus[]));
   const runtimeStatusSignatureRef = useRef(serializeState(null as RuntimeStatus | null));
+  // Mirrors runtimeStatus.installed for closures (background update check) that
+  // must not fire notifications while first-install bootstrap is still running.
+  const runtimeInstalledRef = useRef(false);
   const claudeProjectsSignatureRef = useRef(serializeState([] as ClaudeCodeProject[]));
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
@@ -1240,6 +1243,7 @@ export default function App() {
 
   useEffect(() => {
     runtimeStatusSignatureRef.current = serializeState(runtimeStatus);
+    runtimeInstalledRef.current = runtimeStatus?.installed === true;
   }, [runtimeStatus]);
 
   useEffect(() => {
@@ -1944,7 +1948,11 @@ export default function App() {
       if (
         appUpdateReadyToRestartRef.current ||
         appUpdateBusyRef.current ||
-        appUpdateInstallBusyRef.current
+        appUpdateInstallBusyRef.current ||
+        // Don't fire an "update available" notification while first-install
+        // bootstrap is still building the runtime — it piles onto the install
+        // window. Resume once the runtime is installed.
+        !runtimeInstalledRef.current
       ) {
         return;
       }
