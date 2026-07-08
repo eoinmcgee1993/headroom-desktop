@@ -2409,11 +2409,13 @@ fn codex_guard_command() -> String {
     format!("/usr/bin/python3 {}", codex_guard_hook_path().display())
 }
 
-/// Loud-fail guard that Codex runs at session start and on every prompt: it
-/// checks that `~/.codex/config.toml` still routes through Headroom and that the
-/// desktop app is reachable, so a closed app or a clobbered provider block
-/// surfaces as a visible error instead of Codex silently falling back to a
-/// direct OpenAI route. Runs under system `/usr/bin/python3` (>=3.9), so it
+/// Informational guard that Codex runs at session start: it checks that
+/// `~/.codex/config.toml` still routes through Headroom and that the desktop app
+/// is reachable, and surfaces a notification when either is off so a genuinely
+/// broken route is visible. It never blocks (always exits 0): Codex is the
+/// user's own OpenAI account and must keep working whether or not Headroom is
+/// active -- the intercept forwards Codex direct to OpenAI when the app is down
+/// or the gate trips. Runs under system `/usr/bin/python3` (>=3.9), so it
 /// carries a tiny TOML fallback parser for the pre-3.11 interpreters that lack
 /// `tomllib`. Deliberately does NOT inspect auth mode or `OPENAI_API_KEY`:
 /// routing is decided by `base_url`, so an OpenAI-API-key Codex user is a valid
@@ -2531,20 +2533,24 @@ def main():
     else:
         provider_name = config.get("model_provider")
         if provider_name != "headroom":
-            issues.append('Codex model_provider is "' + str(provider_name) + '" (expected "headroom"); not routing through Headroom')
-        provider = (config.get("model_providers") or {{}}).get("headroom") or {{}}
-        base = provider.get("base_url")
-        if base != BASE_URL:
-            issues.append("Headroom provider base_url is " + str(base) + " (expected " + BASE_URL + ")")
+            issues.append('Codex model_provider is "' + str(provider_name) + '" (expected "headroom"); Codex is not being optimized by Headroom')
+        else:
+            provider = (config.get("model_providers") or {{}}).get("headroom") or {{}}
+            base = provider.get("base_url")
+            if base != BASE_URL:
+                issues.append("Headroom provider base_url is " + str(base) + " (expected " + BASE_URL + ")")
     if not reachable():
-        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- it may be restarting; open the app if it isn't")
+        issues.append("Headroom Desktop isn't running; open it to optimize Codex")
 
+    # Never block (exit 2): Codex is the user's own OpenAI account and must keep
+    # working whether or not Headroom is active. Surface issues as a once-per-
+    # session notification so a genuinely broken route is visible, without
+    # holding a paused or departing user's Codex hostage to the app being open.
     if issues:
         notify("; ".join(issues))
-        sys.stderr.write("Headroom Codex guard failed:\n")
+        sys.stderr.write("Headroom Codex guard:\n")
         for issue in issues:
             sys.stderr.write("- " + issue + "\n")
-        return 2
     return 0
 
 
@@ -2721,21 +2727,33 @@ fn remove_guard_hook_entries(
 }
 
 /// Write the guard script and register it in `~/.codex/hooks.json` for the
-/// SessionStart and UserPromptSubmit events. `hooks.json` is auto-discovered by
-/// Codex (no `config.toml` flag needed). The user must trust the hook once via
-/// Codex's `/hooks` command before it runs (re-trust after any guard update).
+/// SessionStart event only. `hooks.json` is auto-discovered by Codex (no
+/// `config.toml` flag needed). The user must trust the hook once via Codex's
+/// `/hooks` command before it runs (re-trust after any guard update).
+///
+/// SessionStart only (mirrors `ensure_claude_guard_hook`): on UserPromptSubmit a
+/// nonzero exit blocks every prompt, which held a paused or departing user's own
+/// OpenAI-billed Codex hostage to the desktop app being open -- the exact reason
+/// users uninstalled. The guard is informational, not a gate; the intercept
+/// forwards Codex direct to OpenAI when the app is down or the gate trips.
 fn ensure_codex_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
     let script_path = codex_guard_hook_path();
     let (script_changed, script_backup) =
         write_file_if_changed(&script_path, &build_codex_guard_script(), true)?;
+    // Migration: earlier builds registered on UserPromptSubmit, where a nonzero
+    // exit blocked every Codex prompt. Strip that entry from existing installs;
+    // match on the script path so it lands regardless of interpreter drift.
+    remove_guard_hook_entries(
+        &codex_hooks_json_path(),
+        &script_path.display().to_string(),
+        false,
+        Some(&["UserPromptSubmit"]),
+    )?;
     let (mut changed, mut backups) = register_guard_hook_entries(
         &codex_hooks_json_path(),
         &codex_guard_command(),
         CODEX_GUARD_STATUS_MESSAGE,
-        &[
-            ("SessionStart", Some("startup|resume|clear|compact")),
-            ("UserPromptSubmit", None),
-        ],
+        &[("SessionStart", Some("startup|resume|clear|compact"))],
     )?;
     if script_changed {
         changed.insert(0, script_path.display().to_string());
@@ -3521,7 +3539,57 @@ fn file_has_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
 }
 
 fn shell_path(name: &str) -> PathBuf {
-    home_dir().join(name)
+    match name {
+        ZSH_PROFILE_FILE | ZSH_RC_FILE => zsh_dir().join(name),
+        _ => home_dir().join(name),
+    }
+}
+
+/// Directory zsh reads its rc/profile files from. zsh honors `$ZDOTDIR`
+/// (falling back to `$HOME`); a Finder-launched app rarely inherits `$ZDOTDIR`
+/// from the login shell, so when it's absent from our own env we recover it
+/// from `~/.zshenv` — the file zsh always sources from `$HOME` and the
+/// conventional place users set ZDOTDIR.
+fn zsh_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("ZDOTDIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    zdotdir_from_zshenv(&home_dir()).unwrap_or_else(home_dir)
+}
+
+fn zdotdir_from_zshenv(home: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(home.join(".zshenv")).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some(value) = line.strip_prefix("ZDOTDIR=") else {
+            continue;
+        };
+        let raw = if let Some(inner) = value.strip_prefix('"').and_then(|v| v.split('"').next()) {
+            inner
+        } else if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.split('\'').next()) {
+            inner
+        } else {
+            value.split([' ', '\t', '#']).next().unwrap_or("")
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let expanded = if let Some(tail) = raw.strip_prefix("~/") {
+            home.join(tail)
+        } else if raw == "~" {
+            home.to_path_buf()
+        } else if let Some(tail) = raw
+            .strip_prefix("$HOME/")
+            .or_else(|| raw.strip_prefix("${HOME}/"))
+        {
+            home.join(tail)
+        } else {
+            PathBuf::from(raw)
+        };
+        return Some(expanded);
+    }
+    None
 }
 
 fn claude_settings_path() -> PathBuf {
@@ -4564,6 +4632,42 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn zdotdir_from_zshenv_parses_common_forms() {
+        let cases: [(&str, Option<&str>); 6] = [
+            (
+                "export ZDOTDIR=\"$HOME/.config/zsh\"\n",
+                Some(".config/zsh"),
+            ),
+            ("ZDOTDIR=~/.config/zsh\n", Some(".config/zsh")),
+            (
+                "export ZDOTDIR='${HOME}/dotfiles/zsh'\n",
+                Some("dotfiles/zsh"),
+            ),
+            ("# comment\nexport ZDOTDIR=$HOME/z  # trailing\n", Some("z")),
+            ("export ZDOTDIR=~\n", Some("")),
+            ("# no zdotdir here\nexport FOO=bar\n", None),
+        ];
+        for (i, (contents, expected_tail)) in cases.into_iter().enumerate() {
+            let home = unique_temp_dir(&format!("headroom-zdotdir-{i}"));
+            fs::create_dir_all(&home).unwrap();
+            fs::write(home.join(".zshenv"), contents).unwrap();
+            let got = super::zdotdir_from_zshenv(&home);
+            let expected = expected_tail.map(|tail| {
+                if tail.is_empty() {
+                    home.clone()
+                } else {
+                    home.join(tail)
+                }
+            });
+            assert_eq!(got, expected, "case {i}");
+        }
+        // Missing file -> None.
+        let empty = unique_temp_dir("headroom-zdotdir-none");
+        fs::create_dir_all(&empty).unwrap();
+        assert_eq!(super::zdotdir_from_zshenv(&empty), None);
+    }
+
+    #[test]
     fn strip_hook_returns_false_when_file_missing() {
         let root = unique_temp_dir("headroom-strip-missing");
         let settings = root.join("does-not-exist.json");
@@ -5042,6 +5146,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         prev_xdg: Option<std::ffi::OsString>,
         prev_shell: Option<std::ffi::OsString>,
         prev_codex: Option<std::ffi::OsString>,
+        prev_zdotdir: Option<std::ffi::OsString>,
         // Held for the guard's lifetime: env vars are process-global, so two
         // TestHome tests running on parallel threads corrupt each other's HOME
         // (and can leak writes into the developer's real profile). serial_test
@@ -5060,6 +5165,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let prev_xdg = std::env::var_os("XDG_DATA_HOME");
             let prev_shell = std::env::var_os("SHELL");
             let prev_codex = std::env::var_os("CODEX_HOME");
+            let prev_zdotdir = std::env::var_os("ZDOTDIR");
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_DATA_HOME", home.join(".local").join("share"));
             // Force a deterministic shell family so tests don't depend on the
@@ -5068,6 +5174,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             // Clear any real CODEX_HOME so codex_home() falls back to the temp
             // $HOME/.codex and the Codex tests stay hermetic on dev machines.
             std::env::remove_var("CODEX_HOME");
+            // Clear any real ZDOTDIR so zsh_dir() resolves against the temp
+            // $HOME and the shell-block tests stay hermetic on dev machines.
+            std::env::remove_var("ZDOTDIR");
             // Mirror what the app does at startup so write_setup_state has a
             // config dir to land in.
             crate::storage::ensure_data_dirs(&crate::storage::app_data_dir())
@@ -5079,6 +5188,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 prev_xdg,
                 prev_shell,
                 prev_codex,
+                prev_zdotdir,
                 _env_lock: env_lock,
             }
         }
@@ -5105,6 +5215,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             match self.prev_codex.take() {
                 Some(v) => std::env::set_var("CODEX_HOME", v),
                 None => std::env::remove_var("CODEX_HOME"),
+            }
+            match self.prev_zdotdir.take() {
+                Some(v) => std::env::set_var("ZDOTDIR", v),
+                None => std::env::remove_var("ZDOTDIR"),
             }
         }
     }
@@ -5817,21 +5931,28 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let hooks: serde_json::Value =
             read_settings_json(&home.path().join(".codex").join("hooks.json"));
         let command = format!("/usr/bin/python3 {}", script.display());
-        for event in ["SessionStart", "UserPromptSubmit"] {
-            let registered = hooks["hooks"][event]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| {
-                    entry["hooks"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|h| h["command"] == serde_json::Value::String(command.clone()))
-                });
-            assert!(registered, "guard registered for {event}, got:\n{hooks:#}");
-        }
-        // SessionStart carries the lifecycle matcher; UserPromptSubmit does not.
+        // SessionStart only: on UserPromptSubmit a nonzero exit blocks the prompt.
+        let session_registered = hooks["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["hooks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|h| h["command"] == serde_json::Value::String(command.clone()))
+            });
+        assert!(
+            session_registered,
+            "guard registered on SessionStart, got:\n{hooks:#}"
+        );
+        assert!(
+            !hooks["hooks"]["UserPromptSubmit"]
+                .to_string()
+                .contains("headroom-codex-guard.py"),
+            "guard must not register on UserPromptSubmit, got:\n{hooks:#}"
+        );
         assert_eq!(
             hooks["hooks"]["SessionStart"][0]["matcher"],
             "startup|resume|clear|compact"
@@ -5857,7 +5978,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let hooks_path = home.path().join(".codex").join("hooks.json");
         let hooks = read_settings_json(&hooks_path);
-        let guard_count = hooks["hooks"]["UserPromptSubmit"]
+        // Guard registered on SessionStart exactly once (not UserPromptSubmit,
+        // where a nonzero exit would block every prompt).
+        let guard_count = hooks["hooks"]["SessionStart"]
             .as_array()
             .unwrap()
             .iter()
@@ -5872,7 +5995,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             .count();
         assert_eq!(
             guard_count, 1,
-            "guard registered exactly once, got:\n{hooks:#}"
+            "guard registered exactly once on SessionStart, got:\n{hooks:#}"
+        );
+        // The guard must NOT be on UserPromptSubmit; the pre-existing user hook
+        // there survives untouched.
+        let user_prompt = hooks["hooks"]["UserPromptSubmit"].to_string();
+        assert!(
+            !user_prompt.contains("headroom-codex-guard.py"),
+            "guard must not register on UserPromptSubmit, got:\n{hooks:#}"
+        );
+        assert!(
+            user_prompt.contains("echo mine"),
+            "user's UserPromptSubmit hook preserved, got:\n{hooks:#}"
         );
 
         super::disable_client_setup("codex").expect("disable");
@@ -5926,6 +6060,63 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             after_str.contains("echo mine"),
             "user hook preserved, got:\n{after:#}"
+        );
+    }
+
+    #[test]
+    fn codex_guard_script_is_informational_never_blocks() {
+        // Regression: a nonzero exit on a Codex hook blocks the session, which
+        // held lapsed users' own OpenAI-billed Codex hostage to the app. The
+        // guard must only notify, never block.
+        let script = super::build_codex_guard_script();
+        assert!(
+            !script.contains("return 2"),
+            "codex guard must never block (exit 2)"
+        );
+        assert!(script.contains("return 0"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_codex_guard_migrates_off_user_prompt_submit() {
+        let home = TestHome::new();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(codex_dir.join("hooks")).unwrap();
+        let hooks_path = codex_dir.join("hooks.json");
+        let cmd = format!(
+            "/usr/bin/python3 {}",
+            codex_dir
+                .join("hooks")
+                .join("headroom-codex-guard.py")
+                .display()
+        );
+        // Old install: guard registered on both SessionStart and UserPromptSubmit.
+        fs::write(
+            &hooks_path,
+            format!(
+                r#"{{"hooks":{{
+                    "SessionStart":[{{"matcher":"startup|resume|clear|compact","hooks":[{{"type":"command","command":"{cmd}"}}]}}],
+                    "UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"{cmd}"}}]}}]
+                }}}}"#
+            ),
+        )
+        .unwrap();
+
+        super::ensure_codex_guard_hook().unwrap();
+
+        let after = read_settings_json(&hooks_path);
+        let dump = serde_json::to_string_pretty(&after).unwrap();
+        assert!(
+            !after["hooks"]["UserPromptSubmit"]
+                .to_string()
+                .contains("headroom-codex-guard.py"),
+            "guard stripped from UserPromptSubmit, got:\n{dump}"
+        );
+        assert!(
+            after["hooks"]["SessionStart"]
+                .to_string()
+                .contains("headroom-codex-guard.py"),
+            "guard kept on SessionStart, got:\n{dump}"
         );
     }
 

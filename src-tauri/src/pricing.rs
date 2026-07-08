@@ -3475,6 +3475,28 @@ mod tests {
     }
 
     #[test]
+    fn format_nudge_message_renders_product_numbers_and_level_copy() {
+        let l1 = super::format_nudge_message("Claude", 34.2, 50.0, 1);
+        assert!(l1.contains("34.2% of weekly Claude usage"), "{l1}");
+        assert!(
+            l1.contains("through 50.0%"),
+            "level 1 keeps-through copy: {l1}"
+        );
+
+        let l2 = super::format_nudge_message("Codex", 44.0, 50.0, 2);
+        assert!(l2.contains("44.0% of weekly Codex usage"), "{l2}");
+        assert!(l2.contains("pauses at 50.0%"), "level 2 pause copy: {l2}");
+
+        // Any level > 2 falls through to the final "will pause" variant.
+        let l3 = super::format_nudge_message("Claude", 48.5, 50.0, 3);
+        assert!(l3.contains("48.5% of weekly Claude usage"), "{l3}");
+        assert!(
+            l3.contains("will pause at 50.0%"),
+            "level 3 pause copy: {l3}"
+        );
+    }
+
+    #[test]
     fn post_trial_hard_blocks_every_tier_with_no_free_plan() {
         // Trial ended, no subscription: optimization stops for every Claude
         // tier. There is no usable free plan post-trial.

@@ -4869,7 +4869,7 @@ export default function App() {
     return {
       tone: "expired" as const,
       message:
-        "Your 7-day trial has ended. Upgrade to keep Headroom optimizing your prompts — there's no free plan.",
+        "Your 7-day trial has ended. Upgrade to keep Headroom optimizing your prompts.",
       actionLabel: "Upgrade",
       onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
     };
