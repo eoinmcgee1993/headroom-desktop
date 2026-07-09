@@ -3566,7 +3566,7 @@ export default function App() {
               </p>
             ) : (
               <AuthCodeForm
-                lead="Enter your email to start your free 7-day trial. We'll send a one-time code — no credit card required."
+                lead="Enter your email to start your free 7-day trial."
                 email={authEmail}
                 onEmailChange={setAuthEmail}
                 emailValid={authEmailValid}
