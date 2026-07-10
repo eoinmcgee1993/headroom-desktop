@@ -5089,9 +5089,6 @@ export default function App() {
                 {showUpgradeSavingsLine ? (
                   <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
                 ) : null}
-                {launchPromoLine ? (
-                  <p className="callout-banner__subtitle">{launchPromoLine}</p>
-                ) : null}
                 {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
                   <p className="callout-banner__subtitle">Now use your connected tools as normal, and check back later to see how much you are saving by using Headroom.</p>
                 )}
