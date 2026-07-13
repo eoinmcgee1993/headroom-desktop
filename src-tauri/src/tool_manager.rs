@@ -1834,6 +1834,42 @@ impl ToolManager {
         Ok(self.runtime.clone())
     }
 
+    /// Download-only warm-up for the consented bootstrap: pulls the two big
+    /// network artifacts (standalone Python tarball, pinned headroom wheel)
+    /// into `downloads_dir` while the user is still in signup/client-setup.
+    /// Nothing is extracted or installed and nothing outside `downloads_dir`
+    /// changes — `python_runtime_installed()` and every other installed-gate
+    /// stays false, so consent semantics remain with bootstrap. Destinations
+    /// and sha checks are identical to bootstrap's own download calls, which
+    /// therefore skip instantly when they find these files.
+    /// ponytail: pip's dependency downloads (the ~60-90s "Updating
+    /// dependencies" step) can't be prefetched without extracting Python
+    /// first — revisit only if the remaining install time still hurts.
+    pub fn prefetch_bootstrap_artifacts(&self) -> Result<()> {
+        self.runtime.ensure_layout()?;
+        if !self.runtime.standalone_python().exists() {
+            let artifact = python_distribution_artifact()?;
+            let archive_path = self.runtime.downloads_dir.join("python-standalone.tar.gz");
+            download_to_path(&artifact.url, &archive_path, artifact.sha256)?;
+        }
+        if !self.runtime.managed_python().exists() {
+            download_to_path(
+                HEADROOM_PINNED_WHEEL_URL,
+                &self.wheel_download_path(HEADROOM_PINNED_VERSION),
+                Some(HEADROOM_PINNED_SHA256),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Shared by the prefetch and the install/upgrade paths so a prefetched
+    /// wheel always lands exactly where the installer looks for it.
+    fn wheel_download_path(&self, version: &str) -> PathBuf {
+        self.runtime
+            .downloads_dir
+            .join(format!("headroom_ai-{version}-py3-none-any.whl"))
+    }
+
     fn install_python_distribution<F>(&self, mut emit_step: F) -> Result<()>
     where
         F: FnMut(BootstrapStepUpdate),
@@ -2015,10 +2051,7 @@ impl ToolManager {
     {
         let requirements_lock = bootstrap_requirements_lock();
         let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
-        let wheel_path = self
-            .runtime
-            .downloads_dir
-            .join(format!("headroom_ai-{}-py3-none-any.whl", release.version));
+        let wheel_path = self.wheel_download_path(&release.version);
 
         progress(BootstrapStepUpdate {
             step: "Downloading update",
@@ -4976,6 +5009,18 @@ fn download_to_path_with_progress<F>(
 where
     F: FnMut(u64, Option<u64>),
 {
+    // One artifact download at a time, process-wide. The pre-consent prefetch
+    // and the consented bootstrap can otherwise race the same `.partial`
+    // file; holding the lock across the exists+sha check below means
+    // whichever caller runs second sees the finished file and skips.
+    // ponytail: a bootstrap that starts mid-prefetch blocks on a static
+    // progress frame until the in-flight artifact completes; cancellation is
+    // the upgrade path if that stall ever matters.
+    static ARTIFACT_DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _download_guard = ARTIFACT_DOWNLOAD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     if destination.exists() {
         if let Some(expected_sha256) = expected_sha256 {
             match verify_sha256_file(destination, expected_sha256) {
@@ -6652,6 +6697,31 @@ mod tests {
         let raw = "proxy---port-6768---log-messages---learn";
         let cleaned = sanitize_log_variant(raw);
         assert_eq!(cleaned, raw);
+    }
+
+    #[test]
+    fn prefetch_bootstrap_artifacts_is_a_no_op_when_runtime_is_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = ManagedRuntime::bootstrap_root(dir.path());
+        for marker in [runtime.standalone_python(), runtime.managed_python()] {
+            fs::create_dir_all(marker.parent().expect("parent")).expect("mkdir");
+            fs::write(&marker, b"").expect("marker");
+        }
+        let downloads_dir = runtime.downloads_dir.clone();
+
+        // Both gates satisfied: must succeed without attempting any network
+        // download (an attempt would be a gate bug, and flaky offline).
+        ToolManager::new(runtime)
+            .prefetch_bootstrap_artifacts()
+            .expect("no-op prefetch succeeds");
+
+        let leftovers: Vec<_> = fs::read_dir(&downloads_dir)
+            .expect("downloads dir exists")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no-op prefetch must not write into downloads: {leftovers:?}"
+        );
     }
 
     #[test]

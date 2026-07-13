@@ -38,7 +38,8 @@ export const INSTALL_WIZARD_STEPS = [
   "bootstrap_completed",
   "bootstrap_failed",
   "post_install_shown",
-  "first_optimized_request"
+  "first_optimized_request",
+  "first_savings_recorded"
 ] as const;
 
 export type InstallWizardStep = (typeof INSTALL_WIZARD_STEPS)[number];

@@ -186,6 +186,7 @@ struct AvailableAppUpdate {
 }
 
 static ZERO_SPEND_ALERT_FIRED: AtomicBool = AtomicBool::new(false);
+static ZERO_SAVINGS_ALERT_FIRED: AtomicBool = AtomicBool::new(false);
 
 // Set when the watchdog has captured a Sentry event for the current "down
 // episode". Reset whenever the proxy is observed reachable again, so a
@@ -204,6 +205,16 @@ static PORT_CONFLICT_CAPTURED: AtomicBool = AtomicBool::new(false);
 // `configured_clients` is already empty, leaving nothing for the next launch's
 // `restore_client_setups()` to bring back.
 static EXIT_CLEAR_DONE: AtomicBool = AtomicBool::new(false);
+
+// Set at the start of every exit path (settings/tray quit, Cmd-Q / dock quit,
+// restart_app) BEFORE stop_headroom runs. The proxy watchdog polls every 5s
+// and restarts an unreachable backend; without this flag a probe that races
+// exit teardown respawns the backend stop_headroom just killed, leaving an
+// orphaned Python proxy holding the port against the next launch (observed:
+// "watchdog: ... attempting restart" logged 1s into quit teardown).
+// Checked at the watchdog loop top and inside ensure_headroom_running, the
+// choke point every respawn path routes through.
+pub(crate) static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 // Spend fields (actual_cost_usd, total_tokens_sent) were added to SavingsRecord in
 // schema v6, shipped in 0.2.40 on 2026-04-13. Records written before that date
@@ -287,6 +298,66 @@ fn check_zero_spend_anomaly(dashboard: &DashboardState) {
     );
 }
 
+/// Bug-shaped funnel drop: the backend has processed a meaningful number of
+/// requests but lifetime savings never moved off zero — an optimizer or
+/// config problem, not churn. One fingerprinted event; fires once per process
+/// like the zero-spend probe above.
+fn check_zero_savings_anomaly(dashboard: &DashboardState) {
+    const MIN_LIFETIME_REQUESTS: usize = 25;
+    if ZERO_SAVINGS_ALERT_FIRED.load(Ordering::Relaxed) {
+        return;
+    }
+    if dashboard.lifetime_requests < MIN_LIFETIME_REQUESTS
+        || dashboard.lifetime_estimated_tokens_saved > 0
+    {
+        return;
+    }
+    ZERO_SAVINGS_ALERT_FIRED.store(true, Ordering::Relaxed);
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["zero-savings-anomaly"]));
+            scope.set_extra("lifetime_requests", dashboard.lifetime_requests.into());
+        },
+        || {
+            sentry::capture_message(
+                "backend processed requests but lifetime savings is still zero",
+                sentry::Level::Warning,
+            );
+        },
+    );
+}
+
+/// Setup finished, but the backend has never processed a single request —
+/// the classic cause is a terminal/editor still running with the pre-install
+/// environment. One native notification, once ever (persisted flag), only on
+/// a return launch, and only after ten minutes of uptime so a returning user
+/// who codes right away moots it before it fires.
+fn maybe_fire_onboarding_recovery_nudge(
+    app: &AppHandle,
+    state: &AppState,
+    dashboard: &DashboardState,
+) {
+    static FIRST_POLLED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let first_polled_at = *FIRST_POLLED_AT.get_or_init(std::time::Instant::now);
+    if first_polled_at.elapsed() < std::time::Duration::from_secs(10 * 60) {
+        return;
+    }
+    if dashboard.lifetime_requests > 0 {
+        return;
+    }
+    if !state.try_mark_onboarding_recovery_notified() {
+        return;
+    }
+    let _ = show_notification_impl(
+        app,
+        "Headroom isn't seeing any traffic",
+        "Setup finished, but no Claude Code or Codex requests have come through yet. \
+         Restart your terminal or editor so they pick up the new settings.",
+        None,
+    );
+    analytics::track_event(app, "onboarding_recovery_nudge_shown", None);
+}
+
 /// Test affordance (opt-in via env, works in release/RC builds): when
 /// HEADROOM_FAKE_WEEKLY_GATE is set, overwrite daily savings with a synthetic
 /// 7-day history so the upgrade-banner dollar figures render on a fresh machine
@@ -355,6 +426,8 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         }
 
         check_zero_spend_anomaly(&dashboard);
+        check_zero_savings_anomaly(&dashboard);
+        maybe_fire_onboarding_recovery_nudge(&app, &state, &dashboard);
 
         maybe_inject_fake_daily_savings(&mut dashboard);
 
@@ -487,6 +560,7 @@ async fn restart_app(app: AppHandle) {
         log::info!("restart_app: already in progress, ignoring duplicate invocation");
         return;
     }
+    SHUTTING_DOWN.store(true, Ordering::Release);
 
     // Tauri 2.x has an open bug on macOS (tauri-apps/tauri#13923, #11392)
     // where `request_restart()` and `restart()` exit the process but never
@@ -865,6 +939,26 @@ async fn uninstall_addon(
 
 fn emit_bootstrap_progress(app: &AppHandle, state: &AppState) {
     let _ = app.emit("bootstrap_progress", state.bootstrap_progress());
+}
+
+/// Fire-and-forget, download-only warm-up for the consented bootstrap: pulls
+/// the Python tarball and pinned wheel into the downloads cache while the
+/// user is still in signup/client-setup. Failures log at info, not warn —
+/// offline here is normal (bootstrap simply downloads later) and warn would
+/// ship every offline launcher to Sentry.
+#[tauri::command]
+fn prefetch_bootstrap_artifacts(app: AppHandle) {
+    std::thread::spawn(move || {
+        let state: tauri::State<'_, AppState> = app.state();
+        let started = std::time::Instant::now();
+        match state.tool_manager.prefetch_bootstrap_artifacts() {
+            Ok(()) => log::info!(
+                "bootstrap artifact prefetch finished in {:.1}s",
+                started.elapsed().as_secs_f64()
+            ),
+            Err(err) => log::info!("bootstrap artifact prefetch skipped: {err:#}"),
+        }
+    });
 }
 
 #[tauri::command]
@@ -3324,6 +3418,7 @@ fn launched_from_autostart() -> bool {
 }
 
 fn exit_headroom(app: &AppHandle, source: QuitSource) {
+    SHUTTING_DOWN.store(true, Ordering::Release);
     let runtime_paused = {
         let state: tauri::State<'_, AppState> = app.state();
         let runtime_paused = state.runtime_is_paused();
@@ -3616,6 +3711,7 @@ pub fn run() {
             install_addon,
             set_addon_enabled,
             uninstall_addon,
+            prefetch_bootstrap_artifacts,
             start_bootstrap,
             get_bootstrap_progress,
             get_runtime_upgrade_progress,
@@ -3689,6 +3785,7 @@ pub fn run() {
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
+                SHUTTING_DOWN.store(true, Ordering::Release);
                 let state: tauri::State<'_, AppState> = app.state();
                 state.stop_headroom();
                 // Gracefully reverse every client's base-URL override (and shell
@@ -4732,6 +4829,9 @@ fn spawn_proxy_watchdog(app: AppHandle) {
 
         loop {
             std::thread::sleep(POLL);
+            if SHUTTING_DOWN.load(Ordering::Acquire) {
+                return;
+            }
             let now_wall = std::time::SystemTime::now();
             let elapsed = now_wall
                 .duration_since(last_tick_wall)

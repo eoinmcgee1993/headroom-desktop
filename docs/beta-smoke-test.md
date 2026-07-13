@@ -48,7 +48,7 @@ In Settings, toggle Pause then Resume. After Pause, `cat ~/.claude/settings.json
 ### 7. Proxy is actively optimizing this conversation (not just a heartbeat)
 The proxy always runs in `token` mode now (`HEADROOM_MODE=token`, hardcoded — cache mode and the old auth-based mode auto-switch were removed; see `tool_manager.rs`). So `.summary.mode` reports `token` for *every* session, including a Claude Code subscription/OAuth one — don't branch on it. What actually differs per request is the **compression policy**, chosen by the auth-mode classifier (`classify_auth_mode` in the proxy) from the client `User-Agent`:
 
-- **Claude Code subscription/OAuth** (UA `claude-code/`, the normal desktop case) is classified `SUBSCRIPTION` → conservative policy (`live_zone_only=True`, cache-aligner off). The proxy only compresses the **uncached live zone** and freezes the already-cached prefix, so `prefix_frozen` moves while the *cumulative* compression counters move only modestly. The right liveness signal here is `prefix_frozen` + `cache_savings_usd`.
+- **Claude Code subscription/OAuth** (UA `claude-code/`, the normal desktop case) is classified `SUBSCRIPTION` → conservative policy (`live_zone_only=True`, cache-aligner off). The proxy only compresses the **uncached live zone** and freezes the already-cached prefix. Which counter moves depends on the live zone: a request with any live-zone savings counts in `requests_compressed`, while `uncompressed_requests.prefix_frozen` only counts requests the pipeline returned fully unchanged — zero savings (see `build_session_summary` in the proxy's `cost.py`). The right liveness signal here is `cache_savings_usd` plus movement in *either* counter.
 - **Pay-per-token API-key / Codex traffic** is classified `PAYG`/`OAUTH` → aggressive policy, so `requests_compressed` and `total_tokens_removed` move directly.
 
 This policy gate is itself guarded by `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT=enabled` (pinned explicitly in `tool_manager.rs`). If that ever reads disabled, subscription traffic silently falls back to the PAYG-aggressive policy and starts busting the prefix cache — a net loss on cache-billed sessions. Pick the sub-check matching the traffic you're driving.
@@ -58,12 +58,12 @@ Timing matters either way: a `Read` result becomes part of Claude's *next* outgo
 **Claude Code subscription/OAuth traffic** (UA `claude-code/`, classified `SUBSCRIPTION`):
 1. Capture the baseline:
    ```bash
-   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
+   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
    ```
 2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1300-1500 lines is plenty).
 3. On the *next* turn, re-run the same `jq` command.
 
-Expect: `primary_model` is a `claude-*` model, `prefix_frozen` increased by at least 1 (the cached prefix was preserved, not rewritten), `cache_savings_usd` is strictly greater, and `total_tokens_before` jumped by roughly the size of the Read. A bumped mtime on `activity-facts.json` is not enough — interception alone would still touch that file without delivering savings. `requests_compressed` may or may not move here and is *not* the signal for subscription traffic.
+Expect: `primary_model` is a `claude-*` model, `cache_savings_usd` is strictly greater (the cached prefix was preserved, not busted), `total_tokens_before` jumped by at least the size of the Read, and `prefix_frozen` + `requests_compressed` together increased by at least 1. The large Read all but guarantees live-zone savings, so in practice the increment lands in `requests_compressed`; `prefix_frozen` only counts requests returned fully unchanged, so it can legitimately stay flat for a whole session (observed on a healthy 0.6.9-rc.1: `prefix_frozen` flat at 17 while cache savings climbed). A bumped mtime on `activity-facts.json` is not enough — interception alone would still touch that file without delivering savings.
 
 **Pay-per-token API-key traffic** (classified `PAYG`/`OAUTH` — this is also the branch Codex hits; the Codex pass below adds a Codex-attributed version):
 1. Capture the baseline:
@@ -93,9 +93,10 @@ curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:6767/livez"
 ```
 Expect: at least one `127.0.0.1:67XX` line in the 6768-6790 range, and the curl returns `200`.
 
-Then, force a fallback. Quit Headroom, hold 6768 with a Python blocker (`nc -l` exits after one connection, so the proxy's first probe frees the port before fallback can trigger), relaunch, and confirm the proxy comes up on a different port. The proxy on a fallback port boots cold (memory tools / model load), so poll `/livez` for up to 90s instead of a fixed sleep:
+Then, force a fallback. Quit Headroom, hold 6768 with a Python blocker (`nc -l` exits after one connection, so the proxy's first probe frees the port before fallback can trigger), relaunch, and confirm the proxy comes up on a different port. Two timing traps here. First: the quit must wait for the process to actually die — teardown takes 2s+ (`stop_headroom`'s bounded SIGTERM wait plus Codex thread retagging), and `open -a` against a still-dying instance just activates it, so nothing relaunches and the check strands with no app running (a fixed `sleep 2` loses this race; the executable is `headroom-desktop`, not `Headroom`, so poll with `pgrep -x headroom-desktop`). Second: the proxy on a fallback port boots cold (memory tools / model load), so poll `/livez` for up to 90s instead of a fixed sleep:
 ```bash
-osascript -e 'quit app "Headroom"' 2>/dev/null; sleep 2
+osascript -e 'quit app "Headroom"' 2>/dev/null
+for _ in $(seq 1 30); do pgrep -xq headroom-desktop || break; sleep 0.5; done
 python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6768)); s.listen(16); time.sleep(180)" &
 BLOCK_PID=$!
 sleep 1
@@ -109,7 +110,12 @@ echo "livez=$code"
 lsof -iTCP -sTCP:LISTEN -nP 2>/dev/null | awk -v IGNORECASE=1 '$1 ~ /(headroom|python)/ && $9 ~ /:(67[6-9][0-9]|6790)/ { print $9 }'
 kill $BLOCK_PID 2>/dev/null
 ```
-Expect: `livez=200`, a `127.0.0.1:67XX` line where `XX` is NOT `68` (the fallback worked). After the test, quit + relaunch Headroom so the next session goes back to 6768.
+Expect: `livez=200`, a `127.0.0.1:67XX` line where `XX` is NOT `68` (the fallback worked). After the test, restore the default port with the same wait-for-exit pattern (this relaunch loses the teardown race even more often, because the fallback instance was just cold-booted):
+```bash
+osascript -e 'quit app "Headroom"' 2>/dev/null
+for _ in $(seq 1 30); do pgrep -xq headroom-desktop || break; sleep 0.5; done
+open -a Headroom
+```
 
 If the fallback is missing, check `~/Library/Application Support/Headroom/headroom/logs/` for a `[backend_port]` warning line that names the occupant and the chosen fallback port.
 

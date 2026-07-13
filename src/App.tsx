@@ -1390,10 +1390,18 @@ export default function App() {
     ) {
       return;
     }
-    trackInstallMilestoneOnce("first_savings_recorded", {
-      lifetime_tokens_saved: dashboard.lifetimeEstimatedTokensSaved,
-      lifetime_savings_usd: Number(dashboard.lifetimeEstimatedSavingsUsd.toFixed(4))
-    });
+    if (
+      trackInstallMilestoneOnce("first_savings_recorded", {
+        lifetime_tokens_saved: dashboard.lifetimeEstimatedTokensSaved,
+        lifetime_savings_usd: Number(dashboard.lifetimeEstimatedSavingsUsd.toFixed(4))
+      })
+    ) {
+      // Funnel finish line: separates "requests flowed but nothing saved"
+      // (optimizer/config bug) from "never came back" (churn) in the admin
+      // wizard funnel. Server is first-write-wins, so a re-send after a
+      // cleared localStorage is harmless.
+      reportFunnelStep("first_savings_recorded");
+    }
   }, [dashboard.lifetimeEstimatedSavingsUsd, dashboard.lifetimeEstimatedTokensSaved]);
 
   useEffect(() => {
@@ -1780,6 +1788,15 @@ export default function App() {
       window.clearInterval(interval);
     };
   }, [windowLabel, launcherStage, interceptOnlyVerify]);
+
+  // Warm the bootstrap download cache while the user is still signing up.
+  // Download-only: nothing is installed until they consent on the install
+  // step, and the Rust side no-ops when the runtime already exists, so this
+  // is safe to fire on every launcher mount.
+  useEffect(() => {
+    if (windowLabel !== "launcher") return;
+    void invoke("prefetch_bootstrap_artifacts").catch(() => {});
+  }, [windowLabel]);
 
   // One beacon per launcher stage the user reaches. Single source for the
   // "stage shown" funnel steps; sub-steps (client_setup_applied, proxy_verified,
@@ -4400,6 +4417,15 @@ export default function App() {
   if (
     windowLabel === "launcher" && launcherStage === "post_install"
   ) {
+    // The tray's 5s dashboard poll keeps running under the launcher window,
+    // so a first-run user who sends a prompt sees this screen flip from
+    // "waiting" to their first real savings without any interaction — the
+    // payoff moment stays inside onboarding instead of being deferred to a
+    // later session that a third of signups never have.
+    const awaitingFirstSavings =
+      dashboard.launchExperience === "first_run" &&
+      dashboard.lifetimeEstimatedTokensSaved <= 0 &&
+      dashboard.lifetimeEstimatedSavingsUsd <= 0;
     return (
       <LauncherShell
         shellClassName="intro-shell intro-shell--post-install"
@@ -4414,14 +4440,17 @@ export default function App() {
             <br />
             in the background
           </h1>
-          {dashboard.launchExperience === "first_run" ? (
-            <p>
-              Send your first prompt and Headroom will start reducing costs automatically.
+          {awaitingFirstSavings ? (
+            <p className="post-install__waiting">
+              <span className="callout-banner__dot callout-banner__dot--healthy" aria-hidden="true" />
+              Send a prompt in Claude Code or Codex — your first savings will show up right here.
             </p>
           ) : (
             <>
               <p>
-                It will trim prompt bloat whenever you use Claude Code or Codex.
+                {dashboard.launchExperience === "first_run"
+                  ? "That prompt went through Headroom — your first savings are in."
+                  : "It will trim prompt bloat whenever you use Claude Code or Codex."}
               </p>
               <div className="post-install__metrics">
                 <article className="soft-card stat-card">

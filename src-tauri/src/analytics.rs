@@ -28,6 +28,9 @@ const ALLOWED_EVENTS: &[&str] = &[
     "subscription_reactivated",
     "invite_code_used",
     "lifetime_tokens_saved_milestone_reached",
+    // At most once per install (persisted flag); measures how many users hit
+    // the "setup finished but no traffic ever" state.
+    "onboarding_recovery_nudge_shown",
     // Addon adoption (one event per addon, fired from install/enable/uninstall).
     "markitdown_installed",
     "markitdown_enabled",

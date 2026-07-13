@@ -1747,6 +1747,19 @@ impl AppState {
         persist_launch_profile(&self.launch_profile_path, &profile);
     }
 
+    /// One-shot gate for the "setup finished but no traffic ever" recovery
+    /// notification. True at most once per install. Flips and persists the
+    /// flag on the call that returns true.
+    pub fn try_mark_onboarding_recovery_notified(&self) -> bool {
+        let mut profile = self.launch_profile.lock();
+        if !onboarding_recovery_nudge_due(&profile) {
+            return false;
+        }
+        profile.onboarding_recovery_notified = true;
+        persist_launch_profile(&self.launch_profile_path, &profile);
+        true
+    }
+
     pub fn accepted_terms_version(&self) -> u32 {
         self.launch_profile.lock().accepted_terms_version
     }
@@ -2638,6 +2651,14 @@ impl AppState {
     }
 
     pub fn ensure_headroom_running(&self) -> Result<()> {
+        // Exit teardown is in progress: stop_headroom has run (or is about
+        // to), and a proxy spawned now would be orphaned when the process
+        // exits moments later, holding the port against the next launch.
+        // Unconditional — even mid-upgrade-validation, quit wins.
+        if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
+            log::info!("ensure_headroom_running: app is shutting down; not starting proxy");
+            return Ok(());
+        }
         if !self.tool_manager.python_runtime_installed() {
             return Ok(());
         }
@@ -3545,6 +3566,10 @@ struct LaunchProfile {
     /// re-prompted by the acceptance gate when `REQUIRED_TERMS_VERSION` > 0.
     #[serde(default)]
     accepted_terms_version: u32,
+    /// One-shot: the "setup finished but no traffic ever" recovery
+    /// notification has fired. Persisted so it can never nag twice.
+    #[serde(default)]
+    onboarding_recovery_notified: bool,
 }
 
 fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
@@ -3571,6 +3596,7 @@ impl LaunchProfile {
             last_launched_app_version: None,
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
+            onboarding_recovery_notified: false,
         }
     }
 
@@ -3640,6 +3666,15 @@ fn setup_wizard_satisfied_for_profile(
     legacy_clients_configured: bool,
 ) -> bool {
     profile.setup_wizard_complete || (profile.launch_count > 1 && legacy_clients_configured)
+}
+
+/// Whether the "setup finished but no traffic ever" nudge may still fire:
+/// wizard finished, this is a return launch (the install session itself is
+/// excluded so the nudge can't race the wizard), and it never fired before.
+fn onboarding_recovery_nudge_due(profile: &LaunchProfile) -> bool {
+    !profile.onboarding_recovery_notified
+        && profile.setup_wizard_complete
+        && profile.launch_count >= 2
 }
 
 /// Last classification that returned a non-Unknown tier. Persisted so the
@@ -4865,16 +4900,26 @@ fn parse_output_reduction(root: &Value) -> Option<OutputReduction> {
         return None;
     }
 
+    // A reduction is definitionally within [0, 100]. On a freshly-seeded
+    // baseline the synthetic-control estimate divides by a near-zero baseline
+    // and blows up (e.g. -6130%), which the dashboard renders as a
+    // double-negative "Output −-6,130.7%". Treat an out-of-range estimate as
+    // "baseline not ready yet" and hide the stat, same as available:false.
+    let reduction_percent = node
+        .get("reduction_percent")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    if !reduction_percent.is_finite() || !(0.0..=100.0).contains(&reduction_percent) {
+        return None;
+    }
+
     Some(OutputReduction {
         method: node
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or("estimated")
             .to_string(),
-        reduction_percent: node
-            .get("reduction_percent")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0),
+        reduction_percent,
         ci_low_percent: node
             .get("ci_low_percent")
             .and_then(Value::as_f64)
@@ -6468,6 +6513,7 @@ mod tests {
             last_launched_app_version: None,
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
+            onboarding_recovery_notified: false,
         };
 
         assert!(!super::setup_wizard_satisfied_for_profile(&profile, false));
@@ -6478,6 +6524,37 @@ mod tests {
 
         profile.setup_wizard_complete = true;
         assert!(super::setup_wizard_satisfied_for_profile(&profile, false));
+    }
+
+    #[test]
+    fn onboarding_recovery_nudge_due_requires_return_launch_and_fires_once() {
+        let mut profile = super::LaunchProfile {
+            launch_count: 2,
+            launch_experience: crate::models::LaunchExperience::Resume,
+            lifetime_requests: 0,
+            lifetime_estimated_savings_usd: 0.0,
+            lifetime_estimated_tokens_saved: 0,
+            setup_wizard_complete: true,
+            last_launched_app_version: None,
+            last_runtime_upgrade_failure: None,
+            accepted_terms_version: 0,
+            onboarding_recovery_notified: false,
+        };
+        assert!(super::onboarding_recovery_nudge_due(&profile));
+
+        // Install session itself never nudges.
+        profile.launch_count = 1;
+        assert!(!super::onboarding_recovery_nudge_due(&profile));
+        profile.launch_count = 2;
+
+        // Unfinished wizard never nudges.
+        profile.setup_wizard_complete = false;
+        assert!(!super::onboarding_recovery_nudge_due(&profile));
+        profile.setup_wizard_complete = true;
+
+        // Once fired, never again.
+        profile.onboarding_recovery_notified = true;
+        assert!(!super::onboarding_recovery_nudge_due(&profile));
     }
 
     #[test]
@@ -6505,6 +6582,7 @@ mod tests {
                 rollback_restored: true,
             }),
             accepted_terms_version: 3,
+            onboarding_recovery_notified: true,
         };
         super::persist_launch_profile(&path, &profile);
 
@@ -6525,6 +6603,7 @@ mod tests {
             crate::models::UpgradeFailurePhase::BootValidation
         );
         assert_eq!(round_tripped.accepted_terms_version, 3);
+        assert!(round_tripped.onboarding_recovery_notified);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -7624,6 +7703,32 @@ mod tests {
                 "savings": {
                     "by_layer": {
                         "output_shaping": { "available": false }
+                    }
+                }
+            }"#,
+        )
+        .expect("parsed stats");
+        assert!(parsed.output_reduction.is_none());
+    }
+
+    #[test]
+    fn parse_output_reduction_hides_out_of_range_estimate() {
+        // Fresh install: baseline barely seeded, synthetic control blows up
+        // negative. Must hide rather than render "Output −-6,130.7%".
+        let parsed = parse_headroom_stats_from_json(
+            r#"{
+                "requests": { "total": 5 },
+                "tokens": { "saved": 1200 },
+                "savings": {
+                    "by_layer": {
+                        "output_shaping": {
+                            "available": true,
+                            "method": "estimated",
+                            "reduction_percent": -6130.7,
+                            "ci_low_percent": -8000.0,
+                            "ci_high_percent": -4000.0,
+                            "requests": 3
+                        }
                     }
                 }
             }"#,

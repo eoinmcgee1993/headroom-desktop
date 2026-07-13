@@ -231,6 +231,16 @@ select {
   color: #5e5650;
 }
 
+.post-install__waiting {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.post-install__waiting .callout-banner__dot {
+  margin-top: 0;
+}
+
 .post-install__status {
   display: inline-flex;
   align-items: center;

@@ -312,9 +312,7 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
                 // we don't silently drop the user onto api.openai.com. Restored
                 // silently (no takeover notice — that copy is Claude/base_url
                 // specific).
-                state
-                    .preserved_base_urls
-                    .insert(state_id.clone(), original);
+                state.preserved_base_urls.insert(state_id.clone(), original);
             }
 
             // Loud-fail guard so a closed app or clobbered config surfaces in
@@ -2243,7 +2241,8 @@ fn restore_codex_model_provider(provider: &str) -> Result<()> {
     };
     let _ = backup_if_exists(&path)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     atomic_write(&path, rebuilt.as_bytes())?;
     Ok(())
@@ -3703,7 +3702,10 @@ fn expand_env_vars(raw: &str) -> String {
                 .unwrap_or(raw.len());
             (&raw[i + 1..end], end)
         };
-        match (!name.is_empty()).then(|| std::env::var(name).ok()).flatten() {
+        match (!name.is_empty())
+            .then(|| std::env::var(name).ok())
+            .flatten()
+        {
             Some(val) => out.push_str(&val),
             None => out.push_str(&raw[i..next]), // keep literal `$VAR` when unset
         }
@@ -6461,9 +6463,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         // A model_provider inside a table belongs to that table, not the route.
         assert_eq!(
-            super::codex_foreign_model_provider(
-                "[profiles.work]\nmodel_provider = \"gateway\"\n"
-            ),
+            super::codex_foreign_model_provider("[profiles.work]\nmodel_provider = \"gateway\"\n"),
             None,
         );
         assert_eq!(super::codex_foreign_model_provider(""), None);
@@ -6536,7 +6536,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "the pre-Headroom provider is restored on disable, got:\n{after_disable}"
         );
         assert!(
-            parsed.get("model_providers").and_then(|m| m.get("gateway")).is_some(),
+            parsed
+                .get("model_providers")
+                .and_then(|m| m.get("gateway"))
+                .is_some(),
             "user provider table survives the round trip, got:\n{after_disable}"
         );
     }
