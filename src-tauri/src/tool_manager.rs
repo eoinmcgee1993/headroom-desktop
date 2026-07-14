@@ -930,11 +930,11 @@ impl ToolManager {
                     // so the raw error leaks back to the client. Fresh
                     // connection per request avoids reuse of a poisoned socket.
                     .env("HEADROOM_MAX_KEEPALIVE", "0")
-                    // Optimization mode. Always token: maximize raw-token savings via
-                    // prior-turn compression. (Cache mode and the auth-based auto-switch
-                    // were removed; cache mode contributed no measurable savings over
-                    // Claude Code's native prefix caching.)
-                    .env("HEADROOM_MODE", "token")
+                    // Optimization mode. Trying cache: align prior-turn edits to
+                    // the provider prefix cache rather than maximizing raw-token
+                    // savings via compression (which can bust Claude Code's native
+                    // prefix caching on cache-billed sessions).
+                    .env("HEADROOM_MODE", "cache")
                     // Off-path background compression (#1171). The Kompress ML pass
                     // over the stable prefix is CPU-bound Rust that releases the GIL,
                     // so 3+ concurrent Claude Code sessions run their passes in true
