@@ -930,11 +930,13 @@ impl ToolManager {
                     // so the raw error leaks back to the client. Fresh
                     // connection per request avoids reuse of a poisoned socket.
                     .env("HEADROOM_MAX_KEEPALIVE", "0")
-                    // Optimization mode. Trying cache: align prior-turn edits to
-                    // the provider prefix cache rather than maximizing raw-token
-                    // savings via compression (which can bust Claude Code's native
-                    // prefix caching on cache-billed sessions).
-                    .env("HEADROOM_MODE", "cache")
+                    // Optimization mode. token: compress the frozen tool_result
+                    // history for real raw-token savings. cache mode was tested and
+                    // reverted -- on Claude Code subscription traffic it is ~a no-op
+                    // (CacheAligner ships enabled=False, so the prefix-cache discount
+                    // is 100% client-driven; cache mode only avoids busting it and
+                    // adds no compression), leaving the savings chart flat.
+                    .env("HEADROOM_MODE", "token")
                     // Off-path background compression (#1171). The Kompress ML pass
                     // over the stable prefix is CPU-bound Rust that releases the GIL,
                     // so 3+ concurrent Claude Code sessions run their passes in true
