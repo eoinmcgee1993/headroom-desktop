@@ -1039,9 +1039,34 @@ pub(crate) fn activate_account_with_base_url(
         return Err(msg);
     }
 
-    let body: RemoteAccountEnvelope = response.json().map_err(|err| {
+    // Read text first: reqwest's `.json()` collapses body-read failures and
+    // serde mismatches into one opaque "error decoding response body"
+    // (Sentry RUST-58). Splitting them makes the serde error name the field
+    // and lets us see the raw body when the server didn't send JSON at all.
+    let raw = response.text().map_err(|err| {
+        let msg = format!("Could not read Headroom activation response: {err}");
+        if !is_transient_transport_error(&err) {
+            sentry::capture_message(&msg, sentry::Level::Error);
+        }
+        msg
+    })?;
+    let body: RemoteAccountEnvelope = serde_json::from_str(&raw).map_err(|err| {
         let msg = format!("Could not parse Headroom activation response: {err}");
-        sentry::capture_message(&msg, sentry::Level::Error);
+        sentry::with_scope(
+            |scope| {
+                // Serde errors vary by line/column; one fingerprint keeps them
+                // a single issue.
+                scope.set_fingerprint(Some(&["activation-parse-error"]));
+                // Snippet only when the body isn't JSON (HTML error page,
+                // empty body); a valid-JSON schema mismatch is described by
+                // `err` itself and may carry account data.
+                if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+                    let snippet: String = raw.chars().take(300).collect();
+                    scope.set_extra("body_snippet", snippet.into());
+                }
+            },
+            || sentry::capture_message(&msg, sentry::Level::Error),
+        );
         msg
     })?;
     let local_state = reconcile_local_state_with_server(state)?;
@@ -4434,6 +4459,39 @@ mod tests {
         let account = result.account.expect("account profile populated");
         assert_eq!(account.email, "user@example.com");
         assert!(account.trial_active);
+        drop_state(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn activate_account_reports_parse_error_on_non_json_body() {
+        // A 200 whose body is an HTML error page (CDN/proxy interference,
+        // Sentry RUST-58) must surface as a parse error, not a decode panic.
+        use std::io::{Read, Write};
+        let _env = AuthedTestEnv::new("session-xyz");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind raw server");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "<html><body>502 Bad Gateway</body></html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        let (state, dir) = temp_app_state();
+
+        let err =
+            super::activate_account_with_base_url(&state, 0, &format!("http://127.0.0.1:{port}"))
+                .expect_err("non-JSON body surfaces as parse error");
+        server.join().unwrap();
+        assert!(
+            err.contains("Could not parse Headroom activation response"),
+            "got: {err}"
+        );
         drop_state(dir);
     }
 

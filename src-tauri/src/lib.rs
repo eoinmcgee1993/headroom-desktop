@@ -268,6 +268,32 @@ fn zero_spend_affected_days<'a>(
         .collect()
 }
 
+// day -> first Instant it was observed desynced this process. The backend's
+// cost counter transiently lags its savings accumulator (self-heals within a
+// rollup), and a single-snapshot probe latched exactly that window on 11
+// machines (Sentry RUST-4S). Healed days are pruned; only a day still
+// desynced a full window later is a real pipeline anomaly.
+static ZERO_SPEND_FIRST_SEEN: Mutex<std::collections::BTreeMap<String, std::time::Instant>> =
+    Mutex::new(std::collections::BTreeMap::new());
+const ZERO_SPEND_PERSIST_WINDOW: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Track desynced days across probe calls; true once any day has stayed
+/// desynced for `window`.
+fn persistent_zero_spend(
+    first_seen: &mut std::collections::BTreeMap<String, std::time::Instant>,
+    affected_days: &[&str],
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> bool {
+    first_seen.retain(|day, _| affected_days.contains(&day.as_str()));
+    for day in affected_days {
+        first_seen.entry((*day).to_string()).or_insert(now);
+    }
+    first_seen
+        .values()
+        .any(|&seen| now.duration_since(seen) >= window)
+}
+
 fn check_zero_spend_anomaly(dashboard: &DashboardState) {
     if ZERO_SPEND_ALERT_FIRED.load(Ordering::Relaxed) {
         return;
@@ -278,7 +304,12 @@ fn check_zero_spend_anomaly(dashboard: &DashboardState) {
         .format("%Y-%m-%d")
         .to_string();
     let affected_days = zero_spend_affected_days(&dashboard.daily_savings, &min_date);
-    if affected_days.is_empty() {
+    if !persistent_zero_spend(
+        &mut ZERO_SPEND_FIRST_SEEN.lock(),
+        &affected_days,
+        std::time::Instant::now(),
+        ZERO_SPEND_PERSIST_WINDOW,
+    ) {
         return;
     }
     ZERO_SPEND_ALERT_FIRED.store(true, Ordering::Relaxed);
@@ -5692,8 +5723,8 @@ mod tests {
         is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
         noop_app_update_progress_emitter, parse_live_learnings,
         parse_request_count_from_stats_body, parse_request_counts_by_agent,
-        parse_updater_endpoint_list, pattern_matches_project, physical_rect_from_rect,
-        read_applied_patterns_for_project, readyz_failed_checks_csv,
+        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, resolve_release_updater_config, select_updater_endpoints,
         store_checked_update, watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
@@ -5812,6 +5843,44 @@ mod tests {
             zero_spend_affected_days(&days, "2026-07-02"),
             vec!["2026-07-03"]
         );
+    }
+
+    #[test]
+    fn zero_spend_requires_desync_to_persist_across_probes() {
+        use std::time::{Duration, Instant};
+        let mut first_seen = std::collections::BTreeMap::new();
+        let window = Duration::from_secs(600);
+        let t0 = Instant::now();
+
+        // First sighting never fires.
+        assert!(!persistent_zero_spend(
+            &mut first_seen,
+            &["2026-07-13"],
+            t0,
+            window
+        ));
+        // Still inside the window: no fire.
+        assert!(!persistent_zero_spend(
+            &mut first_seen,
+            &["2026-07-13"],
+            t0 + Duration::from_secs(60),
+            window
+        ));
+        // Backend healed (day dropped out), then re-desynced: timer restarts.
+        assert!(!persistent_zero_spend(&mut first_seen, &[], t0, window));
+        assert!(!persistent_zero_spend(
+            &mut first_seen,
+            &["2026-07-13"],
+            t0 + window,
+            window
+        ));
+        // Same day still desynced a full window later: fire.
+        assert!(persistent_zero_spend(
+            &mut first_seen,
+            &["2026-07-13"],
+            t0 + window + window,
+            window
+        ));
     }
 
     #[test]

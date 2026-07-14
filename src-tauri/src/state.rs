@@ -457,6 +457,12 @@ pub struct AppState {
     pub runtime_upgrade_in_progress: Mutex<bool>,
     pub runtime_upgrade_progress: Mutex<RuntimeUpgradeProgress>,
     pub last_startup_error: Mutex<Option<String>>,
+    /// Exit status of the last tracked child that died on its own (not via
+    /// `stop_headroom`). Every `runtime_status` poll reaps an exited child and
+    /// used to discard the status, so a crash-looping backend reached the
+    /// watchdog give-up capture as "still_alive_or_untracked" with no exit
+    /// code (Sentry RUST-53). Cleared on each successful spawn.
+    pub last_child_natural_exit: Mutex<Option<String>>,
     pub bootstrap_progress: Mutex<BootstrapProgress>,
     pub headroom_learn_state: Mutex<HeadroomLearnRuntimeState>,
     /// Last Claude AI OAuth bearer token seen passing through the proxy intercept.
@@ -628,6 +634,7 @@ impl AppState {
                 to_version: None,
             }),
             last_startup_error: Mutex::new(None),
+            last_child_natural_exit: Mutex::new(None),
             bootstrap_progress: Mutex::new(BootstrapProgress {
                 running: false,
                 complete: false,
@@ -1431,18 +1438,25 @@ impl AppState {
     /// Returns true if the tracked Headroom process has DEFINITIVELY exited.
     ///
     /// Only reports exited on `Ok(Some(status))` — i.e., the OS told us the
-    /// child reaped. `None` (no tracked child) is NOT treated as exited,
-    /// because `ensure_headroom_running` intentionally skips spawning when
-    /// the intercept layer already reports the proxy reachable; in that
-    /// case there's a live proxy we just don't own the Child handle for.
-    /// `Err` (child was reaped by someone else) is also not treated as
-    /// exited — the OS-level process may well still be serving traffic.
+    /// child reaped — or on a natural death recorded by an earlier reap
+    /// (`last_child_natural_exit`; the runtime_status pollers race this call
+    /// and clear the handle first). A bare `None` handle with no recorded
+    /// death is NOT treated as exited, because `ensure_headroom_running`
+    /// intentionally skips spawning when the intercept layer already reports
+    /// the proxy reachable; in that case there's a live proxy we just don't
+    /// own the Child handle for. `Err` (child was reaped by someone else) is
+    /// also not treated as exited — the OS-level process may well still be
+    /// serving traffic.
     pub(crate) fn headroom_process_exited(&self) -> Option<String> {
         let mut guard = self.headroom_process.lock();
         match guard.as_mut() {
-            None => None,
+            None => self.last_child_natural_exit.lock().clone(),
             Some(child) => match child.try_wait() {
-                Ok(Some(status)) => Some(format!("{status}")),
+                Ok(Some(status)) => {
+                    let status = format!("{status}");
+                    *self.last_child_natural_exit.lock() = Some(status.clone());
+                    Some(status)
+                }
                 Ok(None) => None,
                 Err(err) => {
                     log::warn!(
@@ -2749,7 +2763,11 @@ impl AppState {
             if let Some(existing) = process.as_mut() {
                 match existing.try_wait() {
                     Ok(None) => return Ok(()),
-                    Ok(Some(_)) | Err(_) => {
+                    Ok(Some(status)) => {
+                        *self.last_child_natural_exit.lock() = Some(format!("{status}"));
+                        *process = None;
+                    }
+                    Err(_) => {
                         *process = None;
                     }
                 }
@@ -2770,6 +2788,9 @@ impl AppState {
             Ok(child) => {
                 *self.headroom_process.lock() = Some(child);
                 *self.last_startup_error.lock() = None;
+                // Fresh child: a death recorded for its predecessor is no
+                // longer diagnostic of the current episode.
+                *self.last_child_natural_exit.lock() = None;
                 Ok(())
             }
             Err(err) => {
@@ -2826,7 +2847,15 @@ impl AppState {
             if let Some(existing) = process.as_mut() {
                 match existing.try_wait() {
                     Ok(None) => Some(existing.id()),
-                    Ok(Some(_)) | Err(_) => {
+                    Ok(Some(status)) => {
+                        // Keep the status: this poller runs every few seconds
+                        // and reaps a crashed child before the watchdog's
+                        // give-up capture can ask how it died (RUST-53).
+                        *self.last_child_natural_exit.lock() = Some(format!("{status}"));
+                        *process = None;
+                        None
+                    }
+                    Err(_) => {
                         *process = None;
                         None
                     }
