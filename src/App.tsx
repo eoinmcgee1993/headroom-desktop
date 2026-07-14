@@ -6438,6 +6438,12 @@ export default function App() {
                   <li>Delete <code>~/Library/Preferences/com.extraheadroom.headroom*</code> and <code>~/Library/Caches/com.extraheadroom.headroom</code></li>
                   <li>Delete Headroom's keychain entries (session token plus any API keys saved by older builds)</li>
                 </ul>
+                <p className="uninstall-note">
+                  Terminals already open keep <code>ANTHROPIC_BASE_URL</code>{" "}
+                  exported until you restart them. If Claude reports a
+                  connection error after uninstalling, open a new terminal or run{" "}
+                  <code>unset ANTHROPIC_BASE_URL</code>.
+                </p>
                 <p>You can reinstall at any time by launching Headroom again.</p>
                 {uninstallError ? (
                   <p className="install-progress__error">{uninstallError}</p>

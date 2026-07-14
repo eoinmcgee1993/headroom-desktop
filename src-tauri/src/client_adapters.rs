@@ -780,6 +780,29 @@ pub fn perform_full_cleanup() -> Vec<String> {
         }
     }
 
+    // Independently strip the ANTHROPIC_BASE_URL routing env and the Claude
+    // guard hook. clear_client_setups() above also removes these via
+    // disable_client_setup, but only after remove_shell_block succeeds (it runs
+    // under `?` before them): a shell-rc failure there silently leaves both in
+    // place, and each bricks Claude once the proxy is gone (stale base URL ->
+    // dead 127.0.0.1:6767; guard hook errors on every prompt). Do them
+    // unconditionally here. Idempotent: each only acts on Headroom's own value,
+    // restoring any preserved pre-Headroom gateway URL.
+    let preserved = load_setup_state()
+        .preserved_base_urls
+        .get(normalized_setup_id("claude_code"))
+        .cloned();
+    if let Err(err) = remove_claude_settings_env(
+        "ANTHROPIC_BASE_URL",
+        HEADROOM_ANTHROPIC_BASE_URL,
+        preserved.as_deref(),
+    ) {
+        log::warn!("cleanup: removing ANTHROPIC_BASE_URL from Claude settings failed: {err}");
+    }
+    if let Err(err) = remove_claude_guard_hook() {
+        log::warn!("cleanup: removing Claude guard hook failed: {err}");
+    }
+
     for hook_path in [headroom_rtk_hook_path(), headroom_markitdown_hook_path()] {
         if hook_path.exists() {
             match std::fs::remove_file(&hook_path) {
@@ -5629,6 +5652,63 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             ss.contains("headroom-claude-guard.py"),
             "guard still registered on SessionStart, got:\n{settings:#}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn full_cleanup_strips_base_url_and_guard_when_shell_block_removal_fails() {
+        // Regression: perform_full_cleanup used to remove ANTHROPIC_BASE_URL and
+        // the guard hook ONLY via clear_client_setups -> disable_client_setup,
+        // where remove_shell_block runs first under `?`. A failure there left the
+        // routing env and the guard hook in place, both of which brick Claude
+        // once the proxy is gone. Force that failure and confirm cleanup still
+        // strips them.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"hooks": {}}"#,
+        )
+        .unwrap();
+        seed_installed_rtk();
+
+        super::apply_client_setup("claude_code").expect("apply");
+
+        let settings_path = home.path().join(".claude").join("settings.json");
+        let guard_script = home
+            .path()
+            .join(".claude")
+            .join("hooks")
+            .join("headroom-claude-guard.py");
+        assert_eq!(
+            read_settings_json(&settings_path)["env"]["ANTHROPIC_BASE_URL"].as_str(),
+            Some("http://127.0.0.1:6767"),
+            "precondition: base url wired"
+        );
+        assert!(guard_script.exists(), "precondition: guard script written");
+
+        // Sabotage a shell target: a directory where remove_managed_block expects
+        // a file makes read_to_string fail, so disable_client_setup("claude_code")
+        // bails before it reaches base-url / guard removal.
+        let zshrc = home.path().join(".zshrc");
+        fs::remove_file(&zshrc).unwrap();
+        fs::create_dir(&zshrc).unwrap();
+
+        super::perform_full_cleanup();
+
+        assert!(settings_path.exists(), "settings.json preserved");
+        let after = read_settings_json(&settings_path);
+        assert!(
+            after["env"]["ANTHROPIC_BASE_URL"].is_null(),
+            "base url stripped despite shell-block failure, got:\n{after:#}"
+        );
+        assert!(
+            !serde_json::to_string(&after["hooks"]).unwrap().contains("headroom-claude-guard.py"),
+            "guard hook stripped despite shell-block failure, got:\n{after:#}"
+        );
+        assert!(!guard_script.exists(), "guard script deleted");
     }
 
     #[test]

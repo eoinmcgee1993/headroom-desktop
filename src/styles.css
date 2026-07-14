@@ -3102,6 +3102,12 @@ details[open] .optimize-minimal__details summary::after {
   color: var(--text-secondary);
 }
 
+.uninstall-note {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: 1.4;
+}
+
 .modal-card label {
   font-size: var(--text-xs);
   color: var(--text-secondary);
