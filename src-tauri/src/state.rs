@@ -708,26 +708,18 @@ impl AppState {
         self.enforce_pricing_gate();
         self.stop_python_if_gated();
 
-        // rtk is pinned to a specific version in source. On an app upgrade the
-        // bundled binary on disk can be stale because bootstrap only runs on
-        // first-run. Reinstall if the receipt's version doesn't match the
-        // pinned version. install_rtk hits GitHub Releases, so this needs
-        // network — failure here is logged and we move on.
-        match self.tool_manager.ensure_rtk_current() {
-            Ok(true) => log::info!("rtk refreshed to pinned version on launch"),
-            Ok(false) => {}
-            Err(err) => log::warn!("rtk version check on launch failed: {err}"),
-        }
-
-        if let Err(err) = ensure_rtk_integrations(
-            &self.tool_manager.rtk_entrypoint(),
-            &self.tool_manager.managed_python(),
-        ) {
-            log::warn!("RTK integrations failed during warm_runtime_on_launch: {err:#}");
-        }
-
-        // App-version-triggered atomic runtime upgrade. Replaces the old
-        // receipt-vs-pinned drift path.
+        // App-version-triggered atomic runtime upgrade. Runs here — right after
+        // the (local, cached) pricing gate and BEFORE the rtk GitHub refresh
+        // below — because this is the work the user clicked "Restart now" for,
+        // and the decision is a local receipt-vs-pin comparison with no network.
+        // ensure_rtk_current() hits GitHub Releases and can stall for seconds on
+        // a slow link; keeping the upgrade ahead of it means the "Preparing
+        // update" progress UI appears within milliseconds of launch instead of
+        // after that network round-trip, so the app no longer looks dead while a
+        // slow connection resolves rtk. The pricing gate stays ahead of the
+        // upgrade on purpose: run_upgrade_with_ui reads the gate flags at the end
+        // of boot validation to decide whether to stop the validation Python.
+        // Replaces the old receipt-vs-pinned drift path.
         if self.should_run_runtime_upgrade(app) {
             // Auto-trigger never forces rebuild — that's reserved for the
             // user-facing "Retry with full rebuild" recovery flow.
@@ -744,6 +736,25 @@ impl AppState {
             if self.can_stamp_no_maintenance(&current_app_version) {
                 self.stamp_app_version(&current_app_version);
             }
+        }
+
+        // rtk is pinned to a specific version in source. On an app upgrade the
+        // bundled binary on disk can be stale because bootstrap only runs on
+        // first-run. Reinstall if the receipt's version doesn't match the
+        // pinned version. install_rtk hits GitHub Releases, so this needs
+        // network — failure here is logged and we move on. Ordered AFTER the
+        // runtime upgrade so a slow GitHub round-trip can't delay the upgrade UI.
+        match self.tool_manager.ensure_rtk_current() {
+            Ok(true) => log::info!("rtk refreshed to pinned version on launch"),
+            Ok(false) => {}
+            Err(err) => log::warn!("rtk version check on launch failed: {err}"),
+        }
+
+        if let Err(err) = ensure_rtk_integrations(
+            &self.tool_manager.rtk_entrypoint(),
+            &self.tool_manager.managed_python(),
+        ) {
+            log::warn!("RTK integrations failed during warm_runtime_on_launch: {err:#}");
         }
 
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
@@ -3822,6 +3833,12 @@ struct PersistedSavingsState {
     last_observation: Option<SavingsObservation>,
     display_session_baseline: Option<SavingsObservation>,
     session_savings_history: Vec<HeadroomSavingsHistoryPoint>,
+    /// Cumulative new-input (uncached + cache-write) sampled once per stats
+    /// poll. Same shape as `session_savings_history`, but the `u64` holds
+    /// tokens SENT, not saved. Diffed per hour to give the chart a real
+    /// per-bucket denominator instead of smearing the session total across
+    /// hours in proportion to savings.
+    session_new_input_history: Vec<HeadroomSavingsHistoryPoint>,
     session_hourly_buckets: BTreeMap<String, DailySavingsBucket>,
     daily_savings: BTreeMap<String, DailySavingsBucket>,
     hourly_savings: BTreeMap<String, DailySavingsBucket>,
@@ -3842,6 +3859,7 @@ struct SavingsTracker {
     last_observation: Option<SavingsObservation>,
     display_session_baseline: Option<SavingsObservation>,
     session_savings_history: Vec<HeadroomSavingsHistoryPoint>,
+    session_new_input_history: Vec<HeadroomSavingsHistoryPoint>,
     session_hourly_buckets: BTreeMap<String, DailySavingsBucket>,
     daily_savings: BTreeMap<String, DailySavingsBucket>,
     hourly_savings: BTreeMap<String, DailySavingsBucket>,
@@ -3929,6 +3947,9 @@ impl SavingsTracker {
             session_savings_history: persisted_state
                 .as_ref()
                 .map_or_else(Vec::new, |state| state.session_savings_history.clone()),
+            session_new_input_history: persisted_state
+                .as_ref()
+                .map_or_else(Vec::new, |state| state.session_new_input_history.clone()),
             session_hourly_buckets: persisted_state
                 .as_ref()
                 .map_or_else(BTreeMap::new, |state| state.session_hourly_buckets.clone()),
@@ -4176,13 +4197,37 @@ impl SavingsTracker {
         };
         if reset_detected {
             self.session_savings_history.clear();
+            self.session_new_input_history.clear();
         }
         self.session_savings_history =
             merge_session_savings_history(&self.session_savings_history, &stats.savings_history);
+        // Sample the cumulative new-input scalar into its own series, pinned to
+        // the proxy's latest request timestamp so it buckets alongside the saved
+        // series. One point per poll: between polls the proxy may have handled
+        // several requests, so a hop across an hour boundary lumps that gap's
+        // sent tokens into the later hour (sub-poll fuzz; the saved numerator
+        // stays exact because the proxy reports it per request).
+        if let Some(sent_total) = session_total_tokens_sent {
+            let sampled_at = stats
+                .savings_history
+                .last()
+                .map(|point| point.timestamp)
+                .unwrap_or_else(Utc::now);
+            self.session_new_input_history = merge_session_savings_history(
+                &self.session_new_input_history,
+                &[HeadroomSavingsHistoryPoint {
+                    timestamp: sampled_at,
+                    total_tokens_saved: sent_total,
+                }],
+            );
+        }
 
         let previous_session_hourly_buckets = self.session_hourly_buckets.clone();
-        let current_session_hourly_buckets =
-            derive_session_hourly_buckets(stats, &self.session_savings_history);
+        let current_session_hourly_buckets = derive_session_hourly_buckets(
+            stats,
+            &self.session_savings_history,
+            &self.session_new_input_history,
+        );
         let current_session_hourly_buckets_map = current_session_hourly_buckets
             .iter()
             .cloned()
@@ -4507,6 +4552,7 @@ impl SavingsTracker {
             last_observation: self.last_observation.clone(),
             display_session_baseline: self.display_session_baseline.clone(),
             session_savings_history: self.session_savings_history.clone(),
+            session_new_input_history: self.session_new_input_history.clone(),
             session_hourly_buckets: self.session_hourly_buckets.clone(),
             daily_savings: self.daily_savings.clone(),
             hourly_savings: self.hourly_savings.clone(),
@@ -5374,6 +5420,7 @@ fn should_rollover_display_session(
 fn derive_session_buckets_with_key<F>(
     stats: &HeadroomDashboardStats,
     history: &[HeadroomSavingsHistoryPoint],
+    sent_history: &[HeadroomSavingsHistoryPoint],
     bucket_key_for_timestamp: F,
 ) -> Vec<(String, DailySavingsBucket)>
 where
@@ -5421,7 +5468,46 @@ where
         }
     }
 
-    if total_tokens > 0 && total_tokens_sent > 0 {
+    // Per-hour denominator. Prefer the real thing: diff the cumulative
+    // new-input series (sampled once per poll) the same way as saved above.
+    // A single reading only carries the session cumulative, and the first
+    // sample's baseline can't be attributed to an hour — so the sampled deltas
+    // only cover sent that landed *after* the app started observing this proxy
+    // session. When coverage is thin (cold start, attach-to-running-proxy,
+    // rolling-window truncation) fall back to the old proportional smear rather
+    // than under-report; once sampling accounts for ~all session sent, use it
+    // and every hour shows its true ratio instead of the session-wide one.
+    let mut sampled_sent: BTreeMap<String, u64> = BTreeMap::new();
+    let mut sampled_total = 0u64;
+    if let Some(first_sent) = sent_history.first().copied() {
+        let mut previous_sent = first_sent.total_tokens_saved;
+        for point in sent_history.iter().copied().skip(1) {
+            let delta_sent = point.total_tokens_saved.saturating_sub(previous_sent);
+            previous_sent = point.total_tokens_saved;
+            if delta_sent == 0 {
+                continue;
+            }
+            sampled_total = sampled_total.saturating_add(delta_sent);
+            let bucket_key = bucket_key_for_timestamp(point.timestamp.with_timezone(&Local));
+            *sampled_sent.entry(bucket_key).or_default() += delta_sent;
+        }
+    }
+    // ponytail: coverage threshold. 0.9 = sampled deltas must account for >=90%
+    // of session sent before we trust per-hour attribution. Raise if the chart
+    // flickers between smear and real early in sessions; lower to switch sooner.
+    let sampling_covers_session =
+        total_tokens_sent > 0 && sampled_total as f64 >= 0.9 * total_tokens_sent as f64;
+
+    if sampling_covers_session {
+        // Real per-hour sent. A bucket may appear for an hour with no saved
+        // delta — an honest 0%-savings hour.
+        for (bucket_key, sent) in sampled_sent {
+            buckets.entry(bucket_key).or_default().total_tokens_sent = sent;
+        }
+    } else if total_tokens > 0 && total_tokens_sent > 0 {
+        // Fallback: smear the session total across buckets in proportion to
+        // savings. Every hour reads the session-wide ratio, but nothing is
+        // dumped or under-counted while sampling coverage is still thin.
         let keys = buckets.keys().cloned().collect::<Vec<_>>();
         for key in keys.iter() {
             let bucket = buckets.get_mut(key).expect("bucket exists");
@@ -5473,8 +5559,9 @@ fn merge_session_savings_history(
 fn derive_session_hourly_buckets(
     stats: &HeadroomDashboardStats,
     history: &[HeadroomSavingsHistoryPoint],
+    sent_history: &[HeadroomSavingsHistoryPoint],
 ) -> Vec<(String, DailySavingsBucket)> {
-    derive_session_buckets_with_key(stats, history, local_hour_key)
+    derive_session_buckets_with_key(stats, history, sent_history, local_hour_key)
 }
 
 fn diff_hourly_buckets(
@@ -5863,20 +5950,54 @@ fn probe_proxy_readyz(timeout: Duration) -> bool {
         client
             .get(format!("http://{host}:6767/readyz"))
             .send()
-            .map(|response| proxy_readyz_status_is_reachable(response.status()))
+            .map(proxy_readyz_response_is_reachable)
             .unwrap_or(false)
     })
 }
 
-/// Whether a `/readyz` HTTP status means the proxy is up and serving.
+/// Whether a `/readyz` response means the proxy is up and serving.
+///
+/// 2xx / 404 are reachable via [`proxy_readyz_status_is_reachable`]. A 503 whose
+/// *only* failing check is `upstream` is also reachable: the process is alive
+/// and answering, and the upstream-connectivity probe is cached 30s and
+/// self-heals on the next refresh. Counting it as down flaps the UI banner
+/// "crashed" on every transient network blip even though nothing restarted
+/// (mirrors the watchdog's `readyz_failure_is_upstream_only`). Any other 503 /
+/// 5xx stays not-reachable so the watchdog keeps waiting / restarting.
+fn proxy_readyz_response_is_reachable(response: reqwest::blocking::Response) -> bool {
+    let status = response.status();
+    if proxy_readyz_status_is_reachable(status) {
+        return true;
+    }
+    if status.as_u16() == 503 {
+        return response
+            .text()
+            .map(|body| proxy_readyz_503_body_is_upstream_only(&body))
+            .unwrap_or(false);
+    }
+    false
+}
+
+/// Whether a `/readyz` HTTP status alone means the proxy is up and serving.
 ///
 /// 2xx is ready. A 404 means an older proxy build that predates the `/readyz`
 /// route is answering -- it's up and serving traffic, just lacks the endpoint,
 /// so it must count as reachable or the watchdog auto-pauses a working proxy
-/// (Sentry RUST-2X). A 503 (current proxy up but not ready) and any 5xx stay
-/// not-reachable so the watchdog keeps waiting / restarting as before.
+/// (Sentry RUST-2X). A 503 is inconclusive from the status line alone --
+/// `proxy_readyz_response_is_reachable` inspects the body to tell an
+/// upstream-only blip from a wedged core; every other 5xx stays not-reachable.
 fn proxy_readyz_status_is_reachable(status: reqwest::StatusCode) -> bool {
     status.is_success() || status == reqwest::StatusCode::NOT_FOUND
+}
+
+/// True when a 503 `/readyz` body's only unhealthy component is `upstream`.
+/// Reuses the watchdog's per-check parser so both paths agree on what a
+/// healthy-but-upstream-blipped process looks like. False when the body can't be
+/// parsed (a bare 503 under load) -- conservative, matching the status-only path.
+fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .map(|json| crate::readyz_failed_checks_csv(&json) == "upstream")
+        .unwrap_or(false)
 }
 
 fn kill_processes_by_command_pattern(pattern: &str) -> Result<()> {
@@ -6075,7 +6196,8 @@ mod tests {
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
-        proxy_readyz_status_is_reachable, rebuild_persisted_savings_from_records,
+        proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
+        rebuild_persisted_savings_from_records,
         tcp_port_accepts_connection, total_dir_size_bytes, AppState, BootValidationOutcome,
         ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
         PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
@@ -6094,6 +6216,23 @@ mod tests {
         assert!(!proxy_readyz_status_is_reachable(
             StatusCode::INTERNAL_SERVER_ERROR
         ));
+    }
+
+    #[test]
+    fn readyz_503_upstream_only_body_counts_as_reachable() {
+        // Only the cached upstream probe is down: process alive and serving, so
+        // don't flap the UI banner "crashed" on a transient network blip.
+        let upstream_only =
+            r#"{"checks":{"startup":{"ready":true},"upstream":{"ready":false}}}"#;
+        assert!(proxy_readyz_503_body_is_upstream_only(upstream_only));
+        // A core component down is a real readiness failure: stay unreachable.
+        let core_down = r#"{"checks":{"cache":{"ready":false},"upstream":{"ready":false}}}"#;
+        assert!(!proxy_readyz_503_body_is_upstream_only(core_down));
+        // Bare / unparseable 503 body (body read starved under load): conservative.
+        assert!(!proxy_readyz_503_body_is_upstream_only("not json"));
+        // Nothing unhealthy (shouldn't be a 503, but be safe): not upstream-only.
+        let all_ready = r#"{"checks":{"upstream":{"ready":true}}}"#;
+        assert!(!proxy_readyz_503_body_is_upstream_only(all_ready));
     }
 
     #[test]
@@ -6711,6 +6850,7 @@ mod tests {
             last_observation: None,
             display_session_baseline: None,
             session_savings_history: Vec::new(),
+            session_new_input_history: Vec::new(),
             session_hourly_buckets: std::collections::BTreeMap::new(),
             daily_savings: std::collections::BTreeMap::new(),
             hourly_savings: std::collections::BTreeMap::new(),
@@ -8453,6 +8593,57 @@ mod tests {
     }
 
     #[test]
+    fn multi_poll_sampling_gives_real_per_hour_sent_not_the_smear() {
+        // Three polls sample the cumulative new-input scalar over time. Once the
+        // sampled deltas cover ~all session sent, each hour gets its true sent
+        // (6000 / 4000) instead of the savings-proportional smear (~3333 / 6667).
+        let mut tracker = make_tracker();
+
+        for (requests, saved, sent, history) in [
+            (1usize, 0u64, 0u64, vec![history_point_at(2026, 3, 20, 8, 0)]),
+            (
+                2,
+                1_000,
+                6_000,
+                vec![
+                    history_point_at(2026, 3, 20, 8, 0),
+                    history_point_at(2026, 3, 20, 9, 1_000),
+                ],
+            ),
+            (
+                3,
+                3_000,
+                10_000,
+                vec![
+                    history_point_at(2026, 3, 20, 8, 0),
+                    history_point_at(2026, 3, 20, 9, 1_000),
+                    history_point_at(2026, 3, 20, 10, 3_000),
+                ],
+            ),
+        ] {
+            tracker
+                .observe(&HeadroomDashboardStats {
+                    output_reduction: None,
+                    session_requests: Some(requests),
+                    session_estimated_savings_usd: Some(saved as f64 / 1000.0),
+                    session_estimated_tokens_saved: Some(saved),
+                    session_savings_pct: Some(30.0),
+                    session_actual_cost_usd: Some(1.0),
+                    session_total_tokens_sent: Some(sent),
+                    savings_history: history,
+                })
+                .expect("snapshot");
+        }
+
+        let hourly = tracker.hourly_savings();
+        assert_eq!(hourly.len(), 2);
+        assert_eq!(hourly[0].estimated_tokens_saved, 1_000);
+        assert_eq!(hourly[0].total_tokens_sent, 6_000);
+        assert_eq!(hourly[1].estimated_tokens_saved, 2_000);
+        assert_eq!(hourly[1].total_tokens_sent, 4_000);
+    }
+
+    #[test]
     fn rolling_window_does_not_dump_unattributable_remainder_into_last_hour() {
         let mut tracker = make_tracker();
 
@@ -8632,6 +8823,7 @@ mod tests {
             }),
             display_session_baseline: None,
             session_savings_history: Vec::new(),
+            session_new_input_history: Vec::new(),
             session_hourly_buckets: std::collections::BTreeMap::new(),
             daily_savings: std::collections::BTreeMap::new(),
             hourly_savings: std::collections::BTreeMap::new(),

@@ -1595,7 +1595,7 @@ fn classify_backend_readyz(
 /// Comma-joined, sorted names of the unhealthy components in a `/readyz`
 /// payload — those whose `checks.<name>.ready` is `false`. Empty when the body
 /// has no `checks` object or every check is ready.
-fn readyz_failed_checks_csv(body: &serde_json::Value) -> String {
+pub(crate) fn readyz_failed_checks_csv(body: &serde_json::Value) -> String {
     let Some(checks) = body.get("checks").and_then(|c| c.as_object()) else {
         return String::new();
     };

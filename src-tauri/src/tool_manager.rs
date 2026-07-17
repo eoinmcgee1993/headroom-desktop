@@ -887,6 +887,11 @@ impl ToolManager {
                     log::warn!("[tool_manager] writing pyinject/sitecustomize.py failed: {err}");
                 }
 
+                // Holdout is off (HEADROOM_OUTPUT_HOLDOUT=0); clear any control
+                // samples an earlier holdout collected so the proxy reports the
+                // synthetic-control estimate instead of a broken "measured" one.
+                purge_output_savings_control_arm();
+
                 // Wrap with `nice` so headroom yields CPU to foreground apps
                 // (Claude Code, terminal, etc.) when the machine is contended.
                 // On idle systems headroom still runs at full speed.
@@ -994,15 +999,14 @@ impl ToolManager {
                     // baseline still feeds the /stats savings estimate. Level 2 =
                     // skip pre/postamble, don't restate in-context code/tool output.
                     .env("HEADROOM_VERBOSITY_LEVEL", "2")
-                    // Output-shaper A/B holdout: route 1% of conversations UNSHAPED
-                    // as a control arm so `output-savings` reports a MEASURED
-                    // reduction (unbiased treatment-vs-control) instead of a
-                    // synthetic-control estimate. 1% (not the doc's 10%) keeps the
-                    // shaping sacrifice tiny; the ~36% effect + high request volume
-                    // still reach a usable CI, just over more calendar time.
-                    // assign_arm hashes the conversation key, so a conversation
-                    // stays in one arm across its turns.
-                    .env("HEADROOM_OUTPUT_HOLDOUT", "0.01")
+                    // No A/B holdout: shape every conversation. A 1% unshaped
+                    // control arm was tried, but a near-empty control produced a
+                    // wildly wrong "measured" reduction (e.g. -1439.9% from a
+                    // handful of stale samples), so we stopped collecting it. With
+                    // holdout 0 the proxy reports the synthetic-control estimate.
+                    // purge_output_savings_control_arm() clears control samples
+                    // collected while the holdout was on.
+                    .env("HEADROOM_OUTPUT_HOLDOUT", "0")
                     // Agent savings persona (new in headroom-ai 0.30.0). The
                     // `proxy` entrypoint reads HEADROOM_SAVINGS_PROFILE into
                     // config.savings_profile, and proxy_pipeline_kwargs() applies
@@ -5454,6 +5458,49 @@ fn output_savings_ledger_path() -> Option<PathBuf> {
     )
 }
 
+/// Core of [`purge_output_savings_control_arm`]: given the ledger bytes, return
+/// rewritten bytes when a non-empty `control` arm was cleared, else `None`
+/// (missing/empty control, or unparseable input we must not clobber).
+fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut ledger = serde_json::from_slice::<Value>(bytes).ok()?;
+    let has_control = ledger
+        .get("control")
+        .and_then(Value::as_object)
+        .is_some_and(|c| !c.is_empty());
+    if !has_control {
+        return None;
+    }
+    ledger
+        .as_object_mut()?
+        .insert("control".to_string(), json!({}));
+    serde_json::to_vec(&ledger).ok()
+}
+
+/// Drop the output-shaper A/B control arm from the savings ledger.
+///
+/// The desktop no longer runs a holdout (HEADROOM_OUTPUT_HOLDOUT=0), but control
+/// samples collected while it was on keep the proxy's `best_estimate` pinned to
+/// the "measured" number — which, on a near-empty control arm, blows up to
+/// nonsense (e.g. -1439.9% from 3 stale samples). Emptying `control` makes the
+/// proxy's `estimate_from_holdout` return None, so /stats falls back to the
+/// synthetic-control estimate. Idempotent one-shot, best-effort: never touch a
+/// missing or unparseable ledger, and only rewrite when there is control data to
+/// drop. Uses atomic_write so a crash mid-write can't truncate the ledger.
+fn purge_output_savings_control_arm() {
+    let Some(path) = output_savings_ledger_path() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let Some(out) = ledger_bytes_without_control(&bytes) else {
+        return;
+    };
+    if let Err(err) = crate::client_adapters::atomic_write(&path, &out) {
+        log::warn!("[tool_manager] purging output_savings control arm failed: {err}");
+    }
+}
+
 /// True once the verbosity baseline has been seeded (non-empty sample count).
 /// The persisted baseline does not carry a `total_samples` field — that is a
 /// computed property of the in-memory model. On disk the total observation
@@ -6052,7 +6099,8 @@ mod tests {
         diagnose_proxy_port, extract_required_pydantic_core_version, format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
-        is_outdated_codex, looks_like_corrupt_venv_error, parse_major_minor_patch,
+        is_outdated_codex, ledger_bytes_without_control, looks_like_corrupt_venv_error,
+        parse_major_minor_patch,
         parse_pid_from_lsof_detail, path_with_binary_dir, pre_upstream_concurrency,
         probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
@@ -6065,6 +6113,23 @@ mod tests {
     use crate::backend_port;
     use crate::port_conflict;
     use std::net::TcpListener;
+
+    #[test]
+    fn ledger_purge_clears_nonempty_control_only() {
+        // Non-empty control -> rewrite with control emptied; baseline/treatment kept.
+        let with_control =
+            br#"{"baseline":{"glob":{"n":5}},"treatment":{"k":{"n":3}},"control":{"k":{"n":2}}}"#;
+        let out = ledger_bytes_without_control(with_control).expect("rewrite when control present");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["control"].as_object().unwrap().len(), 0);
+        assert_eq!(v["treatment"]["k"]["n"], 3);
+        assert_eq!(v["baseline"]["glob"]["n"], 5);
+
+        // Empty control, absent control, and unparseable input -> no rewrite.
+        assert!(ledger_bytes_without_control(br#"{"control":{}}"#).is_none());
+        assert!(ledger_bytes_without_control(br#"{"treatment":{"k":{"n":1}}}"#).is_none());
+        assert!(ledger_bytes_without_control(b"{not json").is_none());
+    }
 
     #[test]
     fn is_checksum_mismatch_detects_bail_through_context_layers() {
