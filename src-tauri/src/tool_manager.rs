@@ -36,10 +36,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// `*-manylinux_*` abi3 wheel from
 /// https://pypi.org/pypi/headroom-ai/<version>/json and add a per-platform
 /// wheel-picker (mirroring `python_distribution_artifact`).
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.31.0";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/93/eb/2abb3553f3a5c9321b2ebb64d11eec79a3cf0c0956698f1e0a33181e2f4c/headroom_ai-0.31.0-cp310-abi3-macosx_11_0_arm64.whl";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.32.0";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/67/76/8c71c4ba11ea39bee6ddb614fbe804e16799cc936ead728b9e4fcaa29588/headroom_ai-0.32.0-cp310-abi3-macosx_11_0_arm64.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "cc342c55b1b148931ead076a4eede5528b4afadd09475f68292619eeb3237553";
+    "5fe97b008d607542c82d2c886591f43257a5724e75c89da8a0957582e2a28173";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On

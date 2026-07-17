@@ -1,9 +1,22 @@
 # Reviewed known-good Headroom runtime lock.
-# Source: headroom-ai[all,vector]==0.28.0 dependency resolution captured on
-# 2026-06-30 for cp312 / macOS 14 arm64 (min deployment target 14.0).
+# Source: headroom-ai[all,vector]==0.32.0 dependency resolution for cp312 /
+# macOS 14 arm64 (min deployment target 14.0). Base pins captured on 2026-06-30,
+# carried forward and topped up per bump (see lineage).
 #
 # Resolution lineage: 0.25.0 freeze -> carried to 0.26.0/0.27.0 -> regenerated
-# for 0.28.0. The 0.28.0 requires_dist changed enough that the lock was re-
+# for 0.28.0 (base of the current pin set) -> carried through 0.29.0-0.31.0
+# point-version churn -> 0.32.0.
+#   - 0.32.0: two new hard deps landed in 0.32.0's requires_dist for the
+#     installed [all,vector] set: tomlkit (unconditional core) and orjson
+#     (proxy extra, CPython-only via `platform_python_implementation != "PyPy"`).
+#     Both are leaf packages (no transitive deps), so they are appended without
+#     re-resolving. headroom-ai installs --no-deps against this lock, so a
+#     missing pin here is a ModuleNotFoundError at proxy boot, not a resolver
+#     warning. Every other 0.32.0 requirement was already satisfied by the
+#     carried-forward pins (verified against 0.32.0 requires_dist); rapidocr and
+#     tomli also appear in requires_dist but are gated out on cp312 by their
+#     python_version markers (>=3.13 and <3.11 respectively).
+#   The 0.28.0 requires_dist changed enough that the lock was re-
 # resolved from scratch rather than hand-patched. Notable deltas vs 0.27.0:
 #   - benchmark extra dropped from headroom-ai[all], removing the eval tooling
 #     tail (lm-eval, evaluate, sacrebleu, rouge-score, nltk, pytablewriter,
@@ -92,6 +105,7 @@ opentelemetry-exporter-otlp-proto-http==1.43.0
 opentelemetry-proto==1.43.0
 opentelemetry-sdk==1.43.0
 opentelemetry-semantic-conventions==0.64b0
+orjson==3.11.9
 packaging==26.2
 pandas==3.0.3
 pillow==12.2.0
@@ -135,6 +149,7 @@ threadpoolctl==3.6.0
 tiktoken==0.13.0
 tld==0.13.2
 tokenizers==0.22.2
+tomlkit==0.15.1
 torch==2.12.1
 tqdm==4.68.3
 trafilatura==2.1.0

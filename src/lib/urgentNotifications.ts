@@ -202,6 +202,63 @@ export async function maybeFireUrgentRuntimeNotification(
   );
 }
 
+// Local day, not UTC: a UTC key flips the throttle window mid-afternoon for US
+// users, letting two nudges land in one local day (and training people to
+// disable notifications on the channel urgent alerts share).
+function localDayKey(now: Date): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+    now.getDate()
+  ).padStart(2, "0")}`;
+}
+
+// Upsell nudges (the tier-mismatch upgrade prompt) are non-urgent marketing, so
+// they carry three throttles the operational alerts don't: never overnight
+// (quiet hours), at most twice per local day, and at least a few hours apart.
+// This is the path that woke under-subscribed users at 2 AM. Operational alerts
+// (auth, runtime down, optimization actually off) keep their any-hour
+// once-a-day path.
+const UPSELL_NUDGE_KEY = "headroom_upsell_nudge_date";
+const UPSELL_MAX_PER_DAY = 2;
+const UPSELL_MIN_GAP_MS = 6 * 60 * 60 * 1000;
+const QUIET_START_HOUR = 22; // 10 PM local
+const QUIET_END_HOUR = 8; // 8 AM local
+
+// Fire the upgrade nudge if it's daytime, we're under the daily cap, and enough
+// time has passed since the last one. State is packed as "YYYY-MM-DD|count|lastMs"
+// under one key. Returns true only when a notification actually showed.
+export async function fireUpsellNudge(
+  title: string,
+  body: string
+): Promise<boolean> {
+  const now = new Date();
+  const hour = now.getHours();
+  if (hour >= QUIET_START_HOUR || hour < QUIET_END_HOUR) return false;
+
+  const today = localDayKey(now);
+  const nowMs = now.getTime();
+  let count = 0;
+  let lastMs = 0;
+  const raw = localStorage.getItem(UPSELL_NUDGE_KEY);
+  if (raw) {
+    const [day, c, l] = raw.split("|");
+    if (day === today) {
+      count = Number(c) || 0;
+      lastMs = Number(l) || 0;
+    }
+  }
+  if (count >= UPSELL_MAX_PER_DAY) return false;
+  if (lastMs && nowMs - lastMs < UPSELL_MIN_GAP_MS) return false;
+
+  try {
+    await invoke("show_notification", { title, body, action: "billing" });
+    localStorage.setItem(UPSELL_NUDGE_KEY, `${today}|${count + 1}|${nowMs}`);
+    return true;
+  } catch {
+    // best-effort
+    return false;
+  }
+}
+
 // Returns true when a notification was actually shown (false when throttled).
 async function fireOncePerDay(
   storageKey: string,
@@ -209,13 +266,7 @@ async function fireOncePerDay(
   body: string,
   action: string
 ): Promise<boolean> {
-  // Local day, not UTC: with a UTC key the throttle window flips mid-afternoon
-  // for US users, letting two nudges land in one local day (and training
-  // people to disable notifications on the channel urgent alerts share).
-  const now = new Date();
-  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
-    now.getDate()
-  ).padStart(2, "0")}`;
+  const today = localDayKey(new Date());
   if (localStorage.getItem(storageKey) === today) return false;
   try {
     await invoke("show_notification", { title, body, action });

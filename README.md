@@ -47,6 +47,29 @@ Headroom sits in your menu bar and does three things:
 
 The app ships as a slim Tauri shell (~a few MB). Heavy Python components are fetched on first launch and kept in `~/Library/Application Support/Headroom`.
 
+### Proxy topology
+
+Headroom is a two-hop local proxy. Nothing leaves `127.0.0.1` except the final upstream call, which goes to the same API your client would have called directly.
+
+```
+Claude Code / Codex
+    |  ANTHROPIC_BASE_URL = http://127.0.0.1:6767
+    |  OPENAI_BASE_URL    = http://127.0.0.1:6767/v1
+    v
+:6767  Rust intercept proxy (always-on, fixed port)
+    |  forwards locally
+    v
+:6768  managed Python backend (headroom + rtk pipeline)
+    |  optimizes request/response, then calls the real API
+    v
+api.anthropic.com / api.openai.com
+```
+
+- **:6767** is the fixed intercept port. Clients are pointed at it, so it never moves. It is the only port your client config references.
+- **:6768** is the internal hop between the intercept proxy and the Python optimization backend. It is configurable and, if the default is already bound, the proxy probes `6768-6790` and falls back to the first free port.
+- Routing is set two ways so both interactive shells and GUI launches pick it up: an `env` block in `~/.claude/settings.json` (Claude Code) and an `export` in a managed shell block (fenced with `# >>> headroom:... >>>` markers). Codex uses a provider block in `~/.codex/config.toml` plus `OPENAI_BASE_URL`.
+- On quit or uninstall, every one of these redirects is removed and clients talk to the upstream API directly again (see below).
+
 ## What Headroom changes on your system
 
 Full disclosure of every location Headroom writes to, so you can decide before installing. The install screen in the app shows the same list, and the uninstall flow reverses every item.

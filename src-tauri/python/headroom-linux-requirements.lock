@@ -3,10 +3,10 @@
 # because packages such as hnswlib do not ship broadly compatible Linux wheels
 # and cause bootstrap to fail on fresh machines.
 #
-# Versions kept in sync with headroom-requirements.lock (0.25.0 freeze on
-# 2026-06-12, carried to 0.27.0 on 2026-06-22) where the package overlaps. The
-# 0.27.0 lock moves (tree-sitter-language-pack, spreadsheet extra) do not touch
-# any package in this minimal subset, so no version here changes. We do not
+# Versions kept in sync with headroom-requirements.lock where the package
+# overlaps. 0.32.0 adds two new hard deps to headroom-ai's core/proxy
+# requires_dist that this subset installs -- tomlkit (core) and orjson (proxy) --
+# so both are added here too (leaf packages, no transitive deps). We do not
 # currently ship Linux from release-macos.yml; when Linux is added, re-validate
 # this lock against a real Linux minimal install before relying on it.
 ast-grep-cli==0.42.2
@@ -19,10 +19,12 @@ mcp==1.27.1
 onnxruntime==1.26.0
 opentelemetry-api==1.41.1
 openai==2.37.0
+orjson==3.11.9
 pydantic==2.13.4
 rich==15.0.0
 sqlite-vec==0.1.9
 tiktoken==0.13.0
+tomlkit==0.15.1
 transformers==5.8.1
 uvicorn==0.47.0
 watchdog==6.0.0

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HeadroomPricingStatus, RuntimeStatus } from "./types";
 import {
   __resetRuntimeNotificationState,
+  fireUpsellNudge,
   maybeFireUrgentPricingNotifications,
   maybeFireUrgentRuntimeNotification,
 } from "./urgentNotifications";
@@ -699,5 +700,71 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     );
 
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("fireUpsellNudge", () => {
+  const KEY = "headroom_upsell_nudge_date";
+
+  afterEach(() => {
+    vi.useRealTimers();
+    invokeMock.mockReset();
+  });
+
+  it("suppresses overnight (quiet hours)", async () => {
+    installStorage();
+    invokeMock.mockResolvedValue(undefined);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 2, 0, 0)); // 2 AM local
+    expect(await fireUpsellNudge("t", "b")).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("fires during the day and records state", async () => {
+    const store = installStorage();
+    invokeMock.mockResolvedValue(undefined);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    expect(await fireUpsellNudge("Upgrade", "body")).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+      title: "Upgrade",
+      body: "body",
+      action: "billing",
+    });
+    expect(store.get(KEY)).toMatch(/^2026-01-15\|1\|/);
+  });
+
+  it("caps at two per local day", async () => {
+    installStorage();
+    invokeMock.mockResolvedValue(undefined);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 9, 0, 0));
+    expect(await fireUpsellNudge("t", "b")).toBe(true);
+    vi.setSystemTime(new Date(2026, 0, 15, 16, 0, 0)); // +7h, past the min gap
+    expect(await fireUpsellNudge("t", "b")).toBe(true);
+    vi.setSystemTime(new Date(2026, 0, 15, 21, 0, 0)); // still daytime, cap hit
+    expect(await fireUpsellNudge("t", "b")).toBe(false);
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("enforces a minimum gap between nudges", async () => {
+    installStorage();
+    invokeMock.mockResolvedValue(undefined);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 9, 0, 0));
+    expect(await fireUpsellNudge("t", "b")).toBe(true);
+    vi.setSystemTime(new Date(2026, 0, 15, 12, 0, 0)); // +3h < 6h gap
+    expect(await fireUpsellNudge("t", "b")).toBe(false);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets the next local day", async () => {
+    const yesterday = new Date(2026, 0, 15, 20, 0, 0).getTime();
+    installStorage({ [KEY]: `2026-01-15|2|${yesterday}` });
+    invokeMock.mockResolvedValue(undefined);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 16, 9, 0, 0)); // next local day
+    expect(await fireUpsellNudge("t", "b")).toBe(true);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
   });
 });

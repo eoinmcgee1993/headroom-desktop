@@ -56,6 +56,7 @@ import {
 } from "./lib/appUpdate";
 import { maybeFireTrialNotifications } from "./lib/trialNotifications";
 import {
+  fireUpsellNudge,
   maybeFireUrgentPricingNotifications,
   maybeFireUrgentRuntimeNotification,
 } from "./lib/urgentNotifications";
@@ -287,6 +288,36 @@ const idleRuntimeUpgradeProgress: RuntimeUpgradeProgress = {
 const MAX_UPGRADE_AUTO_RETRIES = 2;
 
 const GATE_AUTO_DISABLED_STORAGE_KEY = "headroom:gateAutoDisabledConnectors";
+
+// Persisted "a connected tool's request has reached the proxy" marker, shared
+// by both webviews (launcher onboarding verify + main-window poller). Without
+// it, verification state lives only in one webview's RAM: every app restart
+// (and every tray-open, since hidden webviews get timer-throttled) replays the
+// "send a message to verify" nag even though traffic flowed all along.
+const CONNECTOR_TRAFFIC_VERIFIED_STORAGE_KEY = "headroom:connectorTrafficVerified";
+
+function isConnectorTrafficVerified(): boolean {
+  try {
+    return window.localStorage.getItem(CONNECTOR_TRAFFIC_VERIFIED_STORAGE_KEY) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function setConnectorTrafficVerified(verified: boolean): void {
+  try {
+    if (verified) {
+      window.localStorage.setItem(
+        CONNECTOR_TRAFFIC_VERIFIED_STORAGE_KEY,
+        new Date().toISOString()
+      );
+    } else {
+      window.localStorage.removeItem(CONNECTOR_TRAFFIC_VERIFIED_STORAGE_KEY);
+    }
+  } catch {
+    // best effort
+  }
+}
 
 // Fire-and-forget install-wizard funnel beacon. Errors (offline/mid-install)
 // are swallowed so tracking never affects the wizard. Dedup is server-side
@@ -1023,7 +1054,9 @@ export default function App() {
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
   const [connectorsBusy, setConnectorsBusy] = useState(false);
-  const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">("healthy");
+  const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">(
+    () => (isConnectorTrafficVerified() ? "healthy" : "verifying")
+  );
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
   const [connectorsNotice, setConnectorsNotice] = useState<string | null>(null);
   const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
@@ -1325,17 +1358,12 @@ export default function App() {
   useEffect(() => {
     const STORAGE_KEY = "headroom:lastNotifiedMismatchTier";
     const mismatch = pricingStatus?.tierMismatch;
-    if (!mismatch) {
-      // tierMismatch is also null when the account fetch merely failed; only
-      // a definitive "no mismatch" (profile present, no sync error) clears
-      // the dedupe key. Clearing on a transient blip re-fired the same
-      // upgrade notification on the next successful poll — nagware on flaky
-      // wifi and sleep/wake cycles.
-      if (pricingStatus?.account && !pricingStatus.accountSyncError) {
-        window.localStorage.removeItem(STORAGE_KEY);
-      }
-      return;
-    }
+    // Don't clear the dedupe key when the mismatch reads null: the backend also
+    // reports null on a poll where the Claude plan momentarily detects as
+    // Unknown, and clearing there re-armed this notification to re-fire on the
+    // next confident poll — that's what nagged users overnight. Leave the key;
+    // it's overwritten only when we climb to a higher tier below.
+    if (!mismatch) return;
     const rank: Record<string, number> = { pro: 1, max5x: 2, max20x: 3 };
     const previous = window.localStorage.getItem(STORAGE_KEY);
     // Notify on first detection and whenever the recommended tier climbs higher.
@@ -1345,11 +1373,15 @@ export default function App() {
     const paidLabel = upgradePlanIntentLabel(mismatch.paidTier);
     const recommendedLabel = upgradePlanIntentLabel(mismatch.recommendedTier);
     const sourceLabel = tierRecommendationSourceLabel(mismatch.recommendedSource);
-    void invoke("show_notification", {
-      title: "Upgrade your Headroom plan",
-      body: `Your ${sourceLabel} usage needs the Headroom ${recommendedLabel} plan, above your current ${paidLabel} plan. Upgrade to keep unlimited optimization.`,
-    }).catch(() => {});
-    window.localStorage.setItem(STORAGE_KEY, mismatch.recommendedTier);
+    // fireUpsellNudge self-throttles (quiet hours, twice/day, min gap); only
+    // advance the dedupe key once it actually showed, or a quiet-hours skip
+    // would silently mark this tier as notified and suppress it for good.
+    void fireUpsellNudge(
+      "Upgrade your Headroom plan",
+      `Your ${sourceLabel} usage needs the Headroom ${recommendedLabel} plan, above your current ${paidLabel} plan. Upgrade to keep unlimited optimization.`
+    ).then((fired) => {
+      if (fired) window.localStorage.setItem(STORAGE_KEY, mismatch.recommendedTier);
+    });
   }, [pricingStatus?.tierMismatch?.recommendedTier, pricingStatus?.tierMismatch]);
 
   useEffect(() => {
@@ -1827,6 +1859,10 @@ export default function App() {
       proxyVerificationRows.length > 0 &&
       proxyVerificationRows.every((row) => row.state === "verified")
     ) {
+      // Persist for the main window: its own phase poller honors this marker,
+      // so the tray doesn't ask the user to verify a second time right after
+      // onboarding just did.
+      setConnectorTrafficVerified(true);
       reportFunnelStep("proxy_verified");
     }
   }, [windowLabel, launcherStage, proxyVerificationRows]);
@@ -2341,16 +2377,29 @@ export default function App() {
         ? "Headroom learns from your Codex sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
         : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.md.";
   useEffect(() => {
-    setConnectorPhase((prev) => {
-      if (!anyConnectorEnabled) return "disabled";
-      // Any transition from "disabled" → enabled (re-enable click, externally
-      // toggled, or fresh app launch) drops into verifying, so the polling
-      // effect below confirms via /stats that traffic is actually flowing
-      // before the badge flips green.
-      if (prev === "disabled") return "verifying";
-      return prev; // keep "verifying" or "healthy"
-    });
-  }, [anyConnectorEnabled]);
+    // connectors === [] means get_client_connectors hasn't returned yet (the
+    // Rust side always lists every managed client). Don't treat that launch
+    // window as "user disabled everything", or the persisted verification
+    // marker would be wiped on every start.
+    if (connectors.length === 0) return;
+    if (!anyConnectorEnabled) {
+      // A deliberate all-off is the one case that invalidates the persisted
+      // marker: re-enabling must re-verify with fresh traffic.
+      setConnectorTrafficVerified(false);
+      setConnectorPhase("disabled");
+      return;
+    }
+    // Transition from "disabled" → enabled drops into verifying (unless a
+    // past session already verified traffic), so the polling effect below
+    // confirms via /stats before the badge flips green.
+    setConnectorPhase((prev) =>
+      prev === "disabled"
+        ? isConnectorTrafficVerified()
+          ? "healthy"
+          : "verifying"
+        : prev
+    );
+  }, [anyConnectorEnabled, connectors.length]);
 
   useEffect(() => {
     // Pricing status hits the remote Headroom API. When the tray is focused,
@@ -2495,6 +2544,13 @@ export default function App() {
       timer = window.setTimeout(() => void tick(), attempts < 60 ? 1000 : 10000);
     };
     const tick = async () => {
+      // The launcher's onboarding verify step (a separate webview) may have
+      // already observed traffic — honor its persisted marker instead of
+      // demanding a second request.
+      if (isConnectorTrafficVerified()) {
+        setConnectorPhase("healthy");
+        return;
+      }
       const count = await invoke<number | null>("get_headroom_request_count").catch(
         () => null
       );
@@ -2508,8 +2564,13 @@ export default function App() {
         if (anchor === null) {
           anchor = count;
         } else if (count > anchor) {
+          setConnectorTrafficVerified(true);
           setConnectorPhase("healthy");
           return;
+        } else if (count < anchor) {
+          // Backend restart reset the /stats counter; re-anchor or the flip
+          // would wait for traffic to climb past the stale pre-restart total.
+          anchor = count;
         }
       }
       schedule();
