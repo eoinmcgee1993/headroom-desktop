@@ -3566,6 +3566,16 @@ pub fn run() {
                 // registers a dock icon. LSUIElement=true in Info.plist already
                 // covers the packaged bundle.
                 app.set_activation_policy(ActivationPolicy::Accessory);
+
+                // The tray dropdown must open on whatever Space/desktop the
+                // user is currently on. A plain NSWindow stays bound to the
+                // Space it was last shown on, so with multiple desktops (or
+                // "Displays have separate Spaces") show() revealed it on the
+                // wrong desktop. CanJoinAllSpaces is the standard menu-bar
+                // popover behavior and fixes both cases.
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_visible_on_all_workspaces(true);
+                }
             }
 
             let launched_from_autostart = launched_from_autostart();

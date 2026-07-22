@@ -1080,6 +1080,7 @@ export default function App() {
   const [appUpdateAvailable, setAppUpdateAvailable] = useState<AvailableAppUpdate | null>(null);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
   const [appUpdateInstallBusy, setAppUpdateInstallBusy] = useState(false);
+  const [appUpdateRestartBusy, setAppUpdateRestartBusy] = useState(false);
   const [appUpdateReadyToRestart, setAppUpdateReadyToRestart] = useState(false);
   const [showAppUpdateDialog, setShowAppUpdateDialog] = useState(false);
   const [appUpdateStatusCopy, setAppUpdateStatusCopy] = useState<string | null>(null);
@@ -2859,6 +2860,10 @@ export default function App() {
   }
 
   function restartIntoInstalledUpdate() {
+    // Never reset: restart_app tears down the backend before exiting, which
+    // can take seconds on slow machines — the busy label is the only signal
+    // the click registered until the window dies.
+    setAppUpdateRestartBusy(true);
     void invoke("restart_app");
   }
 
@@ -6652,7 +6657,7 @@ export default function App() {
                 <div className="modal-actions">
                   <button
                     className="secondary-button"
-                    disabled={appUpdateInstallBusy}
+                    disabled={appUpdateInstallBusy || appUpdateRestartBusy}
                     onClick={() => setShowAppUpdateDialog(false)}
                     type="button"
                   >
@@ -6660,7 +6665,7 @@ export default function App() {
                   </button>
                   <button
                     className="primary-button"
-                    disabled={appUpdateInstallBusy}
+                    disabled={appUpdateInstallBusy || appUpdateRestartBusy}
                     onClick={() =>
                       appUpdateReadyToRestart
                         ? restartIntoInstalledUpdate()
@@ -6668,11 +6673,13 @@ export default function App() {
                     }
                     type="button"
                   >
-                    {appUpdateInstallBusy
-                      ? "Installing…"
-                      : appUpdateReadyToRestart
-                        ? "Restart now"
-                        : `Install ${appUpdateAvailable.version}`}
+                    {appUpdateRestartBusy
+                      ? "Restarting…"
+                      : appUpdateInstallBusy
+                        ? "Installing…"
+                        : appUpdateReadyToRestart
+                          ? "Restart now"
+                          : `Install ${appUpdateAvailable.version}`}
                   </button>
                 </div>
               </div>
