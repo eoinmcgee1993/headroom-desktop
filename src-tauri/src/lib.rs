@@ -1476,6 +1476,24 @@ pub(crate) fn readyz_outcome_fingerprint_key(outcome: &str) -> &'static str {
     }
 }
 
+/// Fingerprint bucket for the tracked child's state at give-up.
+/// `"still_alive_or_untracked"` (exit_status None) hides two opposite cases:
+/// a child genuinely mid-boot (has a pid) vs no tracked child at all
+/// (pid None — backend absent, we hold no handle). They want different fixes,
+/// so keep them in separate Sentry issues. See RUST-53.
+pub(crate) fn child_state_fingerprint_key(
+    exit_status: &str,
+    tracked_pid: Option<u32>,
+) -> &'static str {
+    if exit_status != "still_alive_or_untracked" {
+        "child_exited"
+    } else if tracked_pid.is_some() {
+        "child_alive"
+    } else {
+        "child_untracked"
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_watchdog_give_up_report(
     consecutive_failures: u32,
@@ -1745,11 +1763,8 @@ fn capture_watchdog_give_up(
             // readyz classification and whether the child is still alive so each
             // genuinely-different wedge gets its own issue and lifecycle.
             let readyz_key = readyz_outcome_fingerprint_key(&report.backend_readyz_outcome);
-            let child_key = if report.tracked_child_exit_status == "still_alive_or_untracked" {
-                "child_alive"
-            } else {
-                "child_exited"
-            };
+            let child_key =
+                child_state_fingerprint_key(&report.tracked_child_exit_status, report.tracked_pid);
             let fp: &[&str] = &["proxy_unreachable_post_boot", readyz_key, child_key];
             scope.set_fingerprint(Some(fp));
             scope.set_extra(
@@ -5714,15 +5729,15 @@ mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
-        build_watchdog_give_up_report, check_headroom_learn_prereqs, classify_backend_readyz,
-        classify_bootstrap_failure, classify_upgrade_error, client_setup_error_kind,
-        compute_tray_window_position, count_memories_created_today, cpu_rate_indicates_burn,
-        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
-        extract_llm_failure_warnings, fetch_transformations_feed_from, install_pending_update,
-        is_disk_full_signal, is_endpoint_protection_signal, is_network_download_signal,
-        is_port_conflict_failure, is_prerelease_version, lifetime_token_milestone_kind,
-        noop_app_update_progress_emitter, parse_live_learnings,
-        parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        build_watchdog_give_up_report, check_headroom_learn_prereqs, child_state_fingerprint_key,
+        classify_backend_readyz, classify_bootstrap_failure, classify_upgrade_error,
+        client_setup_error_kind, compute_tray_window_position, count_memories_created_today,
+        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
+        empty_live_learnings_for_projects, extract_llm_failure_warnings,
+        fetch_transformations_feed_from, install_pending_update, is_disk_full_signal,
+        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
+        is_prerelease_version, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
+        parse_live_learnings, parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
@@ -7395,6 +7410,29 @@ Some unrelated content.
         assert_eq!(
             readyz_outcome_fingerprint_key("error: connection reset by peer"),
             "readyz_error"
+        );
+    }
+
+    #[test]
+    fn child_state_fingerprint_key_splits_alive_from_untracked() {
+        // exit_status present -> the child died, regardless of pid.
+        assert_eq!(
+            child_state_fingerprint_key("exited_with_1", Some(42)),
+            "child_exited"
+        );
+        assert_eq!(
+            child_state_fingerprint_key("exited_with_1", None),
+            "child_exited"
+        );
+        // "still_alive_or_untracked" splits on pid presence: a tracked pid is a
+        // genuinely-alive (mid-boot) child; None is no handle / backend absent.
+        assert_eq!(
+            child_state_fingerprint_key("still_alive_or_untracked", Some(42)),
+            "child_alive"
+        );
+        assert_eq!(
+            child_state_fingerprint_key("still_alive_or_untracked", None),
+            "child_untracked"
         );
     }
 
