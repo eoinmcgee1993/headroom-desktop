@@ -1575,6 +1575,13 @@ enum BootstrapFailureKind {
     /// changes nothing until the permission does, so the message must not send
     /// the user back to the Try again button.
     Permission,
+    /// Windows loaded a foreign OpenSSL into our interpreter. `_ssl.pyd` does
+    /// not provide `OPENSSL_Applink`, so a libcrypto built with uplink aborts
+    /// the moment it is used -- ensurepip dies before pip speaks a word
+    /// (RUST-8K). Nothing about the machine will change on its own, so like
+    /// `Permission` this must not send the user back to Try again: 25 events
+    /// from one host were 25 relaunches into the same wall.
+    SslLibraryConflict,
     /// pip fell back to building a package from source and the build failed.
     /// Since every install passes `--only-binary=:all:` (see `PIP_ONLY_BINARY`)
     /// this should be unreachable, so reaching it means *we* shipped a lock or
@@ -1594,6 +1601,7 @@ impl BootstrapFailureKind {
             // Same vocabulary as `pip_failure_category`, so a support mail's
             // failure_kind lines up with the pip-layer Sentry issue.
             BootstrapFailureKind::Permission => "permission",
+            BootstrapFailureKind::SslLibraryConflict => "ssl_library_conflict",
             BootstrapFailureKind::SourceBuild => "build",
             BootstrapFailureKind::Other => "other",
         }
@@ -1617,6 +1625,8 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         || haystack.contains("self signed certificate in certificate chain")
     {
         BootstrapFailureKind::SslInterception
+    } else if is_ssl_library_conflict_signal(&haystack) {
+        BootstrapFailureKind::SslLibraryConflict
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
     } else if is_unsupported_pin_signal(&haystack) {
@@ -1630,6 +1640,41 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
     } else {
         BootstrapFailureKind::Other
     }
+}
+
+/// True when a foreign OpenSSL aborted the interpreter.
+///
+/// Shares its signal string with `pip_failure_category`'s `openssl-applink`
+/// bucket so the two layers agree. `OPENSSL_Uplink` alone is enough: the abort
+/// prints it whether or not the `no OPENSSL_Applink` line survives the pipe.
+fn is_ssl_library_conflict_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no openssl_applink") || lower.contains("openssl_uplink")
+}
+
+/// PATH directories holding an OpenSSL that could be loaded into our
+/// interpreter ahead of the one we ship.
+///
+/// The abort says only that the wrong libcrypto won, never whose it is, which
+/// is why RUST-8K sat unactionable. Windows resolves a DLL by base name, so
+/// naming every PATH directory that has one turns "some program on your PC"
+/// into a directory the user can act on. Our own runtime is never on PATH, so
+/// every hit here is foreign by construction.
+///
+/// Returns an empty list off Windows, where these names do not exist -- no
+/// `cfg`, so the scan stays testable on any platform.
+fn conflicting_openssl_dirs(path_var: &str) -> Vec<String> {
+    const NAMES: &[&str] = &["libcrypto-3-x64.dll", "libssl-3-x64.dll"];
+    let mut hits = Vec::new();
+    for dir in std::env::split_paths(path_var) {
+        if NAMES.iter().any(|name| dir.join(name).is_file()) {
+            let shown = dir.display().to_string();
+            if !hits.contains(&shown) {
+                hits.push(shown);
+            }
+        }
+    }
+    hits
 }
 
 /// True when pip could not resolve a pin at all — no wheel exists for this
@@ -1738,6 +1783,17 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              reopen Headroom. If it still fails, use Contact support below and \
              we'll read the details it sends."
         }
+        BootstrapFailureKind::SslLibraryConflict => {
+            "Installation failed: another program on this PC has put a conflicting \
+             copy of OpenSSL (libcrypto-3-x64.dll or libssl-3-x64.dll) on your \
+             PATH, and Windows loads it into Headroom's Python instead of ours. \
+             That crashes the installer before it starts, and clicking Try again \
+             will keep hitting it. Search your PATH for those two files - older \
+             Git, PostgreSQL, OpenVPN and Anaconda installs are the usual sources \
+             - remove that folder from PATH, then restart your PC. Use Contact \
+             support below and we'll read the details it sends, including which \
+             folders we found."
+        }
         BootstrapFailureKind::SourceBuild => {
             "Installation failed: Headroom couldn't assemble its runtime on this \
              computer, because one of its components has no prebuilt release for \
@@ -1837,6 +1893,21 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
                 scope.set_extra("stdout", failure.stdout.clone().into());
                 scope.set_extra("stderr", failure.stderr.clone().into());
                 scope.set_extra("error_chain", technical_err.clone().into());
+                if matches!(kind, BootstrapFailureKind::SslLibraryConflict) {
+                    // The abort never names the DLL that won. Without this the
+                    // next 25 events are as unactionable as the last 25.
+                    let dirs = conflicting_openssl_dirs(&std::env::var("PATH").unwrap_or_default());
+                    scope.set_extra(
+                        "openssl_dirs_on_path",
+                        if dirs.is_empty() {
+                            "none found on PATH (library was likely injected into the process)"
+                                .to_string()
+                        } else {
+                            dirs.join("; ")
+                        }
+                        .into(),
+                    );
+                }
             },
             || {
                 sentry::capture_message("bootstrap_failed (install_runtime)", level);
@@ -7217,10 +7288,10 @@ mod tests {
         build_watchdog_give_up_report, check_headroom_learn_prereqs, child_state_fingerprint_key,
         classify_backend_readyz, classify_bootstrap_failure, classify_update_check,
         classify_upgrade_error, client_setup_error_kind, compute_panel_corner_position,
-        compute_tray_window_position, count_memories_created_today, cpu_rate_indicates_burn,
-        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
-        exe_path_resolvable, extract_llm_failure_warnings, fake_override,
-        fetch_transformations_feed_from, first_savings_body, format_token_count,
+        compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
+        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
+        empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
+        fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
         install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
         learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
@@ -8606,6 +8677,61 @@ mod tests {
             classify_bootstrap_failure(&err),
             BootstrapFailureKind::Permission
         ));
+    }
+
+    #[test]
+    fn classify_bootstrap_failure_flags_a_foreign_openssl_as_ssl_library_conflict() {
+        // Verbatim from the RUST-8K event (host GIDI, 0.8.7, Windows 10.0.26200):
+        // the abort line, then ensurepip's own traceback. This landed in `Other`,
+        // whose message sends the user back to Try again -- 25 times.
+        let err: anyhow::Error = make_command_failure(
+            "OPENSSL_Uplink(00007FF926407C58,08): no OPENSSL_Applink\r\n\
+             Traceback (most recent call last):\r\n\
+             \x20 File \"<frozen runpy>\", line 198, in _run_module_as_main\r\n\
+             \x20 File \"ensurepip\\__init__.py\", line 200, in _bootstrap\r\n\
+             \x20   return _run_pip([*args, *_PACKAGE_NAMES], additional_paths)",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::SslLibraryConflict
+        ));
+    }
+
+    #[test]
+    fn ssl_library_conflict_does_not_tell_the_user_to_retry() {
+        // The whole point of the kind: `Other` says "click Try again", which is
+        // what kept this host looping. Guard the property, not the wording.
+        let message = user_message_for(BootstrapFailureKind::SslLibraryConflict);
+        assert!(
+            message.contains("keep hitting it"),
+            "message must say retrying will not help: {message}"
+        );
+        assert!(
+            message.contains("libcrypto-3-x64.dll"),
+            "message must name the file the user has to find: {message}"
+        );
+    }
+
+    #[test]
+    fn conflicting_openssl_dirs_names_every_path_dir_holding_one() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let guilty = root.path().join("some-other-app");
+        let innocent = root.path().join("plain");
+        std::fs::create_dir_all(&guilty).expect("mkdir");
+        std::fs::create_dir_all(&innocent).expect("mkdir");
+        std::fs::write(guilty.join("libcrypto-3-x64.dll"), b"x").expect("write");
+
+        let path_var = std::env::join_paths([&innocent, &guilty])
+            .expect("join_paths")
+            .into_string()
+            .expect("utf8");
+        let hits = conflicting_openssl_dirs(&path_var);
+
+        assert_eq!(hits, vec![guilty.display().to_string()]);
+        // An empty result is meaningful too -- it says the library was injected
+        // rather than found on PATH -- so it must not be a false negative.
+        assert!(conflicting_openssl_dirs(&innocent.display().to_string()).is_empty());
     }
 
     #[test]
