@@ -5496,6 +5496,32 @@ export default function App() {
               {hasEnabledApps
                 ? `We have not detected any ${unverifiedNames} activity flowing through our savings pipeline yet. You can skip and continue for now, but Headroom can only compress requests it sees, so your savings are likely to stay at zero. Restart ${unverifiedNames} to fix this.`
                 : "Headroom has nothing to optimize until a coding agent is connected and its requests flow through our savings pipeline. Your savings will stay at zero. You can connect one later from within the app if you prefer."}
+              <br />
+              <br />
+              <strong>Note:</strong> does not work with Claude Desktop app due to
+              limitations by Anthropic. You need to use Claude Code{" "}
+              <button
+                className="install-progress__notice-link"
+                onClick={() =>
+                  void invoke("open_external_link", {
+                    url: "https://code.claude.com/docs/en/quickstart#step-1-install-claude-code"
+                  })}
+                type="button"
+              >
+                in the CLI
+              </button>{" "}
+              or{" "}
+              <button
+                className="install-progress__notice-link"
+                onClick={() =>
+                  void invoke("open_external_link", {
+                    url: "https://code.claude.com/docs/en/overview#vs-code"
+                  })}
+                type="button"
+              >
+                as part of VS Code
+              </button>
+              .
             </p>
           ) : null}
         </div>

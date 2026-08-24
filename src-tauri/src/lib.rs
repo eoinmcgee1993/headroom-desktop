@@ -93,11 +93,18 @@ const UNINSTALL_LAUNCH_ARG: &str = "--uninstall";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
-/// Extra main-window height for the platforms that render the preview-build
-/// notice (two wrapped 11px/1.4 lines plus the banner's gap) and reserve real
-/// layout width for their scrollbars, which wraps text elsewhere too.
+/// Extra window height for the platforms that render the preview-build notice
+/// (two wrapped 11px/1.4 lines plus the banner's gap) and reserve real layout
+/// width for their scrollbars, which wraps text elsewhere too. Applied to the
+/// main window and the launcher: both are fixed-size and both size their copy
+/// off 100vh, so the same wider-font/narrower-viewport reflow overflows them.
 #[cfg(not(target_os = "macos"))]
 const PREVIEW_NOTICE_EXTRA_HEIGHT: u32 = 72;
+/// Mirrors the `launcher` entry in tauri.conf.json.
+#[cfg(not(target_os = "macos"))]
+const LAUNCHER_WINDOW_WIDTH: u32 = 760;
+#[cfg(not(target_os = "macos"))]
+const LAUNCHER_WINDOW_HEIGHT: u32 = 540;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 const MAIN_WINDOW_BLUR_HIDE_DELAY_MS: u64 = 150;
 
@@ -4488,6 +4495,9 @@ pub fn run() {
             // height back. Applied here rather than in tauri.conf.json because
             // Tauri's platform config overlay replaces the whole `windows`
             // array, which would duplicate every field just to change one.
+            // The launcher needs the same treatment: it is fixed-size too, and
+            // the wider system font wrapping its headline to three lines pushed
+            // the install screen into `.intro-shell`'s scroll fallback.
             #[cfg(not(target_os = "macos"))]
             {
                 use tauri::LogicalSize;
@@ -4496,6 +4506,13 @@ pub fn run() {
                         MAIN_WINDOW_WIDTH,
                         MAIN_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT,
                     ));
+                }
+                if let Some(window) = app.get_webview_window("launcher") {
+                    let _ = window.set_size(LogicalSize::new(
+                        LAUNCHER_WINDOW_WIDTH,
+                        LAUNCHER_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT,
+                    ));
+                    let _ = window.center();
                 }
             }
 

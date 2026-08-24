@@ -706,6 +706,17 @@ select {
   font-size: var(--text-sm);
 }
 
+.install-progress__notice-link {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
 .intro-shell__art {
   display: grid;
   place-items: center;
