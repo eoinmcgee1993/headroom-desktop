@@ -1086,6 +1086,38 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Best-effort Windows counterpart of `schedule_app_bundle_trash`: hand off to
+/// the NSIS uninstaller so Headroom also leaves Add/Remove Programs, the Start
+/// menu and $INSTDIR. `perform_full_cleanup` cannot do any of that itself, and
+/// on a currentUser install it cannot even finish the data wipe, because
+/// $INSTDIR *is* %LOCALAPPDATA%\Headroom and the running exe is undeletable.
+///
+/// `/S` makes the uninstaller copy itself to %TEMP% and kill us on the way
+/// through, so the whole install dir goes. Its PREUNINSTALL hook re-runs
+/// `--uninstall`, which is a no-op sweep by then.
+#[cfg(target_os = "windows")]
+fn schedule_windows_uninstaller() -> Option<std::path::PathBuf> {
+    let uninstaller = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join("uninstall.exe");
+    // Absent for a dev/portable build: cleanup already ran, nothing to hand off.
+    if !uninstaller.exists() {
+        log::info!("uninstall: no NSIS uninstaller at {uninstaller:?}, skipping");
+        return None;
+    }
+    match crate::proc::command(&uninstaller).arg("/S").spawn() {
+        Ok(_) => {
+            log::info!("uninstall: launched NSIS uninstaller {uninstaller:?}");
+            Some(uninstaller)
+        }
+        Err(err) => {
+            log::error!("uninstall: failed to launch NSIS uninstaller: {err}");
+            None
+        }
+    }
+}
+
 #[tauri::command]
 fn show_app_update_notification(app: AppHandle, version: String) -> Result<(), String> {
     show_app_update_notification_impl(&app, &version)
@@ -4193,6 +4225,12 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
         removed.push(bundle.display().to_string());
     }
 
+    // Same on Windows, via the NSIS uninstaller.
+    #[cfg(target_os = "windows")]
+    if let Some(uninstaller) = schedule_windows_uninstaller() {
+        removed.push(uninstaller.display().to_string());
+    }
+
     analytics::track_event(
         &app,
         "uninstall_completed",
@@ -4225,16 +4263,20 @@ fn launched_from_autostart() -> bool {
 
 /// Handle `--uninstall` and exit; return normally otherwise.
 ///
-/// Exists for package managers that delete the app bundle themselves and so
-/// cannot rely on the app being alive to clean up after itself. A Homebrew cask
-/// calls this from its `uninstall script:` stanza, which runs *before* the
-/// bundle is removed.
+/// Exists for package managers that delete the app themselves and so cannot
+/// rely on the app being alive to clean up after itself: a Homebrew cask calls
+/// this from its `uninstall script:` stanza, and the NSIS uninstaller calls it
+/// from `NSIS_HOOK_PREUNINSTALL`, both *before* the binary is removed.
 ///
-/// Scope is deliberately narrower than the in-app "uninstall and quit": it
-/// reverts our edits to *other* tools (agent configs, shell rc blocks, hooks,
-/// MCP registrations, keychain, backup files) and leaves Headroom's own data
-/// directories alone, because a cask's `uninstall` must not destroy user data —
-/// that is what `zap` is for.
+/// Scope differs by platform because the packagers do:
+/// - macOS/Linux: revert our edits to *other* tools (agent configs, shell rc
+///   blocks, hooks, MCP registrations, keychain, backup files) and leave
+///   Headroom's own data alone. A cask's `uninstall` must not destroy user
+///   data, that is what `zap` is for.
+/// - Windows: full cleanup, data included. There is no `zap` counterpart, the
+///   NSIS uninstaller is the only uninstall a user gets, and everything it
+///   cannot reach itself (the multi-GB managed runtime, model caches,
+///   ~\.headroom) would otherwise survive and be inherited by a reinstall.
 ///
 /// Quitting a *running* instance already reverts the routing layer via
 /// `clear_client_setups`, so this mainly covers the case where the app was
@@ -4244,13 +4286,14 @@ fn handle_uninstall_flag() {
         return;
     }
 
+    #[cfg(target_os = "windows")]
+    let removed = client_adapters::perform_full_cleanup();
+    #[cfg(not(target_os = "windows"))]
     let removed = client_adapters::revert_external_mutations();
     for path in &removed {
         println!("removed {path}");
     }
     println!("Headroom: reverted {} item(s).", removed.len());
-    // Headroom's own data (app data dir, ~/.headroom, caches, logs, the Kompress
-    // model) is intentionally left in place; `brew zap` removes it.
     std::process::exit(0);
 }
 

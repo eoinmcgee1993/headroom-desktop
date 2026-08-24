@@ -16,6 +16,15 @@ name: Release App
 # The staging-rolling mirror runs from the same publish job and carries every
 # platform, so a stable release no longer drops linux-x86_64 from that channel
 # (see release-macos-staging.yml).
+#
+# Per-platform release trains: a release commit can carry `[platforms: windows]`
+# (comma list of macos, windows, linux; default all) to ship a version only some
+# platforms are *offered*. Every platform is still built and attached to the
+# release, so direct downloads and the staging mirror stay complete -- only
+# latest.json is narrowed. Installs on an omitted platform see "no update"
+# (classify_update_check in lib.rs treats a missing platform entry as a no-op)
+# and stay put until the next full release converges everyone. Installs older
+# than 0.8.4 predate that no-op and will log an update-check error instead.
 
 on:
   push:
@@ -25,6 +34,11 @@ on:
       - package.json
       - src-tauri/tauri.conf.json
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms offered this update: "all", or a comma list of macos,windows,linux'
+        required: false
+        default: all
 
 concurrency:
   group: macos-release-${{ github.ref }}
@@ -41,6 +55,7 @@ jobs:
     outputs:
       should_release: ${{ steps.release_guard.outputs.should_release }}
       package_version: ${{ steps.release_guard.outputs.package_version }}
+      release_platforms: ${{ steps.release_guard.outputs.release_platforms }}
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
@@ -137,8 +152,38 @@ jobs:
             exit 1
           fi
 
+          # Which platforms are *offered* this version. Manual runs pass an
+          # input; pushes carry `[platforms: windows]` in a commit message in
+          # the pushed range (same idiom as [skip-rc-check]). Default all, so
+          # forgetting the marker ships to everyone rather than stranding a
+          # platform.
+          release_platforms="${{ github.event.inputs.platforms || 'all' }}"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            release_platforms=all
+            range_msgs="$(git log -1 --pretty=%B "${GITHUB_SHA}")"
+            if [[ -n "${before_sha:-}" ]] && git cat-file -e "${before_sha}^{commit}" 2>/dev/null; then
+              range_msgs="$(git log --pretty=%B "${before_sha}..${GITHUB_SHA}")"
+            fi
+            marker="$(grep -oiE '\[platforms:[^]]+\]' <<< "$range_msgs" | tail -1 || true)"
+            if [[ -n "$marker" ]]; then
+              release_platforms="$(sed -E 's/^\[[Pp]latforms:[[:space:]]*//; s/\][[:space:]]*$//; s/[[:space:]]//g' <<< "$marker")"
+            fi
+          fi
+
+          for family in ${release_platforms//,/ }; do
+            case "$family" in
+              all|macos|windows|linux) ;;
+              *)
+                echo "Unknown platform family '${family}' in scope '${release_platforms}'. Use 'all' or a comma list of macos,windows,linux." >&2
+                exit 1
+                ;;
+            esac
+          done
+          echo "Platforms offered this release: ${release_platforms}"
+
           echo "package_version=${package_version}" >> "$GITHUB_OUTPUT"
           echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
+          echo "release_platforms=${release_platforms}" >> "$GITHUB_OUTPUT"
 
       - name: Require validated release candidate
         if: steps.release_guard.outputs.should_release == 'true'
@@ -515,6 +560,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STABLE_TAG: v${{ needs.release.outputs.package_version }}
+          RELEASE_PLATFORMS: ${{ needs.release.outputs.release_platforms }}
         run: |
           set -euo pipefail
           workdir="$(mktemp -d)"
@@ -542,6 +588,35 @@ jobs:
              | .platforms["linux-x86_64-deb"] = {signature: $deb_sig, url: $deb_url}' \
             "$workdir/latest.json" > "$workdir/latest.merged.json"
           mv "$workdir/latest.merged.json" "$workdir/latest.json"
+
+          # Narrow the manifest to this release's platform scope. The bundles
+          # stay attached either way; dropping a platform's entry only means its
+          # installs are not offered this version.
+          families="${RELEASE_PLATFORMS:-all}"
+          if [ "$families" = "all" ]; then families="macos,windows,linux"; fi
+          scope=()
+          for family in ${families//,/ }; do
+            case "$family" in
+              macos) scope+=(darwin-aarch64 darwin-x86_64) ;;
+              windows) scope+=(windows-x86_64) ;;
+              linux) scope+=(linux-x86_64 linux-x86_64-deb) ;;
+              *) echo "unknown platform family: $family" >&2; exit 1 ;;
+            esac
+          done
+          scope_json="$(printf '%s\n' "${scope[@]}" | jq -R . | jq -sc .)"
+          # The updater ignores unknown top-level fields; the beta-channel canary
+          # reads this one so a deliberate omission does not look like a platform
+          # that silently vanished from the manifest.
+          jq --argjson scope "$scope_json" \
+            '.platforms |= with_entries(select(.key as $k | $scope | index($k)))
+             | .headroom_platform_scope = $scope' \
+            "$workdir/latest.json" > "$workdir/latest.scoped.json"
+          mv "$workdir/latest.scoped.json" "$workdir/latest.json"
+          for platform in "${scope[@]}"; do
+            jq -e --arg p "$platform" '.platforms[$p].url' "$workdir/latest.json" >/dev/null \
+              || { echo "latest.json lost in-scope platform ${platform}" >&2; exit 1; }
+          done
+
           gh release upload "$STABLE_TAG" "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
 
           # Manifest complete: hand the release to the stable updater endpoint.

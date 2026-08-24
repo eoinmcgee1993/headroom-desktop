@@ -5001,9 +5001,12 @@ export default function App() {
               <button
                 type="button"
                 className="secondary-button"
+                disabled={connectorsBusy}
                 onClick={() => void handleFirstLaunchContinue()}
               >
-                Continue with previous version
+                {connectorsBusy
+                  ? "Connecting your coding agents…"
+                  : "Continue with previous version"}
               </button>
               {upgradeFailure.failurePhase === "boot_validation" && (
                 <button
@@ -5136,10 +5139,11 @@ export default function App() {
                 <p className="launcher-install-notice">Headroom installation present</p>
                 <button
                   className="primary-button primary-button--large primary-button--success launcher-step1-continue"
+                  disabled={connectorsBusy}
                   onClick={() => void handleFirstLaunchContinue()}
                   type="button"
                 >
-                  Continue
+                  {connectorsBusy ? "Connecting your coding agents…" : "Continue"}
                 </button>
               </>
             )}

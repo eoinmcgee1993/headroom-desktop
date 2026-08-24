@@ -5107,7 +5107,30 @@ fn claude_settings_hook_matches(hook_fragment: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// Cached because a single launcher "Continue" click verifies every installed
+/// client, and `apply_client_setup` re-runs the whole write+verify once when
+/// verification misses -- up to eight probes. While the backend process is up
+/// but not yet answering `/readyz` (Windows warm-up is the slow case) each
+/// probe burns the full timeout on both hosts, so those eight probes are
+/// seconds of dead click. `proxy_reachable` is transient status, never a
+/// `verified` input, so a 3s-stale reading is fine.
 fn is_headroom_proxy_reachable() -> bool {
+    static CACHE: std::sync::Mutex<Option<(bool, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((reachable, at)) = *cache {
+        if at.elapsed() < Duration::from_secs(3) {
+            return reachable;
+        }
+    }
+    let reachable = probe_headroom_proxy();
+    *cache = Some((reachable, std::time::Instant::now()));
+    reachable
+}
+
+fn probe_headroom_proxy() -> bool {
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()

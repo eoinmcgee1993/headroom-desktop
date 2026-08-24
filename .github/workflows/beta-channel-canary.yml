@@ -9,6 +9,12 @@ name: Beta channel canary
 # lib.rs), so a manifest that lost windows-x86_64 strands those installs
 # silently. Both release workflows publish latest.json only once every platform
 # has built, so an in-flight release does not red this run.
+#
+# A release may deliberately ship to a subset of platforms (see the
+# `[platforms:]` marker in release-macos.yml). That release writes the platforms
+# it *intends* to serve into `headroom_platform_scope`, and this run asserts
+# exactly those, so an intentional omission is not an alert but a lost platform
+# still is. Manifests without the field are held to the full set.
 on:
   schedule:
     - cron: "23 */6 * * *"
@@ -25,7 +31,7 @@ jobs:
           body=$(curl -sfL --max-time 30 "$url")
           echo "$body" | head -c 400
           echo "$body" | grep -q '"version"' || { echo "::error::latest.json has no version field"; exit 1; }
-          for platform in darwin-aarch64 darwin-x86_64 windows-x86_64 linux-x86_64 linux-x86_64-deb; do
+          for platform in $(echo "$body" | jq -r '(.headroom_platform_scope // ["darwin-aarch64","darwin-x86_64","windows-x86_64","linux-x86_64","linux-x86_64-deb"])[]'); do
             echo "$body" | jq -e --arg p "$platform" '.platforms[$p].url' >/dev/null \
               || { echo "::error::staging latest.json has no $platform entry"; exit 1; }
           done
@@ -35,7 +41,7 @@ jobs:
           set -euo pipefail
           url="https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
           body=$(curl -sfL --max-time 30 "$url")
-          for platform in darwin-aarch64 darwin-x86_64 windows-x86_64 linux-x86_64 linux-x86_64-deb; do
+          for platform in $(echo "$body" | jq -r '(.headroom_platform_scope // ["darwin-aarch64","darwin-x86_64","windows-x86_64","linux-x86_64","linux-x86_64-deb"])[]'); do
             echo "$body" | jq -e --arg p "$platform" '.platforms[$p].url' >/dev/null \
               || { echo "::error::stable latest.json has no $platform entry"; exit 1; }
           done
