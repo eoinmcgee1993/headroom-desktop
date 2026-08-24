@@ -1288,6 +1288,19 @@ const PYTHON_SHA256_LINUX_AARCH64: &str =
 const PYTHON_SHA256_WINDOWS_X86_64: &str =
     "3c8b9b10a933909c98b9916297e2093b24a9c2abaa23df1c2622c2bfe052cb94";
 
+/// torch and onnxruntime cannot load on a Windows box without the MSVC
+/// redistributable, which a bare install (notably Server 2022) does not ship
+/// (RUST-7W warning half, RUST-8V/8W fatal half). Installing vc_redist.exe
+/// needs admin elevation our per-user install does not have, so instead the
+/// runtime DLLs are vendored from the sha256-pinned `msvc-runtime` wheel next
+/// to python.exe, where the loader's application-directory search finds them.
+/// The cp-tag on the wheel is irrelevant: only its `.data/data/Scripts/*.dll`
+/// payload is extracted, never the .pyd. Windows is x86_64-only (see the
+/// PYTHON pins above), so one wheel covers the platform.
+const MSVC_RUNTIME_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/21/3b/134d04268ab8e35853cd007582076429b45d60d6abb1036d159be9c50342/msvc_runtime-14.44.35112-cp312-cp312-win_amd64.whl";
+const MSVC_RUNTIME_WHEEL_SHA256: &str =
+    "32f9c706009e16ccc319d6947ce3bffe20e5192bee52b18cf48313f9e7bedfbe";
+
 /// Venv layout differs per platform: Unix venvs place interpreters and
 /// console-script entrypoints in `bin/` (python3, no extension); Windows venvs
 /// use `Scripts/` with `.exe`-suffixed names. The standalone python extracted
@@ -1315,6 +1328,41 @@ fn bin_subdir() -> &'static str {
     } else {
         "bin"
     }
+}
+
+/// The wheel ships every DLL twice (`.data/data/` root and `.data/data/Scripts/`);
+/// only the Scripts set is taken -- it is the superset (it adds vcruntime140
+/// and vcruntime140_1) and taking one set keeps extraction single-pass.
+fn msvc_runtime_dll_name(entry_path: &str) -> Option<&str> {
+    let (dirs, name) = entry_path.rsplit_once('/')?;
+    (dirs.ends_with(".data/data/Scripts") && name.to_ascii_lowercase().ends_with(".dll"))
+        .then_some(name)
+}
+
+/// Extract the MSVC runtime DLLs from the pinned wheel into every target dir.
+/// atomic_write per DLL: a crash mid-write must leave absence (retried next
+/// launch), never a truncated msvcp140.dll that torch then fails on weirdly.
+fn extract_msvc_runtime_dlls(wheel_path: &Path, targets: &[&Path]) -> Result<usize> {
+    let file = std::fs::File::open(wheel_path)
+        .with_context(|| format!("opening {}", wheel_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading zip {}", wheel_path.display()))?;
+    let mut extracted = 0usize;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let Some(name) = msvc_runtime_dll_name(entry.name()).map(str::to_owned) else {
+            continue;
+        };
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes)?;
+        for target in targets {
+            std::fs::create_dir_all(target)
+                .with_context(|| format!("creating {}", target.display()))?;
+            crate::client_adapters::atomic_write(&target.join(&name), &bytes)?;
+        }
+        extracted += 1;
+    }
+    Ok(extracted)
 }
 
 #[derive(Debug, Clone)]
@@ -3470,6 +3518,13 @@ impl ToolManager {
             eta_seconds: 6,
             percent: 90,
         });
+        // A bare Windows box lacks the MSVC redistributable torch/onnxruntime
+        // need (RUST-7W/8V/8W). Non-fatal: on failure the box keeps today's
+        // behavior and the launch-path ensure retries next boot.
+        if let Err(err) = self.ensure_msvc_runtime_dlls() {
+            log::warn!("MSVC runtime DLL vendoring failed during bootstrap: {err:#}");
+        }
+
         self.write_ready_flag()?;
         self.write_bootstrap_receipt()?;
         log::info!("bootstrap: managed runtime install complete (ready flag written)");
@@ -3516,6 +3571,50 @@ impl ToolManager {
     /// PyPI's own filename (platform tags and all) so pip's "not a supported
     /// wheel on this platform" check still backstops a mis-picked wheel — a
     /// `py3-none-any` rename made pip install a macOS wheel on Windows.
+    /// Vendor the MSVC runtime DLLs into the managed runtime on Windows boxes
+    /// that lack the system-wide redistributable (RUST-7W/8V/8W). Both
+    /// python.exe locations get the DLLs -- the venv `Scripts/` stub and the
+    /// standalone interpreter it execs -- so the application-directory DLL
+    /// search succeeds whichever one is the process. No-op when System32
+    /// already has the redist (the common case) or the DLLs are in place.
+    pub fn ensure_msvc_runtime_dlls(&self) -> Result<bool> {
+        if !cfg!(target_os = "windows") {
+            return Ok(false);
+        }
+        let system32 =
+            PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()))
+                .join("System32");
+        if system32.join("msvcp140.dll").exists() && system32.join("vcruntime140_1.dll").exists() {
+            return Ok(false);
+        }
+        let targets = [
+            self.runtime.venv_dir.join(bin_subdir()),
+            self.runtime.python_dir.clone(),
+        ];
+        // Presence probe on the three DLLs torch/onnxruntime actually import;
+        // extraction still lands the wheel's full Scripts set.
+        const CORE_DLLS: [&str; 3] = ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"];
+        if targets
+            .iter()
+            .all(|dir| CORE_DLLS.iter().all(|dll| dir.join(dll).exists()))
+        {
+            return Ok(false);
+        }
+        let wheel_path = self.wheel_download_path(MSVC_RUNTIME_WHEEL_URL);
+        download_to_path(
+            MSVC_RUNTIME_WHEEL_URL,
+            &wheel_path,
+            Some(MSVC_RUNTIME_WHEEL_SHA256),
+        )?;
+        let target_refs: Vec<&Path> = targets.iter().map(PathBuf::as_path).collect();
+        let count = extract_msvc_runtime_dlls(&wheel_path, &target_refs)?;
+        log::info!(
+            "vendored {count} MSVC runtime DLLs into the managed runtime \
+             (system redistributable missing)"
+        );
+        Ok(true)
+    }
+
     fn wheel_download_path(&self, wheel_url: &str) -> PathBuf {
         self.runtime.downloads_dir.join(
             wheel_url
@@ -4523,6 +4622,13 @@ impl ToolManager {
                 restored,
                 error: err,
             };
+        }
+
+        // The swap built a fresh venv, so re-vendor the MSVC runtime DLLs
+        // before the smoke test runs against the final state (RUST-7W/8V/8W).
+        // Non-fatal for the same reason as in bootstrap_all_with_progress.
+        if let Err(err) = self.ensure_msvc_runtime_dlls() {
+            log::warn!("MSVC runtime DLL vendoring failed during upgrade: {err:#}");
         }
 
         progress(BootstrapStepUpdate {
@@ -10945,6 +11051,78 @@ asyncio.run(verify())
             stalled_prefetch_cause(&dir.path().join("does-not-exist")),
             "vocab host never answered"
         );
+    }
+
+    /// RUST-7W: only the `.data/data/Scripts/*.dll` payload may extract -- the
+    /// root-level duplicates, the .pyd, and dist-info must all be skipped.
+    #[test]
+    fn msvc_runtime_dll_name_selects_scripts_dlls_only() {
+        assert_eq!(
+            super::msvc_runtime_dll_name("msvc_runtime-14.44.35112.data/data/Scripts/msvcp140.dll"),
+            Some("msvcp140.dll")
+        );
+        assert_eq!(
+            super::msvc_runtime_dll_name(
+                "msvc_runtime-14.44.35112.data/data/Scripts/VCRUNTIME140_1.DLL"
+            ),
+            Some("VCRUNTIME140_1.DLL")
+        );
+        // Root-level duplicate of the same DLL: not the Scripts set.
+        assert_eq!(
+            super::msvc_runtime_dll_name("msvc_runtime-14.44.35112.data/data/msvcp140.dll"),
+            None
+        );
+        assert_eq!(
+            super::msvc_runtime_dll_name("msvc_runtime.cp312-win_amd64.pyd"),
+            None
+        );
+        assert_eq!(
+            super::msvc_runtime_dll_name("msvc_runtime-14.44.35112.dist-info/RECORD"),
+            None
+        );
+    }
+
+    /// Every DLL must land in every target: the venv Scripts dir and the
+    /// standalone python root are both candidate application directories.
+    #[test]
+    fn extract_msvc_runtime_dlls_lands_in_every_target() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wheel_path = dir.path().join("msvc.whl");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&wheel_path).expect("create"));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in [
+            (
+                "msvc_runtime-14.44.35112.data/data/Scripts/msvcp140.dll",
+                b"dll-bytes".as_slice(),
+            ),
+            (
+                "msvc_runtime-14.44.35112.data/data/msvcp140.dll",
+                b"root-duplicate".as_slice(),
+            ),
+            ("msvc_runtime.cp312-win_amd64.pyd", b"pyd".as_slice()),
+        ] {
+            writer.start_file(name, stored).expect("start_file");
+            writer.write_all(bytes).expect("write entry");
+        }
+        writer.finish().expect("finish zip");
+
+        let scripts = dir.path().join("venv-scripts");
+        let python_root = dir.path().join("python");
+        let extracted = super::extract_msvc_runtime_dlls(
+            &wheel_path,
+            &[scripts.as_path(), python_root.as_path()],
+        )
+        .expect("extract");
+        assert_eq!(extracted, 1, "only the Scripts DLL extracts");
+        for target in [&scripts, &python_root] {
+            assert_eq!(
+                std::fs::read(target.join("msvcp140.dll")).expect("dll present"),
+                b"dll-bytes"
+            );
+            assert!(!target.join("msvc_runtime.cp312-win_amd64.pyd").exists());
+        }
     }
 
     #[test]

@@ -799,6 +799,14 @@ impl AppState {
             }
         }
 
+        // Heals installs already in the field: older installs and pre-fix venv
+        // swaps never vendored the MSVC runtime DLLs, so on a redist-less
+        // Windows box torch/onnxruntime cannot load (RUST-7W/8V/8W). Runs
+        // before the proxy starts; a stat-only no-op everywhere else.
+        if let Err(err) = self.tool_manager.ensure_msvc_runtime_dlls() {
+            log::warn!("MSVC runtime DLL vendoring failed during warm_runtime_on_launch: {err:#}");
+        }
+
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
         // during a prior install), retry it now.
         if let Err(err) = self.tool_manager.ensure_mcp_configured() {
