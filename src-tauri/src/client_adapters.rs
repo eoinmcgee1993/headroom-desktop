@@ -1904,12 +1904,32 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         s.push(format!(".tmp.{}.{}", std::process::id(), n));
         PathBuf::from(s)
     };
+    // Create the parent before the tmp write. Most callers do this themselves
+    // (150-odd `create_dir_all(parent)?` sites) but the ones that don't hit
+    // ENOENT / ERROR_PATH_NOT_FOUND the moment the dir is missing or has been
+    // removed under them (RUST-8M: usage-counters.json, os error 3 on Windows).
+    // One guard here covers every caller instead of auditing all of them.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| anyhow!("creating {}: {err}", parent.display()))?;
+        }
+    }
     // The io error goes in the *message*, not a source: every caller logs this
     // with `{err}`, which prints only the top context and drops the chain, so
     // Sentry saw "failed to persist usage-counters.json: writing <path>.tmp.N"
     // with no reason at all (RUST-77). Baking the cause in fixes all 50-odd
     // callers at once instead of auditing each log site for `{err:#}`.
-    std::fs::write(&tmp_path, contents).map_err(|err| {
+    // Write + fsync the tmp before the rename. Without the fsync the rename's
+    // metadata can reach disk ahead of the data, so a crash/power loss leaves a
+    // zero-length file where valid state used to be -- which is what the
+    // "corrupt (expected value at line 1 column 1)" reports are (RUST-8P).
+    let write_tmp = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        std::io::Write::write_all(&mut f, contents)?;
+        f.sync_all()
+    };
+    write_tmp().map_err(|err| {
         // A failed write still leaves the (partial) tmp behind, and the name is
         // unique per write, so nothing ever reclaims it. On a full disk that is
         // one orphan per attempt, each holding whatever bytes did land (RUST-6R).
@@ -10045,6 +10065,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn atomic_write_creates_missing_parent_dir() {
+        // RUST-8M: callers that skip their own `create_dir_all` got ENOENT
+        // (os error 3 on Windows) when the config dir was missing.
+        let dir = std::env::temp_dir().join(format!("aw_mkparent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("state.json");
+        super::atomic_write(&path, b"{}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn atomic_write_concurrent_same_path_no_enoent() {
         // Regression for Sentry RUST-3W / RUST-4W: a shared `<path>.tmp` made
         // concurrent writers race — one rename consumed the tmp, the other hit
@@ -10077,8 +10109,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // must survive plain Display.
         let dir = std::env::temp_dir().join(format!("aw_cause_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Parent does not exist, so writing the tmp file fails with ENOENT.
-        let path = dir.join("missing").join("state.json");
+        // Parent exists (atomic_write creates it now), so force the failure on
+        // the tmp write itself: an over-long name is ENAMETOOLONG on unix and
+        // ERROR_FILENAME_EXCED_RANGE on Windows, both with an "(os error N)".
+        let path = dir.join("s".repeat(300));
         let err = super::atomic_write(&path, b"x").expect_err("write into a missing dir must fail");
         let shown = format!("{err}");
         assert!(shown.starts_with("writing "), "{shown}");
