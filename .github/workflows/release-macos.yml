@@ -327,6 +327,13 @@ jobs:
       HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # Authenticode via Azure Artifact Signing. tauri.conf.json's
+      # bundle.windows.signCommand shells out to artifact-signing-cli, which
+      # reads these three. Missing creds fail the build rather than silently
+      # shipping an unsigned installer.
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
       HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
       HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
       VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
@@ -356,11 +363,14 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Install Azure Artifact Signing CLI
+        run: cargo install artifact-signing-cli --locked
+
       - name: Build NSIS installer
         shell: bash
         # NSIS only: bundle.targets is "all", which also builds an MSI this
-        # workflow never publishes. No Authenticode cert yet, so SmartScreen
-        # warns on install; the release notes should keep saying so.
+        # workflow never publishes. signCommand signs both the inner .exe and
+        # the installer; SmartScreen still warns until reputation accrues; the release notes should keep saying so.
         run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Publish Windows installer to the stable release
