@@ -3072,6 +3072,44 @@ fn report_funnel_step(state: State<'_, AppState>, step: String) {
 /// `take_pending_magic_link`.
 static PENDING_MAGIC_LINK: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
+/// Everything a `headroom://` URL triggers: show the launcher, park any magic
+/// link credentials, and reconcile pricing off-thread.
+///
+/// Reached from three places because no single one covers every platform: the
+/// `on_open_url` listener (macOS, and Windows/Linux warm starts via the
+/// single-instance argv hand-off), and the `get_current()` drain in setup
+/// (Windows/Linux cold start, where the plugin parses argv before the listener
+/// exists).
+fn handle_headroom_deep_link(app: &AppHandle, url: &tauri::Url) {
+    let _ = show_launcher_window(app);
+    capture_magic_link_auth(app, url);
+    // Run the reconciliation on a worker thread - the deep-link callback is on
+    // the main thread and we don't want pricing's blocking HTTP call there.
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        let state: tauri::State<'_, AppState> = app_handle.state();
+        match pricing::get_pricing_status(&state) {
+            Ok(status) => {
+                state.apply_pricing_gate_status(
+                    &status,
+                    crate::client_adapters::any_gate_exempt_client_enabled(),
+                );
+                state.apply_codex_pricing_gate_status(status.codex.as_ref());
+                // Payload-less on purpose: this status was fetched before any
+                // magic link in the same URL was redeemed, so it is stale by
+                // the time it lands. The frontend refetches instead.
+                let _ = app_handle.emit("pricing-refreshed", ());
+            }
+            Err(err) => {
+                sentry::capture_message(
+                    &format!("deep link pricing refresh failed: {err}"),
+                    sentry::Level::Warning,
+                );
+            }
+        }
+    });
+}
+
 /// Parks the email/code from `headroom://auth?email=..&code=..` and nudges the UI.
 ///
 /// The browser never signs the user in (it cannot supply the device
@@ -4381,9 +4419,19 @@ pub fn run() {
     let state = AppState::new().expect("failed to create app state");
 
     let mut builder =
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Second launch: focus the existing window and exit the new process.
             let _ = show_launcher_window(app);
+            // On Windows/Linux the OS answers a `headroom://` link by spawning
+            // a NEW process with the URL in argv; the running instance is never
+            // notified, and the new one dies here. Replay argv into the primary
+            // instance's deep-link plugin so `on_open_url` fires and the magic
+            // link is actually redeemed instead of just raising the launcher.
+            // No cfg guard: `handle_cli_arguments` already no-ops off
+            // Windows/Linux, and compiling it everywhere keeps macOS CI
+            // checking the call.
+            use tauri_plugin_deep_link::DeepLinkExt;
+            app.deep_link().handle_cli_arguments(args.into_iter());
         }));
 
     // tauri-plugin-autostart canonicalizes current_exe() while initializing and
@@ -4661,7 +4709,7 @@ pub fn run() {
                 // EIO. Use `log::*` (panic-safe file logger) instead.
                 //
                 // This callback is invoked synchronously from tao's
-                // `application:openURLs:` handler, which is `extern "C"` —
+                // `application:openURLs:` handler, which is `extern "C"` -
                 // any panic that escapes here aborts the whole process via
                 // `panic_cannot_unwind`. Wrap the body in `catch_unwind` so
                 // an internal failure degrades gracefully instead.
@@ -4669,38 +4717,7 @@ pub fn run() {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     for url in event.urls() {
                         if url.scheme() == "headroom" {
-                            let app_handle = deep_link_app.clone();
-                            let _ = show_launcher_window(&app_handle);
-                            capture_magic_link_auth(&app_handle, &url);
-                            // Run the reconciliation on a worker thread — the
-                            // deep-link callback is on the main thread and we
-                            // don't want pricing's blocking HTTP call there.
-                            std::thread::spawn(move || {
-                                let state: tauri::State<'_, AppState> = app_handle.state();
-                                match pricing::get_pricing_status(&state) {
-                                    Ok(status) => {
-                                        state.apply_pricing_gate_status(
-                                            &status,
-                                            crate::client_adapters::any_gate_exempt_client_enabled(
-                                            ),
-                                        );
-                                        state
-                                            .apply_codex_pricing_gate_status(status.codex.as_ref());
-                                        // Payload-less on purpose: this status
-                                        // was fetched before any magic link in
-                                        // the same URL was redeemed, so it is
-                                        // stale by the time it lands. The
-                                        // frontend refetches instead.
-                                        let _ = app_handle.emit("pricing-refreshed", ());
-                                    }
-                                    Err(err) => {
-                                        sentry::capture_message(
-                                            &format!("deep link pricing refresh failed: {err}"),
-                                            sentry::Level::Warning,
-                                        );
-                                    }
-                                }
-                            });
+                            handle_headroom_deep_link(&deep_link_app, &url);
                             // Only handle the first headroom:// URL in the batch.
                             break;
                         }
@@ -4710,6 +4727,20 @@ pub fn run() {
                     sentry::capture_message("deep link callback panicked", sentry::Level::Error);
                 }
             });
+
+            // Cold start on Windows/Linux: the OS passes the URL as argv and
+            // the plugin parses it during its own init - before the listener
+            // above existed - so the launching URL only survives in
+            // `get_current()`. Always `None` on macOS, which delivers via
+            // `RunEvent::Opened` after setup.
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                for url in urls {
+                    if url.scheme() == "headroom" {
+                        handle_headroom_deep_link(&app.handle().clone(), &url);
+                        break;
+                    }
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| handle_window_event(window, event))

@@ -933,6 +933,83 @@ pub fn clear_client_setups() -> Result<()> {
 /// The first is fixable here, so on the first `PermissionDenied` we clear
 /// read-only bits across the tree and try again. The second is not ours to fix
 /// by force; callers surface it so the user can close the session.
+/// Remove everything inside `dir`, then `dir` itself, skipping past entries that
+/// cannot be removed instead of stopping at the first one.
+///
+/// `remove_dir_all` walks the tree and returns at the first entry it fails on,
+/// leaving every entry it had not reached yet. For the app data dir on Windows
+/// that entry is Headroom's own running exe: a currentUser NSIS install puts
+/// $INSTDIR at %LOCALAPPDATA%\Headroom, the same path as `app_data_dir()`, and
+/// the `--uninstall` sweep runs *from* that exe. So the walk deleted `config`
+/// and gave up before `runtime`, and the reinstall found a complete managed
+/// runtime and skipped setup while re-prompting for terms.
+///
+/// Returns the last failure, so a caller can still tell a partial sweep from a
+/// clean one.
+fn purge_dir_tolerantly(dir: &Path) -> std::io::Result<()> {
+    let mut last = Ok(());
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `file_type` does not follow symlinks or reparse points, so a
+            // junction is unlinked, never descended into.
+            let result = match entry.file_type() {
+                Ok(kind) if kind.is_dir() => remove_dir_all_retry(&path),
+                _ => std::fs::remove_file(&path),
+            };
+            if let Err(err) = result {
+                log::warn!("cleanup: removing {} failed: {err}", path.display());
+                last = Err(err);
+            }
+        }
+    }
+    // Still fails while an undeletable child remains, which is what the caller
+    // should report.
+    std::fs::remove_dir(dir).or(last)
+}
+
+/// Kill every process running out of `dir`, except this one.
+///
+/// Windows keeps a running image undeletable, so anything still executing from
+/// inside Headroom's footprint pins it: the backend proxy, and the MCP servers
+/// (serena, codebase-memory) that Claude Code and Codex spawned from our venv
+/// and that outlive us. The in-app uninstall stops the backend via
+/// `stop_headroom`, but the `--uninstall` entry point the NSIS uninstaller
+/// calls has no `AppState` to do that with, and neither path ever reached the
+/// agents' MCP children.
+///
+/// Identity is the executable's own path, not a port or a name, so this can
+/// only ever match a binary Headroom installed. `uninstall.exe` is exempt: it
+/// lives in the same directory and is usually the process driving this sweep.
+#[cfg(target_os = "windows")]
+fn kill_processes_under(dir: &Path) {
+    // `-like` metacharacters, plus `'` so a username containing one cannot
+    // close the PowerShell literal early.
+    let escaped = dir
+        .display()
+        .to_string()
+        .replace('`', "``")
+        .replace('\'', "''")
+        .replace('[', "`[")
+        .replace(']', "`]");
+    let me = std::process::id();
+    // `$PID` is the powershell process itself: its own command line embeds the
+    // pattern, and Win32_Process would hand it back as a match (RUST-6F).
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne {me} -and $_.Name -ne 'uninstall.exe' -and $_.ExecutablePath -like '{escaped}\\*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+    );
+    match crate::proc::command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => log::warn!("cleanup: process sweep exited {:?}", status.code()),
+        Err(err) => log::warn!("cleanup: process sweep failed to run: {err}"),
+    }
+    // Handles are released asynchronously after the process dies.
+    std::thread::sleep(Duration::from_millis(300));
+}
+
 pub(crate) fn remove_dir_all_retry(path: &Path) -> std::io::Result<()> {
     let mut last = Ok(());
     let mut cleared_readonly = false;
@@ -1140,7 +1217,11 @@ pub fn perform_full_cleanup() -> Vec<String> {
                 app_dir.display()
             );
         } else {
-            match remove_dir_all_retry(&app_dir) {
+            // Before the sweep, not after: on Windows an open image or handle
+            // inside the tree is what makes an entry undeletable.
+            #[cfg(target_os = "windows")]
+            kill_processes_under(&app_dir);
+            match purge_dir_tolerantly(&app_dir) {
                 Ok(_) => removed.push(app_dir.display().to_string()),
                 Err(err) => log::warn!("cleanup: removing {} failed: {err}", app_dir.display()),
             }
@@ -10197,6 +10278,59 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let missing = std::env::temp_dir().join(format!("rdo_absent_{}", std::process::id()));
         std::fs::remove_dir_all(&missing).ok();
         assert!(super::remove_dir_all_retry(&missing).is_ok());
+    }
+
+    #[test]
+    fn purge_dir_tolerantly_skips_past_an_undeletable_entry() {
+        // The 0.8.8-rc.2 Windows uninstall: one `remove_dir_all` over the app
+        // dir stopped at the running Headroom.exe, so `config` was gone (terms
+        // re-prompted on reinstall) while `runtime` survived and the reinstall
+        // reported an installation already present. One undeletable entry must
+        // not strand the entries the walk had not reached yet.
+        let root = std::env::temp_dir().join(format!("purge_tolerant_{}", std::process::id()));
+        super::remove_dir_all_retry(&root).ok();
+        for child in ["config", "runtime"] {
+            std::fs::create_dir_all(root.join(child).join("nested")).unwrap();
+            std::fs::write(root.join(child).join("nested").join("f"), b"x").unwrap();
+        }
+        // Stand-in for the running exe. A mode with no read or execute bit stays
+        // undeletable through the rescue pass in remove_dir_all_retry, which
+        // only ever adds owner *write* (0o200).
+        #[cfg(unix)]
+        let blocked = {
+            use std::os::unix::fs::PermissionsExt;
+            let blocked = root.join("blocked");
+            std::fs::create_dir_all(&blocked).unwrap();
+            std::fs::write(blocked.join("keep"), b"x").unwrap();
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(
+                std::fs::read_dir(&blocked).is_err(),
+                "entry must really be undeletable, or this test proves nothing"
+            );
+            blocked
+        };
+
+        let result = super::purge_dir_tolerantly(&root);
+
+        assert!(!root.join("config").exists(), "config survived the sweep");
+        assert!(!root.join("runtime").exists(), "runtime survived the sweep");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(result.is_err(), "a partial sweep must report the failure");
+            assert!(
+                blocked.exists(),
+                "the undeletable entry should still be there"
+            );
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(result.is_ok(), "nothing blocked the sweep: {result:?}");
+            assert!(!root.exists(), "the dir itself should be gone");
+        }
     }
 
     #[test]

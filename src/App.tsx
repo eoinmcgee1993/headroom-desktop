@@ -4135,7 +4135,11 @@ export default function App() {
       if (windowLabel !== "launcher") {
         setActiveView("upgrade");
       }
-      await refreshConnectors();
+      // Not awaited: sign-in is done, and a connector rescan (filesystem walk
+      // over every client config, slow on Windows) has nothing to do with it.
+      // Awaiting it kept the button on "Verifying..." long after the account
+      // was connected.
+      void refreshConnectors();
       return true;
     } catch (error) {
       setAuthFlowError(describeInvokeError(error, "Could not verify sign-in code."));
