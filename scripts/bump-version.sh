@@ -91,14 +91,17 @@ node -e "
   fs.writeFileSync(path, updated);
 "
 
-# Update Cargo.lock package version
+# Update Cargo.lock package version. `\r?\n` because a Windows checkout has
+# core.autocrlf on: the literal `\n` matched nothing there and the throw below
+# failed the release build. The Cargo.toml regex above uses `\s+`, which
+# already tolerated it.
 node -e "
   const fs = require('fs');
   const path = '${REPO_ROOT}/src-tauri/Cargo.lock';
   if (fs.existsSync(path)) {
     const current = fs.readFileSync(path, 'utf8');
     const updated = current.replace(
-      /(name = \"headroom-desktop\"\nversion = \")[^\"]+\"/,
+      /(name = \"headroom-desktop\"\r?\nversion = \")[^\"]+\"/,
       (_, prefix) => prefix + '${VERSION}' + '\"'
     );
     if (updated === current) {
