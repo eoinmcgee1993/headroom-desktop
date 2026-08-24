@@ -933,6 +933,19 @@ pub fn clear_client_setups() -> Result<()> {
 /// The first is fixable here, so on the first `PermissionDenied` we clear
 /// read-only bits across the tree and try again. The second is not ours to fix
 /// by force; callers surface it so the user can close the session.
+/// The NSIS uninstaller, which on Windows sits in the app data dir because a
+/// currentUser install puts $INSTDIR at %LOCALAPPDATA%\Headroom.
+///
+/// Never ours to delete. It is the file `HKCU\...\Uninstall\Headroom`'s
+/// `UninstallString` points at, and NSIS removes it itself at the end of a
+/// successful uninstall. Delete it from under NSIS and any later abort in that
+/// section -- its "Headroom is still running" check ends in one -- leaves the
+/// registry entry standing with no uninstaller behind it. That machine can
+/// never be uninstalled again: the installer's maintenance page reads the
+/// UninstallString, `ExecWait` fails to launch it, and the run ends instantly
+/// with "Unable to uninstall!" and no uninstaller window.
+const NSIS_UNINSTALLER: &str = "uninstall.exe";
+
 /// Remove everything inside `dir`, then `dir` itself, skipping past entries that
 /// cannot be removed instead of stopping at the first one.
 ///
@@ -950,6 +963,9 @@ fn purge_dir_tolerantly(dir: &Path) -> std::io::Result<()> {
     let mut last = Ok(());
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
+            if entry.file_name().eq_ignore_ascii_case(NSIS_UNINSTALLER) {
+                continue;
+            }
             let path = entry.path();
             // `file_type` does not follow symlinks or reparse points, so a
             // junction is unlinked, never descended into.
@@ -963,9 +979,9 @@ fn purge_dir_tolerantly(dir: &Path) -> std::io::Result<()> {
             }
         }
     }
-    // Still fails while an undeletable child remains, which is what the caller
-    // should report.
-    std::fs::remove_dir(dir).or(last)
+    // A child failure is the more useful error; otherwise report the removal of
+    // the dir itself, which still fails while anything is left in it.
+    last.and(std::fs::remove_dir(dir))
 }
 
 /// Kill every process running out of `dir`, except this one.
@@ -10278,6 +10294,33 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let missing = std::env::temp_dir().join(format!("rdo_absent_{}", std::process::id()));
         std::fs::remove_dir_all(&missing).ok();
         assert!(super::remove_dir_all_retry(&missing).is_ok());
+    }
+
+    #[test]
+    fn purge_dir_tolerantly_never_removes_the_nsis_uninstaller() {
+        // Deleting it leaves the registry's UninstallString pointing at nothing
+        // if anything later in the uninstall section aborts, and the installer
+        // then fails instantly with "Unable to uninstall!". NSIS removes it
+        // itself once its own section has finished.
+        let root = std::env::temp_dir().join(format!("purge_keeps_un_{}", std::process::id()));
+        super::remove_dir_all_retry(&root).ok();
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        std::fs::write(root.join("runtime").join("python"), b"x").unwrap();
+        let uninstaller = root.join("uninstall.exe");
+        std::fs::write(&uninstaller, b"nsis").unwrap();
+
+        let result = super::purge_dir_tolerantly(&root);
+
+        assert!(
+            uninstaller.exists(),
+            "the uninstaller must survive the sweep"
+        );
+        assert!(!root.join("runtime").exists(), "runtime survived the sweep");
+        assert!(
+            result.is_err(),
+            "the dir cannot go while the uninstaller is still in it"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

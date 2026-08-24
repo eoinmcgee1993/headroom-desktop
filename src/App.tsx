@@ -2522,6 +2522,16 @@ export default function App() {
     }
   }, [windowLabel, launcherStage, proxyVerificationRows]);
 
+  // A connector checking in invalidates the armed skip warning: it was written
+  // against the old unverified set and reads as "we still see nothing" even
+  // after the user did exactly what it asked. Re-arm on the next Skip click.
+  const proxyVerifiedCount = proxyVerificationRows.filter(
+    (row) => row.state === "verified"
+  ).length;
+  useEffect(() => {
+    if (proxyVerifiedCount > 0) setProxyVerifySkipArmed(false);
+  }, [proxyVerifiedCount]);
+
   useEffect(() => {
     if (!showInstallProgress) {
       return;
@@ -5521,7 +5531,6 @@ export default function App() {
               >
                 as part of VS Code
               </button>
-              .
             </p>
           ) : null}
         </div>

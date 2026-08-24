@@ -1637,6 +1637,30 @@ fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
     }
 }
 
+/// Which of the two causes a timed-out tiktoken prefetch actually hit.
+///
+/// The alarm fires only when the cache dir was empty on entry (the gate in
+/// [`ToolManager::prefetch_tiktoken_encodings`] returns early otherwise), so
+/// whether anything landed in it separates the two: nothing at all means the
+/// vocab host never answered (blocked egress, DNS, captive portal), some bytes
+/// means a slow link that only needed longer. tiktoken prints nothing while it
+/// blocks on the GET, so the log tail is empty either way -- RUST-2K carried
+/// 326 events over four months with no payload beyond the words "stalled vocab
+/// download", which is an alarm that teaches nothing when it goes off.
+///
+/// Two fixed phrases, never a byte count: a number in the message would
+/// fragment the fingerprint the way per-tail messages did in RUST-6M/6N/6P.
+fn stalled_prefetch_cause(cache_dir: &Path) -> &'static str {
+    let reached = std::fs::read_dir(cache_dir)
+        .map(|mut dir| dir.next().is_some())
+        .unwrap_or(false);
+    if reached {
+        "vocab host reachable but slow"
+    } else {
+        "vocab host never answered"
+    }
+}
+
 impl ToolManager {
     pub fn new(runtime: ManagedRuntime) -> Self {
         let rtk_checksum = rtk_distribution_artifact()
@@ -3101,8 +3125,14 @@ impl ToolManager {
                     let _ = child.wait();
                     let tail = log_tail(&log_path, 1024);
                     bail!(
-                        "tiktoken prefetch timed out after {}s (stalled vocab download): {tail}",
-                        DEADLINE.as_secs()
+                        "tiktoken prefetch timed out after {}s (stalled vocab download, {}){}",
+                        DEADLINE.as_secs(),
+                        stalled_prefetch_cause(&cache_dir),
+                        if tail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {tail}")
+                        }
                     );
                 }
                 None => std::thread::sleep(std::time::Duration::from_millis(500)),
@@ -8966,6 +8996,14 @@ pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
         // where releases stop at 1.23.2). That is a bad pin in *our* lock, not
         // the user's machine -- it must never sit in the "other" grab-bag.
         "no-matching-dist"
+    } else if lower.contains("no openssl_applink") {
+        // The bundled interpreter's OpenSSL refuses to run: `ensurepip` dies
+        // before pip ever speaks (RUST-8K, host GIDI, 24 retries -- a hard
+        // install dead end, and the inner pip's own stderr is swallowed by
+        // CalledProcessError, so this line is the ONLY signal that survives).
+        // Its own bucket because nothing else about it looks like the network
+        // and permission causes it was sharing "other" with.
+        "openssl-applink"
     } else if lower.contains("no usable temporary directory") {
         "no-tempdir"
     } else if crate::is_disk_full_signal(&lower) {
@@ -9438,6 +9476,7 @@ mod tests {
     #[cfg(windows)]
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
+    use super::stalled_prefetch_cause;
     use super::{
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, build_command, cc_switch_reconcile_for_runtime,
@@ -10878,6 +10917,33 @@ asyncio.run(verify())
         assert!(
             leftovers.is_empty(),
             "no-op prefetch must not write into downloads: {leftovers:?}"
+        );
+    }
+
+    /// RUST-2K: the timeout message must say WHICH stall it was, or the alarm
+    /// is unactionable however many times it fires.
+    #[test]
+    fn stalled_prefetch_cause_separates_blocked_from_slow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Nothing landed: the vocab host never answered at all.
+        assert_eq!(
+            stalled_prefetch_cause(dir.path()),
+            "vocab host never answered"
+        );
+        // One vocab through, the other still coming: a slow link, not a wall.
+        std::fs::write(
+            dir.path().join("9b5ad71b2ce5302211f9c61530b329a4922fc6a4"),
+            b"x",
+        )
+        .expect("write cached vocab");
+        assert_eq!(
+            stalled_prefetch_cause(dir.path()),
+            "vocab host reachable but slow"
+        );
+        // An unreadable/absent dir must not panic; treat it as nothing cached.
+        assert_eq!(
+            stalled_prefetch_cause(&dir.path().join("does-not-exist")),
+            "vocab host never answered"
         );
     }
 
@@ -13678,6 +13744,14 @@ exit 0
                 "publishing extracted python into ~\\AppData\\Local\\Headroom: \
                  액세스가 거부되었습니다. (os error 5)",
                 "permission",
+            ),
+            // RUST-8K again, second cause under the same title: the bundled
+            // interpreter's OpenSSL dies inside `ensurepip`, before pip runs.
+            (
+                "installing pip into the Headroom-managed virtualenv: command failed (exit 1): \
+                 python.exe -m ensurepip --upgrade --default-pip\nstderr:\n\
+                 OPENSSL_Uplink(00007FF926407C58,08): no OPENSSL_Applink",
+                "openssl-applink",
             ),
             // The macOS network errnos must not read as a denial: the
             // closing paren in the needle is what keeps 51 out of "permission".

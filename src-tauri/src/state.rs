@@ -7009,6 +7009,23 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     // never laid down; see Sentry RUST-3Y). Must precede the generic
     // exited-before-port branch, whose message is vaguer. A full reinstall is
     // the reliable fix, so name it directly.
+    // The backend prints its whole banner, then dies before binding: its
+    // native deps (onnxruntime/torch) need the MSVC runtime, which a bare
+    // Windows box does not ship (RUST-8V/8W, and RUST-7W for the non-fatal
+    // prefetch half of the same cause). Without this branch the user gets the
+    // generic "crashed at startup, read the logs" -- the log DOES name the
+    // missing redistributable, three lines above the death, but nobody reads
+    // that far. The warning text comes from onnxruntime's Python, so it is
+    // English on every locale; do not match Windows' localized DLL errors.
+    // Must precede the exited-before-port branch, which would swallow it.
+    if raw.contains("Visual C++ Redistributable is not installed") {
+        return Some(
+            "Headroom's runtime needs the Microsoft Visual C++ Redistributable, \
+             which is missing on this machine -- its native libraries fail to load without it. \
+             Install it from https://aka.ms/vs/17/release/vc_redist.x64.exe, then relaunch Headroom."
+                .into(),
+        );
+    }
     if raw.contains("ModuleNotFoundError: No module named 'headroom") {
         return Some(
             "Headroom's runtime is missing some of its own files, so it can't start \
@@ -8166,6 +8183,25 @@ mod tests {
         );
         assert!(hint.contains("Reinstall"));
         // Must win over the generic crash branch (which also matches this raw).
+        assert!(!hint.contains("crashed at startup"), "got: {hint}");
+    }
+
+    /// RUST-8V/8W: the runtime prints its full banner and then dies before
+    /// binding, because its native deps cannot load without the MSVC
+    /// redistributable. The log names the cause; the hint must too, instead of
+    /// sending the user to read it.
+    #[test]
+    fn classify_startup_error_missing_msvc_redistributable() {
+        let raw = "unable to keep headroom running in background: \
+            ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe proxy --port 6768 \
+            exited with status exit code: 0xffffffff before opening port 6768\n--- log tail ---\n\
+            Press Ctrl+C to stop.\n\nMicrosoft Visual C++ Redistributable is not installed, \
+            this may lead to the DLL load failure.\n\
+            It can be downloaded at https://aka.ms/vs/17/release/vc_redist.x64.exe\n";
+        let hint = classify_startup_error(raw).expect("missing redist should classify");
+        assert!(hint.contains("Visual C++ Redistributable"), "got: {hint}");
+        assert!(hint.contains("vc_redist.x64.exe"), "got: {hint}");
+        // Must win over the generic exited-before-port branch, which also matches.
         assert!(!hint.contains("crashed at startup"), "got: {hint}");
     }
 

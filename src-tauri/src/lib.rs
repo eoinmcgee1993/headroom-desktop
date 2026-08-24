@@ -6876,6 +6876,14 @@ fn pixel_char(c: u8) -> [[u8; 3]; 5] {
 }
 
 fn toggle_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result<()> {
+    // Teardown in flight: uninstall deletes the managed runtime while we are
+    // still alive, so onboarding_complete() flips false and a tray click here
+    // would hide the uninstall progress and pop Get Started over a teardown the
+    // user cannot dismiss. Ignore clicks once we are on the way out.
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
     if !onboarding_complete(app) {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.hide();
@@ -6986,6 +6994,14 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
 }
 
 fn show_launcher_window(app: &AppHandle) -> tauri::Result<()> {
+    // Choke point for every "route back to setup" path (tray click, tray menu,
+    // ensure_runtime_ready_for_tray, show_dashboard_window, second instance).
+    // During uninstall the runtime is already gone, so all of them would raise
+    // the onboarding window on top of a quitting app.
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
     let Some(window) = app.get_webview_window("launcher") else {
         return Err(tauri::Error::WebviewNotFound);
     };
