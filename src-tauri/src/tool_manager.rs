@@ -7156,6 +7156,21 @@ pub(crate) fn describe_proxy_port_occupant(port: u16) -> String {
     }
 }
 
+/// `Some(detail)` when `port` is held by a NAMED process that is not our
+/// backend. `None` for free, ours, or held-by-nobody -- the unowned shape is
+/// the updater-relaunch race `diagnose_proxy_port_settled` waits out
+/// (RUST-7F), so a fail-fast caller must never act on it.
+pub(crate) fn proxy_port_held_by_named_foreign(port: u16) -> Option<String> {
+    named_foreign_occupant(diagnose_proxy_port(port))
+}
+
+fn named_foreign_occupant(state: PortState) -> Option<String> {
+    match state {
+        PortState::ForeignOccupant(detail) if detail != UNKNOWN_OCCUPANT => Some(detail),
+        _ => None,
+    }
+}
+
 /// Re-`diagnose` while the port reads as held-by-nobody, up to `attempts`
 /// times. Split from [`diagnose_proxy_port_settled`] so the retry rule is
 /// testable without binding real sockets.
@@ -9082,6 +9097,15 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
     format!("exit={exit}; stderr tail: {tail}")
 }
 
+/// True when pip's resolution failure is really a starved index: every
+/// index/find-links fetch died, so pip saw "(from versions: none)" for a pin
+/// that exists everywhere (RUST-90/91: TLS-broken middleware on one machine).
+/// Requires BOTH signals so a genuinely bad pin with an incidental fetch
+/// warning keeps its no-matching-dist verdict (RUST-6S listed real versions).
+pub(crate) fn pip_index_fetch_failed(lower: &str) -> bool {
+    lower.contains("could not fetch url") && lower.contains("from versions: none")
+}
+
 /// Coarse cause class for a pip failure, used as the Sentry fingerprint.
 ///
 /// The compact message embeds pip's stderr tail, and Sentry groups bridged log
@@ -9094,8 +9118,9 @@ pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
     if lower.contains("no module named pip") {
         "no-pip"
-    } else if lower.contains("no matching distribution found")
-        || lower.contains("could not find a version that satisfies")
+    } else if (lower.contains("no matching distribution found")
+        || lower.contains("could not find a version that satisfies"))
+        && !pip_index_fetch_failed(&lower)
     {
         // Our lock asked for a version PyPI has no wheel for on that
         // interpreter/platform (RUST-6S: onnxruntime==1.27.0 on Intel macOS,
@@ -10237,6 +10262,48 @@ asyncio.run(verify())
 
     /// The boot-validation failure path reports the occupant, not just a
     /// bound/unbound bit. A free port and a held one must not read alike.
+    #[test]
+    fn named_foreign_occupant_only_fires_on_a_named_foreigner() {
+        use super::{named_foreign_occupant, PortState, UNKNOWN_OCCUPANT};
+        assert_eq!(
+            named_foreign_occupant(PortState::ForeignOccupant("nginx pid 42".into())),
+            Some("nginx pid 42".into())
+        );
+        // The unowned shape is the updater-relaunch race (RUST-7F): a
+        // fail-fast caller must keep waiting on it.
+        assert!(
+            named_foreign_occupant(PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into())).is_none()
+        );
+        assert!(named_foreign_occupant(PortState::Free).is_none());
+        assert!(named_foreign_occupant(PortState::HeadroomRunning).is_none());
+    }
+
+    #[test]
+    fn pip_index_fetch_failed_requires_both_signals() {
+        use super::pip_index_fetch_failed;
+        // RUST-90: no index was readable, so the pin verdict is meaningless.
+        assert!(pip_index_fetch_failed(
+            "could not fetch url https://pypi.org/simple/x/: ssl eof\n\
+             error: could not find a version that satisfies x==1 (from versions: none)"
+        ));
+        // A real bad pin lists the versions pip DID see (RUST-6S).
+        assert!(!pip_index_fetch_failed(
+            "could not fetch url https://github.com/x: rate limited\n\
+             no matching distribution found for onnxruntime==1.27.0 (from versions: 1.23.0)"
+        ));
+        assert!(!pip_index_fetch_failed(
+            "no matching distribution found for onnxruntime==1.27.0 (from versions: none)"
+        ));
+        // And a starved index must knock the shape out of no-matching-dist.
+        assert_eq!(
+            super::pip_failure_category(
+                "exit=1; stderr tail: Could not fetch URL https://pypi.org/simple/x/: ssl eof\n\
+                 ERROR: No matching distribution found for x==1 (from versions: none)"
+            ),
+            "network"
+        );
+    }
+
     #[test]
     fn describe_proxy_port_occupant_separates_free_from_held() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");

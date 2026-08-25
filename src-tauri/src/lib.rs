@@ -1683,6 +1683,15 @@ fn conflicting_openssl_dirs(path_var: &str) -> Vec<String> {
 /// timeout word in that preamble must not steal the classification.
 fn is_unsupported_pin_signal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
+    // "No matching distribution" is only a verdict about OUR pin when pip
+    // actually read an index. When every index/find-links fetch died
+    // (RUST-90/91: TLS-broken middleware on one machine), pip reports every
+    // pin as "(from versions: none)" -- that is the network, and calling it
+    // unsupported_pin sends the user to the updater instead of their
+    // connection.
+    if tool_manager::pip_index_fetch_failed(&lower) {
+        return false;
+    }
     lower.contains("no matching distribution found")
         || lower.contains("could not find a version that satisfies")
 }
@@ -1723,6 +1732,8 @@ fn is_network_download_signal(text: &str) -> bool {
         "bad gateway",
         "service unavailable",
         "error sending request",
+        "could not fetch url",  // pip: an index/find-links fetch died
+        "max retries exceeded", // urllib3 inside pip
         "operation timed out",
         "connection timed out",
         "timed out",
@@ -8831,6 +8842,29 @@ mod tests {
         assert!(matches!(
             classify_bootstrap_failure(&err),
             BootstrapFailureKind::UnsupportedPin
+        ));
+    }
+
+    #[test]
+    fn total_index_fetch_failure_is_network_not_unsupported_pin() {
+        // Verbatim shape from RUST-90/91 (one Intel mac behind TLS-breaking
+        // middleware): pip could not fetch ANY index URL, so resolution said
+        // "(from versions: none)" for a pin that exists everywhere. The user
+        // needs their network fixed; the updater cannot help.
+        let err: anyhow::Error = make_command_failure(
+            "Could not fetch URL https://pypi.org/simple/aiohappyeyeballs/: \
+             There was a problem confirming the ssl certificate: \
+             HTTPSConnectionPool(host='pypi.org', port=443): Max retries \
+             exceeded with url: /simple/aiohappyeyeballs/ (Caused by \
+             SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING]'))) - skipping\n\
+             ERROR: Could not find a version that satisfies the requirement \
+             aiohappyeyeballs==2.6.2 (from versions: none)\n\
+             ERROR: No matching distribution found for aiohappyeyeballs==2.6.2",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::NetworkDownload
         ));
     }
 

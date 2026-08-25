@@ -228,6 +228,7 @@ impl IdentityPayload {
         mut builder: reqwest::blocking::RequestBuilder,
     ) -> reqwest::blocking::RequestBuilder {
         builder = builder.header("X-Headroom-App-Version", env!("CARGO_PKG_VERSION"));
+        builder = builder.header("X-Headroom-Os", std::env::consts::OS);
         builder = builder.header("X-Headroom-Device-Id", &self.device_id);
         if let Some(value) = self.chopratejas_instance_id.as_deref() {
             builder = builder.header("X-Headroom-Chopratejas-Id", value);
@@ -708,7 +709,10 @@ struct ApiErrorResponse {
 #[derive(Debug, Clone)]
 enum RemoteAccountSyncError {
     Unauthorized,
-    Other,
+    /// Anything that is not a 401, carrying what actually failed. RUST-8Z
+    /// fired with a bare "Other" after 59 silent hours, which could not tell
+    /// an HTTP 5xx from a transport error from a decode failure.
+    Other(String),
 }
 
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
@@ -3177,7 +3181,7 @@ fn merge_background_account_sync(
         }
         // Network failures carry no evidence about the session; never count
         // them toward escalation.
-        Err(RemoteAccountSyncError::Other) => (
+        Err(RemoteAccountSyncError::Other(_)) => (
             true,
             None,
             Some(
@@ -3455,25 +3459,28 @@ fn fetch_remote_account(
     identity: &IdentityPayload,
 ) -> Result<RemoteAccountEnvelope, RemoteAccountSyncError> {
     let builder = http_client()
-        .map_err(|_| RemoteAccountSyncError::Other)?
+        .map_err(RemoteAccountSyncError::Other)?
         .get(api_url("desktop/account"))
         .header("Authorization", format!("Bearer {token}"));
     let response = identity
         .apply_headers(builder)
         .send()
-        .map_err(|_| RemoteAccountSyncError::Other)?;
+        .map_err(|err| RemoteAccountSyncError::Other(format!("send: {err}")))?;
 
     if response.status().as_u16() == 401 {
         return Err(RemoteAccountSyncError::Unauthorized);
     }
 
     if !response.status().is_success() {
-        return Err(RemoteAccountSyncError::Other);
+        return Err(RemoteAccountSyncError::Other(format!(
+            "http {}",
+            response.status()
+        )));
     }
 
     response
         .json::<RemoteAccountEnvelope>()
-        .map_err(|_| RemoteAccountSyncError::Other)
+        .map_err(|err| RemoteAccountSyncError::Other(format!("decode: {err}")))
 }
 
 fn http_client() -> Result<Client, String> {
@@ -3910,6 +3917,10 @@ mod tests {
             req.headers().get("X-Headroom-App-Version").unwrap(),
             env!("CARGO_PKG_VERSION")
         );
+        assert_eq!(
+            req.headers().get("X-Headroom-Os").unwrap(),
+            std::env::consts::OS
+        );
     }
 
     #[test]
@@ -4217,7 +4228,7 @@ mod tests {
     fn transient_background_sync_error_keeps_local_session_authenticated() {
         let (authenticated, account, error) = merge_background_account_sync(
             Some("session-token"),
-            Err(RemoteAccountSyncError::Other),
+            Err(RemoteAccountSyncError::Other("send: timed out".into())),
         );
 
         assert!(authenticated);

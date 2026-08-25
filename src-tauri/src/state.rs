@@ -435,6 +435,11 @@ pub enum BootValidationOutcome {
     /// Reported instead of `Stalled` so we don't burn ~120s waiting for a
     /// process that was never going to start.
     NotStarted,
+    /// The backend port is held by a named process that is not ours, so the
+    /// freshly spawned child can never bind it. That squatter's accept()
+    /// keeps the TCP activity signal green, which is how RUST-4A burned the
+    /// full 600s boot budget; bail as soon as the occupant is identified.
+    ForeignPortOccupant,
 }
 
 impl BootValidationOutcome {
@@ -448,6 +453,7 @@ impl BootValidationOutcome {
             BootValidationOutcome::Stalled => "stalled",
             BootValidationOutcome::TimedOut => "timed_out",
             BootValidationOutcome::NotStarted => "not_started",
+            BootValidationOutcome::ForeignPortOccupant => "foreign_port_occupant",
         }
     }
 }
@@ -1631,6 +1637,7 @@ impl AppState {
             .checked_sub(Duration::from_secs(5))
             .unwrap_or_else(Instant::now);
 
+        let mut foreign_checked = false;
         let max = Duration::from_secs(RUNTIME_UPGRADE_BOOT_MAX_SECS);
         let hard_max = Duration::from_secs(RUNTIME_UPGRADE_BOOT_HARD_MAX_SECS);
         let grace = Duration::from_secs(RUNTIME_UPGRADE_STALL_GRACE_SECS);
@@ -1687,6 +1694,24 @@ impl AppState {
             let port_bound = proxy_port_accepts_connection();
             if port_bound {
                 last_log_activity = Instant::now();
+            }
+
+            // A bound port that never answers /livez may be a foreign
+            // squatter whose accept() keeps the activity signal green for
+            // the whole boot budget (RUST-4A: 625s against a port the child
+            // could never bind). Identify the occupant once, after the grace
+            // window; unknown/unowned shapes keep waiting, since that is the
+            // updater-relaunch race the settle logic absorbs (RUST-7F).
+            if port_bound && !foreign_checked && elapsed > grace {
+                foreign_checked = true;
+                if let Some(detail) = crate::tool_manager::proxy_port_held_by_named_foreign(
+                    crate::backend_port::get(),
+                ) {
+                    log::warn!(
+                        "wait_for_boot_validation: backend port held by foreign process ({detail}); failing fast"
+                    );
+                    return BootValidationOutcome::ForeignPortOccupant;
+                }
             }
 
             // Refresh CPU-time observation. Catches lifespan-phase work
@@ -7973,6 +7998,11 @@ mod tests {
         assert_eq!(BootValidationOutcome::Stalled.label(), "stalled");
         assert_eq!(BootValidationOutcome::TimedOut.label(), "timed_out");
         assert_eq!(BootValidationOutcome::NotStarted.label(), "not_started");
+        assert_eq!(
+            BootValidationOutcome::ForeignPortOccupant.label(),
+            "foreign_port_occupant"
+        );
+        assert!(!BootValidationOutcome::ForeignPortOccupant.is_ok());
         assert!(BootValidationOutcome::Reachable.is_ok());
         assert!(!BootValidationOutcome::NotStarted.is_ok());
     }
