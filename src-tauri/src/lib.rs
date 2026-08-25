@@ -3273,11 +3273,27 @@ async fn verify_headroom_auth_code(
     // `get_headroom_pricing_status` so a user who signs up after grace
     // expiry doesn't have to wait for the next 60s pricing poll for
     // Python to come back online.
-    state.apply_pricing_gate_status(
-        &status,
-        crate::client_adapters::any_gate_exempt_client_enabled(),
-    );
-    state.apply_codex_pricing_gate_status(status.codex.as_ref());
+    //
+    // On a worker thread, not inline: a gate flip here starts or stops the
+    // Python backend, and `ensure_headroom_running` blocks across a full
+    // cold boot (`start_headroom_background` waits up to
+    // HEADROOM_STARTUP_TIMEOUT_MS = 5min per spawn variant, longer on a
+    // Windows first launch with Defender scanning the venv). Awaiting that
+    // kept the sign-in button on "Verifying..." for minutes after the
+    // account was already connected. Same idiom as
+    // `handle_headroom_deep_link`.
+    {
+        let app_handle = app.clone();
+        let status = status.clone();
+        std::thread::spawn(move || {
+            let state: tauri::State<'_, AppState> = app_handle.state();
+            state.apply_pricing_gate_status(
+                &status,
+                crate::client_adapters::any_gate_exempt_client_enabled(),
+            );
+            state.apply_codex_pricing_gate_status(status.codex.as_ref());
+        });
+    }
     analytics::track_event(
         &app,
         "auth_verified",
