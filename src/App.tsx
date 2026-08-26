@@ -1866,7 +1866,8 @@ export default function App() {
     pricingStatus?.activePercentOff ?? 0,
     pricingStatus?.introOffer ?? null,
     pricingStatus?.account?.subscriptionRenewalCents,
-    pricingStatus?.account?.subscriptionRenewalEndsAt
+    pricingStatus?.account?.subscriptionRenewalEndsAt,
+    pricingStatus?.account?.upgradeAction
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -7226,7 +7227,8 @@ export default function App() {
         <div className="tray-content tray-content--upgrade" hidden={activeView !== "upgrade"}>
           <section className="upgrade-hero">
             <h1>Plans based on your AI subscription</h1>
-            {pricingAudience === "individual" ? (
+            {pricingAudience === "individual" &&
+              pricingStatus?.account?.upgradeAction !== "appsumo" ? (
               <div className="upgrade-billing-toggle" role="group" aria-label="Billing period">
                 {(["monthly", "annual"] as const).map((period) => (
                   <button

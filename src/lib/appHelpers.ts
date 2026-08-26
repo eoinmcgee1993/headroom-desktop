@@ -353,7 +353,10 @@ export function getUpgradePlans(
   activePercentOff: number = 0,
   introOffer: IntroOffer | null = null,
   subscriptionRenewalCents?: number | null,
-  subscriptionRenewalEndsAt?: string | null
+  subscriptionRenewalEndsAt?: string | null,
+  // The server's upgradeAction for AppSumo-entitled accounts; "appsumo" means
+  // every plan change happens on AppSumo, so Polar prices would be wrong.
+  upgradeAction?: string | null
 ): {
   plans: UpgradePlan[];
   featuredPlanId: UpgradePlanId;
@@ -600,13 +603,37 @@ export function getUpgradePlans(
       };
     };
 
+    // While the AppSumo deal is live every plan change happens on AppSumo as a
+    // one-time tier buy, so the Polar monthly/annual prices on the cards would
+    // promise a price nobody pays. centeredPriceLabel replaces the whole price
+    // block (sticker, billing lines, discounts) with the AppSumo figure.
+    const APPSUMO_LIFETIME_PRICES: Record<"pro" | "max5x" | "max20x", string> = {
+      pro: "$29",
+      max5x: "$99",
+      max20x: "$199"
+    };
+    const withAppsumoPricing = (plan: UpgradePlan): UpgradePlan => {
+      if (upgradeAction !== "appsumo") {
+        return plan;
+      }
+      if (plan.id === activeHeadroomPlanId) {
+        return { ...plan, centeredPriceLabel: "lifetime plan • via AppSumo" };
+      }
+      const oneTime = APPSUMO_LIFETIME_PRICES[plan.id as "pro" | "max5x" | "max20x"];
+      return {
+        ...plan,
+        centeredPriceLabel: `${oneTime} one-time • on AppSumo`,
+        ...(plan.ctaLabel.startsWith("Upgrade") ? { ctaLabel: "Upgrade on AppSumo" } : {})
+      };
+    };
+
     if (activeHeadroomPlanId) {
       const orderedPaidPlans = [
         paidPlans[activeHeadroomPlanId],
         ...(["pro", "max5x", "max20x"] as const)
           .filter((planId) => planId !== activeHeadroomPlanId)
           .map((planId) => paidPlans[planId])
-      ].map(withRelativeCta);
+      ].map(withRelativeCta).map(withAppsumoPricing);
       return {
         plans: orderedPaidPlans,
         featuredPlanId: activeHeadroomPlanId
