@@ -1889,8 +1889,6 @@ export default function App() {
     dashboard.lifetimeEstimatedSavingsUsd <= 0;
   // Independent of launchExperience: any savings on record at all, which is
   // what retires the setup-stall watchdog below.
-  const savingsEverRecorded =
-    dashboard.lifetimeEstimatedTokensSaved > 0 || dashboard.lifetimeEstimatedSavingsUsd > 0;
   const forcedSetupStall = debugOverrides?.setupStall ?? null;
   useEffect(() => {
     if (!showHeadroomDetails || !headroomLogRef.current) {
@@ -2607,18 +2605,13 @@ export default function App() {
   // saved almost always means the hookup is incomplete, not that the user was
   // idle the whole time. Runs regardless of tray visibility (the other
   // dashboard pollers are focus-gated, so without this a broken install stays
-  // silent while the window is closed), and stops for good once any savings
-  // land. `maybeFireSetupStallAlert` owns the once-per-local-day throttle.
+  // silent while the window is closed). It no longer retires once savings
+  // land: the same tick also watches for savings DRIFT (saved before, days of
+  // traffic with nothing optimized since - the server's "on but idle" cohort)
+  // and drives the silent connector self-heal. `maybeFireSetupStallAlert`
+  // owns the once-per-local-day throttle for both alert families.
   useEffect(() => {
     if (windowLabel !== "main") {
-      return;
-    }
-    // Forced runs are for eyeballing the modal, so they ignore the "already
-    // earning savings" retirement that would otherwise never let it show.
-    if (!forcedSetupStall && savingsEverRecorded) {
-      // Savings have landed: retire the banner line too, or it would stick at
-      // whatever it last said once this effect stops running.
-      setStallBannerLine(null);
       return;
     }
 
@@ -2633,6 +2626,11 @@ export default function App() {
       if (forcedSetupStall && forcedSetupStallFiredRef.current) {
         return;
       }
+      // Silent self-heal first: re-apply any configured connector whose files
+      // no longer verify (another tool rewrote settings.json, a shell block
+      // vanished). Rust throttles the scan to once per hour and skips it
+      // while paused/bypassed; failures are logged there, not surfaced here.
+      void invoke("repair_client_setups").catch(() => undefined);
       const latest = await loadDashboard().catch(() => null);
       if (!active || !latest) {
         return;
@@ -2669,7 +2667,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [windowLabel, savingsEverRecorded, forcedSetupStall]);
+  }, [windowLabel, forcedSetupStall]);
 
   useEffect(() => {
     if (windowLabel !== "main" || !trayWindowFocused) {

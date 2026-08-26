@@ -1373,6 +1373,19 @@ pub struct BootstrapStepUpdate {
     pub percent: u8,
 }
 
+/// Last progress milestone of a bootstrap attempt that never reached a
+/// verdict. Persisted by `note_bootstrap_attempt` on every progress update,
+/// cleared when the attempt succeeds or fails with a classification, and
+/// consumed on the next launch by `take_abandoned_bootstrap` -- the silent
+/// half of install failures (app quit, crash, kill mid-install) that the
+/// error branch can never see.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AbandonedBootstrap {
+    pub step: String,
+    pub percent: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedRuntime {
     pub root_dir: PathBuf,
@@ -3443,6 +3456,15 @@ impl ToolManager {
     where
         F: FnMut(BootstrapStepUpdate),
     {
+        // Persist every milestone to the attempt marker. If this attempt dies
+        // without a verdict (quit, crash, kill), the marker survives and the
+        // next launch reports it as bootstrap_abandoned with the phase it
+        // died in.
+        let mut caller_progress = progress;
+        let mut progress = |update: BootstrapStepUpdate| {
+            self.note_bootstrap_attempt(update.step, update.percent);
+            caller_progress(update);
+        };
         // Milestone logs mirror the UI progress steps into the file log. The
         // bootstrap is otherwise near-silent on disk (only the codesign line),
         // so a stuck/slow first install is hard to diagnose from logs alone.
@@ -3525,6 +3547,7 @@ impl ToolManager {
             log::warn!("MSVC runtime DLL vendoring failed during bootstrap: {err:#}");
         }
 
+        self.clear_bootstrap_attempt();
         self.write_ready_flag()?;
         self.write_bootstrap_receipt()?;
         log::info!("bootstrap: managed runtime install complete (ready flag written)");
@@ -5640,6 +5663,44 @@ impl ToolManager {
         crate::client_adapters::atomic_write(&lock_path, contents.as_bytes())
             .with_context(|| format!("writing {}", lock_path.display()))?;
         Ok(lock_path)
+    }
+
+    /// Marker recording the newest bootstrap progress milestone. Present
+    /// without the READY flag = an attempt died without a verdict.
+    fn bootstrap_attempt_marker_path(&self) -> PathBuf {
+        self.runtime.root_dir.join("bootstrap-attempt.json")
+    }
+
+    /// Best-effort: a failed marker write must never fail the install itself.
+    pub fn note_bootstrap_attempt(&self, step: &str, percent: u8) {
+        let marker = AbandonedBootstrap {
+            step: step.to_string(),
+            percent,
+        };
+        if let Ok(json) = serde_json::to_vec(&marker) {
+            let _ =
+                crate::client_adapters::atomic_write(&self.bootstrap_attempt_marker_path(), &json);
+        }
+    }
+
+    /// Remove the marker once the attempt has a verdict: success writes the
+    /// READY flag, and a classified failure already reported to Sentry, so
+    /// either way the next launch has nothing abandoned to report.
+    pub fn clear_bootstrap_attempt(&self) {
+        let _ = std::fs::remove_file(self.bootstrap_attempt_marker_path());
+    }
+
+    /// Consume the marker left by a bootstrap attempt that never reached a
+    /// verdict. Reports at most once: the marker is deleted on read. A READY
+    /// runtime means a later attempt succeeded, so nothing was abandoned.
+    pub fn take_abandoned_bootstrap(&self) -> Option<AbandonedBootstrap> {
+        let path = self.bootstrap_attempt_marker_path();
+        let raw = std::fs::read(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        if self.python_runtime_installed() {
+            return None;
+        }
+        serde_json::from_slice(&raw).ok()
     }
 
     fn write_bootstrap_receipt(&self) -> Result<()> {
@@ -9146,6 +9207,20 @@ pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
         // Its own bucket because nothing else about it looks like the network
         // and permission causes it was sharing "other" with.
         "openssl-applink"
+    } else if lower.contains("application control policy has blocked")
+        || lower.contains("(os error 4551)")
+    {
+        // Windows Application Control (Smart App Control / WDAC / AppLocker)
+        // blocked a freshly-extracted file (RUST-8K, third cause). Windows
+        // localizes the prose; the numeric code is the locale-independent
+        // handle. Shares its strings with `is_app_control_signal`.
+        "app-control"
+    } else if lower.contains("cannot import name 'httpshandler'") {
+        // The bundled interpreter's ssl stack would not load, so urllib has
+        // no HTTPSHandler and ensurepip dies importing pip (RUST-8K, fourth
+        // cause: the App Control machine on retry -- python.exe was allowed
+        // through, but _ssl's DLLs were still blocked).
+        "ssl-missing"
     } else if lower.contains("no usable temporary directory") {
         "no-tempdir"
     } else if crate::is_disk_full_signal(&lower) {
@@ -10556,6 +10631,26 @@ asyncio.run(verify())
             release.wheel_url
         );
         assert_eq!(release.sha256.len(), 64, "sha256 must be pinned");
+    }
+
+    #[test]
+    fn abandoned_bootstrap_marker_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(dir.path()));
+        assert!(manager.take_abandoned_bootstrap().is_none());
+
+        manager.note_bootstrap_attempt("Downloading Python", 18);
+        let taken = manager.take_abandoned_bootstrap().expect("marker reported");
+        assert_eq!(taken.step, "Downloading Python");
+        assert_eq!(taken.percent, 18);
+        // Consumed on read: a second launch must not double-report.
+        assert!(manager.take_abandoned_bootstrap().is_none());
+
+        // An attempt with a verdict (success or classified failure) clears
+        // the marker, so the next launch reports nothing.
+        manager.note_bootstrap_attempt("Updating dependencies", 60);
+        manager.clear_bootstrap_attempt();
+        assert!(manager.take_abandoned_bootstrap().is_none());
     }
 
     /// Downloads keep PyPI's filename so pip's own platform check stays a
@@ -14028,6 +14123,23 @@ exit 0
                  python.exe -m ensurepip --upgrade --default-pip\nstderr:\n\
                  OPENSSL_Uplink(00007FF926407C58,08): no OPENSSL_Applink",
                 "openssl-applink",
+            ),
+            // RUST-8K, third cause: Windows Application Control blocked the
+            // venv python before it could run. Localized prose, so the
+            // numeric code carries the match.
+            (
+                "creating Headroom-managed virtualenv: starting python.exe -m venv: \
+                 An Application Control policy has blocked this file. (os error 4551)",
+                "app-control",
+            ),
+            // RUST-8K, fourth cause: same machine on retry -- python ran,
+            // but _ssl's DLLs stayed blocked, so ensurepip dies importing
+            // pip and only this ImportError survives.
+            (
+                "installing pip into the Headroom-managed virtualenv: command failed (exit 1): \
+                 python.exe -m ensurepip --upgrade --default-pip\nstderr:\n\
+                 ImportError: cannot import name 'HTTPSHandler' from 'urllib.request'",
+                "ssl-missing",
             ),
             // The macOS network errnos must not read as a denial: the
             // closing paren in the needle is what keeps 51 out of "permission".

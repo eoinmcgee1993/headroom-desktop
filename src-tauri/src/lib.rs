@@ -593,7 +593,7 @@ fn fake_override(name: &str) -> Option<String> {
 fn get_debug_overrides() -> DebugOverrides {
     DebugOverrides {
         setup_stall: fake_override("HEADROOM_FAKE_SETUP_STALL")
-            .filter(|mode| mode == "no_traffic" || mode == "no_savings"),
+            .filter(|mode| mode == "no_traffic" || mode == "no_savings" || mode == "drift"),
     }
 }
 
@@ -1455,6 +1455,10 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             if let Err(err) = result {
                 let kind = classify_bootstrap_failure(&err);
                 capture_bootstrap_failure(&err, kind);
+                // This failure got a verdict and a Sentry event; drop the
+                // attempt marker so the next launch does not also report it
+                // as bootstrap_abandoned.
+                state.tool_manager.clear_bootstrap_attempt();
                 *state.bootstrap_failure_report.lock() = Some(BootstrapFailureReport {
                     kind: kind.as_str().into(),
                     detail: tool_manager::compact_pip_failure(&err),
@@ -1582,6 +1586,13 @@ enum BootstrapFailureKind {
     /// `Permission` this must not send the user back to Try again: 25 events
     /// from one host were 25 relaunches into the same wall.
     SslLibraryConflict,
+    /// Windows Application Control (Smart App Control, WDAC, or AppLocker)
+    /// refused to run a file we just extracted: "An Application Control policy
+    /// has blocked this file" (os error 4551). A policy verdict, so every
+    /// retry hits the same wall (RUST-8K, third cause: venv creation died on
+    /// it, and the retry got further only for _ssl's DLLs to be blocked the
+    /// same way). The user action is a security setting, not Try again.
+    AppControlBlocked,
     /// pip fell back to building a package from source and the build failed.
     /// Since every install passes `--only-binary=:all:` (see `PIP_ONLY_BINARY`)
     /// this should be unreachable, so reaching it means *we* shipped a lock or
@@ -1602,6 +1613,7 @@ impl BootstrapFailureKind {
             // failure_kind lines up with the pip-layer Sentry issue.
             BootstrapFailureKind::Permission => "permission",
             BootstrapFailureKind::SslLibraryConflict => "ssl_library_conflict",
+            BootstrapFailureKind::AppControlBlocked => "app_control_blocked",
             BootstrapFailureKind::SourceBuild => "build",
             BootstrapFailureKind::Other => "other",
         }
@@ -1627,6 +1639,8 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::SslInterception
     } else if is_ssl_library_conflict_signal(&haystack) {
         BootstrapFailureKind::SslLibraryConflict
+    } else if is_app_control_signal(&haystack) {
+        BootstrapFailureKind::AppControlBlocked
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
     } else if is_unsupported_pin_signal(&haystack) {
@@ -1650,6 +1664,16 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
 fn is_ssl_library_conflict_signal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("no openssl_applink") || lower.contains("openssl_uplink")
+}
+
+/// True when Windows Application Control (Smart App Control, WDAC, AppLocker)
+/// blocked a file we just extracted. Windows localizes the prose like every
+/// other error, so the numeric code is the locale-independent handle
+/// (ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION = 4551). Shares its strings with
+/// `pip_failure_category`'s `app-control` bucket so the two layers agree.
+fn is_app_control_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("application control policy has blocked") || lower.contains("(os error 4551)")
 }
 
 /// PATH directories holding an OpenSSL that could be loaded into our
@@ -1804,6 +1828,15 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              - remove that folder from PATH, then restart your PC. Use Contact \
              support below and we'll read the details it sends, including which \
              folders we found."
+        }
+        BootstrapFailureKind::AppControlBlocked => {
+            "Installation failed: Windows Application Control (Smart App Control, \
+             AppLocker, or a company WDAC policy) blocked the files Headroom just \
+             installed, and clicking Try again will keep hitting the same block. \
+             On a personal PC, check Windows Security > App & browser control. On \
+             a work PC, ask your IT team to allow Headroom's install folder \
+             (%LOCALAPPDATA%\\Headroom). Use Contact support below and we'll read \
+             the details it sends."
         }
         BootstrapFailureKind::SourceBuild => {
             "Installation failed: Headroom couldn't assemble its runtime on this \
@@ -2722,6 +2755,11 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     if lower.contains("operation not permitted")
         && (lower.contains("site-packages") || lower.contains(".so") || lower.contains(".dylib"))
     {
+        return true;
+    }
+    // A Windows Application Control verdict (Smart App Control / WDAC /
+    // AppLocker) is definitionally endpoint protection blocking fresh code.
+    if is_app_control_signal(&lower) {
         return true;
     }
     false
@@ -4136,6 +4174,35 @@ async fn verify_client_setup(client_id: String) -> Result<ClientSetupVerificatio
     client_adapters::verify_client_setup(&client_id).map_err(|err| err.to_string())
 }
 
+/// Watchdog-driven silent self-heal (see `client_adapters::repair_client_setups`).
+/// Skipped while the runtime is paused or bypassed: the pricing gate and the
+/// watchdog give-up path tear client configs down on purpose, and repairing
+/// behind their backs would fight the gate.
+#[tauri::command]
+async fn repair_client_setups(app: AppHandle) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        if state.runtime_is_paused()
+            || state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Vec::new();
+        }
+        let repaired = client_adapters::repair_client_setups();
+        for client_id in &repaired {
+            analytics::track_event(
+                &app,
+                "client_setup_auto_repaired",
+                Some(json!({ "client": client_id })),
+            );
+        }
+        repaired
+    })
+    .await
+    .map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 async fn detect_oss_remnants() -> Result<Vec<String>, String> {
     Ok(client_adapters::detect_oss_remnants())
@@ -4491,6 +4558,14 @@ pub fn run() {
     // records flow into Sentry too. Failure here cannot abort startup.
     let _ = logging::init();
 
+    // Linux AppImage launches export PYTHONHOME pointing into the transient
+    // /tmp/.mount_* squashfs (RUST-5C/RUST-1M: the managed venv's python
+    // resolved its stdlib there and exited 1 before the proxy port opened,
+    // bricking every start). Nothing we spawn ever wants the host's
+    // PYTHONHOME; scrub it once here so every child -- proxy, health checks,
+    // addons -- starts clean, instead of auditing each spawn site.
+    std::env::remove_var("PYTHONHOME");
+
     // Must come before any Tauri/state setup: this path never shows a window and
     // never starts the proxy, it just undoes our edits to other tools and exits.
     handle_uninstall_flag();
@@ -4522,6 +4597,50 @@ pub fn run() {
     }
 
     let state = AppState::new().expect("failed to create app state");
+
+    // A previous bootstrap attempt that never reached a verdict: the app was
+    // quit, crashed, or killed mid-install, so neither bootstrap_completed nor
+    // the error branch ever ran. Production funnel data (2026-08-26) shows
+    // these silent deaths outnumber classified failures ~4:1; this is the only
+    // signal they leave.
+    if let Some(abandoned) = state.tool_manager.take_abandoned_bootstrap() {
+        // The tail of the previous run's app log usually holds the last thing
+        // the install did before dying. Same 12KB cap as
+        // capture_upgrade_failure: Sentry drops extras past ~16KB.
+        let log_tail = std::fs::read_to_string(logging::log_path())
+            .ok()
+            .map(|s| {
+                if s.len() > 12_000 {
+                    let cut = s.len() - 12_000;
+                    format!("[truncated {cut} bytes]\n...{}", &s[cut..])
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_else(|| "app log unreadable".into());
+        sentry::with_scope(
+            |scope| {
+                let fp = ["bootstrap_abandoned", abandoned.step.as_str()];
+                scope.set_fingerprint(Some(fp.as_slice()));
+                scope.set_tag("abandoned_step", &abandoned.step);
+                scope.set_extra("percent", u64::from(abandoned.percent).into());
+                scope.set_extra("app_log_tail", log_tail.into());
+            },
+            || {
+                sentry::capture_message(
+                    &format!(
+                        "bootstrap_abandoned (died at \"{}\" {}%)",
+                        abandoned.step, abandoned.percent
+                    ),
+                    sentry::Level::Warning,
+                );
+            },
+        );
+        // Funnel mirror so the server-side stall query can tell "died
+        // mid-install but came back" from "gone for good". Unknown step names
+        // are ignored by servers that predate this one.
+        pricing::report_funnel_step(&state, "bootstrap_abandoned");
+    }
 
     let mut builder =
         tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -4918,6 +5037,7 @@ pub fn run() {
             start_headroom_learn,
             apply_client_setup,
             verify_client_setup,
+            repair_client_setups,
             detect_oss_remnants,
             get_client_connectors,
             disable_client_setup,
@@ -8765,6 +8885,27 @@ mod tests {
     }
 
     #[test]
+    fn classify_bootstrap_failure_flags_app_control_as_app_control_blocked() {
+        // RUST-8K, third cause, verbatim: Smart App Control / WDAC refused
+        // the venv python. The spawn dies with an io::Error (no
+        // CommandFailure), so the chain is the haystack.
+        let err =
+            anyhow::anyhow!("An Application Control policy has blocked this file. (os error 4551)")
+                .context("starting python.exe -m venv --without-pip")
+                .context("creating Headroom-managed virtualenv");
+        assert_eq!(
+            classify_bootstrap_failure(&err).as_str(),
+            "app_control_blocked"
+        );
+        // Localized Windows prose keeps only the numeric code.
+        let localized = anyhow::anyhow!("정책에 의해 차단되었습니다. (os error 4551)");
+        assert_eq!(
+            classify_bootstrap_failure(&localized).as_str(),
+            "app_control_blocked"
+        );
+    }
+
+    #[test]
     fn classify_bootstrap_failure_flags_a_source_build_as_source_build() {
         // Unreachable while every install passes `--only-binary=:all:`; if it
         // fires, a wheel we promised is missing for this machine.
@@ -8812,6 +8953,7 @@ mod tests {
             BootstrapFailureKind::NetworkDownload,
             BootstrapFailureKind::UnsupportedPin,
             BootstrapFailureKind::Permission,
+            BootstrapFailureKind::AppControlBlocked,
             BootstrapFailureKind::SourceBuild,
             BootstrapFailureKind::Other,
         ] {
@@ -8834,6 +8976,7 @@ mod tests {
         for kind in [
             BootstrapFailureKind::UnsupportedPin,
             BootstrapFailureKind::Permission,
+            BootstrapFailureKind::AppControlBlocked,
             BootstrapFailureKind::SourceBuild,
         ] {
             let msg = user_message_for(kind).to_ascii_lowercase();
@@ -9885,6 +10028,17 @@ Some unrelated content.
         ));
         assert!(is_endpoint_protection_signal(
             "Operation not permitted: cannot exec /venv/lib/libtorch_python.dylib"
+        ));
+    }
+
+    #[test]
+    fn is_endpoint_protection_signal_matches_windows_app_control() {
+        assert!(is_endpoint_protection_signal(
+            "An Application Control policy has blocked this file. (os error 4551)"
+        ));
+        // Localized Windows prose: only the numeric code survives.
+        assert!(is_endpoint_protection_signal(
+            "차단되었습니다. (os error 4551)"
         ));
     }
 

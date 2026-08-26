@@ -703,6 +703,65 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
     })
 }
 
+/// Silent self-heal for drifted client configs: for every client the user has
+/// enabled, if verification fails (another tool rewrote settings.json, a shell
+/// block vanished), re-run `apply_client_setup` and confirm with a re-verify.
+/// Returns the client ids that were actually repaired.
+///
+/// Scans at most once per hour per process: verification reads a handful of
+/// files (and the codex arm spawns a detached `codex doctor`), and a repair
+/// that cannot stick (read-only fs, ancient CLI) must not churn on every
+/// watchdog tick.
+pub fn repair_client_setups() -> Vec<String> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    // ponytail: process-wide hourly throttle; split per client if support
+    // traffic ever shows one client's broken repair starving another's.
+    static LAST_SCAN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    {
+        let mut last = LAST_SCAN.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        if last.is_some_and(|at| at.elapsed() < Duration::from_secs(3600)) {
+            return Vec::new();
+        }
+        *last = Some(Instant::now());
+    }
+
+    let client_ids: Vec<String> = load_setup_state()
+        .configured_clients
+        .keys()
+        .cloned()
+        .collect();
+    let mut repaired = Vec::new();
+    for client_id in client_ids {
+        let failing = match verify_client_setup(&client_id) {
+            Ok(verification) => !verification.failures.is_empty(),
+            // Ids verification doesn't support are ids repair can't help.
+            Err(_) => false,
+        };
+        if !failing {
+            continue;
+        }
+        if let Err(err) = apply_client_setup(&client_id) {
+            log::warn!("repair_client_setups: re-apply for {client_id} failed: {err:#}");
+            continue;
+        }
+        match verify_client_setup(&client_id) {
+            Ok(verification) if verification.failures.is_empty() => {
+                log::info!("repair_client_setups: repaired {client_id}");
+                repaired.push(client_id);
+            }
+            Ok(verification) => log::warn!(
+                "repair_client_setups: {client_id} still failing after re-apply: {:?}",
+                verification.failures
+            ),
+            Err(err) => {
+                log::warn!("repair_client_setups: re-verify for {client_id} errored: {err:#}")
+            }
+        }
+    }
+    repaired
+}
+
 pub fn is_claude_code_enabled() -> bool {
     is_configured(&load_setup_state(), "claude_code")
 }
@@ -10026,6 +10085,40 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             rendered.contains("[model_providers.gateway]"),
             "user provider table preserved, got:\n{rendered}"
         );
+    }
+
+    // NOTE: keep this the only test that calls repair_client_setups: the
+    // function carries a process-wide hourly scan throttle, so a second
+    // caller in the same test binary would get an empty no-op back.
+    #[test]
+    #[serial_test::serial]
+    fn repair_client_setups_reapplies_a_clobbered_config() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+        let baseline = super::verify_client_setup("codex").expect("verify runs");
+        assert!(
+            baseline.failures.is_empty(),
+            "clean right after apply: {:?}",
+            baseline.failures
+        );
+
+        // Another tool clobbers the routing config behind our back.
+        let config_toml = home.path().join(".codex").join("config.toml");
+        fs::write(&config_toml, "model_provider = \"other\"\n").unwrap();
+        assert!(
+            !super::verify_client_setup("codex")
+                .expect("verify runs")
+                .failures
+                .is_empty(),
+            "clobber must be visible to verification"
+        );
+
+        let repaired = super::repair_client_setups();
+        assert_eq!(repaired, vec!["codex_cli".to_string()]);
+        let healed = super::verify_client_setup("codex").expect("verify runs");
+        assert!(healed.failures.is_empty(), "healed: {:?}", healed.failures);
     }
 
     #[test]

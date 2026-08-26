@@ -33,6 +33,19 @@ export const SETUP_STALL_EARLIEST_MS = Math.min(
 // threshold, which is well inside the tolerance of these signals.
 export const SETUP_STALL_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
+// Drift: the install has saved before, but the trailing daily buckets show
+// traffic passing through with nothing optimized. That is the desktop-side
+// mirror of the server's "on but idle" admin scope, and it means the hookup
+// broke after it had been working (agent reconnected outside Headroom,
+// optimization silently off) rather than never having worked.
+export const SAVINGS_DRIFT_WINDOW_DAYS = 3;
+// ponytail: crude evidence floor so a trickle (one stray request, health
+// checks) cannot accuse a working setup; tune if support traffic says so.
+export const SAVINGS_DRIFT_MIN_TOKENS_SENT = 200_000;
+// The newest bucket must be at least this recent, or the user simply stopped
+// coding and stale buckets prove nothing about the setup today.
+export const SAVINGS_DRIFT_MAX_BUCKET_AGE_DAYS = 4;
+
 // Local day, not UTC, for the same reason the other urgent notifications use a
 // local key: a UTC key flips mid-afternoon for US users and lets two alerts
 // land in one local day.
@@ -42,7 +55,7 @@ const SETUP_STALL_DAY_KEY = "headroom_setup_stall_date";
 // (terminal still running the pre-install environment is the classic cause).
 // "no_savings": requests are arriving but nothing is being trimmed, which is a
 // different failure - optimization paused, gated, or misconfigured.
-export type SetupStallKind = "no_traffic" | "no_savings";
+export type SetupStallKind = "no_traffic" | "no_savings" | "drift";
 
 export interface SetupStallAlert {
   kind: SetupStallKind;
@@ -56,7 +69,16 @@ export function setupStallNoTrafficMinutes(): number {
 
 const STALL_TITLE = "Headroom hasn't saved anything yet";
 
+/// The drift branch fires on installs that HAVE saved before, so the shared
+/// "yet" title would be factually wrong there.
+function stallTitle(kind: SetupStallKind): string {
+  return kind === "drift" ? "Headroom has stopped saving" : STALL_TITLE;
+}
+
 function stallBody(kind: SetupStallKind): string {
+  if (kind === "drift") {
+    return "Headroom is running, but days of requests have passed through with nothing optimized. Your coding agent has probably disconnected from Headroom. Open Headroom to check.";
+  }
   if (kind === "no_traffic") {
     return `Your coding agent is connected, but ${setupStallNoTrafficMinutes()} minutes on not one request has come back through Headroom. It is probably still running with its pre-Headroom settings. Open Headroom to check.`;
   }
@@ -67,6 +89,9 @@ function stallBody(kind: SetupStallKind): string {
 /// native notification and ends with "Open Headroom to check", which reads as
 /// nonsense on a banner inside Headroom.
 function stallBannerBody(kind: SetupStallKind): string {
+  if (kind === "drift") {
+    return "Requests are passing through, but nothing has been optimized for days. Your coding agent has likely reconnected outside Headroom - restart it so it picks Headroom's settings back up.";
+  }
   if (kind === "no_traffic") {
     return "No request has come through Headroom yet. Your terminal or editor is probably still running with its pre-Headroom settings - restart it and they should pick the new settings up.";
   }
@@ -101,6 +126,34 @@ function hasUnverifiedConnector(connectors: ClientConnectorStatus[] | undefined)
   );
 }
 
+/// The install saved before, yet the trailing daily buckets show real traffic
+/// with zero savings. Evidence-gated on purpose: an idle machine (vacation,
+/// another computer) produces no fresh buckets and must not be nagged.
+export function savingsDrifted(dashboard: DashboardState): boolean {
+  const recent = dashboard.dailySavings.slice(-SAVINGS_DRIFT_WINDOW_DAYS);
+  if (recent.length < SAVINGS_DRIFT_WINDOW_DAYS) {
+    return false;
+  }
+  // Bucket dates are UTC day keys ("YYYY-MM-DD"), so compare in kind. Off by
+  // up to a day versus local time, which the 4-day allowance absorbs.
+  const newestAllowed = new Date(Date.now() - SAVINGS_DRIFT_MAX_BUCKET_AGE_DAYS * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
+  if (recent[recent.length - 1].date < newestAllowed) {
+    return false;
+  }
+  let sent = 0;
+  let saved = 0;
+  for (const point of recent) {
+    sent += point.totalTokensSent;
+    // Tokens and USD summed together is a unit crime, but the sum is only
+    // ever compared against exactly zero: any nonzero term means savings.
+    saved +=
+      point.estimatedTokensSaved + point.estimatedSavingsUsd + (point.outputTokensSaved ?? 0);
+  }
+  return saved === 0 && sent >= SAVINGS_DRIFT_MIN_TOKENS_SENT;
+}
+
 /// Pure decision: is this session's silence worth alerting about? Returns null
 /// whenever the silence is expected (still installing, runtime not there yet,
 /// blocked behind a gate, not enough uptime) or whenever savings have landed.
@@ -112,7 +165,7 @@ export function evaluateSetupStall(
   if (context.forceKind) {
     return {
       kind: context.forceKind,
-      title: STALL_TITLE,
+      title: stallTitle(context.forceKind),
       body: stallBody(context.forceKind),
     };
   }
@@ -135,6 +188,11 @@ export function evaluateSetupStall(
   const savingsRecorded =
     dashboard.lifetimeEstimatedTokensSaved > 0 || dashboard.lifetimeEstimatedSavingsUsd > 0;
   if (savingsRecorded) {
+    // Saved before: the setup branches below no longer apply, but the hookup
+    // can still break later. Same daily throttle, its own evidence gate.
+    if (savingsDrifted(dashboard)) {
+      return { kind: "drift", title: stallTitle("drift"), body: stallBody("drift") };
+    }
     return null;
   }
 
@@ -145,7 +203,7 @@ export function evaluateSetupStall(
     if (!hasUnverifiedConnector(context.connectors)) {
       return null;
     }
-    return { kind: "no_traffic", title: STALL_TITLE, body: stallBody("no_traffic") };
+    return { kind: "no_traffic", title: stallTitle("no_traffic"), body: stallBody("no_traffic") };
   }
 
   // Some traffic, but not yet enough to rule out a normal quiet start. Wait
@@ -156,7 +214,7 @@ export function evaluateSetupStall(
   ) {
     return null;
   }
-  return { kind: "no_savings", title: STALL_TITLE, body: stallBody("no_savings") };
+  return { kind: "no_savings", title: stallTitle("no_savings"), body: stallBody("no_savings") };
 }
 
 /// Line for the always-on Home banner, which otherwise reassures a user with
@@ -203,7 +261,7 @@ export function setupStallBannerLine(
   const savingsRecorded =
     dashboard.lifetimeEstimatedTokensSaved > 0 || dashboard.lifetimeEstimatedSavingsUsd > 0;
   if (savingsRecorded) {
-    return null;
+    return savingsDrifted(dashboard) ? stallBannerBody("drift") : null;
   }
 
   if (dashboard.lifetimeRequests === 0) {

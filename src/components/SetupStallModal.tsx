@@ -22,6 +22,10 @@ const LEAD: Record<SetupStallKind, string> = {
     "Your coding agent is connected to Headroom, but {minutes} minutes on, not one request has come back through it. That almost always means the agent is still running with the settings it had before Headroom was installed.",
   no_savings:
     "Requests are reaching Headroom, but none of them have been optimized. That usually means your coding agent connected before Headroom was ready, or optimization is paused.",
+  // Fires only on installs that saved before (see savingsDrifted), so the
+  // copy can say "stopped" as fact rather than hedging about a fresh setup.
+  drift:
+    "Headroom was saving you tokens, but requests from the last few days have all passed through without any optimization. That usually means your coding agent reconnected outside Headroom, or optimization is paused.",
 };
 
 const STEPS: Record<SetupStallKind, string[]> = {
@@ -38,6 +42,13 @@ const STEPS: Record<SetupStallKind, string[]> = {
   // plan were the cause this modal would never have appeared. Listing it sent
   // people to verify the one thing already ruled out.
   no_savings: [
+    "Restart your coding agent so it reconnects through Headroom.",
+    "Check that Headroom is not paused. The Home screen shows its current state.",
+  ],
+  // Same cheapest-first recovery as no_savings; a broken hookup is also being
+  // re-applied automatically in the background (repair_client_setups), so the
+  // restart is usually all that is left to do by the time this shows.
+  drift: [
     "Restart your coding agent so it reconnects through Headroom.",
     "Check that Headroom is not paused. The Home screen shows its current state.",
   ],
