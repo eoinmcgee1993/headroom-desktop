@@ -3972,8 +3972,8 @@ details[open] .optimize-minimal__details summary::after {
 }
 
 .connector-state.is-good {
-  color: #1f4a36;
-  background: rgba(108, 191, 155, 0.28);
+  color: var(--success);
+  background: var(--accent-tint-strong);
 }
 
 .connector-state.is-warning {
@@ -4094,8 +4094,8 @@ details[open] .optimize-minimal__details summary::after {
   font-size: 0.72rem;
   font-weight: 700;
   text-transform: uppercase;
-  color: #1f4a36;
-  background: rgba(108, 191, 155, 0.28);
+  color: var(--success);
+  background: var(--accent-tint-strong);
 }
 
 .link-button {
