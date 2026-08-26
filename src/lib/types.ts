@@ -244,7 +244,7 @@ export interface ClientSetupVerification {
 /// field is null on a stable build and on any RC launched without the var, so
 /// production behaviour is the all-null case.
 export interface DebugOverrides {
-  setupStall: "no_traffic" | "no_savings" | null;
+  setupStall: "no_traffic" | "no_savings" | "drift" | null;
 }
 
 export interface ClientConnectorStatus {

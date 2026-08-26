@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { mockDashboard } from "./mockData";
-import type { ClientConnectorStatus, DashboardState } from "./types";
+import type { ClientConnectorStatus, DailySavingsPoint, DashboardState } from "./types";
 import {
   __resetSetupStallThrottle,
   evaluateSetupStall,
@@ -11,6 +11,8 @@ import {
   SETUP_STALL_NO_SAVINGS_AFTER_MS,
   SETUP_STALL_NO_SAVINGS_MIN_REQUESTS,
   SETUP_STALL_NO_TRAFFIC_AFTER_MS,
+  SAVINGS_DRIFT_MIN_TOKENS_SENT,
+  SAVINGS_DRIFT_WINDOW_DAYS,
 } from "./setupHealthAlert";
 
 const { invokeMock, isVisibleMock } = vi.hoisted(() => ({
@@ -449,5 +451,89 @@ describe("setupStallBannerLine", () => {
     expect(setupStallBannerLine(returning(), 0, { forceKind: "no_savings" })).toContain(
       "none are being optimized"
     );
+  });
+});
+
+// --- drift branch: saved before, traffic still flowing, nothing optimized ---
+
+function driftDay(daysAgo: number, overrides: Partial<DailySavingsPoint> = {}): DailySavingsPoint {
+  return {
+    date: new Date(Date.now() - daysAgo * 86_400_000).toISOString().slice(0, 10),
+    estimatedSavingsUsd: 0,
+    estimatedTokensSaved: 0,
+    actualCostUsd: 1,
+    totalTokensSent: SAVINGS_DRIFT_MIN_TOKENS_SENT,
+    ...overrides,
+  };
+}
+
+// An install that has clearly earned savings before, with a full window of
+// fresh buckets showing traffic and zero optimization.
+function driftedDashboard(overrides: Partial<DashboardState> = {}): DashboardState {
+  return stalledDashboard({
+    launchExperience: "dashboard",
+    lifetimeRequests: 5_000,
+    lifetimeEstimatedTokensSaved: 1_000_000,
+    lifetimeEstimatedSavingsUsd: 12,
+    dailySavings: [driftDay(2), driftDay(1), driftDay(0)],
+    ...overrides,
+  });
+}
+
+describe("drift branch", () => {
+  it("fires for a saved-before install with a window of unoptimized traffic", () => {
+    const alert = evaluateSetupStall(driftedDashboard(), PAST_WINDOW);
+    expect(alert?.kind).toBe("drift");
+    expect(alert?.title).toBe("Headroom has stopped saving");
+  });
+
+  it("stays quiet when any bucket in the window recorded savings", () => {
+    const dashboard = driftedDashboard({
+      dailySavings: [driftDay(2), driftDay(1), driftDay(0, { estimatedTokensSaved: 1 })],
+    });
+    expect(evaluateSetupStall(dashboard, PAST_WINDOW)).toBeNull();
+  });
+
+  it("stays quiet below the traffic evidence floor", () => {
+    const dashboard = driftedDashboard({
+      dailySavings: [
+        driftDay(2, { totalTokensSent: 1_000 }),
+        driftDay(1, { totalTokensSent: 1_000 }),
+        driftDay(0, { totalTokensSent: 1_000 }),
+      ],
+    });
+    expect(evaluateSetupStall(dashboard, PAST_WINDOW)).toBeNull();
+  });
+
+  it("stays quiet when the buckets are stale (user stopped coding)", () => {
+    const dashboard = driftedDashboard({
+      dailySavings: [driftDay(8), driftDay(7), driftDay(6)],
+    });
+    expect(evaluateSetupStall(dashboard, PAST_WINDOW)).toBeNull();
+  });
+
+  it("stays quiet without a full window of buckets", () => {
+    const dashboard = driftedDashboard({
+      dailySavings: [driftDay(1), driftDay(0)].slice(0, SAVINGS_DRIFT_WINDOW_DAYS - 1),
+    });
+    expect(evaluateSetupStall(dashboard, PAST_WINDOW)).toBeNull();
+  });
+
+  it("stays quiet while the account gate has optimization off", () => {
+    expect(
+      evaluateSetupStall(driftedDashboard(), PAST_WINDOW, { optimizationBlocked: true })
+    ).toBeNull();
+  });
+
+  it("carries drift onto the Home banner line", () => {
+    const line = setupStallBannerLine(driftedDashboard(), PAST_WINDOW);
+    expect(line).toContain("nothing has been optimized for days");
+  });
+
+  it("keeps the banner quiet for a healthy saved-before install", () => {
+    const dashboard = driftedDashboard({
+      dailySavings: [driftDay(1, { estimatedTokensSaved: 500 }), driftDay(0)],
+    });
+    expect(setupStallBannerLine(dashboard, PAST_WINDOW)).toBeNull();
   });
 });
