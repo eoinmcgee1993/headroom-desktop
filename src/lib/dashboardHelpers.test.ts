@@ -432,7 +432,7 @@ describe("mergeProviderSavingsForDisplay", () => {
         totalTokensSent: 140
       },
       {
-        label: "Codex",
+        label: "ChatGPT",
         estimatedSavingsUsd: 0.04,
         estimatedTokensSaved: 40,
         actualCostUsd: 0.16,

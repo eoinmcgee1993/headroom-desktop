@@ -4,6 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Git Bash reports POSIX paths ("/d/a/repo") that native node resolves against
+# the drive root instead ("D:\d\a\repo"), so every writeFileSync below fails
+# with ENOENT on a Windows runner. `cygpath -m` gives the mixed form
+# ("D:/a/repo") -- forward slashes, so it also stays safe inside the
+# single-quoted JS string literals. cygpath only exists on Windows, so this is
+# a no-op everywhere else.
+if command -v cygpath >/dev/null 2>&1; then
+  REPO_ROOT="$(cygpath -m "${REPO_ROOT}")"
+fi
+
 usage() {
   echo "Usage: $0 <version>" >&2
   echo "  version: e.g. 1.2.3, 1.2.3-rc.1, 1.2.3-win.1, or v1.2.3 (v prefix is stripped)" >&2
@@ -81,14 +91,17 @@ node -e "
   fs.writeFileSync(path, updated);
 "
 
-# Update Cargo.lock package version
+# Update Cargo.lock package version. `\r?\n` because a Windows checkout has
+# core.autocrlf on: the literal `\n` matched nothing there and the throw below
+# failed the release build. The Cargo.toml regex above uses `\s+`, which
+# already tolerated it.
 node -e "
   const fs = require('fs');
   const path = '${REPO_ROOT}/src-tauri/Cargo.lock';
   if (fs.existsSync(path)) {
     const current = fs.readFileSync(path, 'utf8');
     const updated = current.replace(
-      /(name = \"headroom-desktop\"\nversion = \")[^\"]+\"/,
+      /(name = \"headroom-desktop\"\r?\nversion = \")[^\"]+\"/,
       (_, prefix) => prefix + '${VERSION}' + '\"'
     );
     if (updated === current) {

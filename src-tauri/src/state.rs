@@ -435,6 +435,11 @@ pub enum BootValidationOutcome {
     /// Reported instead of `Stalled` so we don't burn ~120s waiting for a
     /// process that was never going to start.
     NotStarted,
+    /// The backend port is held by a named process that is not ours, so the
+    /// freshly spawned child can never bind it. That squatter's accept()
+    /// keeps the TCP activity signal green, which is how RUST-4A burned the
+    /// full 600s boot budget; bail as soon as the occupant is identified.
+    ForeignPortOccupant,
 }
 
 impl BootValidationOutcome {
@@ -448,6 +453,7 @@ impl BootValidationOutcome {
             BootValidationOutcome::Stalled => "stalled",
             BootValidationOutcome::TimedOut => "timed_out",
             BootValidationOutcome::NotStarted => "not_started",
+            BootValidationOutcome::ForeignPortOccupant => "foreign_port_occupant",
         }
     }
 }
@@ -797,6 +803,14 @@ impl AppState {
             if let Err(err) = self.tool_manager.ensure_markitdown_shim() {
                 log::warn!("markitdown shim refresh failed during warm_runtime_on_launch: {err:#}");
             }
+        }
+
+        // Heals installs already in the field: older installs and pre-fix venv
+        // swaps never vendored the MSVC runtime DLLs, so on a redist-less
+        // Windows box torch/onnxruntime cannot load (RUST-7W/8V/8W). Runs
+        // before the proxy starts; a stat-only no-op everywhere else.
+        if let Err(err) = self.tool_manager.ensure_msvc_runtime_dlls() {
+            log::warn!("MSVC runtime DLL vendoring failed during warm_runtime_on_launch: {err:#}");
         }
 
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
@@ -1623,6 +1637,7 @@ impl AppState {
             .checked_sub(Duration::from_secs(5))
             .unwrap_or_else(Instant::now);
 
+        let mut foreign_checked = false;
         let max = Duration::from_secs(RUNTIME_UPGRADE_BOOT_MAX_SECS);
         let hard_max = Duration::from_secs(RUNTIME_UPGRADE_BOOT_HARD_MAX_SECS);
         let grace = Duration::from_secs(RUNTIME_UPGRADE_STALL_GRACE_SECS);
@@ -1679,6 +1694,24 @@ impl AppState {
             let port_bound = proxy_port_accepts_connection();
             if port_bound {
                 last_log_activity = Instant::now();
+            }
+
+            // A bound port that never answers /livez may be a foreign
+            // squatter whose accept() keeps the activity signal green for
+            // the whole boot budget (RUST-4A: 625s against a port the child
+            // could never bind). Identify the occupant once, after the grace
+            // window; unknown/unowned shapes keep waiting, since that is the
+            // updater-relaunch race the settle logic absorbs (RUST-7F).
+            if port_bound && !foreign_checked && elapsed > grace {
+                foreign_checked = true;
+                if let Some(detail) = crate::tool_manager::proxy_port_held_by_named_foreign(
+                    crate::backend_port::get(),
+                ) {
+                    log::warn!(
+                        "wait_for_boot_validation: backend port held by foreign process ({detail}); failing fast"
+                    );
+                    return BootValidationOutcome::ForeignPortOccupant;
+                }
             }
 
             // Refresh CPU-time observation. Catches lifespan-phase work
@@ -2567,6 +2600,9 @@ impl AppState {
                 session_savings_pct: snapshot.session_savings_pct,
                 output_reduction,
                 learner_progress,
+                reread_tokens: stats.as_ref().and_then(|s| s.reread_tokens),
+                reread_compressed_tokens: stats.as_ref().and_then(|s| s.reread_compressed_tokens),
+                ccr_retrievals: stats.as_ref().and_then(|s| s.ccr_retrievals),
                 savings_breakdown,
                 daily_savings,
                 hourly_savings,
@@ -5500,6 +5536,13 @@ struct HeadroomDashboardStats {
     /// Auto-learning progress (`/stats` `traffic_learner`); None on backends
     /// that predate the block or when learning is disabled.
     learner_progress: Option<crate::models::LearnerProgress>,
+    /// Retrieval-churn gauges: tokens the client re-read (`waste_signals`,
+    /// persisted by the backend) and explicit CCR retrieve hits
+    /// (`compression.ccr_retrievals`, process-scoped). Reported to the server
+    /// as latest-observed values, never accumulated here.
+    reread_tokens: Option<u64>,
+    reread_compressed_tokens: Option<u64>,
+    ccr_retrievals: Option<u64>,
 }
 
 /// Counterfactual output-token reduction from the proxy's output shaper,
@@ -6074,6 +6117,15 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
 
     let learner_progress = parse_learner_progress(&root);
 
+    // Retrieval-churn gauges. `waste_signals` is the backend's persisted
+    // waste ledger; `reread_compressed` is the token volume of content a
+    // client re-fetched after Headroom had compressed it away -- the direct
+    // "context filled faster" churn signal. Absent on older backends.
+    let reread_tokens = value_at_path_u64(&root, &["waste_signals", "reread"]);
+    let reread_compressed_tokens =
+        value_at_path_u64(&root, &["waste_signals", "reread_compressed"]);
+    let ccr_retrievals = value_at_path_u64(&root, &["compression", "ccr_retrievals"]);
+
     if requests.is_none()
         && tokens.is_none()
         && usd.is_none()
@@ -6086,6 +6138,9 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
     } else {
         Some(HeadroomDashboardStats {
             learner_progress,
+            reread_tokens,
+            reread_compressed_tokens,
+            ccr_retrievals,
             session_requests: requests,
             session_estimated_savings_usd: usd,
             session_estimated_tokens_saved: tokens,
@@ -7009,6 +7064,23 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     // never laid down; see Sentry RUST-3Y). Must precede the generic
     // exited-before-port branch, whose message is vaguer. A full reinstall is
     // the reliable fix, so name it directly.
+    // The backend prints its whole banner, then dies before binding: its
+    // native deps (onnxruntime/torch) need the MSVC runtime, which a bare
+    // Windows box does not ship (RUST-8V/8W, and RUST-7W for the non-fatal
+    // prefetch half of the same cause). Without this branch the user gets the
+    // generic "crashed at startup, read the logs" -- the log DOES name the
+    // missing redistributable, three lines above the death, but nobody reads
+    // that far. The warning text comes from onnxruntime's Python, so it is
+    // English on every locale; do not match Windows' localized DLL errors.
+    // Must precede the exited-before-port branch, which would swallow it.
+    if raw.contains("Visual C++ Redistributable is not installed") {
+        return Some(
+            "Headroom's runtime needs the Microsoft Visual C++ Redistributable, \
+             which is missing on this machine -- its native libraries fail to load without it. \
+             Install it from https://aka.ms/vs/17/release/vc_redist.x64.exe, then relaunch Headroom."
+                .into(),
+        );
+    }
     if raw.contains("ModuleNotFoundError: No module named 'headroom") {
         return Some(
             "Headroom's runtime is missing some of its own files, so it can't start \
@@ -7169,6 +7241,25 @@ fn group_kill_target(pid: i32) -> Option<String> {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) const STATUS_DLL_INIT_FAILED: i32 = 0xC0000142_u32 as i32;
 
+/// True when a powershell exit code means "the user session is ending", not
+/// "the sweep failed". Same rationale for every member (see the RUST-7N note
+/// at the call site): logoff/shutdown reaps the whole session, orphans
+/// included, so a sweep that was cut short here has nothing left to do, and
+/// the next launch's reclaim_orphan_proxy covers any survivor.
+/// - 0xC0000142 STATUS_DLL_INIT_FAILED: powershell cannot even start (RUST-7N).
+/// - 0x40010004 DBG_TERMINATE_PROCESS: powershell was terminated by the
+///   session's console-control teardown mid-run (RUST-9A).
+/// - 0xC000013A STATUS_CONTROL_C_EXIT: same teardown, delivered as ctrl-close.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn is_session_teardown_exit(code: i32) -> bool {
+    const DBG_TERMINATE_PROCESS: i32 = 0x40010004;
+    const STATUS_CONTROL_C_EXIT: i32 = 0xC000013A_u32 as i32;
+    matches!(
+        code,
+        STATUS_DLL_INIT_FAILED | DBG_TERMINATE_PROCESS | STATUS_CONTROL_C_EXIT
+    )
+}
+
 fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
     // An unresolved runtime path degrades the pattern from "our backend at this
     // exact path" to a loose substring, and `pkill -f` applies it to every
@@ -7247,9 +7338,10 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
         // left to do (RUST-7N). The venv-lock-holder caller loses nothing
         // either: if powershell is this broken outside a logoff, the pip
         // install right after fails with its own actionable error.
-        if status.code() == Some(STATUS_DLL_INIT_FAILED) {
+        if status.code().is_some_and(is_session_teardown_exit) {
             log::info!(
-                "powershell unavailable (0xC0000142, session ending); skipping process sweep for '{}'",
+                "powershell exited with session-teardown status {:?}; skipping process sweep for '{}'",
+                status.code(),
                 exe.display()
             );
             return Ok(());
@@ -7597,6 +7689,21 @@ mod tests {
         // the benign-classification in kill_processes_by_command_pattern only
         // works if the hex constant converts to exactly that decimal.
         assert_eq!(super::STATUS_DLL_INIT_FAILED, -1073741502);
+    }
+
+    #[test]
+    fn session_teardown_exits_are_benign_but_real_failures_are_not() {
+        // RUST-9A's title says "powershell exited with status Some(1073807364)"
+        // (0x40010004, DBG_TERMINATE_PROCESS: the session killed powershell
+        // mid-sweep). Teardown statuses must be classified benign; a plain
+        // script failure (exit 1) or the self-kill of RUST-6F (-1) must not.
+        use super::is_session_teardown_exit;
+        assert!(is_session_teardown_exit(super::STATUS_DLL_INIT_FAILED));
+        assert!(is_session_teardown_exit(1073807364)); // DBG_TERMINATE_PROCESS
+        assert!(is_session_teardown_exit(-1073741510)); // STATUS_CONTROL_C_EXIT
+        assert!(!is_session_teardown_exit(0));
+        assert!(!is_session_teardown_exit(1));
+        assert!(!is_session_teardown_exit(-1));
     }
 
     #[test]
@@ -7948,6 +8055,11 @@ mod tests {
         assert_eq!(BootValidationOutcome::Stalled.label(), "stalled");
         assert_eq!(BootValidationOutcome::TimedOut.label(), "timed_out");
         assert_eq!(BootValidationOutcome::NotStarted.label(), "not_started");
+        assert_eq!(
+            BootValidationOutcome::ForeignPortOccupant.label(),
+            "foreign_port_occupant"
+        );
+        assert!(!BootValidationOutcome::ForeignPortOccupant.is_ok());
         assert!(BootValidationOutcome::Reachable.is_ok());
         assert!(!BootValidationOutcome::NotStarted.is_ok());
     }
@@ -8166,6 +8278,25 @@ mod tests {
         );
         assert!(hint.contains("Reinstall"));
         // Must win over the generic crash branch (which also matches this raw).
+        assert!(!hint.contains("crashed at startup"), "got: {hint}");
+    }
+
+    /// RUST-8V/8W: the runtime prints its full banner and then dies before
+    /// binding, because its native deps cannot load without the MSVC
+    /// redistributable. The log names the cause; the hint must too, instead of
+    /// sending the user to read it.
+    #[test]
+    fn classify_startup_error_missing_msvc_redistributable() {
+        let raw = "unable to keep headroom running in background: \
+            ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe proxy --port 6768 \
+            exited with status exit code: 0xffffffff before opening port 6768\n--- log tail ---\n\
+            Press Ctrl+C to stop.\n\nMicrosoft Visual C++ Redistributable is not installed, \
+            this may lead to the DLL load failure.\n\
+            It can be downloaded at https://aka.ms/vs/17/release/vc_redist.x64.exe\n";
+        let hint = classify_startup_error(raw).expect("missing redist should classify");
+        assert!(hint.contains("Visual C++ Redistributable"), "got: {hint}");
+        assert!(hint.contains("vc_redist.x64.exe"), "got: {hint}");
+        // Must win over the generic exited-before-port branch, which also matches.
         assert!(!hint.contains("crashed at startup"), "got: {hint}");
     }
 
@@ -9530,6 +9661,9 @@ mod tests {
         // savings_history backfills the daily buckets the lifetime total (and
         // hence milestones) is derived from; a cumulative 1.5M crosses 100k+1M.
         let stats = HeadroomDashboardStats {
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
@@ -9575,6 +9709,9 @@ mod tests {
 
         let first = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9595,6 +9732,9 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9619,6 +9759,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9634,6 +9777,9 @@ mod tests {
 
         let reset = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9657,6 +9803,9 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9725,6 +9874,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9881,7 +10033,9 @@ mod tests {
                     "pending_patterns": 3,
                     "min_evidence": 5,
                     "history_size": 12
-                }
+                },
+                "waste_signals": { "reread": 91000, "reread_compressed": 4500 },
+                "compression": { "ccr_retrievals": 6 }
             }"#,
         )
         .expect("contract fixture must parse");
@@ -9912,6 +10066,11 @@ mod tests {
 
         let learner = parsed.learner_progress.expect("learner parsed");
         assert_eq!(learner.pending_patterns, 3);
+
+        // Retrieval-churn gauges ride the savings report to the server.
+        assert_eq!(parsed.reread_tokens, Some(91000));
+        assert_eq!(parsed.reread_compressed_tokens, Some(4500));
+        assert_eq!(parsed.ccr_retrievals, Some(6));
 
         // Fallback contract: without the cumulative counter, the windowed
         // by_layer figure is still accepted for shape.
@@ -10656,6 +10815,9 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10679,6 +10841,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10698,6 +10863,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10727,6 +10895,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10745,6 +10916,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10836,6 +11010,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10864,6 +11041,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10883,6 +11063,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10911,6 +11094,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10934,6 +11120,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10997,6 +11186,9 @@ mod tests {
         ] {
             tracker
                 .observe(&HeadroomDashboardStats {
+                    reread_tokens: None,
+                    reread_compressed_tokens: None,
+                    ccr_retrievals: None,
                     learner_progress: None,
                     output_reduction: None,
                     tool_schema_tokens_saved: None,
@@ -11025,6 +11217,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11044,6 +11239,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11073,6 +11271,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11088,6 +11289,9 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11137,6 +11341,9 @@ mod tests {
 
         let snapshot = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11667,6 +11874,9 @@ mod tests {
 
         // First observation: 1_000 tokens saved, history shows 0→1_000 across hours 9→10.
         tracker.observe(&HeadroomDashboardStats {
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
@@ -11686,6 +11896,9 @@ mod tests {
 
         // Second observation: 3_000 tokens saved, history adds hour 11.
         tracker.observe(&HeadroomDashboardStats {
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,

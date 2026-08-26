@@ -93,11 +93,18 @@ const UNINSTALL_LAUNCH_ARG: &str = "--uninstall";
 const HEADROOM_DASHBOARD_URL: &str = "http://127.0.0.1:6767/dashboard";
 const MAIN_WINDOW_WIDTH: u32 = 760;
 const MAIN_WINDOW_HEIGHT: u32 = 560;
-/// Extra main-window height for the platforms that render the preview-build
-/// notice (two wrapped 11px/1.4 lines plus the banner's gap) and reserve real
-/// layout width for their scrollbars, which wraps text elsewhere too.
+/// Extra window height for the platforms that render the preview-build notice
+/// (two wrapped 11px/1.4 lines plus the banner's gap) and reserve real layout
+/// width for their scrollbars, which wraps text elsewhere too. Applied to the
+/// main window and the launcher: both are fixed-size and both size their copy
+/// off 100vh, so the same wider-font/narrower-viewport reflow overflows them.
 #[cfg(not(target_os = "macos"))]
 const PREVIEW_NOTICE_EXTRA_HEIGHT: u32 = 72;
+/// Mirrors the `launcher` entry in tauri.conf.json.
+#[cfg(not(target_os = "macos"))]
+const LAUNCHER_WINDOW_WIDTH: u32 = 760;
+#[cfg(not(target_os = "macos"))]
+const LAUNCHER_WINDOW_HEIGHT: u32 = 540;
 const TRAY_WINDOW_VERTICAL_GAP: i32 = 10;
 const MAIN_WINDOW_BLUR_HIDE_DELAY_MS: u64 = 150;
 
@@ -476,7 +483,7 @@ fn onboarding_recovery_copy(any_connector_enabled: bool) -> (&'static str, &'sta
     if any_connector_enabled {
         return (
             "Headroom isn't seeing any traffic",
-            "Setup finished, but no Claude Code or Codex requests have come through yet. \
+            "Setup finished, but no Claude Code or ChatGPT requests have come through yet. \
              Restart your terminal or editor so they pick up the new settings.",
         );
     }
@@ -1086,6 +1093,38 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Best-effort Windows counterpart of `schedule_app_bundle_trash`: hand off to
+/// the NSIS uninstaller so Headroom also leaves Add/Remove Programs, the Start
+/// menu and $INSTDIR. `perform_full_cleanup` cannot do any of that itself, and
+/// on a currentUser install it cannot even finish the data wipe, because
+/// $INSTDIR *is* %LOCALAPPDATA%\Headroom and the running exe is undeletable.
+///
+/// `/S` makes the uninstaller copy itself to %TEMP% and kill us on the way
+/// through, so the whole install dir goes. Its PREUNINSTALL hook re-runs
+/// `--uninstall`, which is a no-op sweep by then.
+#[cfg(target_os = "windows")]
+fn schedule_windows_uninstaller() -> Option<std::path::PathBuf> {
+    let uninstaller = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join("uninstall.exe");
+    // Absent for a dev/portable build: cleanup already ran, nothing to hand off.
+    if !uninstaller.exists() {
+        log::info!("uninstall: no NSIS uninstaller at {uninstaller:?}, skipping");
+        return None;
+    }
+    match crate::proc::command(&uninstaller).arg("/S").spawn() {
+        Ok(_) => {
+            log::info!("uninstall: launched NSIS uninstaller {uninstaller:?}");
+            Some(uninstaller)
+        }
+        Err(err) => {
+            log::error!("uninstall: failed to launch NSIS uninstaller: {err}");
+            None
+        }
+    }
+}
+
 #[tauri::command]
 fn show_app_update_notification(app: AppHandle, version: String) -> Result<(), String> {
     show_app_update_notification_impl(&app, &version)
@@ -1213,8 +1252,8 @@ async fn install_addon(
                 };
                 let _ = show_notification_impl(
                     &app,
-                    &format!("Update Codex to finish {name} setup"),
-                    &format!("{name} is installed for Claude Code. Your Codex CLI is too old to add it -- update Codex, then re-install {name} to enable it there too."),
+                    &format!("Update the Codex CLI to finish {name} setup"),
+                    &format!("{name} is installed for Claude Code. Your Codex CLI is too old to add it -- update the Codex CLI, then re-install {name} to enable it there too."),
                     None,
                 );
             }
@@ -1536,6 +1575,13 @@ enum BootstrapFailureKind {
     /// changes nothing until the permission does, so the message must not send
     /// the user back to the Try again button.
     Permission,
+    /// Windows loaded a foreign OpenSSL into our interpreter. `_ssl.pyd` does
+    /// not provide `OPENSSL_Applink`, so a libcrypto built with uplink aborts
+    /// the moment it is used -- ensurepip dies before pip speaks a word
+    /// (RUST-8K). Nothing about the machine will change on its own, so like
+    /// `Permission` this must not send the user back to Try again: 25 events
+    /// from one host were 25 relaunches into the same wall.
+    SslLibraryConflict,
     /// pip fell back to building a package from source and the build failed.
     /// Since every install passes `--only-binary=:all:` (see `PIP_ONLY_BINARY`)
     /// this should be unreachable, so reaching it means *we* shipped a lock or
@@ -1555,6 +1601,7 @@ impl BootstrapFailureKind {
             // Same vocabulary as `pip_failure_category`, so a support mail's
             // failure_kind lines up with the pip-layer Sentry issue.
             BootstrapFailureKind::Permission => "permission",
+            BootstrapFailureKind::SslLibraryConflict => "ssl_library_conflict",
             BootstrapFailureKind::SourceBuild => "build",
             BootstrapFailureKind::Other => "other",
         }
@@ -1578,6 +1625,8 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         || haystack.contains("self signed certificate in certificate chain")
     {
         BootstrapFailureKind::SslInterception
+    } else if is_ssl_library_conflict_signal(&haystack) {
+        BootstrapFailureKind::SslLibraryConflict
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
     } else if is_unsupported_pin_signal(&haystack) {
@@ -1593,12 +1642,56 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
     }
 }
 
+/// True when a foreign OpenSSL aborted the interpreter.
+///
+/// Shares its signal string with `pip_failure_category`'s `openssl-applink`
+/// bucket so the two layers agree. `OPENSSL_Uplink` alone is enough: the abort
+/// prints it whether or not the `no OPENSSL_Applink` line survives the pipe.
+fn is_ssl_library_conflict_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no openssl_applink") || lower.contains("openssl_uplink")
+}
+
+/// PATH directories holding an OpenSSL that could be loaded into our
+/// interpreter ahead of the one we ship.
+///
+/// The abort says only that the wrong libcrypto won, never whose it is, which
+/// is why RUST-8K sat unactionable. Windows resolves a DLL by base name, so
+/// naming every PATH directory that has one turns "some program on your PC"
+/// into a directory the user can act on. Our own runtime is never on PATH, so
+/// every hit here is foreign by construction.
+///
+/// Returns an empty list off Windows, where these names do not exist -- no
+/// `cfg`, so the scan stays testable on any platform.
+fn conflicting_openssl_dirs(path_var: &str) -> Vec<String> {
+    const NAMES: &[&str] = &["libcrypto-3-x64.dll", "libssl-3-x64.dll"];
+    let mut hits = Vec::new();
+    for dir in std::env::split_paths(path_var) {
+        if NAMES.iter().any(|name| dir.join(name).is_file()) {
+            let shown = dir.display().to_string();
+            if !hits.contains(&shown) {
+                hits.push(shown);
+            }
+        }
+    }
+    hits
+}
+
 /// True when pip could not resolve a pin at all — no wheel exists for this
 /// interpreter/platform. Checked before [`is_network_download_signal`] because
 /// pip echoes every index and find-links URL it consulted, so an unrelated
 /// timeout word in that preamble must not steal the classification.
 fn is_unsupported_pin_signal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
+    // "No matching distribution" is only a verdict about OUR pin when pip
+    // actually read an index. When every index/find-links fetch died
+    // (RUST-90/91: TLS-broken middleware on one machine), pip reports every
+    // pin as "(from versions: none)" -- that is the network, and calling it
+    // unsupported_pin sends the user to the updater instead of their
+    // connection.
+    if tool_manager::pip_index_fetch_failed(&lower) {
+        return false;
+    }
     lower.contains("no matching distribution found")
         || lower.contains("could not find a version that satisfies")
 }
@@ -1639,6 +1732,8 @@ fn is_network_download_signal(text: &str) -> bool {
         "bad gateway",
         "service unavailable",
         "error sending request",
+        "could not fetch url",  // pip: an index/find-links fetch died
+        "max retries exceeded", // urllib3 inside pip
         "operation timed out",
         "connection timed out",
         "timed out",
@@ -1698,6 +1793,17 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              something clicking Try again will change. Restart your computer and \
              reopen Headroom. If it still fails, use Contact support below and \
              we'll read the details it sends."
+        }
+        BootstrapFailureKind::SslLibraryConflict => {
+            "Installation failed: another program on this PC has put a conflicting \
+             copy of OpenSSL (libcrypto-3-x64.dll or libssl-3-x64.dll) on your \
+             PATH, and Windows loads it into Headroom's Python instead of ours. \
+             That crashes the installer before it starts, and clicking Try again \
+             will keep hitting it. Search your PATH for those two files - older \
+             Git, PostgreSQL, OpenVPN and Anaconda installs are the usual sources \
+             - remove that folder from PATH, then restart your PC. Use Contact \
+             support below and we'll read the details it sends, including which \
+             folders we found."
         }
         BootstrapFailureKind::SourceBuild => {
             "Installation failed: Headroom couldn't assemble its runtime on this \
@@ -1798,6 +1904,21 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
                 scope.set_extra("stdout", failure.stdout.clone().into());
                 scope.set_extra("stderr", failure.stderr.clone().into());
                 scope.set_extra("error_chain", technical_err.clone().into());
+                if matches!(kind, BootstrapFailureKind::SslLibraryConflict) {
+                    // The abort never names the DLL that won. Without this the
+                    // next 25 events are as unactionable as the last 25.
+                    let dirs = conflicting_openssl_dirs(&std::env::var("PATH").unwrap_or_default());
+                    scope.set_extra(
+                        "openssl_dirs_on_path",
+                        if dirs.is_empty() {
+                            "none found on PATH (library was likely injected into the process)"
+                                .to_string()
+                        } else {
+                            dirs.join("; ")
+                        }
+                        .into(),
+                    );
+                }
             },
             || {
                 sentry::capture_message("bootstrap_failed (install_runtime)", level);
@@ -3040,6 +3161,44 @@ fn report_funnel_step(state: State<'_, AppState>, step: String) {
 /// `take_pending_magic_link`.
 static PENDING_MAGIC_LINK: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
+/// Everything a `headroom://` URL triggers: show the launcher, park any magic
+/// link credentials, and reconcile pricing off-thread.
+///
+/// Reached from three places because no single one covers every platform: the
+/// `on_open_url` listener (macOS, and Windows/Linux warm starts via the
+/// single-instance argv hand-off), and the `get_current()` drain in setup
+/// (Windows/Linux cold start, where the plugin parses argv before the listener
+/// exists).
+fn handle_headroom_deep_link(app: &AppHandle, url: &tauri::Url) {
+    let _ = show_launcher_window(app);
+    capture_magic_link_auth(app, url);
+    // Run the reconciliation on a worker thread - the deep-link callback is on
+    // the main thread and we don't want pricing's blocking HTTP call there.
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        let state: tauri::State<'_, AppState> = app_handle.state();
+        match pricing::get_pricing_status(&state) {
+            Ok(status) => {
+                state.apply_pricing_gate_status(
+                    &status,
+                    crate::client_adapters::any_gate_exempt_client_enabled(),
+                );
+                state.apply_codex_pricing_gate_status(status.codex.as_ref());
+                // Payload-less on purpose: this status was fetched before any
+                // magic link in the same URL was redeemed, so it is stale by
+                // the time it lands. The frontend refetches instead.
+                let _ = app_handle.emit("pricing-refreshed", ());
+            }
+            Err(err) => {
+                sentry::capture_message(
+                    &format!("deep link pricing refresh failed: {err}"),
+                    sentry::Level::Warning,
+                );
+            }
+        }
+    });
+}
+
 /// Parks the email/code from `headroom://auth?email=..&code=..` and nudges the UI.
 ///
 /// The browser never signs the user in (it cannot supply the device
@@ -3114,11 +3273,27 @@ async fn verify_headroom_auth_code(
     // `get_headroom_pricing_status` so a user who signs up after grace
     // expiry doesn't have to wait for the next 60s pricing poll for
     // Python to come back online.
-    state.apply_pricing_gate_status(
-        &status,
-        crate::client_adapters::any_gate_exempt_client_enabled(),
-    );
-    state.apply_codex_pricing_gate_status(status.codex.as_ref());
+    //
+    // On a worker thread, not inline: a gate flip here starts or stops the
+    // Python backend, and `ensure_headroom_running` blocks across a full
+    // cold boot (`start_headroom_background` waits up to
+    // HEADROOM_STARTUP_TIMEOUT_MS = 5min per spawn variant, longer on a
+    // Windows first launch with Defender scanning the venv). Awaiting that
+    // kept the sign-in button on "Verifying..." for minutes after the
+    // account was already connected. Same idiom as
+    // `handle_headroom_deep_link`.
+    {
+        let app_handle = app.clone();
+        let status = status.clone();
+        std::thread::spawn(move || {
+            let state: tauri::State<'_, AppState> = app_handle.state();
+            state.apply_pricing_gate_status(
+                &status,
+                crate::client_adapters::any_gate_exempt_client_enabled(),
+            );
+            state.apply_codex_pricing_gate_status(status.codex.as_ref());
+        });
+    }
     analytics::track_event(
         &app,
         "auth_verified",
@@ -4193,6 +4368,12 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
         removed.push(bundle.display().to_string());
     }
 
+    // Same on Windows, via the NSIS uninstaller.
+    #[cfg(target_os = "windows")]
+    if let Some(uninstaller) = schedule_windows_uninstaller() {
+        removed.push(uninstaller.display().to_string());
+    }
+
     analytics::track_event(
         &app,
         "uninstall_completed",
@@ -4225,16 +4406,20 @@ fn launched_from_autostart() -> bool {
 
 /// Handle `--uninstall` and exit; return normally otherwise.
 ///
-/// Exists for package managers that delete the app bundle themselves and so
-/// cannot rely on the app being alive to clean up after itself. A Homebrew cask
-/// calls this from its `uninstall script:` stanza, which runs *before* the
-/// bundle is removed.
+/// Exists for package managers that delete the app themselves and so cannot
+/// rely on the app being alive to clean up after itself: a Homebrew cask calls
+/// this from its `uninstall script:` stanza, and the NSIS uninstaller calls it
+/// from `NSIS_HOOK_PREUNINSTALL`, both *before* the binary is removed.
 ///
-/// Scope is deliberately narrower than the in-app "uninstall and quit": it
-/// reverts our edits to *other* tools (agent configs, shell rc blocks, hooks,
-/// MCP registrations, keychain, backup files) and leaves Headroom's own data
-/// directories alone, because a cask's `uninstall` must not destroy user data —
-/// that is what `zap` is for.
+/// Scope differs by platform because the packagers do:
+/// - macOS/Linux: revert our edits to *other* tools (agent configs, shell rc
+///   blocks, hooks, MCP registrations, keychain, backup files) and leave
+///   Headroom's own data alone. A cask's `uninstall` must not destroy user
+///   data, that is what `zap` is for.
+/// - Windows: full cleanup, data included. There is no `zap` counterpart, the
+///   NSIS uninstaller is the only uninstall a user gets, and everything it
+///   cannot reach itself (the multi-GB managed runtime, model caches,
+///   ~\.headroom) would otherwise survive and be inherited by a reinstall.
 ///
 /// Quitting a *running* instance already reverts the routing layer via
 /// `clear_client_setups`, so this mainly covers the case where the app was
@@ -4244,13 +4429,14 @@ fn handle_uninstall_flag() {
         return;
     }
 
+    #[cfg(target_os = "windows")]
+    let removed = client_adapters::perform_full_cleanup();
+    #[cfg(not(target_os = "windows"))]
     let removed = client_adapters::revert_external_mutations();
     for path in &removed {
         println!("removed {path}");
     }
     println!("Headroom: reverted {} item(s).", removed.len());
-    // Headroom's own data (app data dir, ~/.headroom, caches, logs, the Kompress
-    // model) is intentionally left in place; `brew zap` removes it.
     std::process::exit(0);
 }
 
@@ -4338,9 +4524,19 @@ pub fn run() {
     let state = AppState::new().expect("failed to create app state");
 
     let mut builder =
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Second launch: focus the existing window and exit the new process.
             let _ = show_launcher_window(app);
+            // On Windows/Linux the OS answers a `headroom://` link by spawning
+            // a NEW process with the URL in argv; the running instance is never
+            // notified, and the new one dies here. Replay argv into the primary
+            // instance's deep-link plugin so `on_open_url` fires and the magic
+            // link is actually redeemed instead of just raising the launcher.
+            // No cfg guard: `handle_cli_arguments` already no-ops off
+            // Windows/Linux, and compiling it everywhere keeps macOS CI
+            // checking the call.
+            use tauri_plugin_deep_link::DeepLinkExt;
+            app.deep_link().handle_cli_arguments(args.into_iter());
         }));
 
     // tauri-plugin-autostart canonicalizes current_exe() while initializing and
@@ -4397,6 +4593,9 @@ pub fn run() {
             // height back. Applied here rather than in tauri.conf.json because
             // Tauri's platform config overlay replaces the whole `windows`
             // array, which would duplicate every field just to change one.
+            // The launcher needs the same treatment: it is fixed-size too, and
+            // the wider system font wrapping its headline to three lines pushed
+            // the install screen into `.intro-shell`'s scroll fallback.
             #[cfg(not(target_os = "macos"))]
             {
                 use tauri::LogicalSize;
@@ -4405,6 +4604,13 @@ pub fn run() {
                         MAIN_WINDOW_WIDTH,
                         MAIN_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT,
                     ));
+                }
+                if let Some(window) = app.get_webview_window("launcher") {
+                    let _ = window.set_size(LogicalSize::new(
+                        LAUNCHER_WINDOW_WIDTH,
+                        LAUNCHER_WINDOW_HEIGHT + PREVIEW_NOTICE_EXTRA_HEIGHT,
+                    ));
+                    let _ = window.center();
                 }
             }
 
@@ -4618,7 +4824,7 @@ pub fn run() {
                 // EIO. Use `log::*` (panic-safe file logger) instead.
                 //
                 // This callback is invoked synchronously from tao's
-                // `application:openURLs:` handler, which is `extern "C"` —
+                // `application:openURLs:` handler, which is `extern "C"` -
                 // any panic that escapes here aborts the whole process via
                 // `panic_cannot_unwind`. Wrap the body in `catch_unwind` so
                 // an internal failure degrades gracefully instead.
@@ -4626,38 +4832,7 @@ pub fn run() {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     for url in event.urls() {
                         if url.scheme() == "headroom" {
-                            let app_handle = deep_link_app.clone();
-                            let _ = show_launcher_window(&app_handle);
-                            capture_magic_link_auth(&app_handle, &url);
-                            // Run the reconciliation on a worker thread — the
-                            // deep-link callback is on the main thread and we
-                            // don't want pricing's blocking HTTP call there.
-                            std::thread::spawn(move || {
-                                let state: tauri::State<'_, AppState> = app_handle.state();
-                                match pricing::get_pricing_status(&state) {
-                                    Ok(status) => {
-                                        state.apply_pricing_gate_status(
-                                            &status,
-                                            crate::client_adapters::any_gate_exempt_client_enabled(
-                                            ),
-                                        );
-                                        state
-                                            .apply_codex_pricing_gate_status(status.codex.as_ref());
-                                        // Payload-less on purpose: this status
-                                        // was fetched before any magic link in
-                                        // the same URL was redeemed, so it is
-                                        // stale by the time it lands. The
-                                        // frontend refetches instead.
-                                        let _ = app_handle.emit("pricing-refreshed", ());
-                                    }
-                                    Err(err) => {
-                                        sentry::capture_message(
-                                            &format!("deep link pricing refresh failed: {err}"),
-                                            sentry::Level::Warning,
-                                        );
-                                    }
-                                }
-                            });
+                            handle_headroom_deep_link(&deep_link_app, &url);
                             // Only handle the first headroom:// URL in the batch.
                             break;
                         }
@@ -4667,6 +4842,20 @@ pub fn run() {
                     sentry::capture_message("deep link callback panicked", sentry::Level::Error);
                 }
             });
+
+            // Cold start on Windows/Linux: the OS passes the URL as argv and
+            // the plugin parses it during its own init - before the listener
+            // above existed - so the launching URL only survives in
+            // `get_current()`. Always `None` on macOS, which delivers via
+            // `RunEvent::Opened` after setup.
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                for url in urls {
+                    if url.scheme() == "headroom" {
+                        handle_headroom_deep_link(&app.handle().clone(), &url);
+                        break;
+                    }
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| handle_window_event(window, event))
@@ -4839,6 +5028,9 @@ fn savings_report(dashboard: &DashboardState) -> pricing::SavingsReport {
             .output_reduction
             .as_ref()
             .map(|o| o.method.clone()),
+        reread_tokens: dashboard.reread_tokens,
+        reread_compressed_tokens: dashboard.reread_compressed_tokens,
+        ccr_retrievals: dashboard.ccr_retrievals,
         days: recent_savings_days(&dashboard.daily_savings),
     }
 }
@@ -5231,7 +5423,7 @@ fn learn_step_label(line: &str) -> Option<String> {
         let model = model.trim_end_matches('.');
         let backend = match model {
             "claude-cli" => "Claude Code",
-            "codex-cli" => "Codex",
+            "codex-cli" => "ChatGPT",
             "gemini-cli" => "Gemini",
             other => other,
         };
@@ -5327,7 +5519,7 @@ fn execute_headroom_learn_run(
                 .to_string();
             (path, name)
         }
-        LearnAgent::Codex => ("codex", "Codex sessions".to_string()),
+        LearnAgent::Codex => ("codex", "ChatGPT sessions".to_string()),
         LearnAgent::Opencode => ("opencode", "OpenCode sessions".to_string()),
         LearnAgent::Grok => ("grok", "Grok sessions".to_string()),
     };
@@ -5929,13 +6121,13 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     TrayRuntimeVisual::Booting => "Headroom — starting",
                     TrayRuntimeVisual::Running => "Headroom — active",
                     TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code or Codex running normally)"
+                        "Headroom — paused (Claude Code or ChatGPT running normally)"
                     }
                     TrayRuntimeVisual::Unhealthy => {
                         "Headroom — proxy unreachable, attempting restart"
                     }
                     TrayRuntimeVisual::Disconnected => {
-                        "Headroom — Claude Code or Codex not connected"
+                        "Headroom — Claude Code or ChatGPT not connected"
                     }
                     TrayRuntimeVisual::Off => "Headroom — off",
                 };
@@ -6018,7 +6210,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
-                                    "Claude Code or Codex is disconnected — open Headroom to re-enable.",
+                                    "Claude Code or ChatGPT is disconnected — open Headroom to re-enable.",
                                     Some("connectors".into()),
                                 );
                             }
@@ -6785,6 +6977,14 @@ fn pixel_char(c: u8) -> [[u8; 3]; 5] {
 }
 
 fn toggle_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result<()> {
+    // Teardown in flight: uninstall deletes the managed runtime while we are
+    // still alive, so onboarding_complete() flips false and a tray click here
+    // would hide the uninstall progress and pop Get Started over a teardown the
+    // user cannot dismiss. Ignore clicks once we are on the way out.
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
     if !onboarding_complete(app) {
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.hide();
@@ -6895,6 +7095,14 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
 }
 
 fn show_launcher_window(app: &AppHandle) -> tauri::Result<()> {
+    // Choke point for every "route back to setup" path (tray click, tray menu,
+    // ensure_runtime_ready_for_tray, show_dashboard_window, second instance).
+    // During uninstall the runtime is already gone, so all of them would raise
+    // the onboarding window on top of a quitting app.
+    if SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
     let Some(window) = app.get_webview_window("launcher") else {
         return Err(tauri::Error::WebviewNotFound);
     };
@@ -7110,10 +7318,10 @@ mod tests {
         build_watchdog_give_up_report, check_headroom_learn_prereqs, child_state_fingerprint_key,
         classify_backend_readyz, classify_bootstrap_failure, classify_update_check,
         classify_upgrade_error, client_setup_error_kind, compute_panel_corner_position,
-        compute_tray_window_position, count_memories_created_today, cpu_rate_indicates_burn,
-        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
-        exe_path_resolvable, extract_llm_failure_warnings, fake_override,
-        fetch_transformations_feed_from, first_savings_body, format_token_count,
+        compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
+        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
+        empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
+        fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
         install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
         learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
@@ -8502,6 +8710,61 @@ mod tests {
     }
 
     #[test]
+    fn classify_bootstrap_failure_flags_a_foreign_openssl_as_ssl_library_conflict() {
+        // Verbatim from the RUST-8K event (host GIDI, 0.8.7, Windows 10.0.26200):
+        // the abort line, then ensurepip's own traceback. This landed in `Other`,
+        // whose message sends the user back to Try again -- 25 times.
+        let err: anyhow::Error = make_command_failure(
+            "OPENSSL_Uplink(00007FF926407C58,08): no OPENSSL_Applink\r\n\
+             Traceback (most recent call last):\r\n\
+             \x20 File \"<frozen runpy>\", line 198, in _run_module_as_main\r\n\
+             \x20 File \"ensurepip\\__init__.py\", line 200, in _bootstrap\r\n\
+             \x20   return _run_pip([*args, *_PACKAGE_NAMES], additional_paths)",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::SslLibraryConflict
+        ));
+    }
+
+    #[test]
+    fn ssl_library_conflict_does_not_tell_the_user_to_retry() {
+        // The whole point of the kind: `Other` says "click Try again", which is
+        // what kept this host looping. Guard the property, not the wording.
+        let message = user_message_for(BootstrapFailureKind::SslLibraryConflict);
+        assert!(
+            message.contains("keep hitting it"),
+            "message must say retrying will not help: {message}"
+        );
+        assert!(
+            message.contains("libcrypto-3-x64.dll"),
+            "message must name the file the user has to find: {message}"
+        );
+    }
+
+    #[test]
+    fn conflicting_openssl_dirs_names_every_path_dir_holding_one() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let guilty = root.path().join("some-other-app");
+        let innocent = root.path().join("plain");
+        std::fs::create_dir_all(&guilty).expect("mkdir");
+        std::fs::create_dir_all(&innocent).expect("mkdir");
+        std::fs::write(guilty.join("libcrypto-3-x64.dll"), b"x").expect("write");
+
+        let path_var = std::env::join_paths([&innocent, &guilty])
+            .expect("join_paths")
+            .into_string()
+            .expect("utf8");
+        let hits = conflicting_openssl_dirs(&path_var);
+
+        assert_eq!(hits, vec![guilty.display().to_string()]);
+        // An empty result is meaningful too -- it says the library was injected
+        // rather than found on PATH -- so it must not be a false negative.
+        assert!(conflicting_openssl_dirs(&innocent.display().to_string()).is_empty());
+    }
+
+    #[test]
     fn classify_bootstrap_failure_flags_a_source_build_as_source_build() {
         // Unreachable while every install passes `--only-binary=:all:`; if it
         // fires, a wheel we promised is missing for this machine.
@@ -8598,6 +8861,29 @@ mod tests {
         assert!(matches!(
             classify_bootstrap_failure(&err),
             BootstrapFailureKind::UnsupportedPin
+        ));
+    }
+
+    #[test]
+    fn total_index_fetch_failure_is_network_not_unsupported_pin() {
+        // Verbatim shape from RUST-90/91 (one Intel mac behind TLS-breaking
+        // middleware): pip could not fetch ANY index URL, so resolution said
+        // "(from versions: none)" for a pin that exists everywhere. The user
+        // needs their network fixed; the updater cannot help.
+        let err: anyhow::Error = make_command_failure(
+            "Could not fetch URL https://pypi.org/simple/aiohappyeyeballs/: \
+             There was a problem confirming the ssl certificate: \
+             HTTPSConnectionPool(host='pypi.org', port=443): Max retries \
+             exceeded with url: /simple/aiohappyeyeballs/ (Caused by \
+             SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING]'))) - skipping\n\
+             ERROR: Could not find a version that satisfies the requirement \
+             aiohappyeyeballs==2.6.2 (from versions: none)\n\
+             ERROR: No matching distribution found for aiohappyeyeballs==2.6.2",
+        )
+        .into();
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::NetworkDownload
         ));
     }
 

@@ -1288,6 +1288,19 @@ const PYTHON_SHA256_LINUX_AARCH64: &str =
 const PYTHON_SHA256_WINDOWS_X86_64: &str =
     "3c8b9b10a933909c98b9916297e2093b24a9c2abaa23df1c2622c2bfe052cb94";
 
+/// torch and onnxruntime cannot load on a Windows box without the MSVC
+/// redistributable, which a bare install (notably Server 2022) does not ship
+/// (RUST-7W warning half, RUST-8V/8W fatal half). Installing vc_redist.exe
+/// needs admin elevation our per-user install does not have, so instead the
+/// runtime DLLs are vendored from the sha256-pinned `msvc-runtime` wheel next
+/// to python.exe, where the loader's application-directory search finds them.
+/// The cp-tag on the wheel is irrelevant: only its `.data/data/Scripts/*.dll`
+/// payload is extracted, never the .pyd. Windows is x86_64-only (see the
+/// PYTHON pins above), so one wheel covers the platform.
+const MSVC_RUNTIME_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/21/3b/134d04268ab8e35853cd007582076429b45d60d6abb1036d159be9c50342/msvc_runtime-14.44.35112-cp312-cp312-win_amd64.whl";
+const MSVC_RUNTIME_WHEEL_SHA256: &str =
+    "32f9c706009e16ccc319d6947ce3bffe20e5192bee52b18cf48313f9e7bedfbe";
+
 /// Venv layout differs per platform: Unix venvs place interpreters and
 /// console-script entrypoints in `bin/` (python3, no extension); Windows venvs
 /// use `Scripts/` with `.exe`-suffixed names. The standalone python extracted
@@ -1315,6 +1328,41 @@ fn bin_subdir() -> &'static str {
     } else {
         "bin"
     }
+}
+
+/// The wheel ships every DLL twice (`.data/data/` root and `.data/data/Scripts/`);
+/// only the Scripts set is taken -- it is the superset (it adds vcruntime140
+/// and vcruntime140_1) and taking one set keeps extraction single-pass.
+fn msvc_runtime_dll_name(entry_path: &str) -> Option<&str> {
+    let (dirs, name) = entry_path.rsplit_once('/')?;
+    (dirs.ends_with(".data/data/Scripts") && name.to_ascii_lowercase().ends_with(".dll"))
+        .then_some(name)
+}
+
+/// Extract the MSVC runtime DLLs from the pinned wheel into every target dir.
+/// atomic_write per DLL: a crash mid-write must leave absence (retried next
+/// launch), never a truncated msvcp140.dll that torch then fails on weirdly.
+fn extract_msvc_runtime_dlls(wheel_path: &Path, targets: &[&Path]) -> Result<usize> {
+    let file = std::fs::File::open(wheel_path)
+        .with_context(|| format!("opening {}", wheel_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("reading zip {}", wheel_path.display()))?;
+    let mut extracted = 0usize;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let Some(name) = msvc_runtime_dll_name(entry.name()).map(str::to_owned) else {
+            continue;
+        };
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes)?;
+        for target in targets {
+            std::fs::create_dir_all(target)
+                .with_context(|| format!("creating {}", target.display()))?;
+            crate::client_adapters::atomic_write(&target.join(&name), &bytes)?;
+        }
+        extracted += 1;
+    }
+    Ok(extracted)
 }
 
 #[derive(Debug, Clone)]
@@ -1634,6 +1682,30 @@ fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
         "missing native dep"
     } else {
         "other"
+    }
+}
+
+/// Which of the two causes a timed-out tiktoken prefetch actually hit.
+///
+/// The alarm fires only when the cache dir was empty on entry (the gate in
+/// [`ToolManager::prefetch_tiktoken_encodings`] returns early otherwise), so
+/// whether anything landed in it separates the two: nothing at all means the
+/// vocab host never answered (blocked egress, DNS, captive portal), some bytes
+/// means a slow link that only needed longer. tiktoken prints nothing while it
+/// blocks on the GET, so the log tail is empty either way -- RUST-2K carried
+/// 326 events over four months with no payload beyond the words "stalled vocab
+/// download", which is an alarm that teaches nothing when it goes off.
+///
+/// Two fixed phrases, never a byte count: a number in the message would
+/// fragment the fingerprint the way per-tail messages did in RUST-6M/6N/6P.
+fn stalled_prefetch_cause(cache_dir: &Path) -> &'static str {
+    let reached = std::fs::read_dir(cache_dir)
+        .map(|mut dir| dir.next().is_some())
+        .unwrap_or(false);
+    if reached {
+        "vocab host reachable but slow"
+    } else {
+        "vocab host never answered"
     }
 }
 
@@ -3101,8 +3173,14 @@ impl ToolManager {
                     let _ = child.wait();
                     let tail = log_tail(&log_path, 1024);
                     bail!(
-                        "tiktoken prefetch timed out after {}s (stalled vocab download): {tail}",
-                        DEADLINE.as_secs()
+                        "tiktoken prefetch timed out after {}s (stalled vocab download, {}){}",
+                        DEADLINE.as_secs(),
+                        stalled_prefetch_cause(&cache_dir),
+                        if tail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {tail}")
+                        }
                     );
                 }
                 None => std::thread::sleep(std::time::Duration::from_millis(500)),
@@ -3440,6 +3518,13 @@ impl ToolManager {
             eta_seconds: 6,
             percent: 90,
         });
+        // A bare Windows box lacks the MSVC redistributable torch/onnxruntime
+        // need (RUST-7W/8V/8W). Non-fatal: on failure the box keeps today's
+        // behavior and the launch-path ensure retries next boot.
+        if let Err(err) = self.ensure_msvc_runtime_dlls() {
+            log::warn!("MSVC runtime DLL vendoring failed during bootstrap: {err:#}");
+        }
+
         self.write_ready_flag()?;
         self.write_bootstrap_receipt()?;
         log::info!("bootstrap: managed runtime install complete (ready flag written)");
@@ -3486,6 +3571,50 @@ impl ToolManager {
     /// PyPI's own filename (platform tags and all) so pip's "not a supported
     /// wheel on this platform" check still backstops a mis-picked wheel — a
     /// `py3-none-any` rename made pip install a macOS wheel on Windows.
+    /// Vendor the MSVC runtime DLLs into the managed runtime on Windows boxes
+    /// that lack the system-wide redistributable (RUST-7W/8V/8W). Both
+    /// python.exe locations get the DLLs -- the venv `Scripts/` stub and the
+    /// standalone interpreter it execs -- so the application-directory DLL
+    /// search succeeds whichever one is the process. No-op when System32
+    /// already has the redist (the common case) or the DLLs are in place.
+    pub fn ensure_msvc_runtime_dlls(&self) -> Result<bool> {
+        if !cfg!(target_os = "windows") {
+            return Ok(false);
+        }
+        let system32 =
+            PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()))
+                .join("System32");
+        if system32.join("msvcp140.dll").exists() && system32.join("vcruntime140_1.dll").exists() {
+            return Ok(false);
+        }
+        let targets = [
+            self.runtime.venv_dir.join(bin_subdir()),
+            self.runtime.python_dir.clone(),
+        ];
+        // Presence probe on the three DLLs torch/onnxruntime actually import;
+        // extraction still lands the wheel's full Scripts set.
+        const CORE_DLLS: [&str; 3] = ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"];
+        if targets
+            .iter()
+            .all(|dir| CORE_DLLS.iter().all(|dll| dir.join(dll).exists()))
+        {
+            return Ok(false);
+        }
+        let wheel_path = self.wheel_download_path(MSVC_RUNTIME_WHEEL_URL);
+        download_to_path(
+            MSVC_RUNTIME_WHEEL_URL,
+            &wheel_path,
+            Some(MSVC_RUNTIME_WHEEL_SHA256),
+        )?;
+        let target_refs: Vec<&Path> = targets.iter().map(PathBuf::as_path).collect();
+        let count = extract_msvc_runtime_dlls(&wheel_path, &target_refs)?;
+        log::info!(
+            "vendored {count} MSVC runtime DLLs into the managed runtime \
+             (system redistributable missing)"
+        );
+        Ok(true)
+    }
+
     fn wheel_download_path(&self, wheel_url: &str) -> PathBuf {
         self.runtime.downloads_dir.join(
             wheel_url
@@ -4493,6 +4622,13 @@ impl ToolManager {
                 restored,
                 error: err,
             };
+        }
+
+        // The swap built a fresh venv, so re-vendor the MSVC runtime DLLs
+        // before the smoke test runs against the final state (RUST-7W/8V/8W).
+        // Non-fatal for the same reason as in bootstrap_all_with_progress.
+        if let Err(err) = self.ensure_msvc_runtime_dlls() {
+            log::warn!("MSVC runtime DLL vendoring failed during upgrade: {err:#}");
         }
 
         progress(BootstrapStepUpdate {
@@ -7020,6 +7156,21 @@ pub(crate) fn describe_proxy_port_occupant(port: u16) -> String {
     }
 }
 
+/// `Some(detail)` when `port` is held by a NAMED process that is not our
+/// backend. `None` for free, ours, or held-by-nobody -- the unowned shape is
+/// the updater-relaunch race `diagnose_proxy_port_settled` waits out
+/// (RUST-7F), so a fail-fast caller must never act on it.
+pub(crate) fn proxy_port_held_by_named_foreign(port: u16) -> Option<String> {
+    named_foreign_occupant(diagnose_proxy_port(port))
+}
+
+fn named_foreign_occupant(state: PortState) -> Option<String> {
+    match state {
+        PortState::ForeignOccupant(detail) if detail != UNKNOWN_OCCUPANT => Some(detail),
+        _ => None,
+    }
+}
+
 /// Re-`diagnose` while the port reads as held-by-nobody, up to `attempts`
 /// times. Split from [`diagnose_proxy_port_settled`] so the retry rule is
 /// testable without binding real sockets.
@@ -8816,7 +8967,18 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         .env("LC_ALL", "C.UTF-8")
         .env("LANG", "C.UTF-8")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        .env("PIP_NO_INPUT", "1");
+        .env("PIP_NO_INPUT", "1")
+        // A host-level pip config (`user = true` in pip.conf, or PIP_USER in
+        // the environment) leaks into the managed venv's pip and fails every
+        // install with "Can not perform a '--user' install. User site-packages
+        // are not visible in this virtualenv." (RUST-6S). Pin the switch off
+        // and aim pip's config lookup at the null device so no user/site/
+        // global pip.conf is read at all.
+        .env("PIP_USER", "0")
+        .env(
+            "PIP_CONFIG_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
     command
 }
 
@@ -8946,6 +9108,15 @@ pub(crate) fn compact_pip_failure(err: &anyhow::Error) -> String {
     format!("exit={exit}; stderr tail: {tail}")
 }
 
+/// True when pip's resolution failure is really a starved index: every
+/// index/find-links fetch died, so pip saw "(from versions: none)" for a pin
+/// that exists everywhere (RUST-90/91: TLS-broken middleware on one machine).
+/// Requires BOTH signals so a genuinely bad pin with an incidental fetch
+/// warning keeps its no-matching-dist verdict (RUST-6S listed real versions).
+pub(crate) fn pip_index_fetch_failed(lower: &str) -> bool {
+    lower.contains("could not fetch url") && lower.contains("from versions: none")
+}
+
 /// Coarse cause class for a pip failure, used as the Sentry fingerprint.
 ///
 /// The compact message embeds pip's stderr tail, and Sentry groups bridged log
@@ -8958,14 +9129,23 @@ pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
     if lower.contains("no module named pip") {
         "no-pip"
-    } else if lower.contains("no matching distribution found")
-        || lower.contains("could not find a version that satisfies")
+    } else if (lower.contains("no matching distribution found")
+        || lower.contains("could not find a version that satisfies"))
+        && !pip_index_fetch_failed(&lower)
     {
         // Our lock asked for a version PyPI has no wheel for on that
         // interpreter/platform (RUST-6S: onnxruntime==1.27.0 on Intel macOS,
         // where releases stop at 1.23.2). That is a bad pin in *our* lock, not
         // the user's machine -- it must never sit in the "other" grab-bag.
         "no-matching-dist"
+    } else if lower.contains("no openssl_applink") {
+        // The bundled interpreter's OpenSSL refuses to run: `ensurepip` dies
+        // before pip ever speaks (RUST-8K, host GIDI, 24 retries -- a hard
+        // install dead end, and the inner pip's own stderr is swallowed by
+        // CalledProcessError, so this line is the ONLY signal that survives).
+        // Its own bucket because nothing else about it looks like the network
+        // and permission causes it was sharing "other" with.
+        "openssl-applink"
     } else if lower.contains("no usable temporary directory") {
         "no-tempdir"
     } else if crate::is_disk_full_signal(&lower) {
@@ -9438,6 +9618,7 @@ mod tests {
     #[cfg(windows)]
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
+    use super::stalled_prefetch_cause;
     use super::{
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, build_command, cc_switch_reconcile_for_runtime,
@@ -10092,6 +10273,48 @@ asyncio.run(verify())
 
     /// The boot-validation failure path reports the occupant, not just a
     /// bound/unbound bit. A free port and a held one must not read alike.
+    #[test]
+    fn named_foreign_occupant_only_fires_on_a_named_foreigner() {
+        use super::{named_foreign_occupant, PortState, UNKNOWN_OCCUPANT};
+        assert_eq!(
+            named_foreign_occupant(PortState::ForeignOccupant("nginx pid 42".into())),
+            Some("nginx pid 42".into())
+        );
+        // The unowned shape is the updater-relaunch race (RUST-7F): a
+        // fail-fast caller must keep waiting on it.
+        assert!(
+            named_foreign_occupant(PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into())).is_none()
+        );
+        assert!(named_foreign_occupant(PortState::Free).is_none());
+        assert!(named_foreign_occupant(PortState::HeadroomRunning).is_none());
+    }
+
+    #[test]
+    fn pip_index_fetch_failed_requires_both_signals() {
+        use super::pip_index_fetch_failed;
+        // RUST-90: no index was readable, so the pin verdict is meaningless.
+        assert!(pip_index_fetch_failed(
+            "could not fetch url https://pypi.org/simple/x/: ssl eof\n\
+             error: could not find a version that satisfies x==1 (from versions: none)"
+        ));
+        // A real bad pin lists the versions pip DID see (RUST-6S).
+        assert!(!pip_index_fetch_failed(
+            "could not fetch url https://github.com/x: rate limited\n\
+             no matching distribution found for onnxruntime==1.27.0 (from versions: 1.23.0)"
+        ));
+        assert!(!pip_index_fetch_failed(
+            "no matching distribution found for onnxruntime==1.27.0 (from versions: none)"
+        ));
+        // And a starved index must knock the shape out of no-matching-dist.
+        assert_eq!(
+            super::pip_failure_category(
+                "exit=1; stderr tail: Could not fetch URL https://pypi.org/simple/x/: ssl eof\n\
+                 ERROR: No matching distribution found for x==1 (from versions: none)"
+            ),
+            "network"
+        );
+    }
+
     #[test]
     fn describe_proxy_port_occupant_separates_free_from_held() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
@@ -10879,6 +11102,105 @@ asyncio.run(verify())
             leftovers.is_empty(),
             "no-op prefetch must not write into downloads: {leftovers:?}"
         );
+    }
+
+    /// RUST-2K: the timeout message must say WHICH stall it was, or the alarm
+    /// is unactionable however many times it fires.
+    #[test]
+    fn stalled_prefetch_cause_separates_blocked_from_slow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Nothing landed: the vocab host never answered at all.
+        assert_eq!(
+            stalled_prefetch_cause(dir.path()),
+            "vocab host never answered"
+        );
+        // One vocab through, the other still coming: a slow link, not a wall.
+        std::fs::write(
+            dir.path().join("9b5ad71b2ce5302211f9c61530b329a4922fc6a4"),
+            b"x",
+        )
+        .expect("write cached vocab");
+        assert_eq!(
+            stalled_prefetch_cause(dir.path()),
+            "vocab host reachable but slow"
+        );
+        // An unreadable/absent dir must not panic; treat it as nothing cached.
+        assert_eq!(
+            stalled_prefetch_cause(&dir.path().join("does-not-exist")),
+            "vocab host never answered"
+        );
+    }
+
+    /// RUST-7W: only the `.data/data/Scripts/*.dll` payload may extract -- the
+    /// root-level duplicates, the .pyd, and dist-info must all be skipped.
+    #[test]
+    fn msvc_runtime_dll_name_selects_scripts_dlls_only() {
+        assert_eq!(
+            super::msvc_runtime_dll_name("msvc_runtime-14.44.35112.data/data/Scripts/msvcp140.dll"),
+            Some("msvcp140.dll")
+        );
+        assert_eq!(
+            super::msvc_runtime_dll_name(
+                "msvc_runtime-14.44.35112.data/data/Scripts/VCRUNTIME140_1.DLL"
+            ),
+            Some("VCRUNTIME140_1.DLL")
+        );
+        // Root-level duplicate of the same DLL: not the Scripts set.
+        assert_eq!(
+            super::msvc_runtime_dll_name("msvc_runtime-14.44.35112.data/data/msvcp140.dll"),
+            None
+        );
+        assert_eq!(
+            super::msvc_runtime_dll_name("msvc_runtime.cp312-win_amd64.pyd"),
+            None
+        );
+        assert_eq!(
+            super::msvc_runtime_dll_name("msvc_runtime-14.44.35112.dist-info/RECORD"),
+            None
+        );
+    }
+
+    /// Every DLL must land in every target: the venv Scripts dir and the
+    /// standalone python root are both candidate application directories.
+    #[test]
+    fn extract_msvc_runtime_dlls_lands_in_every_target() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wheel_path = dir.path().join("msvc.whl");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&wheel_path).expect("create"));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in [
+            (
+                "msvc_runtime-14.44.35112.data/data/Scripts/msvcp140.dll",
+                b"dll-bytes".as_slice(),
+            ),
+            (
+                "msvc_runtime-14.44.35112.data/data/msvcp140.dll",
+                b"root-duplicate".as_slice(),
+            ),
+            ("msvc_runtime.cp312-win_amd64.pyd", b"pyd".as_slice()),
+        ] {
+            writer.start_file(name, stored).expect("start_file");
+            writer.write_all(bytes).expect("write entry");
+        }
+        writer.finish().expect("finish zip");
+
+        let scripts = dir.path().join("venv-scripts");
+        let python_root = dir.path().join("python");
+        let extracted = super::extract_msvc_runtime_dlls(
+            &wheel_path,
+            &[scripts.as_path(), python_root.as_path()],
+        )
+        .expect("extract");
+        assert_eq!(extracted, 1, "only the Scripts DLL extracts");
+        for target in [&scripts, &python_root] {
+            assert_eq!(
+                std::fs::read(target.join("msvcp140.dll")).expect("dll present"),
+                b"dll-bytes"
+            );
+            assert!(!target.join("msvc_runtime.cp312-win_amd64.pyd").exists());
+        }
     }
 
     #[test]
@@ -11864,6 +12186,26 @@ after
             .and_then(|(_, value)| value)
             .expect("PYTHONIOENCODING is set");
         assert_eq!(encoding, std::ffi::OsStr::new("utf-8:backslashreplace"));
+    }
+
+    /// A host pip.conf with `user = true` (or PIP_USER in the environment)
+    /// reaches the managed venv's pip and fails every install with "Can not
+    /// perform a '--user' install" (RUST-6S). `build_command` must pin the
+    /// switch off and aim pip's config lookup at the null device.
+    #[test]
+    fn build_command_isolates_pip_from_host_pip_config() {
+        let cmd = build_command(Path::new("python3"), &["-V"], Path::new("."));
+        let env_of = |name: &str| {
+            cmd.get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value)
+        };
+        assert_eq!(env_of("PIP_USER"), Some(std::ffi::OsStr::new("0")));
+        let devnull = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        assert_eq!(
+            env_of("PIP_CONFIG_FILE"),
+            Some(std::ffi::OsStr::new(devnull))
+        );
     }
 
     #[test]
@@ -13678,6 +14020,14 @@ exit 0
                 "publishing extracted python into ~\\AppData\\Local\\Headroom: \
                  액세스가 거부되었습니다. (os error 5)",
                 "permission",
+            ),
+            // RUST-8K again, second cause under the same title: the bundled
+            // interpreter's OpenSSL dies inside `ensurepip`, before pip runs.
+            (
+                "installing pip into the Headroom-managed virtualenv: command failed (exit 1): \
+                 python.exe -m ensurepip --upgrade --default-pip\nstderr:\n\
+                 OPENSSL_Uplink(00007FF926407C58,08): no OPENSSL_Applink",
+                "openssl-applink",
             ),
             // The macOS network errnos must not read as a denial: the
             // closing paren in the needle is what keeps 51 out of "permission".

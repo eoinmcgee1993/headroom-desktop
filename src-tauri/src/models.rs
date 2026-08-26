@@ -309,6 +309,16 @@ pub struct DashboardState {
     /// Auto-learning progress; `None` when the backend doesn't report it.
     #[serde(default)]
     pub learner_progress: Option<LearnerProgress>,
+    /// Retrieval-churn gauges from `/stats`: tokens re-read by the client
+    /// (total, and the subset that had been compressed away) plus explicit
+    /// CCR retrieve hits. Latest observed values; `None` while the backend is
+    /// unreachable or predates the counters.
+    #[serde(default)]
+    pub reread_tokens: Option<u64>,
+    #[serde(default)]
+    pub reread_compressed_tokens: Option<u64>,
+    #[serde(default)]
+    pub ccr_retrievals: Option<u64>,
     /// Lifetime decomposition behind the headline savings card. `None` until
     /// the backend's `/stats-history` has been fetched at least once.
     pub savings_breakdown: Option<SavingsBreakdown>,
@@ -1124,6 +1134,13 @@ pub struct HeadroomAccountProfile {
     pub invite_code: Option<String>,
     pub accepted_invites_count: usize,
     pub invite_bonus_percent: f64,
+    /// AppSumo-entitled accounts cannot change plan in place: there is no
+    /// Polar subscription (or card) behind the entitlement. The server names
+    /// the route that works - "appsumo" (their AppSumo account page) while
+    /// the deal is live, "checkout" (fresh Polar checkout) afterwards.
+    /// None for everyone else, keeping normal routing.
+    #[serde(default)]
+    pub upgrade_action: Option<String>,
     // Early adopters whose earliest trial identity predates the paywall keep a
     // capped free tier instead of the post-trial hard block. serde default so
     // older cached payloads (no field) still deserialize.

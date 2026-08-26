@@ -42,6 +42,13 @@ jobs:
         # since we pipe stdio) console. See src-tauri/src/proc.rs.
         run: ./scripts/check-no-console.sh
 
+      - name: No new raw colors in component CSS
+        # Ratchet, not a clean gate: styles.css carries a token-migration
+        # backlog, so the script fails only when the count grows. Dark mode is
+        # driven entirely by the :root token overrides, so a hardcoded color in
+        # a component rule is a light-mode-only color that ships broken.
+        run: ./scripts/check-colors.sh
+
       - name: Locks cover every headroom-ai dependency
         # The wheel installs with --no-deps, so a dep absent from a lock is an
         # ImportError at backend start, not something pip resolves later.
@@ -231,3 +238,43 @@ jobs:
           python -m pip install --dry-run --no-deps --only-binary=:all:
           --find-links https://github.com/gglucass/headroom-desktop/releases/expanded_assets/vendor-wheels-v1
           -r src-tauri/python/headroom-requirements.lock
+
+  advisories:
+    # Separate job so a newly-published advisory reds a distinguishable check
+    # rather than looking like a test regression. Both audits read committed
+    # lockfiles, so this needs no build.
+    # Known tradeoff: an advisory published upstream can red an unrelated PR.
+    # If that gets noisy, ignore the specific ID here rather than dropping the
+    # job -- `cargo audit --ignore RUSTSEC-YYYY-NNNN`.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Rust dependency advisories
+        # The two ignores are quick-xml DoS advisories reachable only through
+        # tauri's own tree (plist 1.8 pins ^0.38, tauri-winrt-notification 0.7
+        # pins ^0.37; both reject 0.41, so there is no upgrade from here).
+        # Neither parse path takes attacker-controlled XML -- plist reads our
+        # own bundle Info.plist, and the notification crate serializes toast XML
+        # we generate. Drop these the moment a tauri bump moves the pins;
+        # `cargo audit` prints them as unnecessary ignores when that happens.
+        run: >
+          cargo audit --file src-tauri/Cargo.lock
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Frontend dependency advisories
+        # --omit=dev: a devDependency advisory is not in the shipped bundle and
+        # would block releases on something users never run.
+        run: npm audit --audit-level=high --omit=dev

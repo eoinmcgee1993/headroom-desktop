@@ -158,6 +158,20 @@ describe("app helpers", () => {
     expect(onAnnual.purchaseInfo).toBeUndefined();
   });
 
+  it("prices cards as AppSumo one-time buys while the deal routes there", () => {
+    const result = getUpgradePlans(
+      "individual", "max20x", undefined, "pro", true, false, "annual",
+      null, "lifetime", undefined, undefined, undefined, undefined, false,
+      undefined, 0, null, undefined, undefined, "appsumo"
+    );
+
+    expect(result.plans.map((p) => [p.id, p.centeredPriceLabel, p.ctaLabel])).toEqual([
+      ["pro", "lifetime plan • via AppSumo", "Stay on Pro plan"],
+      ["max5x", "$99 one-time • on AppSumo", "Upgrade on AppSumo"],
+      ["max20x", "$199 one-time • on AppSumo", "Upgrade on AppSumo"],
+    ]);
+  });
+
   describe("server-driven prices", () => {
     afterEach(() => setServerPlanPrices(null));
 

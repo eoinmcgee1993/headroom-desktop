@@ -46,7 +46,7 @@ const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
     },
     ManagedClientSpec {
         id: "codex",
-        name: "Codex",
+        name: "ChatGPT",
     },
     ManagedClientSpec {
         id: "grok_build",
@@ -481,11 +481,11 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             );
             if normalized_setup_id(client_id) == "codex_cli" {
                 steps.push(
-                    "Quit and reopen any Codex desktop app, CLI, or IDE sessions to load the managed provider."
+                    "Quit and reopen any ChatGPT app, Codex CLI, or IDE sessions to load the managed provider."
                         .into(),
                 );
                 steps.push(
-                    "In Codex, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard)."
+                    "In the Codex CLI, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard)."
                         .into(),
                 );
             }
@@ -598,7 +598,9 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             let toml_ok = codex_provider_block_matches()?;
 
             if shell_ok {
-                checks.push("Found Codex OPENAI_BASE_URL export in managed shell block.".into());
+                checks.push(
+                    "Found ChatGPT (Codex) OPENAI_BASE_URL export in managed shell block.".into(),
+                );
             }
             if toml_ok {
                 checks
@@ -933,6 +935,99 @@ pub fn clear_client_setups() -> Result<()> {
 /// The first is fixable here, so on the first `PermissionDenied` we clear
 /// read-only bits across the tree and try again. The second is not ours to fix
 /// by force; callers surface it so the user can close the session.
+/// The NSIS uninstaller, which on Windows sits in the app data dir because a
+/// currentUser install puts $INSTDIR at %LOCALAPPDATA%\Headroom.
+///
+/// Never ours to delete. It is the file `HKCU\...\Uninstall\Headroom`'s
+/// `UninstallString` points at, and NSIS removes it itself at the end of a
+/// successful uninstall. Delete it from under NSIS and any later abort in that
+/// section -- its "Headroom is still running" check ends in one -- leaves the
+/// registry entry standing with no uninstaller behind it. That machine can
+/// never be uninstalled again: the installer's maintenance page reads the
+/// UninstallString, `ExecWait` fails to launch it, and the run ends instantly
+/// with "Unable to uninstall!" and no uninstaller window.
+const NSIS_UNINSTALLER: &str = "uninstall.exe";
+
+/// Remove everything inside `dir`, then `dir` itself, skipping past entries that
+/// cannot be removed instead of stopping at the first one.
+///
+/// `remove_dir_all` walks the tree and returns at the first entry it fails on,
+/// leaving every entry it had not reached yet. For the app data dir on Windows
+/// that entry is Headroom's own running exe: a currentUser NSIS install puts
+/// $INSTDIR at %LOCALAPPDATA%\Headroom, the same path as `app_data_dir()`, and
+/// the `--uninstall` sweep runs *from* that exe. So the walk deleted `config`
+/// and gave up before `runtime`, and the reinstall found a complete managed
+/// runtime and skipped setup while re-prompting for terms.
+///
+/// Returns the last failure, so a caller can still tell a partial sweep from a
+/// clean one.
+fn purge_dir_tolerantly(dir: &Path) -> std::io::Result<()> {
+    let mut last = Ok(());
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().eq_ignore_ascii_case(NSIS_UNINSTALLER) {
+                continue;
+            }
+            let path = entry.path();
+            // `file_type` does not follow symlinks or reparse points, so a
+            // junction is unlinked, never descended into.
+            let result = match entry.file_type() {
+                Ok(kind) if kind.is_dir() => remove_dir_all_retry(&path),
+                _ => std::fs::remove_file(&path),
+            };
+            if let Err(err) = result {
+                log::warn!("cleanup: removing {} failed: {err}", path.display());
+                last = Err(err);
+            }
+        }
+    }
+    // A child failure is the more useful error; otherwise report the removal of
+    // the dir itself, which still fails while anything is left in it.
+    last.and(std::fs::remove_dir(dir))
+}
+
+/// Kill every process running out of `dir`, except this one.
+///
+/// Windows keeps a running image undeletable, so anything still executing from
+/// inside Headroom's footprint pins it: the backend proxy, and the MCP servers
+/// (serena, codebase-memory) that Claude Code and Codex spawned from our venv
+/// and that outlive us. The in-app uninstall stops the backend via
+/// `stop_headroom`, but the `--uninstall` entry point the NSIS uninstaller
+/// calls has no `AppState` to do that with, and neither path ever reached the
+/// agents' MCP children.
+///
+/// Identity is the executable's own path, not a port or a name, so this can
+/// only ever match a binary Headroom installed. `uninstall.exe` is exempt: it
+/// lives in the same directory and is usually the process driving this sweep.
+#[cfg(target_os = "windows")]
+fn kill_processes_under(dir: &Path) {
+    // `-like` metacharacters, plus `'` so a username containing one cannot
+    // close the PowerShell literal early.
+    let escaped = dir
+        .display()
+        .to_string()
+        .replace('`', "``")
+        .replace('\'', "''")
+        .replace('[', "`[")
+        .replace(']', "`]");
+    let me = std::process::id();
+    // `$PID` is the powershell process itself: its own command line embeds the
+    // pattern, and Win32_Process would hand it back as a match (RUST-6F).
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne {me} -and $_.Name -ne 'uninstall.exe' -and $_.ExecutablePath -like '{escaped}\\*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+    );
+    match crate::proc::command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => log::warn!("cleanup: process sweep exited {:?}", status.code()),
+        Err(err) => log::warn!("cleanup: process sweep failed to run: {err}"),
+    }
+    // Handles are released asynchronously after the process dies.
+    std::thread::sleep(Duration::from_millis(300));
+}
+
 pub(crate) fn remove_dir_all_retry(path: &Path) -> std::io::Result<()> {
     let mut last = Ok(());
     let mut cleared_readonly = false;
@@ -1140,7 +1235,11 @@ pub fn perform_full_cleanup() -> Vec<String> {
                 app_dir.display()
             );
         } else {
-            match remove_dir_all_retry(&app_dir) {
+            // Before the sweep, not after: on Windows an open image or handle
+            // inside the tree is what makes an entry undeletable.
+            #[cfg(target_os = "windows")]
+            kill_processes_under(&app_dir);
+            match purge_dir_tolerantly(&app_dir) {
                 Ok(_) => removed.push(app_dir.display().to_string()),
                 Err(err) => log::warn!("cleanup: removing {} failed: {err}", app_dir.display()),
             }
@@ -1904,12 +2003,32 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         s.push(format!(".tmp.{}.{}", std::process::id(), n));
         PathBuf::from(s)
     };
+    // Create the parent before the tmp write. Most callers do this themselves
+    // (150-odd `create_dir_all(parent)?` sites) but the ones that don't hit
+    // ENOENT / ERROR_PATH_NOT_FOUND the moment the dir is missing or has been
+    // removed under them (RUST-8M: usage-counters.json, os error 3 on Windows).
+    // One guard here covers every caller instead of auditing all of them.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| anyhow!("creating {}: {err}", parent.display()))?;
+        }
+    }
     // The io error goes in the *message*, not a source: every caller logs this
     // with `{err}`, which prints only the top context and drops the chain, so
     // Sentry saw "failed to persist usage-counters.json: writing <path>.tmp.N"
     // with no reason at all (RUST-77). Baking the cause in fixes all 50-odd
     // callers at once instead of auditing each log site for `{err:#}`.
-    std::fs::write(&tmp_path, contents).map_err(|err| {
+    // Write + fsync the tmp before the rename. Without the fsync the rename's
+    // metadata can reach disk ahead of the data, so a crash/power loss leaves a
+    // zero-length file where valid state used to be -- which is what the
+    // "corrupt (expected value at line 1 column 1)" reports are (RUST-8P).
+    let write_tmp = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        std::io::Write::write_all(&mut f, contents)?;
+        f.sync_all()
+    };
+    write_tmp().map_err(|err| {
         // A failed write still leaves the (partial) tmp behind, and the name is
         // unique per write, so nothing ever reclaims it. On a full disk that is
         // one orphan per attempt, each holding whatever bytes did land (RUST-6R).
@@ -2760,6 +2879,7 @@ fn discover_codex_state_dbs() -> Vec<PathBuf> {
 /// third-party providers are left alone.
 fn retag_codex_thread_providers(from: &str, to: &str) {
     let mut found_thread_store = false;
+    let mut unreadable = 0usize;
     for path in discover_codex_state_dbs() {
         match retag_one_codex_db(&path, from, to) {
             // No `threads` table: unrelated sqlite store (logs/goals/memories).
@@ -2773,10 +2893,17 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
                     );
                 }
             }
-            Err(e) => log::warn!(
-                "codex retag {from}->{to} skipped for {}: {e}",
-                path.display()
-            ),
+            // Corrupt/unreadable DBs (malformed image, disk I/O error --
+            // Sentry RUST-95/96, one macOS-beta box) are environmental and
+            // dropped from Sentry by the skip_sentry rule in logging.rs;
+            // other causes (e.g. locked past busy_timeout) stay reportable.
+            Err(e) => {
+                unreadable += 1;
+                log::warn!(
+                    "codex retag {from}->{to} skipped for {}: {e}",
+                    path.display()
+                );
+            }
         }
     }
     // A `state_*.sqlite`-shaped file with no `threads` table means Codex renamed
@@ -2786,12 +2913,23 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
     // (Sentry RUST-3R). This is the last remaining schema-drift signal worth a
     // release (Sentry RUST-43).
     if !found_thread_store && codex_sqlite_store_expected() {
-        log::warn!(
-            "codex retag {from}->{to}: a state_*.sqlite is present but has no \
-             `threads` table under {dirs:?}; the history menu may split. Codex \
-             likely renamed the table.",
-            dirs = codex_state_dirs(),
-        );
+        if unreadable > 0 {
+            // Cannot distinguish "Codex renamed the table" from "the disk is
+            // broken" when any candidate failed to open: RUST-95 false-fired
+            // the rename signal on a machine whose sqlite files all threw
+            // disk I/O errors. Local log only (skip_sentry rule).
+            log::warn!(
+                "codex retag {from}->{to}: no `threads` table found but \
+                 {unreadable} candidate(s) unreadable; skipping the rename signal"
+            );
+        } else {
+            log::warn!(
+                "codex retag {from}->{to}: a state_*.sqlite is present but has no \
+                 `threads` table under {dirs:?}; the history menu may split. Codex \
+                 likely renamed the table.",
+                dirs = codex_state_dirs(),
+            );
+        }
     }
 }
 
@@ -4752,7 +4890,7 @@ fn codex_doctor_summary() -> Option<String> {
     let codex = find_on_path(&["codex"])?;
     let output = crate::proc::command(codex).arg("doctor").output().ok()?;
     if output.status.success() {
-        Some("`codex doctor` reports the Codex install is healthy.".into())
+        Some("`codex doctor` reports the Codex CLI install is healthy.".into())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first = stderr
@@ -5087,7 +5225,30 @@ fn claude_settings_hook_matches(hook_fragment: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// Cached because a single launcher "Continue" click verifies every installed
+/// client, and `apply_client_setup` re-runs the whole write+verify once when
+/// verification misses -- up to eight probes. While the backend process is up
+/// but not yet answering `/readyz` (Windows warm-up is the slow case) each
+/// probe burns the full timeout on both hosts, so those eight probes are
+/// seconds of dead click. `proxy_reachable` is transient status, never a
+/// `verified` input, so a 3s-stale reading is fine.
 fn is_headroom_proxy_reachable() -> bool {
+    static CACHE: std::sync::Mutex<Option<(bool, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((reachable, at)) = *cache {
+        if at.elapsed() < Duration::from_secs(3) {
+            return reachable;
+        }
+    }
+    let reachable = probe_headroom_proxy();
+    *cache = Some((reachable, std::time::Instant::now()));
+    reachable
+}
+
+fn probe_headroom_proxy() -> bool {
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()
@@ -6093,14 +6254,22 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
         .as_ref()
         .map(|path| format!("Detected at {}", path.display()))
         .or_else(|| {
-            codex_user_state_exists()
-                .then(|| format!("Detected Codex data in {}.", codex_home().display()))
+            chatgpt_app_path()
+                .map(|path| format!("Detected the ChatGPT app at {}.", path.display()))
+        })
+        .or_else(|| {
+            codex_user_state_exists().then(|| {
+                format!(
+                    "Detected ChatGPT (Codex) data in {}.",
+                    codex_home().display()
+                )
+            })
         });
 
     if let Some(detected_note) = detected {
         return ClientStatus {
             id: "codex".into(),
-            name: "Codex".into(),
+            name: "ChatGPT".into(),
             installed: true,
             configured,
             health: if configured {
@@ -6113,7 +6282,7 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
             } else {
                 vec![
                     detected_note,
-                    "Route Codex through Headroom's localhost proxy so prompts stay lean.".into(),
+                    "Route ChatGPT (previously Codex) through Headroom's localhost proxy so prompts stay lean.".into(),
                 ]
             },
         };
@@ -6121,7 +6290,7 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
 
     ClientStatus {
         id: "codex".into(),
-        name: "Codex".into(),
+        name: "ChatGPT".into(),
         installed: false,
         configured: false,
         health: ClientHealth::NotDetected,
@@ -6241,6 +6410,36 @@ fn codex_user_state_exists() -> bool {
     codex_root.join("config.toml").exists()
         || codex_root.join("auth.json").exists()
         || codex_root.join("sessions").exists()
+        // Written by the unified ChatGPT app's Codex mode even before sign-in.
+        || codex_root.join(".codex-global-state.json").exists()
+}
+
+/// The unified ChatGPT desktop app (the standalone Codex app was absorbed into
+/// it on 2026-07-09; the bundle id stays com.openai.codex). Its Codex mode
+/// reads ~/.codex/config.toml, so app presence alone makes the connector
+/// configurable without the CLI binary on disk.
+fn chatgpt_app_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        [
+            PathBuf::from("/Applications/ChatGPT.app"),
+            home_dir().join("Applications").join("ChatGPT.app"),
+        ]
+        .into_iter()
+        .find(|path| path.exists())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let exe = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+            .join("Programs")
+            .join("ChatGPT")
+            .join("ChatGPT.exe");
+        exe.exists().then_some(exe)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
 }
 
 /// Locate the Codex CLI binary the same way [`detect_codex_client`] does: known
@@ -10045,6 +10244,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn atomic_write_creates_missing_parent_dir() {
+        // RUST-8M: callers that skip their own `create_dir_all` got ENOENT
+        // (os error 3 on Windows) when the config dir was missing.
+        let dir = std::env::temp_dir().join(format!("aw_mkparent_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested").join("state.json");
+        super::atomic_write(&path, b"{}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn atomic_write_concurrent_same_path_no_enoent() {
         // Regression for Sentry RUST-3W / RUST-4W: a shared `<path>.tmp` made
         // concurrent writers race — one rename consumed the tmp, the other hit
@@ -10077,8 +10288,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // must survive plain Display.
         let dir = std::env::temp_dir().join(format!("aw_cause_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Parent does not exist, so writing the tmp file fails with ENOENT.
-        let path = dir.join("missing").join("state.json");
+        // Parent exists (atomic_write creates it now), so force the failure on
+        // the tmp write itself: an over-long name is ENAMETOOLONG on unix and
+        // ERROR_FILENAME_EXCED_RANGE on Windows, both with an "(os error N)".
+        let path = dir.join("s".repeat(300));
         let err = super::atomic_write(&path, b"x").expect_err("write into a missing dir must fail");
         let shown = format!("{err}");
         assert!(shown.starts_with("writing "), "{shown}");
@@ -10140,6 +10353,86 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let missing = std::env::temp_dir().join(format!("rdo_absent_{}", std::process::id()));
         std::fs::remove_dir_all(&missing).ok();
         assert!(super::remove_dir_all_retry(&missing).is_ok());
+    }
+
+    #[test]
+    fn purge_dir_tolerantly_never_removes_the_nsis_uninstaller() {
+        // Deleting it leaves the registry's UninstallString pointing at nothing
+        // if anything later in the uninstall section aborts, and the installer
+        // then fails instantly with "Unable to uninstall!". NSIS removes it
+        // itself once its own section has finished.
+        let root = std::env::temp_dir().join(format!("purge_keeps_un_{}", std::process::id()));
+        super::remove_dir_all_retry(&root).ok();
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        std::fs::write(root.join("runtime").join("python"), b"x").unwrap();
+        let uninstaller = root.join("uninstall.exe");
+        std::fs::write(&uninstaller, b"nsis").unwrap();
+
+        let result = super::purge_dir_tolerantly(&root);
+
+        assert!(
+            uninstaller.exists(),
+            "the uninstaller must survive the sweep"
+        );
+        assert!(!root.join("runtime").exists(), "runtime survived the sweep");
+        assert!(
+            result.is_err(),
+            "the dir cannot go while the uninstaller is still in it"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn purge_dir_tolerantly_skips_past_an_undeletable_entry() {
+        // The 0.8.8-rc.2 Windows uninstall: one `remove_dir_all` over the app
+        // dir stopped at the running Headroom.exe, so `config` was gone (terms
+        // re-prompted on reinstall) while `runtime` survived and the reinstall
+        // reported an installation already present. One undeletable entry must
+        // not strand the entries the walk had not reached yet.
+        let root = std::env::temp_dir().join(format!("purge_tolerant_{}", std::process::id()));
+        super::remove_dir_all_retry(&root).ok();
+        for child in ["config", "runtime"] {
+            std::fs::create_dir_all(root.join(child).join("nested")).unwrap();
+            std::fs::write(root.join(child).join("nested").join("f"), b"x").unwrap();
+        }
+        // Stand-in for the running exe. A mode with no read or execute bit stays
+        // undeletable through the rescue pass in remove_dir_all_retry, which
+        // only ever adds owner *write* (0o200).
+        #[cfg(unix)]
+        let blocked = {
+            use std::os::unix::fs::PermissionsExt;
+            let blocked = root.join("blocked");
+            std::fs::create_dir_all(&blocked).unwrap();
+            std::fs::write(blocked.join("keep"), b"x").unwrap();
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(
+                std::fs::read_dir(&blocked).is_err(),
+                "entry must really be undeletable, or this test proves nothing"
+            );
+            blocked
+        };
+
+        let result = super::purge_dir_tolerantly(&root);
+
+        assert!(!root.join("config").exists(), "config survived the sweep");
+        assert!(!root.join("runtime").exists(), "runtime survived the sweep");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(result.is_err(), "a partial sweep must report the failure");
+            assert!(
+                blocked.exists(),
+                "the undeletable entry should still be there"
+            );
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(result.is_ok(), "nothing blocked the sweep: {result:?}");
+            assert!(!root.exists(), "the dir itself should be gone");
+        }
     }
 
     #[test]

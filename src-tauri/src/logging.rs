@@ -207,6 +207,17 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // The retag summary's "unreadable" variant: when any candidate DB failed
+    // to open, "no `threads` table found" proves nothing about a rename
+    // (RUST-95 false-fired the rename canary on a machine whose sqlite files
+    // all threw disk I/O errors). The canary itself ("has no `threads` table
+    // ... renamed the table") stays reportable.
+    if target.starts_with("headroom_desktop_lib::client_adapters")
+        && msg.starts_with("codex retag ")
+        && msg.contains("candidate(s) unreadable")
+    {
+        return true;
+    }
     // The pip final-failure warn embeds pip's stderr tail, so message-based
     // grouping opened a fresh issue per tail for one underlying failure
     // (RUST-6M/6N/6P, all the same half-built venv). It reaches Sentry via the
@@ -253,9 +264,13 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // a Codex-owned DB corrupted on the user's disk ("database disk image is
     // malformed") is environmental and unfixable by a release. The retag
     // already skips the file; keep the local log, drop the Sentry event.
+    // "disk I/O error" is the same environmental class (RUST-95/96: a
+    // macOS-beta box failing every sqlite open); "database is locked" is NOT
+    // skipped -- recurring lock contention would mean our busy_timeout
+    // assumption went stale.
     if target.starts_with("headroom_desktop_lib::client_adapters")
         && msg.starts_with("codex retag")
-        && msg.contains("database disk image is malformed")
+        && (msg.contains("database disk image is malformed") || msg.contains("disk I/O error"))
     {
         return true;
     }
@@ -554,6 +569,25 @@ mod tests {
         assert!(!skip_sentry(
             "tauri_plugin_updater",
             "invalid release manifest"
+        ));
+    }
+
+    #[test]
+    fn skips_codex_retag_per_db_and_unreadable_warns_keeps_rename_canary() {
+        // Per-DB skip (RUST-95/96: one machine's disk I/O errors): local only.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "codex retag headroom->openai skipped for ~/.codex/goals_1.sqlite: disk I/O error"
+        ));
+        // Summary downgraded because candidates were unreadable: local only.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "codex retag headroom->openai: no `threads` table found but 3 candidate(s) unreadable; skipping the rename signal"
+        ));
+        // The true schema-drift canary must still reach Sentry.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "codex retag headroom->openai: a state_*.sqlite is present but has no `threads` table under [\"~/.codex/sqlite\"]; the history menu may split. Codex likely renamed the table."
         ));
     }
 

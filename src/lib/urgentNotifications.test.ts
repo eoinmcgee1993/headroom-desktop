@@ -461,7 +461,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
     );
 
     expect(invokeMock).toHaveBeenCalledWith("show_notification", {
-      title: "Heads up: 25% of your weekly Codex usage (Headroom pauses at 50%)",
+      title: "Heads up: 25% of your weekly ChatGPT usage (Headroom pauses at 50%)",
       body: "You're at 27.0% of weekly Codex usage.",
       action: "billing",
     });
@@ -487,7 +487,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
     );
 
     expect(invokeMock).toHaveBeenCalledWith("show_notification", {
-      title: "Heads up: 10% of your weekly Codex usage (Headroom pauses at 25%)",
+      title: "Heads up: 10% of your weekly ChatGPT usage (Headroom pauses at 25%)",
       body: "You're at 12.0% of weekly Codex usage.",
       action: "billing",
     });
@@ -513,7 +513,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
 
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith("show_notification", {
-      title: "Getting close: 35% of your weekly Codex usage (Headroom pauses at 50%)",
+      title: "Getting close: 35% of your weekly ChatGPT usage (Headroom pauses at 50%)",
       body: "Codex 36%",
       action: "billing",
     });
