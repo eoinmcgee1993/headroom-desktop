@@ -618,6 +618,11 @@ export interface HeadroomAccountProfile {
   subscriptionPendingTier?: HeadroomSubscriptionTier | null;
   subscriptionPendingBillingPeriod?: string | null;
   subscriptionPendingEffectiveAt?: string | null;
+  /** AppSumo-entitled accounts can't change plan in place (no Polar
+   * subscription behind the entitlement). The server names the route that
+   * works: the AppSumo account page while the deal is live, a fresh
+   * checkout afterwards. Absent for everyone else. */
+  upgradeAction?: "appsumo" | "checkout" | null;
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;

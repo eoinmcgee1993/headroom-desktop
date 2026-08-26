@@ -575,6 +575,8 @@ struct RemoteAccountResponse {
     accepted_invites_count: usize,
     invite_bonus_percent: f64,
     #[serde(default)]
+    upgrade_action: Option<String>,
+    #[serde(default)]
     grandfathered: bool,
 }
 
@@ -3018,6 +3020,7 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         invite_code: value.invite_code,
         accepted_invites_count: value.accepted_invites_count,
         invite_bonus_percent: value.invite_bonus_percent.min(50.0).max(0.0),
+        upgrade_action: value.upgrade_action,
         grandfathered: value.grandfathered,
     }
 }
@@ -3802,6 +3805,7 @@ mod tests {
             invite_code: Some("invite-code".into()),
             accepted_invites_count: 2,
             invite_bonus_percent: 10.0,
+            upgrade_action: None,
             grandfathered: false,
         }
     }
@@ -4340,6 +4344,7 @@ mod tests {
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: 0.0,
+            upgrade_action: None,
             grandfathered: false,
         }
     }
@@ -4368,6 +4373,7 @@ mod tests {
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: invite_bonus,
+            upgrade_action: None,
             grandfathered: false,
         }
     }
@@ -4376,6 +4382,7 @@ mod tests {
     /// keeps the capped free tier instead of the hard block.
     fn grandfathered_account() -> HeadroomAccountProfile {
         HeadroomAccountProfile {
+            upgrade_action: None,
             grandfathered: true,
             ..expired_account(0.0)
         }
@@ -5021,6 +5028,7 @@ mod tests {
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: 999.0,
+            upgrade_action: None,
             grandfathered: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 50.0);
@@ -5051,6 +5059,7 @@ mod tests {
             invite_code: None,
             accepted_invites_count: 0,
             invite_bonus_percent: -10.0,
+            upgrade_action: None,
             grandfathered: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 0.0);

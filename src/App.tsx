@@ -602,6 +602,8 @@ const CODEX_CLI_LOGIN_CMD = "codex login";
 const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
 const CODEX_INSTALL_NPM_CMD = "npm i -g @openai/codex";
 
+const APPSUMO_ACCOUNT_URL = "https://appsumo.com/account/products/";
+
 const SALES_CONTACT_URL = (
   import.meta.env.VITE_HEADROOM_SALES_CONTACT_URL ??
   ""
@@ -4258,6 +4260,16 @@ export default function App() {
           ) {
             return { kind: "internal" as const };
           }
+          // AppSumo-entitled accounts have no Polar subscription to change in
+          // place; the server names the route that works (their AppSumo
+          // account page while the deal is live, a fresh checkout afterwards).
+          const upgradeAction = pricingStatus?.account?.upgradeAction;
+          if (upgradeAction === "appsumo") {
+            return { kind: "external" as const, url: APPSUMO_ACCOUNT_URL };
+          }
+          if (upgradeAction === "checkout") {
+            return { kind: "checkout" as const };
+          }
           // Polar prorates the product swap with the existing discount applied,
           // so every plan change on an active subscription uses the PATCH path.
           if (activeHeadroomPlanId) {
@@ -5441,6 +5453,7 @@ export default function App() {
     const allVerified =
       hasEnabledApps &&
       proxyVerificationRows.every((row) => row.state === "verified");
+    const anyVerified = proxyVerificationRows.some((row) => row.state === "verified");
     const unverified = proxyVerificationRows.filter((row) => row.state !== "verified");
     const unverifiedNames = formatConnectorNameList(unverified.map((row) => row.name));
     const finishSetup = () => {
@@ -5547,6 +5560,16 @@ export default function App() {
           {allVerified ? (
             <button
               className="primary-button primary-button--large primary-button--success"
+              onClick={finishSetup}
+              type="button"
+            >
+              Continue
+            </button>
+          ) : anyVerified ? (
+            // At least one connector is proven working, so continuing is a
+            // legitimate path - no skip-arming friction needed.
+            <button
+              className="primary-button primary-button--large"
               onClick={finishSetup}
               type="button"
             >

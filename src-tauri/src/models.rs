@@ -1134,6 +1134,13 @@ pub struct HeadroomAccountProfile {
     pub invite_code: Option<String>,
     pub accepted_invites_count: usize,
     pub invite_bonus_percent: f64,
+    /// AppSumo-entitled accounts cannot change plan in place: there is no
+    /// Polar subscription (or card) behind the entitlement. The server names
+    /// the route that works - "appsumo" (their AppSumo account page) while
+    /// the deal is live, "checkout" (fresh Polar checkout) afterwards.
+    /// None for everyone else, keeping normal routing.
+    #[serde(default)]
+    pub upgrade_action: Option<String>,
     // Early adopters whose earliest trial identity predates the paywall keep a
     // capped free tier instead of the post-trial hard block. serde default so
     // older cached payloads (no field) still deserialize.
