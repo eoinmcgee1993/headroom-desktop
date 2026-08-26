@@ -6417,8 +6417,8 @@ export default function App() {
                   <h2 className="tier-mismatch-banner__title">Upgrade your Headroom plan</h2>
                   <p className="tier-mismatch-banner__message">
                     {tierMismatch.clamped
-                      ? `Your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan, above your current Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan, so weekly usage limits now apply to ${clampScopeLabel}. Upgrade to restore unlimited optimization.`
-                      : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan. Upgrade to match.`}
+                      ? `Your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan, above your current Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan, so weekly usage limits now apply to ${clampScopeLabel}. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to restore unlimited optimization.`
+                      : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to match.`}
                   </p>
                   {upgradeActionError && upgradeActionBusy === null ? (
                     <p className="tier-mismatch-banner__error" role="status">
