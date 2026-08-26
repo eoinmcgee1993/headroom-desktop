@@ -46,7 +46,7 @@ const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
     },
     ManagedClientSpec {
         id: "codex",
-        name: "Codex",
+        name: "ChatGPT",
     },
     ManagedClientSpec {
         id: "grok_build",
@@ -481,11 +481,11 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             );
             if normalized_setup_id(client_id) == "codex_cli" {
                 steps.push(
-                    "Quit and reopen any Codex desktop app, CLI, or IDE sessions to load the managed provider."
+                    "Quit and reopen any ChatGPT app, Codex CLI, or IDE sessions to load the managed provider."
                         .into(),
                 );
                 steps.push(
-                    "In Codex, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard)."
+                    "In the Codex CLI, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard)."
                         .into(),
                 );
             }
@@ -598,7 +598,9 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             let toml_ok = codex_provider_block_matches()?;
 
             if shell_ok {
-                checks.push("Found Codex OPENAI_BASE_URL export in managed shell block.".into());
+                checks.push(
+                    "Found ChatGPT (Codex) OPENAI_BASE_URL export in managed shell block.".into(),
+                );
             }
             if toml_ok {
                 checks
@@ -2877,6 +2879,7 @@ fn discover_codex_state_dbs() -> Vec<PathBuf> {
 /// third-party providers are left alone.
 fn retag_codex_thread_providers(from: &str, to: &str) {
     let mut found_thread_store = false;
+    let mut unreadable = 0usize;
     for path in discover_codex_state_dbs() {
         match retag_one_codex_db(&path, from, to) {
             // No `threads` table: unrelated sqlite store (logs/goals/memories).
@@ -2890,10 +2893,17 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
                     );
                 }
             }
-            Err(e) => log::warn!(
-                "codex retag {from}->{to} skipped for {}: {e}",
-                path.display()
-            ),
+            // Corrupt/unreadable DBs (malformed image, disk I/O error --
+            // Sentry RUST-95/96, one macOS-beta box) are environmental and
+            // dropped from Sentry by the skip_sentry rule in logging.rs;
+            // other causes (e.g. locked past busy_timeout) stay reportable.
+            Err(e) => {
+                unreadable += 1;
+                log::warn!(
+                    "codex retag {from}->{to} skipped for {}: {e}",
+                    path.display()
+                );
+            }
         }
     }
     // A `state_*.sqlite`-shaped file with no `threads` table means Codex renamed
@@ -2903,12 +2913,23 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
     // (Sentry RUST-3R). This is the last remaining schema-drift signal worth a
     // release (Sentry RUST-43).
     if !found_thread_store && codex_sqlite_store_expected() {
-        log::warn!(
-            "codex retag {from}->{to}: a state_*.sqlite is present but has no \
-             `threads` table under {dirs:?}; the history menu may split. Codex \
-             likely renamed the table.",
-            dirs = codex_state_dirs(),
-        );
+        if unreadable > 0 {
+            // Cannot distinguish "Codex renamed the table" from "the disk is
+            // broken" when any candidate failed to open: RUST-95 false-fired
+            // the rename signal on a machine whose sqlite files all threw
+            // disk I/O errors. Local log only (skip_sentry rule).
+            log::warn!(
+                "codex retag {from}->{to}: no `threads` table found but \
+                 {unreadable} candidate(s) unreadable; skipping the rename signal"
+            );
+        } else {
+            log::warn!(
+                "codex retag {from}->{to}: a state_*.sqlite is present but has no \
+                 `threads` table under {dirs:?}; the history menu may split. Codex \
+                 likely renamed the table.",
+                dirs = codex_state_dirs(),
+            );
+        }
     }
 }
 
@@ -4869,7 +4890,7 @@ fn codex_doctor_summary() -> Option<String> {
     let codex = find_on_path(&["codex"])?;
     let output = crate::proc::command(codex).arg("doctor").output().ok()?;
     if output.status.success() {
-        Some("`codex doctor` reports the Codex install is healthy.".into())
+        Some("`codex doctor` reports the Codex CLI install is healthy.".into())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first = stderr
@@ -6233,14 +6254,22 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
         .as_ref()
         .map(|path| format!("Detected at {}", path.display()))
         .or_else(|| {
-            codex_user_state_exists()
-                .then(|| format!("Detected Codex data in {}.", codex_home().display()))
+            chatgpt_app_path()
+                .map(|path| format!("Detected the ChatGPT app at {}.", path.display()))
+        })
+        .or_else(|| {
+            codex_user_state_exists().then(|| {
+                format!(
+                    "Detected ChatGPT (Codex) data in {}.",
+                    codex_home().display()
+                )
+            })
         });
 
     if let Some(detected_note) = detected {
         return ClientStatus {
             id: "codex".into(),
-            name: "Codex".into(),
+            name: "ChatGPT".into(),
             installed: true,
             configured,
             health: if configured {
@@ -6253,7 +6282,7 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
             } else {
                 vec![
                     detected_note,
-                    "Route Codex through Headroom's localhost proxy so prompts stay lean.".into(),
+                    "Route ChatGPT (previously Codex) through Headroom's localhost proxy so prompts stay lean.".into(),
                 ]
             },
         };
@@ -6261,7 +6290,7 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
 
     ClientStatus {
         id: "codex".into(),
-        name: "Codex".into(),
+        name: "ChatGPT".into(),
         installed: false,
         configured: false,
         health: ClientHealth::NotDetected,
@@ -6381,6 +6410,36 @@ fn codex_user_state_exists() -> bool {
     codex_root.join("config.toml").exists()
         || codex_root.join("auth.json").exists()
         || codex_root.join("sessions").exists()
+        // Written by the unified ChatGPT app's Codex mode even before sign-in.
+        || codex_root.join(".codex-global-state.json").exists()
+}
+
+/// The unified ChatGPT desktop app (the standalone Codex app was absorbed into
+/// it on 2026-07-09; the bundle id stays com.openai.codex). Its Codex mode
+/// reads ~/.codex/config.toml, so app presence alone makes the connector
+/// configurable without the CLI binary on disk.
+fn chatgpt_app_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        [
+            PathBuf::from("/Applications/ChatGPT.app"),
+            home_dir().join("Applications").join("ChatGPT.app"),
+        ]
+        .into_iter()
+        .find(|path| path.exists())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let exe = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+            .join("Programs")
+            .join("ChatGPT")
+            .join("ChatGPT.exe");
+        exe.exists().then_some(exe)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
 }
 
 /// Locate the Codex CLI binary the same way [`detect_codex_client`] does: known

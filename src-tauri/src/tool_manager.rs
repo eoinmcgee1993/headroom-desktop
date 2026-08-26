@@ -8967,7 +8967,18 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         .env("LC_ALL", "C.UTF-8")
         .env("LANG", "C.UTF-8")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        .env("PIP_NO_INPUT", "1");
+        .env("PIP_NO_INPUT", "1")
+        // A host-level pip config (`user = true` in pip.conf, or PIP_USER in
+        // the environment) leaks into the managed venv's pip and fails every
+        // install with "Can not perform a '--user' install. User site-packages
+        // are not visible in this virtualenv." (RUST-6S). Pin the switch off
+        // and aim pip's config lookup at the null device so no user/site/
+        // global pip.conf is read at all.
+        .env("PIP_USER", "0")
+        .env(
+            "PIP_CONFIG_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        );
     command
 }
 
@@ -12175,6 +12186,26 @@ after
             .and_then(|(_, value)| value)
             .expect("PYTHONIOENCODING is set");
         assert_eq!(encoding, std::ffi::OsStr::new("utf-8:backslashreplace"));
+    }
+
+    /// A host pip.conf with `user = true` (or PIP_USER in the environment)
+    /// reaches the managed venv's pip and fails every install with "Can not
+    /// perform a '--user' install" (RUST-6S). `build_command` must pin the
+    /// switch off and aim pip's config lookup at the null device.
+    #[test]
+    fn build_command_isolates_pip_from_host_pip_config() {
+        let cmd = build_command(Path::new("python3"), &["-V"], Path::new("."));
+        let env_of = |name: &str| {
+            cmd.get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| value)
+        };
+        assert_eq!(env_of("PIP_USER"), Some(std::ffi::OsStr::new("0")));
+        let devnull = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        assert_eq!(
+            env_of("PIP_CONFIG_FILE"),
+            Some(std::ffi::OsStr::new(devnull))
+        );
     }
 
     #[test]

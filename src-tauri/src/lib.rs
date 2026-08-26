@@ -483,7 +483,7 @@ fn onboarding_recovery_copy(any_connector_enabled: bool) -> (&'static str, &'sta
     if any_connector_enabled {
         return (
             "Headroom isn't seeing any traffic",
-            "Setup finished, but no Claude Code or Codex requests have come through yet. \
+            "Setup finished, but no Claude Code or ChatGPT requests have come through yet. \
              Restart your terminal or editor so they pick up the new settings.",
         );
     }
@@ -1252,8 +1252,8 @@ async fn install_addon(
                 };
                 let _ = show_notification_impl(
                     &app,
-                    &format!("Update Codex to finish {name} setup"),
-                    &format!("{name} is installed for Claude Code. Your Codex CLI is too old to add it -- update Codex, then re-install {name} to enable it there too."),
+                    &format!("Update the Codex CLI to finish {name} setup"),
+                    &format!("{name} is installed for Claude Code. Your Codex CLI is too old to add it -- update the Codex CLI, then re-install {name} to enable it there too."),
                     None,
                 );
             }
@@ -5028,6 +5028,9 @@ fn savings_report(dashboard: &DashboardState) -> pricing::SavingsReport {
             .output_reduction
             .as_ref()
             .map(|o| o.method.clone()),
+        reread_tokens: dashboard.reread_tokens,
+        reread_compressed_tokens: dashboard.reread_compressed_tokens,
+        ccr_retrievals: dashboard.ccr_retrievals,
         days: recent_savings_days(&dashboard.daily_savings),
     }
 }
@@ -5420,7 +5423,7 @@ fn learn_step_label(line: &str) -> Option<String> {
         let model = model.trim_end_matches('.');
         let backend = match model {
             "claude-cli" => "Claude Code",
-            "codex-cli" => "Codex",
+            "codex-cli" => "ChatGPT",
             "gemini-cli" => "Gemini",
             other => other,
         };
@@ -5516,7 +5519,7 @@ fn execute_headroom_learn_run(
                 .to_string();
             (path, name)
         }
-        LearnAgent::Codex => ("codex", "Codex sessions".to_string()),
+        LearnAgent::Codex => ("codex", "ChatGPT sessions".to_string()),
         LearnAgent::Opencode => ("opencode", "OpenCode sessions".to_string()),
         LearnAgent::Grok => ("grok", "Grok sessions".to_string()),
     };
@@ -6118,13 +6121,13 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     TrayRuntimeVisual::Booting => "Headroom — starting",
                     TrayRuntimeVisual::Running => "Headroom — active",
                     TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code or Codex running normally)"
+                        "Headroom — paused (Claude Code or ChatGPT running normally)"
                     }
                     TrayRuntimeVisual::Unhealthy => {
                         "Headroom — proxy unreachable, attempting restart"
                     }
                     TrayRuntimeVisual::Disconnected => {
-                        "Headroom — Claude Code or Codex not connected"
+                        "Headroom — Claude Code or ChatGPT not connected"
                     }
                     TrayRuntimeVisual::Off => "Headroom — off",
                 };
@@ -6207,7 +6210,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
-                                    "Claude Code or Codex is disconnected — open Headroom to re-enable.",
+                                    "Claude Code or ChatGPT is disconnected — open Headroom to re-enable.",
                                     Some("connectors".into()),
                                 );
                             }

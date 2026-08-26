@@ -2600,6 +2600,9 @@ impl AppState {
                 session_savings_pct: snapshot.session_savings_pct,
                 output_reduction,
                 learner_progress,
+                reread_tokens: stats.as_ref().and_then(|s| s.reread_tokens),
+                reread_compressed_tokens: stats.as_ref().and_then(|s| s.reread_compressed_tokens),
+                ccr_retrievals: stats.as_ref().and_then(|s| s.ccr_retrievals),
                 savings_breakdown,
                 daily_savings,
                 hourly_savings,
@@ -5533,6 +5536,13 @@ struct HeadroomDashboardStats {
     /// Auto-learning progress (`/stats` `traffic_learner`); None on backends
     /// that predate the block or when learning is disabled.
     learner_progress: Option<crate::models::LearnerProgress>,
+    /// Retrieval-churn gauges: tokens the client re-read (`waste_signals`,
+    /// persisted by the backend) and explicit CCR retrieve hits
+    /// (`compression.ccr_retrievals`, process-scoped). Reported to the server
+    /// as latest-observed values, never accumulated here.
+    reread_tokens: Option<u64>,
+    reread_compressed_tokens: Option<u64>,
+    ccr_retrievals: Option<u64>,
 }
 
 /// Counterfactual output-token reduction from the proxy's output shaper,
@@ -6107,6 +6117,15 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
 
     let learner_progress = parse_learner_progress(&root);
 
+    // Retrieval-churn gauges. `waste_signals` is the backend's persisted
+    // waste ledger; `reread_compressed` is the token volume of content a
+    // client re-fetched after Headroom had compressed it away -- the direct
+    // "context filled faster" churn signal. Absent on older backends.
+    let reread_tokens = value_at_path_u64(&root, &["waste_signals", "reread"]);
+    let reread_compressed_tokens =
+        value_at_path_u64(&root, &["waste_signals", "reread_compressed"]);
+    let ccr_retrievals = value_at_path_u64(&root, &["compression", "ccr_retrievals"]);
+
     if requests.is_none()
         && tokens.is_none()
         && usd.is_none()
@@ -6119,6 +6138,9 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
     } else {
         Some(HeadroomDashboardStats {
             learner_progress,
+            reread_tokens,
+            reread_compressed_tokens,
+            ccr_retrievals,
             session_requests: requests,
             session_estimated_savings_usd: usd,
             session_estimated_tokens_saved: tokens,
@@ -7219,6 +7241,25 @@ fn group_kill_target(pid: i32) -> Option<String> {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) const STATUS_DLL_INIT_FAILED: i32 = 0xC0000142_u32 as i32;
 
+/// True when a powershell exit code means "the user session is ending", not
+/// "the sweep failed". Same rationale for every member (see the RUST-7N note
+/// at the call site): logoff/shutdown reaps the whole session, orphans
+/// included, so a sweep that was cut short here has nothing left to do, and
+/// the next launch's reclaim_orphan_proxy covers any survivor.
+/// - 0xC0000142 STATUS_DLL_INIT_FAILED: powershell cannot even start (RUST-7N).
+/// - 0x40010004 DBG_TERMINATE_PROCESS: powershell was terminated by the
+///   session's console-control teardown mid-run (RUST-9A).
+/// - 0xC000013A STATUS_CONTROL_C_EXIT: same teardown, delivered as ctrl-close.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn is_session_teardown_exit(code: i32) -> bool {
+    const DBG_TERMINATE_PROCESS: i32 = 0x40010004;
+    const STATUS_CONTROL_C_EXIT: i32 = 0xC000013A_u32 as i32;
+    matches!(
+        code,
+        STATUS_DLL_INIT_FAILED | DBG_TERMINATE_PROCESS | STATUS_CONTROL_C_EXIT
+    )
+}
+
 fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
     // An unresolved runtime path degrades the pattern from "our backend at this
     // exact path" to a loose substring, and `pkill -f` applies it to every
@@ -7297,9 +7338,10 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
         // left to do (RUST-7N). The venv-lock-holder caller loses nothing
         // either: if powershell is this broken outside a logoff, the pip
         // install right after fails with its own actionable error.
-        if status.code() == Some(STATUS_DLL_INIT_FAILED) {
+        if status.code().is_some_and(is_session_teardown_exit) {
             log::info!(
-                "powershell unavailable (0xC0000142, session ending); skipping process sweep for '{}'",
+                "powershell exited with session-teardown status {:?}; skipping process sweep for '{}'",
+                status.code(),
                 exe.display()
             );
             return Ok(());
@@ -7647,6 +7689,21 @@ mod tests {
         // the benign-classification in kill_processes_by_command_pattern only
         // works if the hex constant converts to exactly that decimal.
         assert_eq!(super::STATUS_DLL_INIT_FAILED, -1073741502);
+    }
+
+    #[test]
+    fn session_teardown_exits_are_benign_but_real_failures_are_not() {
+        // RUST-9A's title says "powershell exited with status Some(1073807364)"
+        // (0x40010004, DBG_TERMINATE_PROCESS: the session killed powershell
+        // mid-sweep). Teardown statuses must be classified benign; a plain
+        // script failure (exit 1) or the self-kill of RUST-6F (-1) must not.
+        use super::is_session_teardown_exit;
+        assert!(is_session_teardown_exit(super::STATUS_DLL_INIT_FAILED));
+        assert!(is_session_teardown_exit(1073807364)); // DBG_TERMINATE_PROCESS
+        assert!(is_session_teardown_exit(-1073741510)); // STATUS_CONTROL_C_EXIT
+        assert!(!is_session_teardown_exit(0));
+        assert!(!is_session_teardown_exit(1));
+        assert!(!is_session_teardown_exit(-1));
     }
 
     #[test]
@@ -9604,6 +9661,9 @@ mod tests {
         // savings_history backfills the daily buckets the lifetime total (and
         // hence milestones) is derived from; a cumulative 1.5M crosses 100k+1M.
         let stats = HeadroomDashboardStats {
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
@@ -9649,6 +9709,9 @@ mod tests {
 
         let first = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9669,6 +9732,9 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9693,6 +9759,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9708,6 +9777,9 @@ mod tests {
 
         let reset = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9731,6 +9803,9 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9799,6 +9874,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -9955,7 +10033,9 @@ mod tests {
                     "pending_patterns": 3,
                     "min_evidence": 5,
                     "history_size": 12
-                }
+                },
+                "waste_signals": { "reread": 91000, "reread_compressed": 4500 },
+                "compression": { "ccr_retrievals": 6 }
             }"#,
         )
         .expect("contract fixture must parse");
@@ -9986,6 +10066,11 @@ mod tests {
 
         let learner = parsed.learner_progress.expect("learner parsed");
         assert_eq!(learner.pending_patterns, 3);
+
+        // Retrieval-churn gauges ride the savings report to the server.
+        assert_eq!(parsed.reread_tokens, Some(91000));
+        assert_eq!(parsed.reread_compressed_tokens, Some(4500));
+        assert_eq!(parsed.ccr_retrievals, Some(6));
 
         // Fallback contract: without the cumulative counter, the windowed
         // by_layer figure is still accepted for shape.
@@ -10730,6 +10815,9 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10753,6 +10841,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10772,6 +10863,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10801,6 +10895,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10819,6 +10916,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10910,6 +11010,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10938,6 +11041,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10957,6 +11063,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -10985,6 +11094,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11008,6 +11120,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11071,6 +11186,9 @@ mod tests {
         ] {
             tracker
                 .observe(&HeadroomDashboardStats {
+                    reread_tokens: None,
+                    reread_compressed_tokens: None,
+                    ccr_retrievals: None,
                     learner_progress: None,
                     output_reduction: None,
                     tool_schema_tokens_saved: None,
@@ -11099,6 +11217,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11118,6 +11239,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11147,6 +11271,9 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11162,6 +11289,9 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11211,6 +11341,9 @@ mod tests {
 
         let snapshot = tracker
             .observe(&HeadroomDashboardStats {
+                reread_tokens: None,
+                reread_compressed_tokens: None,
+                ccr_retrievals: None,
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
@@ -11741,6 +11874,9 @@ mod tests {
 
         // First observation: 1_000 tokens saved, history shows 0→1_000 across hours 9→10.
         tracker.observe(&HeadroomDashboardStats {
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
@@ -11760,6 +11896,9 @@ mod tests {
 
         // Second observation: 3_000 tokens saved, history adds hour 11.
         tracker.observe(&HeadroomDashboardStats {
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,

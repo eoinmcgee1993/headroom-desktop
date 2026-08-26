@@ -409,7 +409,7 @@ export function mergeProviderSavingsForDisplay(
       totalTokensSent: 0
     },
     codex: {
-      label: "Codex",
+      label: "ChatGPT",
       count: 0,
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,

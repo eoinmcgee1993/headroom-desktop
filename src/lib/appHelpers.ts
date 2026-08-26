@@ -267,9 +267,9 @@ export function scheduledPlanChange(
 export function tierRecommendationSourceLabel(source: TierRecommendationSource) {
   switch (source) {
     case "codex":
-      return "Codex";
+      return "ChatGPT";
     case "both":
-      return "Claude and Codex";
+      return "Claude and ChatGPT";
     default:
       return "Claude";
   }

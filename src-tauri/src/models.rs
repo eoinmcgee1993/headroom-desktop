@@ -309,6 +309,16 @@ pub struct DashboardState {
     /// Auto-learning progress; `None` when the backend doesn't report it.
     #[serde(default)]
     pub learner_progress: Option<LearnerProgress>,
+    /// Retrieval-churn gauges from `/stats`: tokens re-read by the client
+    /// (total, and the subset that had been compressed away) plus explicit
+    /// CCR retrieve hits. Latest observed values; `None` while the backend is
+    /// unreachable or predates the counters.
+    #[serde(default)]
+    pub reread_tokens: Option<u64>,
+    #[serde(default)]
+    pub reread_compressed_tokens: Option<u64>,
+    #[serde(default)]
+    pub ccr_retrievals: Option<u64>,
     /// Lifetime decomposition behind the headline savings card. `None` until
     /// the backend's `/stats-history` has been fetched at least once.
     pub savings_breakdown: Option<SavingsBreakdown>,

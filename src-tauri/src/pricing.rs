@@ -1438,6 +1438,12 @@ pub struct SavingsReport {
     pub cache_savings_usd: f64,
     pub output_reduction_percent: Option<f64>,
     pub output_reduction_method: Option<String>,
+    /// Retrieval-churn gauges (see `DashboardState`): how much compressed-away
+    /// content came back. The over-compression tripwire behind "context filled
+    /// up faster with Headroom" reports.
+    pub reread_tokens: Option<u64>,
+    pub reread_compressed_tokens: Option<u64>,
+    pub ccr_retrievals: Option<u64>,
     pub days: Vec<SavingsDay>,
 }
 

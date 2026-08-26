@@ -279,7 +279,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   serena: {
     whatItDoes:
-      "Installing sets up Serena in Headroom's managed runtime and registers it as an MCP server in Claude Code and Codex. Your agent gets symbol-level code tools - find a definition, read just that function, edit in place - instead of reading whole files. Its tool definitions add some tokens to every request, so the net saving is largest in bigger codebases. A serena MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
+      "Installing sets up Serena in Headroom's managed runtime and registers it as an MCP server in Claude Code and ChatGPT (Codex). Your agent gets symbol-level code tools - find a definition, read just that function, edit in place - instead of reading whole files. Its tool definitions add some tokens to every request, so the net saving is largest in bigger codebases. A serena MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
     installing: "Installing Serena and registering its MCP server...",
     installed: "Serena installed. Restart open agent sessions to pick up the new MCP server.",
     uninstalling: "Removing Serena and its MCP registrations...",
@@ -290,7 +290,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   "codebase-memory": {
     whatItDoes:
-      "Installing downloads the codebase-memory binary into Headroom's managed runtime, verifies it, and registers it as an MCP server in Claude Code and Codex. It indexes a repo into a persistent knowledge graph - functions, classes, call chains - so your agent answers structure questions from the graph instead of re-reading files. Ask your agent to index a repo the first time you use it there. Indexes are stored inside Headroom's app data, a codebase-memory MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
+      "Installing downloads the codebase-memory binary into Headroom's managed runtime, verifies it, and registers it as an MCP server in Claude Code and ChatGPT (Codex). It indexes a repo into a persistent knowledge graph - functions, classes, call chains - so your agent answers structure questions from the graph instead of re-reading files. Ask your agent to index a repo the first time you use it there. Indexes are stored inside Headroom's app data, a codebase-memory MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
     installing: "Downloading Codebase Memory and registering its MCP server...",
     installed: "Codebase Memory installed. Restart open agent sessions, then ask your agent to index the repo.",
     uninstalling: "Removing Codebase Memory, its indexes, and its MCP registrations...",
@@ -301,7 +301,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   context7: {
     whatItDoes:
-      "Installing verifies the Context7 MCP server runs via npx, then registers it in Claude Code and Codex. Your agent can pull current, version-specific documentation for the libraries you use instead of guessing APIs from stale training data - docs are fetched only when it asks, so the idle cost is just its tool definitions. A context7 MCP entry you configured yourself is never touched, and the registration is removed cleanly when you uninstall it or Headroom. Requires Node.js on PATH.",
+      "Installing verifies the Context7 MCP server runs via npx, then registers it in Claude Code and ChatGPT (Codex). Your agent can pull current, version-specific documentation for the libraries you use instead of guessing APIs from stale training data - docs are fetched only when it asks, so the idle cost is just its tool definitions. A context7 MCP entry you configured yourself is never touched, and the registration is removed cleanly when you uninstall it or Headroom. Requires Node.js on PATH.",
     installing: "Verifying Context7 with npx and registering its MCP server...",
     installed: "Context7 installed. Restart open agent sessions to pick up the new MCP server.",
     uninstalling: "Removing the Context7 MCP registrations...",
@@ -316,7 +316,7 @@ const connectorSetupDetails: Record<string, string> = {
   claude_code:
     "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom.",
   codex:
-    "Codex CLI, the IDE extension, and the desktop app share ~/.codex/config.toml. Headroom adds a managed provider there and an OPENAI_BASE_URL shell export, plus a SessionStart guard that warns when routing breaks. In Codex CLI, run /hooks once to review and trust the guard (and again after it changes).",
+    "The ChatGPT app (previously Codex), its IDE extension, and the Codex CLI share ~/.codex/config.toml. Headroom adds a managed provider there and an OPENAI_BASE_URL shell export, plus a SessionStart guard that warns when routing breaks. In the Codex CLI, run /hooks once to review and trust the guard (and again after it changes).",
   grok_build:
     "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom.",
   opencode:
@@ -355,7 +355,7 @@ const connectorUnavailableReasons: Record<string, string> = {
   claude_code:
     "Claude Code was not detected. Install the Claude Code CLI and restart Headroom. Note that Claude Code inside the Claude desktop app cannot be optimized: Anthropic's desktop app does not use the CLI's configuration, so Headroom never sees its requests. That is their design decision, not something Headroom can configure around.",
   codex:
-    "Codex CLI was not detected. Headroom can still configure the Codex desktop app and IDE extension; install the CLI only if you also want terminal use.",
+    "The Codex CLI was not detected. Headroom can still configure the ChatGPT app (previously Codex) and its IDE extension; install the CLI only if you also want terminal use.",
   grok_build:
     "Grok Build was not detected. Install Grok Build and restart Headroom.",
   opencode:
@@ -394,7 +394,7 @@ const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnecto
   },
   {
     clientId: "codex",
-    name: "Codex",
+    name: "ChatGPT",
     installed: false,
     enabled: false,
     verified: false
@@ -3203,7 +3203,7 @@ export default function App() {
     learnAgentCount > 1
       ? "Headroom learns from your coding agents' sessions. When an agent repeats a mistake, Headroom updates that agent's memory so it doesn't happen again."
       : codexLearnEnabled
-        ? "Headroom learns from your Codex sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
+        ? "Headroom learns from your ChatGPT (Codex) sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
         : opencodeLearnEnabled || grokLearnEnabled
           ? "Headroom learns from your agent's sessions. When it repeats a mistake, Headroom updates the agent's memory so it doesn't happen again."
           : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.local.md.";
@@ -3948,7 +3948,7 @@ export default function App() {
     const runKey = agent === "claude" ? (projectPath ?? "") : agent;
     const displayName =
       agent === "codex"
-        ? "Codex sessions"
+        ? "ChatGPT sessions"
         : agent === "opencode"
           ? "OpenCode sessions"
           : agent === "grok"
@@ -5101,7 +5101,7 @@ export default function App() {
         <div className="intro-shell__agents" aria-label="Supported coding agents">
           {[
             ["claude_code", "Claude Code"],
-            ["codex", "Codex"],
+            ["codex", "ChatGPT"],
             ["grok_build", "Grok Build"],
             ["opencode", "OpenCode"]
           ].map(([clientId, label]) => (
@@ -5973,7 +5973,7 @@ export default function App() {
   const clampScopeLabel = tierMismatch
     ? [
         tierMismatch.claudeUndercovered ? "Claude" : null,
-        tierMismatch.codexUndercovered ? "Codex" : null,
+        tierMismatch.codexUndercovered ? "ChatGPT" : null,
       ]
         .filter(Boolean)
         .join(" and ") || tierRecommendationSourceLabel(tierMismatch.recommendedSource)
@@ -6889,7 +6889,7 @@ export default function App() {
                               >
                                 <div className="optimize-project-row__main">
                                   <span className="optimize-project-row__name">
-                                    <strong>Codex sessions</strong>
+                                    <strong>ChatGPT sessions</strong>
                                     <small>
                                       <span
                                         className="optimize-project-row__training"
@@ -7549,7 +7549,7 @@ export default function App() {
                       connector.clientId === "claude_code"
                         ? "Claude Code connection"
                         : connector.clientId === "codex"
-                          ? "Codex connection"
+                          ? "ChatGPT connection"
                           : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
@@ -7892,7 +7892,7 @@ export default function App() {
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                 <h3>How savings are calculated</h3>
-                <p>Headroom intercepts and prunes all inputs before sending them to Claude or Codex.</p>
+                <p>Headroom intercepts and prunes all inputs before sending them to Claude or ChatGPT.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
                 {dashboard.savingsBreakdown ? (
                   <div className="savings-breakdown">
@@ -8065,7 +8065,7 @@ export default function App() {
                 <ul className="api-key-guide">
                   <li>
                     Restore the original routing config for every agent Headroom set
-                    up (Claude Code, Codex, Grok Build, OpenCode) and remove the export
+                    up (Claude Code, ChatGPT, Grok Build, OpenCode) and remove the export
                     block from your shell profile
                   </li>
                   <li>
