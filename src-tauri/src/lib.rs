@@ -4604,11 +4604,27 @@ pub fn run() {
     // these silent deaths outnumber classified failures ~4:1; this is the only
     // signal they leave.
     if let Some(abandoned) = state.tool_manager.take_abandoned_bootstrap() {
+        // The tail of the previous run's app log usually holds the last thing
+        // the install did before dying. Same 12KB cap as
+        // capture_upgrade_failure: Sentry drops extras past ~16KB.
+        let log_tail = std::fs::read_to_string(logging::log_path())
+            .ok()
+            .map(|s| {
+                if s.len() > 12_000 {
+                    let cut = s.len() - 12_000;
+                    format!("[truncated {cut} bytes]\n...{}", &s[cut..])
+                } else {
+                    s
+                }
+            })
+            .unwrap_or_else(|| "app log unreadable".into());
         sentry::with_scope(
             |scope| {
                 let fp = ["bootstrap_abandoned", abandoned.step.as_str()];
                 scope.set_fingerprint(Some(fp.as_slice()));
                 scope.set_tag("abandoned_step", &abandoned.step);
+                scope.set_extra("percent", u64::from(abandoned.percent).into());
+                scope.set_extra("app_log_tail", log_tail.into());
             },
             || {
                 sentry::capture_message(
@@ -4620,6 +4636,10 @@ pub fn run() {
                 );
             },
         );
+        // Funnel mirror so the server-side stall query can tell "died
+        // mid-install but came back" from "gone for good". Unknown step names
+        // are ignored by servers that predate this one.
+        pricing::report_funnel_step(&state, "bootstrap_abandoned");
     }
 
     let mut builder =
