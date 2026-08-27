@@ -9113,8 +9113,12 @@ fn verbosity_baseline_present() -> bool {
 /// — it is exactly the path headroom's plugin resolves to, so `--project <cwd>`
 /// matches. Returns `None` when no non-empty transcript exists.
 fn busiest_claude_project_cwd() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let projects_dir = PathBuf::from(home).join(".claude").join("projects");
+    // client_adapters::home_dir, not a bare $HOME: a Windows GUI process has
+    // no HOME env var, and bailing here silently skipped verbosity-baseline
+    // seeding on every Windows install (output savings stayed $0 forever).
+    let projects_dir = crate::client_adapters::home_dir()
+        .join(".claude")
+        .join("projects");
 
     let mut best: Option<(u64, PathBuf)> = None;
     for entry in std::fs::read_dir(&projects_dir).ok()?.flatten() {
