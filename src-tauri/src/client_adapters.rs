@@ -2113,7 +2113,9 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 /// Retries `op` while it fails `PermissionDenied`, sleeping 50/100/200ms
 /// between attempts (4 tries total). Any other error, or the final denial,
 /// is returned as-is.
-fn retry_transient_denied<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+pub(crate) fn retry_transient_denied<T>(
+    mut op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     let mut delay = std::time::Duration::from_millis(50);
     for _ in 0..3 {
         match op() {
