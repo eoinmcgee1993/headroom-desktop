@@ -149,13 +149,17 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // capture at the emit site (RUST-62); this warn repeats on every 15s bind
     // retry and only duplicated it (RUST-5R). Local log only.
     //
-    // Coupled to the emit site's wording in `proxy_intercept::spawn` -- if that
-    // message changes and this substring is not changed with it, the retry warn
-    // silently starts flooding Sentry again. `skips_foreign_port_bind_retry_warns`
-    // is the guard; keep its fixture a copy of the real message.
+    // Matched on the retry marker rather than one variant's prose: the emit
+    // site now says three different things about a held port (draining after a
+    // restart, stuck past the drain window, held by a named process), and
+    // keying on any single wording is what made this fragile before. Every
+    // bind-retry warn ends in the same "retrying in 15s" and every one of them
+    // has an explicit capture at the emit site, so they all belong here.
+    // `skips_foreign_port_bind_retry_warns` is the guard; keep its fixtures
+    // copies of the real messages.
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
         && msg.starts_with("[proxy_intercept] port")
-        && msg.contains("held but not answering")
+        && msg.contains("retrying in 15s")
     {
         return true;
     }
@@ -593,9 +597,15 @@ mod tests {
 
     #[test]
     fn skips_foreign_port_bind_retry_warns() {
+        // Named foreign holder -- captured once at the emit site.
         assert!(skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
-            "[proxy_intercept] port 6767 is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s (Address already in use (os error 48))"
+            "[proxy_intercept] port 6767 is held by Affinity (pid 54915); retrying in 15s (Address already in use (os error 48))"
+        ));
+        // Stuck past the drain window -- also captured once at the emit site.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] port 6767 still in use with nothing listening after 420s; retrying in 15s (Only one usage of each socket address (protocol/network address/port) is normally permitted. (os error 10048))"
         ));
         // Other bind/loop errors from proxy_intercept stay in Sentry.
         assert!(!skip_sentry(
