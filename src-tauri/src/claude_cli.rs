@@ -192,13 +192,7 @@ fn is_runnable(path: &Path) -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(dir) = path.parent() {
-        let existing = std::env::var("PATH").unwrap_or_default();
-        let augmented = if existing.is_empty() {
-            dir.display().to_string()
-        } else {
-            format!("{}:{}", dir.display(), existing)
-        };
-        command.env("PATH", augmented);
+        command.env("PATH", crate::proc::path_with_dir_prepended(dir));
     }
     let child = match command.spawn() {
         Ok(child) => child,

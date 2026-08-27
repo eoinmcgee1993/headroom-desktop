@@ -5480,13 +5480,7 @@ impl ToolManager {
             let mut cmd = build_command(&entrypoint, &args[..], &self.runtime.root_dir);
             if let Some(claude_path) = detected_claude.as_ref() {
                 if let Some(dir) = claude_path.parent() {
-                    let existing = std::env::var("PATH").unwrap_or_default();
-                    let augmented = if existing.is_empty() {
-                        dir.display().to_string()
-                    } else {
-                        format!("{}:{}", dir.display(), existing)
-                    };
-                    cmd.env("PATH", augmented);
+                    cmd.env("PATH", crate::proc::path_with_dir_prepended(dir));
                 }
             }
             let output = cmd
@@ -9063,17 +9057,10 @@ fn context7_package_spec() -> String {
     format!("@upstash/context7-mcp@{CONTEXT7_PINNED_VERSION}")
 }
 
-fn path_with_binary_dir(binary: &Path) -> String {
-    let existing = std::env::var("PATH").unwrap_or_default();
+fn path_with_binary_dir(binary: &Path) -> std::ffi::OsString {
     match binary.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => {
-            if existing.is_empty() {
-                dir.display().to_string()
-            } else {
-                format!("{}:{}", dir.display(), existing)
-            }
-        }
-        _ => existing,
+        Some(dir) if !dir.as_os_str().is_empty() => crate::proc::path_with_dir_prepended(dir),
+        _ => std::env::var_os("PATH").unwrap_or_default(),
     }
 }
 
@@ -10340,9 +10327,10 @@ asyncio.run(verify())
     fn path_with_binary_dir_prepends_parent() {
         let path =
             path_with_binary_dir(&PathBuf::from("/Users/x/.nvm/versions/node/v22/bin/codex"));
-        assert!(path.starts_with("/Users/x/.nvm/versions/node/v22/bin:"));
+        let first = std::env::split_paths(&path).next().expect("non-empty PATH");
+        assert_eq!(first, PathBuf::from("/Users/x/.nvm/versions/node/v22/bin"));
         // A bare binary name has no usable parent; PATH is left unchanged.
-        let existing = std::env::var("PATH").unwrap_or_default();
+        let existing = std::env::var_os("PATH").unwrap_or_default();
         assert_eq!(path_with_binary_dir(&PathBuf::from("codex")), existing);
     }
 
