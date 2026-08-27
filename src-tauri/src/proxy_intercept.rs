@@ -1473,6 +1473,17 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     if (500..600).contains(&status) {
         return;
     }
+    // A geo-block is a property of where the user is, not of anything we sent:
+    // OpenAI refuses the request before it is ever evaluated, and no release we
+    // ship can change the outcome. Same reasoning that already excludes 401 and
+    // 429 above, applied one level deeper because the status alone does not say
+    // it -- a 403 can also be an org-verification challenge, which IS
+    // actionable, so the body's `code` is what splits them. RUST-4H collected
+    // 139 of these from hosts in unsupported regions. The raw body still
+    // reaches the local log::warn! above.
+    if is_geo_blocked_codex_error(&body) {
+        return;
+    }
     // Group by status so each upstream failure class is its own Sentry issue.
     // Without an explicit fingerprint, Sentry parameterizes the message
     // ("codex upstream error {status} on {path}") and collapses 401 noise, 403
@@ -1493,6 +1504,16 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
             );
         },
     );
+}
+
+/// True when an upstream error body carries OpenAI's unsupported-region code.
+/// Only the structural `code` field is read; no free text is inspected or kept.
+fn is_geo_blocked_codex_error(body: &[u8]) -> bool {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let err = json.get("error").unwrap_or(&json);
+    err.get("code").and_then(|v| v.as_str()) == Some("unsupported_country_region_territory")
 }
 
 /// Reduce an upstream error body to structural fields safe for Sentry:
@@ -2641,9 +2662,9 @@ mod tests {
         bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
         codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
         find_header_end, intercept_request_counts, is_codex_request_head, is_codex_sse_response,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_openai_path, is_prompt_request_head, is_reportable_codex_error, os_error_key,
-        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
+        is_geo_blocked_codex_error, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
+        is_local_proxy_path, is_openai_path, is_prompt_request_head, is_reportable_codex_error,
+        os_error_key, parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
         rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, stamp_client_header,
@@ -4531,6 +4552,29 @@ mod tests {
             codex_error_summary(b"<html>gateway error</html>"),
             "unparseable error body (26 bytes)"
         );
+    }
+
+    #[test]
+    fn geo_blocked_codex_error_detects_unsupported_region() {
+        // The exact shape RUST-4H captured 139 times.
+        let body = br#"{"error":{"message":"Country, region, or territory not supported","type":"request_forbidden","code":"unsupported_country_region_territory","param":null}}"#;
+        assert!(is_geo_blocked_codex_error(body));
+    }
+
+    #[test]
+    fn geo_blocked_codex_error_ignores_other_403s() {
+        // An org-verification 403 IS actionable and must still reach Sentry.
+        let body =
+            br#"{"error":{"type":"request_forbidden","code":"organization_must_be_verified"}}"#;
+        assert!(!is_geo_blocked_codex_error(body));
+        // Unrelated shapes must not be mistaken for a geo-block.
+        assert!(!is_geo_blocked_codex_error(
+            br#"{"error":{"type":"invalid_request_error","code":"invalid_prompt"}}"#
+        ));
+        assert!(!is_geo_blocked_codex_error(b"<html>gateway error</html>"));
+        assert!(!is_geo_blocked_codex_error(b""));
+        // A null code must not panic or match.
+        assert!(!is_geo_blocked_codex_error(br#"{"error":{"code":null}}"#));
     }
 
     #[test]
