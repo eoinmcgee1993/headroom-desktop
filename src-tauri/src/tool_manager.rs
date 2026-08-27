@@ -2767,10 +2767,61 @@ impl ToolManager {
                     .join("; ");
                 format!(" (prior attempts: {})", joined)
             };
+            // Silent-crash instrumentation (RUST-9F / RUST-9T): on Windows,
+            // python dying with exit code 0xffffffff before opening the port
+            // leaves no traceback -- faulthandler never runs when a native DLL
+            // kills the process during import. A second distinct host hit this
+            // on 2026-08-27, so probe the prime suspect (onnxruntime's native
+            // init, pulled in by the ml extras) in a bare interpreter and carry
+            // the verdict in the error chain Sentry already captures.
+            let onnx_note = if cfg!(windows)
+                && (last.reason.contains("0xffffffff")
+                    || failures.iter().any(|f| f.reason.contains("0xffffffff")))
+            {
+                format!(" (onnx probe: {})", self.probe_onnx_import())
+            } else {
+                String::new()
+            };
             return Err(anyhow::Error::from(last).context(format!(
-                "unable to keep headroom running in background{}",
-                prior_summary
+                "unable to keep headroom running in background{}{}",
+                prior_summary, onnx_note
             )));
+        }
+    }
+
+    /// Diagnostic for the silent 0xffffffff exit class (RUST-9F / RUST-9T):
+    /// imports onnxruntime in a bare interpreter so a native DLL-init crash
+    /// reproduces in isolation. Best-effort -- every outcome, including a
+    /// crash or a missing module, IS the diagnosis. Only called on the
+    /// already-failed startup path, so the extra subprocess costs nothing in
+    /// the happy path.
+    fn probe_onnx_import(&self) -> String {
+        let python = self.managed_python();
+        if !python.exists() {
+            return "managed python missing".to_string();
+        }
+        match crate::proc::command(&python)
+            .args([
+                "-c",
+                "import onnxruntime, sys; sys.stdout.write(onnxruntime.__version__)",
+            ])
+            .env("PYTHONNOUSERSITE", "1")
+            .output()
+        {
+            Ok(out) if out.status.success() => format!(
+                "onnxruntime {} imports cleanly",
+                String::from_utf8_lossy(&out.stdout).trim()
+            ),
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let last_line = stderr.lines().rev().find(|l| !l.trim().is_empty());
+                format!(
+                    "import onnxruntime exited {}: {}",
+                    out.status,
+                    last_line.unwrap_or("<no stderr>").trim()
+                )
+            }
+            Err(err) => format!("probe spawn failed: {err}"),
         }
     }
 
@@ -5917,6 +5968,7 @@ impl ToolManager {
             &self.runtime.managed_python(),
             &["-m", "pip", "uninstall", "-y", "markitdown"],
             &self.runtime.root_dir,
+            Some(PIP_OUTPUT_SILENCE_TIMEOUT),
             &mut |line: &str| log::info!("markitdown pip uninstall: {line}"),
         );
         let shim = self.markitdown_shim_path();
@@ -6355,9 +6407,13 @@ impl ToolManager {
     ) -> Result<()> {
         let id = plugin.id;
         let label = host.label();
-        run_command_streaming(cli, args, &self.runtime.root_dir, &mut |line: &str| {
-            log::info!("{id} [{label}]: {line}")
-        })
+        run_command_streaming(
+            cli,
+            args,
+            &self.runtime.root_dir,
+            None,
+            &mut |line: &str| log::info!("{id} [{label}]: {line}"),
+        )
     }
 
     /// Registers the marketplace (best-effort) and installs the plugin into a
@@ -9300,6 +9356,12 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
 /// "Installing collected packages", "Successfully installed") into
 /// user-facing progress updates instead of staring at a static message for
 /// the 60–90 seconds a large pip install takes.
+/// Kill a pip child that has produced no output at all for this long. pip
+/// streams constantly when healthy (Collecting/Downloading/Installing lines),
+/// so total silence this long means wedged, not slow. Generous enough for the
+/// quietest legitimate gap we ship (large wheel extract on a slow disk).
+const PIP_OUTPUT_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
+
 fn run_pip_install_with_retries_streaming<F>(
     python: &Path,
     args: &[&str],
@@ -9313,7 +9375,13 @@ where
     const BACKOFFS_SECS: &[u64] = &[2, 5];
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match run_command_streaming(python, args, cwd, &mut on_line) {
+        match run_command_streaming(
+            python,
+            args,
+            cwd,
+            Some(PIP_OUTPUT_SILENCE_TIMEOUT),
+            &mut on_line,
+        ) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 if attempt < MAX_ATTEMPTS {
@@ -9379,7 +9447,13 @@ where
 /// Like `run_command` but streams stdout + stderr line-by-line through
 /// `on_line` in real time. Captures everything for the structured failure
 /// payload so error reporting is unchanged.
-fn run_command_streaming<F>(binary: &Path, args: &[&str], cwd: &Path, on_line: &mut F) -> Result<()>
+fn run_command_streaming<F>(
+    binary: &Path,
+    args: &[&str],
+    cwd: &Path,
+    silence_timeout: Option<Duration>,
+    on_line: &mut F,
+) -> Result<()>
 where
     F: FnMut(&str),
 {
@@ -9421,15 +9495,59 @@ where
     let mut stdout_buf = String::new();
     let mut stderr_buf = String::new();
 
-    while let Ok(streamed) = rx.recv() {
-        on_line(&streamed.line);
-        let sink = if streamed.is_stderr {
-            &mut stderr_buf
-        } else {
-            &mut stdout_buf
-        };
-        sink.push_str(&streamed.line);
-        sink.push('\n');
+    // Silence watchdog. A child that stops producing output entirely (AV
+    // scan wedge, stuck filesystem, hung post-download step) used to hang
+    // this loop -- and the install wizard -- forever with no verdict; pip's
+    // own `--timeout` only bounds socket reads, not the process (Aug 26/27
+    // stall cohort). No output for the whole window => kill and fail the
+    // attempt so the caller's retry/verdict machinery runs. `None` keeps the
+    // old wait-forever behavior for callers whose children are legitimately
+    // quiet for long stretches.
+    let mut last_output = Instant::now();
+    loop {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(streamed) => {
+                last_output = Instant::now();
+                on_line(&streamed.line);
+                let sink = if streamed.is_stderr {
+                    &mut stderr_buf
+                } else {
+                    &mut stdout_buf
+                };
+                sink.push_str(&streamed.line);
+                sink.push('\n');
+            }
+            // Pipes closed: the child is exiting; fall through to wait().
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let Some(limit) = silence_timeout else {
+                    continue;
+                };
+                if last_output.elapsed() >= limit {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Do NOT join the reader threads here: an orphaned
+                    // grandchild (sh's `sleep`, a wedged pip subprocess) can
+                    // hold the pipe open indefinitely after the kill, and a
+                    // blocked join would re-create the very hang this branch
+                    // exists to end. The buffers already hold everything
+                    // received; the readers exit on their own when the pipe
+                    // finally closes.
+                    stderr_buf.push_str(&format!(
+                        "\n[headroom] killed: no output for {}s (stalled installer)\n",
+                        limit.as_secs()
+                    ));
+                    return Err(anyhow::Error::new(CommandFailure {
+                        program: binary.display().to_string(),
+                        args: args.iter().map(|s| s.to_string()).collect(),
+                        stdout: stdout_buf,
+                        stderr: stderr_buf,
+                        exit_code: None,
+                        signal: None,
+                    }));
+                }
+            }
+        }
     }
 
     let _ = stdout_handle.join();
@@ -14001,6 +14119,44 @@ exit 0
     /// and even once ensurepip is run directly, pip's `ERROR:` line is followed
     /// by a traceback, so the 300-byte tail kept the traceback and dropped the
     /// diagnosis. Verified against the real stderr of a failing ensurepip.
+    #[test]
+    #[cfg(unix)] // exercises /bin/sh; Windows cannot exec it
+    fn run_command_streaming_kills_silent_child() {
+        let err = super::run_command_streaming(
+            std::path::Path::new("/bin/sh"),
+            &["-c", "echo hi; sleep 30"],
+            &std::env::temp_dir(),
+            Some(Duration::from_millis(700)),
+            &mut |_| {},
+        )
+        .expect_err("silent child must be killed");
+        let failure = err
+            .downcast_ref::<CommandFailure>()
+            .expect("stall reports as CommandFailure");
+        assert!(
+            failure.stderr.contains("no output for"),
+            "stderr should name the stall: {}",
+            failure.stderr
+        );
+        assert!(
+            failure.stdout.contains("hi"),
+            "output before the stall is preserved"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_command_streaming_spares_slow_but_talking_child() {
+        super::run_command_streaming(
+            std::path::Path::new("/bin/sh"),
+            &["-c", "for i in 1 2 3; do echo tick; sleep 0.3; done"],
+            &std::env::temp_dir(),
+            Some(Duration::from_secs(5)),
+            &mut |_| {},
+        )
+        .expect("child that keeps talking must not be killed");
+    }
+
     #[test]
     fn compact_pip_failure_keeps_pips_diagnosis_ahead_of_a_traceback() {
         let stderr = concat!(

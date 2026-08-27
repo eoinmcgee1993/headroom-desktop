@@ -320,18 +320,58 @@ pub fn report_funnel_step_device_only(step: &str) {
     spawn_funnel_step(IdentityPayload::device_only(), step);
 }
 
+/// Retry backoffs for the funnel beacon. A relaunch that races network
+/// bring-up (Windows boot Wi-Fi, VPN) used to lose the step forever: one
+/// detached thread, one POST, result discarded -- which is how a
+/// `bootstrap_abandoned` report from a briefly-offline relaunch vanished.
+/// The server is first-write-wins per (device, step), so retries are
+/// idempotent; the sequence is bounded so an all-session-offline device
+/// gives up instead of polling forever.
+const FUNNEL_STEP_RETRY_BACKOFFS: &[std::time::Duration] = &[
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(60),
+    std::time::Duration::from_secs(120),
+    std::time::Duration::from_secs(300),
+];
+
 fn spawn_funnel_step(identity: IdentityPayload, step: &str) {
     let step = step.to_string();
     std::thread::spawn(move || {
-        let _ = post_grace_start_with_step(&identity, &step);
+        if let Err(err) = post_funnel_step_with_retries(
+            &identity,
+            &step,
+            &api_base_url(),
+            FUNNEL_STEP_RETRY_BACKOFFS,
+        ) {
+            // info, not warn: the log->Sentry bridge captures warns, and a
+            // device offline for the whole session would emit one event per
+            // funnel step for a condition that is not our bug.
+            log::info!("funnel step {step} not delivered after retries: {err}");
+        }
     });
 }
 
-fn post_grace_start_with_step(identity: &IdentityPayload, step: &str) -> Result<(), String> {
-    post_grace_start_with_step_to(identity, step, &api_base_url())
+fn post_funnel_step_with_retries(
+    identity: &IdentityPayload,
+    step: &str,
+    base_url: &str,
+    backoffs: &[std::time::Duration],
+) -> Result<(), String> {
+    let mut last_err = match post_grace_start_with_step_to(identity, step, base_url) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    for backoff in backoffs {
+        std::thread::sleep(*backoff);
+        match post_grace_start_with_step_to(identity, step, base_url) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_err = err,
+        }
+    }
+    Err(last_err)
 }
 
-/// Test-only seam: like `post_grace_start_with_step` but against a parameterized
+/// Test-only seam: a single funnel-step POST against a parameterized
 /// base URL so a canned-response server can stand in for headroom-web.
 fn post_grace_start_with_step_to(
     identity: &IdentityPayload,
@@ -5674,6 +5714,38 @@ mod tests {
                 .contains("x-headroom-funnel-step: signup_gate_shown"),
             "missing funnel-step header:\n{request}"
         );
+    }
+
+    #[test]
+    fn funnel_step_retries_until_a_post_lands() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for status in ["HTTP/1.1 500 Internal Server Error", "HTTP/1.1 200 OK"] {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "{}";
+                let response = format!(
+                    "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let identity = super::IdentityPayload::device_only();
+        super::post_funnel_step_with_retries(
+            &identity,
+            "bootstrap_abandoned",
+            &format!("http://127.0.0.1:{port}"),
+            &[std::time::Duration::from_millis(20)],
+        )
+        .expect("second attempt lands after one failure");
+        server.join().unwrap();
     }
 
     #[test]

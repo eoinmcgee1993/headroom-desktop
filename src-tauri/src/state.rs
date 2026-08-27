@@ -7421,10 +7421,14 @@ fn drop_rollup_backfill<T>(
 /// shallower, so 10% is the conservative choice across providers.
 const CACHE_READ_PRICE_RATIO: f64 = 0.10;
 
-/// The most any provider bills for a single input token, in USD per million.
-/// Claude Fable 5 tops the Anthropic table at $10/M; the headroom above it
-/// absorbs a pricier model shipping before this constant is revisited.
-const MAX_PLAUSIBLE_INPUT_USD_PER_M: f64 = 15.0;
+/// The most any provider plausibly bills for a single input token, in USD per
+/// million. Claude Fable 5 tops the Anthropic table at $10/M, but OpenAI's pro
+/// tiers go higher (o3-pro $20/M; o1-pro is $150/M but rare enough to accept a
+/// false fire on). $25 clears a blended o3-pro-heavy mix while staying under
+/// the ~$33/M signature the 0.36.0 tool-schema contamination produced -- the
+/// event this canary exists to catch. RUST-89's lone post-b86b91b event was an
+/// o3-pro-class mix reading $20.11/M on the pinned, uncontaminated wheel.
+const MAX_PLAUSIBLE_INPUT_USD_PER_M: f64 = 25.0;
 
 /// True when the buckets imply a savings $/token that no provider charges for
 /// an input token. A saved input token is worth exactly the rate it would have
