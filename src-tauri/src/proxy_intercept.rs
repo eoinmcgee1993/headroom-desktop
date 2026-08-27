@@ -457,6 +457,39 @@ pub type FreshBearerNotifier = mpsc::Sender<()>;
 pub const ANTHROPIC_DIRECT_BASE: &str = "https://api.anthropic.com";
 pub const OPENAI_DIRECT_BASE: &str = "https://api.openai.com";
 
+/// What a held intercept port means, given who (if anyone) is listening on it
+/// and how long we have been trying.
+///
+/// Split out from the bind loop so the decision is testable: the loop itself
+/// is an infinite async retry that cannot be driven from a unit test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeldPortVerdict {
+    /// Bind says in-use but nothing is LISTENING, and we are still inside the
+    /// window where a previous instance's sockets could be draining. Windows
+    /// only in practice: Rust sets `SO_REUSEADDR` on Unix but not there, so an
+    /// exiting instance's accepted connections hold the port through
+    /// TIME_WAIT. Self-healing, so it is not worth an error report.
+    Draining,
+    /// Same shape, but past the longest drain Windows can be configured for
+    /// (`TcpTimedWaitDelay` maxes at 300s). No longer safe to assume it clears.
+    Stuck,
+    /// A live foreign listener. Does not clear on its own, and we can name it,
+    /// so this is the one the user can actually act on.
+    Foreign { name: String, pid: u32 },
+}
+
+pub(crate) fn classify_held_port(
+    occupant: Option<(String, u32)>,
+    elapsed: std::time::Duration,
+    drain_grace: std::time::Duration,
+) -> HeldPortVerdict {
+    match occupant {
+        Some((name, pid)) => HeldPortVerdict::Foreign { name, pid },
+        None if elapsed < drain_grace => HeldPortVerdict::Draining,
+        None => HeldPortVerdict::Stuck,
+    }
+}
+
 /// Locale-invariant identity for an OS error.
 ///
 /// `io::Error`'s `Display` is the *localized* platform string, so keying a
@@ -536,6 +569,13 @@ pub fn spawn(
                 // this; anything still held after it is something the user has
                 // to be told about.
                 const HINT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+                // Past RELAUNCH_GRACE a held port is still not necessarily a
+                // problem: on Windows the exiting instance's accepted
+                // connections hold the port through TIME_WAIT with nothing
+                // in LISTENING state, and `TcpTimedWaitDelay` tops out at
+                // 300s. Below that a listener-less port is still draining;
+                // above it, it is stuck and worth saying so.
+                const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
                 let launched_at = tokio::time::Instant::now();
                 let mut consecutive_failures = 0usize;
                 loop {
@@ -608,25 +648,104 @@ pub fn spawn(
                                         continue;
                                     }
                                 }
-                                log::warn!(
-                                    "[proxy_intercept] port {INTERCEPT_PORT} is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s ({e})"
-                                );
+                                // Who actually holds it decides whether this
+                                // is worth a report. `listener_process` only
+                                // ever names a socket in LISTENING state, so
+                                // `None` here means bind says in-use while
+                                // nothing is listening -- on Windows that is
+                                // the previous instance's accepted connections
+                                // draining through TIME_WAIT, because Rust
+                                // sets SO_REUSEADDR on Unix but not there.
+                                // RUST-7M was exactly this: one event per
+                                // update relaunch, Windows-only, every one of
+                                // them self-healing. Reporting it filed an
+                                // error at the user that named no cause they
+                                // could act on and that fixed itself minutes
+                                // later. `Some` is the opposite case -- a live
+                                // foreign listener, which does not clear on
+                                // its own and which we can name.
+                                let occupant =
+                                    crate::tool_manager::listener_process(INTERCEPT_PORT);
                                 let key = os_error_key(&e);
-                                if reported_errors.insert(format!("foreign:{key}")) {
-                                    sentry::with_scope(
-                                        |scope| {
-                                            scope.set_extra(
-                                                "os_error", e.to_string().into());
-                                        },
-                                        || {
-                                            sentry::capture_message(
-                                                &format!(
-                                                    "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} held but not answering /health; retrying)"
-                                                ),
-                                                sentry::Level::Error,
+                                match classify_held_port(
+                                    occupant,
+                                    launched_at.elapsed(),
+                                    DRAIN_GRACE,
+                                ) {
+                                    HeldPortVerdict::Draining => {
+                                        // Still a real outage from the user's
+                                        // side, so the banner stays -- but it
+                                        // says what is happening instead of
+                                        // the bare OS string, which reads as
+                                        // "the runtime is broken".
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} is still being released after a restart; reconnecting"
+                                        ));
+                                        log::info!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} in use but nothing is listening {}s after launch (a previous instance's sockets draining looks exactly like this); retrying in 15s ({e})",
+                                            launched_at.elapsed().as_secs()
+                                        );
+                                    }
+                                    HeldPortVerdict::Stuck => {
+                                        // Past the longest drain Windows can
+                                        // be configured for, so "it will
+                                        // clear itself" has stopped being
+                                        // true. Nothing to name, but worth
+                                        // knowing about.
+                                        log::warn!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} still in use with nothing listening after {}s; retrying in 15s ({e})",
+                                            launched_at.elapsed().as_secs()
+                                        );
+                                        if reported_errors.insert(format!("stuck:{key}")) {
+                                            sentry::with_scope(
+                                                |scope| {
+                                                    scope.set_extra(
+                                                        "os_error", e.to_string().into());
+                                                    scope.set_extra(
+                                                        "held_secs",
+                                                        launched_at.elapsed().as_secs().into());
+                                                },
+                                                || {
+                                                    sentry::capture_message(
+                                                        &format!(
+                                                            "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} in use with no listener past the drain window; retrying)"
+                                                        ),
+                                                        sentry::Level::Error,
+                                                    );
+                                                },
                                             );
-                                        },
-                                    );
+                                        }
+                                    }
+                                    HeldPortVerdict::Foreign { name, pid } => {
+                                        // Actionable: the user can quit this.
+                                        // Reclaim already declined it, so it
+                                        // is not one of ours.
+                                        log::warn!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} is held by {name} (pid {pid}); retrying in 15s ({e})"
+                                        );
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} is held by {name} (pid {pid})"
+                                        ));
+                                        if reported_errors.insert(format!("foreign:{key}:{name}")) {
+                                            sentry::with_scope(
+                                                |scope| {
+                                                    scope.set_extra(
+                                                        "os_error", e.to_string().into());
+                                                    scope.set_extra(
+                                                        "occupant", name.clone().into());
+                                                    scope.set_extra("occupant_pid", pid.into());
+                                                },
+                                                || {
+                                                    sentry::capture_message(
+                                                        &format!(
+                                                            "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} held by {name}; retrying)"
+                                                        ),
+                                                        sentry::Level::Error,
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2638,18 +2757,19 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
-        codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
-        find_header_end, intercept_request_counts, is_codex_request_head, is_codex_sse_response,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_openai_path, is_prompt_request_head, is_reportable_codex_error, os_error_key,
-        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
-        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
-        set_response_content_length, should_report_throttled, stamp_client_header,
-        stamp_codex_client_header, stamp_headroom_bypass_header, stamp_request_header,
-        strip_request_header, BypassFlag, CodexTerminalReader, ModelsRewrite, ParsedRequestHead,
-        SharedToken, FIRST_OPTIMIZED_REQUEST_REPORTED,
+        bearer_value_changed, classify_held_port, codex_error_summary,
+        codex_snapshot_from_usage_payload, codex_window_label, decode_codex_plan_tier,
+        extract_bearer, extract_header_value, find_header_end, intercept_request_counts,
+        is_codex_request_head, is_codex_sse_response, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_openai_path, is_prompt_request_head,
+        is_reportable_codex_error, os_error_key, parse_codex_rate_limit_headers,
+        parse_request_head, parse_response_status, read_http_headers, request_has_header,
+        request_is_loopback_safe, request_uses_chatgpt_auth, rewrite_use_responses_lite, run,
+        sanitize_stale_tool_references, set_response_content_length, should_report_throttled,
+        stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
+        stamp_request_header, strip_request_header, BypassFlag, CodexTerminalReader,
+        HeldPortVerdict, ModelsRewrite, ParsedRequestHead, SharedToken,
+        FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -2683,6 +2803,71 @@ mod tests {
         // Non-OS errors have no code; fall back to the text so they stay distinct.
         let synthetic = std::io::Error::other("synthesized by a wrapper");
         assert_eq!(os_error_key(&synthetic), "synthesized by a wrapper");
+    }
+
+    const HELD_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// RUST-7M: Windows-only, one event per update relaunch, every one
+    /// self-healing. Nothing is LISTENING because the port is held by the
+    /// previous instance's connections in TIME_WAIT, so there is no pid to
+    /// name and nothing for the user to do about it.
+    #[test]
+    fn a_listener_less_port_inside_the_grace_is_draining_not_an_error() {
+        assert_eq!(
+            classify_held_port(None, std::time::Duration::from_secs(120), HELD_GRACE),
+            HeldPortVerdict::Draining
+        );
+    }
+
+    /// The 90s RELAUNCH_GRACE expires while Windows' TcpTimedWaitDelay (120s
+    /// by default) is still running, which is exactly why RUST-7M reported at
+    /// all. Past 90s but inside the drain window must stay quiet.
+    #[test]
+    fn the_relaunch_grace_alone_does_not_cover_the_windows_drain() {
+        assert_eq!(
+            classify_held_port(None, std::time::Duration::from_secs(91), HELD_GRACE),
+            HeldPortVerdict::Draining
+        );
+    }
+
+    #[test]
+    fn a_listener_less_port_past_the_grace_is_stuck() {
+        assert_eq!(
+            classify_held_port(None, std::time::Duration::from_secs(301), HELD_GRACE),
+            HeldPortVerdict::Stuck
+        );
+    }
+
+    /// A named holder does not clear on its own, so the drain window is
+    /// irrelevant to it -- report immediately rather than sitting on it 300s.
+    #[test]
+    fn a_live_listener_is_foreign_however_early_it_shows_up() {
+        assert_eq!(
+            classify_held_port(
+                Some(("Affinity".into(), 54915)),
+                std::time::Duration::from_secs(1),
+                HELD_GRACE
+            ),
+            HeldPortVerdict::Foreign {
+                name: "Affinity".into(),
+                pid: 54915
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_listener_past_the_grace_is_still_named_not_stuck() {
+        assert_eq!(
+            classify_held_port(
+                Some(("node".into(), 99)),
+                std::time::Duration::from_secs(9_999),
+                HELD_GRACE
+            ),
+            HeldPortVerdict::Foreign {
+                name: "node".into(),
+                pid: 99
+            }
+        );
     }
     use tokio::time::{timeout, Duration};
 

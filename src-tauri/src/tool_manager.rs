@@ -7439,7 +7439,7 @@ fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
 /// `None` means "could not identify the listener" — never "nothing is
 /// listening" and never "it is not ours". Both the port-reclaim kill path and
 /// the stale-argv check hang off this, so neither may treat None as evidence.
-fn listener_process(port: u16) -> Option<(String, u32)> {
+pub(crate) fn listener_process(port: u16) -> Option<(String, u32)> {
     for lsof in ["/usr/sbin/lsof", "/usr/bin/lsof"] {
         // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
         // selector (lsof ORs `-i` options) and match every listening socket on
