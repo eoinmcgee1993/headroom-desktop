@@ -2050,9 +2050,16 @@ impl ToolManager {
         // re-downloads the distribution and rebuilds the venv from it -- the
         // only thing standing between the user and a self-repair was this
         // check. Same blind spot as RUST-66/6M one level down.
+        // pyvenv.cfg is the same blind spot one file over: the venv's python
+        // stub resolves the interpreter through it, so a venv missing only
+        // this file passes the three checks below while every spawn (and
+        // every pip) dies with exit 106 / `No pyvenv.cfg file` (RUST-6S,
+        // third shape). Checking it here is what routes that machine back to
+        // bootstrap's rebuild instead of a permanent pip-retry loop.
         self.runtime.ready_flag().exists()
             && self.runtime.managed_python().exists()
             && self.runtime.standalone_python().exists()
+            && self.runtime.venv_dir.join("pyvenv.cfg").exists()
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -2442,7 +2449,7 @@ impl ToolManager {
                     use std::os::unix::process::CommandExt;
                     command.process_group(0);
                 }
-                let mut child = command
+                command
                     .env("PYTHONNOUSERSITE", "1")
                     .env("PYTHONPATH", &inject_dir)
                     .env("PYTHONUNBUFFERED", "1")
@@ -2653,8 +2660,14 @@ impl ToolManager {
                             .try_clone()
                             .with_context(|| format!("cloning {}", log_path.display()))?,
                     ))
-                    .stderr(Stdio::from(log_file))
-                    .spawn()
+                    .stderr(Stdio::from(log_file));
+                // Windows: AV/Defender briefly holds the just-installed (or
+                // just-scanned) exe open and CreateProcess fails ACCESS_DENIED
+                // (os error 5) even though nothing is wrong -- the spawn twin
+                // of RUST-9M's rename (Sentry RUST-9X, launch auto-start on
+                // 0.8.8). Transient by nature; retry briefly before failing
+                // the launch.
+                let mut child = crate::client_adapters::retry_transient_denied(|| command.spawn())
                     .with_context(|| {
                         format!(
                             "starting headroom background process: {} {}",
@@ -3517,7 +3530,7 @@ impl ToolManager {
         Ok(())
     }
 
-    pub fn bootstrap_all_with_progress<F>(&self, mut progress: F) -> Result<ManagedRuntime>
+    pub fn bootstrap_all_with_progress<F>(&self, progress: F) -> Result<ManagedRuntime>
     where
         F: FnMut(BootstrapStepUpdate),
     {
@@ -7699,6 +7712,109 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     Ok(())
 }
 
+/// Kill a stranded prior Headroom DESKTOP instance holding `port` (the
+/// intercept port). A restart or updater relaunch can leave the old
+/// headroom-desktop process holding 6767 while no longer serving on it, and
+/// nothing else ever reclaims that port -- the intercept's bind loop just
+/// retries forever, so the app stays "not hooked up" until the user kills
+/// the process by hand (RUST-7M; kill-and-restart is the confirmed field
+/// fix). Identity gate: the listener must be running THIS same executable
+/// (exact current_exe path match) and not be this process. A foreign
+/// squatter or a reserved range never matches, and nothing is killed.
+/// Returns true when a kill was issued and the port came free.
+pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
+    let Some((_, pid)) = listener_process(port) else {
+        return false;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    if !pid_is_headroom_desktop_twin(pid) {
+        return false;
+    }
+    log::warn!(
+        "[proxy_intercept] reclaiming stranded Headroom desktop instance pid {pid} on port {port}"
+    );
+    kill_pid(pid, false);
+    if !wait_for_port_free(port, Duration::from_secs(3)) {
+        kill_pid(pid, true);
+        if !wait_for_port_free(port, Duration::from_secs(2)) {
+            return false;
+        }
+    }
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("flow", "intercept_stranded_instance_reclaimed");
+            scope.set_extra("port", port.into());
+            scope.set_extra("occupant_pid", pid.into());
+        },
+        || {
+            sentry::capture_message(
+                &format!(
+                    "intercept_stranded_instance_reclaimed: killed pid {pid} holding port {port}"
+                ),
+                sentry::Level::Info,
+            );
+        },
+    );
+    true
+}
+
+/// True when `pid` runs the same executable as this process. The strictest
+/// identity claim available: an updater-stranded old instance runs from the
+/// exact same install path as us, while any foreign process cannot.
+fn pid_is_headroom_desktop_twin(pid: u32) -> bool {
+    let Some(me) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    #[cfg(windows)]
+    let theirs = {
+        let Ok(output) = crate::proc::command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Path"),
+            ])
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    #[cfg(not(windows))]
+    let theirs = {
+        let Ok(output) = crate::proc::command("/bin/ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    exe_identity_matches(&theirs, &me)
+}
+
+/// True when `listener_exe` -- a bare exe path (Windows `Get-Process .Path`)
+/// or an argv line (unix `ps -o command=`) -- names exactly `my_exe`.
+/// Case-insensitive (Windows and default macOS filesystems are), and the
+/// match must end at a boundary so `...\Headroom-old.exe` cannot pass for
+/// `...\Headroom.exe`.
+fn exe_identity_matches(listener_exe: &str, my_exe: &str) -> bool {
+    let theirs = listener_exe.trim().to_lowercase();
+    let mine = my_exe.trim().to_lowercase();
+    if mine.is_empty() || !theirs.starts_with(&mine) {
+        return false;
+    }
+    match theirs[mine.len()..].chars().next() {
+        None => true,        // exact path match
+        Some(c) => c == ' ', // argv: path followed by arguments
+    }
+}
+
 /// Bail message when 6768 is foreign-held AND every port in the fallback
 /// range is also taken. Must contain `"is occupied by a non-headroom process"`
 /// so `port_conflict::is_port_conflict` continues to match, and the
@@ -8997,8 +9113,12 @@ fn verbosity_baseline_present() -> bool {
 /// — it is exactly the path headroom's plugin resolves to, so `--project <cwd>`
 /// matches. Returns `None` when no non-empty transcript exists.
 fn busiest_claude_project_cwd() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let projects_dir = PathBuf::from(home).join(".claude").join("projects");
+    // client_adapters::home_dir, not a bare $HOME: a Windows GUI process has
+    // no HOME env var, and bailing here silently skipped verbosity-baseline
+    // seeding on every Windows install (output savings stayed $0 forever).
+    let projects_dir = crate::client_adapters::home_dir()
+        .join(".claude")
+        .join("projects");
 
     let mut best: Option<(u64, PathBuf)> = None;
     for entry in std::fs::read_dir(&projects_dir).ok()?.flatten() {
@@ -9278,6 +9398,15 @@ pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
         // cause: the App Control machine on retry -- python.exe was allowed
         // through, but _ssl's DLLs were still blocked).
         "ssl-missing"
+    } else if lower.contains("no pyvenv.cfg") {
+        // The venv launcher stub found no pyvenv.cfg next to it (exit 106):
+        // the venv was damaged in place (AV quarantine, disk cleanup) while
+        // the READY flag survived, so pip dies before it ever runs. A broken
+        // install of OURS, not a user-machine problem -- and the
+        // `python_runtime_installed` gate now checks pyvenv.cfg, so the next
+        // launch routes to bootstrap self-repair (RUST-6S third shape, 0.9.1;
+        // same blind-spot family as RUST-8E's missing base interpreter).
+        "venv-broken"
     } else if lower.contains("no usable temporary directory") {
         "no-tempdir"
     } else if crate::is_disk_full_signal(&lower) {
@@ -11494,6 +11623,31 @@ asyncio.run(verify())
     /// that never matches, so the identity check could never pass and every
     /// reclaim stayed dead.
     #[test]
+    fn exe_identity_matches_twin_paths_and_argv_only() {
+        // RUST-7M reclaim gate: a stranded old instance is the same binary.
+        let me = "/Applications/Headroom.app/Contents/MacOS/headroom-desktop";
+        // Bare path (Windows Get-Process .Path), case-insensitive.
+        assert!(super::exe_identity_matches(me, me));
+        assert!(super::exe_identity_matches(&me.to_uppercase(), me));
+        // Argv line (unix ps): path plus arguments.
+        assert!(super::exe_identity_matches(
+            "/Applications/Headroom.app/Contents/MacOS/headroom-desktop --flag",
+            me
+        ));
+        // Prefix collisions and strangers must NOT pass.
+        assert!(!super::exe_identity_matches(
+            "/Applications/Headroom.app/Contents/MacOS/headroom-desktop-old",
+            me
+        ));
+        assert!(!super::exe_identity_matches(
+            "/usr/bin/python3 serve.py",
+            me
+        ));
+        assert!(!super::exe_identity_matches("", me));
+        assert!(!super::exe_identity_matches(me, ""));
+    }
+
+    #[test]
     fn exe_path_is_under_accepts_both_windows_python_layouts() {
         let runtime = PathBuf::from(r"C:\Users\garm\AppData\Local\Headroom\headroom\runtime");
         assert!(exe_path_is_under(
@@ -12342,9 +12496,18 @@ after
         let base = runtime.standalone_python();
         fs::create_dir_all(base.parent().expect("parent")).expect("mkdir");
         fs::write(&base, b"").expect("base");
+
+        // RUST-6S third shape: same blind spot one file over. A venv whose
+        // pyvenv.cfg was deleted in place keeps all three markers, but every
+        // spawn dies with exit 106 / `No pyvenv.cfg file`.
+        assert!(
+            !manager.python_runtime_installed(),
+            "a venv missing pyvenv.cfg must not read as installed"
+        );
+        fs::write(runtime.venv_dir.join("pyvenv.cfg"), b"").expect("pyvenv.cfg");
         assert!(
             manager.python_runtime_installed(),
-            "all three markers present must read as installed"
+            "all four markers present must read as installed"
         );
     }
 
@@ -14267,6 +14430,9 @@ exit 0
                 "network",
             ),
             ("exit=1; stderr tail: something new", "other"),
+            // RUST-6S third shape: venv damaged in place, launcher stub can't
+            // resolve the interpreter, pip never runs.
+            ("exit=106; stderr tail: No pyvenv.cfg file", "venv-broken"),
             // RUST-8K, verbatim: Windows access-denied on a Korean install.
             // Only the numeric code survives translation.
             (

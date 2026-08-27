@@ -753,8 +753,10 @@ enum RemoteAccountSyncError {
     Unauthorized,
     /// Anything that is not a 401, carrying what actually failed. RUST-8Z
     /// fired with a bare "Other" after 59 silent hours, which could not tell
-    /// an HTTP 5xx from a transport error from a decode failure.
-    Other(String),
+    /// an HTTP 5xx from a transport error from a decode failure. The payload
+    /// is read only via the derived Debug in the sync-failure log, which
+    /// dead-code analysis deliberately ignores.
+    Other(#[allow(dead_code)] String),
 }
 
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {

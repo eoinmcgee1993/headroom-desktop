@@ -1266,6 +1266,7 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     (removed, oss_hooks_pending)
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))] // Windows uninstall uses perform_full_cleanup()
 pub fn revert_external_mutations() -> Vec<String> {
     revert_external_mutations_with_status().0
 }
@@ -2112,7 +2113,9 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
 /// Retries `op` while it fails `PermissionDenied`, sleeping 50/100/200ms
 /// between attempts (4 tries total). Any other error, or the final denial,
 /// is returned as-is.
-fn retry_transient_denied<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+pub(crate) fn retry_transient_denied<T>(
+    mut op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     let mut delay = std::time::Duration::from_millis(50);
     for _ in 0..3 {
         match op() {
@@ -5073,6 +5076,8 @@ fn write_file_if_changed(
     content: &str,
     executable: bool,
 ) -> Result<(bool, Option<PathBuf>)> {
+    #[cfg(not(unix))]
+    let _ = executable; // only used for chmod on unix
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;

@@ -7950,7 +7950,7 @@ export default function App() {
                     {(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0) > 0 ? (
                       <>
                         <div className="savings-breakdown__row">
-                          <span>Tool schemas deferred (Headroom)</span>
+                          <span>Additional costs saved (tool schemas deferred)</span>
                           <strong>{currencyExact(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
                         </div>
                         {/* Priced at the cache-read rate, not the input rate --
@@ -7959,7 +7959,8 @@ export default function App() {
                           {compactNumber(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0)} tokens
                           of tool definitions Headroom kept out of your requests until they were
                           needed. These sit at the front of the cached prefix, so they are priced at
-                          the provider's cache-read rate rather than the full input rate.
+                          the provider's cache-read rate rather than the full input rate. Counted in
+                          addition to the Total costs saved figure, not inside it.
                         </p>
                       </>
                     ) : null}

@@ -71,12 +71,6 @@ impl Accum {
         let n = self.n as f64;
         ((self.sumsq - self.sum * self.sum / n) / (n - 1.0)).max(0.0)
     }
-
-    fn merge(&mut self, other: &Accum) {
-        self.n += other.n;
-        self.sum += other.sum;
-        self.sumsq += other.sumsq;
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -2409,14 +2409,16 @@ impl AppState {
                 (history.daily_savings(), history.hourly_savings())
             } else {
                 (
-                    drop_rollup_backfill(
+                    settle_rollup_backfill(
                         history.daily_savings(),
                         daily_savings.iter().map(|p| p.date.as_str()).min(),
+                        history.ring_start.as_ref(),
                         |p| p.date.as_str(),
                     ),
-                    drop_rollup_backfill(
+                    settle_rollup_backfill(
                         history.hourly_savings(),
                         hourly_savings.iter().map(|p| p.hour.as_str()).min(),
+                        history.ring_start.as_ref(),
                         |p| p.hour.as_str(),
                     ),
                 )
@@ -2526,9 +2528,12 @@ impl AppState {
         );
         let lifetime_tool_schema_savings_usd =
             tool_schema_savings_usd(&daily_savings, lifetime_tool_schema_tokens_saved);
-        let lifetime_estimated_savings_usd = lifetime_compression_savings_usd
-            + lifetime_output_savings_usd
-            + lifetime_tool_schema_savings_usd;
+        // The tool-schema layer is deliberately NOT in the headline card: it
+        // has no time dimension (lifetime counter, no backfill), so including
+        // it made "Total costs saved" exceed anything the history chart can
+        // show. It renders in the drill-down as "Additional costs saved".
+        let lifetime_estimated_savings_usd =
+            lifetime_compression_savings_usd + lifetime_output_savings_usd;
         warn_once_if_savings_rate_implausible(&daily_savings);
         // Tokens stay input-only: the card is labelled "Total input tokens
         // saved", and this total also drives the milestone notifications, which
@@ -5631,6 +5636,13 @@ struct HeadroomSavingsHistoryResponse {
     /// leave the series alone: applying both drops eats a real day, and with
     /// only two buckets in the window it emptied the series outright.
     backfill_bucket_dropped: bool,
+    /// Cumulative counter totals at the oldest raw `history` checkpoint.
+    /// The rollup's leading bucket diffs that checkpoint against a zero
+    /// baseline, so these totals are exactly the pre-ring history folded into
+    /// that bucket: ~zero for a data dir created at the series start (a
+    /// genuine first day), large when counters survived a reset or trim.
+    /// None when the payload carries no raw history.
+    ring_start: Option<RingStartTotals>,
 }
 
 impl HeadroomSavingsHistoryResponse {
@@ -6191,6 +6203,61 @@ fn drop_oldest_rollup_bucket(series: &mut Vec<HeadroomSavingsRollupPoint>) {
     }
 }
 
+/// Cumulative counter totals at the raw ring's oldest checkpoint. See the
+/// field doc on `HeadroomSavingsHistoryResponse::ring_start`.
+#[derive(Debug, Default, Clone, Copy)]
+struct RingStartTotals {
+    tokens_saved: u64,
+    compression_savings_usd: f64,
+    total_input_tokens: u64,
+    total_input_cost_usd: f64,
+    output_tokens_saved: u64,
+    output_savings_usd: f64,
+}
+
+fn ring_start_totals(root: &Value) -> Option<RingStartTotals> {
+    let Some(Value::Array(items)) = value_at_path(root, &["history"]) else {
+        return None;
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let map = item.as_object()?;
+            let timestamp = map
+                .get("timestamp")
+                .and_then(|value| value.as_str())
+                .and_then(parse_history_timestamp)?;
+            Some((timestamp, map))
+        })
+        .min_by_key(|(timestamp, _)| *timestamp)
+        .map(|(_, map)| RingStartTotals {
+            tokens_saved: map
+                .get("total_tokens_saved")
+                .and_then(parse_u64_value)
+                .unwrap_or(0),
+            compression_savings_usd: map
+                .get("compression_savings_usd")
+                .and_then(parse_f64_value)
+                .unwrap_or(0.0),
+            total_input_tokens: map
+                .get("total_input_tokens")
+                .and_then(parse_u64_value)
+                .unwrap_or(0),
+            total_input_cost_usd: map
+                .get("total_input_cost_usd")
+                .and_then(parse_f64_value)
+                .unwrap_or(0.0),
+            output_tokens_saved: map
+                .get("output_tokens_saved")
+                .and_then(parse_u64_value)
+                .unwrap_or(0),
+            output_savings_usd: map
+                .get("output_savings_usd")
+                .and_then(parse_f64_value)
+                .unwrap_or(0.0),
+        })
+}
+
 fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsHistoryResponse> {
     let root = serde_json::from_str::<Value>(body).ok()?;
     let mut hourly = value_at_path(&root, &["series", "hourly"])
@@ -6239,6 +6306,7 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
             daily,
             lifetime,
             backfill_bucket_dropped,
+            ring_start: ring_start_totals(&root),
         })
     }
 }
@@ -7432,6 +7500,90 @@ fn drop_rollup_backfill<T>(
     native.into_iter().filter(|p| key(p) != first).collect()
 }
 
+/// A rollup bucket whose leading against-zero delta can be settled exactly by
+/// subtracting the ring's starting totals (see `settle_rollup_backfill`).
+trait BackfillSettle {
+    fn subtract_ring_start(&mut self, start: &RingStartTotals);
+    fn is_empty_after_settle(&self) -> bool;
+}
+
+impl BackfillSettle for DailySavingsPoint {
+    fn subtract_ring_start(&mut self, start: &RingStartTotals) {
+        self.estimated_tokens_saved = self
+            .estimated_tokens_saved
+            .saturating_sub(start.tokens_saved);
+        self.estimated_savings_usd =
+            (self.estimated_savings_usd - start.compression_savings_usd).max(0.0);
+        self.total_tokens_sent = self
+            .total_tokens_sent
+            .saturating_sub(start.total_input_tokens);
+        self.actual_cost_usd = (self.actual_cost_usd - start.total_input_cost_usd).max(0.0);
+        self.output_tokens_saved = self
+            .output_tokens_saved
+            .saturating_sub(start.output_tokens_saved);
+        self.output_savings_usd = (self.output_savings_usd - start.output_savings_usd).max(0.0);
+    }
+    fn is_empty_after_settle(&self) -> bool {
+        self.estimated_tokens_saved == 0 && self.total_tokens_sent == 0
+    }
+}
+
+impl BackfillSettle for HourlySavingsPoint {
+    fn subtract_ring_start(&mut self, start: &RingStartTotals) {
+        self.estimated_tokens_saved = self
+            .estimated_tokens_saved
+            .saturating_sub(start.tokens_saved);
+        self.estimated_savings_usd =
+            (self.estimated_savings_usd - start.compression_savings_usd).max(0.0);
+        self.total_tokens_sent = self
+            .total_tokens_sent
+            .saturating_sub(start.total_input_tokens);
+        self.actual_cost_usd = (self.actual_cost_usd - start.total_input_cost_usd).max(0.0);
+        self.output_tokens_saved = self
+            .output_tokens_saved
+            .saturating_sub(start.output_tokens_saved);
+        self.output_savings_usd = (self.output_savings_usd - start.output_savings_usd).max(0.0);
+    }
+    fn is_empty_after_settle(&self) -> bool {
+        self.estimated_tokens_saved == 0 && self.total_tokens_sent == 0
+    }
+}
+
+/// Like `drop_rollup_backfill`, but exact when the payload's raw ring is
+/// available: the leading bucket's spurious content is precisely the ring's
+/// starting cumulative totals, so subtract those and keep whatever real
+/// traffic remains. Whole-bucket dropping stays as the fallback without a
+/// ring, and for a bucket the subtraction empties. Dropping unconditionally
+/// cost a full real day when the backend data dir was fresh (ring start
+/// ~zero): the tracker predating the ring made today look like backfill, and
+/// the lifetime card fell back to the tracker's partial observation
+/// (2026-08-27: $0.50 shown against a $1.24 day).
+fn settle_rollup_backfill<T: BackfillSettle>(
+    native: Vec<T>,
+    earliest_local: Option<&str>,
+    ring_start: Option<&RingStartTotals>,
+    key: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    let Some(ring_start) = ring_start else {
+        return drop_rollup_backfill(native, earliest_local, key);
+    };
+    let Some(earliest_local) = earliest_local else {
+        return native;
+    };
+    let Some(first) = native.iter().map(|p| key(p).to_string()).min() else {
+        return native;
+    };
+    if earliest_local >= first.as_str() {
+        return native;
+    }
+    let mut native = native;
+    if let Some(point) = native.iter_mut().find(|p| key(p) == first) {
+        point.subtract_ring_start(ring_start);
+    }
+    native.retain(|p| key(p) != first.as_str() || !p.is_empty_after_settle());
+    native
+}
+
 /// What a cached prefix token costs relative to a fresh input token.
 ///
 /// Anthropic bills a cache read at 10% of the input rate; OpenAI's discount is
@@ -7778,12 +7930,12 @@ mod tests {
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
         parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
-        rebuild_persisted_savings_from_records, savings_rate_implausible,
+        rebuild_persisted_savings_from_records, savings_rate_implausible, settle_rollup_backfill,
         stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
         tool_schema_savings_usd, total_dir_size_bytes, warn_stats_fetch_failed, AppState,
         BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
         HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
-        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
+        PersistedSavingsState, RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
         OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
         STATS_FETCH_WARN_MAX_INTERVAL,
     };
@@ -7817,6 +7969,146 @@ mod tests {
         // Tracker starts with the series: nothing predates it, nothing to drop.
         let kept = drop_rollup_backfill(native, Some("2026-08-02"), |p| p.date.as_str());
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn settle_rollup_backfill_keeps_a_real_day_minus_the_ring_start() {
+        // Fresh backend data dir: the ring's first checkpoint is near zero, so
+        // the leading bucket is a genuine day, not backfill. Dropping it showed
+        // a $0.50 lifetime against a $0.91 "saved today" on 2026-08-27.
+        let native = vec![daily("2026-08-27", 480_748, 1.244165)];
+        let ring_start = RingStartTotals {
+            tokens_saved: 1_917,
+            compression_savings_usd: 0.003834,
+            total_input_tokens: 48_545,
+            total_input_cost_usd: 0.11771,
+            output_tokens_saved: 0,
+            output_savings_usd: 0.0,
+        };
+        let settled = settle_rollup_backfill(native, Some("2026-08-20"), Some(&ring_start), |p| {
+            p.date.as_str()
+        });
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].estimated_tokens_saved, 478_831);
+        assert!((settled[0].estimated_savings_usd - 1.240331).abs() < 1e-9);
+
+        // A true backfill lump -- counters survived a trim or reset, so the
+        // whole bucket is pre-ring history -- still empties and drops.
+        let native = vec![
+            daily("2026-08-02", 900_000, 5134.28),
+            daily("2026-08-03", 500, 3.35),
+        ];
+        let lump = RingStartTotals {
+            tokens_saved: 900_000,
+            compression_savings_usd: 5134.28,
+            ..RingStartTotals::default()
+        };
+        let settled =
+            settle_rollup_backfill(native.clone(), Some("2026-07-15"), Some(&lump), |p| {
+                p.date.as_str()
+            });
+        assert_eq!(
+            settled.iter().map(|p| p.date.as_str()).collect::<Vec<_>>(),
+            vec!["2026-08-03"]
+        );
+
+        // No raw ring in the payload: fall back to the whole-bucket drop.
+        let settled = settle_rollup_backfill(native.clone(), Some("2026-07-15"), None, |p| {
+            p.date.as_str()
+        });
+        assert_eq!(settled.len(), 1);
+
+        // Tracker does not predate the ring: untouched either way.
+        let settled =
+            settle_rollup_backfill(native, Some("2026-08-02"), Some(&lump), |p| p.date.as_str());
+        assert_eq!(settled.len(), 2);
+    }
+
+    #[test]
+    fn parser_extracts_ring_start_from_the_oldest_raw_checkpoint() {
+        let body = r#"{
+            "lifetime": { "tokens_saved": 10, "compression_savings_usd": 0.1 },
+            "series": { "daily": [] },
+            "history": [
+                { "timestamp": "2026-08-27T11:00:00Z", "total_tokens_saved": 60,
+                  "compression_savings_usd": 0.6, "total_input_tokens": 600,
+                  "total_input_cost_usd": 0.06, "cache_read_tokens": 0 },
+                { "timestamp": "2026-08-27T10:00:00Z", "total_tokens_saved": 50,
+                  "compression_savings_usd": 0.5, "total_input_tokens": 500,
+                  "total_input_cost_usd": 0.05, "cache_read_tokens": 0 }
+            ]
+        }"#;
+        let parsed = parse_headroom_stats_history_from_json(body).expect("parsed");
+        let start = parsed.ring_start.expect("ring start");
+        assert_eq!(start.tokens_saved, 50);
+        assert!((start.compression_savings_usd - 0.5).abs() < 1e-9);
+        assert_eq!(start.total_input_tokens, 500);
+        assert_eq!(start.output_tokens_saved, 0);
+    }
+
+    #[test]
+    fn lifetime_card_never_reads_below_saved_today_on_a_fresh_ring() {
+        // Full display-pipeline regression for 2026-08-27: fresh backend data
+        // dir (ring starts near zero) + tracker history older than the ring.
+        // The daily settle used to drop the whole live day, so the lifetime
+        // card (daily sum) read $0.50 while "saved today" (hourly sum, which
+        // only lost one hour) read $0.91.
+        let ring_start = RingStartTotals {
+            tokens_saved: 1_917,
+            compression_savings_usd: 0.003834,
+            ..RingStartTotals::default()
+        };
+        // The backend's rollups for the live day.
+        let native_daily = vec![daily("2026-08-27", 480_748, 1.244165)];
+        let mut native_hourly = vec![
+            hourly("2026-08-27T10:00", 250_000),
+            hourly("2026-08-27T11:00", 180_000),
+            hourly("2026-08-27T12:00", 50_748),
+        ];
+        native_hourly[0].estimated_savings_usd = 0.53;
+        native_hourly[1].estimated_savings_usd = 0.60;
+        native_hourly[2].estimated_savings_usd = 0.114165;
+        // The local tracker predates the ring and only saw part of today.
+        let tracker_daily = vec![
+            daily("2026-08-20", 134_000, 0.30),
+            daily("2026-08-27", 200_000, 0.50),
+        ];
+        let tracker_hourly = vec![
+            hourly("2026-08-20T09:00", 134_000),
+            hourly("2026-08-27T11:00", 200_000),
+        ];
+
+        let settled_daily = settle_rollup_backfill(
+            native_daily,
+            tracker_daily.iter().map(|p| p.date.as_str()).min(),
+            Some(&ring_start),
+            |p| p.date.as_str(),
+        );
+        let settled_hourly = settle_rollup_backfill(
+            native_hourly,
+            tracker_hourly.iter().map(|p| p.hour.as_str()).min(),
+            Some(&ring_start),
+            |p| p.hour.as_str(),
+        );
+        let merged_daily = merge_daily_savings(tracker_daily, settled_daily, "2026-06-02");
+        let merged_hourly =
+            merge_hourly_savings(tracker_hourly, settled_hourly, "2026-06-02T00:00");
+
+        // The two figures the Home screen renders.
+        let lifetime: f64 = merged_daily.iter().map(|p| p.estimated_savings_usd).sum();
+        let today: f64 = merged_hourly
+            .iter()
+            .filter(|p| p.hour.starts_with("2026-08-27"))
+            .map(|p| p.estimated_savings_usd + p.output_savings_usd)
+            .sum();
+        assert!(
+            lifetime >= today,
+            "lifetime {lifetime} must cover saved-today {today}"
+        );
+        // Today survives at full ring value minus the ring start, on both
+        // series -- not the tracker's partial $0.50 observation.
+        assert!((today - 1.240331).abs() < 1e-9, "{today}");
+        assert!((lifetime - (0.30 + 1.240331)).abs() < 1e-9, "{lifetime}");
     }
 
     #[test]

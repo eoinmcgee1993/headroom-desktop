@@ -507,6 +507,11 @@ pub fn spawn(
                 // forever; report each distinct error to Sentry once.
                 let mut reported_errors: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
+                // One reclaim attempt per launch: past the grace, a
+                // held-but-not-serving port is most often a stranded prior
+                // Headroom desktop instance (updater relaunch), which nothing
+                // else ever clears -- see reclaim_stranded_intercept_holder.
+                let mut reclaim_attempted = false;
                 // A restart -- the updater relaunch, or the "Restart now"
                 // button -- starts the new process while the old one still
                 // holds the port, so the first bind after launch routinely
@@ -586,6 +591,23 @@ pub fn spawn(
                                 // asserted the holder was not ours and sent a
                                 // whole investigation down the wrong path.
                                 *bind_error.lock() = Some(e.to_string());
+                                // Identity-gated: only ever kills a process
+                                // running this exact executable, so a foreign
+                                // holder or reserved range is untouched and
+                                // falls through to the report below. Blocking
+                                // shell-outs are fine here: bind failed, so
+                                // nothing is being served on this runtime.
+                                if !reclaim_attempted {
+                                    reclaim_attempted = true;
+                                    if crate::tool_manager::reclaim_stranded_intercept_holder(
+                                        INTERCEPT_PORT,
+                                    ) {
+                                        log::info!(
+                                            "[proxy_intercept] reclaimed stranded instance on port {INTERCEPT_PORT}; retrying bind"
+                                        );
+                                        continue;
+                                    }
+                                }
                                 log::warn!(
                                     "[proxy_intercept] port {INTERCEPT_PORT} is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s ({e})"
                                 );
