@@ -5771,13 +5771,16 @@ fn execute_headroom_learn_run(
         // routing the call to a slow/hung path past 120s.
         .env_remove("ANTHROPIC_MODEL");
     if let Some(dir) = cli_path.as_ref().and_then(|p| p.parent()) {
-        let existing = std::env::var("PATH").unwrap_or_default();
-        let augmented = if existing.is_empty() {
-            dir.display().to_string()
-        } else {
-            format!("{}:{}", dir.display(), existing)
-        };
-        command.env("PATH", augmented);
+        // join_paths, not a hand-formatted string: the separator is ':' on
+        // Unix but ';' on Windows, and a hardcoded ':' fuses the CLI dir with
+        // the first existing entry into one garbage path on Windows.
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let augmented = std::env::join_paths(
+            std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&existing)),
+        );
+        if let Ok(augmented) = augmented {
+            command.env("PATH", augmented);
+        }
     }
     // Seed a step before the first line arrives: session scanning is silent, and
     // an empty line that pops in later would shift the row.
