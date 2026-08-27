@@ -1,42 +1,32 @@
-<!-- headroom:rtk-instructions -->
-# RTK (Rust Token Killer) - Token-Optimized Commands
+# AGENTS.md - headroom-desktop
 
-When running shell commands, **always prefix with `rtk`**. This reduces context
-usage by 60-90% with zero behavior change. If rtk has no filter for a command,
-it passes through unchanged — so it is always safe to use.
+Canonical agent guidance for this repo lives in [CLAUDE.md](CLAUDE.md) (same
+directory). Read it before changing code; it holds the project invariants
+(testing rules, persistence rules, wheel-bump rules, styling/token rules,
+formatting). This file only adds the quickstart every agent needs.
 
-## Key Commands
+## What this is
+
+Tauri desktop app (Rust backend in `src-tauri/src/`, React/TS frontend in
+`src/`) that routes Claude Code / Codex / OpenCode through a local
+token-optimization proxy. See README.md for architecture and the proxy
+topology (ports 6767/6768).
+
+## Commands
+
 ```bash
-# Git (59-80% savings)
-rtk git status          rtk git diff            rtk git log
-
-# Files & Search (60-75% savings)
-rtk ls <path>           rtk read <file>         rtk grep <pattern>
-rtk find <pattern>      rtk diff <file>
-
-# Test (90-99% savings) — shows failures only
-rtk pytest tests/       rtk cargo test          rtk test <cmd>
-
-# Build & Lint (80-90% savings) — shows errors only
-rtk tsc                 rtk lint                rtk cargo build
-rtk prettier --check    rtk mypy                rtk ruff check
-
-# Analysis (70-90% savings)
-rtk err <cmd>           rtk log <file>          rtk json <file>
-rtk summary <cmd>       rtk deps                rtk env
-
-# GitHub (26-87% savings)
-rtk gh pr view <n>      rtk gh run list         rtk gh issue list
-
-# Infrastructure (85% savings)
-rtk docker ps           rtk kubectl get         rtk docker logs <c>
-
-# Package managers (70-90% savings)
-rtk pip list            rtk pnpm install        rtk npm run <script>
+npm install && npm run tauri dev            # run the app
+cargo test --manifest-path src-tauri/Cargo.toml --lib <filter>   # Rust tests
+cargo check --manifest-path src-tauri/Cargo.toml                 # cross-module changes
+npx tsc --noEmit                            # frontend types
+npx vitest run                              # frontend tests
+./scripts/check-colors.sh                   # CSS token gate (CI-enforced)
+./scripts/check-no-console.sh               # console.log gate (CI-enforced)
 ```
 
-## Rules
-- In command chains, prefix each segment: `rtk git add . && rtk git commit -m "msg"`
-- For debugging, use raw command without rtk prefix
-- `rtk proxy <cmd>` runs command without filtering but tracks usage
-<!-- /headroom:rtk-instructions -->
+## Large files warning
+
+`tool_manager.rs` (~12k lines), `state.rs` (~9k), `lib.rs` (~7.3k),
+`client_adapters.rs` (~5k), and `src/App.tsx` (~7.7k) are too big to read
+whole. Locate symbols with `grep -n`, then read only the region you edit.
+

@@ -2725,7 +2725,7 @@ impl AppState {
             // ghost shares a basename with a real project — makes the Activity
             // tile look like it's nagging about the working copy.
             let project_path = match std::fs::canonicalize(&project_path) {
-                Ok(p) => p.to_string_lossy().into_owned(),
+                Ok(p) => strip_extended_length_prefix(p.to_string_lossy().into_owned()),
                 Err(_) => continue,
             };
             if project_path.trim().is_empty() {
@@ -3909,6 +3909,23 @@ fn list_session_jsonl_files(project_dir: &Path) -> Vec<PathBuf> {
             .ok()
     });
     files
+}
+
+/// On Windows, `std::fs::canonicalize` returns extended-length paths
+/// (`\\?\C:\...`). This string leaves the app as `headroom learn --project
+/// <path>`, where the pinned Python CLI matches it against transcript `cwd`
+/// values by literal `Path` equality -- the prefix made every match fail, so
+/// learn runs completed in half a second with "No project data found" and
+/// exit 0 (observed on the 0.9.1-rc.4 Windows smoke). Strip it back to the
+/// plain form; no-op on Unix, where the prefix never occurs.
+fn strip_extended_length_prefix(path: String) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path
+    }
 }
 
 fn canonical_session_file_path(path: &Path) -> PathBuf {
@@ -7421,10 +7438,14 @@ fn drop_rollup_backfill<T>(
 /// shallower, so 10% is the conservative choice across providers.
 const CACHE_READ_PRICE_RATIO: f64 = 0.10;
 
-/// The most any provider bills for a single input token, in USD per million.
-/// Claude Fable 5 tops the Anthropic table at $10/M; the headroom above it
-/// absorbs a pricier model shipping before this constant is revisited.
-const MAX_PLAUSIBLE_INPUT_USD_PER_M: f64 = 15.0;
+/// The most any provider plausibly bills for a single input token, in USD per
+/// million. Claude Fable 5 tops the Anthropic table at $10/M, but OpenAI's pro
+/// tiers go higher (o3-pro $20/M; o1-pro is $150/M but rare enough to accept a
+/// false fire on). $25 clears a blended o3-pro-heavy mix while staying under
+/// the ~$33/M signature the 0.36.0 tool-schema contamination produced -- the
+/// event this canary exists to catch. RUST-89's lone post-b86b91b event was an
+/// o3-pro-class mix reading $20.11/M on the pinned, uncontaminated wheel.
+const MAX_PLAUSIBLE_INPUT_USD_PER_M: f64 = 25.0;
 
 /// True when the buckets imply a savings $/token that no provider charges for
 /// an input token. A saved input token is worth exactly the rate it would have
@@ -7682,6 +7703,23 @@ fn bootstrap_failed_state(current: &BootstrapProgress, message: String) -> Boots
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn strip_extended_length_prefix_handles_windows_and_unix_forms() {
+        let f = super::strip_extended_length_prefix;
+        assert_eq!(
+            f(r"\\?\C:\Users\garm\code\headroom-desktop-main".into()),
+            r"C:\Users\garm\code\headroom-desktop-main"
+        );
+        assert_eq!(
+            f(r"\\?\UNC\server\share\proj".into()),
+            r"\\server\share\proj"
+        );
+        assert_eq!(
+            f("/Users/garm/code/headroom-desktop".into()),
+            "/Users/garm/code/headroom-desktop"
+        );
+    }
 
     #[test]
     fn status_dll_init_failed_matches_the_exit_code_sentry_reports() {

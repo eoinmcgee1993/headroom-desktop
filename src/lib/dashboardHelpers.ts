@@ -45,6 +45,8 @@ export function currencyExact(value: number) {
 export function currency(value: number) {
   // Avoid "-$0" from tiny negatives that round to zero at 0 decimals.
   if (value > -0.5 && value <= 0) value = 0;
+  // Sub-dollar savings would render as a flat "$0"; show cents instead.
+  if (value > 0 && value < 1) return currencyExact(value);
   if (value >= 10_000) {
     return new Intl.NumberFormat("en-US", {
       style: "currency",

@@ -2094,7 +2094,12 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp_path);
         anyhow!("writing {}: {err}", tmp_path.display())
     })?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
+    // Windows: AV scanners / the search indexer briefly hold the destination
+    // (or the just-written tmp) open, so the rename fails ERROR_ACCESS_DENIED
+    // (os error 5) even though nothing is wrong with the state (RUST-9M,
+    // pricing-state on 0.8.9). Transient by nature -- retry briefly before
+    // reporting.
+    retry_transient_denied(|| std::fs::rename(&tmp_path, path)).map_err(|err| {
         let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
         anyhow!(
             "renaming {} -> {}: {err}",
@@ -2102,6 +2107,23 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
             path.display()
         )
     })
+}
+
+/// Retries `op` while it fails `PermissionDenied`, sleeping 50/100/200ms
+/// between attempts (4 tries total). Any other error, or the final denial,
+/// is returned as-is.
+fn retry_transient_denied<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut delay = std::time::Duration::from_millis(50);
+    for _ in 0..3 {
+        match op() {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            other => return other,
+        }
+    }
+    op()
 }
 
 /// Move an unparsable state file aside instead of letting the next write
@@ -10334,6 +10356,45 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // Round-trip survives.
         let reloaded = super::load_setup_state();
         assert!(reloaded.configured_clients.contains_key("claude_code"));
+    }
+
+    #[test]
+    fn retry_transient_denied_retries_then_succeeds() {
+        // RUST-9M: a rename denied by a transient AV/indexer hold must be
+        // retried, not reported. Two denials then success => Ok.
+        let mut calls = 0;
+        let out = super::retry_transient_denied(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(out.unwrap(), 3);
+    }
+
+    #[test]
+    fn retry_transient_denied_gives_up_and_passes_other_errors_through() {
+        // Persistent denial: 4 attempts total, then the error surfaces.
+        let mut calls = 0;
+        let out = super::retry_transient_denied(|| -> std::io::Result<()> {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(
+            out.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(calls, 4);
+        // A non-denied error is never retried.
+        let mut calls = 0;
+        let out = super::retry_transient_denied(|| -> std::io::Result<()> {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(calls, 1);
     }
 
     #[test]

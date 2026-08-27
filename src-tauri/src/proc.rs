@@ -12,7 +12,8 @@
 //! `scripts/check-no-console.sh` fails the build if a bare `Command::new`
 //! reappears.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::process::Command;
 
 /// <https://learn.microsoft.com/windows/win32/procthread/process-creation-flags>
@@ -42,8 +43,31 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// Current PATH with `dir` prepended, joined with the platform separator
+/// (':' on Unix, ';' on Windows). Hand-formatted `"{dir}:{existing}"` strings
+/// were a recurring Windows bug: the colon fuses the new dir and the first
+/// existing entry into one garbage path. On the (pathological) case where a
+/// PATH entry contains the separator, returns the existing PATH unchanged
+/// rather than corrupting it.
+pub fn path_with_dir_prepended(dir: &Path) -> OsString {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&existing)))
+        .unwrap_or(existing)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn path_with_dir_prepended_puts_dir_first_with_platform_separator() {
+        let dir = std::env::temp_dir();
+        let path = super::path_with_dir_prepended(&dir);
+        let entries: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(entries.first(), Some(&dir));
+        let existing: Vec<_> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+        assert_eq!(entries.len(), existing.len() + 1);
+    }
+
     #[test]
     fn command_still_runs_and_captures_output() {
         // The flag must not disturb stdio or exit codes on any platform.

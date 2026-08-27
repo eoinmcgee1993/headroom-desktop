@@ -3838,11 +3838,14 @@ fn parse_live_learnings(
 
 /// True if any absolute path in `content` or `entity_refs` is under `project_path`.
 fn pattern_matches_project(content: &str, entity_refs: &[String], project_path: &str) -> bool {
-    let root = project_path.trim_end_matches('/');
+    let root = project_path.trim_end_matches(['/', '\\']);
     if root.is_empty() {
         return false;
     }
-    let needle_slash = format!("{root}/");
+    // Windows project paths use '\'; build the child-path needle with the
+    // separator the path itself uses.
+    let sep = if root.contains('\\') { '\\' } else { '/' };
+    let needle_slash = format!("{root}{sep}");
     if content.contains(root) {
         // Guard against /x/ab matching /x/a — require either exact or followed by /
         if content.contains(&needle_slash)
@@ -5771,13 +5774,7 @@ fn execute_headroom_learn_run(
         // routing the call to a slow/hung path past 120s.
         .env_remove("ANTHROPIC_MODEL");
     if let Some(dir) = cli_path.as_ref().and_then(|p| p.parent()) {
-        let existing = std::env::var("PATH").unwrap_or_default();
-        let augmented = if existing.is_empty() {
-            dir.display().to_string()
-        } else {
-            format!("{}:{}", dir.display(), existing)
-        };
-        command.env("PATH", augmented);
+        command.env("PATH", crate::proc::path_with_dir_prepended(dir));
     }
     // Seed a step before the first line arrives: session scanning is silent, and
     // an empty line that pops in later would shift the row.
