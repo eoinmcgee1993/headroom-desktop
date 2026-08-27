@@ -10,7 +10,7 @@ After installing a new beta (`-rc.N`) build, paste this file into Claude Code an
 
 ## Checks (Claude Code pass)
 
-Run these from a Claude Code session and report PASS / FAIL with the observed value. Check 14 has a step that must run **before** you install the rc - read it first. Checks 1, 5, 8, 9, 10, 11, 12, 14, and 15 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `~/.claude/settings.json`, pay-per-token), so its equivalents of checks 6 and 7 live in the **Codex pass** below; run that whole section from a Codex session.
+Run these from a Claude Code session and report PASS / FAIL with the observed value. Check 14 has a step that must run **before** you install the rc - read it first. Checks 1, 5, 8, 9, 10, 11, 12, 14, 15, and 16 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `~/.claude/settings.json`, pay-per-token), so its equivalents of checks 6 and 7 live in the **Codex pass** below; run that whole section from a Codex session.
 
 ### 1. Version matches the new beta
 ```bash
@@ -269,6 +269,21 @@ Expect: every pair is `0/0` or `1/1` - never `2/2` (duplicated block) and never 
 A `2/2` is the duplicate-block bug: `strip_marker_block` loops for exactly this reason, and `upsert_managed_block` treats reordered `end`-before-`start` markers as absent and appends fresh rather than rebuilding around them. Both behaviours have unit tests (`managed_block_upsert_replaces_existing_block_without_duplication`, `managed_block_upsert_treats_reordered_markers_as_absent`, `updating_one_managed_block_does_not_touch_other_blocks_or_user_content`), so a failure here means a new writer, not a regression in those.
 
 Note what this check does **not** cover: the CLAUDE.md damage users reported in 0.34.0 was never on disk. Upstream's user-turn compression split the file's content mid-tag as it was sent to the model, so the file was fine and the model saw mangled instructions. That class is invisible to any filesystem check - it is caught by check 11 (mutations reaching the wire) and by reading a `/v1/messages` request body, not here. Fixed upstream in #2887, shipped in 0.35.0.
+
+### 16. Lifetime card covers "saved today" (rollup backfill regression)
+
+The two Home figures come from different bucket series: "Total costs saved" sums UTC-day buckets, the chart's "saved today" sums local-hour buckets. On 2026-08-27 a fresh backend data dir under an older local tracker made `drop_rollup_backfill` discard the ring's entire live-day daily bucket, so the lifetime card read $0.50 against a $0.91 "saved today" (the real day was $1.24). Fixed in 0.9.2-rc.3 by `settle_rollup_backfill` (subtract the ring's first-checkpoint cumulative instead of dropping the bucket); unit coverage is `settle_rollup_backfill_keeps_a_real_day_minus_the_ring_start` and `lifetime_card_never_reads_below_saved_today_on_a_fresh_ring`.
+
+With the dashboard open and the backend up for at least a minute (history fetched, tray tick fired):
+
+1. Visual: Home -> "Total costs saved" must be >= the chart's "saved today" figure (day view, today). Strictly less is a FAIL - lifetime is a superset of today.
+2. Cross-check today's magnitude against the backend's own ring:
+```bash
+curl -s 127.0.0.1:6767/stats-history | jq -r --arg d "$(date -u +%Y-%m-%d)"   '[.series.daily[] | select(.timestamp | startswith($d)) | .compression_savings_usd_delta] | add // 0'
+```
+Expect: the chart's "saved today" is in the same ballpark as this number plus any output-shaping dollars (it may run slightly lower - the ring-start remainder and the live tray cadence - but must not be a small fraction of it, and the lifetime card must not sit below either).
+
+This regression only reproduces when the local tracker's history predates the backend ring (reset/recreated backend data dir). A truly fresh install cannot show it; if this machine's install is fresh, report the visual invariant only and note the scenario did not apply.
 
 ## Codex checks (Codex pass)
 

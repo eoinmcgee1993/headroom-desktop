@@ -13,7 +13,7 @@ Run the commands from Git Bash unless a section says PowerShell. Paths below use
 
 ## Checks (Claude Code pass)
 
-Run these from a Claude Code session and report PASS / FAIL with the observed value. Checks 1, 5, 7, 8, 9, and 10 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `%USERPROFILE%\.claude\settings.json`, pay-per-token), so its equivalents live in the **Codex pass** below; run that whole section from a Codex session.
+Run these from a Claude Code session and report PASS / FAIL with the observed value. Checks 1, 5, 7, 8, 9, 10, and 12 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `%USERPROFILE%\.claude\settings.json`, pay-per-token), so its equivalents live in the **Codex pass** below; run that whole section from a Codex session.
 
 ### 1. Version matches the new build (PowerShell)
 The uninstall registry key carries no `DisplayVersion` value (only MainBinaryName / DisplayName / InstallLocation / UninstallString), so grepping the registry for a version returns nothing even on a healthy install. Read the binary's version resource instead:
@@ -116,6 +116,17 @@ grep -c 'headroom-rtk-rewrite' "$USERPROFILE/.claude/settings.json"
 grep -c 'markitdown' "$USERPROFILE/.claude/settings.json"
 ```
 Expect: non-zero only when the RTK / markitdown addons are installed; `0` on a fresh install is the correct state, not a failure. When markitdown is installed, a prompt that Reads an Office file should route through the shim and report compressed input.
+
+### 12. Lifetime card covers "saved today" (rollup backfill regression)
+
+Same check as beta check 16 - this class was found on a Windows install (2026-08-27: fresh `%USERPROFILE%\.headroom` under an older tracker showed a $0.50 lifetime against a $0.91 "saved today"), but it is platform-agnostic desktop logic. With the dashboard open and the backend up for a minute:
+
+1. Visual: Home -> "Total costs saved" must be >= the chart's "saved today". Strictly less is a FAIL.
+2. Cross-check against the backend's ring (Git Bash):
+```bash
+curl -s 127.0.0.1:6767/stats-history | jq -r --arg d "$(date -u +%Y-%m-%d)"   '[.series.daily[] | select(.timestamp | startswith($d)) | .compression_savings_usd_delta] | add // 0'
+```
+Expect: "saved today" in the same ballpark as this number (plus output dollars, if any); the lifetime card at or above both. Only reproduces when the tracker predates the ring (reset/recreated `.headroom`); on a truly fresh install report the visual invariant only.
 
 ## Codex checks (Codex pass)
 

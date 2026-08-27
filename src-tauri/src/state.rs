@@ -8044,6 +8044,71 @@ mod tests {
     }
 
     #[test]
+    fn lifetime_card_never_reads_below_saved_today_on_a_fresh_ring() {
+        // Full display-pipeline regression for 2026-08-27: fresh backend data
+        // dir (ring starts near zero) + tracker history older than the ring.
+        // The daily settle used to drop the whole live day, so the lifetime
+        // card (daily sum) read $0.50 while "saved today" (hourly sum, which
+        // only lost one hour) read $0.91.
+        let ring_start = RingStartTotals {
+            tokens_saved: 1_917,
+            compression_savings_usd: 0.003834,
+            ..RingStartTotals::default()
+        };
+        // The backend's rollups for the live day.
+        let native_daily = vec![daily("2026-08-27", 480_748, 1.244165)];
+        let mut native_hourly = vec![
+            hourly("2026-08-27T10:00", 250_000),
+            hourly("2026-08-27T11:00", 180_000),
+            hourly("2026-08-27T12:00", 50_748),
+        ];
+        native_hourly[0].estimated_savings_usd = 0.53;
+        native_hourly[1].estimated_savings_usd = 0.60;
+        native_hourly[2].estimated_savings_usd = 0.114165;
+        // The local tracker predates the ring and only saw part of today.
+        let tracker_daily = vec![
+            daily("2026-08-20", 134_000, 0.30),
+            daily("2026-08-27", 200_000, 0.50),
+        ];
+        let tracker_hourly = vec![
+            hourly("2026-08-20T09:00", 134_000),
+            hourly("2026-08-27T11:00", 200_000),
+        ];
+
+        let settled_daily = settle_rollup_backfill(
+            native_daily,
+            tracker_daily.iter().map(|p| p.date.as_str()).min(),
+            Some(&ring_start),
+            |p| p.date.as_str(),
+        );
+        let settled_hourly = settle_rollup_backfill(
+            native_hourly,
+            tracker_hourly.iter().map(|p| p.hour.as_str()).min(),
+            Some(&ring_start),
+            |p| p.hour.as_str(),
+        );
+        let merged_daily = merge_daily_savings(tracker_daily, settled_daily, "2026-06-02");
+        let merged_hourly =
+            merge_hourly_savings(tracker_hourly, settled_hourly, "2026-06-02T00:00");
+
+        // The two figures the Home screen renders.
+        let lifetime: f64 = merged_daily.iter().map(|p| p.estimated_savings_usd).sum();
+        let today: f64 = merged_hourly
+            .iter()
+            .filter(|p| p.hour.starts_with("2026-08-27"))
+            .map(|p| p.estimated_savings_usd + p.output_savings_usd)
+            .sum();
+        assert!(
+            lifetime >= today,
+            "lifetime {lifetime} must cover saved-today {today}"
+        );
+        // Today survives at full ring value minus the ring start, on both
+        // series -- not the tracker's partial $0.50 observation.
+        assert!((today - 1.240331).abs() < 1e-9, "{today}");
+        assert!((lifetime - (0.30 + 1.240331)).abs() < 1e-9, "{lifetime}");
+    }
+
+    #[test]
     fn lifetime_output_savings_prices_the_estimators_full_history() {
         // Buckets: 2 days, 100k tokens for $2.50 -> $25/M blended.
         let mut buckets = vec![daily("2026-08-04", 0, 0.0), daily("2026-08-05", 0, 0.0)];
