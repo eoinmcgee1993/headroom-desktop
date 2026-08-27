@@ -1666,16 +1666,36 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     if (500..600).contains(&status) {
         return;
     }
+    // A geo-block is a property of where the user is, not of anything we sent:
+    // OpenAI refuses the request before it is ever evaluated, and no release we
+    // ship can change the outcome. Same reasoning that already excludes 401 and
+    // 429 above, applied one level deeper because the status alone does not say
+    // it -- a 403 can also be an org-verification challenge, which IS
+    // actionable, so the body's `code` is what splits them. RUST-4H collected
+    // 139 of these from hosts in unsupported regions. The raw body still
+    // reaches the local log::warn! above.
+    if is_geo_blocked_codex_error(&body) {
+        return;
+    }
     // Group by status so each upstream failure class is its own Sentry issue.
     // Without an explicit fingerprint, Sentry parameterizes the message
     // ("codex upstream error {status} on {path}") and collapses 401 noise, 403
     // challenges and real 502/503 connection errors into one un-triageable
     // bucket that regresses the moment any sibling status reappears (RUST-46).
     let status_str = status.to_string();
+    // Tags, not extras: an extra can only be read one event at a time, so the
+    // shape RUST-4V's 578 events shared was never visible from the issue view.
+    // Both values are bounded and content-free, so they stay aggregatable.
+    let shape = codex_error_shape_tag(&body);
+    let content_type = response_content_type(head);
     sentry::with_scope(
         |scope| {
             scope.set_tag("codex_upstream_status", status);
             scope.set_tag("codex_request_path", &path);
+            scope.set_tag("codex_error_shape", &shape);
+            if let Some(content_type) = content_type.as_deref() {
+                scope.set_tag("codex_response_content_type", content_type);
+            }
             scope.set_extra("error_body", snippet.clone().into());
             scope.set_fingerprint(Some(&["codex-upstream-error", status_str.as_str()]));
         },
@@ -1688,6 +1708,25 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     );
 }
 
+/// True when an upstream error body carries OpenAI's unsupported-region code.
+/// Only the structural `code` field is read; no free text is inspected or kept.
+fn is_geo_blocked_codex_error(body: &[u8]) -> bool {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let err = json.get("error").unwrap_or(&json);
+    err.get("code").and_then(|v| v.as_str()) == Some("unsupported_country_region_territory")
+}
+
+/// The response's media type with any parameters (`; charset=...`) stripped, so
+/// it stays a low-cardinality tag. Distinguishes a JSON error from an HTML
+/// gateway page or an SSE frame without reading a byte of the body.
+fn response_content_type(head: &[u8]) -> Option<String> {
+    let value = extract_header_value(head, "content-type")?;
+    let media_type = value.split(';').next()?.trim().to_ascii_lowercase();
+    (!media_type.is_empty()).then_some(media_type)
+}
+
 /// Reduce an upstream error body to structural fields safe for Sentry:
 /// `error.type` / `error.code` / `error.param`, never free-text (the
 /// `message` field and raw bodies can quote request content).
@@ -1695,21 +1734,87 @@ fn codex_error_summary(body: &[u8]) -> String {
     match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(json) => {
             let err = json.get("error").unwrap_or(&json);
-            let field = |key: &str| {
-                err.get(key)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-")
-                    .to_string()
-            };
+            let field = |key: &str| err.get(key).and_then(|v| v.as_str());
+            let (kind, code, param) = (field("type"), field("code"), field("param"));
+            // All three absent means the body parsed but carried none of the
+            // schema we know how to read, and "type=- code=- param=-" then
+            // says only "something failed" -- RUST-4V collected 578 events
+            // that were all exactly that string and stayed untriageable for
+            // two months. Describe the shape instead, so the next one is a
+            // lead rather than another tally mark.
+            if kind.is_none() && code.is_none() && param.is_none() {
+                return format!(
+                    "no structural error fields; shape={} ({} bytes)",
+                    codex_error_body_shape(&json),
+                    body.len()
+                );
+            }
             format!(
                 "type={} code={} param={}",
-                field("type"),
-                field("code"),
-                field("param")
+                kind.unwrap_or("-"),
+                code.unwrap_or("-"),
+                param.unwrap_or("-")
             )
         }
         // Truncated (peek is bounded) or non-JSON body — report size only.
         Err(_) => format!("unparseable error body ({} bytes)", body.len()),
+    }
+}
+
+/// Content-free descriptor of an error body's JSON shape.
+///
+/// Key NAMES are schema; only values can quote the request, and none are read
+/// here. Top-level keys of an HTTP error body are chosen by the API, not by the
+/// user, so naming them cannot leak prompt content even when a 400 echoes
+/// request fields. `is_safe_shape_key` is the belt-and-braces: anything that
+/// does not look like an identifier is dropped rather than forwarded.
+fn codex_error_body_shape(json: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match json {
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map
+                .keys()
+                .map(String::as_str)
+                .filter(|key| is_safe_shape_key(key))
+                .collect();
+            keys.sort_unstable();
+            keys.truncate(SHAPE_MAX_KEYS);
+            format!("object{{{}}}", keys.join(","))
+        }
+        Value::Array(_) => "array".to_string(),
+        Value::String(_) => "string".to_string(),
+        Value::Number(_) => "number".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::Null => "null".to_string(),
+    }
+}
+
+/// Cap on keys named in a shape descriptor. Bounds both the message length and
+/// the cardinality of the `codex_error_shape` tag built from it.
+const SHAPE_MAX_KEYS: usize = 8;
+
+/// Whether a JSON key is safe to forward as schema: a short, identifier-shaped
+/// name. Rejects anything long or punctuated, which is what a key carrying
+/// user content would look like.
+fn is_safe_shape_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 32
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// The shape descriptor as a Sentry TAG value.
+///
+/// Deliberately a tag and not an extra: extras cannot be aggregated or
+/// searched, so `error_body` could only ever be read one event at a time --
+/// which is why RUST-4V's 578 events never revealed that they shared one
+/// shape. A tag makes "which shapes are these?" a single query.
+fn codex_error_shape_tag(body: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(json) => codex_error_body_shape(&json),
+        Err(_) if body.is_empty() => "empty".to_string(),
+        Err(_) => "non-json".to_string(),
     }
 }
 
@@ -2831,18 +2936,19 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, bind_intercept, classify_held_port, codex_error_summary,
-        codex_snapshot_from_usage_payload, codex_window_label, decode_codex_plan_tier,
-        extract_bearer, extract_header_value, find_header_end, intercept_request_counts,
-        is_codex_request_head, is_codex_sse_response, is_hop_by_hop_request_header,
-        is_hop_by_hop_response_header, is_local_proxy_path, is_openai_path, is_prompt_request_head,
-        is_reportable_codex_error, os_error_key, parse_codex_rate_limit_headers,
-        parse_request_head, parse_response_status, read_http_headers, request_has_header,
-        request_is_loopback_safe, request_uses_chatgpt_auth, rewrite_use_responses_lite, run,
-        sanitize_stale_tool_references, set_response_content_length, should_report_throttled,
-        stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
-        stamp_request_header, strip_request_header, verdict_permits_reuse, BypassFlag,
-        CodexTerminalReader, HeldPortVerdict, ModelsRewrite, ParsedRequestHead, SharedToken,
+        bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
+        codex_error_summary, codex_snapshot_from_usage_payload, codex_window_label,
+        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
+        intercept_request_counts, is_codex_request_head, is_codex_sse_response,
+        is_geo_blocked_codex_error, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
+        is_local_proxy_path, is_openai_path, is_prompt_request_head, is_reportable_codex_error,
+        os_error_key, parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
+        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
+        response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        set_response_content_length, should_report_throttled, stamp_client_header,
+        stamp_codex_client_header, stamp_headroom_bypass_header, stamp_request_header,
+        strip_request_header, verdict_permits_reuse, BypassFlag, CodexTerminalReader,
+        HeldPortVerdict, ModelsRewrite, ParsedRequestHead, SharedToken,
         FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
@@ -4829,6 +4935,105 @@ mod tests {
             codex_error_summary(b"<html>gateway error</html>"),
             "unparseable error body (26 bytes)"
         );
+    }
+
+    #[test]
+    fn codex_error_summary_describes_shape_when_fields_are_absent() {
+        // The RUST-4V case: valid JSON, none of type/code/param, which used to
+        // render as the useless "type=- code=- param=-".
+        let summary = codex_error_summary(br#"{"detail":"nope","status":400}"#);
+        assert_eq!(
+            summary,
+            "no structural error fields; shape=object{detail,status} (30 bytes)"
+        );
+        // `{"error": "..."}` — error present but a string, so no fields resolve.
+        assert_eq!(
+            codex_error_summary(br#"{"error":"boom"}"#),
+            "no structural error fields; shape=object{error} (16 bytes)"
+        );
+        // An empty object and a bare null are both distinguishable now.
+        assert_eq!(
+            codex_error_summary(b"{}"),
+            "no structural error fields; shape=object{} (2 bytes)"
+        );
+        assert_eq!(
+            codex_error_summary(b"null"),
+            "no structural error fields; shape=null (4 bytes)"
+        );
+    }
+
+    #[test]
+    fn codex_error_summary_still_prefers_structural_fields() {
+        // A partially-populated body must keep the field rendering, not fall
+        // through to the shape branch.
+        assert_eq!(
+            codex_error_summary(br#"{"error":{"code":"invalid_prompt"}}"#),
+            "type=- code=invalid_prompt param=-"
+        );
+    }
+
+    #[test]
+    fn codex_error_shape_tag_stays_low_cardinality_and_content_free() {
+        assert_eq!(
+            codex_error_shape_tag(br#"{"error":{"code":"x"}}"#),
+            "object{error}"
+        );
+        assert_eq!(codex_error_shape_tag(b"<html>502</html>"), "non-json");
+        assert_eq!(codex_error_shape_tag(b""), "empty");
+        assert_eq!(codex_error_shape_tag(b"[]"), "array");
+
+        // Keys are sorted (stable tag value) and capped at SHAPE_MAX_KEYS.
+        let many = (0..20)
+            .map(|i| format!("\"k{i:02}\":1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tag = codex_error_shape_tag(format!("{{{many}}}").as_bytes());
+        assert_eq!(tag, "object{k00,k01,k02,k03,k04,k05,k06,k07}");
+
+        // A key shaped like user content is dropped rather than forwarded.
+        let leaky = br#"{"Summarise this: my password is hunter2":1,"detail":2}"#;
+        let tag = codex_error_shape_tag(leaky);
+        assert_eq!(tag, "object{detail}");
+        assert!(!tag.contains("hunter2"), "{tag}");
+    }
+
+    #[test]
+    fn response_content_type_strips_parameters() {
+        let head =
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\n\r\n";
+        assert_eq!(
+            response_content_type(head).as_deref(),
+            Some("application/json")
+        );
+        let sse = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+        assert_eq!(
+            response_content_type(sse).as_deref(),
+            Some("text/event-stream")
+        );
+        assert_eq!(response_content_type(b"HTTP/1.1 400 Bad\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn geo_blocked_codex_error_detects_unsupported_region() {
+        // The exact shape RUST-4H captured 139 times.
+        let body = br#"{"error":{"message":"Country, region, or territory not supported","type":"request_forbidden","code":"unsupported_country_region_territory","param":null}}"#;
+        assert!(is_geo_blocked_codex_error(body));
+    }
+
+    #[test]
+    fn geo_blocked_codex_error_ignores_other_403s() {
+        // An org-verification 403 IS actionable and must still reach Sentry.
+        let body =
+            br#"{"error":{"type":"request_forbidden","code":"organization_must_be_verified"}}"#;
+        assert!(!is_geo_blocked_codex_error(body));
+        // Unrelated shapes must not be mistaken for a geo-block.
+        assert!(!is_geo_blocked_codex_error(
+            br#"{"error":{"type":"invalid_request_error","code":"invalid_prompt"}}"#
+        ));
+        assert!(!is_geo_blocked_codex_error(b"<html>gateway error</html>"));
+        assert!(!is_geo_blocked_codex_error(b""));
+        // A null code must not panic or match.
+        assert!(!is_geo_blocked_codex_error(br#"{"error":{"code":null}}"#));
     }
 
     #[test]

@@ -8093,19 +8093,24 @@ pub fn running_proxy_argv() -> Option<String> {
     ps_command(pid)
 }
 
-/// Identity of whatever is listening on `port`, for diagnostics that need to
-/// tell a foreign squatter from an orphaned old Headroom: a port that answers
-/// HTTP without the backend's routes is invisible to the readyz gate (a 404
-/// there deliberately counts as reachable), so the listener's name is the one
-/// fact that resolves the ambiguity. Best-effort: `None` where lsof is
-/// unavailable (Windows), and the caller's message must read fine without it.
-pub(crate) fn listener_identity(port: u16) -> Option<String> {
+/// Identity of whatever is listening on `port`, plus whether it is one of ours.
+///
+/// Diagnostics need to tell a foreign squatter from an orphaned old Headroom: a
+/// port that answers HTTP without the backend's routes is invisible to the
+/// readyz gate (a 404 there deliberately counts as reachable), so the listener
+/// is the one fact that resolves the ambiguity. The identity string alone
+/// cannot: "python3.12 (pid 7)" is our managed runtime on one host and an
+/// unrelated venv on the next, so ownership goes through
+/// `pid_is_headroom_backend`, which checks argv (or the executable path on
+/// Windows) rather than the process name.
+///
+/// Best-effort: `None` where lsof is unavailable (Windows) or no listener could
+/// be resolved. That is "unknown", not "foreign" -- callers must not read it as
+/// proof of either, and the caller's message must read fine without it.
+pub(crate) fn listener_identity_and_ownership(port: u16) -> Option<(String, bool)> {
     let (cmd, pid) = listener_process(port)?;
-    Some(format_listener_identity(
-        &cmd,
-        pid,
-        ps_command(pid).as_deref(),
-    ))
+    let identity = format_listener_identity(&cmd, pid, ps_command(pid).as_deref());
+    Some((identity, pid_is_headroom_backend(pid)))
 }
 
 fn format_listener_identity(cmd: &str, pid: u32, argv: Option<&str>) -> String {

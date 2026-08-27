@@ -5775,25 +5775,38 @@ fn warn_stats_fetch_failed(reason: &str) {
     // one fact that splits "foreign squatter" from "orphaned old Headroom" --
     // RUST-87 shipped three unattributable 404s before this. Throttled to one
     // lookup per 15-minute warn window, so the lsof subprocess is free here.
-    let held_by = if category.starts_with("http-4") {
-        crate::tool_manager::listener_identity(6767)
-            .map(|who| format!("; port 6767 is held by {who}"))
-            .unwrap_or_default()
+    // `foreign_holder` stays false when the lookup returns None: "we could not
+    // resolve the listener" is not evidence that it is someone else's, and
+    // guessing wrong here silently drops a real backend fault.
+    let (held_by, foreign_holder) = if category.starts_with("http-4") {
+        match crate::tool_manager::listener_identity_and_ownership(6767) {
+            Some((who, is_ours)) => (format!("; port 6767 is held by {who}"), !is_ours),
+            None => (String::new(), false),
+        }
     } else {
-        String::new()
+        (String::new(), false)
     };
     let message = format!(
         "headroom /stats fetch failed ({reason}){held_by}; dashboard loses the layers \
          only this endpoint reports (output shaping, tool schema)"
     );
-    sentry::with_scope(
-        |scope| {
-            scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
-        },
-        || {
-            sentry::capture_message(&message, sentry::Level::Warning);
-        },
-    );
+    // A 4xx answered by a process that is demonstrably not ours means another
+    // application owns 6767 on this host. Nothing we ship changes that -- the
+    // backoff above was added for exactly this case (RUST-87) and only slowed
+    // the bleed: one mac still sent 129 events with no end state, because a
+    // throttle cannot reach zero. The user-visible remedy is freeing the port,
+    // which the local log states in full; Sentry gains nothing from a repeat.
+    // Our OWN backend answering 4xx is a real fault and still reports.
+    if !foreign_holder {
+        sentry::with_scope(
+            |scope| {
+                scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
+            },
+            || {
+                sentry::capture_message(&message, sentry::Level::Warning);
+            },
+        );
+    }
     // Local only: the fingerprinted capture above is the Sentry path, and the
     // bridged warn would double-report it under the old flat grouping.
     log::warn!("{message}");
