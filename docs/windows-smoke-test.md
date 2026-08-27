@@ -13,7 +13,7 @@ Run the commands from Git Bash unless a section says PowerShell. Paths below use
 
 ## Checks (Claude Code pass)
 
-Run these from a Claude Code session and report PASS / FAIL with the observed value. Checks 1, 5, 7, 8, 9, and 10 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `%USERPROFILE%\.claude\settings.json`, pay-per-token), so its equivalents live in the **Codex pass** below; run that whole section from a Codex session.
+Run these from a Claude Code session and report PASS / FAIL with the observed value. Check 13 has a step that must run **before** you install the rc - read it first. Checks 1, 5, 7, 8, 9, 10, 12, 13, and 14 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `%USERPROFILE%\.claude\settings.json`, pay-per-token), so its equivalents live in the **Codex pass** below; run that whole section from a Codex session.
 
 ### 1. Version matches the new build
 ```bash
@@ -105,6 +105,101 @@ grep -c 'markitdown' "$USERPROFILE/.claude/settings.json"
 ls "$USERPROFILE/.claude/hooks/" 2>/dev/null
 ```
 Expect: non-zero hook references for RTK rewrite and markitdown, and the hook scripts exist under `~/.claude/hooks/` (the guard hook and markitdown shim run through Git Bash's `bash` on Windows). Sending a prompt that triggers a `Read` should route through markitdown and report compressed input.
+
+### 12. Backend port fallback when 6768 is held
+
+The desktop's internal proxy port (default `6768`) can be claimed by another process - on Windows the historic occupant is a stranded Headroom process left behind by an update (`os error 10048`, fixed in 0.8.4). The desktop should scan `6769..=6790` and pick a free one instead of failing.
+
+First, confirm the live port and verify the proxy answers there:
+```bash
+netstat -ano | grep -i listening | grep -E ':(676[8-9]|67[78][0-9]|6790)\s'
+curl -sS --max-time 5 -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:6767/livez"
+```
+Expect: at least one `127.0.0.1:67XX` line in the 6768-6790 range, and the curl returns `200`.
+
+Then, force a fallback. Quit Headroom from the tray menu, hold 6768 with a blocker, relaunch, and confirm the proxy comes up on a different port. Adaptations and traps:
+
+- The blocker must NOT set `SO_REUSEADDR`: on Windows that option lets a second socket bind over an active listener, so the proxy would bind straight through the block and the test would silently test nothing. A plain `bind` holds the port exclusively.
+- There is no system `python3` in Git Bash; use the bundled runtime's `python.exe`.
+- The quit must wait for the process to actually die before relaunching - poll `tasklist` instead of a fixed sleep.
+- The proxy on a fallback port boots cold, so poll `/livez` for up to 90s, and give every curl in the loop a `--max-time` (a timeout-less curl against a half-booted intercept can hang for minutes and strand the script even after the fallback succeeded).
+
+```bash
+taskkill //IM Headroom.exe >/dev/null 2>&1   # graceful; use the tray menu if this does not exit it
+for _ in $(seq 1 30); do tasklist //FI "IMAGENAME eq Headroom.exe" | grep -q Headroom.exe || break; sleep 0.5; done
+"$LOCALAPPDATA/Headroom/headroom/runtime/venv/Scripts/python.exe" -c "import socket,time; s=socket.socket(); s.bind(('127.0.0.1',6768)); s.listen(16); time.sleep(180)" &
+BLOCK_PID=$!
+sleep 1
+cmd //c start "" "$LOCALAPPDATA\\Headroom\\Headroom.exe"
+for _ in $(seq 1 90); do
+  code=$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:6767/livez" 2>/dev/null)
+  [ "$code" = "200" ] && break
+  sleep 1
+done
+echo "livez=$code"
+netstat -ano | grep -i listening | grep -E ':(676[8-9]|67[78][0-9]|6790)\s'
+kill $BLOCK_PID 2>/dev/null
+```
+Expect: `livez=200`, and a `127.0.0.1:67XX` listener where `XX` is NOT `68` (the fallback worked). A second confirmation is the proxy log *filename*, which embeds the chosen port - a successful fallback leaves a `headroom-proxy---port-6769---....log` next to the usual `...port-6768...` one:
+```bash
+ls -t "$LOCALAPPDATA/Headroom/headroom/logs/" | grep -m3 'headroom-proxy---port-'
+```
+After the test, quit and relaunch once more with the same wait-for-exit pattern to restore the default port.
+
+If the fallback is missing, check the desktop log for a `[backend_port]` warning line naming the occupant and the chosen fallback port. On Windows the desktop log is `%LOCALAPPDATA%\headroom\headroom-desktop.log` - note the lowercase `headroom` directory, which is NOT inside `%LOCALAPPDATA%\Headroom`. The *proxy* logs under `...\Headroom\headroom\logs\` never carry that line - it is emitted by the Rust side, so grepping the proxy log directory for `backend_port` comes back empty even on a successful fallback.
+
+### 13. User state survived the upgrade
+
+None of the earlier checks notice that the upgrade silently reset user state, because a wiped state file looks exactly like a healthy fresh one. Every persisted file here is read back through `serde`, so one field added or renamed in the new build is enough to fail a parse and hand the user a default: a restarted grace clock, an empty savings history, or a client-setup record that no longer knows which shell files we wrote (which is also what uninstall reads to clean up).
+
+**Run this block BEFORE installing the rc**, on the build you are upgrading from:
+```bash
+S="$LOCALAPPDATA/Headroom"
+mkdir -p /tmp/hr-preupgrade
+jq '{first_seen_at,paywall_first}' "$S/config/headroom-pricing-state.json" > /tmp/hr-preupgrade/pricing.json
+jq '{configured:(.configuredClients|keys),shell:(.managedShellFiles|keys)}' "$S/config/client-setup.json" > /tmp/hr-preupgrade/setup.json
+jq '{tokens:.allTimeRecordTokens,recap:.lastWeeklyRecapWeekKey,schema:.schemaVersion}' "$S/config/activity-facts.json" > /tmp/hr-preupgrade/facts.json
+# For check 14: the user's own CLAUDE.md content, excluding our managed blocks.
+awk '/headroom:(learn:start|markitdown_office >>>)/{skip=1} !skip{n+=length($0)+1} /headroom:(learn:end|markitdown_office <<<)/{skip=0} END{print FILENAME, n+0}' \
+  ~/.claude/CLAUDE.md > /tmp/hr-preupgrade/claude-md.txt
+cat /tmp/hr-preupgrade/*.json /tmp/hr-preupgrade/claude-md.txt
+```
+
+**After installing and launching the rc**, re-run the same three `jq` expressions and diff:
+```bash
+S="$LOCALAPPDATA/Headroom"
+stat -c '%y %n' /tmp/hr-preupgrade/*   # must predate THIS install, not an older one
+diff <(jq '{first_seen_at,paywall_first}' "$S/config/headroom-pricing-state.json") /tmp/hr-preupgrade/pricing.json
+diff <(jq '{configured:(.configuredClients|keys),shell:(.managedShellFiles|keys)}' "$S/config/client-setup.json") /tmp/hr-preupgrade/setup.json
+jq '{tokens:.allTimeRecordTokens,recap:.lastWeeklyRecapWeekKey,schema:.schemaVersion}' "$S/config/activity-facts.json"
+ls "$S/config/" | grep -c '\.corrupt$'
+```
+Expect: `first_seen_at` byte-identical (`paywall_first` may legitimately change - the server owns it), the configured-client and shell-file key sets unchanged, and `0` quarantine files.
+
+Check the snapshot's mtime before trusting a clean diff. `/tmp/hr-preupgrade` (Git Bash maps `/tmp` to the user temp dir) survives across rcs, so a run that forgot the pre-install step silently diffs against a snapshot from two builds ago - which passes, but tests the wrong upgrade. If the mtime predates the build you just replaced, say so in the report rather than claiming this rc preserved state.
+
+`activity-facts.json` is the deliberate exception: a `schemaVersion` bump intentionally drops the tile slots, so it needs its own comparison rather than a `diff`. What must survive a bump is `allTimeRecordTokens` and `lastWeeklyRecapWeekKey` - wiping those re-fires the weekly recap and resets all-time records for every user, which has happened on four bumps so far.
+
+A non-empty `*.corrupt` listing is the highest-signal failure in this doc. `quarantine_unparsable` only creates one when a state file failed to parse and was about to be overwritten, so the file itself is the evidence: `jq . <the .corrupt file>` to see which field the new build could not read. The fix belongs on the struct (`#[serde(default)]`, per the Persistence Rules in CLAUDE.md), not on the file.
+
+### 14. CLAUDE.md files are intact after the upgrade
+
+Two independent writers edit the user's CLAUDE.md, and neither is a Headroom-owned file - a bad write damages the user's own instructions. The desktop's `upsert_managed_block` maintains `# >>> headroom:markitdown_office >>>` in `~/.claude/CLAUDE.md`; the Python `headroom learn` command maintains `<!-- headroom:learn:start -->` blocks in both the global and every project CLAUDE.md. Both find their markers by literal string search on the whole file, so an interrupted write, a hand-edited half-block, or a second writer racing the first duplicates markers instead of replacing the block.
+
+Run against the global file plus any project CLAUDE.md files present on the machine:
+```bash
+for f in ~/.claude/CLAUDE.md; do
+  echo "== $f"
+  echo "  markitdown: $(grep -c '^# >>> headroom:markitdown_office >>>' "$f")/$(grep -c '^# <<< headroom:markitdown_office <<<' "$f")"
+  echo "  learn:      $(grep -c '<!-- headroom:learn:start -->' "$f")/$(grep -c '<!-- headroom:learn:end -->' "$f")"
+  awk '/headroom:(learn:start|markitdown_office >>>)/{skip=1} !skip{n+=length($0)+1} /headroom:(learn:end|markitdown_office <<<)/{skip=0} END{print "  user bytes outside managed blocks: " n+0}' "$f"
+done
+```
+Expect: every pair is `0/0` or `1/1` - never `2/2` (duplicated block) and never `1/0` (truncated mid-write). The user-bytes figure has no fixed value; capture it in the check 13 pre-install snapshot and confirm it does not shrink across the upgrade.
+
+A `2/2` is the duplicate-block bug: `strip_marker_block` loops for exactly this reason, and `upsert_managed_block` treats reordered `end`-before-`start` markers as absent and appends fresh rather than rebuilding around them. Both behaviours have unit tests, so a failure here means a new writer, not a regression in those.
+
+Note what this check does **not** cover: CLAUDE.md damage that never reaches disk (the 0.34.0 class, where upstream's user-turn compression mangled the file's content on the wire while the file stayed intact). That is invisible to any filesystem check - catching it means reading a `/v1/messages` request body (beta smoke test check 11, not ported here).
 
 ## Codex checks (Codex pass)
 
