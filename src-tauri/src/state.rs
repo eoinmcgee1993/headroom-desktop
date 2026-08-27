@@ -2528,9 +2528,12 @@ impl AppState {
         );
         let lifetime_tool_schema_savings_usd =
             tool_schema_savings_usd(&daily_savings, lifetime_tool_schema_tokens_saved);
-        let lifetime_estimated_savings_usd = lifetime_compression_savings_usd
-            + lifetime_output_savings_usd
-            + lifetime_tool_schema_savings_usd;
+        // The tool-schema layer is deliberately NOT in the headline card: it
+        // has no time dimension (lifetime counter, no backfill), so including
+        // it made "Total costs saved" exceed anything the history chart can
+        // show. It renders in the drill-down as "Additional costs saved".
+        let lifetime_estimated_savings_usd =
+            lifetime_compression_savings_usd + lifetime_output_savings_usd;
         warn_once_if_savings_rate_implausible(&daily_savings);
         // Tokens stay input-only: the card is labelled "Total input tokens
         // saved", and this total also drives the milestone notifications, which
