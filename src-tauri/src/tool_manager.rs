@@ -35,6 +35,11 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
 pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.35.0";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Kill the RUST-9F onnxruntime import probe after this long: a native
+/// DLL-init DEADLOCK (as opposed to the usual crash) must read as "timed
+/// out", not hang the already-failing startup path the probe reports on.
+const ONNX_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
 /// macOS 26 the first run of freshly-installed *unsigned* wheel binaries is
@@ -2800,28 +2805,37 @@ impl ToolManager {
         if !python.exists() {
             return "managed python missing".to_string();
         }
-        match crate::proc::command(&python)
-            .args([
-                "-c",
-                "import onnxruntime, sys; sys.stdout.write(onnxruntime.__version__)",
-            ])
-            .env("PYTHONNOUSERSITE", "1")
-            .output()
-        {
-            Ok(out) if out.status.success() => format!(
-                "onnxruntime {} imports cleanly",
-                String::from_utf8_lossy(&out.stdout).trim()
-            ),
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let last_line = stderr.lines().rev().find(|l| !l.trim().is_empty());
-                format!(
-                    "import onnxruntime exited {}: {}",
-                    out.status,
-                    last_line.unwrap_or("<no stderr>").trim()
-                )
-            }
-            Err(err) => format!("probe spawn failed: {err}"),
+        // Bounded: an unbounded `.output()` here meant a DLL that deadlocks
+        // during import would hang this thread forever -- turning a host that
+        // used to fail fast into one that hangs silently. 15s then kill; the
+        // "timed out" stderr line is itself the diagnosis. Going through
+        // `run_command_with_timeout` also gives the probe the full child-env
+        // isolation of `build_command` (PYTHONNOUSERSITE, PYTHONPATH removal)
+        // that the ad-hoc spawn only partially set. The pinned venv fixes the
+        // onnxruntime version, so the happy-path message doesn't need it.
+        match run_command_with_timeout(
+            &python,
+            &["-c", "import onnxruntime"],
+            &self.runtime.root_dir,
+            ONNX_PROBE_TIMEOUT,
+        ) {
+            Ok(()) => "onnxruntime imports cleanly".to_string(),
+            Err(err) => match err.downcast_ref::<CommandFailure>() {
+                Some(failure) => {
+                    let status = match failure.exit_code {
+                        Some(code) => format!("exit {code}"),
+                        None => "killed".to_string(),
+                    };
+                    let last_line = failure
+                        .stderr
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("<no stderr>");
+                    format!("import onnxruntime failed ({status}): {}", last_line.trim())
+                }
+                None => format!("probe spawn failed: {err:#}"),
+            },
         }
     }
 
