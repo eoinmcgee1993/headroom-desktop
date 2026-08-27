@@ -6591,7 +6591,14 @@ export default function App() {
               </article>
             </section>
 
-            {dashboard.savingsHistoryLoaded || historyLoadTimedOut ? (
+            {/* The 20s timeout is an escape hatch for a backend that is not
+                coming up (paused, failed) - while it is actively STARTING,
+                keep the skeleton instead of flashing the tracker-only
+                archive chart, whose today figure reads far below the real
+                one until /stats-history loads (rc.5 Windows startup showed
+                $0.26 against a real $1). */}
+            {dashboard.savingsHistoryLoaded ||
+            (historyLoadTimedOut && !runtimeStatus?.starting) ? (
               <DailySavingsChart
                 data={dashboard.dailySavings}
                 hourlyData={dashboard.hourlySavings}
