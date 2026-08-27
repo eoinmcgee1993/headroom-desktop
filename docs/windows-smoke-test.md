@@ -17,9 +17,10 @@ Run these from a Claude Code session and report PASS / FAIL with the observed va
 
 ### 1. Version matches the new build (PowerShell)
 The uninstall registry key carries no `DisplayVersion` value (only MainBinaryName / DisplayName / InstallLocation / UninstallString), so grepping the registry for a version returns nothing even on a healthy install. Read the binary's version resource instead:
+Two traps: `InstallLocation` comes back with embedded quotes (breaks `Join-Path`), and the binary is `$k.MainBinaryName` (`headroom-desktop.exe`), not `Headroom.exe`.
 ```powershell
 $k = Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object { $_.DisplayName -like '*Headroom*' }
-(Get-Item (Join-Path $k.InstallLocation 'Headroom.exe')).VersionInfo.ProductVersion
+(Get-Item (Join-Path $k.InstallLocation.Trim('"') $k.MainBinaryName)).VersionInfo.ProductVersion
 ```
 Expect: the `-rc.N` version you just installed (the dashboard Settings page shows the same version as a cross-check). If this shows an older rc, STOP - every other check below would measure the stale build, not the one being promoted.
 
@@ -45,7 +46,7 @@ Expect: a version line and a gain summary, no "command not found". Claude Code's
 ### 4. MCP retrieve tool is available (Claude Code only; only if memory tools are enabled)
 First check whether the proxy was started with memory tools:
 ```bash
-ls "$LOCALAPPDATA/Headroom/headroom/logs/" | grep -E 'no-memory-tools' >/dev/null && echo 'memory tools DISABLED — skip this check' || echo 'memory tools enabled — run check'
+ls -t "$LOCALAPPDATA/Headroom/headroom/logs/" | grep 'port-6767' | head -1 | grep -q 'no-memory-tools' && echo 'memory tools DISABLED - skip this check' || echo 'memory tools enabled - run check'
 ```
 If enabled, have Claude call `mcp__headroom__headroom_retrieve` with any small query and expect a tool result (not "No such tool available").
 
