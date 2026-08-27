@@ -478,6 +478,19 @@ pub(crate) enum HeldPortVerdict {
     Foreign { name: String, pid: u32 },
 }
 
+/// Whether a verdict makes a `SO_REUSEADDR` rebind safe.
+///
+/// Only `Draining` does, and the distinction is a correctness boundary rather
+/// than a preference. On Windows `SO_REUSEADDR` also permits binding over a
+/// socket that is actively LISTENING, so reusing on `Foreign` would bind us
+/// alongside a live holder, and reusing on any verdict reached while another
+/// Headroom held the port would defeat single-instance protection and split
+/// traffic across two proxies. `Draining` is the only verdict that guarantees
+/// nothing is listening.
+pub(crate) fn verdict_permits_reuse(verdict: &HeldPortVerdict) -> bool {
+    matches!(verdict, HeldPortVerdict::Draining)
+}
+
 pub(crate) fn classify_held_port(
     occupant: Option<(String, u32)>,
     elapsed: std::time::Duration,
@@ -578,9 +591,16 @@ pub fn spawn(
                 const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
                 let launched_at = tokio::time::Instant::now();
                 let mut consecutive_failures = 0usize;
+                // Set only by the `Draining` verdict, which is the one case
+                // where nothing is listening and the port is held purely by
+                // sockets on their way out. Never reset: once we have
+                // established that, a plain bind has nothing left to prove,
+                // and `run` does not return after it binds.
+                let mut reuse_addr = false;
                 loop {
                     match run(
                         bind_addr,
+                        reuse_addr,
                         token_slot.clone(),
                         codex_slot.clone(),
                         codex_plan_slot.clone(),
@@ -667,11 +687,19 @@ pub fn spawn(
                                 let occupant =
                                     crate::tool_manager::listener_process(INTERCEPT_PORT);
                                 let key = os_error_key(&e);
-                                match classify_held_port(
+                                let verdict = classify_held_port(
                                     occupant,
                                     launched_at.elapsed(),
                                     DRAIN_GRACE,
-                                ) {
+                                );
+                                // Nothing listening means the only thing
+                                // holding the port is sockets draining, so the
+                                // next attempt can take it back now instead of
+                                // waiting out TcpTimedWaitDelay.
+                                if verdict_permits_reuse(&verdict) {
+                                    reuse_addr = true;
+                                }
+                                match verdict {
                                     HeldPortVerdict::Draining => {
                                         // Still a real outage from the user's
                                         // side, so the banner stays -- but it
@@ -794,8 +822,54 @@ pub fn spawn(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Bind the intercept port on Windows with `SO_REUSEADDR` set.
+///
+/// Rust sets `SO_REUSEADDR` for you on Unix but not on Windows, so a listener
+/// there cannot rebind a port whose previous owner left connections in
+/// TIME_WAIT -- which is every update relaunch, for up to `TcpTimedWaitDelay`
+/// (120s by default, 300s at most). That wait was RUST-7M.
+///
+/// Only ever reached from the `Draining` verdict, and that is load-bearing.
+/// `SO_REUSEADDR` on Windows also lets a bind succeed over a socket that is
+/// actively LISTENING, so using it unconditionally would let a second Headroom
+/// bind 6767 alongside the first and split traffic between two proxies -- the
+/// `probe_existing_intercept` branch relies on that bind failing. `Draining`
+/// is only reached when `listener_process` found nothing in LISTENING state,
+/// which rules out both another Headroom and a foreign holder, leaving the
+/// kernel's TIME_WAIT reservation as the only thing this can bind over.
+#[cfg(windows)]
+fn reuse_bound_std_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    // Matches the backlog tokio's own `TcpListener::bind` requests.
+    socket.listen(1024)?;
+    let listener: std::net::TcpListener = socket.into();
+    // tokio's reactor requires this; `from_std` documents it as the caller's job.
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Plain bind, or a `SO_REUSEADDR` bind when the caller has established that
+/// nothing is listening and the port is only held by draining sockets.
+///
+/// `reuse_addr` is inert off Windows: Unix already sets the option, so the
+/// plain path there is the reuse path.
+async fn bind_intercept(addr: SocketAddr, reuse_addr: bool) -> std::io::Result<TcpListener> {
+    #[cfg(windows)]
+    if reuse_addr {
+        return TcpListener::from_std(reuse_bound_std_listener(addr)?);
+    }
+    #[cfg(not(windows))]
+    let _ = reuse_addr;
+    TcpListener::bind(addr).await
+}
+
 async fn run(
     bind_addr: SocketAddr,
+    reuse_addr: bool,
     token_slot: SharedToken,
     codex_slot: CodexRateLimitSlot,
     codex_plan_slot: CodexPlanSlot,
@@ -806,7 +880,7 @@ async fn run(
     upstream_base: Arc<String>,
     bind_error: BindErrorSlot,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(bind_addr).await?;
+    let listener = bind_intercept(bind_addr, reuse_addr).await?;
     // Serving again: clear whatever the previous attempt recorded so a
     // recovered port stops showing a stale cause in the UI.
     *bind_error.lock() = None;
@@ -2757,7 +2831,7 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, classify_held_port, codex_error_summary,
+        bearer_value_changed, bind_intercept, classify_held_port, codex_error_summary,
         codex_snapshot_from_usage_payload, codex_window_label, decode_codex_plan_tier,
         extract_bearer, extract_header_value, find_header_end, intercept_request_counts,
         is_codex_request_head, is_codex_sse_response, is_hop_by_hop_request_header,
@@ -2767,8 +2841,8 @@ mod tests {
         request_is_loopback_safe, request_uses_chatgpt_auth, rewrite_use_responses_lite, run,
         sanitize_stale_tool_references, set_response_content_length, should_report_throttled,
         stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
-        stamp_request_header, strip_request_header, BypassFlag, CodexTerminalReader,
-        HeldPortVerdict, ModelsRewrite, ParsedRequestHead, SharedToken,
+        stamp_request_header, strip_request_header, verdict_permits_reuse, BypassFlag,
+        CodexTerminalReader, HeldPortVerdict, ModelsRewrite, ParsedRequestHead, SharedToken,
         FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
@@ -2828,6 +2902,37 @@ mod tests {
             classify_held_port(None, std::time::Duration::from_secs(91), HELD_GRACE),
             HeldPortVerdict::Draining
         );
+    }
+
+    /// The safety boundary for the SO_REUSEADDR rebind. Draining is the only
+    /// verdict that establishes nothing is listening, and on Windows
+    /// SO_REUSEADDR binds over live listeners too -- so widening this to any
+    /// other verdict would let a second Headroom bind 6767 alongside the
+    /// first, or park us next to a foreign holder, instead of failing.
+    #[test]
+    fn only_a_draining_port_may_be_rebound_with_reuseaddr() {
+        assert!(verdict_permits_reuse(&HeldPortVerdict::Draining));
+        assert!(!verdict_permits_reuse(&HeldPortVerdict::Stuck));
+        assert!(!verdict_permits_reuse(&HeldPortVerdict::Foreign {
+            name: "Affinity".into(),
+            pid: 54915
+        }));
+    }
+
+    /// Off Windows the flag is inert (Unix already sets SO_REUSEADDR), so both
+    /// paths must still produce a usable listener.
+    #[tokio::test]
+    async fn bind_intercept_binds_either_way() {
+        for reuse in [false, true] {
+            let listener = bind_intercept("127.0.0.1:0".parse().unwrap(), reuse)
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            assert_ne!(addr.port(), 0);
+            let joined = tokio::spawn(async move { listener.accept().await.is_ok() });
+            let _client = TcpStream::connect(addr).await.expect("connect");
+            assert!(joined.await.expect("join"));
+        }
     }
 
     #[test]
@@ -3152,6 +3257,7 @@ mod tests {
             // run() loops forever; the test cancels it via abort below.
             let _ = run(
                 intercept_addr,
+                false,
                 slot_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -3257,6 +3363,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -3336,6 +3443,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 slot_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -3914,6 +4022,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 token_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -4059,6 +4168,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 token_slot,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -4162,6 +4272,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 token_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -4503,6 +4614,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 slot_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -4616,6 +4728,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 slot_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
