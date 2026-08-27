@@ -26,10 +26,10 @@ stat -f '%Sm' ~/Library/Application\ Support/Headroom/config/activity-facts.json
 Expect: mtime within the last minute. `lastTransformation` inside the file is a "Recent large compression" tile pick (gated on >=1000 tokens saved and >20% savings, see `activity_facts.rs`), not a per-request heartbeat — don't use it as a liveness signal.
 
 ### 3. RTK is on PATH and reports savings (Claude Code only — RTK does not rewrite Codex)
-First check whether RTK is installed at all. It is an opt-in addon and can be turned off from the Optimize view, which sets `rtkDisabled` in the setup state; `ensure_rtk_integrations` then writes no PATH block and no Claude Code hook (see `is_rtk_disabled` in `client_adapters.rs`). Skip the check when it is off — a missing `rtk` is the correct state, not a regression.
+First check whether RTK is installed at all. RTK is an opt-in addon (since 7a0f489, 2026-06-23): bootstrap never installs it, so a fresh install has no `rtk` until the user adds it from the Addons tab - and it can additionally be turned off from the Optimize view (`rtkDisabled` in the setup state; `is_rtk_disabled` in `client_adapters.rs`). Either way a missing `rtk` is the correct state, not a regression. Do NOT gate on `rtkDisabled` alone: `false` only means "never explicitly disabled" and says nothing about whether it was ever installed (the 0.9.1-rc.2 Windows pass false-flagged on exactly this). Gate on the binary:
 ```bash
-jq -r 'if .rtkDisabled then "RTK DISABLED — skip this check" else "RTK enabled — run check" end' \
-  ~/Library/Application\ Support/Headroom/config/client-setup.json
+ls ~/Library/Application\ Support/Headroom/headroom/bin/rtk >/dev/null 2>&1 \
+  && echo "RTK installed - run check" || echo "RTK NOT INSTALLED (opt-in addon) - skip this check"
 ```
 If enabled:
 ```bash

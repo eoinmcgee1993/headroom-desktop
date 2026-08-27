@@ -29,6 +29,12 @@ stat -c '%y' "$APPDATA/Headroom/config/activity-facts.json"
 Expect: mtime within the last minute.
 
 ### 3. RTK is on PATH and reports savings (Claude Code only — RTK does not rewrite Codex)
+RTK is an opt-in addon: bootstrap never installs it, so a fresh install has no `rtk.exe` until the user adds it from the Addons tab. That is the correct state, not a regression - skip this check when it is absent:
+```bash
+ls "$APPDATA/Headroom/headroom/bin/rtk.exe" >/dev/null 2>&1 \
+  && echo "RTK installed - run check" || echo "RTK NOT INSTALLED (opt-in addon) - skip this check"
+```
+If installed:
 ```bash
 "$APPDATA/Headroom/headroom/bin/rtk.exe" --version && "$APPDATA/Headroom/headroom/bin/rtk.exe" gain | head -5
 ```
