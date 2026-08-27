@@ -3517,7 +3517,7 @@ impl ToolManager {
         Ok(())
     }
 
-    pub fn bootstrap_all_with_progress<F>(&self, mut progress: F) -> Result<ManagedRuntime>
+    pub fn bootstrap_all_with_progress<F>(&self, progress: F) -> Result<ManagedRuntime>
     where
         F: FnMut(BootstrapStepUpdate),
     {

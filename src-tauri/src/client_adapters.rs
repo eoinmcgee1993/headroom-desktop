@@ -1266,6 +1266,7 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     (removed, oss_hooks_pending)
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))] // Windows uninstall uses perform_full_cleanup()
 pub fn revert_external_mutations() -> Vec<String> {
     revert_external_mutations_with_status().0
 }
@@ -5073,6 +5074,8 @@ fn write_file_if_changed(
     content: &str,
     executable: bool,
 ) -> Result<(bool, Option<PathBuf>)> {
+    #[cfg(not(unix))]
+    let _ = executable; // only used for chmod on unix
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
