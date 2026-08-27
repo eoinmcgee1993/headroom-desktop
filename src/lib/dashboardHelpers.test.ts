@@ -46,6 +46,8 @@ describe("dashboard helpers", () => {
   it("formats stable numeric summaries", () => {
     expect(currencyExact(12.345)).toBe("$12.35");
     expect(currency(9999)).toBe("$9,999");
+    expect(currency(0.37)).toBe("$0.37");
+    expect(currency(1)).toBe("$1");
     expect(currency(15_432)).toContain("K");
     expect(compactNumber(12_345)).toBe("12.3K");
     expect(percent1(18)).toBe("18.0");
