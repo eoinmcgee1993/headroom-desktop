@@ -2,7 +2,7 @@
 
 After installing a new Windows build (`-rc.N`), paste this file into Claude Code and ask it to run the checks. Each check has a single expected signal — if any fail, stop and investigate before promoting to stable.
 
-Run the commands from Git Bash unless a section says PowerShell. Paths below use the Windows layout added by the Windows support work: the bundled runtime lives under `%APPDATA%\Headroom\headroom\runtime\venv\Scripts` (`python.exe` / `headroom.exe`), RTK at `%APPDATA%\Headroom\headroom\bin\rtk.exe`, and the markitdown shim at `%APPDATA%\Headroom\headroom\bin\markitdown.cmd`.
+Run the commands from Git Bash unless a section says PowerShell. Paths below use the Windows layout added by the Windows support work: the bundled runtime lives under `%LOCALAPPDATA%\Headroom\headroom\runtime\venv\Scripts` (`python.exe` / `headroom.exe`), RTK at `%LOCALAPPDATA%\Headroom\headroom\bin\rtk.exe`, and the markitdown shim at `%LOCALAPPDATA%\Headroom\headroom\bin\markitdown.cmd`.
 
 ## Setup
 
@@ -24,26 +24,26 @@ Expect: the `-rc.N` version you just installed.
 ### 2. Proxy is intercepting this conversation
 Send a trivial prompt ("say hi"), then:
 ```bash
-stat -c '%y' "$APPDATA/Headroom/config/activity-facts.json"
+stat -c '%y' "$LOCALAPPDATA/Headroom/config/activity-facts.json"
 ```
 Expect: mtime within the last minute.
 
 ### 3. RTK is on PATH and reports savings (Claude Code only — RTK does not rewrite Codex)
 RTK is an opt-in addon: bootstrap never installs it, so a fresh install has no `rtk.exe` until the user adds it from the Addons tab. That is the correct state, not a regression - skip this check when it is absent:
 ```bash
-ls "$APPDATA/Headroom/headroom/bin/rtk.exe" >/dev/null 2>&1 \
+ls "$LOCALAPPDATA/Headroom/headroom/bin/rtk.exe" >/dev/null 2>&1 \
   && echo "RTK installed - run check" || echo "RTK NOT INSTALLED (opt-in addon) - skip this check"
 ```
 If installed:
 ```bash
-"$APPDATA/Headroom/headroom/bin/rtk.exe" --version && "$APPDATA/Headroom/headroom/bin/rtk.exe" gain | head -5
+"$LOCALAPPDATA/Headroom/headroom/bin/rtk.exe" --version && "$LOCALAPPDATA/Headroom/headroom/bin/rtk.exe" gain | head -5
 ```
 Expect: a version line and a gain summary, no "command not found". Claude Code's Bash tool spawns a non-login shell, so a bare `rtk` may report `command not found` even on a healthy install; call the managed `rtk.exe` by its absolute path instead.
 
 ### 4. MCP retrieve tool is available (Claude Code only; only if memory tools are enabled)
 First check whether the proxy was started with memory tools:
 ```bash
-ls "$APPDATA/Headroom/headroom/logs/" | grep -E 'no-memory-tools' >/dev/null && echo 'memory tools DISABLED — skip this check' || echo 'memory tools enabled — run check'
+ls "$LOCALAPPDATA/Headroom/headroom/logs/" | grep -E 'no-memory-tools' >/dev/null && echo 'memory tools DISABLED — skip this check' || echo 'memory tools enabled — run check'
 ```
 If enabled, have Claude call `mcp__headroom__headroom_retrieve` with any small query and expect a tool result (not "No such tool available").
 
@@ -61,7 +61,7 @@ Timing matters either way: a `Read` result becomes part of Claude's *next* outgo
 **Claude Code subscription/OAuth traffic** (classified `SUBSCRIPTION`):
 1. Capture the baseline:
    ```bash
-   "$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
+   "$LOCALAPPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before_with_cli_filtering}'
    ```
 2. End the turn with a large Read in flight — ask Claude to read a long file (~1300-1500 lines).
 3. On the *next* turn, re-run the same `jq` command.
@@ -71,7 +71,7 @@ Expect: `primary_model` is a `claude-*` model, `cache_savings_usd` is strictly g
 **Pay-per-token API-key traffic** (classified `PAYG`/`OAUTH` — the branch Codex hits):
 1. Capture the baseline:
    ```bash
-   "$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
+   "$LOCALAPPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
    ```
 2. End the turn with the same large Read in flight (~1300-1500 lines clears the compression threshold).
 3. On the *next* turn, re-run the same `jq` command.
@@ -80,8 +80,8 @@ Expect: `requests_compressed` increased by at least 1, and `total_tokens_removed
 
 ### 8. Bundled runtime is healthy
 ```bash
-"$APPDATA/Headroom/headroom/runtime/venv/Scripts/headroom.exe" --version && \
-  "$APPDATA/Headroom/headroom/runtime/venv/Scripts/python.exe" -c "import headroom; print(headroom.__file__)"
+"$LOCALAPPDATA/Headroom/headroom/runtime/venv/Scripts/headroom.exe" --version && \
+  "$LOCALAPPDATA/Headroom/headroom/runtime/venv/Scripts/python.exe" -c "import headroom; print(headroom.__file__)"
 ```
 Expect: a `headroom, version X.Y.Z` line and a path under `...\runtime\venv\Lib\site-packages\headroom\__init__.py`. No `ModuleNotFoundError`, no `pydantic-core` mismatch traceback.
 
@@ -123,7 +123,7 @@ Expect: `PASS`.
 ### C2. Codex traffic is actively optimized (token mode)
 1. Capture the baseline:
    ```bash
-   "$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq '{mode: .summary.mode, primary_model: .summary.primary_model, requests_compressed: .summary.compression.requests_compressed, total_tokens_removed: .summary.compression.total_tokens_removed}'
+   "$LOCALAPPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq '{mode: .summary.mode, primary_model: .summary.primary_model, requests_compressed: .summary.compression.requests_compressed, total_tokens_removed: .summary.compression.total_tokens_removed}'
    ```
 2. End the turn with a large file read in flight from Codex (~1300-1500 lines).
 3. On the next turn, re-run the same command.
@@ -145,12 +145,12 @@ Expect: after Pause it prints `0`; after Resume it is non-zero (back to `4` mark
 When inspecting the running proxy by hand (e.g. checking `/stats`), wrap `curl` with `rtk proxy` to bypass RTK's output filtering — otherwise large JSON responses get summarized into a type-shape view that looks like a broken endpoint:
 
 ```bash
-"$APPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq .summary
+"$LOCALAPPDATA/Headroom/headroom/bin/rtk.exe" proxy curl -s http://127.0.0.1:6767/stats | jq .summary
 ```
 
 ## When something fails
 
-- Proxy log silent → check `%APPDATA%\Headroom\headroom\logs\` for a newer log file or a crash file.
-- RTK missing → check `%APPDATA%\Headroom\headroom\bin\rtk.exe` exists; the managed blocks in `%USERPROFILE%\.claude\settings.json` / `%USERPROFILE%\.codex\config.toml` are intact.
+- Proxy log silent → check `%LOCALAPPDATA%\Headroom\headroom\logs\` for a newer log file or a crash file.
+- RTK missing → check `%LOCALAPPDATA%\Headroom\headroom\bin\rtk.exe` exists; the managed blocks in `%USERPROFILE%\.claude\settings.json` / `%USERPROFILE%\.codex\config.toml` are intact.
 - MCP tool missing → restart Claude Code; the MCP server registration happens at session start.
 - Credential Manager entries missing → re-run sign-in; verify the app is the release (non-debug) build, since the Windows keyring module is only compiled in release builds.
