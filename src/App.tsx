@@ -74,6 +74,7 @@ import {
   type SetupStallKind,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
+import { UpstreamPanel } from "./components/UpstreamPanel";
 import {
   buildInstallFailureMailto,
   buildSetupStallMailto,
@@ -7696,6 +7697,8 @@ export default function App() {
                   <p className="install-progress__notice">{connectorsNotice}</p>
                 ) : null}
               </article>
+
+              <UpstreamPanel />
 
               <article className="soft-card panel-card">
                 <div className="panel-card__header">

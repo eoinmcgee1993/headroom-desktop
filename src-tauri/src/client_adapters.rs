@@ -2726,6 +2726,49 @@ fn ensure_claude_settings_hook(
 /// gateway URL) when one was preserved, otherwise delete the key. A key that
 /// no longer matches Headroom's value was changed by the user and is left
 /// alone.
+/// Put the configured provider token where the client will actually send it:
+/// `env.ANTHROPIC_AUTH_TOKEN` in `~/.claude/settings.json`.
+///
+/// This is the same place cc-switch and hand-configured setups keep it, and it
+/// is deliberately the only copy outside the keychain: Headroom forwards
+/// whatever the client sent rather than injecting credentials of its own, so
+/// there is no path that puts this token on the wire from the desktop.
+///
+/// `None` removes the key -- used when the override is cleared, so a stale
+/// provider token cannot outlive the endpoint it belonged to.
+pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
+    match token {
+        Some(value) if !value.is_empty() => {
+            configure_claude_settings_env("ANTHROPIC_AUTH_TOKEN", value)?;
+            Ok(())
+        }
+        _ => {
+            let existing = read_claude_settings_env("ANTHROPIC_AUTH_TOKEN")?;
+            match existing {
+                Some(current) => remove_claude_settings_env("ANTHROPIC_AUTH_TOKEN", &current, None),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+/// Current value of one `env` key in `~/.claude/settings.json`, if any.
+fn read_claude_settings_env(env_key: &str) -> Result<Option<String>> {
+    let settings_path = claude_settings_path();
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&settings_path)
+        .with_context(|| format!("reading {}", settings_path.display()))?;
+    let root = parse_json_object(&raw, &settings_path)?;
+    Ok(root
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get(env_key))
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
 fn remove_claude_settings_env(
     env_key: &str,
     expected_value: &str,
