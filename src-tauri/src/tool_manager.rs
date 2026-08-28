@@ -322,6 +322,13 @@ gate: it self-neutralizes once a wheel ships #3166 (the fixed tick has
 already reset the upstream by the time the wrapper looks). Kill switch:
 HEADROOM_CC_SWITCH_RESET_GUARD=0, which turns the reconciler off with
 it.
+The same guard pins the URL the reconciler advertises to clients.
+Upstream builds it from the port this proxy bound -- the internal port
+between the desktop intercept and this process -- so every provider
+switch rewrote the client onto that port and out of the intercept, where
+the activity feed, request counts and savings accounting live. The
+desktop passes the intercept URL in HEADROOM_CC_SWITCH_PROXY_URL and the
+guard writes it onto every reconciler instance.
 """
 import faulthandler
 import signal
@@ -969,6 +976,36 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     "cc-switch reconciler no longer takes %r" % (_hd_ccs_needed,)
                 )
         _hd_ccs_warned = False
+
+        # Advertise the intercept port, not the port this process bound.
+        # server.py builds the reconciler with
+        # proxy_url=f"http://127.0.0.1:{config.port}", which is the INTERNAL
+        # port between the desktop's intercept and this proxy (6768, or
+        # 6769-6790 when something else already holds 6768). Clients belong on
+        # the fixed intercept port: everything the desktop measures -- activity
+        # feed, request counts, savings accounting, stale-tool-ref sanitisation
+        # -- lives in the intercept, so a settings.json rewritten to the
+        # internal port silently drops that client out of all of it, and breaks
+        # outright on the next launch that has to take a fallback port. The
+        # desktop passes the URL it wants advertised; no upstream knob exists
+        # for this yet.
+        _hd_ccs_url = _hd_os.environ.get("HEADROOM_CC_SWITCH_PROXY_URL", "").strip()
+        if not _hd_ccs_url.startswith(("http://", "https://")):
+            # Missing or malformed while the reconciler is enabled is an
+            # inconsistent spawn, and guessing would write a bad base_url into
+            # the user's settings.json. Fail closed with everything else.
+            raise RuntimeError(
+                "HEADROOM_CC_SWITCH_PROXY_URL missing or malformed: %r" % (_hd_ccs_url,)
+            )
+        _hd_ccs_url = _hd_ccs_url.rstrip("/")
+        _hd_ccs_orig_init = _hd_ccs_mod.CCSwitchReconciler.__init__
+
+        def _hd_ccs_init(self, *args, **kwargs):
+            _hd_ccs_orig_init(self, *args, **kwargs)
+            # Already rstripped, which is what the loop guard compares against.
+            self.proxy_url = _hd_ccs_url
+
+        _hd_ccs_mod.CCSwitchReconciler.__init__ = _hd_ccs_init
 
         def _hd_ccs_selects_official(reconciler):
             # True when settings.json names no base URL at all -- what cc-switch
@@ -2761,6 +2798,13 @@ impl ToolManager {
                         "HEADROOM_CC_SWITCH_RECONCILE",
                         cc_switch_reconcile_for_spawn(sitecustomize_injected),
                     )
+                    // The URL the reconciler writes into the client's
+                    // settings.json. Upstream advertises the port this proxy
+                    // bound, which is the internal one -- see the guard in
+                    // SITECUSTOMIZE_PY. Derived from INTERCEPT_PORT rather than
+                    // written out, because a port mismatch here is exactly the
+                    // bug being fixed.
+                    .env("HEADROOM_CC_SWITCH_PROXY_URL", cc_switch_proxy_url())
                     // Pre-upstream concurrency. The proxy's own auto is
                     // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
                     // event loop from CPU-bound compression. The desktop runs with
@@ -8125,6 +8169,12 @@ fn savings_profile_for_runtime(installed_version: Option<&str>) -> &'static str 
 /// HEADROOM_CC_SWITCH_RECONCILE before `reconciler_enabled()` reads it. Neither
 /// side needs a version bump when a wheel finally ships #3166: the patch
 /// self-neutralizes against a runtime that already resets.
+/// The URL cc-switch users' clients must be pointed at: the desktop's intercept,
+/// never the Python proxy's own port. See the guard in `SITECUSTOMIZE_PY`.
+fn cc_switch_proxy_url() -> String {
+    format!("http://127.0.0.1:{}", crate::proxy_intercept::INTERCEPT_PORT)
+}
+
 fn cc_switch_reconcile_for_spawn(sitecustomize_injected: bool) -> &'static str {
     if sitecustomize_injected {
         "1"
@@ -10055,7 +10105,8 @@ mod tests {
     use super::stalled_prefetch_cause;
     use super::{
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
-        bootstrap_requirements_lock_for_target, build_command, cc_switch_reconcile_for_spawn,
+        bootstrap_requirements_lock_for_target, build_command, cc_switch_proxy_url,
+        cc_switch_reconcile_for_spawn,
         classify_kompress_prefetch_failure, codebase_memory_distribution_artifact,
         compact_pip_failure, describe_proxy_port_occupant, diagnose_proxy_port, exe_path_is_under,
         extract_required_pydantic_core_version, format_all_foreign_bail,
@@ -12262,6 +12313,36 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         assert!(py.contains(r#"for _hd_ccs_needed in ("proxy_url", "default_upstream", "set_upstream", "path"):"#));
         // And a wrapper that does fail at runtime says so once.
         assert!(py.contains("event=cc_switch_official_reset_failed"));
+    }
+
+    /// The reconciler must point clients at the intercept, not at the port the
+    /// Python proxy bound. Upstream builds proxy_url from `config.port` -- the
+    /// internal hop -- so without this pin every cc-switch provider switch
+    /// rewrote the user's settings.json onto 6768 (or a 6769-6790 fallback),
+    /// dropping that client out of the intercept's activity feed, request
+    /// counts and savings accounting, and stranding it on the next launch that
+    /// had to move ports.
+    #[test]
+    fn cc_switch_advertises_the_intercept_port() {
+        assert_eq!(
+            cc_switch_proxy_url(),
+            format!("http://127.0.0.1:{}", crate::proxy_intercept::INTERCEPT_PORT)
+        );
+        // The port clients are configured with app-wide, spelled out here so a
+        // change to either constant has to be deliberate.
+        assert_eq!(cc_switch_proxy_url(), "http://127.0.0.1:6767");
+        assert_ne!(
+            cc_switch_proxy_url(),
+            format!("http://127.0.0.1:{}", crate::backend_port::DEFAULT_BACKEND_PORT)
+        );
+
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains(r#"_hd_os.environ.get("HEADROOM_CC_SWITCH_PROXY_URL", "")"#));
+        assert!(py.contains("_hd_ccs_mod.CCSwitchReconciler.__init__ = _hd_ccs_init"));
+        assert!(py.contains("self.proxy_url = _hd_ccs_url"));
+        // Missing or malformed falls into the same fail-closed except as the
+        // reset guard: no reconciler rather than one writing a bad base_url.
+        assert!(py.contains("HEADROOM_CC_SWITCH_PROXY_URL missing or malformed"));
     }
 
     /// Regression: `start_headroom_background` previously built `startup_variants`
