@@ -111,17 +111,31 @@ fn is_windows_session_end_panic(msg: &str) -> bool {
     msg.contains("cannot move state from Destroyed")
 }
 
+// The whole machine is out of file descriptors (ENFILE). Like disk-full this
+// is a system-wide resource the app cannot free -- it is not our per-process
+// limit, so no leak of ours is the cause and no release can change the outcome
+// -- and it fails every file touch identically, so it fragments into one
+// un-fixable issue per call site (RUST-A3 on the usage-counters write, RUST-5T
+// on the client-setup read, same class). Every affected read/write is retried
+// on its next tick and heals once the machine has descriptors again.
+//
+// ENFILE only. EMFILE ("Too many open files", os error 24) is the PER-PROCESS
+// limit and would mean we are leaking descriptors -- that one stays reportable.
+fn is_system_fd_exhaustion(msg: &str) -> bool {
+    msg.contains("Too many open files in system") // unix ENFILE
+}
+
 // Environmental or otherwise unfixable-by-release: keep the local log, never
 // send. One predicate so panics and log records answer it the same way.
 fn is_unreportable(msg: &str) -> bool {
-    is_disk_full(msg) || is_windows_session_end_panic(msg)
+    is_disk_full(msg) || is_system_fd_exhaustion(msg) || is_windows_session_end_panic(msg)
 }
 
 // Drop transient transport errors (offline laptop, flaky wifi, upstream blip)
 // from Sentry. They still hit the local log file via write_record.
 fn skip_sentry(target: &str, msg: &str) -> bool {
     // Environmental and target-agnostic: keep the local log, drop the event.
-    if is_disk_full(msg) {
+    if is_disk_full(msg) || is_system_fd_exhaustion(msg) {
         return true;
     }
     if target.starts_with("tauri_plugin_updater") {
@@ -346,6 +360,20 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("tauri_runtime_wry")
         && msg.starts_with("WebView2 error:")
         && msg.contains("HRESULT(0x8007139F)")
+    {
+        return true;
+    }
+    // The canary captures its own fully-scoped event at the emit site (flow
+    // tag, sample/zero/strata/models extras, and the fixed `zero_savings_canary`
+    // fingerprint that makes the fleet-wide event count the blast radius). This
+    // log line fires in the same breath with none of that, so one detection
+    // landed as two issues in the same millisecond: RUST-A5 (the capture) and
+    // RUST-A4 (this warn, parameterized into its own group because the counts
+    // and model list are baked into the text). Same split as the intercept-port
+    // and backend-port lines above. Keep the local log -- it is what a support
+    // thread reads -- and drop the Sentry twin.
+    if target.starts_with("headroom_desktop_lib::savings_canary")
+        && msg.starts_with("zero-savings canary:")
     {
         return true;
     }
@@ -592,6 +620,42 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::client_adapters",
             "codex retag headroom->openai: a state_*.sqlite is present but has no `threads` table under [\"~/.codex/sqlite\"]; the history menu may split. Codex likely renamed the table."
+        ));
+    }
+
+    /// One detection, two issues: the fully-scoped capture at the emit site
+    /// (RUST-A5) and this bridged log line (RUST-A4). The capture is the Sentry
+    /// path; the warn is local only.
+    #[test]
+    fn skips_the_zero_savings_canary_log_twin() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::savings_canary",
+            "zero-savings canary: 32/32 requests over 10000 tokens saved nothing (models: anthropic/glm-5.3; strata: other|new_user_ask|xl|tools)"
+        ));
+        // The emit-site capture's own wording must still reach Sentry -- it is
+        // the half that carries the fingerprint and the extras.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::savings_canary",
+            "zero_savings_canary: 32/32 large requests compressed to nothing (models: anthropic/glm-5.3; strata: other|new_user_ask|xl|tools)"
+        ));
+    }
+
+    /// ENFILE is a machine-wide resource we cannot free, and it fails every
+    /// file touch identically (RUST-A3 writing, RUST-5T reading). EMFILE is the
+    /// per-process limit and would mean we leak descriptors -- keep reporting it.
+    #[test]
+    fn skips_system_wide_fd_exhaustion_but_not_our_own() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "failed to persist usage-counters.json: writing ~/Library/Application Support/Headroom/config/usage-counters.json.tmp.22503.30753: Too many open files in system (os error 23)"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "load_setup_state: could not read ~/Library/Application Support/Headroom/config/client-setup.json twice (reading: Too many open files in system (os error 23))"
+        ));
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "failed to persist usage-counters.json: writing /tmp/x: Too many open files (os error 24)"
         ));
     }
 
