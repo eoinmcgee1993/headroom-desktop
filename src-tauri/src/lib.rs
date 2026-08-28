@@ -19,6 +19,7 @@ mod savings_canary;
 mod state;
 mod storage;
 mod tool_manager;
+mod upstream_override;
 mod usage_counters;
 
 /// Cross-module lock for tests that repoint $HOME / $CODEX_HOME. Env vars are
@@ -4259,6 +4260,134 @@ async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), S
     Ok(())
 }
 
+/// Frontend shape of the configured upstream. Separate from the persisted
+/// struct so `launch-profile.json` keeps the snake_case of every other field
+/// in it while the UI gets the camelCase it uses everywhere else. The token is
+/// never in either -- only whether one is stored.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamOverrideView {
+    mode: &'static str,
+    base_url: String,
+    has_token: bool,
+}
+
+impl From<crate::state::UpstreamOverride> for UpstreamOverrideView {
+    fn from(value: crate::state::UpstreamOverride) -> Self {
+        use crate::state::UpstreamOverrideMode::*;
+        UpstreamOverrideView {
+            mode: match value.mode {
+                Off => "off",
+                Fallback => "fallback",
+                Override => "override",
+            },
+            base_url: value.base_url,
+            has_token: value.has_token,
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_upstream_override(app: AppHandle) -> UpstreamOverrideView {
+    let state: tauri::State<'_, AppState> = app.state();
+    state.upstream_override().into()
+}
+
+/// Save the configured upstream and restart the proxy onto it.
+///
+/// `token`: `None` leaves the stored one alone (the field renders as "set" and
+/// is only sent when the user types a new one), `Some("")` clears it, anything
+/// else replaces it.
+#[tauri::command]
+async fn save_upstream_override(
+    app: AppHandle,
+    mode: String,
+    base_url: String,
+    token: Option<String>,
+) -> Result<UpstreamOverrideView, String> {
+    use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+
+    let mode = match mode.as_str() {
+        "off" => UpstreamOverrideMode::Off,
+        "fallback" => UpstreamOverrideMode::Fallback,
+        "override" => UpstreamOverrideMode::Override,
+        other => return Err(format!("unknown upstream mode: {other}")),
+    };
+
+    // Off keeps neither URL nor token: a cleared override must not leave a
+    // provider credential behind in the client config for the next launch.
+    let base_url = if mode == UpstreamOverrideMode::Off {
+        String::new()
+    } else {
+        crate::state::normalize_upstream_base_url(&base_url)?
+    };
+
+    let has_token = if mode == UpstreamOverrideMode::Off {
+        upstream_override::delete_token()?;
+        client_adapters::apply_upstream_auth_token(None).map_err(|err| err.to_string())?;
+        false
+    } else {
+        match token.as_deref() {
+            Some("") => {
+                upstream_override::delete_token()?;
+                client_adapters::apply_upstream_auth_token(None).map_err(|err| err.to_string())?;
+                false
+            }
+            Some(value) => {
+                upstream_override::write_token(value)?;
+                client_adapters::apply_upstream_auth_token(Some(value))
+                    .map_err(|err| err.to_string())?;
+                true
+            }
+            // Untouched: re-apply the stored one, because cc-switch or a hand
+            // edit may have overwritten the copy in the client's settings.
+            None => match upstream_override::read_token() {
+                Some(stored) => {
+                    client_adapters::apply_upstream_auth_token(Some(&stored))
+                        .map_err(|err| err.to_string())?;
+                    true
+                }
+                None => false,
+            },
+        }
+    };
+
+    let next = UpstreamOverride {
+        mode,
+        base_url,
+        has_token,
+    };
+    let state: tauri::State<'_, AppState> = app.state();
+    state.set_upstream_override(next.clone());
+
+    // ANTHROPIC_TARGET_API_URL is read at boot, so the running proxy is still
+    // pointed at the old upstream until it is replaced. Same hard restart the
+    // paused-banner button uses: stop_headroom kills the group so a wedged
+    // process cannot survive the change.
+    state.stop_headroom();
+    state.set_runtime_auto_paused(false);
+    state.resume_runtime().map_err(|err| err.to_string())?;
+    std::thread::spawn(|| {
+        client_adapters::restore_client_setups();
+    });
+    analytics::track_event(
+        &app,
+        "upstream_override_saved",
+        Some(json!({
+            "mode": match next.mode {
+                UpstreamOverrideMode::Off => "off",
+                UpstreamOverrideMode::Fallback => "fallback",
+                UpstreamOverrideMode::Override => "override",
+            },
+            // The endpoint itself is the user's business; only whether one and
+            // a token are set.
+            "has_base_url": !next.base_url.is_empty(),
+            "has_token": next.has_token,
+        })),
+    );
+    Ok(next.into())
+}
+
 #[tauri::command]
 async fn clear_client_setups() -> Result<(), String> {
     client_adapters::clear_client_setups().map_err(|err| err.to_string())
@@ -5070,6 +5199,8 @@ pub fn run() {
             get_client_connectors,
             disable_client_setup,
             clear_client_setups,
+            get_upstream_override,
+            save_upstream_override,
             pause_headroom,
             start_headroom,
             force_restart_headroom,

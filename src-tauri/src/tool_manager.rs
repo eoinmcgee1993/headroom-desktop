@@ -998,6 +998,25 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 "HEADROOM_CC_SWITCH_PROXY_URL missing or malformed: %r" % (_hd_ccs_url,)
             )
         _hd_ccs_url = _hd_ccs_url.rstrip("/")
+
+        # Explicit upstream override (Override mode in the app). The user named
+        # this endpoint, so a cc-switch capture must not move it; the
+        # reconciler still rewrites settings.json, which is what keeps the
+        # client on the intercept. Empty unless the desktop set both, so this
+        # is inert for everyone else.
+        _hd_ccs_pinned = ""
+        if _hd_os.environ.get("HEADROOM_CC_SWITCH_PIN_UPSTREAM", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            _hd_ccs_pinned = _hd_os.environ.get("ANTHROPIC_TARGET_API_URL", "").strip()
+            if not _hd_ccs_pinned.startswith(("http://", "https://")):
+                raise RuntimeError(
+                    "pinned upstream missing or malformed: %r" % (_hd_ccs_pinned,)
+                )
+
         _hd_ccs_orig_init = _hd_ccs_mod.CCSwitchReconciler.__init__
 
         def _hd_ccs_init(self, *args, **kwargs):
@@ -1023,13 +1042,25 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             global _hd_ccs_warned
             rewrote = _hd_ccs_orig_tick(self)
             try:
+                # With an override configured, the user's endpoint IS the
+                # default this reconciler returns to -- both when cc-switch
+                # captures something else and when it goes back to Official.
+                target = _hd_ccs_pinned or self.default_upstream
+                if _hd_ccs_pinned:
+                    if self.current_upstream != target:
+                        self.current_upstream = target
+                        self._set_upstream(target)
+                        _hd_ccs_log.info(
+                            "event=cc_switch_upstream_pinned upstream=%s", target
+                        )
+                    return rewrote
                 # Only a captured third-party upstream can go stale, and only a
                 # changed settings.json can end it. Both checks keep this off
                 # the hot path of a 0.3s poll -- an Anthropic-only user never
                 # gets past the first one. That first check is also what makes
                 # the guard self-neutralizing: a wheel carrying #3166 has
                 # already reset current_upstream by the time we look.
-                if self.current_upstream in (None, self.default_upstream):
+                if self.current_upstream in (None, target):
                     return rewrote
                 mtime_ns = self.path.stat().st_mtime_ns
                 if mtime_ns == getattr(self, "_hd_ccs_mtime_ns", None):
@@ -1038,11 +1069,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 # Read succeeded: only now is this mtime processed.
                 self._hd_ccs_mtime_ns = mtime_ns
                 if official:
-                    self.current_upstream = self.default_upstream
-                    self._set_upstream(self.default_upstream)
+                    self.current_upstream = target
+                    self._set_upstream(target)
                     _hd_ccs_log.info(
                         "event=cc_switch_official_upstream_reset upstream=%s",
-                        self.default_upstream,
+                        target,
                     )
             except Exception as exc:  # noqa: BLE001 - the watcher must not die
                 # Logged once: the reconciler is running and the reset that
@@ -2526,6 +2557,10 @@ impl ToolManager {
                 // now also costs the cc-switch Official-branch reset, so the
                 // outcome gates HEADROOM_CC_SWITCH_RECONCILE below.
                 let inject_dir = self.runtime.root_dir.join("pyinject");
+                // Read once per spawn: the env below has to see one consistent
+                // override, not three separate reads of a cache another thread
+                // could republish in between.
+                let upstream_env = upstream_spawn_env(&crate::upstream_override::get());
                 let sitecustomize_injected = match std::fs::create_dir_all(&inject_dir)
                     .and_then(|_| {
                         std::fs::write(inject_dir.join("sitecustomize.py"), SITECUSTOMIZE_PY)
@@ -2805,6 +2840,23 @@ impl ToolManager {
                     // written out, because a port mismatch here is exactly the
                     // bug being fixed.
                     .env("HEADROOM_CC_SWITCH_PROXY_URL", cc_switch_proxy_url())
+                    // User-configured upstream (GLM, Kimi, DeepSeek). Empty
+                    // for everyone who has not set one, and an empty env is
+                    // the same as unset to the runtime's _get_env_str, so this
+                    // is inert by default. In Fallback mode this is only the
+                    // boot default and a later cc-switch capture wins, which
+                    // is the runtime's own behaviour; Override additionally
+                    // pins it (see HEADROOM_CC_SWITCH_PIN_UPSTREAM).
+                    .env("ANTHROPIC_TARGET_API_URL", &upstream_env.target_api_url)
+                    .env("HEADROOM_CC_SWITCH_PIN_UPSTREAM", upstream_env.pin_upstream)
+                    // Lossless-only for a third-party endpoint: no lossy
+                    // Kompress, no CCR, so the payload shape stays close to
+                    // what the client sent while still saving tokens. These
+                    // endpoints are Anthropic-COMPATIBLE, not Anthropic, and
+                    // each one's tolerance for a rewritten payload is unknown
+                    // until it is checked. Promote a provider to the full
+                    // pipeline once it has been.
+                    .env("HEADROOM_LOSSLESS", upstream_env.lossless)
                     // Pre-upstream concurrency. The proxy's own auto is
                     // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
                     // event loop from CPU-bound compression. The desktop runs with
@@ -8169,6 +8221,34 @@ fn savings_profile_for_runtime(installed_version: Option<&str>) -> &'static str 
 /// HEADROOM_CC_SWITCH_RECONCILE before `reconciler_enabled()` reads it. Neither
 /// side needs a version bump when a wheel finally ships #3166: the patch
 /// self-neutralizes against a runtime that already resets.
+/// The env a configured upstream contributes to the backend spawn.
+struct UpstreamSpawnEnv {
+    target_api_url: String,
+    pin_upstream: &'static str,
+    lossless: &'static str,
+}
+
+/// Translate the user's override into that env.
+///
+/// All three are always set, so a spawn after the override was cleared cannot
+/// inherit the previous one from the environment. Empty is what the runtime's
+/// `_get_env_str` already treats as unset, so the default case is inert.
+///
+/// `HEADROOM_LOSSLESS` rides along with any configured upstream: these
+/// endpoints are Anthropic-COMPATIBLE rather than Anthropic, and lossless
+/// compaction keeps the payload shape close to what the client sent while
+/// still saving tokens. It is deliberately keyed on "an upstream is
+/// configured", not on the mode -- a Fallback upstream serves the same
+/// third-party endpoint.
+fn upstream_spawn_env(upstream: &crate::state::UpstreamOverride) -> UpstreamSpawnEnv {
+    let configured = upstream.configured_upstream();
+    UpstreamSpawnEnv {
+        target_api_url: configured.unwrap_or_default().to_string(),
+        pin_upstream: if upstream.pins_upstream() { "1" } else { "0" },
+        lossless: if configured.is_some() { "1" } else { "0" },
+    }
+}
+
 /// The URL cc-switch users' clients must be pointed at: the desktop's intercept,
 /// never the Python proxy's own port. See the guard in `SITECUSTOMIZE_PY`.
 fn cc_switch_proxy_url() -> String {
@@ -10178,6 +10258,7 @@ mod tests {
     use super::{
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, build_command, cc_switch_proxy_url,
+        upstream_spawn_env,
         cc_switch_reconcile_for_spawn,
         classify_kompress_prefetch_failure, codebase_memory_distribution_artifact,
         compact_pip_failure, describe_proxy_port_occupant, diagnose_proxy_port, exe_path_is_under,
@@ -12426,15 +12507,17 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         // class object, so a module-level shim would be bypassed).
         assert!(py.contains("import headroom.proxy.cc_switch_reconciler as _hd_ccs_mod"));
         assert!(py.contains("_hd_ccs_mod.CCSwitchReconciler.tick = _hd_ccs_tick"));
-        // Resets to the default upstream, through the reconciler's own setter.
-        assert!(py.contains("self._set_upstream(self.default_upstream)"));
+        // Resets through the reconciler's own setter, to the effective default
+        // (the user's endpoint when one is configured, Anthropic's otherwise).
+        assert!(py.contains("self._set_upstream(target)"));
+        assert!(py.contains("target = _hd_ccs_pinned or self.default_upstream"));
         // Every failure path -- kill switch included -- disables the watcher.
         assert!(py.contains("HEADROOM_CC_SWITCH_RESET_GUARD"));
         assert!(py.contains(r#"raise RuntimeError("cc-switch reset guard disabled by env")"#));
         assert!(py.contains(r#"_hd_os.environ["HEADROOM_CC_SWITCH_RECONCILE"] = "0""#));
         // Self-neutralizing: a wheel carrying #3166 has already reset
         // current_upstream by the time the wrapper looks.
-        assert!(py.contains("if self.current_upstream in (None, self.default_upstream):"));
+        assert!(py.contains("if self.current_upstream in (None, target):"));
         // A renamed instance attribute fails closed at bind time rather than
         // binding a wrapper that raises on every tick and resets nothing.
         assert!(py.contains(
@@ -12442,6 +12525,66 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         ));
         // And a wrapper that does fail at runtime says so once.
         assert!(py.contains("event=cc_switch_official_reset_failed"));
+    }
+
+    /// A user-configured upstream reaches the backend as env, and clearing it
+    /// has to reach the backend too: all three vars are always set, so a spawn
+    /// after "Off" cannot inherit the previous endpoint from the environment.
+    #[test]
+    fn upstream_spawn_env_carries_the_configured_endpoint() {
+        use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+
+        let off = upstream_spawn_env(&UpstreamOverride::default());
+        assert_eq!(off.target_api_url, "");
+        assert_eq!(off.pin_upstream, "0");
+        // No third-party endpoint, so the full pipeline stays on for the
+        // Anthropic users who are the overwhelming majority.
+        assert_eq!(off.lossless, "0");
+
+        let fallback = upstream_spawn_env(&UpstreamOverride {
+            mode: UpstreamOverrideMode::Fallback,
+            base_url: "https://api.z.ai/api/anthropic".into(),
+            has_token: true,
+        });
+        assert_eq!(fallback.target_api_url, "https://api.z.ai/api/anthropic");
+        // Fallback boots at the endpoint but lets a cc-switch capture win.
+        assert_eq!(fallback.pin_upstream, "0");
+        assert_eq!(fallback.lossless, "1");
+
+        let overridden = upstream_spawn_env(&UpstreamOverride {
+            mode: UpstreamOverrideMode::Override,
+            base_url: "https://api.z.ai/api/anthropic".into(),
+            has_token: true,
+        });
+        assert_eq!(overridden.pin_upstream, "1");
+        assert_eq!(overridden.lossless, "1");
+
+        // A mode with no URL is not an upstream: booting the proxy at an empty
+        // target would be worse than not configuring one.
+        let empty = upstream_spawn_env(&UpstreamOverride {
+            mode: UpstreamOverrideMode::Override,
+            base_url: String::new(),
+            has_token: false,
+        });
+        assert_eq!(empty.target_api_url, "");
+        assert_eq!(empty.pin_upstream, "0");
+        assert_eq!(empty.lossless, "0");
+    }
+
+    /// Override mode has to survive a cc-switch provider switch, and the
+    /// Official branch has to return to the user's endpoint rather than
+    /// Anthropic's -- otherwise "override" would last until the next switch.
+    #[test]
+    fn sitecustomize_pins_the_configured_upstream() {
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_CC_SWITCH_PIN_UPSTREAM"));
+        assert!(py.contains(r#"_hd_ccs_pinned = _hd_os.environ.get("ANTHROPIC_TARGET_API_URL", "").strip()"#));
+        assert!(py.contains("event=cc_switch_upstream_pinned"));
+        // The pinned endpoint becomes the default the reset returns to.
+        assert!(py.contains("target = _hd_ccs_pinned or self.default_upstream"));
+        // Pin on with nothing usable to pin to is a broken spawn, not a
+        // reason to fall back to capturing.
+        assert!(py.contains("pinned upstream missing or malformed"));
     }
 
     /// The reconciler must point clients at the intercept, not at the port the

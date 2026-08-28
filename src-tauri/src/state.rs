@@ -646,6 +646,11 @@ impl AppState {
         let runtime = ManagedRuntime::bootstrap_root(&base_dir);
         let tool_manager = ToolManager::new(runtime);
         let (launch_profile, launch_profile_path) = LaunchProfile::load_or_create(&base_dir)?;
+        // The proxy spawn reads the override through the module-level cache
+        // (no AppState in hand there, same as the backend port), so a launch
+        // has to publish what it just loaded or the first spawn of the session
+        // would boot at the default upstream.
+        crate::upstream_override::publish(launch_profile.upstream_override.clone());
         let (last_known_good_plan, last_known_good_plan_path) = LastKnownGoodPlan::load(&base_dir);
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
         let activity_facts = ActivityFacts::load_or_create(&base_dir)?;
@@ -1908,6 +1913,24 @@ impl AppState {
         }
         profile.accepted_terms_version = version;
         persist_launch_profile(&self.launch_profile_path, &profile);
+    }
+
+    pub fn upstream_override(&self) -> UpstreamOverride {
+        self.launch_profile.lock().upstream_override.clone()
+    }
+
+    /// Persist the override and publish it for the next proxy spawn. The token
+    /// is handled separately (keychain); this only records whether one exists.
+    pub fn set_upstream_override(&self, next: UpstreamOverride) {
+        {
+            let mut profile = self.launch_profile.lock();
+            if profile.upstream_override == next {
+                return;
+            }
+            profile.upstream_override = next.clone();
+            persist_launch_profile(&self.launch_profile_path, &profile);
+        }
+        crate::upstream_override::publish(next);
     }
 
     pub fn cached_clients(&self) -> Vec<ClientStatus> {
@@ -3993,6 +4016,80 @@ pub fn tail_lines(text: &str, max_lines: usize) -> Vec<String> {
     lines
 }
 
+/// How an explicitly configured upstream interacts with a cc-switch capture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamOverrideMode {
+    /// Nothing configured: the runtime default, or whatever cc-switch captures.
+    #[default]
+    Off,
+    /// Boot with the configured upstream, but let a later cc-switch capture
+    /// win. This is what the proxy does natively -- ANTHROPIC_TARGET_API_URL
+    /// sets the boot default and the reconciler overwrites it at runtime.
+    Fallback,
+    /// The configured upstream wins, including over a cc-switch capture. The
+    /// reconciler still rewrites the client's base_url back to the intercept,
+    /// it just does not get to move the upstream.
+    Override,
+}
+
+/// A user-configured Anthropic-compatible upstream (GLM, Kimi, DeepSeek).
+///
+/// The token is deliberately NOT a field here: it lives in the OS keychain and
+/// `has_token` only records that one exists, so launch-profile.json never
+/// carries a credential. Everything in this struct is safe to log.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamOverride {
+    pub mode: UpstreamOverrideMode,
+    /// Normalized by `normalize_upstream_base_url`; empty when unset.
+    pub base_url: String,
+    pub has_token: bool,
+}
+
+impl UpstreamOverride {
+    /// The upstream to boot with, or None when nothing usable is configured.
+    /// A mode without a URL is not an upstream, so it is treated as unset
+    /// rather than booting the proxy at an empty target.
+    pub fn configured_upstream(&self) -> Option<&str> {
+        if self.mode == UpstreamOverrideMode::Off || self.base_url.is_empty() {
+            return None;
+        }
+        Some(self.base_url.as_str())
+    }
+
+    /// Whether the configured upstream must survive a cc-switch capture.
+    pub fn pins_upstream(&self) -> bool {
+        self.mode == UpstreamOverrideMode::Override && self.configured_upstream().is_some()
+    }
+}
+
+/// Accept only what can safely become `ANTHROPIC_TARGET_API_URL` and be written
+/// into a user's settings.json: an absolute http(s) URL, no whitespace, no
+/// trailing slash (the reconciler's loop guard compares stripped URLs, so a
+/// trailing slash there would make every tick rewrite).
+pub fn normalize_upstream_base_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Enter the provider's base URL.".into());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("The base URL cannot contain spaces.".into());
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err("The base URL must start with http:// or https://".into());
+    }
+    let stripped = trimmed.trim_end_matches('/');
+    let host = stripped
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+        .unwrap_or("");
+    if host.is_empty() {
+        return Err("That base URL has no host.".into());
+    }
+    Ok(stripped.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct LaunchProfile {
@@ -4012,6 +4109,10 @@ struct LaunchProfile {
     /// re-prompted by the acceptance gate when `REQUIRED_TERMS_VERSION` > 0.
     #[serde(default)]
     accepted_terms_version: u32,
+    /// User-configured Anthropic-compatible upstream. Off/empty for everyone
+    /// who has not set one, which is the pre-existing behaviour.
+    #[serde(default)]
+    upstream_override: UpstreamOverride,
     /// One-shot: the "setup finished but no traffic ever" recovery
     /// notification has fired. Persisted so it can never nag twice.
     #[serde(default)]
@@ -4048,6 +4149,7 @@ impl LaunchProfile {
             last_launched_app_version: None,
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
+            upstream_override: UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
         }
@@ -8808,6 +8910,7 @@ mod tests {
             last_launched_app_version: None,
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
+            upstream_override: super::UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
         };
@@ -8834,6 +8937,7 @@ mod tests {
             last_launched_app_version: None,
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
+            upstream_override: super::UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
         };
@@ -8856,6 +8960,32 @@ mod tests {
 
     #[test]
     fn persist_launch_profile_round_trips_new_fields() {
+    /// What a user can type into the upstream field. The trailing-slash strip
+    /// is not cosmetic: the reconciler's loop guard compares a stripped url
+    /// against the configured one, so "https://host/" would make every tick
+    /// see a mismatch and rewrite settings.json.
+    #[test]
+    fn upstream_base_urls_are_normalized_or_rejected_with_a_reason() {
+        use super::normalize_upstream_base_url as norm;
+
+        assert_eq!(
+            norm("https://api.z.ai/api/anthropic").unwrap(),
+            "https://api.z.ai/api/anthropic"
+        );
+        assert_eq!(
+            norm("  https://api.z.ai/api/anthropic/  ").unwrap(),
+            "https://api.z.ai/api/anthropic"
+        );
+        // Local endpoints are a legitimate upstream (another proxy, a mock).
+        assert_eq!(norm("http://127.0.0.1:8000").unwrap(), "http://127.0.0.1:8000");
+
+        // Every rejection has to say what to fix: this text is the field error.
+        for bad in ["", "   ", "api.z.ai", "ftp://api.z.ai", "https://", "http:// api.z.ai"] {
+            let err = norm(bad).unwrap_err();
+            assert!(!err.is_empty(), "{bad:?} must be rejected with a reason");
+        }
+    }
+
         let id = uuid::Uuid::new_v4();
         let path = std::env::temp_dir().join(format!("headroom-launch-profile-test-{}.json", id));
         let profile = super::LaunchProfile {
@@ -8879,6 +9009,11 @@ mod tests {
                 rollback_restored: true,
             }),
             accepted_terms_version: 3,
+            upstream_override: super::UpstreamOverride {
+                mode: super::UpstreamOverrideMode::Override,
+                base_url: "https://api.z.ai/api/anthropic".into(),
+                has_token: true,
+            },
             onboarding_recovery_notified: true,
             first_savings_notified: true,
         };
