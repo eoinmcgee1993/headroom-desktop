@@ -9343,10 +9343,78 @@ fn context7_package_spec() -> String {
     format!("@upstash/context7-mcp@{CONTEXT7_PINNED_VERSION}")
 }
 
+/// PATH directories that would load a foreign OpenSSL into a bundled
+/// interpreter. Computed once -- our own PATH does not change under us, and
+/// this stats every entry.
+fn foreign_openssl_path_dirs() -> &'static [String] {
+    static DIRS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| crate::conflicting_openssl_dirs(&std::env::var("PATH").unwrap_or_default()))
+}
+
+/// `path_var` with every entry in `drop` removed. Pure and unconditional so it
+/// stays testable off Windows; the caller decides when it applies.
+fn path_without_dirs(path_var: &std::ffi::OsStr, drop: &[String]) -> std::ffi::OsString {
+    if drop.is_empty() {
+        return path_var.to_os_string();
+    }
+    let kept: Vec<PathBuf> = std::env::split_paths(path_var)
+        .filter(|dir| !drop.iter().any(|d| Path::new(d) == dir))
+        .collect();
+    std::env::join_paths(kept).unwrap_or_else(|_| path_var.to_os_string())
+}
+
+/// True for our managed CPython, whatever the platform names it
+/// (`python3`, `python.exe`, `pythonw.exe`).
+fn is_python_interpreter(binary: &Path) -> bool {
+    binary
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.to_ascii_lowercase().starts_with("python"))
+}
+
+/// PATH for a child of `binary`, with the binary's own directory first.
+///
+/// For our bundled interpreter the inherited PATH is filtered first. Windows
+/// resolves a DLL by base name along PATH, so a `libcrypto-3-x64.dll` left in
+/// some unrelated program's directory is loaded into our interpreter ahead of
+/// the one we ship; `_ssl.pyd` does not export `OPENSSL_Applink`, so that
+/// libcrypto aborts the instant it is used and ensurepip dies before pip speaks
+/// a word. RUST-8K was 25 relaunches into that wall on one host, RUST-A0 the
+/// same abort with a WAMP PHP directory on PATH. Until now all we could do was
+/// name the directory in the failure report and ask the user to change their
+/// own PATH; dropping it from the *child's* environment fixes it for them.
+///
+/// Scoped deliberately. Only the child's PATH changes -- the user's is
+/// untouched -- and only for the interpreter, because a directory is dropped
+/// here purely for holding an OpenSSL DLL and a non-Python child (a node CLI,
+/// say) may legitimately need to exec something else out of it. Our runtime is
+/// never on PATH, so every entry dropped is foreign by construction, and the
+/// interpreter's own directory is prepended *after* the filter so a DLL we ship
+/// beside it can never be the thing removed. Off Windows the scan finds nothing
+/// (it looks for `.dll` names) and this is a no-op.
 fn path_with_binary_dir(binary: &Path) -> std::ffi::OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let base = if is_python_interpreter(binary) {
+        let foreign = foreign_openssl_path_dirs();
+        if !foreign.is_empty() {
+            // info, not warn: this is the mitigation working. A warn would
+            // bridge to Sentry (see logging.rs) once per spawn on every machine
+            // that has any OpenSSL on PATH, which is a lot of them.
+            log::info!(
+                "dropping {} foreign OpenSSL dir(s) from the interpreter's PATH: {}",
+                foreign.len(),
+                foreign.join(", ")
+            );
+        }
+        path_without_dirs(&inherited, foreign)
+    } else {
+        inherited
+    };
     match binary.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => crate::proc::path_with_dir_prepended(dir),
-        _ => std::env::var_os("PATH").unwrap_or_default(),
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            crate::proc::path_with_dir_prepended_to(dir, &base)
+        }
+        _ => base,
     }
 }
 
@@ -10103,7 +10171,6 @@ mod tests {
 
     use chrono::Local;
 
-    use super::log_tail;
     #[cfg(windows)]
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
@@ -10134,6 +10201,7 @@ mod tests {
         MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
         UNKNOWN_OCCUPANT,
     };
+    use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
     use crate::models::ManagedTool;
     use crate::port_conflict;
@@ -10617,6 +10685,60 @@ asyncio.run(verify())
         // No bundle, or blank -> nothing to bridge.
         assert!(httpx_ca_bundle_bridge_from(false, None).is_empty());
         assert!(httpx_ca_bundle_bridge_from(false, Some("  ")).is_empty());
+    }
+
+    /// RUST-A0/RUST-8K: a foreign `libcrypto-3-x64.dll` on PATH aborts our
+    /// interpreter before pip runs. Drop those directories from the child's
+    /// PATH -- but only for the interpreter, and never the one we spawn from.
+    #[test]
+    fn foreign_openssl_dirs_are_dropped_from_the_interpreter_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let wamp = dir.path().join("wamp64").join("php");
+        let innocent = dir.path().join("tools");
+        let runtime = dir.path().join("runtime").join("Scripts");
+        for d in [&wamp, &innocent, &runtime] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // The interpreter ships its own copy beside itself; it must survive.
+        std::fs::write(wamp.join("libcrypto-3-x64.dll"), b"foreign").unwrap();
+        std::fs::write(runtime.join("libcrypto-3-x64.dll"), b"ours").unwrap();
+
+        let path_var = std::env::join_paths([&wamp, &innocent, &runtime]).unwrap();
+        let foreign = crate::conflicting_openssl_dirs(&path_var.to_string_lossy());
+        assert!(foreign.contains(&wamp.display().to_string()));
+
+        let filtered = path_without_dirs(&path_var, &foreign);
+        let kept: Vec<PathBuf> = std::env::split_paths(&filtered).collect();
+        assert!(!kept.contains(&wamp), "the foreign dir is dropped");
+        assert!(kept.contains(&innocent), "unrelated dirs are kept");
+
+        // And prepending puts the interpreter's own dir back at the front even
+        // when the scan flagged it, so a DLL we ship is never the casualty.
+        let python = runtime.join("python.exe");
+        let restored =
+            crate::proc::path_with_dir_prepended_to(python.parent().unwrap(), &filtered);
+        assert_eq!(
+            std::env::split_paths(&restored).next(),
+            Some(runtime.clone())
+        );
+
+        // Nothing to drop leaves PATH byte-identical.
+        assert_eq!(path_without_dirs(&path_var, &[]), path_var);
+    }
+
+    #[test]
+    fn only_the_interpreter_gets_the_openssl_filter() {
+        // Built with `join`, the way the real caller does: a hardcoded
+        // "C:\\...\\python.exe" literal is one string with no separators to a
+        // non-Windows `Path`, so it would assert nothing off Windows.
+        let venv: PathBuf = ["Headroom", "runtime", "venv", "Scripts"].iter().collect();
+        assert!(is_python_interpreter(&venv.join("python.exe")));
+        assert!(is_python_interpreter(&venv.join("pythonw.exe")));
+        assert!(is_python_interpreter(Path::new("/usr/bin/python3")));
+        assert!(is_python_interpreter(Path::new("python")));
+        // A node CLI may legitimately need something out of a dropped dir.
+        assert!(!is_python_interpreter(&venv.join("codex")));
+        assert!(!is_python_interpreter(Path::new("/opt/nvm/bin/node")));
     }
 
     #[test]
@@ -12315,7 +12437,9 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         assert!(py.contains("if self.current_upstream in (None, self.default_upstream):"));
         // A renamed instance attribute fails closed at bind time rather than
         // binding a wrapper that raises on every tick and resets nothing.
-        assert!(py.contains(r#"for _hd_ccs_needed in ("proxy_url", "default_upstream", "set_upstream", "path"):"#));
+        assert!(py.contains(
+            r#"for _hd_ccs_needed in ("proxy_url", "default_upstream", "set_upstream", "path"):"#
+        ));
         // And a wrapper that does fail at runtime says so once.
         assert!(py.contains("event=cc_switch_official_reset_failed"));
     }
