@@ -164,6 +164,98 @@ fn transport_level(err: &reqwest::Error) -> sentry::Level {
     }
 }
 
+/// Stable, low-cardinality name for the failure kind behind `transport_failure`.
+/// The prose in the message differs per kind, and Sentry groups on message
+/// text, so without this the same round trip splinters into one issue per
+/// phrase (RUST-7H "could not be reached" and RUST-8X "the request timed out"
+/// are one machine's one outage, filed twice).
+fn transport_failure_kind(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else {
+        "request"
+    }
+}
+
+/// Consecutive-failure throttle for the activation transport capture. The
+/// window DOUBLES per consecutive capture up to the cap, and only a round trip
+/// that actually reached the server clears it (`note_activation_reachable`).
+static ACTIVATION_TRANSPORT_WARNED_AT: std::sync::Mutex<Option<(std::time::Instant, u32)>> =
+    std::sync::Mutex::new(None);
+const ACTIVATION_TRANSPORT_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
+const ACTIVATION_TRANSPORT_WARN_MAX_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(6 * 3600);
+
+fn activation_transport_warn_interval(streak: u32) -> std::time::Duration {
+    ACTIVATION_TRANSPORT_WARN_INTERVAL
+        .saturating_mul(1u32 << streak.clamp(1, 6).saturating_sub(1))
+        .min(ACTIVATION_TRANSPORT_WARN_MAX_INTERVAL)
+}
+
+/// Clear the activation throttle: the server answered, whatever it answered.
+/// A 401 or a 500 is still proof the transport works, so the next outage warns
+/// immediately instead of inheriting a stale streak.
+fn note_activation_reachable() {
+    // Poison-tolerant like the other throttles in this file: a panic elsewhere
+    // must not turn an error-reporting path into a second crash.
+    *ACTIVATION_TRANSPORT_WARNED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Advance the activation-failure throttle and say whether this failure earns a
+/// Sentry event. Split out from the capture so the state machine is testable
+/// without manufacturing a `reqwest::Error`.
+fn claim_activation_transport_warn_slot() -> bool {
+    let mut last = ACTIVATION_TRANSPORT_WARNED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let streak = match *last {
+        Some((at, streak)) => {
+            if at.elapsed() < activation_transport_warn_interval(streak) {
+                return false;
+            }
+            streak.saturating_add(1)
+        }
+        None => 1,
+    };
+    *last = Some((std::time::Instant::now(), streak));
+    true
+}
+
+/// Report an activation round trip that never produced a response.
+///
+/// The premise this path shipped with -- "sign-in runs ~15x/day fleet-wide, so
+/// capturing every failure at Warning costs little" -- was wrong about who
+/// calls it. Activation is driven by an effect that re-fires whenever runtime
+/// reachability flaps, so a single offline machine sent 187 events in 12 hours,
+/// two of them 3 seconds apart (RUST-7H/RUST-8X). The caller now backs off, but
+/// this is the backstop: no future caller can turn one user's dead network into
+/// a Sentry flood. A non-transport failure implies something wrong on our side
+/// and is never throttled.
+fn capture_activation_transport_failure(msg: &str, err: &reqwest::Error) {
+    if !is_transient_transport_error(err) {
+        sentry::capture_message(msg, sentry::Level::Error);
+        return;
+    }
+
+    if !claim_activation_transport_warn_slot() {
+        return;
+    }
+
+    let kind = transport_failure_kind(err);
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["activation-transport-failure", kind]));
+        },
+        || {
+            sentry::capture_message(msg, sentry::Level::Warning);
+        },
+    );
+}
+
 fn plan_tier_header_value(tier: &ClaudePlanTier) -> &'static str {
     match tier {
         ClaudePlanTier::Free => "free",
@@ -1374,9 +1466,13 @@ pub(crate) fn activate_account_with_base_url(
         .send()
         .map_err(|err| {
             let msg = transport_failure("activate Headroom desktop access", &err);
-            sentry::capture_message(&msg, transport_level(&err));
+            capture_activation_transport_failure(&msg, &err);
             msg
         })?;
+    // The server answered. Whatever the status, the transport is healthy, so
+    // the next outage gets a fresh (immediate) warn rather than inheriting the
+    // streak that a previous outage left behind.
+    note_activation_reachable();
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -5891,6 +5987,137 @@ mod tests {
     }
 
     // ── activate_account / create_checkout_session / get_billing_portal_url ─
+
+    // ── activation transport throttle (RUST-7H / RUST-8X) ──────────────────
+
+    /// Sole owner of ACTIVATION_TRANSPORT_WARNED_AT in the suite; reset both
+    /// ends so ordering against other tests cannot leak a streak in.
+    #[test]
+    fn activation_transport_throttle_suppresses_a_repeating_outage() {
+        use super::{
+            activation_transport_warn_interval, claim_activation_transport_warn_slot,
+            note_activation_reachable, ACTIVATION_TRANSPORT_WARNED_AT,
+        };
+
+        note_activation_reachable();
+
+        assert!(
+            claim_activation_transport_warn_slot(),
+            "the first failure of an outage must always report"
+        );
+        assert!(
+            !claim_activation_transport_warn_slot(),
+            "a second failure inside the window must be dropped -- this is the \
+             one that sent 187 events in 12 hours"
+        );
+
+        // Age the stamp past the streak-1 window: the next failure reports and
+        // the streak advances, widening the window.
+        {
+            let mut slot = ACTIVATION_TRANSPORT_WARNED_AT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (_, streak) = slot.expect("stamped by the first claim");
+            let stale = std::time::Instant::now()
+                .checked_sub(
+                    activation_transport_warn_interval(streak) + std::time::Duration::from_secs(1),
+                )
+                .expect("clock has enough history");
+            *slot = Some((stale, streak));
+        }
+        assert!(
+            claim_activation_transport_warn_slot(),
+            "a failure past the window must report again"
+        );
+        assert_eq!(
+            ACTIVATION_TRANSPORT_WARNED_AT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap()
+                .1,
+            2,
+            "the streak must advance so the next window doubles"
+        );
+
+        note_activation_reachable();
+        assert!(
+            ACTIVATION_TRANSPORT_WARNED_AT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "a reachable server must clear the throttle"
+        );
+        assert!(
+            claim_activation_transport_warn_slot(),
+            "after recovery the next outage reports immediately"
+        );
+        note_activation_reachable();
+    }
+
+    #[test]
+    fn activation_transport_warn_interval_backs_off_and_caps() {
+        use super::{
+            activation_transport_warn_interval, ACTIVATION_TRANSPORT_WARN_INTERVAL,
+            ACTIVATION_TRANSPORT_WARN_MAX_INTERVAL,
+        };
+
+        assert_eq!(
+            activation_transport_warn_interval(1),
+            ACTIVATION_TRANSPORT_WARN_INTERVAL
+        );
+        assert_eq!(
+            activation_transport_warn_interval(2),
+            ACTIVATION_TRANSPORT_WARN_INTERVAL * 2
+        );
+        assert_eq!(
+            activation_transport_warn_interval(6),
+            ACTIVATION_TRANSPORT_WARN_MAX_INTERVAL
+        );
+        assert_eq!(
+            activation_transport_warn_interval(u32::MAX),
+            ACTIVATION_TRANSPORT_WARN_MAX_INTERVAL
+        );
+        // A streak of 0 is unreachable, but must not shift by -1.
+        assert_eq!(
+            activation_transport_warn_interval(0),
+            ACTIVATION_TRANSPORT_WARN_INTERVAL
+        );
+
+        // The bound that matters: 24h of unbroken failure, first warn at t=0.
+        let mut elapsed = std::time::Duration::ZERO;
+        let mut warns = 1u32;
+        while elapsed < std::time::Duration::from_secs(24 * 3600) {
+            elapsed += activation_transport_warn_interval(warns);
+            warns += 1;
+        }
+        assert!(
+            warns <= 10,
+            "an offline machine still floods Sentry: {warns} events/day"
+        );
+    }
+
+    /// The two phrases `transport_failure` produces for one dead network were
+    /// two Sentry issues (RUST-7H, RUST-8X). The kind tag is what regroups
+    /// them, so it must stay stable and distinct per class.
+    #[test]
+    fn transport_failure_kind_separates_connect_from_timeout() {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .expect("build client");
+        // Nothing listens on port 1: a connect failure, not a timeout.
+        let err = client
+            .get("http://127.0.0.1:1/")
+            .send()
+            .expect_err("port 1 refuses");
+        assert_eq!(super::transport_failure_kind(&err), "connect");
+        assert!(super::is_transient_transport_error(&err));
+        assert!(
+            super::transport_failure("activate Headroom desktop access", &err)
+                .contains("the server could not be reached"),
+            "the RUST-7H phrase changed; the kind tag and the prose must agree"
+        );
+    }
 
     /// Snapshot HOME / XDG_DATA_HOME, redirect them at a fresh tempdir,
     /// ensure_data_dirs, and seed a session token in the (debug) keychain

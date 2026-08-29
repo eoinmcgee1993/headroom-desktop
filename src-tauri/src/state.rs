@@ -5816,13 +5816,43 @@ impl HeadroomSavingsHistoryResponse {
 /// RUST-87 is a single mac whose 6767 belongs to another app, and the flat
 /// 15-minute window sent 96 identical events a day from that one host with no
 /// end state. A first failure still speaks immediately; only the repeats decay.
-/// A successful fetch clears the streak, so a condition that heals and comes
-/// back is loud again.
+/// A SUSTAINED run of successful fetches clears the streak, so a condition that
+/// heals and comes back is loud again. It has to be sustained: clearing on the
+/// first success made the backoff unreachable for the most common failure
+/// shape. `/stats` is a cold rebuild that finishes in ~3s idle but runs past
+/// the timeout while the proxy is busy serving a session, so a coding user
+/// alternates success, timeout, success, timeout -- and every timeout found an
+/// empty slot and warned immediately. That is RUST-86: 1066 events, no host
+/// ever reaching streak 2.
 /// ponytail: one global slot, not per-category -- a host has one cause at a
 /// time in practice; key it by category if that stops being true.
 const STATS_FETCH_WARN_INTERVAL: Duration = Duration::from_secs(900);
 const STATS_FETCH_WARN_MAX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 static STATS_FETCH_WARNED_AT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
+
+/// How long `/stats` must answer without a single failure before the backoff
+/// above is forgiven. One good poll proves nothing on a backend that only
+/// stalls under load; a clean quarter-hour means the stall is actually over.
+const STATS_FETCH_RECOVERY_WINDOW: Duration = STATS_FETCH_WARN_INTERVAL;
+/// When the current unbroken run of successful fetches began. `None` = the
+/// most recent fetch failed.
+static STATS_FETCH_HEALTHY_SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// A `/stats` fetch succeeded. Clears the warn backoff only once the run of
+/// successes has lasted `STATS_FETCH_RECOVERY_WINDOW`.
+fn note_stats_fetch_ok() {
+    let mut healthy = STATS_FETCH_HEALTHY_SINCE.lock();
+    let since = *healthy.get_or_insert_with(Instant::now);
+    if since.elapsed() >= STATS_FETCH_RECOVERY_WINDOW {
+        *STATS_FETCH_WARNED_AT.lock() = None;
+    }
+}
+
+/// A `/stats` fetch failed. Breaks the healthy run whether or not the failure
+/// is loud enough to warn -- a suppressed failure is still a failure.
+fn note_stats_fetch_failed() {
+    *STATS_FETCH_HEALTHY_SINCE.lock() = None;
+}
 
 /// Window a warn must clear before the `streak`-th consecutive one may speak:
 /// 15m, 30m, 1h, 2h, 4h, then capped. `streak` is 1-based.
@@ -5858,6 +5888,7 @@ fn stats_fetch_failure_category(reason: &str) -> String {
 }
 
 fn warn_stats_fetch_failed(reason: &str) {
+    note_stats_fetch_failed();
     let mut last = STATS_FETCH_WARNED_AT.lock();
     let streak = match *last {
         Some((at, streak)) => {
@@ -5967,8 +5998,8 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
         };
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
-            // Recovery resets the backoff: the next outage warns immediately.
-            *STATS_FETCH_WARNED_AT.lock() = None;
+            // Sustained recovery resets the backoff; see note_stats_fetch_ok.
+            note_stats_fetch_ok();
             return Some(parsed);
         }
         last_failure = Some("payload had no recognised savings fields".to_string());
@@ -7460,6 +7491,65 @@ pub(crate) fn is_session_teardown_exit(code: i32) -> bool {
     )
 }
 
+/// Exit code the Windows sweep script uses for "the process enumeration itself
+/// failed" (WMI unavailable or access-denied), as opposed to powershell's own
+/// exit codes.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const PS_SWEEP_ENUMERATION_FAILED: i32 = 3;
+
+/// Escape a value for use inside a single-quoted PowerShell `-like` pattern.
+/// `[`/`]` are wildcard metacharacters to `-like`, and an embedded `'` would
+/// close the string literal early -- a Windows username containing `'` could
+/// otherwise break out of it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn escape_powershell_like(value: &str) -> String {
+    value
+        .replace('`', "``")
+        .replace('\'', "''")
+        .replace('[', "`[")
+        .replace(']', "`]")
+}
+
+/// The PowerShell one-liner that force-kills every process whose command line
+/// matches both the executable and the argument pattern.
+///
+/// `Win32_Process.CommandLine` wraps the executable in double quotes (e.g.
+/// `"C:\...\python.exe" -m headroom.proxy.server`), so matching
+/// "{exe} {args_pattern}" as one substring never hits -- the quote right after
+/// the exe breaks the adjacency. Match the exe and the args as two independent
+/// `-like` clauses instead.
+///
+/// Excluding our own PID matters: this powershell process's `CommandLine`
+/// embeds both `-like` patterns as literals, so without the guard it matches
+/// its own filter and force-kills itself mid-pipeline -- exit -1, and the real
+/// targets after it in the enumeration are never killed (RUST-6F/6G/6H: 44
+/// events on the first 0.7.7 Windows install).
+///
+/// The script reports its own verdict rather than letting powershell infer one.
+/// `powershell -Command` exits 1 whenever the last pipeline element left `$?`
+/// false, and `-ErrorAction SilentlyContinue` suppresses the message without
+/// clearing that flag -- so a `Stop-Process` against a pid that exited on its
+/// own between the enumeration and the kill (the common case here: we just
+/// asked the proxy to stop) made a fully successful sweep look like a failure.
+/// That is the second RUST-6F/RUST-6G wave: 22 warnings from a machine where
+/// nothing was wrong. `exit 0` means the sweep ran; `PS_SWEEP_ENUMERATION_FAILED`
+/// means the enumeration itself failed, which is the only outcome worth a
+/// report. A powershell that cannot start at all reaches neither and still
+/// surfaces through its own exit code (see `is_session_teardown_exit`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_process_sweep_script(exe: &std::path::Path, args_pattern: &str) -> String {
+    let exe_pattern = escape_powershell_like(&exe.display().to_string());
+    let args_escaped = escape_powershell_like(args_pattern);
+    format!(
+        "try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
+         | Where-Object {{ $_.ProcessId -ne $PID \
+         -and $_.CommandLine -like '*{exe_pattern}*' \
+         -and $_.CommandLine -like '*{args_escaped}*' }} \
+         | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
+         catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
+    )
+}
+
 fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
     // An unresolved runtime path degrades the pattern from "our backend at this
     // exact path" to a loose substring, and `pkill -f` applies it to every
@@ -7491,31 +7581,7 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
 
     #[cfg(target_os = "windows")]
     {
-        // `Win32_Process.CommandLine` wraps the executable in double quotes
-        // (e.g. `"C:\...\python.exe" -m headroom.proxy.server`), so matching
-        // "{exe} {args_pattern}" as one substring never hits -- the quote
-        // right after the exe breaks the adjacency. Match the exe and the
-        // args as two independent `-like` clauses instead. Escape `[`/`]`
-        // (wildcard metacharacters to `-like`) and any embedded `'` (would
-        // otherwise close the single-quoted PowerShell literal early -- a
-        // Windows username containing `'` could break out of it).
-        fn escape_like(value: &str) -> String {
-            value
-                .replace('`', "``")
-                .replace('\'', "''")
-                .replace('[', "`[")
-                .replace(']', "`]")
-        }
-        let exe_pattern = escape_like(&exe.display().to_string());
-        let args_escaped = escape_like(args_pattern);
-        // Exclude our own PID: this powershell process's `CommandLine` embeds
-        // both `-like` patterns as literals, so without the guard it matches
-        // its own filter and force-kills itself mid-pipeline -- exit -1, and
-        // the real targets after it in the enumeration are never killed
-        // (RUST-6F/6G/6H: 44 events on the first 0.7.7 Windows install).
-        let script = format!(
-            "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{exe_pattern}*' -and $_.CommandLine -like '*{args_escaped}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
-        );
+        let script = windows_process_sweep_script(exe, args_pattern);
         let status = crate::proc::command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status()
@@ -7545,6 +7611,15 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
                 exe.display()
             );
             return Ok(());
+        }
+
+        if status.code() == Some(PS_SWEEP_ENUMERATION_FAILED) {
+            return Err(anyhow!(
+                "powershell could not enumerate processes (Win32_Process query failed) \
+                 for exe '{}' args '{}'",
+                exe.display(),
+                args_pattern
+            ));
         }
 
         return Err(anyhow!(
@@ -8042,8 +8117,8 @@ mod tests {
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
         hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
-        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        merge_hourly_savings, most_recent_monday, note_stats_fetch_ok,
+        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, savings_rate_implausible, settle_rollup_backfill,
         stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
@@ -8051,8 +8126,8 @@ mod tests {
         BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
         HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
         PersistedSavingsState, RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
-        STATS_FETCH_WARN_MAX_INTERVAL,
+        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_HEALTHY_SINCE, STATS_FETCH_RECOVERY_WINDOW,
+        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -10666,11 +10741,146 @@ mod tests {
         assert!(parsed.output_reduction.is_none());
     }
 
+    /// RUST-86's actual shape: the backend answers when idle and stalls when
+    /// busy, so successes and timeouts alternate. Clearing the streak on the
+    /// first success made every timeout look like a fresh outage and warn
+    /// immediately -- 1066 events with no host ever reaching streak 2.
+    #[test]
+    fn a_single_good_fetch_does_not_forgive_the_stats_backoff() {
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_HEALTHY_SINCE.lock() = None;
+
+        warn_stats_fetch_failed("timed out after 15s");
+        let (first, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
+        assert_eq!(streak, 1);
+
+        // One success, then another timeout: the flapping pattern.
+        note_stats_fetch_ok();
+        warn_stats_fetch_failed("timed out after 15s");
+        assert_eq!(
+            (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped").0,
+            first,
+            "one good poll must not re-arm the immediate warn"
+        );
+
+        // Even a long-looking run of successes is not enough while failures
+        // keep interrupting it: each failure restarts the recovery clock.
+        for _ in 0..50 {
+            note_stats_fetch_ok();
+            warn_stats_fetch_failed("timed out after 15s");
+        }
+        assert_eq!(
+            (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped").0,
+            first,
+            "an alternating backend must stay throttled"
+        );
+
+        // A genuinely sustained recovery does forgive it.
+        if let Some(stale) =
+            Instant::now().checked_sub(STATS_FETCH_RECOVERY_WINDOW + Duration::from_secs(1))
+        {
+            *STATS_FETCH_HEALTHY_SINCE.lock() = Some(stale);
+            note_stats_fetch_ok();
+            assert!(
+                (*STATS_FETCH_WARNED_AT.lock()).is_none(),
+                "a clean recovery window must clear the backoff"
+            );
+        }
+
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_HEALTHY_SINCE.lock() = None;
+    }
+
+    /// RUST-6F/RUST-6G, second wave: the sweep worked, but powershell exited 1
+    /// because a `Stop-Process` in the pipeline failed (the pid was already
+    /// gone -- we had just asked the proxy to stop), and `-ErrorAction
+    /// SilentlyContinue` hides the message without clearing `$?`. The script
+    /// must state its own verdict so a successful sweep cannot be read as a
+    /// failure, while a genuinely broken enumeration still is one.
+    #[test]
+    fn the_windows_sweep_script_reports_its_own_verdict() {
+        use super::{windows_process_sweep_script, PS_SWEEP_ENUMERATION_FAILED};
+        let script = windows_process_sweep_script(
+            std::path::Path::new(r"C:\Users\a\venv\Scripts\headroom.exe"),
+            "proxy --port",
+        );
+
+        assert!(
+            script.trim_end().ends_with("exit 0"),
+            "a sweep that ran must not inherit powershell's $?-derived exit code: {script}"
+        );
+        assert!(
+            script.contains(&format!("catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}")),
+            "a failed enumeration must stay distinguishable: {script}"
+        );
+        assert!(
+            script.contains("-ErrorAction Stop"),
+            "without this the catch never fires and every failure looks clean: {script}"
+        );
+        // The self-kill guard this script already depended on (first RUST-6F
+        // wave) must survive the rewrite.
+        assert!(
+            script.contains("$_.ProcessId -ne $PID"),
+            "lost the self-kill guard: {script}"
+        );
+        // Stop-Process stays best-effort: one unkillable pid must not abort
+        // the sweep for the rest.
+        assert!(
+            script.contains("Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue"),
+            "the kill must stay best-effort: {script}"
+        );
+
+        // The script is built from a `\`-continued literal, which strips the
+        // newline AND the next line's indentation -- so a trailing space on the
+        // wrong side of the backslash silently glues two tokens together
+        // ("$PID-and"). This only ever runs on Windows, so a slip here is
+        // invisible until a user hits it.
+        assert!(
+            !script.contains('\n'),
+            "the script must stay a single -Command line: {script}"
+        );
+        for token in [
+            " | Where-Object ",
+            " | ForEach-Object ",
+            " -and $_.CommandLine ",
+        ] {
+            assert!(
+                script.contains(token),
+                "tokens got glued together around {token:?}: {script}"
+            );
+        }
+        assert_eq!(
+            script.matches('{').count(),
+            script.matches('}').count(),
+            "unbalanced braces: {script}"
+        );
+    }
+
+    /// A `'` in a Windows username would close the single-quoted `-like`
+    /// literal early, and `[`/`]` are wildcards to `-like`.
+    #[test]
+    fn the_windows_sweep_script_escapes_hostile_paths() {
+        use super::windows_process_sweep_script;
+        let script = windows_process_sweep_script(
+            std::path::Path::new(r"C:\Users\O'Brien [dev]\venv\Scripts\headroom.exe"),
+            "proxy --port",
+        );
+        assert!(script.contains("O''Brien"), "unescaped quote: {script}");
+        assert!(script.contains("`[dev`]"), "unescaped wildcard: {script}");
+        // Every `-like` literal must still be balanced after escaping.
+        assert_eq!(
+            script.matches('\'').count() % 2,
+            0,
+            "escaping left an unbalanced string literal: {script}"
+        );
+    }
+
     #[test]
     fn stats_fetch_warn_is_throttled_within_the_window() {
         // The dashboard retries /stats every 12s and this warn bridges to
         // Sentry, so only the first failure in a window may speak.
         *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_HEALTHY_SINCE.lock() = None;
 
         warn_stats_fetch_failed("timed out after 5s");
         let (first, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");

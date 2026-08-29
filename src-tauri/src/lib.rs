@@ -238,6 +238,11 @@ static WATCHDOG_DOWN_CAPTURED: AtomicBool = AtomicBool::new(false);
 // doesn't drown in the sleep/wake / kill -9 race noise.
 static PORT_CONFLICT_CAPTURED: AtomicBool = AtomicBool::new(false);
 
+// Same once-per-session shape as PORT_CONFLICT_CAPTURED, for a runtime the
+// machine's security policy refuses to execute at all. See
+// `capture_headroom_start_failure`.
+static ENDPOINT_PROTECTION_CAPTURED: AtomicBool = AtomicBool::new(false);
+
 // Guards the quit-time `clear_client_setups()` so it runs at most once per
 // process. The exit handler fires for both `ExitRequested` and `Exit`, and a
 // second `clear_client_setups()` call is destructive: its `disable_client_setup`
@@ -2083,6 +2088,51 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
             },
             || {
                 sentry::capture_message(&truncated, sentry::Level::Warning);
+            },
+        );
+        return;
+    }
+
+    // Windows Application Control (Smart App Control / WDAC / AppLocker), an
+    // EDR agent, or Gatekeeper refusing to execute the runtime we just
+    // installed. Two things were wrong with letting this fall through:
+    //
+    //   - Level::Error, for a machine-policy verdict no release we ship can
+    //     change. `classify_startup_error` already turns it into an actionable
+    //     hint for the user; Sentry is not where that gets fixed.
+    //   - No fingerprint, so Sentry grouped on the message -- which embeds the
+    //     full proxy command line, including the port and the user's home
+    //     path. One cause, one issue per machine: RUST-AD and RUST-AC are the
+    //     same Windows host's same App Control block, filed twice because the
+    //     two call sites prefix it differently.
+    //
+    // Once per session at Warning under a stable fingerprint, so the cohort
+    // stays countable without either splintering or drowning the dashboard.
+    if is_endpoint_protection_signal(&technical_err) {
+        if ENDPOINT_PROTECTION_CAPTURED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        sentry::with_scope(
+            |scope| {
+                let fp: &[&str] = &["proxy_start_endpoint_protection"];
+                scope.set_fingerprint(Some(fp));
+                if let Some(failure) = startup_failure {
+                    scope.set_extra("program", failure.program.clone().into());
+                    scope.set_extra("args", failure.args.join(" ").into());
+                    scope.set_extra("log_path", failure.log_path.clone().into());
+                    scope.set_extra("log_tail", failure.log_tail.clone().into());
+                    scope.set_extra("reason", failure.reason.clone().into());
+                }
+                scope.set_extra("error_chain", technical_err.clone().into());
+            },
+            || {
+                sentry::capture_message(
+                    "headroom runtime blocked by endpoint protection at start",
+                    sentry::Level::Warning,
+                );
             },
         );
         return;
@@ -4123,7 +4173,12 @@ async fn apply_client_setup(
         .load(std::sync::atomic::Ordering::Acquire);
     if state.runtime_is_paused() || bypassed {
         if let Err(err) = state.resume_runtime() {
-            log::warn!("apply_client_setup: resume_runtime failed: {err:#}");
+            // Local log keeps the full chain; the capture below is the Sentry
+            // path (fingerprinted, and silent for a machine-policy block).
+            // Bridging this warn instead grouped on a message that embeds the
+            // port and the user's home path -- RUST-AD.
+            log::info!("apply_client_setup: resume_runtime failed: {err:#}");
+            capture_headroom_start_failure("apply_client_setup: resume_runtime failed", &err);
         }
     }
     match client_adapters::apply_client_setup(&client_id) {
@@ -10347,6 +10402,39 @@ Some unrelated content.
         // Localized Windows prose: only the numeric code survives.
         assert!(is_endpoint_protection_signal(
             "차단되었습니다. (os error 4551)"
+        ));
+    }
+
+    /// The exact strings RUST-AD and RUST-AC carried: one Windows host, one
+    /// App Control policy, filed as two issues because the two call sites
+    /// prefix the same error differently and neither set a fingerprint. Both
+    /// must reach the endpoint-protection branch of
+    /// `capture_headroom_start_failure`, which is what collapses them.
+    #[test]
+    fn a_windows_app_control_block_is_recognised_at_proxy_start() {
+        // Spanish Windows, verbatim from the event. Only "os error 4551"
+        // survives localization, so that is what has to carry the match.
+        let resume = "apply_client_setup: resume_runtime failed: starting headroom background \
+                      process: ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe \
+                      proxy --port 6768 --no-http2 --log-messages --no-ccr --learn \
+                      --no-memory-tools --no-memory-context --memory-db-path \
+                      ~\\AppData\\Local\\Headroom\\memory.db: Una directiva de Control de \
+                      aplicaciones bloqueó este archivo. (os error 4551)";
+        let autostart = "headroom auto-start failed after bootstrap: starting headroom \
+                         background process: ...: Una directiva de Control de aplicaciones \
+                         bloqueó este archivo. (os error 4551)";
+
+        assert!(is_endpoint_protection_signal(resume), "RUST-AD unmatched");
+        assert!(
+            is_endpoint_protection_signal(autostart),
+            "RUST-AC unmatched"
+        );
+
+        // A port conflict must NOT be swallowed by the new branch: it has its
+        // own fingerprint and its own remediation.
+        assert!(!is_endpoint_protection_signal(
+            "starting headroom background process: port 6768 is occupied by a \
+             non-headroom process"
         ));
     }
 

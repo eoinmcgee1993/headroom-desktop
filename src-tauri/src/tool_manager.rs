@@ -9678,12 +9678,37 @@ pub(crate) fn pip_index_fetch_failed(lower: &str) -> bool {
 /// regress the instant an unrelated cause reappeared (RUST-5Q). These classes
 /// match the buckets triage already sorts these into by hand.
 pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
+    pip_failure_category_with_evidence(compact, compact)
+}
+
+/// pip's whole output for a failure, for the classifiers that need evidence
+/// `compact_pip_failure` throws away. That tail starts at pip's FIRST
+/// `ERROR:` line, and pip prints its `Could not fetch URL` / `Retrying`
+/// warnings well before that -- so a starved index arrives at
+/// `pip_failure_category` looking exactly like a bad pin. RUST-90 is the
+/// result: `colorama==0.4.6`, a wheel that exists for every platform we ship,
+/// filed under `no-matching-dist`, the bucket whose whole point is "a bad pin
+/// in *our* lock". Falls back to the compact string when the error carries no
+/// `CommandFailure` (spawn failure -- there was no pip output to read).
+pub(crate) fn pip_failure_evidence(err: &anyhow::Error, compact: &str) -> String {
+    match err.chain().find_map(|c| c.downcast_ref::<CommandFailure>()) {
+        Some(failure) => format!("{}\n{}", failure.stderr, failure.stdout),
+        None => compact.to_string(),
+    }
+}
+
+/// `pip_failure_category`, but with pip's full output available separately for
+/// the index-starvation check. `compact` still decides everything else, so the
+/// buckets keep matching the message text triage reads.
+pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) -> &'static str {
     let lower = compact.to_ascii_lowercase();
+    let evidence_lower = evidence.to_ascii_lowercase();
     if lower.contains("no module named pip") {
         "no-pip"
     } else if (lower.contains("no matching distribution found")
         || lower.contains("could not find a version that satisfies"))
         && !pip_index_fetch_failed(&lower)
+        && !pip_index_fetch_failed(&evidence_lower)
     {
         // Our lock asked for a version PyPI has no wheel for on that
         // interpreter/platform (RUST-6S: onnxruntime==1.27.0 on Intel macOS,
@@ -9750,6 +9775,11 @@ pub(crate) fn pip_failure_category(compact: &str) -> &'static str {
         || lower.contains("connection")
         || lower.contains("timed out")
         || lower.contains("temporary failure in name resolution")
+        // Same truncation as above, milder symptom: pip retried through a
+        // network fault, then printed an ERROR: line that names only the
+        // package. Read the evidence before shrugging it into `other`.
+        || evidence_lower.contains("temporary failure in name resolution")
+        || evidence_lower.contains("could not fetch url")
     {
         "network"
     } else {
@@ -9854,7 +9884,10 @@ where
                         // Explicit per-category fingerprint; the bridged warn is
                         // local-only (skip_sentry rule) so this doesn't double-
                         // report. See `pip_failure_category`.
-                        let category = pip_failure_category(&compact);
+                        let category = pip_failure_category_with_evidence(
+                            &compact,
+                            &pip_failure_evidence(&err, &compact),
+                        );
                         sentry::with_scope(
                             |scope| {
                                 scope.set_fingerprint(Some(&["pip-install-failed", category]));
@@ -14802,6 +14835,66 @@ exit 0
             &mut |_| {},
         )
         .expect("child that keeps talking must not be killed");
+    }
+
+    /// RUST-90: `colorama==0.4.6` -- a pure-python wheel that exists for every
+    /// platform we ship -- filed under `no-matching-dist`, the bucket reserved
+    /// for a bad pin in our own lock. The machine's index was unreachable; pip
+    /// said so, but `compact_pip_failure` tails from the first `ERROR:` line
+    /// and pip prints `Could not fetch URL` above it. Classify against pip's
+    /// whole output, not the tail that survives into the Sentry message.
+    #[test]
+    fn a_starved_index_is_not_blamed_on_our_lock() {
+        let stderr = concat!(
+            "WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) ",
+            "after connection broken by 'SSLError(SSLCertVerificationError(1, ",
+            "'[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed'))': /simple/colorama/\n",
+            "WARNING: Could not fetch URL https://pypi.org/simple/colorama/: ",
+            "There was a problem confirming the ssl certificate - skipping\n",
+            "ERROR: Could not find a version that satisfies the requirement colorama==0.4.6 ",
+            "(from versions: none)\n",
+            "ERROR: No matching distribution found for colorama==0.4.6\n",
+        );
+        let err = pip_failure(stderr);
+        let compact = compact_pip_failure(&err);
+
+        // The evidence really is gone from the message Sentry groups on --
+        // that is the whole bug, so pin it.
+        assert!(
+            !compact.to_ascii_lowercase().contains("could not fetch url"),
+            "test no longer reproduces the truncation: {compact}"
+        );
+        assert_eq!(
+            pip_failure_category(&compact),
+            "no-matching-dist",
+            "the tail alone is genuinely ambiguous; that is why evidence is needed"
+        );
+
+        let evidence = super::pip_failure_evidence(&err, &compact);
+        assert_eq!(
+            super::pip_failure_category_with_evidence(&compact, &evidence),
+            "network",
+            "a starved index must not be filed as a bad pin in our lock"
+        );
+    }
+
+    /// The counter-case the two-signal rule exists for (RUST-6S): a pin our
+    /// lock really did get wrong. pip reached the index and listed what it
+    /// found, so nothing here may be excused as a network fault.
+    #[test]
+    fn a_genuinely_bad_pin_keeps_its_verdict() {
+        let stderr = concat!(
+            "ERROR: Could not find a version that satisfies the requirement onnxruntime==1.27.0 ",
+            "(from versions: 1.13.1, 1.22.0, 1.23.2)\n",
+            "ERROR: No matching distribution found for onnxruntime==1.27.0\n",
+        );
+        let err = pip_failure(stderr);
+        let compact = compact_pip_failure(&err);
+        let evidence = super::pip_failure_evidence(&err, &compact);
+        assert_eq!(
+            super::pip_failure_category_with_evidence(&compact, &evidence),
+            "no-matching-dist"
+        );
     }
 
     #[test]

@@ -630,6 +630,13 @@ const CANCELLATION_REASONS: { value: string; label: string }[] = [
 const authCodeExpiryFallbackSeconds = 900;
 const APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS = 12_000;
 const APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+// Desktop activation is a one-shot "this device is live" ping to headroom-web.
+// It is not worth an unbounded retry: a machine that is offline now is usually
+// offline for a while, and every attempt costs a Sentry warning. Five attempts
+// spread over ~8 minutes, then wait for the next launch.
+const DESKTOP_ACTIVATION_MAX_ATTEMPTS = 5;
+const DESKTOP_ACTIVATION_RETRY_BASE_MS = 30_000;
+const DESKTOP_ACTIVATION_RETRY_MAX_MS = 5 * 60 * 1000;
 
 async function loadDashboard(): Promise<DashboardState> {
   try {
@@ -1740,6 +1747,16 @@ export default function App() {
   const [showAllUpgradePlans, setShowAllUpgradePlans] = useState(false);
   const [checkoutPollingDeadline, setCheckoutPollingDeadline] = useState<number | null>(null);
   const desktopActivationSentRef = useRef(false);
+  // Activation retry bookkeeping. A failed attempt used to clear
+  // `desktopActivationSentRef` immediately, so the next flip of any dep below
+  // (runtime reachability flaps every time the proxy restarts) fired another
+  // attempt with no delay -- offline machines sent 187 activation failures to
+  // Sentry in 12 hours, two of them 3 seconds apart (RUST-7H/RUST-8X). Retry
+  // on a widening backoff instead, and stop after a handful: activation is
+  // best-effort, and the next app launch tries again from scratch.
+  const desktopActivationAttemptsRef = useRef(0);
+  const desktopActivationRetryTimerRef = useRef<number | undefined>(undefined);
+  const [desktopActivationRetry, setDesktopActivationRetry] = useState(0);
   // Persisted: pricing gates last days, and an app restart mid-gate used to
   // lose this set — the auto-disabled connectors then never re-enabled when
   // the gate reopened, leaving users silently unoptimized until a manual
@@ -2007,8 +2024,19 @@ export default function App() {
   useEffect(() => {
     if (!pricingStatus?.authenticated) {
       desktopActivationSentRef.current = false;
+      // Signing out and back in is an explicit user action: give it a full
+      // fresh budget rather than whatever the previous session burned.
+      desktopActivationAttemptsRef.current = 0;
+      window.clearTimeout(desktopActivationRetryTimerRef.current);
+      desktopActivationRetryTimerRef.current = undefined;
     }
   }, [pricingStatus?.authenticated]);
+
+  // Drop any pending activation retry when the app unmounts.
+  useEffect(
+    () => () => window.clearTimeout(desktopActivationRetryTimerRef.current),
+    []
+  );
 
   useEffect(() => {
     if (!pricingStatus) return;
@@ -3360,11 +3388,38 @@ export default function App() {
     }
     desktopActivationSentRef.current = true;
     void invoke<HeadroomPricingStatus>("activate_headroom_account")
-      .then((status) => setPricingStatus(status))
+      .then((status) => {
+        desktopActivationAttemptsRef.current = 0;
+        setPricingStatus(status);
+      })
       .catch(() => {
-        desktopActivationSentRef.current = false;
+        const attempts = (desktopActivationAttemptsRef.current += 1);
+        if (attempts >= DESKTOP_ACTIVATION_MAX_ATTEMPTS) {
+          // Leave the guard set: this launch is done trying. The machine is
+          // offline or headroom-web is down, and neither is something more
+          // requests fix.
+          return;
+        }
+        const delay = Math.min(
+          DESKTOP_ACTIVATION_RETRY_BASE_MS * 2 ** (attempts - 1),
+          DESKTOP_ACTIVATION_RETRY_MAX_MS
+        );
+        window.clearTimeout(desktopActivationRetryTimerRef.current);
+        desktopActivationRetryTimerRef.current = window.setTimeout(() => {
+          desktopActivationSentRef.current = false;
+          // The guard alone cannot restart the effect (no dep changed), so
+          // bump a counter the effect watches. Without it a cleared guard just
+          // waits for the next unrelated reachability flap.
+          setDesktopActivationRetry((n) => n + 1);
+        }, delay);
       });
-  }, [connectorPhase, pricingStatus?.authenticated, runtimeStatus?.proxyReachable, runtimeStatus?.running]);
+  }, [
+    connectorPhase,
+    desktopActivationRetry,
+    pricingStatus?.authenticated,
+    runtimeStatus?.proxyReachable,
+    runtimeStatus?.running,
+  ]);
 
   // While verifying, poll the proxy's /stats request counter and flip to
   // healthy when it ticks past the anchor we captured on the first reachable
