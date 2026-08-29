@@ -50,9 +50,16 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 /// PATH entry contains the separator, returns the existing PATH unchanged
 /// rather than corrupting it.
 pub fn path_with_dir_prepended(dir: &Path) -> OsString {
-    let existing = std::env::var_os("PATH").unwrap_or_default();
-    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&existing)))
-        .unwrap_or(existing)
+    path_with_dir_prepended_to(dir, &std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// As `path_with_dir_prepended`, but over a caller-supplied base instead of the
+/// process PATH -- so a caller that has already filtered the inherited PATH can
+/// still put the binary's own directory first (and keep it there, whatever the
+/// filter dropped).
+pub fn path_with_dir_prepended_to(dir: &Path, existing: &OsStr) -> OsString {
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(existing)))
+        .unwrap_or_else(|_| existing.to_os_string())
 }
 
 #[cfg(test)]

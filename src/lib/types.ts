@@ -710,3 +710,17 @@ export interface HeadroomAuthCodeRequest {
   email: string;
   expiresInSeconds: number;
 }
+
+/** How a configured provider interacts with a cc-switch provider switch. */
+export type UpstreamMode = "off" | "fallback" | "override";
+
+/**
+ * The configured Anthropic-compatible provider. Never carries the token
+ * itself, only whether one is stored: the token lives in the OS keychain and
+ * in the client's own settings.json.
+ */
+export interface UpstreamOverrideView {
+  mode: UpstreamMode;
+  baseUrl: string;
+  hasToken: boolean;
+}

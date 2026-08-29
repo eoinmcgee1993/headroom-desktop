@@ -257,7 +257,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports four fixes owed upstream (remove each once a wheel ships it),
+Also ports five fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -303,6 +303,32 @@ turn one -- upstream #3194, the 0.36.3 regression from the same lift.
 No version gate: it self-neutralizes when payload["tools"] is already
 present, and 0.36.2 has no additional_tools support either. Kill
 switch: HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
+cc-switch Official-branch upstream reset (upstream PR #3166): the
+reconciler captures the third-party endpoint cc-switch selected (Kimi,
+DeepSeek, GLM) as this proxy's Anthropic upstream, but switching back to
+Claude Official only stops it rewriting settings.json -- the captured
+endpoint stays live on HeadroomProxy.ANTHROPIC_API_URL, a process-wide
+class attr, so every Anthropic client still routed through this proxy
+keeps reaching the old provider while sending Anthropic OAuth
+credentials. The guard resets the upstream to the default when
+settings.json goes back to an empty env, and only when this reconciler
+is the one that captured a non-default upstream (an operator-configured
+upstream is left alone). Unlike the other four this one is load-bearing,
+not corrective: the desktop sets HEADROOM_CC_SWITCH_RECONCILE=1 only
+because the guard binds here, so every failure path -- kill switch,
+missing module, renamed method -- clears that env before the proxy reads
+it, and the reconciler stays off instead of running unfixed. No version
+gate: it self-neutralizes once a wheel ships #3166 (the fixed tick has
+already reset the upstream by the time the wrapper looks). Kill switch:
+HEADROOM_CC_SWITCH_RESET_GUARD=0, which turns the reconciler off with
+it.
+The same guard pins the URL the reconciler advertises to clients.
+Upstream builds it from the port this proxy bound -- the internal port
+between the desktop intercept and this process -- so every provider
+switch rewrote the client onto that port and out of the intercept, where
+the activity feed, request counts and savings accounting live. The
+desktop passes the intercept URL in HEADROOM_CC_SWITCH_PROXY_URL and the
+guard writes it onto every reconciler instance.
 """
 import faulthandler
 import signal
@@ -916,6 +942,159 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             )
     except Exception:
         pass
+
+    # cc-switch Official-branch upstream reset (upstream PR #3166, still open;
+    # remove once a wheel ships it -- see the module docstring for the misroute
+    # this prevents). Load-bearing: the desktop opts into the reconciler ONLY
+    # because this binds, so every failure path below clears
+    # HEADROOM_CC_SWITCH_RECONCILE, which the proxy reads later
+    # (reconciler_enabled(), at app creation) -- fail closed, not unfixed.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_CC_SWITCH_RESET_GUARD", "1"
+        ).strip().lower() in ("0", "false", "no", "off"):
+            raise RuntimeError("cc-switch reset guard disabled by env")
+
+        import inspect as _hd_ccs_inspect
+        import json as _hd_ccs_json
+        import logging as _hd_ccs_logging
+
+        import headroom.proxy.cc_switch_reconciler as _hd_ccs_mod
+
+        _hd_ccs_log = _hd_ccs_logging.getLogger("headroom.proxy")
+        _hd_ccs_orig_tick = _hd_ccs_mod.CCSwitchReconciler.tick
+        # The wrapper reads four instance attributes the constructor names.
+        # Checking them here means a runtime that renamed any of them fails
+        # closed at bind time, instead of binding a wrapper whose every tick
+        # raises into the swallow below and silently leaves the upstream stale.
+        _hd_ccs_params = _hd_ccs_inspect.signature(
+            _hd_ccs_mod.CCSwitchReconciler.__init__
+        ).parameters
+        for _hd_ccs_needed in ("proxy_url", "default_upstream", "set_upstream", "path"):
+            if _hd_ccs_needed not in _hd_ccs_params:
+                raise RuntimeError(
+                    "cc-switch reconciler no longer takes %r" % (_hd_ccs_needed,)
+                )
+        _hd_ccs_warned = False
+
+        # Advertise the intercept port, not the port this process bound.
+        # server.py builds the reconciler with
+        # proxy_url=f"http://127.0.0.1:{config.port}", which is the INTERNAL
+        # port between the desktop's intercept and this proxy (6768, or
+        # 6769-6790 when something else already holds 6768). Clients belong on
+        # the fixed intercept port: everything the desktop measures -- activity
+        # feed, request counts, savings accounting, stale-tool-ref sanitisation
+        # -- lives in the intercept, so a settings.json rewritten to the
+        # internal port silently drops that client out of all of it, and breaks
+        # outright on the next launch that has to take a fallback port. The
+        # desktop passes the URL it wants advertised; no upstream knob exists
+        # for this yet.
+        _hd_ccs_url = _hd_os.environ.get("HEADROOM_CC_SWITCH_PROXY_URL", "").strip()
+        if not _hd_ccs_url.startswith(("http://", "https://")):
+            # Missing or malformed while the reconciler is enabled is an
+            # inconsistent spawn, and guessing would write a bad base_url into
+            # the user's settings.json. Fail closed with everything else.
+            raise RuntimeError(
+                "HEADROOM_CC_SWITCH_PROXY_URL missing or malformed: %r" % (_hd_ccs_url,)
+            )
+        _hd_ccs_url = _hd_ccs_url.rstrip("/")
+
+        # Explicit upstream override (Override mode in the app). The user named
+        # this endpoint, so a cc-switch capture must not move it; the
+        # reconciler still rewrites settings.json, which is what keeps the
+        # client on the intercept. Empty unless the desktop set both, so this
+        # is inert for everyone else.
+        _hd_ccs_pinned = ""
+        if _hd_os.environ.get("HEADROOM_CC_SWITCH_PIN_UPSTREAM", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            _hd_ccs_pinned = _hd_os.environ.get("ANTHROPIC_TARGET_API_URL", "").strip()
+            if not _hd_ccs_pinned.startswith(("http://", "https://")):
+                raise RuntimeError(
+                    "pinned upstream missing or malformed: %r" % (_hd_ccs_pinned,)
+                )
+
+        _hd_ccs_orig_init = _hd_ccs_mod.CCSwitchReconciler.__init__
+
+        def _hd_ccs_init(self, *args, **kwargs):
+            _hd_ccs_orig_init(self, *args, **kwargs)
+            # Already rstripped, which is what the loop guard compares against.
+            self.proxy_url = _hd_ccs_url
+
+        _hd_ccs_mod.CCSwitchReconciler.__init__ = _hd_ccs_init
+
+        def _hd_ccs_selects_official(reconciler):
+            # True when settings.json names no base URL at all -- what cc-switch
+            # writes for "Claude Official" ({"env": {}}). Raises on a partial
+            # read (caught mid atomic-replace); the caller must not consume the
+            # mtime in that case.
+            data = _hd_ccs_json.loads(reconciler.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return False
+            env = data.get("env")
+            url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+            return not (isinstance(url, str) and url.strip())
+
+        def _hd_ccs_tick(self):
+            global _hd_ccs_warned
+            rewrote = _hd_ccs_orig_tick(self)
+            try:
+                # With an override configured, the user's endpoint IS the
+                # default this reconciler returns to -- both when cc-switch
+                # captures something else and when it goes back to Official.
+                target = _hd_ccs_pinned or self.default_upstream
+                if _hd_ccs_pinned:
+                    if self.current_upstream != target:
+                        self.current_upstream = target
+                        self._set_upstream(target)
+                        _hd_ccs_log.info(
+                            "event=cc_switch_upstream_pinned upstream=%s", target
+                        )
+                    return rewrote
+                # Only a captured third-party upstream can go stale, and only a
+                # changed settings.json can end it. Both checks keep this off
+                # the hot path of a 0.3s poll -- an Anthropic-only user never
+                # gets past the first one. That first check is also what makes
+                # the guard self-neutralizing: a wheel carrying #3166 has
+                # already reset current_upstream by the time we look.
+                if self.current_upstream in (None, target):
+                    return rewrote
+                mtime_ns = self.path.stat().st_mtime_ns
+                if mtime_ns == getattr(self, "_hd_ccs_mtime_ns", None):
+                    return rewrote
+                official = _hd_ccs_selects_official(self)
+                # Read succeeded: only now is this mtime processed.
+                self._hd_ccs_mtime_ns = mtime_ns
+                if official:
+                    self.current_upstream = target
+                    self._set_upstream(target)
+                    _hd_ccs_log.info(
+                        "event=cc_switch_official_upstream_reset upstream=%s",
+                        target,
+                    )
+            except Exception as exc:  # noqa: BLE001 - the watcher must not die
+                # Logged once: the reconciler is running and the reset that
+                # makes it safe just did not happen, so a captured third-party
+                # endpoint may still be live. Never silent.
+                if not _hd_ccs_warned:
+                    _hd_ccs_warned = True
+                    _hd_ccs_log.warning(
+                        "event=cc_switch_official_reset_failed err=%s "
+                        "(set HEADROOM_CC_SWITCH_RECONCILE=0 to leave cc-switch alone)",
+                        exc,
+                    )
+            return rewrote
+
+        _hd_ccs_mod.CCSwitchReconciler.tick = _hd_ccs_tick
+    except Exception:
+        # Fail closed: without the reset, a switch back to Claude Official
+        # leaves the captured third-party endpoint live process-wide and
+        # Anthropic OAuth traffic follows it. Off is always the safe answer for
+        # an opt-in flag.
+        _hd_os.environ["HEADROOM_CC_SWITCH_RECONCILE"] = "0"
 "#;
 
 /// Pre-upstream concurrency passed to the backend: 2x logical cores,
@@ -2374,13 +2553,26 @@ impl ToolManager {
                 // SIGUSR1 -> faulthandler dump of all Python threads into the
                 // proxy log (see SITECUSTOMIZE_PY). The dir holds nothing but
                 // sitecustomize.py, so PYTHONPATH can't shadow real imports.
-                // Best-effort: a failed write only costs the wedge diagnostics.
+                // A failed write used to cost only the wedge diagnostics; it
+                // now also costs the cc-switch Official-branch reset, so the
+                // outcome gates HEADROOM_CC_SWITCH_RECONCILE below.
                 let inject_dir = self.runtime.root_dir.join("pyinject");
-                if let Err(err) = std::fs::create_dir_all(&inject_dir).and_then(|_| {
-                    std::fs::write(inject_dir.join("sitecustomize.py"), SITECUSTOMIZE_PY)
-                }) {
-                    log::warn!("[tool_manager] writing pyinject/sitecustomize.py failed: {err}");
-                }
+                // Read once per spawn: the env below has to see one consistent
+                // override, not three separate reads of a cache another thread
+                // could republish in between.
+                let upstream_env = upstream_spawn_env(&crate::upstream_override::get());
+                let sitecustomize_injected = match std::fs::create_dir_all(&inject_dir)
+                    .and_then(|_| {
+                        std::fs::write(inject_dir.join("sitecustomize.py"), SITECUSTOMIZE_PY)
+                    }) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        log::warn!(
+                            "[tool_manager] writing pyinject/sitecustomize.py failed: {err}"
+                        );
+                        false
+                    }
+                };
 
                 // Drop control samples left by the abandoned 1% holdout before
                 // the 3% one starts filling the arm. One shot, stamped: from
@@ -2634,14 +2826,37 @@ impl ToolManager {
                     // rewrites env.ANTHROPIC_BASE_URL back to us, leaving the
                     // user's token untouched -- so their traffic is still
                     // compressed, and token-priced providers are exactly where
-                    // compression is worth the most. Version-gated: see
-                    // cc_switch_reconcile_for_runtime.
+                    // compression is worth the most. Safe only alongside the
+                    // Official-branch upstream reset SITECUSTOMIZE_PY carries:
+                    // see cc_switch_reconcile_for_spawn.
                     .env(
                         "HEADROOM_CC_SWITCH_RECONCILE",
-                        cc_switch_reconcile_for_runtime(
-                            self.installed_headroom_version().as_deref(),
-                        ),
+                        cc_switch_reconcile_for_spawn(sitecustomize_injected),
                     )
+                    // The URL the reconciler writes into the client's
+                    // settings.json. Upstream advertises the port this proxy
+                    // bound, which is the internal one -- see the guard in
+                    // SITECUSTOMIZE_PY. Derived from INTERCEPT_PORT rather than
+                    // written out, because a port mismatch here is exactly the
+                    // bug being fixed.
+                    .env("HEADROOM_CC_SWITCH_PROXY_URL", cc_switch_proxy_url())
+                    // User-configured upstream (GLM, Kimi, DeepSeek). Empty
+                    // for everyone who has not set one, and an empty env is
+                    // the same as unset to the runtime's _get_env_str, so this
+                    // is inert by default. In Fallback mode this is only the
+                    // boot default and a later cc-switch capture wins, which
+                    // is the runtime's own behaviour; Override additionally
+                    // pins it (see HEADROOM_CC_SWITCH_PIN_UPSTREAM).
+                    .env("ANTHROPIC_TARGET_API_URL", &upstream_env.target_api_url)
+                    .env("HEADROOM_CC_SWITCH_PIN_UPSTREAM", upstream_env.pin_upstream)
+                    // Lossless-only for a third-party endpoint: no lossy
+                    // Kompress, no CCR, so the payload shape stays close to
+                    // what the client sent while still saving tokens. These
+                    // endpoints are Anthropic-COMPATIBLE, not Anthropic, and
+                    // each one's tolerance for a rewritten payload is unknown
+                    // until it is checked. Promote a provider to the full
+                    // pipeline once it has been.
+                    .env("HEADROOM_LOSSLESS", upstream_env.lossless)
                     // Pre-upstream concurrency. The proxy's own auto is
                     // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
                     // event loop from CPU-bound compression. The desktop runs with
@@ -7439,7 +7654,7 @@ fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
 /// `None` means "could not identify the listener" — never "nothing is
 /// listening" and never "it is not ours". Both the port-reclaim kill path and
 /// the stale-argv check hang off this, so neither may treat None as evidence.
-fn listener_process(port: u16) -> Option<(String, u32)> {
+pub(crate) fn listener_process(port: u16) -> Option<(String, u32)> {
     for lsof in ["/usr/sbin/lsof", "/usr/bin/lsof"] {
         // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
         // selector (lsof ORs `-i` options) and match every listening socket on
@@ -7984,41 +8199,67 @@ fn savings_profile_for_runtime(installed_version: Option<&str>) -> &'static str 
     }
 }
 
-/// First bundled runtime carrying the cc-switch reconciler's Official-branch
-/// upstream reset (upstream PR #3166). The reconciler itself has shipped since
-/// 0.29.0, but before the reset a switch back to Claude Official left the
-/// previously captured third-party endpoint live on
-/// `HeadroomProxy.ANTHROPIC_API_URL` -- a process-wide class attr -- so every
-/// Anthropic client on this proxy kept reaching e.g. api.deepseek.com while
-/// sending Anthropic OAuth credentials. Bump this the release the fix lands in;
-/// until then the gate below keeps the flag off.
-const CC_SWITCH_RESET_MIN_VERSION: (u64, u64, u64) = (0, 36, 3);
-
-/// Whether to opt this runtime into the cc-switch reconciler.
+/// Whether to opt this spawn into the cc-switch reconciler.
 ///
-/// Defaults to off for an unreadable version and for the 0.28.0 fallback the
-/// app drops to when boot validation times out: enabling the reconciler on a
-/// runtime without the reset is worse than leaving it off, because it only
-/// misroutes AFTER the user has already switched providers once.
-fn cc_switch_reconcile_for_runtime(installed_version: Option<&str>) -> &'static str {
-    let Some(version) = installed_version else {
-        return "0";
-    };
-    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
-    let parsed = (
-        parts.next().flatten(),
-        parts.next().flatten(),
-        parts.next().flatten(),
-    );
-    match parsed {
-        (Some(major), Some(minor), Some(patch)) => {
-            if (major, minor, patch) >= CC_SWITCH_RESET_MIN_VERSION {
-                "1"
-            } else {
-                "0"
-            }
-        }
-        _ => "0",
+/// The reconciler is only safe alongside the Official-branch upstream reset:
+/// without it, a switch back to Claude Official leaves the previously captured
+/// third-party endpoint live on `HeadroomProxy.ANTHROPIC_API_URL` -- a
+/// process-wide class attr -- so every Anthropic client on this proxy keeps
+/// reaching e.g. api.deepseek.com while sending Anthropic OAuth credentials.
+///
+/// That reset is upstream PR #3166, still unmerged, so this used to be gated on
+/// the wheel version the fix was expected to land in. That gate failed OPEN: it
+/// was set to 0.36.3 as a guess, 0.36.3/0.36.4/0.36.5 all shipped without the
+/// fix, and the next pin bump would have switched the reconciler on against a
+/// runtime that still misroutes. SITECUSTOMIZE_PY now carries the reset itself,
+/// so the question is no longer "which wheel is this" but "is the patch
+/// actually in place", which the desktop can answer exactly.
+///
+/// Fail-closed on both sides: the flag is only set when this spawn wrote
+/// pyinject/sitecustomize.py, and if the patch cannot bind in-process (kill
+/// switch, module renamed, import failure) the injection clears
+/// HEADROOM_CC_SWITCH_RECONCILE before `reconciler_enabled()` reads it. Neither
+/// side needs a version bump when a wheel finally ships #3166: the patch
+/// self-neutralizes against a runtime that already resets.
+/// The env a configured upstream contributes to the backend spawn.
+struct UpstreamSpawnEnv {
+    target_api_url: String,
+    pin_upstream: &'static str,
+    lossless: &'static str,
+}
+
+/// Translate the user's override into that env.
+///
+/// All three are always set, so a spawn after the override was cleared cannot
+/// inherit the previous one from the environment. Empty is what the runtime's
+/// `_get_env_str` already treats as unset, so the default case is inert.
+///
+/// `HEADROOM_LOSSLESS` rides along with any configured upstream: these
+/// endpoints are Anthropic-COMPATIBLE rather than Anthropic, and lossless
+/// compaction keeps the payload shape close to what the client sent while
+/// still saving tokens. It is deliberately keyed on "an upstream is
+/// configured", not on the mode -- a Fallback upstream serves the same
+/// third-party endpoint.
+fn upstream_spawn_env(upstream: &crate::state::UpstreamOverride) -> UpstreamSpawnEnv {
+    let configured = upstream.configured_upstream();
+    UpstreamSpawnEnv {
+        target_api_url: configured.unwrap_or_default().to_string(),
+        pin_upstream: if upstream.pins_upstream() { "1" } else { "0" },
+        lossless: if configured.is_some() { "1" } else { "0" },
+    }
+}
+
+/// The URL cc-switch users' clients must be pointed at: the desktop's intercept,
+/// never the Python proxy's own port. See the guard in `SITECUSTOMIZE_PY`.
+fn cc_switch_proxy_url() -> String {
+    format!("http://127.0.0.1:{}", crate::proxy_intercept::INTERCEPT_PORT)
+}
+
+fn cc_switch_reconcile_for_spawn(sitecustomize_injected: bool) -> &'static str {
+    if sitecustomize_injected {
+        "1"
+    } else {
+        "0"
     }
 }
 
@@ -8093,19 +8334,24 @@ pub fn running_proxy_argv() -> Option<String> {
     ps_command(pid)
 }
 
-/// Identity of whatever is listening on `port`, for diagnostics that need to
-/// tell a foreign squatter from an orphaned old Headroom: a port that answers
-/// HTTP without the backend's routes is invisible to the readyz gate (a 404
-/// there deliberately counts as reachable), so the listener's name is the one
-/// fact that resolves the ambiguity. Best-effort: `None` where lsof is
-/// unavailable (Windows), and the caller's message must read fine without it.
-pub(crate) fn listener_identity(port: u16) -> Option<String> {
+/// Identity of whatever is listening on `port`, plus whether it is one of ours.
+///
+/// Diagnostics need to tell a foreign squatter from an orphaned old Headroom: a
+/// port that answers HTTP without the backend's routes is invisible to the
+/// readyz gate (a 404 there deliberately counts as reachable), so the listener
+/// is the one fact that resolves the ambiguity. The identity string alone
+/// cannot: "python3.12 (pid 7)" is our managed runtime on one host and an
+/// unrelated venv on the next, so ownership goes through
+/// `pid_is_headroom_backend`, which checks argv (or the executable path on
+/// Windows) rather than the process name.
+///
+/// Best-effort: `None` where lsof is unavailable (Windows) or no listener could
+/// be resolved. That is "unknown", not "foreign" -- callers must not read it as
+/// proof of either, and the caller's message must read fine without it.
+pub(crate) fn listener_identity_and_ownership(port: u16) -> Option<(String, bool)> {
     let (cmd, pid) = listener_process(port)?;
-    Some(format_listener_identity(
-        &cmd,
-        pid,
-        ps_command(pid).as_deref(),
-    ))
+    let identity = format_listener_identity(&cmd, pid, ps_command(pid).as_deref());
+    Some((identity, pid_is_headroom_backend(pid)))
 }
 
 fn format_listener_identity(cmd: &str, pid: u32, argv: Option<&str>) -> String {
@@ -9177,10 +9423,78 @@ fn context7_package_spec() -> String {
     format!("@upstash/context7-mcp@{CONTEXT7_PINNED_VERSION}")
 }
 
+/// PATH directories that would load a foreign OpenSSL into a bundled
+/// interpreter. Computed once -- our own PATH does not change under us, and
+/// this stats every entry.
+fn foreign_openssl_path_dirs() -> &'static [String] {
+    static DIRS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| crate::conflicting_openssl_dirs(&std::env::var("PATH").unwrap_or_default()))
+}
+
+/// `path_var` with every entry in `drop` removed. Pure and unconditional so it
+/// stays testable off Windows; the caller decides when it applies.
+fn path_without_dirs(path_var: &std::ffi::OsStr, drop: &[String]) -> std::ffi::OsString {
+    if drop.is_empty() {
+        return path_var.to_os_string();
+    }
+    let kept: Vec<PathBuf> = std::env::split_paths(path_var)
+        .filter(|dir| !drop.iter().any(|d| Path::new(d) == dir))
+        .collect();
+    std::env::join_paths(kept).unwrap_or_else(|_| path_var.to_os_string())
+}
+
+/// True for our managed CPython, whatever the platform names it
+/// (`python3`, `python.exe`, `pythonw.exe`).
+fn is_python_interpreter(binary: &Path) -> bool {
+    binary
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.to_ascii_lowercase().starts_with("python"))
+}
+
+/// PATH for a child of `binary`, with the binary's own directory first.
+///
+/// For our bundled interpreter the inherited PATH is filtered first. Windows
+/// resolves a DLL by base name along PATH, so a `libcrypto-3-x64.dll` left in
+/// some unrelated program's directory is loaded into our interpreter ahead of
+/// the one we ship; `_ssl.pyd` does not export `OPENSSL_Applink`, so that
+/// libcrypto aborts the instant it is used and ensurepip dies before pip speaks
+/// a word. RUST-8K was 25 relaunches into that wall on one host, RUST-A0 the
+/// same abort with a WAMP PHP directory on PATH. Until now all we could do was
+/// name the directory in the failure report and ask the user to change their
+/// own PATH; dropping it from the *child's* environment fixes it for them.
+///
+/// Scoped deliberately. Only the child's PATH changes -- the user's is
+/// untouched -- and only for the interpreter, because a directory is dropped
+/// here purely for holding an OpenSSL DLL and a non-Python child (a node CLI,
+/// say) may legitimately need to exec something else out of it. Our runtime is
+/// never on PATH, so every entry dropped is foreign by construction, and the
+/// interpreter's own directory is prepended *after* the filter so a DLL we ship
+/// beside it can never be the thing removed. Off Windows the scan finds nothing
+/// (it looks for `.dll` names) and this is a no-op.
 fn path_with_binary_dir(binary: &Path) -> std::ffi::OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let base = if is_python_interpreter(binary) {
+        let foreign = foreign_openssl_path_dirs();
+        if !foreign.is_empty() {
+            // info, not warn: this is the mitigation working. A warn would
+            // bridge to Sentry (see logging.rs) once per spawn on every machine
+            // that has any OpenSSL on PATH, which is a lot of them.
+            log::info!(
+                "dropping {} foreign OpenSSL dir(s) from the interpreter's PATH: {}",
+                foreign.len(),
+                foreign.join(", ")
+            );
+        }
+        path_without_dirs(&inherited, foreign)
+    } else {
+        inherited
+    };
     match binary.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => crate::proc::path_with_dir_prepended(dir),
-        _ => std::env::var_os("PATH").unwrap_or_default(),
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            crate::proc::path_with_dir_prepended_to(dir, &base)
+        }
+        _ => base,
     }
 }
 
@@ -9937,14 +10251,15 @@ mod tests {
 
     use chrono::Local;
 
-    use super::log_tail;
     #[cfg(windows)]
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
     use super::stalled_prefetch_cause;
     use super::{
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
-        bootstrap_requirements_lock_for_target, build_command, cc_switch_reconcile_for_runtime,
+        bootstrap_requirements_lock_for_target, build_command, cc_switch_proxy_url,
+        upstream_spawn_env,
+        cc_switch_reconcile_for_spawn,
         classify_kompress_prefetch_failure, codebase_memory_distribution_artifact,
         compact_pip_failure, describe_proxy_port_occupant, diagnose_proxy_port, exe_path_is_under,
         extract_required_pydantic_core_version, format_all_foreign_bail,
@@ -9967,6 +10282,7 @@ mod tests {
         MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
         UNKNOWN_OCCUPANT,
     };
+    use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
     use crate::models::ManagedTool;
     use crate::port_conflict;
@@ -10450,6 +10766,60 @@ asyncio.run(verify())
         // No bundle, or blank -> nothing to bridge.
         assert!(httpx_ca_bundle_bridge_from(false, None).is_empty());
         assert!(httpx_ca_bundle_bridge_from(false, Some("  ")).is_empty());
+    }
+
+    /// RUST-A0/RUST-8K: a foreign `libcrypto-3-x64.dll` on PATH aborts our
+    /// interpreter before pip runs. Drop those directories from the child's
+    /// PATH -- but only for the interpreter, and never the one we spawn from.
+    #[test]
+    fn foreign_openssl_dirs_are_dropped_from_the_interpreter_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let wamp = dir.path().join("wamp64").join("php");
+        let innocent = dir.path().join("tools");
+        let runtime = dir.path().join("runtime").join("Scripts");
+        for d in [&wamp, &innocent, &runtime] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // The interpreter ships its own copy beside itself; it must survive.
+        std::fs::write(wamp.join("libcrypto-3-x64.dll"), b"foreign").unwrap();
+        std::fs::write(runtime.join("libcrypto-3-x64.dll"), b"ours").unwrap();
+
+        let path_var = std::env::join_paths([&wamp, &innocent, &runtime]).unwrap();
+        let foreign = crate::conflicting_openssl_dirs(&path_var.to_string_lossy());
+        assert!(foreign.contains(&wamp.display().to_string()));
+
+        let filtered = path_without_dirs(&path_var, &foreign);
+        let kept: Vec<PathBuf> = std::env::split_paths(&filtered).collect();
+        assert!(!kept.contains(&wamp), "the foreign dir is dropped");
+        assert!(kept.contains(&innocent), "unrelated dirs are kept");
+
+        // And prepending puts the interpreter's own dir back at the front even
+        // when the scan flagged it, so a DLL we ship is never the casualty.
+        let python = runtime.join("python.exe");
+        let restored =
+            crate::proc::path_with_dir_prepended_to(python.parent().unwrap(), &filtered);
+        assert_eq!(
+            std::env::split_paths(&restored).next(),
+            Some(runtime.clone())
+        );
+
+        // Nothing to drop leaves PATH byte-identical.
+        assert_eq!(path_without_dirs(&path_var, &[]), path_var);
+    }
+
+    #[test]
+    fn only_the_interpreter_gets_the_openssl_filter() {
+        // Built with `join`, the way the real caller does: a hardcoded
+        // "C:\\...\\python.exe" literal is one string with no separators to a
+        // non-Windows `Path`, so it would assert nothing off Windows.
+        let venv: PathBuf = ["Headroom", "runtime", "venv", "Scripts"].iter().collect();
+        assert!(is_python_interpreter(&venv.join("python.exe")));
+        assert!(is_python_interpreter(&venv.join("pythonw.exe")));
+        assert!(is_python_interpreter(Path::new("/usr/bin/python3")));
+        assert!(is_python_interpreter(Path::new("python")));
+        // A node CLI may legitimately need something out of a dropped dir.
+        assert!(!is_python_interpreter(&venv.join("codex")));
+        assert!(!is_python_interpreter(Path::new("/opt/nvm/bin/node")));
     }
 
     #[test]
@@ -12110,29 +12480,141 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         assert_eq!(savings_profile_for_runtime(Some("garbage")), "coding");
     }
 
-    /// The cc-switch reconciler must stay off on any runtime without the
-    /// Official-branch upstream reset (upstream PR #3166). Enabling it there
-    /// leaves a captured third-party endpoint live process-wide after the user
-    /// switches back to Claude Official, so Anthropic OAuth traffic goes to the
-    /// old provider. Unlike the savings persona, an unreadable version fails
-    /// CLOSED: the flag is an opt-in, and off is always the safe answer.
+    /// The cc-switch reconciler must never run without the Official-branch
+    /// upstream reset (upstream PR #3166): enabling it there leaves a captured
+    /// third-party endpoint live process-wide after the user switches back to
+    /// Claude Official, so Anthropic OAuth traffic goes to the old provider.
+    /// The desktop ships that reset in SITECUSTOMIZE_PY, so the flag tracks
+    /// whether the injection landed -- not a wheel version, which is what the
+    /// previous gate guessed wrong (it named 0.36.3; 0.36.3, 0.36.4 and 0.36.5
+    /// all shipped without the fix).
     #[test]
-    #[serial_test::serial]
-    fn cc_switch_reconcile_gated_on_runtime_version() {
-        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.35.0")), "0");
-        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.36.2")), "0");
-        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.36.3")), "1");
-        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.37.0")), "1");
-        assert_eq!(cc_switch_reconcile_for_runtime(Some("1.0.0")), "1");
-        // Unreadable version or the 0.28.0 boot-validation fallback: stay off.
-        assert_eq!(cc_switch_reconcile_for_runtime(None), "0");
-        assert_eq!(cc_switch_reconcile_for_runtime(Some("garbage")), "0");
-        assert_eq!(cc_switch_reconcile_for_runtime(Some("0.36")), "0");
-        // The currently pinned wheel predates the fix, so this ships inert.
+    fn cc_switch_reconcile_gated_on_the_injected_reset() {
+        assert_eq!(cc_switch_reconcile_for_spawn(true), "1");
+        // Injection write failed: the reset is not in the interpreter, so the
+        // reconciler stays off rather than running unfixed.
+        assert_eq!(cc_switch_reconcile_for_spawn(false), "0");
+    }
+
+    /// The Python half of the same invariant. The guard is load-bearing, not
+    /// corrective like the other four ports: whenever it cannot bind it must
+    /// clear the env the desktop just set, because `reconciler_enabled()` reads
+    /// it later in the same process.
+    #[test]
+    fn sitecustomize_cc_switch_reset_guard_fails_closed() {
+        let py = super::SITECUSTOMIZE_PY;
+        // Patches the real entry point, on the class (server.py imports the
+        // class object, so a module-level shim would be bypassed).
+        assert!(py.contains("import headroom.proxy.cc_switch_reconciler as _hd_ccs_mod"));
+        assert!(py.contains("_hd_ccs_mod.CCSwitchReconciler.tick = _hd_ccs_tick"));
+        // Resets through the reconciler's own setter, to the effective default
+        // (the user's endpoint when one is configured, Anthropic's otherwise).
+        assert!(py.contains("self._set_upstream(target)"));
+        assert!(py.contains("target = _hd_ccs_pinned or self.default_upstream"));
+        // Every failure path -- kill switch included -- disables the watcher.
+        assert!(py.contains("HEADROOM_CC_SWITCH_RESET_GUARD"));
+        assert!(py.contains(r#"raise RuntimeError("cc-switch reset guard disabled by env")"#));
+        assert!(py.contains(r#"_hd_os.environ["HEADROOM_CC_SWITCH_RECONCILE"] = "0""#));
+        // Self-neutralizing: a wheel carrying #3166 has already reset
+        // current_upstream by the time the wrapper looks.
+        assert!(py.contains("if self.current_upstream in (None, target):"));
+        // A renamed instance attribute fails closed at bind time rather than
+        // binding a wrapper that raises on every tick and resets nothing.
+        assert!(py.contains(
+            r#"for _hd_ccs_needed in ("proxy_url", "default_upstream", "set_upstream", "path"):"#
+        ));
+        // And a wrapper that does fail at runtime says so once.
+        assert!(py.contains("event=cc_switch_official_reset_failed"));
+    }
+
+    /// A user-configured upstream reaches the backend as env, and clearing it
+    /// has to reach the backend too: all three vars are always set, so a spawn
+    /// after "Off" cannot inherit the previous endpoint from the environment.
+    #[test]
+    fn upstream_spawn_env_carries_the_configured_endpoint() {
+        use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+
+        let off = upstream_spawn_env(&UpstreamOverride::default());
+        assert_eq!(off.target_api_url, "");
+        assert_eq!(off.pin_upstream, "0");
+        // No third-party endpoint, so the full pipeline stays on for the
+        // Anthropic users who are the overwhelming majority.
+        assert_eq!(off.lossless, "0");
+
+        let fallback = upstream_spawn_env(&UpstreamOverride {
+            mode: UpstreamOverrideMode::Fallback,
+            base_url: "https://api.z.ai/api/anthropic".into(),
+            has_token: true,
+        });
+        assert_eq!(fallback.target_api_url, "https://api.z.ai/api/anthropic");
+        // Fallback boots at the endpoint but lets a cc-switch capture win.
+        assert_eq!(fallback.pin_upstream, "0");
+        assert_eq!(fallback.lossless, "1");
+
+        let overridden = upstream_spawn_env(&UpstreamOverride {
+            mode: UpstreamOverrideMode::Override,
+            base_url: "https://api.z.ai/api/anthropic".into(),
+            has_token: true,
+        });
+        assert_eq!(overridden.pin_upstream, "1");
+        assert_eq!(overridden.lossless, "1");
+
+        // A mode with no URL is not an upstream: booting the proxy at an empty
+        // target would be worse than not configuring one.
+        let empty = upstream_spawn_env(&UpstreamOverride {
+            mode: UpstreamOverrideMode::Override,
+            base_url: String::new(),
+            has_token: false,
+        });
+        assert_eq!(empty.target_api_url, "");
+        assert_eq!(empty.pin_upstream, "0");
+        assert_eq!(empty.lossless, "0");
+    }
+
+    /// Override mode has to survive a cc-switch provider switch, and the
+    /// Official branch has to return to the user's endpoint rather than
+    /// Anthropic's -- otherwise "override" would last until the next switch.
+    #[test]
+    fn sitecustomize_pins_the_configured_upstream() {
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_CC_SWITCH_PIN_UPSTREAM"));
+        assert!(py.contains(r#"_hd_ccs_pinned = _hd_os.environ.get("ANTHROPIC_TARGET_API_URL", "").strip()"#));
+        assert!(py.contains("event=cc_switch_upstream_pinned"));
+        // The pinned endpoint becomes the default the reset returns to.
+        assert!(py.contains("target = _hd_ccs_pinned or self.default_upstream"));
+        // Pin on with nothing usable to pin to is a broken spawn, not a
+        // reason to fall back to capturing.
+        assert!(py.contains("pinned upstream missing or malformed"));
+    }
+
+    /// The reconciler must point clients at the intercept, not at the port the
+    /// Python proxy bound. Upstream builds proxy_url from `config.port` -- the
+    /// internal hop -- so without this pin every cc-switch provider switch
+    /// rewrote the user's settings.json onto 6768 (or a 6769-6790 fallback),
+    /// dropping that client out of the intercept's activity feed, request
+    /// counts and savings accounting, and stranding it on the next launch that
+    /// had to move ports.
+    #[test]
+    fn cc_switch_advertises_the_intercept_port() {
         assert_eq!(
-            cc_switch_reconcile_for_runtime(Some(HEADROOM_PINNED_VERSION)),
-            "0"
+            cc_switch_proxy_url(),
+            format!("http://127.0.0.1:{}", crate::proxy_intercept::INTERCEPT_PORT)
         );
+        // The port clients are configured with app-wide, spelled out here so a
+        // change to either constant has to be deliberate.
+        assert_eq!(cc_switch_proxy_url(), "http://127.0.0.1:6767");
+        assert_ne!(
+            cc_switch_proxy_url(),
+            format!("http://127.0.0.1:{}", crate::backend_port::DEFAULT_BACKEND_PORT)
+        );
+
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains(r#"_hd_os.environ.get("HEADROOM_CC_SWITCH_PROXY_URL", "")"#));
+        assert!(py.contains("_hd_ccs_mod.CCSwitchReconciler.__init__ = _hd_ccs_init"));
+        assert!(py.contains("self.proxy_url = _hd_ccs_url"));
+        // Missing or malformed falls into the same fail-closed except as the
+        // reset guard: no reconciler rather than one writing a bad base_url.
+        assert!(py.contains("HEADROOM_CC_SWITCH_PROXY_URL missing or malformed"));
     }
 
     /// Regression: `start_headroom_background` previously built `startup_variants`
