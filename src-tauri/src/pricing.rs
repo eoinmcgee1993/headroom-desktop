@@ -164,6 +164,53 @@ fn transport_level(err: &reqwest::Error) -> sentry::Level {
     }
 }
 
+/// Low-cardinality slug for a transport failure's kind. Part of the Sentry
+/// fingerprint, so keep the values stable.
+fn transport_kind_slug(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else {
+        "other"
+    }
+}
+
+/// Capture a transport failure fingerprinted by (call site, kind).
+///
+/// `capture_message` alone groups on the shared capture site, so every failure
+/// mode of one call lands in a single issue: RUST-7H ended up holding both a
+/// genuine server-side 502 and a user's flaky Wi-Fi, which is exactly the
+/// camouflage that made an outage question unanswerable from the issue list.
+/// Splitting on the kind keeps "could not be reached" (client network) apart
+/// from "timed out" (usually a deploy switchover). `action_slug` names the call
+/// site and is also part of the fingerprint, so keep it stable too.
+fn capture_transport_failure(action_slug: &str, msg: &str, err: &reqwest::Error) {
+    let kind = transport_kind_slug(err);
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["transport-failure", action_slug, kind]));
+            scope.set_tag("transport.kind", kind);
+        },
+        || sentry::capture_message(msg, transport_level(err)),
+    );
+}
+
+/// Capture a non-success HTTP status fingerprinted by (call site, status), so a
+/// 502 thrown by the edge during a deploy switchover stays a separate issue
+/// from a 500 raised inside the handler - and neither is grouped with the
+/// transport failures above.
+fn capture_http_status(action_slug: &str, msg: &str, status: u16) {
+    let status_slug = status.to_string();
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["http-status", action_slug, status_slug.as_str()]));
+            scope.set_tag("http.status", status_slug.as_str());
+        },
+        || sentry::capture_message(msg, sentry::Level::Error),
+    );
+}
+
 fn plan_tier_header_value(tier: &ClaudePlanTier) -> &'static str {
     match tier {
         ClaudePlanTier::Free => "free",
@@ -1231,7 +1278,7 @@ pub(crate) fn request_auth_code_with_base_url(
         .send()
         .map_err(|err| {
             let msg = transport_failure("request a sign-in code", &err);
-            sentry::capture_message(&msg, transport_level(&err));
+            capture_transport_failure("auth-request-code", &msg, &err);
             msg
         })?;
 
@@ -1239,7 +1286,7 @@ pub(crate) fn request_auth_code_with_base_url(
         let status = response.status().as_u16();
         let msg = format!("Could not request sign-in code (status {status}).");
         if status >= 500 {
-            sentry::capture_message(&msg, sentry::Level::Error);
+            capture_http_status("auth-request-code", &msg, status);
         }
         return Err(msg);
     }
@@ -1294,7 +1341,7 @@ pub(crate) fn verify_auth_code_with_base_url(
         .send()
         .map_err(|err| {
             let msg = transport_failure("verify your sign-in code", &err);
-            sentry::capture_message(&msg, transport_level(&err));
+            capture_transport_failure("auth-verify-code", &msg, &err);
             msg
         })?;
 
@@ -1348,6 +1395,67 @@ pub fn sign_out() -> Result<(), String> {
     clear_session_token()
 }
 
+/// How long to wait before the single activation retry.
+///
+/// headroom-web answers this endpoint in ~8ms at p50, so a slow attempt is not
+/// load, it is a deploy switchover: Railway's edge holds the connection until
+/// its 15s cap while the replacement instance comes up, which the 8s
+/// per-attempt timeout in `http_client` turns into a guaranteed client-side
+/// failure (Sentry RUST-8X, and the "hit during a headroom-web deploy
+/// switchover" note on `transport_failure`). One retry a second later lands
+/// after the switchover instead of surfacing an error the user cannot act on.
+const ACTIVATE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Gateway-class statuses worth the one retry: the edge could not hand the
+/// request to a healthy instance, so it never reached the activation handler.
+/// 500 and 504 are deliberately excluded - there the handler did run, and may
+/// already have applied its write.
+fn is_retryable_gateway_status(status: u16) -> bool {
+    matches!(status, 502 | 503)
+}
+
+/// POST the activation request, retrying once past a deploy switchover.
+///
+/// Only the final outcome reaches Sentry: a first attempt that fails and then
+/// succeeds is a switchover the user never saw, and capturing it would keep
+/// exactly the noise the fingerprinting above is meant to cut.
+///
+/// Retrying a POST is safe here because activation is idempotent server-side -
+/// it marks an account active and returns that account's current state - so a
+/// duplicate reaching the handler is a no-op, the same reasoning that lets
+/// `post_funnel_step_with_retries` retry `desktop/grace/start`.
+fn send_activation_request(
+    identity: &IdentityPayload,
+    token: &str,
+    base_url: &str,
+    payload: &serde_json::Value,
+    retry_backoff: std::time::Duration,
+) -> Result<reqwest::blocking::Response, String> {
+    let mut retried = false;
+    loop {
+        let builder = http_client()?
+            .post(join_url(base_url, "desktop/account/activate"))
+            .header("Authorization", format!("Bearer {token}"));
+        let result = identity.apply_headers(builder).json(payload).send();
+
+        let retryable = match &result {
+            Err(err) => is_transient_transport_error(err),
+            Ok(response) => is_retryable_gateway_status(response.status().as_u16()),
+        };
+        if retryable && !retried {
+            retried = true;
+            std::thread::sleep(retry_backoff);
+            continue;
+        }
+
+        return result.map_err(|err| {
+            let msg = transport_failure("activate Headroom desktop access", &err);
+            capture_transport_failure("account-activate", &msg, &err);
+            msg
+        });
+    }
+}
+
 pub fn activate_account(
     state: &AppState,
     lifetime_tokens_saved: u64,
@@ -1362,21 +1470,28 @@ pub(crate) fn activate_account_with_base_url(
     lifetime_tokens_saved: u64,
     base_url: &str,
 ) -> Result<HeadroomPricingStatus, String> {
+    activate_account_with_retry_backoff(
+        state,
+        lifetime_tokens_saved,
+        base_url,
+        ACTIVATE_RETRY_BACKOFF,
+    )
+}
+
+/// Test-only seam: `activate_account_with_base_url` with the switchover retry
+/// backoff parameterized, so a test can exercise the retry without sleeping the
+/// production delay.
+pub(crate) fn activate_account_with_retry_backoff(
+    state: &AppState,
+    lifetime_tokens_saved: u64,
+    base_url: &str,
+    retry_backoff: std::time::Duration,
+) -> Result<HeadroomPricingStatus, String> {
     let token = read_session_token()?
         .ok_or_else(|| "Sign in to Headroom before activating desktop access.".to_string())?;
     let identity = IdentityPayload::for_state(state);
-    let builder = http_client()?
-        .post(join_url(base_url, "desktop/account/activate"))
-        .header("Authorization", format!("Bearer {token}"));
-    let response = identity
-        .apply_headers(builder)
-        .json(&serde_json::json!({ "lifetime_tokens_saved": lifetime_tokens_saved }))
-        .send()
-        .map_err(|err| {
-            let msg = transport_failure("activate Headroom desktop access", &err);
-            sentry::capture_message(&msg, transport_level(&err));
-            msg
-        })?;
+    let payload = serde_json::json!({ "lifetime_tokens_saved": lifetime_tokens_saved });
+    let response = send_activation_request(&identity, &token, base_url, &payload, retry_backoff)?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;
@@ -1387,7 +1502,7 @@ pub(crate) fn activate_account_with_base_url(
         let status = response.status().as_u16();
         let msg = format!("Could not activate Headroom desktop access (status {status}).");
         if status >= 500 {
-            sentry::capture_message(&msg, sentry::Level::Error);
+            capture_http_status("account-activate", &msg, status);
         }
         return Err(msg);
     }
@@ -6021,6 +6136,114 @@ mod tests {
             "got: {err}"
         );
         drop_state(dir);
+    }
+
+    /// Serves `first_status` once, then `sample_account_envelope_body()` with a
+    /// 200, so a test can assert the second attempt is the one that lands.
+    fn spawn_flaky_activation_server(
+        first_status: &'static str,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind flaky server");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let (status, body) = if attempt == 0 {
+                    (first_status, "{}".to_string())
+                } else {
+                    (
+                        "HTTP/1.1 200 OK",
+                        sample_account_envelope_body().to_string(),
+                    )
+                };
+                let response = format!(
+                    "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn activate_account_retries_once_past_a_gateway_error() {
+        // A 502 from the edge during a headroom-web deploy switchover must not
+        // reach the user: the replacement instance answers the retry.
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_flaky_activation_server("HTTP/1.1 502 Bad Gateway");
+        let (state, dir) = temp_app_state();
+
+        let result = super::activate_account_with_retry_backoff(
+            &state,
+            0,
+            &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::from_millis(20),
+        )
+        .expect("second attempt lands after one 502");
+
+        server.join().unwrap();
+        assert!(result.authenticated);
+        assert_eq!(
+            result.account.expect("account profile populated").email,
+            "user@example.com"
+        );
+        drop_state(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn activate_account_does_not_retry_a_server_error_that_reached_the_handler() {
+        // 500 means the handler ran and may already have written; only the
+        // gateway-class statuses are safe to repeat. One attempt, then surface.
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (port, server) = spawn_flaky_activation_server("HTTP/1.1 500 Internal Server Error");
+        let (state, dir) = temp_app_state();
+
+        let err = super::activate_account_with_retry_backoff(
+            &state,
+            0,
+            &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::from_millis(20),
+        )
+        .expect_err("500 surfaces without a retry");
+
+        assert!(err.contains("status 500"), "got: {err}");
+        drop_state(dir);
+        // The server thread still waits on its second connection; the test
+        // asserting no retry happened is precisely why it is never made, so
+        // let it be reaped at process exit rather than joining.
+        drop(server);
+    }
+
+    #[test]
+    fn retryable_gateway_statuses_are_limited_to_the_edge_class() {
+        assert!(super::is_retryable_gateway_status(502));
+        assert!(super::is_retryable_gateway_status(503));
+        // Handler-side and success statuses must never be repeated.
+        for status in [200, 401, 429, 500, 504] {
+            assert!(
+                !super::is_retryable_gateway_status(status),
+                "{status} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_kind_slug_labels_a_connect_failure() {
+        // The slug is the trailing fingerprint component, so a drift here
+        // silently re-merges issues the split was added to separate.
+        let connect = super::http_client()
+            .expect("client")
+            .post("http://127.0.0.1:1/desktop/account/activate")
+            .send()
+            .expect_err("port 1 refuses");
+        assert_eq!(super::transport_kind_slug(&connect), "connect");
     }
 
     #[test]
