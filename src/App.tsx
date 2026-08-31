@@ -5531,10 +5531,17 @@ export default function App() {
         <div className="post-install__lead">
           <h1>Test your setup</h1>
           <p>
-            Restart each tool below, then send it any message - "Say hi" is
-            enough. Tools only pick up Headroom's setting when they launch, so
-            the restart is usually the missing step. This screen ticks over by
-            itself as each one checks in.
+            Restart each tool below, then send it any message to test its connection with Headroom. 
+            "Say hi" is enough. If restarting doesn't work, contact{" "}
+            <button
+              className="install-progress__notice-link"
+              onClick={() =>
+                void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
+              type="button"
+            >
+              support@extraheadroom.com
+            </button>{" "}
+            for help.
           </p>
           {hasEnabledApps ? (
             <div className="connector-list">
