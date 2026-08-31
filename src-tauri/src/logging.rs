@@ -138,6 +138,22 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if is_disk_full(msg) || is_system_fd_exhaustion(msg) {
         return true;
     }
+    // A line announcing that a Sentry capture was skipped must never itself be
+    // captured -- the bridge forwarding it re-created exactly the event the
+    // skip existed to prevent, minus all its structure (RUST-AR: the
+    // bootstrap_failed ENOSPC skip filed 7 events). Target-agnostic on
+    // purpose: every capture site uses this phrasing.
+    if msg.starts_with("skipping Sentry capture for") {
+        return true;
+    }
+    // tiktoken prefetch is best-effort warm-up, same contract as the kompress
+    // prefetch below: the proxy lazy-loads the tokenizer on first request if
+    // the prefetch fails, and the dominant failure is the host's own
+    // network/proxy environment (RUST-AP). Local log only; the repeat
+    // suppression at the emit site already demotes follow-ups to info.
+    if target.starts_with("headroom_desktop_lib") && msg.starts_with("tiktoken prefetch failed") {
+        return true;
+    }
     if target.starts_with("tauri_plugin_updater") {
         return is_transient_transport_error(msg) || is_updater_endpoint_error(msg);
     }
@@ -598,6 +614,29 @@ pub(crate) fn log_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::skip_sentry;
+
+    #[test]
+    fn skips_capture_skip_announcements_and_tiktoken_prefetch() {
+        // RUST-AR: the skip announcement itself was bridged to Sentry.
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "skipping Sentry capture for bootstrap_failed (other): disk full (ENOSPC)"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "skipping Sentry capture for runtime_upgrade_failed (install): disk full (ENOSPC)"
+        ));
+        // RUST-AP: best-effort prefetch, lazy-load fallback exists.
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "tiktoken prefetch failed: tiktoken prefetch exited with exit code: 1"
+        ));
+        // A real bootstrap failure capture is not the skip announcement.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib",
+            "bootstrap_failed (install_runtime)"
+        ));
+    }
 
     #[test]
     fn skips_updater_transport_errors() {

@@ -9549,6 +9549,41 @@ fn strip_unsupported_proxy_env(command: &mut Command) {
     }
 }
 
+/// True when a proxy env value names a socks-scheme proxy (any variant -
+/// socks4/socks4a/socks5/socks5h), which pip's vendored requests cannot use
+/// without the optional pysocks package.
+fn is_socks_proxy_value(value: &str) -> bool {
+    value.trim().to_ascii_lowercase().starts_with("socks")
+}
+
+/// Remove socks-scheme proxy env vars from tool children. The managed venv
+/// does not ship pysocks, so every pip run under `all_proxy=socks5://...`
+/// dies with "Missing dependencies for SOCKS support" (RUST-6S) - going
+/// direct is strictly better than that guaranteed failure. http/https
+/// proxies pass through untouched, and the backend spawn is unaffected: it
+/// keeps socks5 via its own narrower `strip_unsupported_proxy_env`, because
+/// httpx vendors socksio and can actually use it.
+fn strip_socks_proxy_env(command: &mut Command) {
+    for (name, value) in std::env::vars_os() {
+        let Some(name) = name.to_str() else { continue };
+        let is_proxy_var = ["http_proxy", "https_proxy", "all_proxy"]
+            .iter()
+            .any(|p| name.eq_ignore_ascii_case(p));
+        if !is_proxy_var {
+            continue;
+        }
+        if !is_socks_proxy_value(&value.to_string_lossy()) {
+            continue;
+        }
+        // info, not warn: warn is bridged to Sentry and would re-report on
+        // every launch of an affected machine, forever.
+        log::info!(
+            "[tool_manager] dropping {name} from child env: socks proxies need pysocks, which the managed venv does not ship (pip would fail on it)"
+        );
+        command.env_remove(name);
+    }
+}
+
 /// True when the SSLKEYLOGFILE path can actually be opened for append, which
 /// is exactly what CPython's `SSLContext.keylog_filename` setter does the
 /// moment a TLS context is created. Probing with create matches those
@@ -9625,6 +9660,7 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         );
     strip_unusable_sslkeylogfile(&mut command);
+    strip_socks_proxy_env(&mut command);
     command
 }
 
@@ -13230,6 +13266,30 @@ after
             assert!(
                 !super::httpx_supports_proxy_url(bad),
                 "{bad:?} should be stripped"
+            );
+        }
+    }
+
+    /// RUST-6S: pip cannot use socks proxies without pysocks, so any socks
+    /// scheme must read as strippable for pip-class children; http/https and
+    /// the empty "proxy disabled" value pass through.
+    #[test]
+    fn socks_proxy_detection_covers_every_socks_scheme() {
+        for socks in [
+            "socks5://127.0.0.1:10808",
+            "SOCKS4://127.0.0.1:1080",
+            "socks5h://proxy.local:1080",
+            "  socks4a://127.0.0.1:9 ",
+        ] {
+            assert!(
+                super::is_socks_proxy_value(socks),
+                "{socks:?} should be stripped for pip children"
+            );
+        }
+        for other in ["", "http://127.0.0.1:8080", "https://proxy.corp:3128"] {
+            assert!(
+                !super::is_socks_proxy_value(other),
+                "{other:?} should pass through"
             );
         }
     }
