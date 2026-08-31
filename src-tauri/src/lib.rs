@@ -7392,7 +7392,21 @@ fn build_running_with_savings(
         }
     }
 
-    (out, new_w, base_h)
+    // macOS menu bars accept wide status images; everywhere else the tray
+    // cell is square and the shell squashes a wide image into it, distorting
+    // the icon. Pad to square so downscaling stays uniform.
+    if cfg!(target_os = "macos") {
+        return (out, new_w, base_h);
+    }
+    let side = nw.max(h);
+    let mut square = vec![0u8; side * side * 4];
+    let y_off = (side - h) / 2;
+    for y in 0..h {
+        let src = y * nw * 4;
+        let dst = (y + y_off) * side * 4;
+        square[dst..dst + nw * 4].copy_from_slice(&out[src..src + nw * 4]);
+    }
+    (square, side as u32, side as u32)
 }
 
 // Each glyph is [[col0, col1, col2]; 5 rows], top to bottom.
@@ -8057,6 +8071,26 @@ mod tests {
             TrayRuntimeVisual::Running
         );
         assert_eq!(unhealthy_streak, 0);
+    }
+
+    #[test]
+    fn tray_savings_icon_shape_matches_platform() {
+        let base = vec![255u8; 32 * 32 * 4];
+        let (out, w, h) = super::build_running_with_savings(&base, 32, 32, 1);
+        assert_eq!(out.len(), (w * h * 4) as usize);
+        if cfg!(target_os = "macos") {
+            // Menu bar accepts wide images: icon column plus text column.
+            assert!(w > h);
+            assert_eq!(h, 32);
+        } else {
+            // Square tray cells squash non-square images; output must be square.
+            assert_eq!(w, h);
+            assert!(w > 32);
+        }
+        // Zero dollars: base passes through untouched on every platform.
+        let (out0, w0, h0) = super::build_running_with_savings(&base, 32, 32, 0);
+        assert_eq!((w0, h0), (32, 32));
+        assert_eq!(out0, base);
     }
 
     #[test]
