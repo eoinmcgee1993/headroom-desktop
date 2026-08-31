@@ -9056,8 +9056,6 @@ mod tests {
         assert!(!super::onboarding_recovery_nudge_due(&profile));
     }
 
-    #[test]
-    fn persist_launch_profile_round_trips_new_fields() {
     /// What a user can type into the upstream field. The trailing-slash strip
     /// is not cosmetic: the reconciler's loop guard compares a stripped url
     /// against the configured one, so "https://host/" would make every tick
@@ -9075,15 +9073,27 @@ mod tests {
             "https://api.z.ai/api/anthropic"
         );
         // Local endpoints are a legitimate upstream (another proxy, a mock).
-        assert_eq!(norm("http://127.0.0.1:8000").unwrap(), "http://127.0.0.1:8000");
+        assert_eq!(
+            norm("http://127.0.0.1:8000").unwrap(),
+            "http://127.0.0.1:8000"
+        );
 
         // Every rejection has to say what to fix: this text is the field error.
-        for bad in ["", "   ", "api.z.ai", "ftp://api.z.ai", "https://", "http:// api.z.ai"] {
+        for bad in [
+            "",
+            "   ",
+            "api.z.ai",
+            "ftp://api.z.ai",
+            "https://",
+            "http:// api.z.ai",
+        ] {
             let err = norm(bad).unwrap_err();
             assert!(!err.is_empty(), "{bad:?} must be rejected with a reason");
         }
     }
 
+    #[test]
+    fn persist_launch_profile_round_trips_new_fields() {
         let id = uuid::Uuid::new_v4();
         let path = std::env::temp_dir().join(format!("headroom-launch-profile-test-{}.json", id));
         let profile = super::LaunchProfile {
