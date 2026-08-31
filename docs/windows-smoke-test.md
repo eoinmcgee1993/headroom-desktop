@@ -223,6 +223,7 @@ If RTK *is* installed, its rewrite hook filters large `curl` output into a type-
 ## When something fails
 
 - Proxy log silent → check `%LOCALAPPDATA%\Headroom\headroom\logs\` for a newer log file or a crash file.
+- Two log locations, not one bug: `%LOCALAPPDATA%\Headroom\headroom\logs\` holds the desktop-managed per-launch logs (filenames embed the *backend* port - 6768 or a fallback, never 6767 - plus the launch flags), while the live rotating wire-truth log that check 13 reads is `%USERPROFILE%\.headroom\logs\proxy.log`. The proxy answers `/stats` on 6767 because that is the intercept; the Python backend behind it is what the filename names.
 - RTK missing → check `%LOCALAPPDATA%\Headroom\headroom\bin\rtk.exe` exists; the managed blocks in `%USERPROFILE%\.claude\settings.json` / `%USERPROFILE%\.codex\config.toml` are intact.
 - MCP tool missing → restart Claude Code; the MCP server registration happens at session start.
 - Credential Manager entries missing → re-run sign-in; verify the app is the release (non-debug) build, since the Windows keyring module is only compiled in release builds.
