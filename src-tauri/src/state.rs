@@ -5816,13 +5816,29 @@ impl HeadroomSavingsHistoryResponse {
 /// RUST-87 is a single mac whose 6767 belongs to another app, and the flat
 /// 15-minute window sent 96 identical events a day from that one host with no
 /// end state. A first failure still speaks immediately; only the repeats decay.
-/// A successful fetch clears the streak, so a condition that heals and comes
-/// back is loud again.
+/// A SUSTAINED run of successes clears the streak, so a condition that truly
+/// heals and comes back is loud again. One success is NOT enough: the common
+/// starved-backend shape flaps -- a cold `/stats` rebuild crosses 15s only
+/// while the proxy is busy serving a session -- so clearing on the first
+/// success reset the backoff between every pair of timeouts and the streak
+/// never reached 2. That is how RUST-86 sent 97 events in 2 days from a single
+/// host: the flat-window volume this backoff exists to prevent. The streak
+/// clears only after `STATS_FETCH_RECOVERY_WINDOW` of unbroken successes; any
+/// failure restarts that run.
 /// ponytail: one global slot, not per-category -- a host has one cause at a
 /// time in practice; key it by category if that stops being true.
 const STATS_FETCH_WARN_INTERVAL: Duration = Duration::from_secs(900);
 const STATS_FETCH_WARN_MAX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// How long `/stats` must fetch cleanly before a recovery counts as real. The
+/// dashboard polls every 12s, so this is ~25 consecutive good fetches -- long
+/// enough that a busy-proxy flap cannot span it, short enough that a genuine
+/// fix is loud again within one sitting.
+const STATS_FETCH_RECOVERY_WINDOW: Duration = Duration::from_secs(300);
 static STATS_FETCH_WARNED_AT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
+/// When the current unbroken run of successful fetches began; `None` when the
+/// last fetch failed or nothing has failed yet.
+/// Lock order: take `STATS_FETCH_WARNED_AT` before this one.
+static STATS_FETCH_RECOVERED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Window a warn must clear before the `streak`-th consecutive one may speak:
 /// 15m, 30m, 1h, 2h, 4h, then capped. `streak` is 1-based.
@@ -5859,6 +5875,9 @@ fn stats_fetch_failure_category(reason: &str) -> String {
 
 fn warn_stats_fetch_failed(reason: &str) {
     let mut last = STATS_FETCH_WARNED_AT.lock();
+    // Any failure breaks the recovery run -- including one this window
+    // throttles, which is still evidence the condition has not healed.
+    *STATS_FETCH_RECOVERED_AT.lock() = None;
     let streak = match *last {
         Some((at, streak)) => {
             if at.elapsed() < stats_fetch_warn_interval(streak) {
@@ -5914,6 +5933,35 @@ fn warn_stats_fetch_failed(reason: &str) {
     log::warn!("{message}");
 }
 
+/// Record a successful `/stats` fetch, clearing the warn backoff only once the
+/// successes have been unbroken for `STATS_FETCH_RECOVERY_WINDOW`.
+///
+/// The window is what makes the backoff hold under a FLAPPING cause. Resetting
+/// on the first success meant a host alternating timeout/success re-armed an
+/// immediate warn every poll, so the streak never advanced past 1 and the
+/// 15m..6h decay never applied (RUST-86).
+fn note_stats_fetch_success() {
+    let mut warned = STATS_FETCH_WARNED_AT.lock();
+    let mut recovered = STATS_FETCH_RECOVERED_AT.lock();
+    if warned.is_none() {
+        // No outage to recover from; keep the marker clear so the next
+        // failure's first warn still speaks immediately.
+        *recovered = None;
+        return;
+    }
+    match *recovered {
+        // The run has spanned the window: the cause is really gone.
+        Some(since) if since.elapsed() >= STATS_FETCH_RECOVERY_WINDOW => {
+            *warned = None;
+            *recovered = None;
+        }
+        // Run in progress but too short to trust yet.
+        Some(_) => {}
+        // First success after a failure: start timing the run.
+        None => *recovered = Some(Instant::now()),
+    }
+}
+
 fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     if !is_headroom_proxy_reachable() {
         return None;
@@ -5967,8 +6015,9 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
         };
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
-            // Recovery resets the backoff: the next outage warns immediately.
-            *STATS_FETCH_WARNED_AT.lock() = None;
+            // Only a SUSTAINED recovery resets the backoff; a lone success
+            // between two timeouts must not (see STATS_FETCH_RECOVERY_WINDOW).
+            note_stats_fetch_success();
             return Some(parsed);
         }
         last_failure = Some("payload had no recognised savings fields".to_string());
@@ -8042,8 +8091,8 @@ mod tests {
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
         hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
-        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
+        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, savings_rate_implausible, settle_rollup_backfill,
         stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
@@ -8051,8 +8100,8 @@ mod tests {
         BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
         HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
         PersistedSavingsState, RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
-        STATS_FETCH_WARN_MAX_INTERVAL,
+        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW,
+        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -10667,6 +10716,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(stats_fetch_warn)]
     fn stats_fetch_warn_is_throttled_within_the_window() {
         // The dashboard retries /stats every 12s and this warn bridges to
         // Sentry, so only the first failure in a window may speak.
@@ -10710,6 +10760,62 @@ mod tests {
         }
 
         *STATS_FETCH_WARNED_AT.lock() = None;
+    }
+
+    #[test]
+    #[serial_test::serial(stats_fetch_warn)]
+    fn a_lone_success_between_failures_does_not_reset_the_backoff() {
+        // RUST-86: a starved backend flaps -- /stats times out only while the
+        // proxy is busy -- so timeout/success/timeout was the common shape.
+        // Clearing the streak on the FIRST success re-armed an immediate warn
+        // every poll, so the streak never advanced past 1 and the 15m..6h
+        // decay never applied: 97 events in 2 days from one host.
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_RECOVERED_AT.lock() = None;
+
+        warn_stats_fetch_failed("timed out after 15s");
+        let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
+        assert_eq!(streak, 1);
+
+        // One good poll starts a recovery run but must NOT clear the streak.
+        note_stats_fetch_success();
+        let (stamped, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("streak survives");
+        assert_eq!(streak, 1, "a lone success must not clear the backoff");
+        assert!(
+            (*STATS_FETCH_RECOVERED_AT.lock()).is_some(),
+            "the success starts timing a recovery run"
+        );
+
+        // The next failure warns only when the window has elapsed, and it
+        // breaks the recovery run.
+        warn_stats_fetch_failed("timed out after 15s");
+        assert_eq!(
+            (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped").0,
+            stamped,
+            "the flap must stay throttled, not warn again immediately"
+        );
+        assert!(
+            (*STATS_FETCH_RECOVERED_AT.lock()).is_none(),
+            "a failure restarts the recovery run"
+        );
+
+        // A run that spans the window is a real recovery: the streak clears
+        // and the next outage is loud again.
+        if let Some(stale) = Instant::now().checked_sub(STATS_FETCH_RECOVERY_WINDOW) {
+            *STATS_FETCH_RECOVERED_AT.lock() = Some(stale);
+            note_stats_fetch_success();
+            assert!(
+                (*STATS_FETCH_WARNED_AT.lock()).is_none(),
+                "a sustained recovery clears the backoff"
+            );
+
+            warn_stats_fetch_failed("timed out after 15s");
+            let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("loud again");
+            assert_eq!(streak, 1, "a healed-then-broken cause warns immediately");
+        }
+
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_RECOVERED_AT.lock() = None;
     }
 
     #[test]

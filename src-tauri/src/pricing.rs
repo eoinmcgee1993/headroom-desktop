@@ -176,7 +176,37 @@ fn transport_kind_slug(err: &reqwest::Error) -> &'static str {
     }
 }
 
-/// Capture a transport failure fingerprinted by (call site, kind).
+/// (action, kind) pairs that have already reported a TRANSIENT transport
+/// failure this session, so the repeats can be dropped.
+static TRANSIENT_TRANSPORT_REPORTED: std::sync::Mutex<
+    Option<std::collections::HashSet<(&'static str, &'static str)>>,
+> = std::sync::Mutex::new(None);
+
+/// Say whether a transient transport failure for `(action_slug, kind)` may
+/// still report this session.
+///
+/// Issue #58 wants the user count, and capturing every transient failure did
+/// deliver it -- then kept charging for it. The desktop-activation effect
+/// re-fires whenever the runtime-health signal flaps (a 3s poll drives it), so
+/// four persistently-offline machines produced RUST-7H: 229 events in 4 days,
+/// all of them the same four users re-reporting a captive portal. The first
+/// failure per (action, kind) still speaks, so `users_impacted` -- the number
+/// issue #58 actually asked for -- is unchanged; only the per-host repetition
+/// goes. Keyed by kind as well as action so a connect failure reported early
+/// in a session cannot swallow a later, differently-caused timeout: those are
+/// separate Sentry issues by design (see `capture_transport_failure`).
+fn claim_transient_report_slot(action_slug: &'static str, kind: &'static str) -> bool {
+    let mut seen = TRANSIENT_TRANSPORT_REPORTED.lock().unwrap_or_else(|e| {
+        // A poisoned lock must not silence reporting outright.
+        TRANSIENT_TRANSPORT_REPORTED.clear_poison();
+        e.into_inner()
+    });
+    seen.get_or_insert_with(std::collections::HashSet::new)
+        .insert((action_slug, kind))
+}
+
+/// Capture a transport failure fingerprinted by (call site, kind), with the
+/// transient class capped at one event per (call site, kind) per session.
 ///
 /// `capture_message` alone groups on the shared capture site, so every failure
 /// mode of one call lands in a single issue: RUST-7H ended up holding both a
@@ -185,8 +215,14 @@ fn transport_kind_slug(err: &reqwest::Error) -> &'static str {
 /// Splitting on the kind keeps "could not be reached" (client network) apart
 /// from "timed out" (usually a deploy switchover). `action_slug` names the call
 /// site and is also part of the fingerprint, so keep it stable too.
-fn capture_transport_failure(action_slug: &str, msg: &str, err: &reqwest::Error) {
+///
+/// A NON-transient failure implies something wrong on our side, so it is never
+/// gated and reports every time.
+fn capture_transport_failure(action_slug: &'static str, msg: &str, err: &reqwest::Error) {
     let kind = transport_kind_slug(err);
+    if is_transient_transport_error(err) && !claim_transient_report_slot(action_slug, kind) {
+        return;
+    }
     sentry::with_scope(
         |scope| {
             scope.set_fingerprint(Some(&["transport-failure", action_slug, kind]));
@@ -6244,6 +6280,23 @@ mod tests {
             .send()
             .expect_err("port 1 refuses");
         assert_eq!(super::transport_kind_slug(&connect), "connect");
+    }
+
+    #[test]
+    fn transient_transport_gate_caps_one_event_per_action_kind() {
+        // RUST-7H: four offline machines re-reported the same captive portal
+        // 229 times in 4 days. One event per (action, kind) per session keeps
+        // users_impacted intact and drops the repetition.
+        assert!(super::claim_transient_report_slot("test-gate-alpha", "timeout"));
+        assert!(
+            !super::claim_transient_report_slot("test-gate-alpha", "timeout"),
+            "a repeat of the same failure must be dropped"
+        );
+        // A different kind on the same action is a different Sentry issue and
+        // must still speak.
+        assert!(super::claim_transient_report_slot("test-gate-alpha", "connect"));
+        // Other actions are unaffected.
+        assert!(super::claim_transient_report_slot("test-gate-beta", "timeout"));
     }
 
     #[test]

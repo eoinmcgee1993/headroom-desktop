@@ -377,6 +377,33 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Routing a missing managed runtime back to setup is the RECOVERY path, and
+    // the emit site says so: `ensure_runtime_ready_for_tray` deliberately logs
+    // instead of calling `capture_headroom_start_failure`, because capturing a
+    // not-installed runtime as a startup crash was misleading noise (RUST-1M).
+    // The log bridge defeated that intent -- the warn reached Sentry anyway as
+    // RUST-8W, and because it interpolates `{err:#}` (program, full argv, log
+    // tail) it fragmented per command line on top. The app re-runs bootstrap
+    // from the setup window, so there is no failure left to report.
+    if target.starts_with("headroom_desktop_lib")
+        && msg.starts_with("ensure_runtime_ready_for_tray: managed runtime missing")
+    {
+        return true;
+    }
+    // The detached-proxy sweep in `stop_headroom` is best-effort teardown. On
+    // unix a `pkill` that matched nothing (exit 1) is already treated as
+    // success; the Windows branch has no such carve-out, so a PowerShell that
+    // exits non-zero -- matched nothing, or WMI hiccuped -- surfaced as a
+    // warning per command pattern (RUST-6F/6G, one issue each for
+    // `-m headroom.proxy.server` and `proxy --port`). Nothing is actionable:
+    // the app is stopping, and the next launch's `reclaim_orphan_proxy` reaps
+    // whatever survived, which is the same reasoning that made the
+    // session-teardown exit codes an info log (RUST-7N). Keep the local log.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with("failed to clean detached headroom proxy processes")
+    {
+        return true;
+    }
     // Stopping without the lifecycle lock is the DESIGNED path, not a failure:
     // `stop_headroom` deliberately caps its wait so a quit racing a launch can
     // never hang the app with the window stuck on "Restarting...". The pkill
@@ -792,6 +819,43 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::state",
             "WebView2 error: something we emitted ourselves"
+        ));
+    }
+
+    #[test]
+    fn skips_tray_missing_runtime_route_to_setup() {
+        // RUST-8W: the emit site already decided this is a recovery, not a
+        // crash (RUST-1M); the log bridge sent it to Sentry regardless, with
+        // the whole argv inlined so it fragmented per command line too.
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "ensure_runtime_ready_for_tray: managed runtime missing; routing to setup: unable to keep headroom running in background (prior attempts: ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe proxy --port 6768 exited with status exit code: 1)"
+        ));
+        // A real tray-path start failure still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib",
+            "ensure_runtime_ready_for_tray failed: unable to keep headroom running in background"
+        ));
+    }
+
+    #[test]
+    fn skips_detached_proxy_sweep_failures() {
+        // RUST-6F/6G: one issue per command pattern, from a best-effort sweep
+        // during teardown that unix already treats as success when it matches
+        // nothing.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "failed to clean detached headroom proxy processes: powershell exited with status Some(1) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe' args '-m headroom.proxy.server'"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "failed to clean detached headroom proxy processes: powershell exited with status Some(1) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
+        ));
+        // The refusal guard is a real bug (an unresolved runtime path would
+        // turn the sweep into a loose substring kill), so it must still report.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::state",
+            "refusing to pkill with an unresolved executable path \"\""
         ));
     }
 
