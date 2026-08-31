@@ -6287,16 +6287,25 @@ mod tests {
         // RUST-7H: four offline machines re-reported the same captive portal
         // 229 times in 4 days. One event per (action, kind) per session keeps
         // users_impacted intact and drops the repetition.
-        assert!(super::claim_transient_report_slot("test-gate-alpha", "timeout"));
+        assert!(super::claim_transient_report_slot(
+            "test-gate-alpha",
+            "timeout"
+        ));
         assert!(
             !super::claim_transient_report_slot("test-gate-alpha", "timeout"),
             "a repeat of the same failure must be dropped"
         );
         // A different kind on the same action is a different Sentry issue and
         // must still speak.
-        assert!(super::claim_transient_report_slot("test-gate-alpha", "connect"));
+        assert!(super::claim_transient_report_slot(
+            "test-gate-alpha",
+            "connect"
+        ));
         // Other actions are unaffected.
-        assert!(super::claim_transient_report_slot("test-gate-beta", "timeout"));
+        assert!(super::claim_transient_report_slot(
+            "test-gate-beta",
+            "timeout"
+        ));
     }
 
     #[test]

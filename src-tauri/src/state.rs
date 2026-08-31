@@ -7509,6 +7509,65 @@ pub(crate) fn is_session_teardown_exit(code: i32) -> bool {
     )
 }
 
+/// Exit code the Windows sweep script uses for "the process enumeration itself
+/// failed" (WMI unavailable or access-denied), as opposed to powershell's own
+/// exit codes.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const PS_SWEEP_ENUMERATION_FAILED: i32 = 3;
+
+/// Escape a value for use inside a single-quoted PowerShell `-like` pattern.
+/// `[`/`]` are wildcard metacharacters to `-like`, and an embedded `'` would
+/// close the string literal early -- a Windows username containing `'` could
+/// otherwise break out of it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn escape_powershell_like(value: &str) -> String {
+    value
+        .replace('`', "``")
+        .replace('\'', "''")
+        .replace('[', "`[")
+        .replace(']', "`]")
+}
+
+/// The PowerShell one-liner that force-kills every process whose command line
+/// matches both the executable and the argument pattern.
+///
+/// `Win32_Process.CommandLine` wraps the executable in double quotes (e.g.
+/// `"C:\...\python.exe" -m headroom.proxy.server`), so matching
+/// "{exe} {args_pattern}" as one substring never hits -- the quote right after
+/// the exe breaks the adjacency. Match the exe and the args as two independent
+/// `-like` clauses instead.
+///
+/// Excluding our own PID matters: this powershell process's `CommandLine`
+/// embeds both `-like` patterns as literals, so without the guard it matches
+/// its own filter and force-kills itself mid-pipeline -- exit -1, and the real
+/// targets after it in the enumeration are never killed (RUST-6F/6G/6H: 44
+/// events on the first 0.7.7 Windows install).
+///
+/// The script reports its own verdict rather than letting powershell infer one.
+/// `powershell -Command` exits 1 whenever the last pipeline element left `$?`
+/// false, and `-ErrorAction SilentlyContinue` suppresses the message without
+/// clearing that flag -- so a `Stop-Process` against a pid that exited on its
+/// own between the enumeration and the kill (the common case here: we just
+/// asked the proxy to stop) made a fully successful sweep look like a failure.
+/// That is the second RUST-6F/RUST-6G wave: 22 warnings from a machine where
+/// nothing was wrong. `exit 0` means the sweep ran; `PS_SWEEP_ENUMERATION_FAILED`
+/// means the enumeration itself failed, which is the only outcome worth a
+/// report. A powershell that cannot start at all reaches neither and still
+/// surfaces through its own exit code (see `is_session_teardown_exit`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_process_sweep_script(exe: &std::path::Path, args_pattern: &str) -> String {
+    let exe_pattern = escape_powershell_like(&exe.display().to_string());
+    let args_escaped = escape_powershell_like(args_pattern);
+    format!(
+        "try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
+         | Where-Object {{ $_.ProcessId -ne $PID \
+         -and $_.CommandLine -like '*{exe_pattern}*' \
+         -and $_.CommandLine -like '*{args_escaped}*' }} \
+         | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
+         catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
+    )
+}
+
 fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
     // An unresolved runtime path degrades the pattern from "our backend at this
     // exact path" to a loose substring, and `pkill -f` applies it to every
@@ -7540,31 +7599,7 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
 
     #[cfg(target_os = "windows")]
     {
-        // `Win32_Process.CommandLine` wraps the executable in double quotes
-        // (e.g. `"C:\...\python.exe" -m headroom.proxy.server`), so matching
-        // "{exe} {args_pattern}" as one substring never hits -- the quote
-        // right after the exe breaks the adjacency. Match the exe and the
-        // args as two independent `-like` clauses instead. Escape `[`/`]`
-        // (wildcard metacharacters to `-like`) and any embedded `'` (would
-        // otherwise close the single-quoted PowerShell literal early -- a
-        // Windows username containing `'` could break out of it).
-        fn escape_like(value: &str) -> String {
-            value
-                .replace('`', "``")
-                .replace('\'', "''")
-                .replace('[', "`[")
-                .replace(']', "`]")
-        }
-        let exe_pattern = escape_like(&exe.display().to_string());
-        let args_escaped = escape_like(args_pattern);
-        // Exclude our own PID: this powershell process's `CommandLine` embeds
-        // both `-like` patterns as literals, so without the guard it matches
-        // its own filter and force-kills itself mid-pipeline -- exit -1, and
-        // the real targets after it in the enumeration are never killed
-        // (RUST-6F/6G/6H: 44 events on the first 0.7.7 Windows install).
-        let script = format!(
-            "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{exe_pattern}*' -and $_.CommandLine -like '*{args_escaped}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
-        );
+        let script = windows_process_sweep_script(exe, args_pattern);
         let status = crate::proc::command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status()
@@ -7594,6 +7629,15 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
                 exe.display()
             );
             return Ok(());
+        }
+
+        if status.code() == Some(PS_SWEEP_ENUMERATION_FAILED) {
+            return Err(anyhow!(
+                "powershell could not enumerate processes (Win32_Process query failed) \
+                 for exe '{}' args '{}'",
+                exe.display(),
+                args_pattern
+            ));
         }
 
         return Err(anyhow!(
@@ -10713,6 +10757,90 @@ mod tests {
         )
         .expect("parsed stats");
         assert!(parsed.output_reduction.is_none());
+    }
+
+    /// RUST-6F/RUST-6G, second wave: the sweep worked, but powershell exited 1
+    /// because a `Stop-Process` in the pipeline failed (the pid was already
+    /// gone -- we had just asked the proxy to stop), and `-ErrorAction
+    /// SilentlyContinue` hides the message without clearing `$?`. The script
+    /// must state its own verdict so a successful sweep cannot be read as a
+    /// failure, while a genuinely broken enumeration still is one.
+    #[test]
+    fn the_windows_sweep_script_reports_its_own_verdict() {
+        use super::{windows_process_sweep_script, PS_SWEEP_ENUMERATION_FAILED};
+        let script = windows_process_sweep_script(
+            std::path::Path::new(r"C:\Users\a\venv\Scripts\headroom.exe"),
+            "proxy --port",
+        );
+
+        assert!(
+            script.trim_end().ends_with("exit 0"),
+            "a sweep that ran must not inherit powershell's $?-derived exit code: {script}"
+        );
+        assert!(
+            script.contains(&format!("catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}")),
+            "a failed enumeration must stay distinguishable: {script}"
+        );
+        assert!(
+            script.contains("-ErrorAction Stop"),
+            "without this the catch never fires and every failure looks clean: {script}"
+        );
+        // The self-kill guard this script already depended on (first RUST-6F
+        // wave) must survive the rewrite.
+        assert!(
+            script.contains("$_.ProcessId -ne $PID"),
+            "lost the self-kill guard: {script}"
+        );
+        // Stop-Process stays best-effort: one unkillable pid must not abort
+        // the sweep for the rest.
+        assert!(
+            script.contains("Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue"),
+            "the kill must stay best-effort: {script}"
+        );
+
+        // The script is built from a `\`-continued literal, which strips the
+        // newline AND the next line's indentation -- so a trailing space on the
+        // wrong side of the backslash silently glues two tokens together
+        // ("$PID-and"). This only ever runs on Windows, so a slip here is
+        // invisible until a user hits it.
+        assert!(
+            !script.contains('\n'),
+            "the script must stay a single -Command line: {script}"
+        );
+        for token in [
+            " | Where-Object ",
+            " | ForEach-Object ",
+            " -and $_.CommandLine ",
+        ] {
+            assert!(
+                script.contains(token),
+                "tokens got glued together around {token:?}: {script}"
+            );
+        }
+        assert_eq!(
+            script.matches('{').count(),
+            script.matches('}').count(),
+            "unbalanced braces: {script}"
+        );
+    }
+
+    /// A `'` in a Windows username would close the single-quoted `-like`
+    /// literal early, and `[`/`]` are wildcards to `-like`.
+    #[test]
+    fn the_windows_sweep_script_escapes_hostile_paths() {
+        use super::windows_process_sweep_script;
+        let script = windows_process_sweep_script(
+            std::path::Path::new(r"C:\Users\O'Brien [dev]\venv\Scripts\headroom.exe"),
+            "proxy --port",
+        );
+        assert!(script.contains("O''Brien"), "unescaped quote: {script}");
+        assert!(script.contains("`[dev`]"), "unescaped wildcard: {script}");
+        // Every `-like` literal must still be balanced after escaping.
+        assert_eq!(
+            script.matches('\'').count() % 2,
+            0,
+            "escaping left an unbalanced string literal: {script}"
+        );
     }
 
     #[test]
