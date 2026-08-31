@@ -630,6 +630,10 @@ const CANCELLATION_REASONS: { value: string; label: string }[] = [
 const authCodeExpiryFallbackSeconds = 900;
 const APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS = 12_000;
 const APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+// Provider settings (Settings -> Provider) are hidden while the multi-provider
+// work gets its finishing touches; the upstream-override backend stays live so
+// already-configured setups keep working. Remove the flag when it ships.
+const SHOW_PROVIDER_SETTINGS = false;
 // Desktop activation is a one-shot "this device is live" ping to headroom-web.
 // It is not worth an unbounded retry: a machine that is offline now is usually
 // offline for a while, and every attempt costs a Sentry warning. Five attempts
@@ -7760,7 +7764,11 @@ export default function App() {
                 ) : null}
               </article>
 
-              <UpstreamPanel />
+              {/* Provider settings ship dark for now: the backend default is
+                  Off and explicitly-configured setups keep working, but the
+                  panel stays hidden until the provider work is finished.
+                  Flip to true to restore Settings -> Provider. */}
+              {SHOW_PROVIDER_SETTINGS ? <UpstreamPanel /> : null}
 
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
