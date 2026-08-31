@@ -646,6 +646,11 @@ impl AppState {
         let runtime = ManagedRuntime::bootstrap_root(&base_dir);
         let tool_manager = ToolManager::new(runtime);
         let (launch_profile, launch_profile_path) = LaunchProfile::load_or_create(&base_dir)?;
+        // The proxy spawn reads the override through the module-level cache
+        // (no AppState in hand there, same as the backend port), so a launch
+        // has to publish what it just loaded or the first spawn of the session
+        // would boot at the default upstream.
+        crate::upstream_override::publish(launch_profile.upstream_override.clone());
         let (last_known_good_plan, last_known_good_plan_path) = LastKnownGoodPlan::load(&base_dir);
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
         let activity_facts = ActivityFacts::load_or_create(&base_dir)?;
@@ -1908,6 +1913,24 @@ impl AppState {
         }
         profile.accepted_terms_version = version;
         persist_launch_profile(&self.launch_profile_path, &profile);
+    }
+
+    pub fn upstream_override(&self) -> UpstreamOverride {
+        self.launch_profile.lock().upstream_override.clone()
+    }
+
+    /// Persist the override and publish it for the next proxy spawn. The token
+    /// is handled separately (keychain); this only records whether one exists.
+    pub fn set_upstream_override(&self, next: UpstreamOverride) {
+        {
+            let mut profile = self.launch_profile.lock();
+            if profile.upstream_override == next {
+                return;
+            }
+            profile.upstream_override = next.clone();
+            persist_launch_profile(&self.launch_profile_path, &profile);
+        }
+        crate::upstream_override::publish(next);
     }
 
     pub fn cached_clients(&self) -> Vec<ClientStatus> {
@@ -3993,6 +4016,80 @@ pub fn tail_lines(text: &str, max_lines: usize) -> Vec<String> {
     lines
 }
 
+/// How an explicitly configured upstream interacts with a cc-switch capture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamOverrideMode {
+    /// Nothing configured: the runtime default, or whatever cc-switch captures.
+    #[default]
+    Off,
+    /// Boot with the configured upstream, but let a later cc-switch capture
+    /// win. This is what the proxy does natively -- ANTHROPIC_TARGET_API_URL
+    /// sets the boot default and the reconciler overwrites it at runtime.
+    Fallback,
+    /// The configured upstream wins, including over a cc-switch capture. The
+    /// reconciler still rewrites the client's base_url back to the intercept,
+    /// it just does not get to move the upstream.
+    Override,
+}
+
+/// A user-configured Anthropic-compatible upstream (GLM, Kimi, DeepSeek).
+///
+/// The token is deliberately NOT a field here: it lives in the OS keychain and
+/// `has_token` only records that one exists, so launch-profile.json never
+/// carries a credential. Everything in this struct is safe to log.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamOverride {
+    pub mode: UpstreamOverrideMode,
+    /// Normalized by `normalize_upstream_base_url`; empty when unset.
+    pub base_url: String,
+    pub has_token: bool,
+}
+
+impl UpstreamOverride {
+    /// The upstream to boot with, or None when nothing usable is configured.
+    /// A mode without a URL is not an upstream, so it is treated as unset
+    /// rather than booting the proxy at an empty target.
+    pub fn configured_upstream(&self) -> Option<&str> {
+        if self.mode == UpstreamOverrideMode::Off || self.base_url.is_empty() {
+            return None;
+        }
+        Some(self.base_url.as_str())
+    }
+
+    /// Whether the configured upstream must survive a cc-switch capture.
+    pub fn pins_upstream(&self) -> bool {
+        self.mode == UpstreamOverrideMode::Override && self.configured_upstream().is_some()
+    }
+}
+
+/// Accept only what can safely become `ANTHROPIC_TARGET_API_URL` and be written
+/// into a user's settings.json: an absolute http(s) URL, no whitespace, no
+/// trailing slash (the reconciler's loop guard compares stripped URLs, so a
+/// trailing slash there would make every tick rewrite).
+pub fn normalize_upstream_base_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Enter the provider's base URL.".into());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("The base URL cannot contain spaces.".into());
+    }
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err("The base URL must start with http:// or https://".into());
+    }
+    let stripped = trimmed.trim_end_matches('/');
+    let host = stripped
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+        .unwrap_or("");
+    if host.is_empty() {
+        return Err("That base URL has no host.".into());
+    }
+    Ok(stripped.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct LaunchProfile {
@@ -4012,6 +4109,10 @@ struct LaunchProfile {
     /// re-prompted by the acceptance gate when `REQUIRED_TERMS_VERSION` > 0.
     #[serde(default)]
     accepted_terms_version: u32,
+    /// User-configured Anthropic-compatible upstream. Off/empty for everyone
+    /// who has not set one, which is the pre-existing behaviour.
+    #[serde(default)]
+    upstream_override: UpstreamOverride,
     /// One-shot: the "setup finished but no traffic ever" recovery
     /// notification has fired. Persisted so it can never nag twice.
     #[serde(default)]
@@ -4048,6 +4149,7 @@ impl LaunchProfile {
             last_launched_app_version: None,
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
+            upstream_override: UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
         }
@@ -5714,13 +5816,29 @@ impl HeadroomSavingsHistoryResponse {
 /// RUST-87 is a single mac whose 6767 belongs to another app, and the flat
 /// 15-minute window sent 96 identical events a day from that one host with no
 /// end state. A first failure still speaks immediately; only the repeats decay.
-/// A successful fetch clears the streak, so a condition that heals and comes
-/// back is loud again.
+/// A SUSTAINED run of successes clears the streak, so a condition that truly
+/// heals and comes back is loud again. One success is NOT enough: the common
+/// starved-backend shape flaps -- a cold `/stats` rebuild crosses 15s only
+/// while the proxy is busy serving a session -- so clearing on the first
+/// success reset the backoff between every pair of timeouts and the streak
+/// never reached 2. That is how RUST-86 sent 97 events in 2 days from a single
+/// host: the flat-window volume this backoff exists to prevent. The streak
+/// clears only after `STATS_FETCH_RECOVERY_WINDOW` of unbroken successes; any
+/// failure restarts that run.
 /// ponytail: one global slot, not per-category -- a host has one cause at a
 /// time in practice; key it by category if that stops being true.
 const STATS_FETCH_WARN_INTERVAL: Duration = Duration::from_secs(900);
 const STATS_FETCH_WARN_MAX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// How long `/stats` must fetch cleanly before a recovery counts as real. The
+/// dashboard polls every 12s, so this is ~25 consecutive good fetches -- long
+/// enough that a busy-proxy flap cannot span it, short enough that a genuine
+/// fix is loud again within one sitting.
+const STATS_FETCH_RECOVERY_WINDOW: Duration = Duration::from_secs(300);
 static STATS_FETCH_WARNED_AT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
+/// When the current unbroken run of successful fetches began; `None` when the
+/// last fetch failed or nothing has failed yet.
+/// Lock order: take `STATS_FETCH_WARNED_AT` before this one.
+static STATS_FETCH_RECOVERED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Window a warn must clear before the `streak`-th consecutive one may speak:
 /// 15m, 30m, 1h, 2h, 4h, then capped. `streak` is 1-based.
@@ -5757,6 +5875,9 @@ fn stats_fetch_failure_category(reason: &str) -> String {
 
 fn warn_stats_fetch_failed(reason: &str) {
     let mut last = STATS_FETCH_WARNED_AT.lock();
+    // Any failure breaks the recovery run -- including one this window
+    // throttles, which is still evidence the condition has not healed.
+    *STATS_FETCH_RECOVERED_AT.lock() = None;
     let streak = match *last {
         Some((at, streak)) => {
             if at.elapsed() < stats_fetch_warn_interval(streak) {
@@ -5775,28 +5896,70 @@ fn warn_stats_fetch_failed(reason: &str) {
     // one fact that splits "foreign squatter" from "orphaned old Headroom" --
     // RUST-87 shipped three unattributable 404s before this. Throttled to one
     // lookup per 15-minute warn window, so the lsof subprocess is free here.
-    let held_by = if category.starts_with("http-4") {
-        crate::tool_manager::listener_identity(6767)
-            .map(|who| format!("; port 6767 is held by {who}"))
-            .unwrap_or_default()
+    // `foreign_holder` stays false when the lookup returns None: "we could not
+    // resolve the listener" is not evidence that it is someone else's, and
+    // guessing wrong here silently drops a real backend fault.
+    let (held_by, foreign_holder) = if category.starts_with("http-4") {
+        match crate::tool_manager::listener_identity_and_ownership(6767) {
+            Some((who, is_ours)) => (format!("; port 6767 is held by {who}"), !is_ours),
+            None => (String::new(), false),
+        }
     } else {
-        String::new()
+        (String::new(), false)
     };
     let message = format!(
         "headroom /stats fetch failed ({reason}){held_by}; dashboard loses the layers \
          only this endpoint reports (output shaping, tool schema)"
     );
-    sentry::with_scope(
-        |scope| {
-            scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
-        },
-        || {
-            sentry::capture_message(&message, sentry::Level::Warning);
-        },
-    );
+    // A 4xx answered by a process that is demonstrably not ours means another
+    // application owns 6767 on this host. Nothing we ship changes that -- the
+    // backoff above was added for exactly this case (RUST-87) and only slowed
+    // the bleed: one mac still sent 129 events with no end state, because a
+    // throttle cannot reach zero. The user-visible remedy is freeing the port,
+    // which the local log states in full; Sentry gains nothing from a repeat.
+    // Our OWN backend answering 4xx is a real fault and still reports.
+    if !foreign_holder {
+        sentry::with_scope(
+            |scope| {
+                scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
+            },
+            || {
+                sentry::capture_message(&message, sentry::Level::Warning);
+            },
+        );
+    }
     // Local only: the fingerprinted capture above is the Sentry path, and the
     // bridged warn would double-report it under the old flat grouping.
     log::warn!("{message}");
+}
+
+/// Record a successful `/stats` fetch, clearing the warn backoff only once the
+/// successes have been unbroken for `STATS_FETCH_RECOVERY_WINDOW`.
+///
+/// The window is what makes the backoff hold under a FLAPPING cause. Resetting
+/// on the first success meant a host alternating timeout/success re-armed an
+/// immediate warn every poll, so the streak never advanced past 1 and the
+/// 15m..6h decay never applied (RUST-86).
+fn note_stats_fetch_success() {
+    let mut warned = STATS_FETCH_WARNED_AT.lock();
+    let mut recovered = STATS_FETCH_RECOVERED_AT.lock();
+    if warned.is_none() {
+        // No outage to recover from; keep the marker clear so the next
+        // failure's first warn still speaks immediately.
+        *recovered = None;
+        return;
+    }
+    match *recovered {
+        // The run has spanned the window: the cause is really gone.
+        Some(since) if since.elapsed() >= STATS_FETCH_RECOVERY_WINDOW => {
+            *warned = None;
+            *recovered = None;
+        }
+        // Run in progress but too short to trust yet.
+        Some(_) => {}
+        // First success after a failure: start timing the run.
+        None => *recovered = Some(Instant::now()),
+    }
 }
 
 fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
@@ -5852,8 +6015,9 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
         };
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
-            // Recovery resets the backoff: the next outage warns immediately.
-            *STATS_FETCH_WARNED_AT.lock() = None;
+            // Only a SUSTAINED recovery resets the backoff; a lone success
+            // between two timeouts must not (see STATS_FETCH_RECOVERY_WINDOW).
+            note_stats_fetch_success();
             return Some(parsed);
         }
         last_failure = Some("payload had no recognised savings fields".to_string());
@@ -7345,6 +7509,70 @@ pub(crate) fn is_session_teardown_exit(code: i32) -> bool {
     )
 }
 
+/// Exit code the Windows sweep script uses for "the process enumeration itself
+/// failed" (WMI unavailable or access-denied), as opposed to powershell's own
+/// exit codes.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const PS_SWEEP_ENUMERATION_FAILED: i32 = 3;
+
+/// Escape a value for use inside a single-quoted PowerShell `-like` pattern.
+/// `[`/`]` are wildcard metacharacters to `-like`, and an embedded `'` would
+/// close the string literal early -- a Windows username containing `'` could
+/// otherwise break out of it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn escape_powershell_like(value: &str) -> String {
+    value
+        .replace('`', "``")
+        .replace('\'', "''")
+        .replace('[', "`[")
+        .replace(']', "`]")
+}
+
+/// The PowerShell one-liner that force-kills every process whose command line
+/// matches both the executable and the argument pattern.
+///
+/// `Win32_Process.CommandLine` wraps the executable in double quotes (e.g.
+/// `"C:\...\python.exe" -m headroom.proxy.server`), so matching
+/// "{exe} {args_pattern}" as one substring never hits -- the quote right after
+/// the exe breaks the adjacency. Match the exe and the args as two independent
+/// `-like` clauses instead.
+///
+/// Excluding our own PID matters: this powershell process's `CommandLine`
+/// embeds both `-like` patterns as literals, so without the guard it matches
+/// its own filter and force-kills itself mid-pipeline -- exit -1, and the real
+/// targets after it in the enumeration are never killed (RUST-6F/6G/6H: 44
+/// events on the first 0.7.7 Windows install).
+///
+/// The script reports its own verdict rather than letting powershell infer one.
+/// `powershell -Command` exits 1 whenever the last pipeline element left `$?`
+/// false, and `-ErrorAction SilentlyContinue` suppresses the message without
+/// clearing that flag -- so a `Stop-Process` against a pid that exited on its
+/// own between the enumeration and the kill (the common case here: we just
+/// asked the proxy to stop) made a fully successful sweep look like a failure.
+/// That is the second RUST-6F/RUST-6G wave: 22 warnings from a machine where
+/// nothing was wrong. `exit 0` means the sweep ran; `PS_SWEEP_ENUMERATION_FAILED`
+/// means the enumeration itself failed, which is the only outcome worth a
+/// report. A powershell that cannot start at all reaches neither and still
+/// surfaces through its own exit code (see `is_session_teardown_exit`).
+/// ponytail: a Stop-Process the machine's policy denies still exits 0, so a
+/// matched pid that SURVIVES the sweep is invisible here. For
+/// kill_venv_lock_holders the follow-up pip run fails loudly on the held
+/// lock, which is where that case surfaces today; count failed kills in the
+/// script if that ever stops being true.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_process_sweep_script(exe: &std::path::Path, args_pattern: &str) -> String {
+    let exe_pattern = escape_powershell_like(&exe.display().to_string());
+    let args_escaped = escape_powershell_like(args_pattern);
+    format!(
+        "try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
+         | Where-Object {{ $_.ProcessId -ne $PID \
+         -and $_.CommandLine -like '*{exe_pattern}*' \
+         -and $_.CommandLine -like '*{args_escaped}*' }} \
+         | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
+         catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
+    )
+}
+
 fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
     // An unresolved runtime path degrades the pattern from "our backend at this
     // exact path" to a loose substring, and `pkill -f` applies it to every
@@ -7376,31 +7604,7 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
 
     #[cfg(target_os = "windows")]
     {
-        // `Win32_Process.CommandLine` wraps the executable in double quotes
-        // (e.g. `"C:\...\python.exe" -m headroom.proxy.server`), so matching
-        // "{exe} {args_pattern}" as one substring never hits -- the quote
-        // right after the exe breaks the adjacency. Match the exe and the
-        // args as two independent `-like` clauses instead. Escape `[`/`]`
-        // (wildcard metacharacters to `-like`) and any embedded `'` (would
-        // otherwise close the single-quoted PowerShell literal early -- a
-        // Windows username containing `'` could break out of it).
-        fn escape_like(value: &str) -> String {
-            value
-                .replace('`', "``")
-                .replace('\'', "''")
-                .replace('[', "`[")
-                .replace(']', "`]")
-        }
-        let exe_pattern = escape_like(&exe.display().to_string());
-        let args_escaped = escape_like(args_pattern);
-        // Exclude our own PID: this powershell process's `CommandLine` embeds
-        // both `-like` patterns as literals, so without the guard it matches
-        // its own filter and force-kills itself mid-pipeline -- exit -1, and
-        // the real targets after it in the enumeration are never killed
-        // (RUST-6F/6G/6H: 44 events on the first 0.7.7 Windows install).
-        let script = format!(
-            "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{exe_pattern}*' -and $_.CommandLine -like '*{args_escaped}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
-        );
+        let script = windows_process_sweep_script(exe, args_pattern);
         let status = crate::proc::command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status()
@@ -7430,6 +7634,15 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
                 exe.display()
             );
             return Ok(());
+        }
+
+        if status.code() == Some(PS_SWEEP_ENUMERATION_FAILED) {
+            return Err(anyhow!(
+                "powershell could not enumerate processes (Win32_Process query failed) \
+                 for exe '{}' args '{}'",
+                exe.display(),
+                args_pattern
+            ));
         }
 
         return Err(anyhow!(
@@ -7927,8 +8140,8 @@ mod tests {
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
         hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
-        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
+        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, savings_rate_implausible, settle_rollup_backfill,
         stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
@@ -7936,8 +8149,8 @@ mod tests {
         BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
         HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
         PersistedSavingsState, RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
-        STATS_FETCH_WARN_MAX_INTERVAL,
+        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW,
+        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -8795,6 +9008,7 @@ mod tests {
             last_launched_app_version: None,
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
+            upstream_override: super::UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
         };
@@ -8821,6 +9035,7 @@ mod tests {
             last_launched_app_version: None,
             last_runtime_upgrade_failure: None,
             accepted_terms_version: 0,
+            upstream_override: super::UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
         };
@@ -8839,6 +9054,42 @@ mod tests {
         // Once fired, never again.
         profile.onboarding_recovery_notified = true;
         assert!(!super::onboarding_recovery_nudge_due(&profile));
+    }
+
+    /// What a user can type into the upstream field. The trailing-slash strip
+    /// is not cosmetic: the reconciler's loop guard compares a stripped url
+    /// against the configured one, so "https://host/" would make every tick
+    /// see a mismatch and rewrite settings.json.
+    #[test]
+    fn upstream_base_urls_are_normalized_or_rejected_with_a_reason() {
+        use super::normalize_upstream_base_url as norm;
+
+        assert_eq!(
+            norm("https://api.z.ai/api/anthropic").unwrap(),
+            "https://api.z.ai/api/anthropic"
+        );
+        assert_eq!(
+            norm("  https://api.z.ai/api/anthropic/  ").unwrap(),
+            "https://api.z.ai/api/anthropic"
+        );
+        // Local endpoints are a legitimate upstream (another proxy, a mock).
+        assert_eq!(
+            norm("http://127.0.0.1:8000").unwrap(),
+            "http://127.0.0.1:8000"
+        );
+
+        // Every rejection has to say what to fix: this text is the field error.
+        for bad in [
+            "",
+            "   ",
+            "api.z.ai",
+            "ftp://api.z.ai",
+            "https://",
+            "http:// api.z.ai",
+        ] {
+            let err = norm(bad).unwrap_err();
+            assert!(!err.is_empty(), "{bad:?} must be rejected with a reason");
+        }
     }
 
     #[test]
@@ -8866,6 +9117,11 @@ mod tests {
                 rollback_restored: true,
             }),
             accepted_terms_version: 3,
+            upstream_override: super::UpstreamOverride {
+                mode: super::UpstreamOverrideMode::Override,
+                base_url: "https://api.z.ai/api/anthropic".into(),
+                has_token: true,
+            },
             onboarding_recovery_notified: true,
             first_savings_notified: true,
         };
@@ -10518,7 +10774,92 @@ mod tests {
         assert!(parsed.output_reduction.is_none());
     }
 
+    /// RUST-6F/RUST-6G, second wave: the sweep worked, but powershell exited 1
+    /// because a `Stop-Process` in the pipeline failed (the pid was already
+    /// gone -- we had just asked the proxy to stop), and `-ErrorAction
+    /// SilentlyContinue` hides the message without clearing `$?`. The script
+    /// must state its own verdict so a successful sweep cannot be read as a
+    /// failure, while a genuinely broken enumeration still is one.
     #[test]
+    fn the_windows_sweep_script_reports_its_own_verdict() {
+        use super::{windows_process_sweep_script, PS_SWEEP_ENUMERATION_FAILED};
+        let script = windows_process_sweep_script(
+            std::path::Path::new(r"C:\Users\a\venv\Scripts\headroom.exe"),
+            "proxy --port",
+        );
+
+        assert!(
+            script.trim_end().ends_with("exit 0"),
+            "a sweep that ran must not inherit powershell's $?-derived exit code: {script}"
+        );
+        assert!(
+            script.contains(&format!("catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}")),
+            "a failed enumeration must stay distinguishable: {script}"
+        );
+        assert!(
+            script.contains("-ErrorAction Stop"),
+            "without this the catch never fires and every failure looks clean: {script}"
+        );
+        // The self-kill guard this script already depended on (first RUST-6F
+        // wave) must survive the rewrite.
+        assert!(
+            script.contains("$_.ProcessId -ne $PID"),
+            "lost the self-kill guard: {script}"
+        );
+        // Stop-Process stays best-effort: one unkillable pid must not abort
+        // the sweep for the rest.
+        assert!(
+            script.contains("Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue"),
+            "the kill must stay best-effort: {script}"
+        );
+
+        // The script is built from a `\`-continued literal, which strips the
+        // newline AND the next line's indentation -- so a trailing space on the
+        // wrong side of the backslash silently glues two tokens together
+        // ("$PID-and"). This only ever runs on Windows, so a slip here is
+        // invisible until a user hits it.
+        assert!(
+            !script.contains('\n'),
+            "the script must stay a single -Command line: {script}"
+        );
+        for token in [
+            " | Where-Object ",
+            " | ForEach-Object ",
+            " -and $_.CommandLine ",
+        ] {
+            assert!(
+                script.contains(token),
+                "tokens got glued together around {token:?}: {script}"
+            );
+        }
+        assert_eq!(
+            script.matches('{').count(),
+            script.matches('}').count(),
+            "unbalanced braces: {script}"
+        );
+    }
+
+    /// A `'` in a Windows username would close the single-quoted `-like`
+    /// literal early, and `[`/`]` are wildcards to `-like`.
+    #[test]
+    fn the_windows_sweep_script_escapes_hostile_paths() {
+        use super::windows_process_sweep_script;
+        let script = windows_process_sweep_script(
+            std::path::Path::new(r"C:\Users\O'Brien [dev]\venv\Scripts\headroom.exe"),
+            "proxy --port",
+        );
+        assert!(script.contains("O''Brien"), "unescaped quote: {script}");
+        assert!(script.contains("`[dev`]"), "unescaped wildcard: {script}");
+        // Every `-like` literal must still be balanced after escaping.
+        assert_eq!(
+            script.matches('\'').count() % 2,
+            0,
+            "escaping left an unbalanced string literal: {script}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(stats_fetch_warn)]
     fn stats_fetch_warn_is_throttled_within_the_window() {
         // The dashboard retries /stats every 12s and this warn bridges to
         // Sentry, so only the first failure in a window may speak.
@@ -10562,6 +10903,62 @@ mod tests {
         }
 
         *STATS_FETCH_WARNED_AT.lock() = None;
+    }
+
+    #[test]
+    #[serial_test::serial(stats_fetch_warn)]
+    fn a_lone_success_between_failures_does_not_reset_the_backoff() {
+        // RUST-86: a starved backend flaps -- /stats times out only while the
+        // proxy is busy -- so timeout/success/timeout was the common shape.
+        // Clearing the streak on the FIRST success re-armed an immediate warn
+        // every poll, so the streak never advanced past 1 and the 15m..6h
+        // decay never applied: 97 events in 2 days from one host.
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_RECOVERED_AT.lock() = None;
+
+        warn_stats_fetch_failed("timed out after 15s");
+        let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
+        assert_eq!(streak, 1);
+
+        // One good poll starts a recovery run but must NOT clear the streak.
+        note_stats_fetch_success();
+        let (stamped, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("streak survives");
+        assert_eq!(streak, 1, "a lone success must not clear the backoff");
+        assert!(
+            (*STATS_FETCH_RECOVERED_AT.lock()).is_some(),
+            "the success starts timing a recovery run"
+        );
+
+        // The next failure warns only when the window has elapsed, and it
+        // breaks the recovery run.
+        warn_stats_fetch_failed("timed out after 15s");
+        assert_eq!(
+            (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped").0,
+            stamped,
+            "the flap must stay throttled, not warn again immediately"
+        );
+        assert!(
+            (*STATS_FETCH_RECOVERED_AT.lock()).is_none(),
+            "a failure restarts the recovery run"
+        );
+
+        // A run that spans the window is a real recovery: the streak clears
+        // and the next outage is loud again.
+        if let Some(stale) = Instant::now().checked_sub(STATS_FETCH_RECOVERY_WINDOW) {
+            *STATS_FETCH_RECOVERED_AT.lock() = Some(stale);
+            note_stats_fetch_success();
+            assert!(
+                (*STATS_FETCH_WARNED_AT.lock()).is_none(),
+                "a sustained recovery clears the backoff"
+            );
+
+            warn_stats_fetch_failed("timed out after 15s");
+            let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("loud again");
+            assert_eq!(streak, 1, "a healed-then-broken cause warns immediately");
+        }
+
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_RECOVERED_AT.lock() = None;
     }
 
     #[test]

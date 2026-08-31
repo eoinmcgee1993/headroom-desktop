@@ -37,12 +37,8 @@ zsh -lc 'rtk --version && rtk gain | head -5'
 ```
 Expect: a version line and a gain summary, no "command not found". The `zsh -lc` wrapper is required: `rtk` is added to PATH by the `headroom:managed_rtk` block in `~/.zprofile`, which only a login shell sources. Claude Code's Bash tool (and Codex's shell tool) spawn a non-login, non-interactive shell that does *not* source it, so a bare `rtk` here reports `command not found` on a perfectly healthy install. A login shell exercises the same PATH wiring a real terminal gets, so this confirms both that the managed block is intact and that the binary runs.
 
-### 4. MCP retrieve tool is available (Claude Code only; only if memory tools are enabled)
-First check whether the proxy was started with memory tools:
-```bash
-ls ~/Library/Application\ Support/Headroom/headroom/logs/ | grep -E 'no-memory-tools' >/dev/null && echo 'memory tools DISABLED — skip this check' || echo 'memory tools enabled — run check'
-```
-If enabled, have Claude call `mcp__headroom__headroom_retrieve` with any small query and expect a tool result (not "No such tool available").
+### 4. MCP retrieve tool is available (Claude Code only)
+Have Claude call `mcp__headroom__headroom_retrieve` with any small query and expect a structured tool result - an "expired or incorrect hash" error payload is a PASS; only "No such tool available" fails. Do not gate this on the proxy's `no-memory-tools` flag: MCP registration is independent of it (observed on the 0.9.3-rc.5 pass - the live proxy log carried `no-memory-tools` and the tool still answered), and the old log-filename gate here also matched rotated logs from old boots. If you want the flag state anyway, read the *newest* `headroom-proxy---port-` filename - it is informational, not a skip condition.
 
 ### 5. Tray → Dashboard renders
 Click the tray icon, open the dashboard. Expect savings chart and per-client stats render without a blank/error state.
@@ -65,6 +61,8 @@ The proxy always runs in `token` mode now (`HEADROOM_MODE=token`, hardcoded — 
 This policy gate is itself guarded by `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT=enabled` (pinned explicitly in `tool_manager.rs`). If that ever reads disabled, subscription traffic silently falls back to the PAYG-aggressive policy and starts busting the prefix cache — a net loss on cache-billed sessions. Pick the sub-check matching the traffic you're driving.
 
 Timing matters either way: a `Read` result becomes part of Claude's *next* outgoing prompt, not the one currently being composed. So the baseline capture, the large Read, and the re-check cannot all happen in one turn — the re-check will still show the old numbers.
+
+Generate the payload with a real `Read` tool call. Dumping the file through Bash (`cat`, `sed`) does not work: the harness persists oversized command output to disk and only a ~2KB preview enters the next prompt, so the proxy never sees the bulk (observed on the 0.9.3-rc.5 Windows pass).
 
 **Claude Code subscription/OAuth traffic** (UA `claude-code/`, classified `SUBSCRIPTION`):
 1. Capture the baseline:

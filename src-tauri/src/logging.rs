@@ -111,17 +111,31 @@ fn is_windows_session_end_panic(msg: &str) -> bool {
     msg.contains("cannot move state from Destroyed")
 }
 
+// The whole machine is out of file descriptors (ENFILE). Like disk-full this
+// is a system-wide resource the app cannot free -- it is not our per-process
+// limit, so no leak of ours is the cause and no release can change the outcome
+// -- and it fails every file touch identically, so it fragments into one
+// un-fixable issue per call site (RUST-A3 on the usage-counters write, RUST-5T
+// on the client-setup read, same class). Every affected read/write is retried
+// on its next tick and heals once the machine has descriptors again.
+//
+// ENFILE only. EMFILE ("Too many open files", os error 24) is the PER-PROCESS
+// limit and would mean we are leaking descriptors -- that one stays reportable.
+fn is_system_fd_exhaustion(msg: &str) -> bool {
+    msg.contains("Too many open files in system") // unix ENFILE
+}
+
 // Environmental or otherwise unfixable-by-release: keep the local log, never
 // send. One predicate so panics and log records answer it the same way.
 fn is_unreportable(msg: &str) -> bool {
-    is_disk_full(msg) || is_windows_session_end_panic(msg)
+    is_disk_full(msg) || is_system_fd_exhaustion(msg) || is_windows_session_end_panic(msg)
 }
 
 // Drop transient transport errors (offline laptop, flaky wifi, upstream blip)
 // from Sentry. They still hit the local log file via write_record.
 fn skip_sentry(target: &str, msg: &str) -> bool {
     // Environmental and target-agnostic: keep the local log, drop the event.
-    if is_disk_full(msg) {
+    if is_disk_full(msg) || is_system_fd_exhaustion(msg) {
         return true;
     }
     if target.starts_with("tauri_plugin_updater") {
@@ -149,13 +163,17 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // capture at the emit site (RUST-62); this warn repeats on every 15s bind
     // retry and only duplicated it (RUST-5R). Local log only.
     //
-    // Coupled to the emit site's wording in `proxy_intercept::spawn` -- if that
-    // message changes and this substring is not changed with it, the retry warn
-    // silently starts flooding Sentry again. `skips_foreign_port_bind_retry_warns`
-    // is the guard; keep its fixture a copy of the real message.
+    // Matched on the retry marker rather than one variant's prose: the emit
+    // site now says three different things about a held port (draining after a
+    // restart, stuck past the drain window, held by a named process), and
+    // keying on any single wording is what made this fragile before. Every
+    // bind-retry warn ends in the same "retrying in 15s" and every one of them
+    // has an explicit capture at the emit site, so they all belong here.
+    // `skips_foreign_port_bind_retry_warns` is the guard; keep its fixtures
+    // copies of the real messages.
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
         && msg.starts_with("[proxy_intercept] port")
-        && msg.contains("held but not answering")
+        && msg.contains("retrying in 15s")
     {
         return true;
     }
@@ -342,6 +360,51 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("tauri_runtime_wry")
         && msg.starts_with("WebView2 error:")
         && msg.contains("HRESULT(0x8007139F)")
+    {
+        return true;
+    }
+    // The canary captures its own fully-scoped event at the emit site (flow
+    // tag, sample/zero/strata/models extras, and the fixed `zero_savings_canary`
+    // fingerprint that makes the fleet-wide event count the blast radius). This
+    // log line fires in the same breath with none of that, so one detection
+    // landed as two issues in the same millisecond: RUST-A5 (the capture) and
+    // RUST-A4 (this warn, parameterized into its own group because the counts
+    // and model list are baked into the text). Same split as the intercept-port
+    // and backend-port lines above. Keep the local log -- it is what a support
+    // thread reads -- and drop the Sentry twin.
+    if target.starts_with("headroom_desktop_lib::savings_canary")
+        && msg.starts_with("zero-savings canary:")
+    {
+        return true;
+    }
+    // Routing a missing managed runtime back to setup is the RECOVERY path, and
+    // the emit site says so: `ensure_runtime_ready_for_tray` deliberately logs
+    // instead of calling `capture_headroom_start_failure`, because capturing a
+    // not-installed runtime as a startup crash was misleading noise (RUST-1M).
+    // The log bridge defeated that intent -- the warn reached Sentry anyway as
+    // RUST-8W, and because it interpolates `{err:#}` (program, full argv, log
+    // tail) it fragmented per command line on top. The app re-runs bootstrap
+    // from the setup window, so there is no failure left to report.
+    if target.starts_with("headroom_desktop_lib")
+        && msg.starts_with("ensure_runtime_ready_for_tray: managed runtime missing")
+    {
+        return true;
+    }
+    // The detached-proxy sweep in `stop_headroom` is best-effort teardown. On
+    // unix a `pkill` that matched nothing (exit 1) is already treated as
+    // success; on Windows the sweep script now states its own verdict, so a
+    // residual "powershell exited with status" error is a crash-class exit
+    // with nothing actionable in it: the app is stopping, and the next
+    // launch's `reclaim_orphan_proxy` reaps whatever survived -- the same
+    // reasoning that made the session-teardown exit codes an info log
+    // (RUST-7N; RUST-6F/6G were the old per-command-pattern warnings).
+    // Deliberately NARROW: the script's enumeration-failure verdict ("could
+    // not enumerate processes") and the pkill refusal guard must still
+    // report. Keep the local log either way.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with(
+            "failed to clean detached headroom proxy processes: powershell exited with status",
+        )
     {
         return true;
     }
@@ -591,11 +654,53 @@ mod tests {
         ));
     }
 
+    /// One detection, two issues: the fully-scoped capture at the emit site
+    /// (RUST-A5) and this bridged log line (RUST-A4). The capture is the Sentry
+    /// path; the warn is local only.
+    #[test]
+    fn skips_the_zero_savings_canary_log_twin() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::savings_canary",
+            "zero-savings canary: 32/32 requests over 10000 tokens saved nothing (models: anthropic/glm-5.3; strata: other|new_user_ask|xl|tools)"
+        ));
+        // The emit-site capture's own wording must still reach Sentry -- it is
+        // the half that carries the fingerprint and the extras.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::savings_canary",
+            "zero_savings_canary: 32/32 large requests compressed to nothing (models: anthropic/glm-5.3; strata: other|new_user_ask|xl|tools)"
+        ));
+    }
+
+    /// ENFILE is a machine-wide resource we cannot free, and it fails every
+    /// file touch identically (RUST-A3 writing, RUST-5T reading). EMFILE is the
+    /// per-process limit and would mean we leak descriptors -- keep reporting it.
+    #[test]
+    fn skips_system_wide_fd_exhaustion_but_not_our_own() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "failed to persist usage-counters.json: writing ~/Library/Application Support/Headroom/config/usage-counters.json.tmp.22503.30753: Too many open files in system (os error 23)"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "load_setup_state: could not read ~/Library/Application Support/Headroom/config/client-setup.json twice (reading: Too many open files in system (os error 23))"
+        ));
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "failed to persist usage-counters.json: writing /tmp/x: Too many open files (os error 24)"
+        ));
+    }
+
     #[test]
     fn skips_foreign_port_bind_retry_warns() {
+        // Named foreign holder -- captured once at the emit site.
         assert!(skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
-            "[proxy_intercept] port 6767 is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s (Address already in use (os error 48))"
+            "[proxy_intercept] port 6767 is held by Affinity (pid 54915); retrying in 15s (Address already in use (os error 48))"
+        ));
+        // Stuck past the drain window -- also captured once at the emit site.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] port 6767 still in use with nothing listening after 420s; retrying in 15s (Only one usage of each socket address (protocol/network address/port) is normally permitted. (os error 10048))"
         ));
         // Other bind/loop errors from proxy_intercept stay in Sentry.
         assert!(!skip_sentry(
@@ -718,6 +823,50 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::state",
             "WebView2 error: something we emitted ourselves"
+        ));
+    }
+
+    #[test]
+    fn skips_tray_missing_runtime_route_to_setup() {
+        // RUST-8W: the emit site already decided this is a recovery, not a
+        // crash (RUST-1M); the log bridge sent it to Sentry regardless, with
+        // the whole argv inlined so it fragmented per command line too.
+        assert!(skip_sentry(
+            "headroom_desktop_lib",
+            "ensure_runtime_ready_for_tray: managed runtime missing; routing to setup: unable to keep headroom running in background (prior attempts: ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe proxy --port 6768 exited with status exit code: 1)"
+        ));
+        // A real tray-path start failure still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib",
+            "ensure_runtime_ready_for_tray failed: unable to keep headroom running in background"
+        ));
+    }
+
+    #[test]
+    fn skips_detached_proxy_sweep_failures() {
+        // RUST-6F/6G: one issue per command pattern, from a best-effort sweep
+        // during teardown that unix already treats as success when it matches
+        // nothing.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "failed to clean detached headroom proxy processes: powershell exited with status Some(1) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe' args '-m headroom.proxy.server'"
+        ));
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "failed to clean detached headroom proxy processes: powershell exited with status Some(1) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
+        ));
+        // The refusal guard is a real bug (an unresolved runtime path would
+        // turn the sweep into a loose substring kill), so it must still
+        // report -- as the caller actually bridges it, prefix and all.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::state",
+            "failed to clean detached headroom proxy processes: refusing to pkill with an unresolved executable path \"\""
+        ));
+        // A failed Win32_Process enumeration is the one sweep outcome worth a
+        // report; the script's own verdict separates it from a clean run.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::state",
+            "failed to clean detached headroom proxy processes: powershell could not enumerate processes (Win32_Process query failed) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
         ));
     }
 

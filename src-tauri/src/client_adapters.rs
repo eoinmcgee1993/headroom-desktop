@@ -1990,13 +1990,29 @@ fn load_setup_state() -> ClientSetupState {
             match try_load_setup_state(&path) {
                 Ok(state) => normalize_setup_state(state),
                 Err(second_err) => {
+                    // Only a parse failure is evidence that the bytes on disk
+                    // are unusable. An I/O failure says nothing about them, and
+                    // quarantining on one is destructive: it renames the user's
+                    // real setup away, every caller gets the empty default (the
+                    // tray reads that as "every client disconnected"), and the
+                    // next write_setup_state persists that emptiness over the
+                    // top. Worse, `quarantine_unparsable` reuses one `.corrupt`
+                    // slot, so a second failure overwrites the rescue copy of
+                    // the first with the now-empty file and the original is
+                    // gone for good. RUST-5T is exactly that: one machine out
+                    // of file descriptors system-wide (ENFILE), both attempts
+                    // failing in `read`, 8 times. Leave the file alone and let
+                    // the next launch read it once the machine recovers.
+                    let unreadable = first_err.is_io() && second_err.is_io();
+                    let verb = if unreadable { "read" } else { "read/parse" };
                     log::warn!(
-                        "load_setup_state: failed to read/parse {} twice ({first_err:#}; {second_err:#}); returning default",
-                        path.display()
+                        "load_setup_state: failed to {verb} {} twice ({first_err:#}; {second_err:#}); returning default{}",
+                        path.display(),
+                        if unreadable { " without quarantining" } else { "" }
                     );
-                    // The next write_setup_state would overwrite the file with
-                    // the empty default; keep the original for recovery.
-                    quarantine_unparsable(&path, "client setup state");
+                    if !unreadable {
+                        quarantine_unparsable(&path, "client setup state");
+                    }
                     ClientSetupState::default()
                 }
             }
@@ -2004,10 +2020,39 @@ fn load_setup_state() -> ClientSetupState {
     }
 }
 
-fn try_load_setup_state(path: &Path) -> Result<ClientSetupState> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+/// Why a `client-setup.json` load failed. The two cases must never be handled
+/// alike: `Parse` means the bytes on disk are unusable and moving them aside is
+/// the recovery path, while `Io` means we never saw the bytes at all and have
+/// no grounds to touch the file. See the quarantine decision in
+/// `load_setup_state` for what conflating them cost (RUST-5T).
+enum SetupStateLoadError {
+    Io(anyhow::Error),
+    Parse(anyhow::Error),
+}
+
+impl SetupStateLoadError {
+    fn is_io(&self) -> bool {
+        matches!(self, SetupStateLoadError::Io(_))
+    }
+}
+
+impl std::fmt::Display for SetupStateLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `{:#}` on the inner anyhow error: the callers log with `{err:#}` and
+        // the context chain ("reading <path>: <os error>") is the whole signal.
+        match self {
+            SetupStateLoadError::Io(err) | SetupStateLoadError::Parse(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+fn try_load_setup_state(path: &Path) -> std::result::Result<ClientSetupState, SetupStateLoadError> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading {}", path.display()))
+        .map_err(SetupStateLoadError::Io)?;
     serde_json::from_slice::<ClientSetupState>(&bytes)
         .with_context(|| format!("parsing {}", path.display()))
+        .map_err(SetupStateLoadError::Parse)
 }
 
 fn normalize_setup_state(mut state: ClientSetupState) -> ClientSetupState {
@@ -2726,6 +2771,49 @@ fn ensure_claude_settings_hook(
 /// gateway URL) when one was preserved, otherwise delete the key. A key that
 /// no longer matches Headroom's value was changed by the user and is left
 /// alone.
+/// Put the configured provider token where the client will actually send it:
+/// `env.ANTHROPIC_AUTH_TOKEN` in `~/.claude/settings.json`.
+///
+/// This is the same place cc-switch and hand-configured setups keep it, and it
+/// is deliberately the only copy outside the keychain: Headroom forwards
+/// whatever the client sent rather than injecting credentials of its own, so
+/// there is no path that puts this token on the wire from the desktop.
+///
+/// `None` removes the key -- used when the override is cleared, so a stale
+/// provider token cannot outlive the endpoint it belonged to.
+pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
+    match token {
+        Some(value) if !value.is_empty() => {
+            configure_claude_settings_env("ANTHROPIC_AUTH_TOKEN", value)?;
+            Ok(())
+        }
+        _ => {
+            let existing = read_claude_settings_env("ANTHROPIC_AUTH_TOKEN")?;
+            match existing {
+                Some(current) => remove_claude_settings_env("ANTHROPIC_AUTH_TOKEN", &current, None),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+/// Current value of one `env` key in `~/.claude/settings.json`, if any.
+fn read_claude_settings_env(env_key: &str) -> Result<Option<String>> {
+    let settings_path = claude_settings_path();
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&settings_path)
+        .with_context(|| format!("reading {}", settings_path.display()))?;
+    let root = parse_json_object(&raw, &settings_path)?;
+    Ok(root
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get(env_key))
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
 fn remove_claude_settings_env(
     env_key: &str,
     expected_value: &str,
@@ -6782,6 +6870,51 @@ mod tests {
         let state: ClientSetupState = serde_json::from_str(dropped).unwrap();
         assert!(state.managed_shell_files.contains_key("codex_cli"));
         assert!(state.rtk_disabled);
+    }
+
+    /// RUST-5T: both load attempts failed in `read` (the machine was out of
+    /// file descriptors), and the old code quarantined on that -- renaming the
+    /// user's real setup away and handing every caller the empty default. An
+    /// unreadable file must be left exactly where it is.
+    #[test]
+    fn an_unreadable_setup_state_is_never_quarantined() {
+        let _home = TestHome::new();
+        let mut state = super::ClientSetupState::default();
+        state
+            .configured_clients
+            .insert("claude_code".into(), "2026-01-01T00:00:00+00:00".into());
+        super::write_setup_state(&state).expect("write");
+        let path = super::setup_state_path();
+        let original = std::fs::read(&path).expect("read back");
+
+        // Unreadable, not unparsable: a directory where the file is expected
+        // makes every `fs::read` fail without saying anything about contents,
+        // which is the same class of evidence as ENFILE.
+        std::fs::remove_file(&path).expect("remove");
+        std::fs::create_dir(&path).expect("dir in its place");
+        assert!(super::try_load_setup_state(&path).is_err_and(|e| e.is_io()));
+        assert!(
+            super::load_setup_state().configured_clients.is_empty(),
+            "callers still get the default"
+        );
+        assert!(
+            !path.with_extension("json.corrupt").exists(),
+            "an unreadable file must not be moved aside"
+        );
+
+        // A genuinely unparsable file still is: the bytes were read and are bad.
+        std::fs::remove_dir(&path).expect("undo");
+        std::fs::write(&path, b"{ truncated").expect("corrupt it");
+        assert!(super::load_setup_state().configured_clients.is_empty());
+        let corrupt = path.with_extension("json.corrupt");
+        assert!(corrupt.exists(), "unparsable bytes are quarantined");
+        assert_eq!(std::fs::read(&corrupt).unwrap(), b"{ truncated");
+
+        // And the healthy path is untouched.
+        std::fs::write(&path, &original).expect("restore");
+        assert!(super::load_setup_state()
+            .configured_clients
+            .contains_key("claude_code"));
     }
 
     #[test]

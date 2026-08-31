@@ -457,6 +457,52 @@ pub type FreshBearerNotifier = mpsc::Sender<()>;
 pub const ANTHROPIC_DIRECT_BASE: &str = "https://api.anthropic.com";
 pub const OPENAI_DIRECT_BASE: &str = "https://api.openai.com";
 
+/// What a held intercept port means, given who (if anyone) is listening on it
+/// and how long we have been trying.
+///
+/// Split out from the bind loop so the decision is testable: the loop itself
+/// is an infinite async retry that cannot be driven from a unit test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeldPortVerdict {
+    /// Bind says in-use but nothing is LISTENING, and we are still inside the
+    /// window where a previous instance's sockets could be draining. Windows
+    /// only in practice: Rust sets `SO_REUSEADDR` on Unix but not there, so an
+    /// exiting instance's accepted connections hold the port through
+    /// TIME_WAIT. Self-healing, so it is not worth an error report.
+    Draining,
+    /// Same shape, but past the longest drain Windows can be configured for
+    /// (`TcpTimedWaitDelay` maxes at 300s). No longer safe to assume it clears.
+    Stuck,
+    /// A live foreign listener. Does not clear on its own, and we can name it,
+    /// so this is the one the user can actually act on.
+    Foreign { name: String, pid: u32 },
+}
+
+/// Whether a verdict makes a `SO_REUSEADDR` rebind safe.
+///
+/// Only `Draining` does, and the distinction is a correctness boundary rather
+/// than a preference. On Windows `SO_REUSEADDR` also permits binding over a
+/// socket that is actively LISTENING, so reusing on `Foreign` would bind us
+/// alongside a live holder, and reusing on any verdict reached while another
+/// Headroom held the port would defeat single-instance protection and split
+/// traffic across two proxies. `Draining` is the only verdict that guarantees
+/// nothing is listening.
+pub(crate) fn verdict_permits_reuse(verdict: &HeldPortVerdict) -> bool {
+    matches!(verdict, HeldPortVerdict::Draining)
+}
+
+pub(crate) fn classify_held_port(
+    occupant: Option<(String, u32)>,
+    elapsed: std::time::Duration,
+    drain_grace: std::time::Duration,
+) -> HeldPortVerdict {
+    match occupant {
+        Some((name, pid)) => HeldPortVerdict::Foreign { name, pid },
+        None if elapsed < drain_grace => HeldPortVerdict::Draining,
+        None => HeldPortVerdict::Stuck,
+    }
+}
+
 /// Locale-invariant identity for an OS error.
 ///
 /// `io::Error`'s `Display` is the *localized* platform string, so keying a
@@ -536,11 +582,25 @@ pub fn spawn(
                 // this; anything still held after it is something the user has
                 // to be told about.
                 const HINT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+                // Past RELAUNCH_GRACE a held port is still not necessarily a
+                // problem: on Windows the exiting instance's accepted
+                // connections hold the port through TIME_WAIT with nothing
+                // in LISTENING state, and `TcpTimedWaitDelay` tops out at
+                // 300s. Below that a listener-less port is still draining;
+                // above it, it is stuck and worth saying so.
+                const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
                 let launched_at = tokio::time::Instant::now();
                 let mut consecutive_failures = 0usize;
+                // Set only by the `Draining` verdict, which is the one case
+                // where nothing is listening and the port is held purely by
+                // sockets on their way out. Never reset: once we have
+                // established that, a plain bind has nothing left to prove,
+                // and `run` does not return after it binds.
+                let mut reuse_addr = false;
                 loop {
                     match run(
                         bind_addr,
+                        reuse_addr,
                         token_slot.clone(),
                         codex_slot.clone(),
                         codex_plan_slot.clone(),
@@ -608,25 +668,112 @@ pub fn spawn(
                                         continue;
                                     }
                                 }
-                                log::warn!(
-                                    "[proxy_intercept] port {INTERCEPT_PORT} is held but not answering /health (leftover Headroom, another app, or a reserved range); retrying in 15s ({e})"
-                                );
+                                // Who actually holds it decides whether this
+                                // is worth a report. `listener_process` only
+                                // ever names a socket in LISTENING state, so
+                                // `None` here means bind says in-use while
+                                // nothing is listening -- on Windows that is
+                                // the previous instance's accepted connections
+                                // draining through TIME_WAIT, because Rust
+                                // sets SO_REUSEADDR on Unix but not there.
+                                // RUST-7M was exactly this: one event per
+                                // update relaunch, Windows-only, every one of
+                                // them self-healing. Reporting it filed an
+                                // error at the user that named no cause they
+                                // could act on and that fixed itself minutes
+                                // later. `Some` is the opposite case -- a live
+                                // foreign listener, which does not clear on
+                                // its own and which we can name.
+                                let occupant =
+                                    crate::tool_manager::listener_process(INTERCEPT_PORT);
                                 let key = os_error_key(&e);
-                                if reported_errors.insert(format!("foreign:{key}")) {
-                                    sentry::with_scope(
-                                        |scope| {
-                                            scope.set_extra(
-                                                "os_error", e.to_string().into());
-                                        },
-                                        || {
-                                            sentry::capture_message(
-                                                &format!(
-                                                    "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} held but not answering /health; retrying)"
-                                                ),
-                                                sentry::Level::Error,
+                                let verdict = classify_held_port(
+                                    occupant,
+                                    launched_at.elapsed(),
+                                    DRAIN_GRACE,
+                                );
+                                // Nothing listening means the only thing
+                                // holding the port is sockets draining, so the
+                                // next attempt can take it back now instead of
+                                // waiting out TcpTimedWaitDelay.
+                                if verdict_permits_reuse(&verdict) {
+                                    reuse_addr = true;
+                                }
+                                match verdict {
+                                    HeldPortVerdict::Draining => {
+                                        // Still a real outage from the user's
+                                        // side, so the banner stays -- but it
+                                        // says what is happening instead of
+                                        // the bare OS string, which reads as
+                                        // "the runtime is broken".
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} is still being released after a restart; reconnecting"
+                                        ));
+                                        log::info!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} in use but nothing is listening {}s after launch (a previous instance's sockets draining looks exactly like this); retrying in 15s ({e})",
+                                            launched_at.elapsed().as_secs()
+                                        );
+                                    }
+                                    HeldPortVerdict::Stuck => {
+                                        // Past the longest drain Windows can
+                                        // be configured for, so "it will
+                                        // clear itself" has stopped being
+                                        // true. Nothing to name, but worth
+                                        // knowing about.
+                                        log::warn!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} still in use with nothing listening after {}s; retrying in 15s ({e})",
+                                            launched_at.elapsed().as_secs()
+                                        );
+                                        if reported_errors.insert(format!("stuck:{key}")) {
+                                            sentry::with_scope(
+                                                |scope| {
+                                                    scope.set_extra(
+                                                        "os_error", e.to_string().into());
+                                                    scope.set_extra(
+                                                        "held_secs",
+                                                        launched_at.elapsed().as_secs().into());
+                                                },
+                                                || {
+                                                    sentry::capture_message(
+                                                        &format!(
+                                                            "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} in use with no listener past the drain window; retrying)"
+                                                        ),
+                                                        sentry::Level::Error,
+                                                    );
+                                                },
                                             );
-                                        },
-                                    );
+                                        }
+                                    }
+                                    HeldPortVerdict::Foreign { name, pid } => {
+                                        // Actionable: the user can quit this.
+                                        // Reclaim already declined it, so it
+                                        // is not one of ours.
+                                        log::warn!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} is held by {name} (pid {pid}); retrying in 15s ({e})"
+                                        );
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} is held by {name} (pid {pid})"
+                                        ));
+                                        if reported_errors.insert(format!("foreign:{key}:{name}")) {
+                                            sentry::with_scope(
+                                                |scope| {
+                                                    scope.set_extra(
+                                                        "os_error", e.to_string().into());
+                                                    scope.set_extra(
+                                                        "occupant", name.clone().into());
+                                                    scope.set_extra("occupant_pid", pid.into());
+                                                },
+                                                || {
+                                                    sentry::capture_message(
+                                                        &format!(
+                                                            "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} held by {name}; retrying)"
+                                                        ),
+                                                        sentry::Level::Error,
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -675,8 +822,54 @@ pub fn spawn(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Bind the intercept port on Windows with `SO_REUSEADDR` set.
+///
+/// Rust sets `SO_REUSEADDR` for you on Unix but not on Windows, so a listener
+/// there cannot rebind a port whose previous owner left connections in
+/// TIME_WAIT -- which is every update relaunch, for up to `TcpTimedWaitDelay`
+/// (120s by default, 300s at most). That wait was RUST-7M.
+///
+/// Only ever reached from the `Draining` verdict, and that is load-bearing.
+/// `SO_REUSEADDR` on Windows also lets a bind succeed over a socket that is
+/// actively LISTENING, so using it unconditionally would let a second Headroom
+/// bind 6767 alongside the first and split traffic between two proxies -- the
+/// `probe_existing_intercept` branch relies on that bind failing. `Draining`
+/// is only reached when `listener_process` found nothing in LISTENING state,
+/// which rules out both another Headroom and a foreign holder, leaving the
+/// kernel's TIME_WAIT reservation as the only thing this can bind over.
+#[cfg(windows)]
+fn reuse_bound_std_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    // Matches the backlog tokio's own `TcpListener::bind` requests.
+    socket.listen(1024)?;
+    let listener: std::net::TcpListener = socket.into();
+    // tokio's reactor requires this; `from_std` documents it as the caller's job.
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Plain bind, or a `SO_REUSEADDR` bind when the caller has established that
+/// nothing is listening and the port is only held by draining sockets.
+///
+/// `reuse_addr` is inert off Windows: Unix already sets the option, so the
+/// plain path there is the reuse path.
+async fn bind_intercept(addr: SocketAddr, reuse_addr: bool) -> std::io::Result<TcpListener> {
+    #[cfg(windows)]
+    if reuse_addr {
+        return TcpListener::from_std(reuse_bound_std_listener(addr)?);
+    }
+    #[cfg(not(windows))]
+    let _ = reuse_addr;
+    TcpListener::bind(addr).await
+}
+
 async fn run(
     bind_addr: SocketAddr,
+    reuse_addr: bool,
     token_slot: SharedToken,
     codex_slot: CodexRateLimitSlot,
     codex_plan_slot: CodexPlanSlot,
@@ -687,7 +880,7 @@ async fn run(
     upstream_base: Arc<String>,
     bind_error: BindErrorSlot,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(bind_addr).await?;
+    let listener = bind_intercept(bind_addr, reuse_addr).await?;
     // Serving again: clear whatever the previous attempt recorded so a
     // recovered port stops showing a stale cause in the UI.
     *bind_error.lock() = None;
@@ -1473,16 +1666,36 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     if (500..600).contains(&status) {
         return;
     }
+    // A geo-block is a property of where the user is, not of anything we sent:
+    // OpenAI refuses the request before it is ever evaluated, and no release we
+    // ship can change the outcome. Same reasoning that already excludes 401 and
+    // 429 above, applied one level deeper because the status alone does not say
+    // it -- a 403 can also be an org-verification challenge, which IS
+    // actionable, so the body's `code` is what splits them. RUST-4H collected
+    // 139 of these from hosts in unsupported regions. The raw body still
+    // reaches the local log::warn! above.
+    if is_geo_blocked_codex_error(&body) {
+        return;
+    }
     // Group by status so each upstream failure class is its own Sentry issue.
     // Without an explicit fingerprint, Sentry parameterizes the message
     // ("codex upstream error {status} on {path}") and collapses 401 noise, 403
     // challenges and real 502/503 connection errors into one un-triageable
     // bucket that regresses the moment any sibling status reappears (RUST-46).
     let status_str = status.to_string();
+    // Tags, not extras: an extra can only be read one event at a time, so the
+    // shape RUST-4V's 578 events shared was never visible from the issue view.
+    // Both values are bounded and content-free, so they stay aggregatable.
+    let shape = codex_error_shape_tag(&body);
+    let content_type = response_content_type(head);
     sentry::with_scope(
         |scope| {
             scope.set_tag("codex_upstream_status", status);
             scope.set_tag("codex_request_path", &path);
+            scope.set_tag("codex_error_shape", &shape);
+            if let Some(content_type) = content_type.as_deref() {
+                scope.set_tag("codex_response_content_type", content_type);
+            }
             scope.set_extra("error_body", snippet.clone().into());
             scope.set_fingerprint(Some(&["codex-upstream-error", status_str.as_str()]));
         },
@@ -1495,6 +1708,25 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     );
 }
 
+/// True when an upstream error body carries OpenAI's unsupported-region code.
+/// Only the structural `code` field is read; no free text is inspected or kept.
+fn is_geo_blocked_codex_error(body: &[u8]) -> bool {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let err = json.get("error").unwrap_or(&json);
+    err.get("code").and_then(|v| v.as_str()) == Some("unsupported_country_region_territory")
+}
+
+/// The response's media type with any parameters (`; charset=...`) stripped, so
+/// it stays a low-cardinality tag. Distinguishes a JSON error from an HTML
+/// gateway page or an SSE frame without reading a byte of the body.
+fn response_content_type(head: &[u8]) -> Option<String> {
+    let value = extract_header_value(head, "content-type")?;
+    let media_type = value.split(';').next()?.trim().to_ascii_lowercase();
+    (!media_type.is_empty()).then_some(media_type)
+}
+
 /// Reduce an upstream error body to structural fields safe for Sentry:
 /// `error.type` / `error.code` / `error.param`, never free-text (the
 /// `message` field and raw bodies can quote request content).
@@ -1502,21 +1734,87 @@ fn codex_error_summary(body: &[u8]) -> String {
     match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(json) => {
             let err = json.get("error").unwrap_or(&json);
-            let field = |key: &str| {
-                err.get(key)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-")
-                    .to_string()
-            };
+            let field = |key: &str| err.get(key).and_then(|v| v.as_str());
+            let (kind, code, param) = (field("type"), field("code"), field("param"));
+            // All three absent means the body parsed but carried none of the
+            // schema we know how to read, and "type=- code=- param=-" then
+            // says only "something failed" -- RUST-4V collected 578 events
+            // that were all exactly that string and stayed untriageable for
+            // two months. Describe the shape instead, so the next one is a
+            // lead rather than another tally mark.
+            if kind.is_none() && code.is_none() && param.is_none() {
+                return format!(
+                    "no structural error fields; shape={} ({} bytes)",
+                    codex_error_body_shape(&json),
+                    body.len()
+                );
+            }
             format!(
                 "type={} code={} param={}",
-                field("type"),
-                field("code"),
-                field("param")
+                kind.unwrap_or("-"),
+                code.unwrap_or("-"),
+                param.unwrap_or("-")
             )
         }
         // Truncated (peek is bounded) or non-JSON body — report size only.
         Err(_) => format!("unparseable error body ({} bytes)", body.len()),
+    }
+}
+
+/// Content-free descriptor of an error body's JSON shape.
+///
+/// Key NAMES are schema; only values can quote the request, and none are read
+/// here. Top-level keys of an HTTP error body are chosen by the API, not by the
+/// user, so naming them cannot leak prompt content even when a 400 echoes
+/// request fields. `is_safe_shape_key` is the belt-and-braces: anything that
+/// does not look like an identifier is dropped rather than forwarded.
+fn codex_error_body_shape(json: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match json {
+        Value::Object(map) => {
+            let mut keys: Vec<&str> = map
+                .keys()
+                .map(String::as_str)
+                .filter(|key| is_safe_shape_key(key))
+                .collect();
+            keys.sort_unstable();
+            keys.truncate(SHAPE_MAX_KEYS);
+            format!("object{{{}}}", keys.join(","))
+        }
+        Value::Array(_) => "array".to_string(),
+        Value::String(_) => "string".to_string(),
+        Value::Number(_) => "number".to_string(),
+        Value::Bool(_) => "bool".to_string(),
+        Value::Null => "null".to_string(),
+    }
+}
+
+/// Cap on keys named in a shape descriptor. Bounds both the message length and
+/// the cardinality of the `codex_error_shape` tag built from it.
+const SHAPE_MAX_KEYS: usize = 8;
+
+/// Whether a JSON key is safe to forward as schema: a short, identifier-shaped
+/// name. Rejects anything long or punctuated, which is what a key carrying
+/// user content would look like.
+fn is_safe_shape_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 32
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// The shape descriptor as a Sentry TAG value.
+///
+/// Deliberately a tag and not an extra: extras cannot be aggregated or
+/// searched, so `error_body` could only ever be read one event at a time --
+/// which is why RUST-4V's 578 events never revealed that they shared one
+/// shape. A tag makes "which shapes are these?" a single query.
+fn codex_error_shape_tag(body: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(json) => codex_error_body_shape(&json),
+        Err(_) if body.is_empty() => "empty".to_string(),
+        Err(_) => "non-json".to_string(),
     }
 }
 
@@ -2638,18 +2936,20 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
-        codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
-        find_header_end, intercept_request_counts, is_codex_request_head, is_codex_sse_response,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_openai_path, is_prompt_request_head, is_reportable_codex_error, os_error_key,
-        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
+        bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
+        codex_error_summary, codex_snapshot_from_usage_payload, codex_window_label,
+        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
+        intercept_request_counts, is_codex_request_head, is_codex_sse_response,
+        is_geo_blocked_codex_error, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
+        is_local_proxy_path, is_openai_path, is_prompt_request_head, is_reportable_codex_error,
+        os_error_key, parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
-        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, stamp_client_header,
         stamp_codex_client_header, stamp_headroom_bypass_header, stamp_request_header,
-        strip_request_header, BypassFlag, CodexTerminalReader, ModelsRewrite, ParsedRequestHead,
-        SharedToken, FIRST_OPTIMIZED_REQUEST_REPORTED,
+        strip_request_header, verdict_permits_reuse, BypassFlag, CodexTerminalReader,
+        HeldPortVerdict, ModelsRewrite, ParsedRequestHead, SharedToken,
+        FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -2683,6 +2983,102 @@ mod tests {
         // Non-OS errors have no code; fall back to the text so they stay distinct.
         let synthetic = std::io::Error::other("synthesized by a wrapper");
         assert_eq!(os_error_key(&synthetic), "synthesized by a wrapper");
+    }
+
+    const HELD_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// RUST-7M: Windows-only, one event per update relaunch, every one
+    /// self-healing. Nothing is LISTENING because the port is held by the
+    /// previous instance's connections in TIME_WAIT, so there is no pid to
+    /// name and nothing for the user to do about it.
+    #[test]
+    fn a_listener_less_port_inside_the_grace_is_draining_not_an_error() {
+        assert_eq!(
+            classify_held_port(None, std::time::Duration::from_secs(120), HELD_GRACE),
+            HeldPortVerdict::Draining
+        );
+    }
+
+    /// The 90s RELAUNCH_GRACE expires while Windows' TcpTimedWaitDelay (120s
+    /// by default) is still running, which is exactly why RUST-7M reported at
+    /// all. Past 90s but inside the drain window must stay quiet.
+    #[test]
+    fn the_relaunch_grace_alone_does_not_cover_the_windows_drain() {
+        assert_eq!(
+            classify_held_port(None, std::time::Duration::from_secs(91), HELD_GRACE),
+            HeldPortVerdict::Draining
+        );
+    }
+
+    /// The safety boundary for the SO_REUSEADDR rebind. Draining is the only
+    /// verdict that establishes nothing is listening, and on Windows
+    /// SO_REUSEADDR binds over live listeners too -- so widening this to any
+    /// other verdict would let a second Headroom bind 6767 alongside the
+    /// first, or park us next to a foreign holder, instead of failing.
+    #[test]
+    fn only_a_draining_port_may_be_rebound_with_reuseaddr() {
+        assert!(verdict_permits_reuse(&HeldPortVerdict::Draining));
+        assert!(!verdict_permits_reuse(&HeldPortVerdict::Stuck));
+        assert!(!verdict_permits_reuse(&HeldPortVerdict::Foreign {
+            name: "Affinity".into(),
+            pid: 54915
+        }));
+    }
+
+    /// Off Windows the flag is inert (Unix already sets SO_REUSEADDR), so both
+    /// paths must still produce a usable listener.
+    #[tokio::test]
+    async fn bind_intercept_binds_either_way() {
+        for reuse in [false, true] {
+            let listener = bind_intercept("127.0.0.1:0".parse().unwrap(), reuse)
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            assert_ne!(addr.port(), 0);
+            let joined = tokio::spawn(async move { listener.accept().await.is_ok() });
+            let _client = TcpStream::connect(addr).await.expect("connect");
+            assert!(joined.await.expect("join"));
+        }
+    }
+
+    #[test]
+    fn a_listener_less_port_past_the_grace_is_stuck() {
+        assert_eq!(
+            classify_held_port(None, std::time::Duration::from_secs(301), HELD_GRACE),
+            HeldPortVerdict::Stuck
+        );
+    }
+
+    /// A named holder does not clear on its own, so the drain window is
+    /// irrelevant to it -- report immediately rather than sitting on it 300s.
+    #[test]
+    fn a_live_listener_is_foreign_however_early_it_shows_up() {
+        assert_eq!(
+            classify_held_port(
+                Some(("Affinity".into(), 54915)),
+                std::time::Duration::from_secs(1),
+                HELD_GRACE
+            ),
+            HeldPortVerdict::Foreign {
+                name: "Affinity".into(),
+                pid: 54915
+            }
+        );
+    }
+
+    #[test]
+    fn a_live_listener_past_the_grace_is_still_named_not_stuck() {
+        assert_eq!(
+            classify_held_port(
+                Some(("node".into(), 99)),
+                std::time::Duration::from_secs(9_999),
+                HELD_GRACE
+            ),
+            HeldPortVerdict::Foreign {
+                name: "node".into(),
+                pid: 99
+            }
+        );
     }
     use tokio::time::{timeout, Duration};
 
@@ -2967,6 +3363,7 @@ mod tests {
             // run() loops forever; the test cancels it via abort below.
             let _ = run(
                 intercept_addr,
+                false,
                 slot_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -3072,6 +3469,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -3151,6 +3549,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 slot_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -3729,6 +4128,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 token_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -3874,6 +4274,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 token_slot,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -3977,6 +4378,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 token_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -4318,6 +4720,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 slot_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -4431,6 +4834,7 @@ mod tests {
         let run_task = tokio::spawn(async move {
             let _ = run(
                 intercept_addr,
+                false,
                 slot_for_run,
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(None)),
@@ -4531,6 +4935,105 @@ mod tests {
             codex_error_summary(b"<html>gateway error</html>"),
             "unparseable error body (26 bytes)"
         );
+    }
+
+    #[test]
+    fn codex_error_summary_describes_shape_when_fields_are_absent() {
+        // The RUST-4V case: valid JSON, none of type/code/param, which used to
+        // render as the useless "type=- code=- param=-".
+        let summary = codex_error_summary(br#"{"detail":"nope","status":400}"#);
+        assert_eq!(
+            summary,
+            "no structural error fields; shape=object{detail,status} (30 bytes)"
+        );
+        // `{"error": "..."}` — error present but a string, so no fields resolve.
+        assert_eq!(
+            codex_error_summary(br#"{"error":"boom"}"#),
+            "no structural error fields; shape=object{error} (16 bytes)"
+        );
+        // An empty object and a bare null are both distinguishable now.
+        assert_eq!(
+            codex_error_summary(b"{}"),
+            "no structural error fields; shape=object{} (2 bytes)"
+        );
+        assert_eq!(
+            codex_error_summary(b"null"),
+            "no structural error fields; shape=null (4 bytes)"
+        );
+    }
+
+    #[test]
+    fn codex_error_summary_still_prefers_structural_fields() {
+        // A partially-populated body must keep the field rendering, not fall
+        // through to the shape branch.
+        assert_eq!(
+            codex_error_summary(br#"{"error":{"code":"invalid_prompt"}}"#),
+            "type=- code=invalid_prompt param=-"
+        );
+    }
+
+    #[test]
+    fn codex_error_shape_tag_stays_low_cardinality_and_content_free() {
+        assert_eq!(
+            codex_error_shape_tag(br#"{"error":{"code":"x"}}"#),
+            "object{error}"
+        );
+        assert_eq!(codex_error_shape_tag(b"<html>502</html>"), "non-json");
+        assert_eq!(codex_error_shape_tag(b""), "empty");
+        assert_eq!(codex_error_shape_tag(b"[]"), "array");
+
+        // Keys are sorted (stable tag value) and capped at SHAPE_MAX_KEYS.
+        let many = (0..20)
+            .map(|i| format!("\"k{i:02}\":1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tag = codex_error_shape_tag(format!("{{{many}}}").as_bytes());
+        assert_eq!(tag, "object{k00,k01,k02,k03,k04,k05,k06,k07}");
+
+        // A key shaped like user content is dropped rather than forwarded.
+        let leaky = br#"{"Summarise this: my password is hunter2":1,"detail":2}"#;
+        let tag = codex_error_shape_tag(leaky);
+        assert_eq!(tag, "object{detail}");
+        assert!(!tag.contains("hunter2"), "{tag}");
+    }
+
+    #[test]
+    fn response_content_type_strips_parameters() {
+        let head =
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\n\r\n";
+        assert_eq!(
+            response_content_type(head).as_deref(),
+            Some("application/json")
+        );
+        let sse = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+        assert_eq!(
+            response_content_type(sse).as_deref(),
+            Some("text/event-stream")
+        );
+        assert_eq!(response_content_type(b"HTTP/1.1 400 Bad\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn geo_blocked_codex_error_detects_unsupported_region() {
+        // The exact shape RUST-4H captured 139 times.
+        let body = br#"{"error":{"message":"Country, region, or territory not supported","type":"request_forbidden","code":"unsupported_country_region_territory","param":null}}"#;
+        assert!(is_geo_blocked_codex_error(body));
+    }
+
+    #[test]
+    fn geo_blocked_codex_error_ignores_other_403s() {
+        // An org-verification 403 IS actionable and must still reach Sentry.
+        let body =
+            br#"{"error":{"type":"request_forbidden","code":"organization_must_be_verified"}}"#;
+        assert!(!is_geo_blocked_codex_error(body));
+        // Unrelated shapes must not be mistaken for a geo-block.
+        assert!(!is_geo_blocked_codex_error(
+            br#"{"error":{"type":"invalid_request_error","code":"invalid_prompt"}}"#
+        ));
+        assert!(!is_geo_blocked_codex_error(b"<html>gateway error</html>"));
+        assert!(!is_geo_blocked_codex_error(b""));
+        // A null code must not panic or match.
+        assert!(!is_geo_blocked_codex_error(br#"{"error":{"code":null}}"#));
     }
 
     #[test]

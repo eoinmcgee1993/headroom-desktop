@@ -2,7 +2,7 @@
 
 After installing a new Windows build (`-rc.N`), paste this file into Claude Code and ask it to run the checks. Each check has a single expected signal — if any fail, stop and investigate before promoting to stable.
 
-Run the commands from Git Bash unless a section says PowerShell. Paths below use the Windows layout added by the Windows support work: the bundled runtime lives under `%LOCALAPPDATA%\Headroom\headroom\runtime\venv\Scripts` (`python.exe` / `headroom.exe`), RTK at `%LOCALAPPDATA%\Headroom\headroom\bin\rtk.exe`, and the markitdown shim at `%LOCALAPPDATA%\Headroom\headroom\bin\markitdown.cmd`.
+Run the commands from Git Bash unless a section says PowerShell - pasting the bash blocks into a PowerShell prompt fails with `grep : The term 'grep' is not recognized` (Claude Code's Bash tool already runs Git Bash, so this only bites when running them by hand). Paths below use the Windows layout added by the Windows support work: the bundled runtime lives under `%LOCALAPPDATA%\Headroom\headroom\runtime\venv\Scripts` (`python.exe` / `headroom.exe`), RTK at `%LOCALAPPDATA%\Headroom\headroom\bin\rtk.exe`, and the markitdown shim at `%LOCALAPPDATA%\Headroom\headroom\bin\markitdown.cmd`.
 
 ## Setup
 
@@ -13,7 +13,7 @@ Run the commands from Git Bash unless a section says PowerShell. Paths below use
 
 ## Checks (Claude Code pass)
 
-Run these from a Claude Code session and report PASS / FAIL with the observed value. Checks 1, 5, 7, 8, 9, 10, and 12 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `%USERPROFILE%\.claude\settings.json`, pay-per-token), so its equivalents live in the **Codex pass** below; run that whole section from a Codex session.
+Run these from a Claude Code session and report PASS / FAIL with the observed value. Checks 1, 5, 7, 8, 9, 10, 12, 13, and 14 are client-agnostic — run them once in either client. Check 14 has a step that must run **before** you install the rc - read it first. Codex has very different wiring (no RTK, no `%USERPROFILE%\.claude\settings.json`, pay-per-token), so its equivalents live in the **Codex pass** below; run that whole section from a Codex session.
 
 ### 1. Version matches the new build (PowerShell)
 The uninstall registry key carries no `DisplayVersion` value (only MainBinaryName / DisplayName / InstallLocation / UninstallString), so grepping the registry for a version returns nothing even on a healthy install. Read the binary's version resource instead:
@@ -43,12 +43,8 @@ If installed:
 ```
 Expect: a version line and a gain summary, no "command not found". Claude Code's Bash tool spawns a non-login shell, so a bare `rtk` may report `command not found` even on a healthy install; call the managed `rtk.exe` by its absolute path instead.
 
-### 4. MCP retrieve tool is available (Claude Code only; only if memory tools are enabled)
-First check whether the proxy was started with memory tools:
-```bash
-ls -t "$LOCALAPPDATA/Headroom/headroom/logs/" | grep 'port-6767' | head -1 | grep -q 'no-memory-tools' && echo 'memory tools DISABLED - skip this check' || echo 'memory tools enabled - run check'
-```
-If enabled, have Claude call `mcp__headroom__headroom_retrieve` with any small query and expect a tool result (not "No such tool available").
+### 4. MCP retrieve tool is available (Claude Code only)
+Have Claude call `mcp__headroom__headroom_retrieve` with any small query and expect a structured tool result - an "expired or incorrect hash" error payload is a PASS; only "No such tool available" fails. MCP registration is independent of the proxy's `no-memory-tools` flag, so there is no skip gate here. (The old gate grepped log filenames for `port-6767`, which never matches - log names embed the *backend* port, 6768 or a fallback, never the intercept's 6767 - so it unconditionally reported "enabled".)
 
 ### 5. Tray → Dashboard renders
 Click the tray icon, open the dashboard. Expect savings chart and per-client stats render without a blank/error state.
@@ -60,6 +56,8 @@ In Settings, toggle Pause then Resume. After Pause, `grep -c '127.0.0.1:6767' "$
 The proxy always runs in `token` mode now (`HEADROOM_MODE=token`, hardcoded). The compression policy is chosen per request by the auth-mode classifier from the client `User-Agent`: Claude Code subscription/OAuth traffic (UA `claude-code/`) is classified `SUBSCRIPTION` → conservative policy; pay-per-token API-key / Codex traffic is classified `PAYG`/`OAUTH` → aggressive policy, so `requests_compressed` and `total_tokens_removed` move directly.
 
 Timing matters either way: a `Read` result becomes part of Claude's *next* outgoing prompt, not the one currently being composed. The baseline capture, the large Read, and the re-check cannot all happen in one turn.
+
+Generate the payload with a real `Read` tool call. Dumping the file through Bash (`cat`, `sed`) does not work: the harness persists oversized command output to disk and only a ~2KB preview enters the next prompt, so the proxy never sees the bulk (observed on the 0.9.3-rc.5 pass).
 
 **Claude Code subscription/OAuth traffic** (classified `SUBSCRIPTION`):
 1. Capture the baseline:
@@ -129,6 +127,55 @@ curl -s 127.0.0.1:6767/stats-history | jq -r --arg d "$(date -u +%Y-%m-%d)"   '[
 ```
 Expect: "saved today" in the same ballpark as this number (plus output dollars, if any); the lifetime card at or above both. Only reproduces when the tracker predates the ring (reset/recreated `.headroom`); on a truly fresh install report the visual invariant only.
 
+### 13. Wire truth: computed transforms reached the wire, and nothing was billed for an unusable response
+
+Windows port of beta checks 11 and 13 - see `beta-smoke-test.md` for the full rationale. This class is invisible in `/stats`, on the dashboard, and in `activity-facts.json`; the proxy log is the only place the wire truth appears. The backend writes it to `%USERPROFILE%\.headroom\logs\proxy.log`. Git Bash:
+
+```bash
+L="$USERPROFILE/.headroom/logs/proxy.log"
+echo "empty-200 class: $(grep -c 'ccr_streaming_retrieve_buffered[^ ]* source=passthrough' "$L")"
+echo "discards: $(grep -c 'body_mutated=true.*source=passthrough' "$L")"
+grep 'body_mutated=true.*source=passthrough' "$L" | sed -n 's/.*mutation_reasons=\([^ ]*\).*/\1/p' | tr ',' '\n' | sort | uniq -c
+echo "zero-output claude 200s: $(grep -c 'PERF model=claude-[^ ]* .*tok_out=0 ' "$L")"
+echo "cache store refusals: $(grep -c 'response_cache_store_refused' "$L")"
+```
+
+Expect: `empty-200 class`, `zero-output claude 200s`, and `cache store refusals` all `0` - any of them non-zero is a hard FAIL. `discards` may be non-zero on the current wheel pin: FAIL only if a reason other than `output_shaper` / `image_compression` / `structural_diff_vs_original` appears (a new transform joined the silent-discard set). Promote `discards` to "expect 0" at the wheel bump that lands upstream #3015, exactly as in the beta doc; the deeper poisoned-replay probe also lives there.
+
+### 14. User state survived the upgrade
+
+Windows port of beta check 14 - see `beta-smoke-test.md` for the rationale. A wiped state file looks exactly like a healthy fresh one, so this needs a before/after comparison. **Run this snapshot BEFORE installing the rc**, on the build you are upgrading from (Git Bash):
+
+```bash
+S="$LOCALAPPDATA/Headroom/config"; P="$USERPROFILE/hr-preupgrade"; mkdir -p "$P"
+cp "$S/headroom-pricing-state.json" "$S/client-setup.json" "$S/activity-facts.json" "$P/"
+ls -l "$P"
+```
+
+**After installing and launching the rc**, compare (Git Bash; uses the bundled Python because Git Bash has no `jq`):
+
+```bash
+ls -l "$USERPROFILE/hr-preupgrade"   # mtimes must predate THIS install, not an older one
+"$LOCALAPPDATA/Headroom/headroom/runtime/venv/Scripts/python.exe" -c "
+import json, os
+S = os.path.expandvars(r'%LOCALAPPDATA%\Headroom\config')
+P = os.path.expandvars(r'%USERPROFILE%\hr-preupgrade')
+load = lambda d, n: json.load(open(os.path.join(d, n), encoding='utf-8'))
+old, new = load(P, 'headroom-pricing-state.json'), load(S, 'headroom-pricing-state.json')
+print('pricing first_seen_at:', 'OK' if old.get('first_seen_at') == new.get('first_seen_at') else 'CHANGED')
+old, new = load(P, 'client-setup.json'), load(S, 'client-setup.json')
+keys = lambda d, k: sorted((d.get(k) or {}).keys())
+ok = keys(old, 'configuredClients') == keys(new, 'configuredClients') and keys(old, 'managedShellFiles') == keys(new, 'managedShellFiles')
+print('client-setup key sets:', 'OK' if ok else 'CHANGED')
+old, new = load(P, 'activity-facts.json'), load(S, 'activity-facts.json')
+ok = old.get('allTimeRecordTokens') == new.get('allTimeRecordTokens') and old.get('lastWeeklyRecapWeekKey') == new.get('lastWeeklyRecapWeekKey')
+print('activity-facts records/recap:', 'OK' if ok else 'CHANGED')
+print('corrupt files:', sum(f.endswith('.corrupt') for f in os.listdir(S)))
+"
+```
+
+Expect: three `OK` lines and `corrupt files: 0`. Only `first_seen_at`, the two key sets, and the two activity-facts fields are compared - `paywall_first` (server-owned) and a `schemaVersion` tile reset may legitimately change. The snapshot dir survives across rcs, so check its mtimes first: if they predate the build you just replaced, say so in the report rather than claiming this rc preserved state.
+
 ## Codex checks (Codex pass)
 
 Run these from a Codex CLI session. Codex routes through Headroom via an `OPENAI_BASE_URL` shell export plus a managed provider block in `%USERPROFILE%\.codex\config.toml`, and its traffic is pay-per-token, so the proxy runs it in `token` mode.
@@ -176,6 +223,9 @@ If RTK *is* installed, its rewrite hook filters large `curl` output into a type-
 ## When something fails
 
 - Proxy log silent → check `%LOCALAPPDATA%\Headroom\headroom\logs\` for a newer log file or a crash file.
+- Two log locations, not one bug: `%LOCALAPPDATA%\Headroom\headroom\logs\` holds the desktop-managed per-launch logs (filenames embed the *backend* port - 6768 or a fallback, never 6767 - plus the launch flags), while the live rotating wire-truth log that check 13 reads is `%USERPROFILE%\.headroom\logs\proxy.log`. The proxy answers `/stats` on 6767 because that is the intercept; the Python backend behind it is what the filename names.
 - RTK missing → check `%LOCALAPPDATA%\Headroom\headroom\bin\rtk.exe` exists; the managed blocks in `%USERPROFILE%\.claude\settings.json` / `%USERPROFILE%\.codex\config.toml` are intact.
 - MCP tool missing → restart Claude Code; the MCP server registration happens at session start.
 - Credential Manager entries missing → re-run sign-in; verify the app is the release (non-debug) build, since the Windows keyring module is only compiled in release builds.
+- Check 13 non-zero → the regression is in the bundled `headroom-ai`, not desktop code. Confirm the wheel version with check 8, then search upstream before assuming it is ours (see the beta doc's failure notes).
+- Check 14 `CHANGED` or a non-zero corrupt count → this one is ours, and it is data loss, so stop the promotion. The fix goes on the struct (`#[serde(default)]`), never by hand-repairing the user's file.

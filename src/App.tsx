@@ -74,6 +74,7 @@ import {
   type SetupStallKind,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
+import { UpstreamPanel } from "./components/UpstreamPanel";
 import {
   buildInstallFailureMailto,
   buildSetupStallMailto,
@@ -629,6 +630,17 @@ const CANCELLATION_REASONS: { value: string; label: string }[] = [
 const authCodeExpiryFallbackSeconds = 900;
 const APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS = 12_000;
 const APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+// Provider settings (Settings -> Provider) are hidden while the multi-provider
+// work gets its finishing touches; the upstream-override backend stays live so
+// already-configured setups keep working. Remove the flag when it ships.
+const SHOW_PROVIDER_SETTINGS = false;
+// Desktop activation is a one-shot "this device is live" ping to headroom-web.
+// It is not worth an unbounded retry: a machine that is offline now is usually
+// offline for a while, and every attempt costs a Sentry warning. Five attempts
+// spread over ~8 minutes, then wait for the next launch.
+const DESKTOP_ACTIVATION_MAX_ATTEMPTS = 5;
+const DESKTOP_ACTIVATION_RETRY_BASE_MS = 30_000;
+const DESKTOP_ACTIVATION_RETRY_MAX_MS = 5 * 60 * 1000;
 
 async function loadDashboard(): Promise<DashboardState> {
   try {
@@ -1739,6 +1751,16 @@ export default function App() {
   const [showAllUpgradePlans, setShowAllUpgradePlans] = useState(false);
   const [checkoutPollingDeadline, setCheckoutPollingDeadline] = useState<number | null>(null);
   const desktopActivationSentRef = useRef(false);
+  // Activation retry bookkeeping. A failed attempt used to clear
+  // `desktopActivationSentRef` immediately, so the next flip of any dep below
+  // (runtime reachability flaps every time the proxy restarts) fired another
+  // attempt with no delay -- offline machines sent 187 activation failures to
+  // Sentry in 12 hours, two of them 3 seconds apart (RUST-7H/RUST-8X). Retry
+  // on a widening backoff instead, and stop after a handful: activation is
+  // best-effort, and the next app launch tries again from scratch.
+  const desktopActivationAttemptsRef = useRef(0);
+  const desktopActivationRetryTimerRef = useRef<number | undefined>(undefined);
+  const [desktopActivationRetry, setDesktopActivationRetry] = useState(0);
   // Persisted: pricing gates last days, and an app restart mid-gate used to
   // lose this set — the auto-disabled connectors then never re-enabled when
   // the gate reopened, leaving users silently unoptimized until a manual
@@ -2006,8 +2028,19 @@ export default function App() {
   useEffect(() => {
     if (!pricingStatus?.authenticated) {
       desktopActivationSentRef.current = false;
+      // Signing out and back in is an explicit user action: give it a full
+      // fresh budget rather than whatever the previous session burned.
+      desktopActivationAttemptsRef.current = 0;
+      window.clearTimeout(desktopActivationRetryTimerRef.current);
+      desktopActivationRetryTimerRef.current = undefined;
     }
   }, [pricingStatus?.authenticated]);
+
+  // Drop any pending activation retry when the app unmounts.
+  useEffect(
+    () => () => window.clearTimeout(desktopActivationRetryTimerRef.current),
+    []
+  );
 
   useEffect(() => {
     if (!pricingStatus) return;
@@ -3359,11 +3392,38 @@ export default function App() {
     }
     desktopActivationSentRef.current = true;
     void invoke<HeadroomPricingStatus>("activate_headroom_account")
-      .then((status) => setPricingStatus(status))
+      .then((status) => {
+        desktopActivationAttemptsRef.current = 0;
+        setPricingStatus(status);
+      })
       .catch(() => {
-        desktopActivationSentRef.current = false;
+        const attempts = (desktopActivationAttemptsRef.current += 1);
+        if (attempts >= DESKTOP_ACTIVATION_MAX_ATTEMPTS) {
+          // Leave the guard set: this launch is done trying. The machine is
+          // offline or headroom-web is down, and neither is something more
+          // requests fix.
+          return;
+        }
+        const delay = Math.min(
+          DESKTOP_ACTIVATION_RETRY_BASE_MS * 2 ** (attempts - 1),
+          DESKTOP_ACTIVATION_RETRY_MAX_MS
+        );
+        window.clearTimeout(desktopActivationRetryTimerRef.current);
+        desktopActivationRetryTimerRef.current = window.setTimeout(() => {
+          desktopActivationSentRef.current = false;
+          // The guard alone cannot restart the effect (no dep changed), so
+          // bump a counter the effect watches. Without it a cleared guard just
+          // waits for the next unrelated reachability flap.
+          setDesktopActivationRetry((n) => n + 1);
+        }, delay);
       });
-  }, [connectorPhase, pricingStatus?.authenticated, runtimeStatus?.proxyReachable, runtimeStatus?.running]);
+  }, [
+    connectorPhase,
+    desktopActivationRetry,
+    pricingStatus?.authenticated,
+    runtimeStatus?.proxyReachable,
+    runtimeStatus?.running,
+  ]);
 
   // While verifying, poll the proxy's /stats request counter and flip to
   // healthy when it ticks past the anchor we captured on the first reachable
@@ -5471,10 +5531,17 @@ export default function App() {
         <div className="post-install__lead">
           <h1>Test your setup</h1>
           <p>
-            Restart each tool below, then send it any message - "Say hi" is
-            enough. Tools only pick up Headroom's setting when they launch, so
-            the restart is usually the missing step. This screen ticks over by
-            itself as each one checks in.
+            Restart each tool below, then send it any message to test its connection with Headroom. 
+            "Say hi" is enough. If restarting doesn't work, contact{" "}
+            <button
+              className="install-progress__notice-link"
+              onClick={() =>
+                void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
+              type="button"
+            >
+              support@extraheadroom.com
+            </button>{" "}
+            for help.
           </p>
           {hasEnabledApps ? (
             <div className="connector-list">
@@ -6591,7 +6658,14 @@ export default function App() {
               </article>
             </section>
 
-            {dashboard.savingsHistoryLoaded || historyLoadTimedOut ? (
+            {/* The 20s timeout is an escape hatch for a backend that is not
+                coming up (paused, failed) - while it is actively STARTING,
+                keep the skeleton instead of flashing the tracker-only
+                archive chart, whose today figure reads far below the real
+                one until /stats-history loads (rc.5 Windows startup showed
+                $0.26 against a real $1). */}
+            {dashboard.savingsHistoryLoaded ||
+            (historyLoadTimedOut && !runtimeStatus?.starting) ? (
               <DailySavingsChart
                 data={dashboard.dailySavings}
                 hourlyData={dashboard.hourlySavings}
@@ -7696,6 +7770,12 @@ export default function App() {
                   <p className="install-progress__notice">{connectorsNotice}</p>
                 ) : null}
               </article>
+
+              {/* Provider settings ship dark for now: the backend default is
+                  Off and explicitly-configured setups keep working, but the
+                  panel stays hidden until the provider work is finished.
+                  Flip to true to restore Settings -> Provider. */}
+              {SHOW_PROVIDER_SETTINGS ? <UpstreamPanel /> : null}
 
               <article className="soft-card panel-card">
                 <div className="panel-card__header">

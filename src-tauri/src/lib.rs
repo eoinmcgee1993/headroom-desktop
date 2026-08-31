@@ -19,6 +19,7 @@ mod savings_canary;
 mod state;
 mod storage;
 mod tool_manager;
+mod upstream_override;
 mod usage_counters;
 
 /// Cross-module lock for tests that repoint $HOME / $CODEX_HOME. Env vars are
@@ -236,6 +237,11 @@ static WATCHDOG_DOWN_CAPTURED: AtomicBool = AtomicBool::new(false);
 // session. Subsequent in-session port conflicts stay silent so the dashboard
 // doesn't drown in the sleep/wake / kill -9 race noise.
 static PORT_CONFLICT_CAPTURED: AtomicBool = AtomicBool::new(false);
+
+// Same once-per-session shape as PORT_CONFLICT_CAPTURED, for a runtime the
+// machine's security policy refuses to execute at all. See
+// `capture_headroom_start_failure`.
+static ENDPOINT_PROTECTION_CAPTURED: AtomicBool = AtomicBool::new(false);
 
 // Guards the quit-time `clear_client_setups()` so it runs at most once per
 // process. The exit handler fires for both `ExitRequested` and `Exit`, and a
@@ -1620,6 +1626,50 @@ impl BootstrapFailureKind {
     }
 }
 
+/// Sentry drops an extra larger than roughly 16KB, so every log/output tail we
+/// attach is capped well under that. One constant so the three call sites stay
+/// in step.
+const SENTRY_EXTRA_TAIL_BYTES: usize = 12_000;
+
+/// Last `max_bytes` of `text`, prefixed with how much was dropped.
+///
+/// Slices on a char boundary. The three call sites this replaced each did
+/// `&s[s.len() - 12_000..]` with a raw byte offset, which panics ("byte index N
+/// is not a char boundary") the moment the cut lands mid-codepoint -- and these
+/// inputs are precisely where non-ASCII turns up: app logs quoting Windows
+/// paths with accented usernames, and Python's non-ASCII startup banner
+/// (RUST-7C). Panicking here loses the very report being assembled, and on the
+/// `bootstrap_abandoned` path it happens during startup, before there is a
+/// window to show anything in.
+fn tail_bytes_for_sentry(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    // Round the cut forward to the next boundary: dropping a few extra bytes is
+    // always safe, and this can never run past the end because `text.len()` is
+    // itself a boundary.
+    let mut cut = text.len() - max_bytes;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("[truncated {cut} bytes]\n...{}", &text[cut..])
+}
+
+/// Drop the per-request connection-pool debug lines from an app-log tail.
+///
+/// The health poll opens a connection to the local proxy several times a second
+/// and `reqwest` logs every one, so on a machine that sat at a bootstrap step
+/// for minutes these crowd out everything else. RUST-9Y spent its entire 12KB
+/// budget on them and arrived with nothing about the install in it at all,
+/// which is the one thing the extra exists to carry. Only this exact line is
+/// dropped -- connection *failures* and every other target are kept.
+fn strip_connection_noise(log: &str) -> String {
+    log.lines()
+        .filter(|line| !line.contains("reqwest::connect: starting new connection"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
     // pip/venv failures surface as CommandFailure, where stdout/stderr carry the
     // real signal. Our own reqwest downloads (Python runtime, rtk binary) have no
@@ -1687,7 +1737,7 @@ fn is_app_control_signal(text: &str) -> bool {
 ///
 /// Returns an empty list off Windows, where these names do not exist -- no
 /// `cfg`, so the scan stays testable on any platform.
-fn conflicting_openssl_dirs(path_var: &str) -> Vec<String> {
+pub(crate) fn conflicting_openssl_dirs(path_var: &str) -> Vec<String> {
     const NAMES: &[&str] = &["libcrypto-3-x64.dll", "libssl-3-x64.dll"];
     let mut hits = Vec::new();
     for dir in std::env::split_paths(path_var) {
@@ -1997,6 +2047,41 @@ pub(crate) fn is_port_conflict_failure(technical_err: &str) -> bool {
 /// contains a `HeadroomStartupFailure`, its log tail, log path, and invocation
 /// are sent as structured `extra` fields so we can see what Python printed
 /// before failing to bind the port.
+/// Coarse cause class for a managed-backend start failure, used as the Sentry
+/// fingerprint.
+///
+/// `HeadroomStartupFailure`'s `Display` embeds the program path, the full argv
+/// and the log tail, and Sentry groups an un-fingerprinted `capture_message` by
+/// its message text. So ONE condition -- the managed backend will not stay up --
+/// opened a fresh issue per command line and per exit code, none of them
+/// resolvable: RUST-9F/AF/AH/AJ/AK were all this failure wearing different
+/// argv. Same split as the pip (RUST-6M/6N/6P) and plugin (RUST-6K) captures.
+/// The variable detail still ships as `extra` on every event; only this bounded
+/// class reaches the fingerprint.
+fn headroom_start_failure_category(reason: &str) -> String {
+    if let Some(rest) = reason.strip_prefix("exited with status ") {
+        // `ExitStatus` renders as "exit code: 0xffffffff" (Windows),
+        // "exit status: 1" or "signal: 6 (SIGABRT)" (unix), followed by
+        // " before opening port N". Keep the status -- 0xffffffff is its own
+        // bug class, a native DLL init crash (RUST-9F/9T) -- drop the port.
+        let status = rest
+            .split(" before opening port")
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .trim_start_matches("exit code:")
+            .trim_start_matches("exit status:")
+            .trim();
+        format!("exited-{status}")
+    } else if reason.starts_with("wait check failed") {
+        "wait-check-failed".to_string()
+    } else if reason.starts_with("never opened port") {
+        "startup-timeout".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
 pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error) {
     let technical_err = format!("{err:#}");
 
@@ -2043,9 +2128,59 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
         return;
     }
 
-    if let Some(failure) = startup_failure {
+    // Windows Application Control (Smart App Control / WDAC / AppLocker), an
+    // EDR agent, or Gatekeeper refusing to execute the runtime we just
+    // installed. Two things were wrong with letting this fall through:
+    //
+    //   - Level::Error, for a machine-policy verdict no release we ship can
+    //     change. `classify_startup_error` already turns it into an actionable
+    //     hint for the user; Sentry is not where that gets fixed.
+    //   - No fingerprint, so Sentry grouped on the message -- which embeds the
+    //     full proxy command line, including the port and the user's home
+    //     path. One cause, one issue per machine: RUST-AD and RUST-AC are the
+    //     same Windows host's same App Control block, filed twice because the
+    //     two call sites prefix it differently.
+    //
+    // Once per session at Warning under a stable fingerprint, so the cohort
+    // stays countable without either splintering or drowning the dashboard.
+    if is_endpoint_protection_signal(&technical_err) {
+        if ENDPOINT_PROTECTION_CAPTURED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         sentry::with_scope(
             |scope| {
+                let fp: &[&str] = &["proxy_start_endpoint_protection"];
+                scope.set_fingerprint(Some(fp));
+                if let Some(failure) = startup_failure {
+                    scope.set_extra("program", failure.program.clone().into());
+                    scope.set_extra("args", failure.args.join(" ").into());
+                    scope.set_extra("log_path", failure.log_path.clone().into());
+                    scope.set_extra("log_tail", failure.log_tail.clone().into());
+                    scope.set_extra("reason", failure.reason.clone().into());
+                }
+                scope.set_extra("error_chain", technical_err.clone().into());
+            },
+            || {
+                sentry::capture_message(
+                    "headroom runtime blocked by endpoint protection at start",
+                    sentry::Level::Warning,
+                );
+            },
+        );
+        return;
+    }
+
+    if let Some(failure) = startup_failure {
+        let category = headroom_start_failure_category(&failure.reason);
+        sentry::with_scope(
+            |scope| {
+                // `context` is a bounded set of call sites and keeps the
+                // launch/tray lifecycles apart; `category` is the cause class.
+                // Neither can fragment, unlike the argv in the message text.
+                scope.set_fingerprint(Some(&["headroom-start-failed", context, &category]));
                 scope.set_extra("program", failure.program.clone().into());
                 scope.set_extra("args", failure.args.join(" ").into());
                 scope.set_extra("log_path", failure.log_path.clone().into());
@@ -2544,14 +2679,7 @@ pub(crate) fn capture_upgrade_failure(
 
     // Sentry drops extras larger than ~16KB. Cap the tail aggressively so the
     // tail's tail (where the panic/error usually lives) survives.
-    let log_tail_capped = log_tail.map(|s| {
-        if s.len() > 12_000 {
-            let cut = s.len() - 12_000;
-            format!("[truncated {cut} bytes]\n...{}", &s[cut..])
-        } else {
-            s.to_string()
-        }
-    });
+    let log_tail_capped = log_tail.map(|s| tail_bytes_for_sentry(s, SENTRY_EXTRA_TAIL_BYTES));
 
     let outcome_for_fingerprint = outcome.unwrap_or("none");
     let fingerprint: [&str; 3] = ["runtime_upgrade", phase, outcome_for_fingerprint];
@@ -2651,15 +2779,8 @@ pub(crate) fn capture_upgrade_failure(
                     // Cap aggressively — Sentry drops extras > ~16KB and the
                     // tail (where pip warnings/skips/successfully-installed
                     // lines live) is the most informative part.
-                    let tail = if diag.pip_output_tail.len() > 12_000 {
-                        let cut = diag.pip_output_tail.len() - 12_000;
-                        format!(
-                            "[truncated {cut} bytes]\n...{}",
-                            &diag.pip_output_tail[cut..]
-                        )
-                    } else {
-                        diag.pip_output_tail.clone()
-                    };
+                    let tail =
+                        tail_bytes_for_sentry(&diag.pip_output_tail, SENTRY_EXTRA_TAIL_BYTES);
                     scope.set_extra("pip_install_output", tail.into());
                 }
             }
@@ -4092,7 +4213,12 @@ async fn apply_client_setup(
         .load(std::sync::atomic::Ordering::Acquire);
     if state.runtime_is_paused() || bypassed {
         if let Err(err) = state.resume_runtime() {
-            log::warn!("apply_client_setup: resume_runtime failed: {err:#}");
+            // Local log keeps the full chain; the capture below is the Sentry
+            // path (fingerprinted, and silent for a machine-policy block).
+            // Bridging this warn instead grouped on a message that embeds the
+            // port and the user's home path -- RUST-AD.
+            log::info!("apply_client_setup: resume_runtime failed: {err:#}");
+            capture_headroom_start_failure("apply_client_setup: resume_runtime failed", &err);
         }
     }
     match client_adapters::apply_client_setup(&client_id) {
@@ -4227,6 +4353,134 @@ async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), S
         Some(json!({ "client_id": client_id })),
     );
     Ok(())
+}
+
+/// Frontend shape of the configured upstream. Separate from the persisted
+/// struct so `launch-profile.json` keeps the snake_case of every other field
+/// in it while the UI gets the camelCase it uses everywhere else. The token is
+/// never in either -- only whether one is stored.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamOverrideView {
+    mode: &'static str,
+    base_url: String,
+    has_token: bool,
+}
+
+impl From<crate::state::UpstreamOverride> for UpstreamOverrideView {
+    fn from(value: crate::state::UpstreamOverride) -> Self {
+        use crate::state::UpstreamOverrideMode::*;
+        UpstreamOverrideView {
+            mode: match value.mode {
+                Off => "off",
+                Fallback => "fallback",
+                Override => "override",
+            },
+            base_url: value.base_url,
+            has_token: value.has_token,
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_upstream_override(app: AppHandle) -> UpstreamOverrideView {
+    let state: tauri::State<'_, AppState> = app.state();
+    state.upstream_override().into()
+}
+
+/// Save the configured upstream and restart the proxy onto it.
+///
+/// `token`: `None` leaves the stored one alone (the field renders as "set" and
+/// is only sent when the user types a new one), `Some("")` clears it, anything
+/// else replaces it.
+#[tauri::command]
+async fn save_upstream_override(
+    app: AppHandle,
+    mode: String,
+    base_url: String,
+    token: Option<String>,
+) -> Result<UpstreamOverrideView, String> {
+    use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+
+    let mode = match mode.as_str() {
+        "off" => UpstreamOverrideMode::Off,
+        "fallback" => UpstreamOverrideMode::Fallback,
+        "override" => UpstreamOverrideMode::Override,
+        other => return Err(format!("unknown upstream mode: {other}")),
+    };
+
+    // Off keeps neither URL nor token: a cleared override must not leave a
+    // provider credential behind in the client config for the next launch.
+    let base_url = if mode == UpstreamOverrideMode::Off {
+        String::new()
+    } else {
+        crate::state::normalize_upstream_base_url(&base_url)?
+    };
+
+    let has_token = if mode == UpstreamOverrideMode::Off {
+        upstream_override::delete_token()?;
+        client_adapters::apply_upstream_auth_token(None).map_err(|err| err.to_string())?;
+        false
+    } else {
+        match token.as_deref() {
+            Some("") => {
+                upstream_override::delete_token()?;
+                client_adapters::apply_upstream_auth_token(None).map_err(|err| err.to_string())?;
+                false
+            }
+            Some(value) => {
+                upstream_override::write_token(value)?;
+                client_adapters::apply_upstream_auth_token(Some(value))
+                    .map_err(|err| err.to_string())?;
+                true
+            }
+            // Untouched: re-apply the stored one, because cc-switch or a hand
+            // edit may have overwritten the copy in the client's settings.
+            None => match upstream_override::read_token() {
+                Some(stored) => {
+                    client_adapters::apply_upstream_auth_token(Some(&stored))
+                        .map_err(|err| err.to_string())?;
+                    true
+                }
+                None => false,
+            },
+        }
+    };
+
+    let next = UpstreamOverride {
+        mode,
+        base_url,
+        has_token,
+    };
+    let state: tauri::State<'_, AppState> = app.state();
+    state.set_upstream_override(next.clone());
+
+    // ANTHROPIC_TARGET_API_URL is read at boot, so the running proxy is still
+    // pointed at the old upstream until it is replaced. Same hard restart the
+    // paused-banner button uses: stop_headroom kills the group so a wedged
+    // process cannot survive the change.
+    state.stop_headroom();
+    state.set_runtime_auto_paused(false);
+    state.resume_runtime().map_err(|err| err.to_string())?;
+    std::thread::spawn(|| {
+        client_adapters::restore_client_setups();
+    });
+    analytics::track_event(
+        &app,
+        "upstream_override_saved",
+        Some(json!({
+            "mode": match next.mode {
+                UpstreamOverrideMode::Off => "off",
+                UpstreamOverrideMode::Fallback => "fallback",
+                UpstreamOverrideMode::Override => "override",
+            },
+            // The endpoint itself is the user's business; only whether one and
+            // a token are set.
+            "has_base_url": !next.base_url.is_empty(),
+            "has_token": next.has_token,
+        })),
+    );
+    Ok(next.into())
 }
 
 #[tauri::command]
@@ -4609,17 +4863,12 @@ pub fn run() {
     if let Some(abandoned) = state.tool_manager.take_abandoned_bootstrap() {
         // The tail of the previous run's app log usually holds the last thing
         // the install did before dying. Same 12KB cap as
-        // capture_upgrade_failure: Sentry drops extras past ~16KB.
+        // capture_upgrade_failure: Sentry drops extras past ~16KB. Connection-
+        // pool debug lines are dropped first so the budget goes to the install
+        // rather than to health polling (RUST-9Y).
         let log_tail = std::fs::read_to_string(logging::log_path())
             .ok()
-            .map(|s| {
-                if s.len() > 12_000 {
-                    let cut = s.len() - 12_000;
-                    format!("[truncated {cut} bytes]\n...{}", &s[cut..])
-                } else {
-                    s
-                }
-            })
+            .map(|s| tail_bytes_for_sentry(&strip_connection_noise(&s), SENTRY_EXTRA_TAIL_BYTES))
             .unwrap_or_else(|| "app log unreadable".into());
         sentry::with_scope(
             |scope| {
@@ -5045,6 +5294,8 @@ pub fn run() {
             get_client_connectors,
             disable_client_setup,
             clear_client_setups,
+            get_upstream_override,
+            save_upstream_override,
             pause_headroom,
             start_headroom,
             force_restart_headroom,
@@ -5532,6 +5783,56 @@ fn extract_llm_failure_warnings(stderr: &str) -> Option<String> {
     }
 }
 
+/// Strip the machine-specific part out of an LLM-failure signature so the same
+/// failure groups as one Sentry issue across the fleet.
+///
+/// Upstream renders the reason as ``LLM analysis failed: `<cli> -p --output-format
+/// stream-json --verbose` failed (exit N):``, where `<cli>` is the *resolved*
+/// path to the agent binary on that machine. That path is different on every
+/// host, and because the signature is the fingerprint, one failure class opened
+/// one issue per user: RUST-A2 (`~\AppData\Roaming\npm\claude.CMD`) and
+/// RUST-9Z (a bare `claude`) are the same thing seen twice. Rewriting the
+/// program to its bare stem groups them while leaving every discriminator that
+/// actually means something -- the flags and the exit code -- in place. (The
+/// exit code stays: 1 and 3221226505/0xC0000409 really are different failures,
+/// an error exit versus the CLI crashing.)
+///
+/// Path-shaped input only: anything without a separator is already bare and is
+/// returned untouched, so a reason that is not command-shaped passes through.
+fn normalize_learn_failure_signature(signature: &str) -> String {
+    let Some(open) = signature.find('`') else {
+        return signature.to_string();
+    };
+    let rest = &signature[open + 1..];
+    let Some(close) = rest.find('`') else {
+        return signature.to_string();
+    };
+    let command = &rest[..close];
+    let (program, args) = command
+        .split_once(char::is_whitespace)
+        .unwrap_or((command, ""));
+    // Both separators unconditionally: these strings arrive from Windows hosts
+    // and are read on any platform, so `Path` (which does not treat `\` as a
+    // separator off Windows) is the wrong tool.
+    let stem = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    // Drop the executable suffix so `claude.CMD`, `claude.exe` and `claude` are
+    // one program. Only the last dot, and only when it looks like an extension.
+    let stem = match stem.rsplit_once('.') {
+        Some((base, ext)) if !base.is_empty() && ext.chars().all(char::is_alphanumeric) => base,
+        _ => stem,
+    };
+    let normalized_command = if args.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{stem} {args}")
+    };
+    format!(
+        "{}`{normalized_command}`{}",
+        &signature[..open],
+        &rest[close + 1..]
+    )
+}
+
 /// Turn a `headroom learn` stdout line into the step shown under the scan timer,
 /// or None to leave the current step alone.
 ///
@@ -5802,7 +6103,7 @@ fn execute_headroom_learn_run(
                     // usage limit, a dead local route, or our own 400. Warning
                     // (not Error) because some causes are user-environment;
                     // fingerprinted on the reason so the split is visible.
-                    let signature: String = warnings
+                    let raw_signature: String = warnings
                         .lines()
                         .map(str::trim)
                         .find(|l| !l.is_empty())
@@ -5810,12 +6111,18 @@ fn execute_headroom_learn_run(
                         .chars()
                         .take(160)
                         .collect();
+                    // Fingerprint and title on the normalized form: the raw one
+                    // carries the machine's resolved CLI path and split one
+                    // failure class per user (RUST-A2/RUST-9Z). The unmodified
+                    // text stays in `reason` and `stderr_tail` below.
+                    let signature = normalize_learn_failure_signature(&raw_signature);
                     sentry::with_scope(
                         |scope| {
                             scope.set_tag("flow", "headroom_learn");
                             scope.set_tag("learn_outcome", "llm_analysis_failed");
                             scope.set_tag("learn_agent", agent.as_tag());
                             scope.set_extra("reason", warnings.clone().into());
+                            scope.set_extra("raw_signature", raw_signature.clone().into());
                             scope.set_extra("project_name", project_name.to_string().into());
                             // The marker line ends at its colon: upstream
                             // appends the child's stderr, and `claude -p
@@ -5899,14 +6206,22 @@ fn execute_headroom_learn_run(
                 } else {
                     stdout.as_str()
                 };
-                let signature: String = signature_source
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .unwrap_or("no output")
-                    .chars()
-                    .take(160)
-                    .collect();
+                // Same normalization as the exit-0 branch above, and for the
+                // same reason: when upstream's first stderr line is the
+                // command-shaped reason, the resolved CLI path in it would
+                // split one failure class per machine. A no-op on any line that
+                // is not command-shaped.
+                let signature: String = normalize_learn_failure_signature(
+                    signature_source
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| !l.is_empty())
+                        .unwrap_or("no output")
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                        .as_str(),
+                );
                 let stderr_head: String = stderr.chars().take(2000).collect();
                 let stdout_head: String = stdout.chars().take(2000).collect();
                 let cli_path_str = cli_path
@@ -7442,18 +7757,19 @@ mod tests {
         install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
         learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
-        parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
+        parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        select_updater_endpoints, store_checked_update, take_pending_magic_link, user_message_for,
-        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
-        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
+        select_updater_endpoints, store_checked_update, strip_connection_noise,
+        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        PENDING_MAGIC_LINK,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -8496,6 +8812,96 @@ mod tests {
         }
     }
 
+    /// The three tail sites used to slice on a raw byte offset, which panics
+    /// when the cut lands mid-codepoint. These inputs carry non-ASCII routinely
+    /// (Windows paths with accented usernames, Python's startup banner), so the
+    /// crash reporter could take the process down while building its report.
+    #[test]
+    fn sentry_tail_never_splits_a_codepoint() {
+        // A 3-byte codepoint repeated: every offset that is not a multiple of 3
+        // is mid-character, so most caps land on one.
+        let text = "\u{2500}".repeat(8_000);
+        assert_eq!(text.len(), 24_000);
+        for cap in [11_999, 12_000, 12_001, 1, 2, 23_999] {
+            let tail = tail_bytes_for_sentry(&text, cap);
+            assert!(tail.len() <= cap + 64, "cap {cap} respected (plus prefix)");
+            assert!(tail.contains("[truncated "), "cap {cap} announces the cut");
+            assert!(
+                tail.trim_start_matches(|c| c != '\u{2500}').is_empty()
+                    || tail.ends_with('\u{2500}'),
+                "cap {cap} produced valid text"
+            );
+        }
+        // Under the cap the text is returned whole, with no prefix.
+        assert_eq!(tail_bytes_for_sentry("short", 12_000), "short");
+        assert_eq!(tail_bytes_for_sentry("", 12_000), "");
+    }
+
+    /// RUST-9Y arrived with 12KB of connection-pool debug lines and nothing
+    /// about the install it was supposed to be reporting on.
+    #[test]
+    fn abandoned_bootstrap_tail_drops_connection_pool_noise() {
+        let log = "2026-08-27 18:06:32.282 DEBUG reqwest::connect: starting new connection: http://localhost:6767/\n                   2026-08-27 18:06:33.000 INFO installing pip into the managed venv\n                   2026-08-27 18:06:33.100 DEBUG reqwest::connect: starting new connection: http://127.0.0.1:6767/\n                   2026-08-27 18:06:34.000 WARN pip install attempt 1 failed";
+        let stripped = strip_connection_noise(log);
+        assert!(!stripped.contains("starting new connection"));
+        assert!(stripped.contains("installing pip into the managed venv"));
+        assert!(stripped.contains("pip install attempt 1 failed"));
+        // A connection *failure* is signal, not noise, and stays.
+        let failure = "DEBUG reqwest::connect: connection refused for http://localhost:6767/";
+        assert_eq!(strip_connection_noise(failure), failure);
+    }
+
+    /// RUST-A2 and RUST-9Z are one failure class that opened two issues because
+    /// the fingerprint carried each machine's resolved CLI path.
+    #[test]
+    fn learn_failure_signatures_group_across_machines() {
+        let windows = normalize_learn_failure_signature(
+            "LLM analysis failed: `~\\AppData\\Roaming\\npm\\claude.CMD -p --output-format stream-json --verbose` failed (exit 1):",
+        );
+        let bare = normalize_learn_failure_signature(
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):",
+        );
+        let posix = normalize_learn_failure_signature(
+            "LLM analysis failed: `/Users/x/.nvm/versions/node/v22/bin/claude -p --output-format stream-json --verbose` failed (exit 1):",
+        );
+        assert_eq!(windows, bare);
+        assert_eq!(posix, bare);
+        assert_eq!(
+            bare,
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):"
+        );
+
+        // The exit code still discriminates: an error exit and a Windows crash
+        // (0xC0000409) are different failures and must stay different issues.
+        assert_ne!(
+            bare,
+            normalize_learn_failure_signature(
+                "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 3221226505):",
+            )
+        );
+        // So does the agent.
+        assert_ne!(
+            bare,
+            normalize_learn_failure_signature(
+                "LLM analysis failed: `codex -p --output-format stream-json --verbose` failed (exit 1):",
+            )
+        );
+    }
+
+    /// Anything not command-shaped passes through untouched -- the normalizer
+    /// must never eat a reason it does not recognize.
+    #[test]
+    fn learn_failure_signature_normalization_is_a_no_op_off_the_command_shape() {
+        for raw in [
+            "no reason",
+            "Credit balance is too low",
+            "LLM analysis failed: usage limit reached",
+            "unterminated `backtick",
+        ] {
+            assert_eq!(normalize_learn_failure_signature(raw), raw);
+        }
+    }
+
     #[test]
     fn check_headroom_learn_prereqs_passes_when_cli_available() {
         let prereq = learn_prereq(true, false, false);
@@ -9409,6 +9815,43 @@ Some unrelated content.
     }
 
     #[test]
+    fn headroom_start_failure_category_collapses_the_argv_grab_bag() {
+        // RUST-9F/AF/AH/AJ/AK: one condition, five issues, because the
+        // un-fingerprinted message carried the program path and full argv.
+        use super::headroom_start_failure_category as cat;
+
+        // The exit status is the bug class and survives; the port does not.
+        assert_eq!(
+            cat("exited with status exit code: 0xffffffff before opening port 6768"),
+            "exited-0xffffffff"
+        );
+        assert_eq!(
+            cat("exited with status exit status: 1 before opening port 6768"),
+            "exited-1"
+        );
+        // A different port is the SAME bug -- this is what used to split.
+        assert_eq!(
+            cat("exited with status exit status: 1 before opening port 6767"),
+            "exited-1"
+        );
+        assert_eq!(
+            cat("exited with status signal: 6 (SIGABRT) before opening port 6768"),
+            "exited-signal: 6 (SIGABRT)"
+        );
+        // The two non-exit shapes stay separate: a wedged start and a crashed
+        // one are different bugs.
+        assert_eq!(
+            cat("never opened port 6768 within 45000ms"),
+            "startup-timeout"
+        );
+        assert_eq!(
+            cat("wait check failed: No child processes (os error 10)"),
+            "wait-check-failed"
+        );
+        assert_eq!(cat("something upstream changed"), "other");
+    }
+
+    #[test]
     fn parse_request_count_reads_nested_requests_total() {
         let body = json!({
             "requests": { "total": 42, "active": 1 },
@@ -10036,6 +10479,39 @@ Some unrelated content.
         // Localized Windows prose: only the numeric code survives.
         assert!(is_endpoint_protection_signal(
             "차단되었습니다. (os error 4551)"
+        ));
+    }
+
+    /// The exact strings RUST-AD and RUST-AC carried: one Windows host, one
+    /// App Control policy, filed as two issues because the two call sites
+    /// prefix the same error differently and neither set a fingerprint. Both
+    /// must reach the endpoint-protection branch of
+    /// `capture_headroom_start_failure`, which is what collapses them.
+    #[test]
+    fn a_windows_app_control_block_is_recognised_at_proxy_start() {
+        // Spanish Windows, verbatim from the event. Only "os error 4551"
+        // survives localization, so that is what has to carry the match.
+        let resume = "apply_client_setup: resume_runtime failed: starting headroom background \
+                      process: ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe \
+                      proxy --port 6768 --no-http2 --log-messages --no-ccr --learn \
+                      --no-memory-tools --no-memory-context --memory-db-path \
+                      ~\\AppData\\Local\\Headroom\\memory.db: Una directiva de Control de \
+                      aplicaciones bloqueó este archivo. (os error 4551)";
+        let autostart = "headroom auto-start failed after bootstrap: starting headroom \
+                         background process: ...: Una directiva de Control de aplicaciones \
+                         bloqueó este archivo. (os error 4551)";
+
+        assert!(is_endpoint_protection_signal(resume), "RUST-AD unmatched");
+        assert!(
+            is_endpoint_protection_signal(autostart),
+            "RUST-AC unmatched"
+        );
+
+        // A port conflict must NOT be swallowed by the new branch: it has its
+        // own fingerprint and its own remediation.
+        assert!(!is_endpoint_protection_signal(
+            "starting headroom background process: port 6768 is occupied by a \
+             non-headroom process"
         ));
     }
 

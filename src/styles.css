@@ -6367,3 +6367,93 @@ html.window-hiding {
   margin: 0;
   text-align: center;
 }
+
+.upstream-panel {
+  display: grid;
+  gap: 14px;
+  /* .panel-card is padding only, so the header does not space its sibling. */
+  margin-top: 12px;
+}
+
+.upstream-panel__modes {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.upstream-panel__legend {
+  padding: 0;
+  font-size: var(--text-sm);
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.upstream-panel__mode {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+}
+
+.upstream-panel__mode > span {
+  display: grid;
+  gap: 2px;
+}
+
+.upstream-panel__mode-help {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.upstream-field {
+  display: grid;
+  gap: 8px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.upstream-field > span:first-child {
+  font-weight: 700;
+}
+
+.upstream-field__input {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-default);
+  background: var(--surface-overlay);
+  color: var(--text-primary);
+}
+
+.upstream-field__input input {
+  width: 100%;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.upstream-field__input input:disabled {
+  color: var(--text-secondary);
+}
+
+.upstream-panel__actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.upstream-panel__meta {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
