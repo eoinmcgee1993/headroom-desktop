@@ -9777,9 +9777,12 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         || lower.contains("temporary failure in name resolution")
         // Same truncation as above, milder symptom: pip retried through a
         // network fault, then printed an ERROR: line that names only the
-        // package. Read the evidence before shrugging it into `other`.
+        // package. Read the evidence before shrugging it into `other` -- but
+        // hold the fetch-warning evidence to the same two-signal rule as the
+        // no-matching-dist guard, so an incidental (recovered) warning cannot
+        // relabel an unclassified failure as environmental.
         || evidence_lower.contains("temporary failure in name resolution")
-        || evidence_lower.contains("could not fetch url")
+        || pip_index_fetch_failed(&evidence_lower)
     {
         "network"
     } else {

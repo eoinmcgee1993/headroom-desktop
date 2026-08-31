@@ -7554,6 +7554,11 @@ fn escape_powershell_like(value: &str) -> String {
 /// means the enumeration itself failed, which is the only outcome worth a
 /// report. A powershell that cannot start at all reaches neither and still
 /// surfaces through its own exit code (see `is_session_teardown_exit`).
+/// ponytail: a Stop-Process the machine's policy denies still exits 0, so a
+/// matched pid that SURVIVES the sweep is invisible here. For
+/// kill_venv_lock_holders the follow-up pip run fails loudly on the held
+/// lock, which is where that case surfaces today; count failed kills in the
+/// script if that ever stops being true.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn windows_process_sweep_script(exe: &std::path::Path, args_pattern: &str) -> String {
     let exe_pattern = escape_powershell_like(&exe.display().to_string());

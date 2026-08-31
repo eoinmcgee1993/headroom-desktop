@@ -392,15 +392,19 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     }
     // The detached-proxy sweep in `stop_headroom` is best-effort teardown. On
     // unix a `pkill` that matched nothing (exit 1) is already treated as
-    // success; the Windows branch has no such carve-out, so a PowerShell that
-    // exits non-zero -- matched nothing, or WMI hiccuped -- surfaced as a
-    // warning per command pattern (RUST-6F/6G, one issue each for
-    // `-m headroom.proxy.server` and `proxy --port`). Nothing is actionable:
-    // the app is stopping, and the next launch's `reclaim_orphan_proxy` reaps
-    // whatever survived, which is the same reasoning that made the
-    // session-teardown exit codes an info log (RUST-7N). Keep the local log.
+    // success; on Windows the sweep script now states its own verdict, so a
+    // residual "powershell exited with status" error is a crash-class exit
+    // with nothing actionable in it: the app is stopping, and the next
+    // launch's `reclaim_orphan_proxy` reaps whatever survived -- the same
+    // reasoning that made the session-teardown exit codes an info log
+    // (RUST-7N; RUST-6F/6G were the old per-command-pattern warnings).
+    // Deliberately NARROW: the script's enumeration-failure verdict ("could
+    // not enumerate processes") and the pkill refusal guard must still
+    // report. Keep the local log either way.
     if target.starts_with("headroom_desktop_lib::state")
-        && msg.starts_with("failed to clean detached headroom proxy processes")
+        && msg.starts_with(
+            "failed to clean detached headroom proxy processes: powershell exited with status",
+        )
     {
         return true;
     }
@@ -852,10 +856,17 @@ mod tests {
             "failed to clean detached headroom proxy processes: powershell exited with status Some(1) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
         ));
         // The refusal guard is a real bug (an unresolved runtime path would
-        // turn the sweep into a loose substring kill), so it must still report.
+        // turn the sweep into a loose substring kill), so it must still
+        // report -- as the caller actually bridges it, prefix and all.
         assert!(!skip_sentry(
             "headroom_desktop_lib::state",
-            "refusing to pkill with an unresolved executable path \"\""
+            "failed to clean detached headroom proxy processes: refusing to pkill with an unresolved executable path \"\""
+        ));
+        // A failed Win32_Process enumeration is the one sweep outcome worth a
+        // report; the script's own verdict separates it from a clean run.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::state",
+            "failed to clean detached headroom proxy processes: powershell could not enumerate processes (Win32_Process query failed) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
         ));
     }
 
