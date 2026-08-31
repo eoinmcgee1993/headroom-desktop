@@ -2561,18 +2561,18 @@ impl ToolManager {
                 // override, not three separate reads of a cache another thread
                 // could republish in between.
                 let upstream_env = upstream_spawn_env(&crate::upstream_override::get());
-                let sitecustomize_injected = match std::fs::create_dir_all(&inject_dir)
-                    .and_then(|_| {
+                let sitecustomize_injected =
+                    match std::fs::create_dir_all(&inject_dir).and_then(|_| {
                         std::fs::write(inject_dir.join("sitecustomize.py"), SITECUSTOMIZE_PY)
                     }) {
-                    Ok(()) => true,
-                    Err(err) => {
-                        log::warn!(
-                            "[tool_manager] writing pyinject/sitecustomize.py failed: {err}"
-                        );
-                        false
-                    }
-                };
+                        Ok(()) => true,
+                        Err(err) => {
+                            log::warn!(
+                                "[tool_manager] writing pyinject/sitecustomize.py failed: {err}"
+                            );
+                            false
+                        }
+                    };
 
                 // Drop control samples left by the abandoned 1% holdout before
                 // the 3% one starts filling the arm. One shot, stamped: from
@@ -2641,6 +2641,7 @@ impl ToolManager {
                     use std::os::unix::process::CommandExt;
                     command.process_group(0);
                 }
+                strip_unsupported_proxy_env(&mut command);
                 command
                     .env("PYTHONNOUSERSITE", "1")
                     .env("PYTHONPATH", &inject_dir)
@@ -8252,7 +8253,10 @@ fn upstream_spawn_env(upstream: &crate::state::UpstreamOverride) -> UpstreamSpaw
 /// The URL cc-switch users' clients must be pointed at: the desktop's intercept,
 /// never the Python proxy's own port. See the guard in `SITECUSTOMIZE_PY`.
 fn cc_switch_proxy_url() -> String {
-    format!("http://127.0.0.1:{}", crate::proxy_intercept::INTERCEPT_PORT)
+    format!(
+        "http://127.0.0.1:{}",
+        crate::proxy_intercept::INTERCEPT_PORT
+    )
 }
 
 fn cc_switch_reconcile_for_spawn(sitecustomize_injected: bool) -> &'static str {
@@ -9498,6 +9502,52 @@ fn path_with_binary_dir(binary: &Path) -> std::ffi::OsString {
     }
 }
 
+/// True when httpx can actually use `value` as a proxy URL. httpx parses the
+/// standard proxy env vars at client construction (trust_env) and raises
+/// `ValueError: Unknown scheme for proxy URL` for anything outside
+/// http/https/socks5/socks5h -- socks4 in particular (v2rayN-style local
+/// proxies advertise socks4://127.0.0.1:10808). An empty value is how users
+/// disable a proxy; httpx ignores it, so it passes.
+fn httpx_supports_proxy_url(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    v.is_empty()
+        || ["http://", "https://", "socks5://", "socks5h://"]
+            .iter()
+            .any(|scheme| v.starts_with(scheme))
+}
+
+/// Remove proxy env vars the backend's HTTP stack cannot use. A scheme httpx
+/// rejects kills the Python backend inside AsyncClient() before it opens the
+/// port (RUST-AS/RUST-AT: exit 3, `Unknown scheme for proxy URL
+/// URL('socks4://127.0.0.1:10808')`). Strip only the offending vars: a
+/// supported proxy (socksio is vendored, so socks5 works) passes through
+/// untouched, and going direct is strictly better than a guaranteed boot
+/// crash -- httpx could never have used the value anyway. Name matching is
+/// case-insensitive because Windows envs carry arbitrary casings.
+fn strip_unsupported_proxy_env(command: &mut Command) {
+    for (name, value) in std::env::vars_os() {
+        let Some(name) = name.to_str() else { continue };
+        let is_proxy_var = ["http_proxy", "https_proxy", "all_proxy"]
+            .iter()
+            .any(|p| name.eq_ignore_ascii_case(p));
+        if !is_proxy_var {
+            continue;
+        }
+        let value = value.to_string_lossy();
+        if httpx_supports_proxy_url(&value) {
+            continue;
+        }
+        // Scheme only -- proxy URLs can embed credentials, keep them out of logs.
+        let scheme = value.split("://").next().unwrap_or("").trim().to_string();
+        // info, not warn: warn is bridged to Sentry and would re-report on
+        // every launch of an affected machine, forever.
+        log::info!(
+            "[tool_manager] dropping {name} from backend env: scheme {scheme:?} unsupported by httpx (would crash backend boot)"
+        );
+        command.env_remove(name);
+    }
+}
+
 fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
     let mut command = crate::proc::command(binary);
     command
@@ -10294,12 +10344,10 @@ mod tests {
     use super::{
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, build_command, cc_switch_proxy_url,
-        upstream_spawn_env,
-        cc_switch_reconcile_for_spawn,
-        classify_kompress_prefetch_failure, codebase_memory_distribution_artifact,
-        compact_pip_failure, describe_proxy_port_occupant, diagnose_proxy_port, exe_path_is_under,
-        extract_required_pydantic_core_version, format_all_foreign_bail,
-        format_already_running_bail, headroom_entrypoint_startup_args,
+        cc_switch_reconcile_for_spawn, classify_kompress_prefetch_failure,
+        codebase_memory_distribution_artifact, compact_pip_failure, describe_proxy_port_occupant,
+        diagnose_proxy_port, exe_path_is_under, extract_required_pydantic_core_version,
+        format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
@@ -10311,12 +10359,12 @@ mod tests {
         receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
         savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
-        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
-        MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
-        UNKNOWN_OCCUPANT,
+        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
+        wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture,
+        PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS,
+        PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -10832,8 +10880,7 @@ asyncio.run(verify())
         // And prepending puts the interpreter's own dir back at the front even
         // when the scan flagged it, so a DLL we ship is never the casualty.
         let python = runtime.join("python.exe");
-        let restored =
-            crate::proc::path_with_dir_prepended_to(python.parent().unwrap(), &filtered);
+        let restored = crate::proc::path_with_dir_prepended_to(python.parent().unwrap(), &filtered);
         assert_eq!(
             std::env::split_paths(&restored).next(),
             Some(runtime.clone())
@@ -12614,7 +12661,9 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     fn sitecustomize_pins_the_configured_upstream() {
         let py = super::SITECUSTOMIZE_PY;
         assert!(py.contains("HEADROOM_CC_SWITCH_PIN_UPSTREAM"));
-        assert!(py.contains(r#"_hd_ccs_pinned = _hd_os.environ.get("ANTHROPIC_TARGET_API_URL", "").strip()"#));
+        assert!(py.contains(
+            r#"_hd_ccs_pinned = _hd_os.environ.get("ANTHROPIC_TARGET_API_URL", "").strip()"#
+        ));
         assert!(py.contains("event=cc_switch_upstream_pinned"));
         // The pinned endpoint becomes the default the reset returns to.
         assert!(py.contains("target = _hd_ccs_pinned or self.default_upstream"));
@@ -12634,14 +12683,20 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     fn cc_switch_advertises_the_intercept_port() {
         assert_eq!(
             cc_switch_proxy_url(),
-            format!("http://127.0.0.1:{}", crate::proxy_intercept::INTERCEPT_PORT)
+            format!(
+                "http://127.0.0.1:{}",
+                crate::proxy_intercept::INTERCEPT_PORT
+            )
         );
         // The port clients are configured with app-wide, spelled out here so a
         // change to either constant has to be deliberate.
         assert_eq!(cc_switch_proxy_url(), "http://127.0.0.1:6767");
         assert_ne!(
             cc_switch_proxy_url(),
-            format!("http://127.0.0.1:{}", crate::backend_port::DEFAULT_BACKEND_PORT)
+            format!(
+                "http://127.0.0.1:{}",
+                crate::backend_port::DEFAULT_BACKEND_PORT
+            )
         );
 
         let py = super::SITECUSTOMIZE_PY;
@@ -13102,6 +13157,37 @@ after
             env_of("PIP_CONFIG_FILE"),
             Some(std::ffi::OsStr::new(devnull))
         );
+    }
+
+    /// socks4 (and anything else httpx cannot parse) must be treated as
+    /// unusable so the spawn path strips it (RUST-AS/RUST-AT); supported
+    /// schemes and the empty "proxy disabled" value must pass through.
+    #[test]
+    fn httpx_proxy_url_support_matches_httpx_scheme_map() {
+        for ok in [
+            "",
+            "  ",
+            "http://127.0.0.1:8080",
+            "https://proxy.corp:3128",
+            "socks5://127.0.0.1:10808",
+            "SOCKS5h://127.0.0.1:10808",
+        ] {
+            assert!(
+                super::httpx_supports_proxy_url(ok),
+                "{ok:?} should be supported"
+            );
+        }
+        for bad in [
+            "socks4://127.0.0.1:10808",
+            "socks4a://127.0.0.1:1080",
+            "socks://127.0.0.1:1080",
+            "127.0.0.1:8080",
+        ] {
+            assert!(
+                !super::httpx_supports_proxy_url(bad),
+                "{bad:?} should be stripped"
+            );
+        }
     }
 
     #[test]
