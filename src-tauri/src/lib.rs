@@ -4853,6 +4853,11 @@ pub fn run() {
         }
     }
 
+    // Raw pre-upgrade snapshot of the user-state files, before AppState::new
+    // can parse (and a schema change silently reset) any of them. See check 14
+    // of docs/beta-smoke-test.md.
+    storage::snapshot_state_on_version_change(&storage::app_data_dir(), env!("CARGO_PKG_VERSION"));
+
     let state = AppState::new().expect("failed to create app state");
 
     // A previous bootstrap attempt that never reached a verdict: the app was

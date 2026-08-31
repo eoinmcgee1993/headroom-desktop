@@ -140,11 +140,13 @@ echo "zero-output claude 200s: $(grep -c 'PERF model=claude-[^ ]* .*tok_out=0 ' 
 echo "cache store refusals: $(grep -c 'response_cache_store_refused' "$L")"
 ```
 
-Expect: `empty-200 class`, `zero-output claude 200s`, and `cache store refusals` all `0` - any of them non-zero is a hard FAIL. `discards` may be non-zero on the current wheel pin: FAIL only if a reason other than `output_shaper` / `image_compression` / `structural_diff_vs_original` appears (a new transform joined the silent-discard set). Promote `discards` to "expect 0" at the wheel bump that lands upstream #3015, exactly as in the beta doc; the deeper poisoned-replay probe also lives there.
+Expect: `empty-200 class` and `cache store refusals` `0` - non-zero is a hard FAIL. `zero-output claude 200s` should also be `0`, but a non-zero count is a tripwire, not yet a verdict: the PERF line carries no status, and an upstream error passed through produces the same shape (a session-start 429 logged `tok_out=0 ttfb_ms=0` on the 0.9.3-rc.5 pass). For each matching PERF line, find the `event=proxy_inbound_response ... path=/v1/messages status=` line at the same timestamp (its `duration_ms` tracks the PERF `total_ms`; the `hr_...` and `id=inbound-...` id namespaces never join, so the timestamp is the key). `status=200` there is the bug class and a hard FAIL; a 4xx/5xx is benign. `discards` may be non-zero on the current wheel pin: FAIL only if a reason other than `output_shaper` / `image_compression` / `structural_diff_vs_original` appears (a new transform joined the silent-discard set). Promote `discards` to "expect 0" at the wheel bump that lands upstream #3015, exactly as in the beta doc; the deeper poisoned-replay probe also lives there.
 
 ### 14. User state survived the upgrade
 
-Windows port of beta check 14 - see `beta-smoke-test.md` for the rationale. A wiped state file looks exactly like a healthy fresh one, so this needs a before/after comparison. **Run this snapshot BEFORE installing the rc**, on the build you are upgrading from (Git Bash):
+Windows port of beta check 14 - see `beta-smoke-test.md` for the rationale. A wiped state file looks exactly like a healthy fresh one, so this needs a before/after comparison.
+
+From 0.9.3 on, the app snapshots automatically on the first launch of a new version: raw copies of the three state files land in `%LOCALAPPDATA%\Headroom\config\pre-update\` with a `meta.json` naming the from/to versions. When the build being replaced is >= 0.9.3, verify `meta.json` and diff against that directory instead of the manual snapshot. The manual block below remains for upgrades from older builds and as a cross-check. **Run it BEFORE installing the rc**, on the build you are upgrading from (Git Bash):
 
 ```bash
 S="$LOCALAPPDATA/Headroom/config"; P="$USERPROFILE/hr-preupgrade"; mkdir -p "$P"
@@ -155,11 +157,24 @@ ls -l "$P"
 **After installing and launching the rc**, compare (Git Bash; uses the bundled Python because Git Bash has no `jq`):
 
 ```bash
-ls -l "$USERPROFILE/hr-preupgrade"   # mtimes must predate THIS install, not an older one
 "$LOCALAPPDATA/Headroom/headroom/runtime/venv/Scripts/python.exe" -c "
-import json, os
+import json, os, time
 S = os.path.expandvars(r'%LOCALAPPDATA%\Headroom\config')
 P = os.path.expandvars(r'%USERPROFILE%\hr-preupgrade')
+names = ['headroom-pricing-state.json', 'client-setup.json', 'activity-facts.json']
+missing = [n for n in names if not os.path.exists(os.path.join(P, n))]
+if missing:
+    raise SystemExit('NOT RUN - snapshot missing or wrong format (need full-file copies): ' + ', '.join(missing))
+fmt = lambda t: time.strftime('%Y-%m-%d %H:%M', time.localtime(t))
+snap = max(os.path.getmtime(os.path.join(P, n)) for n in names)
+exe = os.path.expandvars(r'%LOCALAPPDATA%\Headroom\headroom-desktop.exe')
+if os.path.exists(exe):
+    print('snapshot taken', fmt(snap), '/ rc installed', fmt(os.path.getmtime(exe)))
+    if snap > os.path.getmtime(exe):
+        raise SystemExit('NOT RUN - snapshot is NEWER than the installed binary; it was taken after this install')
+else:
+    print('snapshot taken', fmt(snap), '- binary not at the default path, verify the install time by hand')
+print('confirm by eye: the snapshot must come from the build you JUST replaced, not an older rc')
 load = lambda d, n: json.load(open(os.path.join(d, n), encoding='utf-8'))
 old, new = load(P, 'headroom-pricing-state.json'), load(S, 'headroom-pricing-state.json')
 print('pricing first_seen_at:', 'OK' if old.get('first_seen_at') == new.get('first_seen_at') else 'CHANGED')
