@@ -164,6 +164,45 @@ fn transport_level(err: &reqwest::Error) -> sentry::Level {
     }
 }
 
+/// Actions that have already reported a TRANSIENT transport failure this
+/// session, so the repeats can be dropped.
+static TRANSIENT_TRANSPORT_REPORTED: std::sync::Mutex<
+    Option<std::collections::HashSet<&'static str>>,
+> = std::sync::Mutex::new(None);
+
+/// Build the user-facing message for a failed round trip and report it, with
+/// the transient class capped at ONE event per action per session.
+///
+/// Issue #58 wants the user count, and capturing every transient failure did
+/// deliver it -- then kept charging for it. The desktop-activation effect
+/// re-fires whenever the runtime-health signal flaps (a 3s poll drives it), so
+/// four persistently-offline machines produced RUST-7H: 229 events in 4 days,
+/// all of them the same four users re-reporting a captive portal. Sign-in code
+/// verification is the same shape (RUST-AM).
+///
+/// The first failure per action still speaks, so `users_impacted` -- the number
+/// issue #58 actually asked for -- is unchanged; only the per-host repetition
+/// goes. A NON-transport failure implies something wrong on our side, so it is
+/// never gated and still reports every time.
+fn report_transport_failure(action: &'static str, err: &reqwest::Error) -> String {
+    let msg = transport_failure(action, err);
+    if is_transient_transport_error(err) {
+        let mut seen = TRANSIENT_TRANSPORT_REPORTED.lock().unwrap_or_else(|e| {
+            // A poisoned lock must not silence reporting outright.
+            TRANSIENT_TRANSPORT_REPORTED.clear_poison();
+            e.into_inner()
+        });
+        if !seen
+            .get_or_insert_with(std::collections::HashSet::new)
+            .insert(action)
+        {
+            return msg;
+        }
+    }
+    sentry::capture_message(&msg, transport_level(err));
+    msg
+}
+
 fn plan_tier_header_value(tier: &ClaudePlanTier) -> &'static str {
     match tier {
         ClaudePlanTier::Free => "free",
@@ -1229,11 +1268,7 @@ pub(crate) fn request_auth_code_with_base_url(
             identity: IdentityPayload::for_state(state),
         })
         .send()
-        .map_err(|err| {
-            let msg = transport_failure("request a sign-in code", &err);
-            sentry::capture_message(&msg, transport_level(&err));
-            msg
-        })?;
+        .map_err(|err| report_transport_failure("request a sign-in code", &err))?;
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -1292,11 +1327,7 @@ pub(crate) fn verify_auth_code_with_base_url(
             identity: IdentityPayload::for_state(state),
         })
         .send()
-        .map_err(|err| {
-            let msg = transport_failure("verify your sign-in code", &err);
-            sentry::capture_message(&msg, transport_level(&err));
-            msg
-        })?;
+        .map_err(|err| report_transport_failure("verify your sign-in code", &err))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -1372,11 +1403,7 @@ pub(crate) fn activate_account_with_base_url(
         .apply_headers(builder)
         .json(&serde_json::json!({ "lifetime_tokens_saved": lifetime_tokens_saved }))
         .send()
-        .map_err(|err| {
-            let msg = transport_failure("activate Headroom desktop access", &err);
-            sentry::capture_message(&msg, transport_level(&err));
-            msg
-        })?;
+        .map_err(|err| report_transport_failure("activate Headroom desktop access", &err))?;
 
     if response.status().as_u16() == 401 {
         clear_session_token()?;

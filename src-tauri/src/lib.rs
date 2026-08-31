@@ -2042,6 +2042,41 @@ pub(crate) fn is_port_conflict_failure(technical_err: &str) -> bool {
 /// contains a `HeadroomStartupFailure`, its log tail, log path, and invocation
 /// are sent as structured `extra` fields so we can see what Python printed
 /// before failing to bind the port.
+/// Coarse cause class for a managed-backend start failure, used as the Sentry
+/// fingerprint.
+///
+/// `HeadroomStartupFailure`'s `Display` embeds the program path, the full argv
+/// and the log tail, and Sentry groups an un-fingerprinted `capture_message` by
+/// its message text. So ONE condition -- the managed backend will not stay up --
+/// opened a fresh issue per command line and per exit code, none of them
+/// resolvable: RUST-9F/AF/AH/AJ/AK were all this failure wearing different
+/// argv. Same split as the pip (RUST-6M/6N/6P) and plugin (RUST-6K) captures.
+/// The variable detail still ships as `extra` on every event; only this bounded
+/// class reaches the fingerprint.
+fn headroom_start_failure_category(reason: &str) -> String {
+    if let Some(rest) = reason.strip_prefix("exited with status ") {
+        // `ExitStatus` renders as "exit code: 0xffffffff" (Windows),
+        // "exit status: 1" or "signal: 6 (SIGABRT)" (unix), followed by
+        // " before opening port N". Keep the status -- 0xffffffff is its own
+        // bug class, a native DLL init crash (RUST-9F/9T) -- drop the port.
+        let status = rest
+            .split(" before opening port")
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .trim_start_matches("exit code:")
+            .trim_start_matches("exit status:")
+            .trim();
+        format!("exited-{status}")
+    } else if reason.starts_with("wait check failed") {
+        "wait-check-failed".to_string()
+    } else if reason.starts_with("never opened port") {
+        "startup-timeout".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
 pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error) {
     let technical_err = format!("{err:#}");
 
@@ -2089,8 +2124,13 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
     }
 
     if let Some(failure) = startup_failure {
+        let category = headroom_start_failure_category(&failure.reason);
         sentry::with_scope(
             |scope| {
+                // `context` is a bounded set of call sites and keeps the
+                // launch/tray lifecycles apart; `category` is the cause class.
+                // Neither can fragment, unlike the argv in the message text.
+                scope.set_fingerprint(Some(&["headroom-start-failed", context, &category]));
                 scope.set_extra("program", failure.program.clone().into());
                 scope.set_extra("args", failure.args.join(" ").into());
                 scope.set_extra("log_path", failure.log_path.clone().into());
@@ -9717,6 +9757,43 @@ Some unrelated content.
             "venv interpreter exited with status 1"
         ));
         assert!(!is_port_conflict_failure(""));
+    }
+
+    #[test]
+    fn headroom_start_failure_category_collapses_the_argv_grab_bag() {
+        // RUST-9F/AF/AH/AJ/AK: one condition, five issues, because the
+        // un-fingerprinted message carried the program path and full argv.
+        use super::headroom_start_failure_category as cat;
+
+        // The exit status is the bug class and survives; the port does not.
+        assert_eq!(
+            cat("exited with status exit code: 0xffffffff before opening port 6768"),
+            "exited-0xffffffff"
+        );
+        assert_eq!(
+            cat("exited with status exit status: 1 before opening port 6768"),
+            "exited-1"
+        );
+        // A different port is the SAME bug -- this is what used to split.
+        assert_eq!(
+            cat("exited with status exit status: 1 before opening port 6767"),
+            "exited-1"
+        );
+        assert_eq!(
+            cat("exited with status signal: 6 (SIGABRT) before opening port 6768"),
+            "exited-signal: 6 (SIGABRT)"
+        );
+        // The two non-exit shapes stay separate: a wedged start and a crashed
+        // one are different bugs.
+        assert_eq!(
+            cat("never opened port 6768 within 45000ms"),
+            "startup-timeout"
+        );
+        assert_eq!(
+            cat("wait check failed: No child processes (os error 10)"),
+            "wait-check-failed"
+        );
+        assert_eq!(cat("something upstream changed"), "other");
     }
 
     #[test]
