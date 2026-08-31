@@ -2642,6 +2642,7 @@ impl ToolManager {
                     command.process_group(0);
                 }
                 strip_unsupported_proxy_env(&mut command);
+                strip_unusable_sslkeylogfile(&mut command);
                 command
                     .env("PYTHONNOUSERSITE", "1")
                     .env("PYTHONPATH", &inject_dir)
@@ -9548,6 +9549,48 @@ fn strip_unsupported_proxy_env(command: &mut Command) {
     }
 }
 
+/// True when the SSLKEYLOGFILE path can actually be opened for append, which
+/// is exactly what CPython's `SSLContext.keylog_filename` setter does the
+/// moment a TLS context is created. Probing with create matches those
+/// semantics: a not-yet-existing but creatable file is fine (Python would
+/// create it the same way), so only a genuinely unopenable path is unusable.
+fn sslkeylogfile_is_usable(path: &str) -> bool {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .is_ok()
+}
+
+/// Remove SSLKEYLOGFILE from the child env when its path cannot be opened.
+/// urllib3 (vendored in pip) and httpx both honor the variable by assigning
+/// `context.keylog_filename` at TLS-context creation, and CPython opens the
+/// file eagerly there -- so a machine-wide SSLKEYLOGFILE pointing at an
+/// inaccessible path (RUST-A8: `\\?\Volume{...}\virtual_file.log`, set by a
+/// TLS-inspection tool) kills ensurepip/pip during bootstrap and would kill
+/// the backend's AsyncClient the same way. A path that opens fine passes
+/// through: deliberate Wireshark-style key logging keeps working. Empty
+/// values pass too -- Python skips them. Name matching is case-insensitive
+/// because Windows envs carry arbitrary casings.
+fn strip_unusable_sslkeylogfile(command: &mut Command) {
+    for (name, value) in std::env::vars_os() {
+        let Some(name) = name.to_str() else { continue };
+        if !name.eq_ignore_ascii_case("SSLKEYLOGFILE") {
+            continue;
+        }
+        let value = value.to_string_lossy();
+        if value.trim().is_empty() || sslkeylogfile_is_usable(&value) {
+            continue;
+        }
+        // info, not warn: warn is bridged to Sentry and would re-report on
+        // every launch of an affected machine, forever.
+        log::info!(
+            "[tool_manager] dropping {name} from child env: its path cannot be opened (would crash pip/backend at TLS-context creation)"
+        );
+        command.env_remove(name);
+    }
+}
+
 fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
     let mut command = crate::proc::command(binary);
     command
@@ -9581,6 +9624,7 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
             "PIP_CONFIG_FILE",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         );
+    strip_unusable_sslkeylogfile(&mut command);
     command
 }
 
@@ -13188,6 +13232,24 @@ after
                 "{bad:?} should be stripped"
             );
         }
+    }
+
+    /// RUST-A8: SSLKEYLOGFILE pointing at an unopenable path must read as
+    /// unusable so the spawn paths strip it; a creatable path must pass
+    /// through (python would create it the same way).
+    #[test]
+    fn sslkeylogfile_usability_matches_python_eager_open_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let creatable = dir.path().join("keylog.txt");
+        assert!(
+            super::sslkeylogfile_is_usable(creatable.to_str().unwrap()),
+            "creatable path should be usable"
+        );
+        let unopenable = dir.path().join("no-such-dir").join("keylog.txt");
+        assert!(
+            !super::sslkeylogfile_is_usable(unopenable.to_str().unwrap()),
+            "path in a missing directory fails python's eager open and should be stripped"
+        );
     }
 
     #[test]

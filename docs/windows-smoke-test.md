@@ -189,6 +189,8 @@ print('corrupt files:', sum(f.endswith('.corrupt') for f in os.listdir(S)))
 "
 ```
 
+The script's snapshot-newer-than-binary guard applies to the **manual** snapshot only. The auto-snapshot in `config\pre-update\` is written on first launch of the new build, so it always postdates the install by construction - its validity check is `meta.json`'s versions, never its mtime.
+
 Expect: three `OK` lines and `corrupt files: 0`. Only `first_seen_at`, the two key sets, and the two activity-facts fields are compared - `paywall_first` (server-owned) and a `schemaVersion` tile reset may legitimately change. The snapshot dir survives across rcs, so check its mtimes first: if they predate the build you just replaced, say so in the report rather than claiming this rc preserved state.
 
 ## Codex checks (Codex pass)
