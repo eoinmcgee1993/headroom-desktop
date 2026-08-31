@@ -208,6 +208,8 @@ Expect: `0` and `0`.
 
 Line 1 is a real generating model that produced no output tokens - the client-visible shape of the empty-200 bug. Requiring `model=claude-` is what makes it usable: `passthrough:count_tokens` requests legitimately report `tok_out=0` and would otherwise swamp the count. Verified discriminating: `0` on the current log, `20` on the pre-fix rotated log, 28 across all history.
 
+A non-zero line 1 is a tripwire, not yet a verdict: the PERF line carries no status, and an upstream error passed through produces the same shape (a session-start 429 logged `tok_out=0 ttfb_ms=0` on the 0.9.3-rc.5 Windows pass). For each matching PERF line, find the `event=proxy_inbound_response ... path=/v1/messages status=` line at the same timestamp - its `duration_ms` tracks the PERF `total_ms` when several requests share the second, and the two id namespaces (`hr_...` vs `id=inbound-...`) never join, so the timestamp is the key. `status=200` with zero output tokens is the bug class and a hard FAIL; a 4xx/5xx is the proxy passing an upstream error through - report it as benign.
+
 Line 2 is the desktop's own `SemanticCache.set` guard in `SITECUSTOMIZE_PY` refusing to store a body that is empty, non-JSON, or an error envelope. It has never fired in ~6,400 requests, which is the point: `0` is healthy, and any non-zero means the runtime is producing bodies bad enough that the semantic cache would have replayed them for the full 1h TTL. Treat a hit as a wheel-bump regression and read the surrounding request, not as the guard doing routine work.
 
 If the cache ever does replay a poisoned body, the signature is a `/v1/messages` 200 in under 20ms with `tok_out=0`:
@@ -219,6 +221,8 @@ Expect: `0`. Only a proxy restart clears a poisoned entry, so this stays non-zer
 ### 14. User state survived the upgrade
 
 Checks 1-13 all describe a working install. None of them notice that the upgrade silently reset it, because a wiped state file looks exactly like a healthy fresh one. Every persisted file here is read back through `serde`, so one field added or renamed in the new build is enough to fail a parse and hand the user a default: a restarted grace clock, an empty savings history, or a client-setup record that no longer knows which shell files we wrote (which is also what uninstall reads to clean up).
+
+From 0.9.3 on, the app takes this snapshot itself: on the first launch of a new version, `snapshot_state_on_version_change` (storage.rs) copies the three state files raw into `config/pre-update/` - before anything parses them - with a `meta.json` naming the from/to versions. When the build being replaced is >= 0.9.3, verify `meta.json`'s `from_version` is that build and diff against `config/pre-update/` instead of a manual snapshot. The manual block below remains for upgrades from older builds and as a cross-check. One expected asymmetry: the auto-snapshot's `client-setup.json` is captured in the post-quit state, where `clear_client_setups()` has already emptied `configuredClients`/`managedShellFiles` - the surviving client set lives under `rememberedClients` there. Compare that key, not the configured sets (observed and verified on the rc.5 -> rc.7 pass).
 
 **Run this block BEFORE installing the rc**, on the build you are upgrading from:
 ```bash
@@ -237,6 +241,7 @@ cat /tmp/hr-preupgrade/*.json /tmp/hr-preupgrade/claude-md.txt
 ```bash
 S=~/Library/Application\ Support/Headroom
 stat -f '%Sm %N' /tmp/hr-preupgrade/*   # must predate THIS install, not an older one
+[ /tmp/hr-preupgrade -nt /Applications/Headroom.app ] && echo 'NOT RUN - snapshot is NEWER than the installed app; it was taken after this install'
 diff <(jq '{first_seen_at,paywall_first}' "$S/config/headroom-pricing-state.json") /tmp/hr-preupgrade/pricing.json
 diff <(jq '{configured:(.configuredClients|keys),shell:(.managedShellFiles|keys)}' "$S/config/client-setup.json") /tmp/hr-preupgrade/setup.json
 jq '{tokens:.allTimeRecordTokens,recap:.lastWeeklyRecapWeekKey,schema:.schemaVersion}' "$S/config/activity-facts.json"
