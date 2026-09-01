@@ -32,6 +32,9 @@ fn detect_cli(name: &str) -> Option<PathBuf> {
     if let Some(path) = probe_on_path(name) {
         return Some(path);
     }
+    if let Some(path) = probe_version_manager_dirs(name) {
+        return Some(path);
+    }
     probe_via_login_shell(name)
 }
 
@@ -77,6 +80,78 @@ fn known_path_candidates_for_platform(home: PathBuf, name: &str, windows: bool) 
         candidates.push(path);
     }
     candidates
+}
+
+/// Version-managed node trees (nvm/mise/fnm) keep binaries under
+/// per-version dirs no static candidate list can name
+/// (`~/.nvm/versions/node/v22.1.0/bin/claude`). GUI launches inherit
+/// launchd's bare PATH and the login-shell probe is a coin flip against a
+/// noisy rc file (RUST-AZ: learn ran with no usable `claude` on a machine
+/// that has one) -- so enumerate the version dirs directly, newest first,
+/// and smoke-test like every other candidate.
+fn probe_version_manager_dirs(name: &str) -> Option<PathBuf> {
+    first_runnable(version_manager_candidates(home_dir(), name).into_iter())
+}
+
+fn version_manager_candidates(home: PathBuf, name: &str) -> Vec<PathBuf> {
+    let roots = [
+        (
+            home.join(".nvm").join("versions").join("node"),
+            PathBuf::from("bin"),
+        ),
+        (
+            home.join(".local")
+                .join("share")
+                .join("mise")
+                .join("installs")
+                .join("node"),
+            PathBuf::from("bin"),
+        ),
+        (
+            home.join(".fnm").join("node-versions"),
+            PathBuf::from("installation").join("bin"),
+        ),
+    ];
+    let mut candidates = Vec::new();
+    for (root, bin) in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        let mut versions: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        sort_versions_newest_first(&mut versions);
+        for version in versions {
+            candidates.push(root.join(version).join(&bin).join(name));
+        }
+    }
+    candidates
+}
+
+/// Descending by the numeric runs in the name ("v10.1.0" above "v9.9.9",
+/// which plain string order gets backwards). Ties and non-numeric names sort
+/// arbitrarily but deterministically -- every candidate is smoke-tested
+/// anyway, order only decides which working install wins.
+fn sort_versions_newest_first(versions: &mut [String]) {
+    fn numeric_key(version: &str) -> Vec<u64> {
+        let mut nums = Vec::new();
+        let mut current = String::new();
+        for ch in version.chars() {
+            if ch.is_ascii_digit() {
+                current.push(ch);
+            } else if !current.is_empty() {
+                nums.push(current.parse().unwrap_or(0));
+                current.clear();
+            }
+        }
+        if !current.is_empty() {
+            nums.push(current.parse().unwrap_or(0));
+        }
+        nums
+    }
+    versions.sort_by(|a, b| numeric_key(b).cmp(&numeric_key(a)));
 }
 
 fn first_runnable<I: Iterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
@@ -420,6 +495,42 @@ mod tests {
 
         let candidates = vec![tmp.path().join("missing"), broken];
         assert!(first_runnable(candidates.into_iter()).is_none());
+    }
+
+    #[test]
+    fn version_sort_is_numeric_not_lexicographic() {
+        let mut versions = vec![
+            "v9.9.9".to_string(),
+            "v22.1.0".to_string(),
+            "v10.0.0".to_string(),
+        ];
+        sort_versions_newest_first(&mut versions);
+        assert_eq!(versions, ["v22.1.0", "v10.0.0", "v9.9.9"]);
+    }
+
+    #[test]
+    fn version_manager_candidates_walk_nvm_newest_first() {
+        let dir = ScopedTempDir::new("vm-candidates");
+        let home = dir.path().to_path_buf();
+        for version in ["v9.0.0", "v22.1.0"] {
+            std::fs::create_dir_all(
+                home.join(".nvm")
+                    .join("versions")
+                    .join("node")
+                    .join(version)
+                    .join("bin"),
+            )
+            .unwrap();
+        }
+        let candidates = version_manager_candidates(home.clone(), "claude");
+        let nvm = home.join(".nvm").join("versions").join("node");
+        assert_eq!(
+            candidates,
+            [
+                nvm.join("v22.1.0").join("bin").join("claude"),
+                nvm.join("v9.0.0").join("bin").join("claude"),
+            ]
+        );
     }
 
     #[test]

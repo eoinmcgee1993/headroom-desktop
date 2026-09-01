@@ -2642,6 +2642,7 @@ impl ToolManager {
                     command.process_group(0);
                 }
                 strip_unsupported_proxy_env(&mut command);
+                override_unsupported_registry_proxy(&mut command);
                 strip_unusable_sslkeylogfile(&mut command);
                 command
                     .env("PYTHONNOUSERSITE", "1")
@@ -9549,6 +9550,163 @@ fn strip_unsupported_proxy_env(command: &mut Command) {
     }
 }
 
+/// Windows keeps a second proxy source the env strip above cannot reach:
+/// the WinINET registry proxy (`ProxyEnable`/`ProxyServer` under HKCU).
+/// Python's `urllib.getproxies()` falls back to it whenever the process env
+/// carries not a single non-empty `*_proxy` var, and httpx wraps every
+/// http/https entry in `Proxy(url=...)` at AsyncClient() construction -- so a
+/// v2rayN-style `socks4://127.0.0.1:10808` system proxy kills backend boot
+/// with the exact ValueError of RUST-AS/RUST-AT even on builds that ship
+/// `strip_unsupported_proxy_env` (RUST-AY, stable 0.9.3). Mirror urllib's
+/// expansion; if the entries httpx would mount include a scheme it cannot
+/// parse, override the child env: usable entries become explicit
+/// http_proxy/https_proxy vars (any env proxy var makes urllib skip the
+/// registry), and when nothing is usable NO_PROXY="*" sends the backend
+/// direct -- strictly better than a guaranteed boot crash.
+fn override_unsupported_registry_proxy(command: &mut Command) {
+    if !cfg!(windows) {
+        return;
+    }
+    // urllib consults the registry only when the child sees zero non-empty
+    // *_proxy env vars. Vars the strip above removes are gone from the child,
+    // so they do not count; anything else (ftp_proxy, no_proxy, a supported
+    // http_proxy) suppresses the registry on its own.
+    let child_keeps_a_proxy_var = std::env::vars_os().any(|(name, value)| {
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let lower = name.to_ascii_lowercase();
+        let value = value.to_string_lossy();
+        if value.is_empty() || !lower.ends_with("_proxy") {
+            return false;
+        }
+        let stripped_above = ["http_proxy", "https_proxy", "all_proxy"].contains(&lower.as_str())
+            && !httpx_supports_proxy_url(&value);
+        !stripped_above
+    });
+    if child_keeps_a_proxy_var {
+        return;
+    }
+    let Some(output) = crate::proc::command("reg")
+        .args([
+            "query",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+    else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let enabled = parse_reg_value(&text, "ProxyEnable")
+        .map(|v| reg_dword_is_set(&v))
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    let Some(server) = parse_reg_value(&text, "ProxyServer") else {
+        return;
+    };
+    let Some(overrides) = registry_proxy_env_overrides(&server) else {
+        return;
+    };
+    // info, not warn: warn is bridged to Sentry and would re-report on every
+    // launch of an affected machine, forever. Values stay out of the log --
+    // proxy URLs can embed credentials.
+    log::info!(
+        "[tool_manager] WinINET registry proxy carries a scheme httpx cannot parse; overriding {} child proxy env var(s) so backend boot survives",
+        overrides.len()
+    );
+    for (name, value) in overrides {
+        command.env(name, value);
+    }
+}
+
+/// The data row for `value_name` in `reg query` output:
+/// `    ProxyServer    REG_SZ    socks4://127.0.0.1:10808`.
+/// Localized Windows translates headers and INFO lines but never the value
+/// rows' REG_* type token, so matching name + type token is locale-safe.
+fn parse_reg_value(reg_output: &str, value_name: &str) -> Option<String> {
+    for line in reg_output.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some(value_name) {
+            continue;
+        }
+        let Some(ty) = parts.next() else { continue };
+        if !ty.starts_with("REG_") {
+            continue;
+        }
+        let rest = parts.collect::<Vec<_>>().join(" ");
+        if !rest.is_empty() {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// `reg query` prints REG_DWORD as hex (`0x1`).
+fn reg_dword_is_set(value: &str) -> bool {
+    let v = value.trim().trim_start_matches("0x");
+    u64::from_str_radix(v, 16).map(|n| n != 0).unwrap_or(false)
+}
+
+/// urllib's `getproxies_registry` expansion of the `ProxyServer` string,
+/// restricted to the keys httpx mounts (http/https -- keyed socks entries
+/// never reach httpx and are harmless). A value without `=` applies to every
+/// protocol; `proto=addr` pairs are per-protocol; an address without a scheme
+/// inherits its protocol name as the scheme. Returns None when no override is
+/// needed (nothing mounted, or every mounted entry parses), otherwise the env
+/// vars to set on the child.
+fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, String)>> {
+    let server = proxy_server.trim();
+    if server.is_empty() {
+        return None;
+    }
+    let expanded = if server.contains('=') {
+        server.to_string()
+    } else {
+        format!("http={server};https={server}")
+    };
+    let mut mounted: Vec<(String, String)> = Vec::new();
+    for pair in expanded.split(';') {
+        let Some((proto, addr)) = pair.split_once('=') else {
+            continue;
+        };
+        let proto = proto.trim().to_ascii_lowercase();
+        if proto != "http" && proto != "https" {
+            continue;
+        }
+        let addr = addr.trim();
+        if addr.is_empty() {
+            continue;
+        }
+        // urllib keeps an existing scheme (`^([^/:]+)://`) and otherwise
+        // prefixes the protocol name.
+        let has_scheme = addr
+            .split_once("://")
+            .is_some_and(|(scheme, _)| !scheme.contains('/') && !scheme.contains(':'));
+        let url = if has_scheme {
+            addr.to_string()
+        } else {
+            format!("{proto}://{addr}")
+        };
+        mounted.push((proto, url));
+    }
+    if mounted.iter().all(|(_, url)| httpx_supports_proxy_url(url)) {
+        return None;
+    }
+    let usable: Vec<(String, String)> = mounted
+        .into_iter()
+        .filter(|(_, url)| httpx_supports_proxy_url(url))
+        .map(|(proto, url)| (format!("{proto}_proxy"), url))
+        .collect();
+    if usable.is_empty() {
+        return Some(vec![("NO_PROXY".to_string(), "*".to_string())]);
+    }
+    Some(usable)
+}
+
 /// True when a proxy env value names a socks-scheme proxy (any variant -
 /// socks4/socks4a/socks5/socks5h), which pip's vendored requests cannot use
 /// without the optional pysocks package.
@@ -13268,6 +13426,64 @@ after
                 "{bad:?} should be stripped"
             );
         }
+    }
+
+    #[test]
+    fn parse_reg_value_reads_typed_rows() {
+        let out = "\r\nHKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\r\n    ProxyEnable    REG_DWORD    0x1\r\n    ProxyServer    REG_SZ    socks4://127.0.0.1:10808\r\n";
+        assert_eq!(
+            super::parse_reg_value(out, "ProxyEnable").as_deref(),
+            Some("0x1")
+        );
+        assert_eq!(
+            super::parse_reg_value(out, "ProxyServer").as_deref(),
+            Some("socks4://127.0.0.1:10808")
+        );
+        assert!(super::parse_reg_value(out, "ProxyOverride").is_none());
+        assert!(super::reg_dword_is_set("0x1"));
+        assert!(!super::reg_dword_is_set("0x0"));
+    }
+
+    /// RUST-AY: v2rayN "set system proxy" writes a single socks4 URL into
+    /// `ProxyServer`; urllib mounts it under http AND https, httpx's
+    /// AsyncClient() raises, and the backend dies before opening the port.
+    /// Nothing is usable -> the child goes direct.
+    #[test]
+    fn registry_socks4_single_value_goes_direct() {
+        assert_eq!(
+            super::registry_proxy_env_overrides("socks4://127.0.0.1:10808"),
+            Some(vec![("NO_PROXY".to_string(), "*".to_string())])
+        );
+    }
+
+    #[test]
+    fn registry_clean_proxies_need_no_override() {
+        assert_eq!(super::registry_proxy_env_overrides("1.2.3.4:8080"), None);
+        assert_eq!(
+            super::registry_proxy_env_overrides("http=1.2.3.4:8080;https=1.2.3.4:8080"),
+            None
+        );
+        // Keyed socks entries never reach httpx's mounts.
+        assert_eq!(
+            super::registry_proxy_env_overrides("http=1.2.3.4:8080;socks=127.0.0.1:10808"),
+            None
+        );
+        assert_eq!(super::registry_proxy_env_overrides(""), None);
+        assert_eq!(super::registry_proxy_env_overrides("   "), None);
+    }
+
+    /// A corporate box with a usable http proxy next to a broken socks4
+    /// https entry keeps the working half as an explicit env var (which also
+    /// makes urllib skip the registry entirely).
+    #[test]
+    fn registry_mixed_keeps_the_usable_entry() {
+        assert_eq!(
+            super::registry_proxy_env_overrides("http=socks4://127.0.0.1:10808;https=1.2.3.4:8080"),
+            Some(vec![(
+                "https_proxy".to_string(),
+                "https://1.2.3.4:8080".to_string()
+            )])
+        );
     }
 
     /// RUST-6S: pip cannot use socks proxies without pysocks, so any socks
