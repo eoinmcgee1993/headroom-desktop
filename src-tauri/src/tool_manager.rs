@@ -33,7 +33,7 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// per-platform axis still matters, which `headroom_wheel_artifact` handles —
 /// when bumping this pin, re-pick every platform's wheel URL/sha256 from
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.35.0";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.37.0";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Kill the RUST-9F onnxruntime import probe after this long: a native
@@ -257,7 +257,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports five fixes owed upstream (remove each once a wheel ships it),
+Also ports six fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -285,24 +285,36 @@ clamp optimized to 0 and record savings rates above 100% ("4,436 -> 0,
 request's tools schema once per compressed HTTP request and widens the
 recorded pair at the outcome funnel so original - optimized == saved.
 Kill switch: HEADROOM_RESPONSES_DENOMINATOR_GUARD=0.
-Codex additional_tools guard (upstream issue #3185): Codex CLI 0.149.0
-stopped sending a top-level tools array on /v1/responses for models its
-capability cache flags (gpt-5.6-sol, its default) -- tool definitions
-ride inside input as items of type "additional_tools". Every tools
-consumer in the proxy (tool_schema_compaction, the output-shaper
-stratum, the tools token counts, the denominator guard above) reads
-only payload["tools"], so those requests classify "notools" and record
-zero savings (2026-08-21: 0/13 afternoon signups and 42/54 active
-codex users with frozen savings). The guard lifts the items' tools into
-a top-level array before compression and puts the compacted definitions
-back into the carrier before the payload is forwarded. The lift is
-internal only: tools is a per-request parameter while additional_tools
-is an input item, so forwarding the lifted shape costs a stateful
-session (Codex TUI/app-server over WS) its whole tool surface after
-turn one -- upstream #3194, the 0.36.3 regression from the same lift.
-No version gate: it self-neutralizes when payload["tools"] is already
-present, and 0.36.2 has no additional_tools support either. Kill
-switch: HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
+Tool-schema dollar unfold (upstream PR #3170): since the 0.36.0
+attribution unification, record_request folds the priced tool-schema
+bucket into compression_savings_usd (lifetime, display_session,
+per-model, per-project, and every history checkpoint) while the token
+fields beside them stay message-only, so any $/token read on the
+persisted state is inflated by 1 + tool/message -- 5.59x tool/message
+measured on one real install, an implied $32.88/M next to models that
+list at $10/M input. The desktop accumulates lifetime savings from
+these dollar fields, so the fold would contaminate the headline the
+product is trusted for (the savings-rate canary in state.rs is the
+runtime tripwire for exactly this). The guard zeroes the tool_schema
+bucket before the fold, restoring the 0.35.0 meaning of every
+persisted dollar field; tool-schema TOKENS are untouched and the
+desktop keeps pricing those itself at the cache-read rate.
+Self-neutralizes once a wheel ships #3170's disjoint fields. Kill
+switch: HEADROOM_SAVINGS_FOLD_GUARD=0.
+Chained-read protection (upstream PR #2668): _is_read_command
+inspects only the FIRST program and applies its write/redirect check
+to the whole string, so a read batched behind other work
+(`wc -l a.py && sed -n '1,60p' a.py`) classifies as a non-read and the
+file content is lossy-compressed despite read protection -- the agent
+then re-reads the file to recover exact bytes (turn inflation) or
+fails the edit outright (resolve loss). The guard splits on ;/&&/||
+(never on a single |: downstream pipeline stages consume output, not
+files), judges redirects and tee per segment so a sibling write does
+not unprotect the read beside it, keeps the heredoc whole-string
+bailout (a heredoc body may contain ; or &&), and delegates each
+segment's program parsing to the original function so wrapper peeling,
+bash -c recursion and the lockfile carve-out stay upstream's. Kill
+switch: HEADROOM_READ_CHAIN_GUARD=0.
 cc-switch Official-branch upstream reset (upstream PR #3166): the
 reconciler captures the third-party endpoint cc-switch selected (Kimi,
 DeepSeek, GLM) as this proxy's Anthropic upstream, but switching back to
@@ -781,165 +793,92 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     except Exception:
         pass
 
-    # Codex additional_tools guard (upstream issue #3185; remove once a wheel
-    # ships support -- see the module docstring for the failure mode). Applied
-    # AFTER the denominator guard so this wrapper is outermost: the lift runs
-    # first at runtime and every inner layer (denominator widening included)
-    # sees the classic top-level tools shape. Symmetric: the lift is in place
-    # for the compression pass only, and the carrier goes back on the wire
-    # before the payload is forwarded (see _hd_at_restore -- forwarding the
-    # lifted shape is upstream's 0.36.3 regression, #3194). Kill switch:
-    # HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
+    # Tool-schema dollar unfold (upstream PR #3170; remove once a wheel ships
+    # it -- see the module docstring for the contamination this prevents). The
+    # wrapper strikes at the single choke point every caller funnels through:
+    # SavingsTracker.record_request is keyword-only, and the fold is
+    # priced["compression"] + priced["tool_schema"] inside it. Zeroing the
+    # tool_schema bucket on a COPY (the caller's mapping is never mutated)
+    # restores message-only dollars everywhere the tracker persists them,
+    # while tool_search_saved -- the token side -- passes through untouched.
+    # Gated on the runtime NOT having #3170's disjoint fields, so the first
+    # wheel that ships them keeps its proper split and this block goes inert.
+    # Kill switch: HEADROOM_SAVINGS_FOLD_GUARD=0.
     try:
         if _hd_os.environ.get(
-            "HEADROOM_ADDITIONAL_TOOLS_GUARD", "1"
+            "HEADROOM_SAVINGS_FOLD_GUARD", "1"
         ).strip().lower() not in ("0", "false", "no", "off"):
-            import logging as _hd_at_logging
+            import headroom.proxy.savings_tracker as _hd_sf_st
 
-            import headroom.proxy.handlers.openai as _hd_at_openai
+            if "tool_schema_savings_usd" not in _hd_sf_st._empty_display_session():
+                _hd_sf_orig_record = _hd_sf_st.SavingsTracker.record_request
 
-            _hd_at_log = _hd_at_logging.getLogger("headroom.proxy")
-            _hd_at_announced = False
-
-            _hd_at_warned = False
-
-            def _hd_at_lift(payload, plan):
-                # Lift additional_tools input items into a top-level tools
-                # array, in place, recording the carrier in `plan` so the
-                # forwarded payload can be put back the way Codex sent it.
-                # No-op (0) unless the request uses the Codex >= 0.149.0
-                # encoding and has no top-level tools.
-                global _hd_at_announced
-                if not isinstance(payload, dict) or payload.get("tools"):
-                    return 0
-                items = payload.get("input")
-                if not isinstance(items, list):
-                    return 0
-                lifted = []
-                kept = []
-                carrier = None
-                for item in items:
-                    if (
-                        isinstance(item, dict)
-                        and item.get("type") == "additional_tools"
-                        and isinstance(item.get("tools"), list)
-                        and item["tools"]
-                    ):
-                        if carrier is None:
-                            # Restore template: the carrier's own fields
-                            # minus the definitions, plus its position among
-                            # the items that survive the lift. Codex sends a
-                            # single carrier; extra carriers merge into this
-                            # one rather than being split on a boundary that
-                            # compaction may have invalidated.
-                            carrier = (
-                                {k: v for k, v in item.items() if k != "tools"},
-                                len(kept),
-                            )
-                        lifted.extend(item["tools"])
-                    else:
-                        kept.append(item)
-                if not lifted:
-                    return 0
-                payload["tools"] = lifted
-                payload["input"] = kept
-                plan.append((carrier[0], carrier[1], list(lifted)))
-                if not _hd_at_announced:
-                    _hd_at_announced = True
-                    _hd_at_log.info(
-                        "event=codex_additional_tools_lifted tools=%d "
-                        "(codex >= 0.149.0 encoding; desktop guard active)",
-                        len(lifted),
-                    )
-                return len(lifted)
-
-            def _hd_at_restore(payload, plan):
-                # Put the definitions back into the carrier Codex sent them
-                # in, post-compaction, and drop the top-level array. The lift
-                # is an internal normalization for the tools consumers; the
-                # forwarded shape must match what the client sent. `tools` is
-                # a per-request parameter while additional_tools is an input
-                # item and therefore part of the transcript, so a stateful
-                # session (Codex TUI/app-server over WS) declares its tools
-                # once and relies on the transcript for every later turn --
-                # forwarding the lifted shape leaves that transcript
-                # tool-less: turn one works, then all shell/filesystem access
-                # vanishes for the rest of the session (upstream #3194).
-                if not isinstance(payload, dict) or not plan:
-                    return 0
-                items = payload.get("input")
-                if not isinstance(items, list):
-                    return 0
-                if any(
-                    isinstance(item, dict)
-                    and item.get("type") == "additional_tools"
-                    and item.get("tools")
-                    for item in items
-                ):
-                    # Already in carrier form; restoring again would
-                    # duplicate the definitions. Keeps the restore idempotent.
-                    return 0
-                template, position, original = plan[0]
-                tools = payload.get("tools")
-                if not isinstance(tools, list) or not tools:
-                    # A consumer emptied the array. Restoring what Codex sent
-                    # is strictly safer than forwarding a tool-less payload.
-                    tools = original
-                if not tools:
-                    return 0
-                carrier = dict(template)
-                carrier["type"] = "additional_tools"
-                carrier["tools"] = list(tools)
-                restored = list(items)
-                restored.insert(min(max(position, 0), len(restored)), carrier)
-                payload["input"] = restored
-                payload.pop("tools", None)
-                return len(carrier["tools"])
-
-            _hd_at_orig_compress = (
-                _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor
-            )
-
-            async def _hd_at_compress(self, payload, **kwargs):
-                global _hd_at_warned
-                plan = []
-                result = None
-                try:
-                    _hd_at_lift(payload, plan)
-                except Exception:
-                    # The plan is deliberately kept: a lift that raised after
-                    # mutating the payload is undone by the restore below.
-                    pass
-                try:
-                    result = await _hd_at_orig_compress(self, payload, **kwargs)
-                finally:
-                    if plan:
-                        targets = [payload]
+                def _hd_sf_record(self, **kwargs):
+                    priced = kwargs.get("estimated_savings_usd")
+                    if priced is not None:
                         try:
-                            # result[0] is what the call sites forward; the caller
-                            # payload is restored too, for the paths that forward
-                            # the object they passed in when nothing was modified.
-                            out = result[0] if isinstance(result, tuple) and result else None
-                            if isinstance(out, dict) and out is not payload:
-                                targets.append(out)
-                            failed = [t for t in targets if not _hd_at_restore(t, plan)]
+                            unfolded = dict(priced)
+                            unfolded["tool_schema"] = 0.0
+                            kwargs["estimated_savings_usd"] = unfolded
                         except Exception:
-                            failed = targets
-                        if failed and not _hd_at_warned:
-                            # Logged once: the lifted shape is about to go out and
-                            # a stateful client will lose its tools after this
-                            # turn. Never silent.
-                            _hd_at_warned = True
-                            _hd_at_log.warning(
-                                "event=codex_additional_tools_restore_failed "
-                                "(forwarding lifted shape; set "
-                                "HEADROOM_ADDITIONAL_TOOLS_GUARD=0 to opt out)"
-                            )
-                return result
+                            pass
+                    return _hd_sf_orig_record(self, **kwargs)
 
-            _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
-                _hd_at_compress
-            )
+                _hd_sf_st.SavingsTracker.record_request = _hd_sf_record
+    except Exception:
+        pass
+
+    # Chained-read protection (upstream PR #2668; remove once a wheel ships it
+    # -- see the module docstring for the re-read/resolve-loss failure this
+    # prevents). Rebinding the module-level name covers both in-module call
+    # sites: Python resolves it via module globals at call time, which also
+    # routes the original's own bash -c recursion through the new version.
+    # Kill switch: HEADROOM_READ_CHAIN_GUARD=0.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_READ_CHAIN_GUARD", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import re as _hd_rc_re
+
+            import headroom.transforms.content_router as _hd_rc_cr
+
+            _hd_rc_orig = _hd_rc_cr._is_read_command
+            # ; && and || start a NEW command; a single | deliberately does
+            # not: downstream pipeline stages consume the previous stage's
+            # output, not a file, so `grep -n x a.py | head -40` stays derived
+            # (compressible) while `cat a.py | head -40` reads via stage one.
+            _hd_rc_sep = _hd_rc_re.compile(r"\|\||&&|;")
+            _hd_rc_write = _hd_rc_re.compile(r"(^|\s)(>>?|tee\b)")
+            _hd_rc_heredoc = _hd_rc_re.compile(r"(^|\s)<<")
+
+            def _hd_rc_segment_is_read(seg):
+                # A redirect or tee in THIS segment means it writes a file;
+                # judged on the whole segment -- pipeline included, so
+                # `cat a.py | tee b.py` stays a write -- before reducing to
+                # the stage that touches the file. Sibling segments never
+                # see each other, so `cat a.py && echo done > marker` keeps
+                # its read protected.
+                if _hd_rc_write.search(seg):
+                    return False
+                first = seg.split("|", 1)[0].strip()
+                return bool(first) and _hd_rc_orig(first)
+
+            def _hd_rc_is_read(command):
+                if not command or not isinstance(command, str):
+                    return False
+                c = _hd_rc_cr._strip_cd_prefix(command)
+                # A heredoc is the one WHOLE-STRING bailout: its body can
+                # contain ; or &&, which would split into bogus segments that
+                # look like reads. The command as a whole writes a file.
+                if _hd_rc_heredoc.search(c):
+                    return False
+                return any(
+                    _hd_rc_segment_is_read(seg)
+                    for seg in (s.strip() for s in _hd_rc_sep.split(c))
+                    if seg
+                )
+
+            _hd_rc_cr._is_read_command = _hd_rc_is_read
     except Exception:
         pass
 
@@ -8668,24 +8607,24 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
 fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => (
-            "https://files.pythonhosted.org/packages/b0/27/a67c70358769ff1844326e1b9695bfa9ed2f298aeb7001bb32e74c92c7d5/headroom_ai-0.35.0-cp310-abi3-macosx_11_0_arm64.whl",
-            "54dc9be2b8f7b0397f35d15b73f48db3eefdd3b3c613630bcaee695a4fbf509e",
+            "https://files.pythonhosted.org/packages/47/21/8a87b66e83498da89404cdba4ced6397e84331047df9e11a9ea6f3510b29/headroom_ai-0.37.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "b4392f68a8d02d74c62c1734cf5bf327511dcc72678f01669f44f0612944d59c",
         ),
         ("macos", "x86_64") => (
-            "https://files.pythonhosted.org/packages/af/7d/4f6199cf9ede6eec15df036ba06e52ce36025a82e23988397db6ff16d3a6/headroom_ai-0.35.0-cp310-abi3-macosx_10_12_x86_64.whl",
-            "ef8622df6230a6e63a44ca5d25a8aaca985d3573dbe83db9a74556286f4bee0f",
+            "https://files.pythonhosted.org/packages/56/cc/385712352911b7a482514902745cba802e03947850689a784b2d40764e06/headroom_ai-0.37.0-cp310-abi3-macosx_10_12_x86_64.whl",
+            "d89fd5858e701ada53d01849f73039d891fad84d9eb370f952d56581962d9cf8",
         ),
         ("linux", "aarch64") => (
-            "https://files.pythonhosted.org/packages/7d/4f/972f50843a9c419967b443ef41121de4687bbdab91682ac1e4b800366c68/headroom_ai-0.35.0-cp310-abi3-manylinux_2_28_aarch64.whl",
-            "ec261ca9c3a8599c4a1b8bc7b69301d39bd434448b64bd043b510fd5ee14d358",
+            "https://files.pythonhosted.org/packages/c6/2e/8d1c60683c74ae2871270789e0af1acc93727a51189799e74529679d795c/headroom_ai-0.37.0-cp310-abi3-manylinux_2_28_aarch64.whl",
+            "bc30d31a6b9336155d62bbdd99f3c2f6c5a1ed3882a8730ea0cd8ede4c40fa19",
         ),
         ("linux", "x86_64") => (
-            "https://files.pythonhosted.org/packages/56/ea/b5f112b90ea2033276c35a7bddd4bdfd4429a1c011b2f109fa5a809bac14/headroom_ai-0.35.0-cp310-abi3-manylinux_2_28_x86_64.whl",
-            "abdbbabc314b09e0f27b166f0be43dc386b8de338048a66fe804bc1d3cf2bff4",
+            "https://files.pythonhosted.org/packages/72/b8/16878cf4fe6fc390a0d22025b671468619db690ff14c1b103ace4b5e35f9/headroom_ai-0.37.0-cp310-abi3-manylinux_2_28_x86_64.whl",
+            "2efc5cdf681a10c5fc7a2a271a471179c409074537045f682b10e4d724976f46",
         ),
         ("windows", "x86_64") => (
-            "https://files.pythonhosted.org/packages/fc/8c/297b742144144c8411ca021436004a15318a6f5cce033093d9333f693089/headroom_ai-0.35.0-cp310-abi3-win_amd64.whl",
-            "c80533399c911761fb47f49ac02db35c33ef4eb628c6568c213d7d7f0b594bef",
+            "https://files.pythonhosted.org/packages/c9/84/6803f3cc069dc8a6843c7ed8b155d1cf0c603a7467f58ffa24c5c399b8c9/headroom_ai-0.37.0-cp310-abi3-win_amd64.whl",
+            "e961f892786f7577e75f2c26229f11e2609fc007083dae24d336e76fc4c72e58",
         ),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
@@ -10895,144 +10834,58 @@ mod tests {
     }
 
     #[test]
-    fn sitecustomize_lifts_codex_additional_tools() {
-        // Upstream issue #3185: Codex CLI 0.149.0 moved tool definitions off
-        // the top-level tools array into input items of type
-        // "additional_tools" (gpt-5.6-sol default), so every tools consumer
-        // classified those requests "notools" and savings recorded zero.
-        // Verified live against the ChatGPT Codex backend on 2026-08-21:
-        // lifted requests compact (608 tokens/turn) and tool calls execute.
+    fn sitecustomize_unfolds_tool_schema_dollars() {
+        // Upstream PR #3170 not yet in a wheel: 0.36.0's attribution
+        // unification folds priced tool-schema dollars into
+        // compression_savings_usd while every token field beside it stays
+        // message-only, inflating any $/token read on the persisted state by
+        // 1 + tool/message (5.59x measured; an implied $32.88/M next to
+        // models listing at $10/M). The guard zeroes the tool_schema bucket
+        // before the fold so the desktop's lifetime dollars keep their
+        // 0.35.0 meaning on the 0.37.0 wheel.
         let py = super::SITECUSTOMIZE_PY;
-        assert!(py.contains("HEADROOM_ADDITIONAL_TOOLS_GUARD"));
-        assert!(py.contains(r#"item.get("type") == "additional_tools""#));
-        // Self-neutralizes on classic-encoding requests: a present top-level
-        // tools array must short-circuit the lift.
-        assert!(py.contains(r#"or payload.get("tools"):"#));
-        // The wrapper must be installed on the executor seam (the single
-        // funnel for HTTP, WS, and passthrough responses compression)...
-        assert!(py.contains(
-            "_hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = ("
-        ));
-        // ...and the lift must be symmetric. Upstream #3194: tools is a
-        // per-request parameter, additional_tools is an input item and so
-        // part of the transcript, so a stateful Codex session (TUI/app-server
-        // over WS) declares its tools once and relies on the transcript
-        // afterwards -- forwarding the lifted shape gives it tools on turn
-        // one and none for the rest of the session. The carrier goes back,
-        // carrying the compacted definitions, before the payload is
-        // forwarded, and the top-level array is dropped.
-        assert!(py.contains("def _hd_at_restore(payload, plan):"));
-        assert!(py.contains(r#"payload.pop("tools", None)"#));
-        assert!(py.contains("failed = [t for t in targets if not _hd_at_restore(t, plan)]"));
-        // Both what the call sites forward (result[0]) and the payload the
-        // caller passed in are restored.
-        assert!(py.contains("out = result[0] if isinstance(result, tuple) and result else None"));
-        assert!(py.contains("targets = [payload]"));
-        // Restoring an already-restored payload must not duplicate the
-        // definitions, and an emptied array falls back to what Codex sent
-        // rather than forwarding a tool-less payload.
-        assert!(py.contains("if not isinstance(tools, list) or not tools:"));
-        assert!(py.contains("tools = original"));
-        // A restore that cannot happen is logged, never silent.
-        assert!(py.contains("event=codex_additional_tools_restore_failed"));
-        let restore_pos = py.find("def _hd_at_restore").expect("restore present");
-        let call_pos = py
-            .find("failed = [t for t in targets")
-            .expect("restore call present");
-        let orig_pos = py
-            .find("result = await _hd_at_orig_compress")
-            .expect("inner compress call present");
-        assert!(restore_pos < orig_pos && orig_pos < call_pos);
-        // ...and AFTER the denominator guard's wrapper of the same method, so
-        // the lift is outermost and the widening sees the lifted tools.
-        let lift_pos = py
-            .find("_hd_at_openai.OpenAIHandlerMixin")
-            .expect("lift patch present");
-        let denom_pos = py
-            .find("_hd_rd_openai.OpenAIHandlerMixin")
-            .expect("denominator patch present");
-        assert!(denom_pos < lift_pos);
+        assert!(py.contains("HEADROOM_SAVINGS_FOLD_GUARD"));
+        assert!(py.contains("_hd_sf_st.SavingsTracker.record_request = _hd_sf_record"));
+        // The unfold works on a copy -- the caller's mapping is not mutated.
+        assert!(py.contains("unfolded = dict(priced)"));
+        assert!(py.contains(r#"unfolded["tool_schema"] = 0.0"#));
+        // Self-neutralizes on the first wheel shipping #3170's disjoint
+        // fields, so a proper upstream split is never zeroed.
+        assert!(
+            py.contains(r#""tool_schema_savings_usd" not in _hd_sf_st._empty_display_session()"#)
+        );
+        // Only the dollar fold is undone; the token side must pass through.
+        assert!(!py.contains(r#"kwargs["tool_search_saved"]"#));
+        // The 0.37.0 wheel handles Codex additional_tools natively (#3186 +
+        // #3194), so the desktop lift is gone with the pin bump.
+        assert!(!py.contains("HEADROOM_ADDITIONAL_TOOLS_GUARD"));
+        assert!(!py.contains("additional_tools"));
     }
 
     #[test]
-    fn sitecustomize_restores_codex_additional_tools_when_compression_raises() {
+    fn sitecustomize_ports_read_chain_guard() {
+        // Upstream PR #2668 not yet in a wheel: _is_read_command matches only
+        // the first program and applies its write check whole-string, so a
+        // read batched behind other work (`wc -l a.py && sed -n '1,60p'
+        // a.py`) is lossy-compressed despite read protection -- the exact
+        // re-read/resolve-loss failure the protection exists to prevent.
         let py = super::SITECUSTOMIZE_PY;
-        let guard = &py[py
-            .find("    # Codex additional_tools guard")
-            .expect("additional_tools guard present")..];
-        let mut script = r#"
-import asyncio
-import copy
-import os as _hd_os
-import sys
-import types
-
-headroom = types.ModuleType("headroom")
-headroom.__path__ = []
-proxy = types.ModuleType("headroom.proxy")
-proxy.__path__ = []
-handlers = types.ModuleType("headroom.proxy.handlers")
-handlers.__path__ = []
-openai = types.ModuleType("headroom.proxy.handlers.openai")
-
-class OpenAIHandlerMixin:
-    async def _compress_openai_responses_payload_in_executor(self, payload, **kwargs):
-        assert payload.get("tools"), payload
-        raise TimeoutError("boom")
-
-openai.OpenAIHandlerMixin = OpenAIHandlerMixin
-headroom.proxy = proxy
-proxy.handlers = handlers
-handlers.openai = openai
-sys.modules.update({
-    "headroom": headroom,
-    "headroom.proxy": proxy,
-    "headroom.proxy.handlers": handlers,
-    "headroom.proxy.handlers.openai": openai,
-})
-"#
-        .to_string();
-        script.push_str("if True:\n");
-        script.push_str(guard);
-        script.push_str(
-            r#"
-payload = {
-    "input": [
-        {"type": "message", "content": "before"},
-        {
-            "type": "additional_tools",
-            "id": "carrier",
-            "tools": [{"type": "function", "name": "shell"}],
-        },
-        {"type": "message", "content": "after"},
-    ]
-}
-original = copy.deepcopy(payload)
-
-async def verify():
-    try:
-        await OpenAIHandlerMixin()._compress_openai_responses_payload_in_executor(payload)
-    except TimeoutError:
-        pass
-    else:
-        raise AssertionError("compressor did not raise")
-    assert payload == original, (payload, original)
-
-asyncio.run(verify())
-"#,
-        );
-
-        let python = if cfg!(windows) { "python" } else { "python3" };
-        let out = match crate::proc::command(python).args(["-c", &script]).output() {
-            Ok(out) => out,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => panic!("spawn failed: {e}"),
-        };
-        assert!(
-            out.status.success(),
-            "additional_tools exception round-trip failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(py.contains("HEADROOM_READ_CHAIN_GUARD"));
+        assert!(py.contains("upstream PR #2668"));
+        // Split on ; && and || -- never on a single | (pipelines reduce to
+        // their first stage instead).
+        assert!(py.contains(r#"_hd_rc_re.compile(r"\|\||&&|;")"#));
+        assert!(py.contains(r#"seg.split("|", 1)[0].strip()"#));
+        // Redirect/tee are judged per SEGMENT so a sibling write cannot
+        // unprotect the read next to it; the heredoc bailout stays
+        // whole-string because its body may contain separators.
+        assert!(py.contains(r#"(^|\s)(>>?|tee\b)"#));
+        assert!(py.contains(r#"(^|\s)<<"#));
+        // Each segment delegates to the ORIGINAL parser (wrapper peeling,
+        // bash -c recursion, lockfile carve-out stay upstream's), and the
+        // rebind covers both in-module call sites via module globals.
+        assert!(py.contains("_hd_rc_orig(first)"));
+        assert!(py.contains("_hd_rc_cr._is_read_command = _hd_rc_is_read"));
     }
 
     #[test]
