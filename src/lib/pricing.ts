@@ -21,6 +21,8 @@ export function claudePlanLabel(plan: ClaudePlanTier) {
       return "Claude Max x5";
     case "max20x":
       return "Claude Max x20";
+    case "api":
+      return "Claude API";
     default:
       return "Unknown Claude plan";
   }

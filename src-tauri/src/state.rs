@@ -2121,6 +2121,9 @@ impl AppState {
                     ) | (
                         crate::models::ClaudePlanTier::Max20x,
                         crate::models::ClaudePlanTier::Max20x
+                    ) | (
+                        crate::models::ClaudePlanTier::Api,
+                        crate::models::ClaudePlanTier::Api
                     )
                 ) {
                     return;
