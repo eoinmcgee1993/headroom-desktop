@@ -27,6 +27,7 @@ describe("install-wizard funnel steps", () => {
       "email_code_requested",
       "email_code_verified",
       "client_setup_shown",
+      "client_setup_no_clients_detected",
       "client_setup_applied",
       "proxy_verify_started",
       "proxy_verified",

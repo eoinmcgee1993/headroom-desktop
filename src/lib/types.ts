@@ -517,7 +517,7 @@ export interface ActivityFeedResponse {
 
 export type ClaudeAuthMethod = "claude_ai_oauth" | "api_key" | "unknown";
 
-export type ClaudePlanTier = "free" | "pro" | "max5x" | "max20x" | "unknown";
+export type ClaudePlanTier = "free" | "pro" | "max5x" | "max20x" | "api" | "unknown";
 
 export type HeadroomSubscriptionTier = "pro" | "max5x" | "max20x";
 

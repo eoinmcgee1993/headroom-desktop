@@ -795,6 +795,9 @@ pub enum ClaudePlanTier {
     Pro,
     Max5x,
     Max20x,
+    /// Anthropic API console org (`api_individual` and friends): pay-per-token
+    /// billing, no Claude subscription plan to mirror.
+    Api,
     Unknown,
 }
 
@@ -831,6 +834,12 @@ pub fn headroom_tier_for_claude_plan(plan: &ClaudePlanTier) -> Option<HeadroomSu
         // in `pricing::detect_tier_mismatch`. The pricing gate's separate
         // Unknown -> Max x20 *threshold* fallback is unaffected.
         ClaudePlanTier::Unknown => None,
+        // API-billed org: no subscription to mirror. The server's usage-band
+        // pitch (account.recommended_tier, computed from user_daily_savings
+        // with the >=5:1 savings ROI clamp) drives the recommendation; a local
+        // guess would overpitch light API users. None also keeps
+        // detect_tier_mismatch quiet, same contract as Unknown.
+        ClaudePlanTier::Api => None,
         ClaudePlanTier::Free => None,
     }
 }
@@ -1141,6 +1150,12 @@ pub struct HeadroomAccountProfile {
     /// None for everyone else, keeping normal routing.
     #[serde(default)]
     pub upgrade_action: Option<String>,
+    /// Server-computed pitch tier for API-billed orgs: their usage band mapped
+    /// onto subscriber plans (>=5:1 savings ROI clamp), from
+    /// user_daily_savings. None for everyone else - local recommendation
+    /// logic applies unchanged.
+    #[serde(default)]
+    pub recommended_tier: Option<HeadroomSubscriptionTier>,
     // Early adopters whose earliest trial identity predates the paywall keep a
     // capped free tier instead of the post-trial hard block. serde default so
     // older cached payloads (no field) still deserialize.

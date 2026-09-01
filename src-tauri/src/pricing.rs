@@ -253,6 +253,7 @@ fn plan_tier_header_value(tier: &ClaudePlanTier) -> &'static str {
         ClaudePlanTier::Pro => "pro",
         ClaudePlanTier::Max5x => "max5x",
         ClaudePlanTier::Max20x => "max20x",
+        ClaudePlanTier::Api => "api",
         ClaudePlanTier::Unknown => "unknown",
     }
 }
@@ -699,6 +700,8 @@ struct RemoteAccountResponse {
     invite_bonus_percent: f64,
     #[serde(default)]
     upgrade_action: Option<String>,
+    #[serde(default)]
+    recommended_tier: Option<HeadroomSubscriptionTier>,
     #[serde(default)]
     grandfathered: bool,
 }
@@ -2245,6 +2248,18 @@ fn evaluate_pricing_status_with_mismatch(
                 .into();
     }
 
+    // Server-computed usage-band pitch for API-billed orgs: the server fills
+    // account.recommendedTier only for api_* organizations (band over
+    // user_daily_savings at subscriber-typical thresholds, >=5:1 savings ROI
+    // clamp). It outranks every local guess - the Api gate policy's Max
+    // ceiling would otherwise pitch Max20x at a light API user.
+    if let Some(tier) = account
+        .as_ref()
+        .and_then(|account| account.recommended_tier)
+    {
+        recommended_subscription_tier = Some(tier);
+    }
+
     HeadroomPricingStatus {
         authenticated,
         local_grace_started_at,
@@ -3083,6 +3098,19 @@ fn detect_plan_tier_from_profile(profile: &ClaudeOauthProfile) -> (ClaudePlanTie
                 Some("oauth_profile.organization.organizationType".into()),
             );
         }
+        // Anthropic API console orgs (api_individual, api_*): pay-per-token
+        // accounts, not Claude subscriptions. Both observed shapes land here:
+        // prepaid with subscription_created_at set (previously fell through to
+        // Unknown and fired plan_tier_unknown - RUST-B2) and
+        // auto_api_evaluation without subscription_created_at (previously
+        // misread as Free). The server prices these by usage band; see
+        // HeadroomAccountProfile::recommended_tier.
+        if normalized.starts_with("api") {
+            return (
+                ClaudePlanTier::Api,
+                Some("oauth_profile.organization.organizationType".into()),
+            );
+        }
         if normalized == "claude_free" || normalized == "free" {
             return (
                 ClaudePlanTier::Free,
@@ -3214,6 +3242,7 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         accepted_invites_count: value.accepted_invites_count,
         invite_bonus_percent: value.invite_bonus_percent.min(50.0).max(0.0),
         upgrade_action: value.upgrade_action,
+        recommended_tier: value.recommended_tier,
         grandfathered: value.grandfathered,
     }
 }
@@ -3778,6 +3807,12 @@ fn pricing_policy_for_plan(plan: &ClaudePlanTier) -> Option<PricingPolicy> {
         ClaudePlanTier::Pro => Some(policy_for_paid_tier(HeadroomSubscriptionTier::Pro)),
         ClaudePlanTier::Max5x => Some(policy_for_paid_tier(HeadroomSubscriptionTier::Max5x)),
         ClaudePlanTier::Max20x => Some(policy_for_paid_tier(HeadroomSubscriptionTier::Max20x)),
+        // API-billed org: metered at the Max ceiling like Unknown - per-token
+        // billing carries no weekly quota to key a softer ladder off, and the
+        // ceiling stops an API org from riding free. The PITCHED tier comes
+        // from the server usage band (account.recommended_tier), not this
+        // policy's recommended_tier.
+        ClaudePlanTier::Api => Some(policy_for_paid_tier(HeadroomSubscriptionTier::Max20x)),
         // Undecodable plan is metered at the Max ceiling (25%) rather than left
         // ungated, so an obscured plan can't buy unlimited free optimization.
         ClaudePlanTier::Unknown => Some(policy_for_paid_tier(HeadroomSubscriptionTier::Max20x)),
@@ -3999,6 +4034,7 @@ mod tests {
             accepted_invites_count: 2,
             invite_bonus_percent: 10.0,
             upgrade_action: None,
+            recommended_tier: None,
             grandfathered: false,
         }
     }
@@ -4538,6 +4574,7 @@ mod tests {
             accepted_invites_count: 0,
             invite_bonus_percent: 0.0,
             upgrade_action: None,
+            recommended_tier: None,
             grandfathered: false,
         }
     }
@@ -4567,6 +4604,7 @@ mod tests {
             accepted_invites_count: 0,
             invite_bonus_percent: invite_bonus,
             upgrade_action: None,
+            recommended_tier: None,
             grandfathered: false,
         }
     }
@@ -4576,6 +4614,7 @@ mod tests {
     fn grandfathered_account() -> HeadroomAccountProfile {
         HeadroomAccountProfile {
             upgrade_action: None,
+            recommended_tier: None,
             grandfathered: true,
             ..expired_account(0.0)
         }
@@ -5196,6 +5235,42 @@ mod tests {
         ));
     }
 
+    /// RUST-B2 shape: prepaid API console org with subscription_created_at
+    /// set. Previously fell through to Unknown and fired plan_tier_unknown.
+    #[test]
+    fn detect_plan_tier_api_org_with_subscription_is_api() {
+        let p = oauth_profile(
+            Some("auto_trust_tier_c"),
+            Some("api_individual"),
+            Some(Utc::now()),
+        );
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Api
+        ));
+    }
+
+    /// The other observed shape (user 1208): auto_api_evaluation without
+    /// subscription_created_at. Previously misread as Free.
+    #[test]
+    fn detect_plan_tier_api_org_without_subscription_is_api_not_free() {
+        let p = oauth_profile(Some("auto_api_evaluation"), Some("api_individual"), None);
+        assert!(matches!(
+            detect_plan_tier_from_profile(&p).0,
+            ClaudePlanTier::Api
+        ));
+    }
+
+    #[test]
+    fn api_plan_tier_is_ceiling_metered_and_server_pitched() {
+        // Gate: Max ceiling like Unknown.
+        let policy = super::pricing_policy_for_plan(&ClaudePlanTier::Api).unwrap();
+        assert_eq!(policy.disable_threshold_percent, 25.0);
+        // No local pitch: the server usage band owns the recommendation.
+        assert!(crate::models::headroom_tier_for_claude_plan(&ClaudePlanTier::Api).is_none());
+        assert_eq!(super::plan_tier_header_value(&ClaudePlanTier::Api), "api");
+    }
+
     #[test]
     fn remote_account_clamps_invite_bonus_to_50() {
         let raw = RemoteAccountResponse {
@@ -5222,6 +5297,7 @@ mod tests {
             accepted_invites_count: 0,
             invite_bonus_percent: 999.0,
             upgrade_action: None,
+            recommended_tier: None,
             grandfathered: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 50.0);
@@ -5253,6 +5329,7 @@ mod tests {
             accepted_invites_count: 0,
             invite_bonus_percent: -10.0,
             upgrade_action: None,
+            recommended_tier: None,
             grandfathered: false,
         };
         assert_eq!(remote_account_to_profile(raw).invite_bonus_percent, 0.0);

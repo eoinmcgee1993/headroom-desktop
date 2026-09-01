@@ -31,6 +31,12 @@ const ALLOWED_EVENTS: &[&str] = &[
     // At most once per install (persisted flag); measures how many users hit
     // the "setup finished but no traffic ever" state.
     "onboarding_recovery_nudge_shown",
+    // Emitted by the apply_client_setup command / watchdog repair since 0.8.x
+    // but missing here, so they were silently dropped by the gate below.
+    // Carries client_id + verified + proxy_reachable: the per-OS
+    // "applied but never verified/used" slice.
+    "client_setup_applied",
+    "client_setup_auto_repaired",
     // Addon adoption (one event per addon, fired from install/enable/uninstall).
     "markitdown_installed",
     "markitdown_enabled",

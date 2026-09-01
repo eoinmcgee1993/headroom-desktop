@@ -6,7 +6,7 @@
 
 [![Website](https://img.shields.io/badge/extraheadroom.com-website-blue?style=for-the-badge)](https://extraheadroom.com)&nbsp;&nbsp;[![Download](https://img.shields.io/github/v/release/gglucass/headroom-desktop?label=Download&style=for-the-badge&color=000000)](https://github.com/gglucass/headroom-desktop/releases/latest)
 
-> **macOS:** 14 (Sonoma) or later on Apple Silicon (M1 or later)
+> **macOS:** 14 (Sonoma) or later, Apple Silicon or Intel (universal build)
 >
 > **Windows:** Windows 10 or later, x64
 >
@@ -23,7 +23,7 @@ brew install --cask headroom
 **Option B - manual download:**
 
 1. Go to the [latest release](https://github.com/gglucass/headroom-desktop/releases/latest)
-2. **macOS:** download the `.dmg` (for example `Headroom_0.8.9_mac.dmg`), open it, drag **Headroom** to Applications
+2. **macOS:** download the `.dmg` (for example `Headroom_0.9.3_mac.dmg`), open it, drag **Headroom** to Applications
 3. **Windows:** download and run the `_x64-setup.exe` installer
 4. **Linux:** download the `.AppImage` (has the built-in updater) or the `.deb` (same build, updates only by downloading a newer one)
 5. Launch Headroom - it appears in your menu bar / system tray and walks you through setup
@@ -91,7 +91,7 @@ Full disclosure of every location Headroom writes to, so you can decide before i
 
 **On install:**
 
-- Downloads a self-contained Python runtime (~2 GB) under `~/Library/Application Support/Headroom`. Your system Python is untouched.
+- Downloads a self-contained Python runtime (~3 GB on disk) under `~/Library/Application Support/Headroom`. Your system Python is untouched.
 - Adds a `PreToolUse` hook to `~/.claude/settings.json` and a script at `~/.claude/hooks/headroom-rtk-rewrite.sh` so Claude Code routes through Headroom. A timestamped backup of `settings.json` is written before any edit.
 - For Codex, adds a Headroom provider block to `~/.codex/config.toml` and an `OPENAI_BASE_URL` export to your managed shell block so the Codex CLI and desktop app route through the local proxy. The TOML block is fenced with `# >>> headroom:... >>>` markers, a backup is written before any edit, and existing Codex threads are retagged to the managed provider.
 - For OpenCode, points the anthropic and openai provider base URLs in OpenCode's config at the local proxy and installs a small transport plugin. A backup is written before any edit.
@@ -124,7 +124,7 @@ If the proxy dies unexpectedly, a watchdog restarts it; after repeated failures 
 
 ## Compression benchmarks
 
-Numbers from the [headroom](https://github.com/chopratejas/headroom) open-source library that powers the optimization pipeline, summarized from the current published benchmarks page.
+Numbers from the [headroom](https://github.com/headroomlabs-ai/headroom) open-source library that powers the optimization pipeline, summarized from the current published benchmarks page.
 
 ### Current benchmark summary
 
@@ -161,7 +161,7 @@ Numbers from the [headroom](https://github.com/chopratejas/headroom) open-source
 - **Text compression (LLMLingua) adds latency.** It requires a ~2 GB model download on first use and doesn't break even on fast models. Useful for cost reduction, not speed.
 - **Plain-text RAG results pass through.** Compression targets tool outputs and JSON; plain text in user messages is not compressed.
 
-Full methodology and reproducible benchmarks: [chopratejas/headroom benchmarks](https://chopratejas.github.io/headroom/benchmarks/) · [limitations](https://chopratejas.github.io/headroom/LIMITATIONS/)
+Full methodology and reproducible benchmarks: [headroom benchmarks](https://docs.headroomlabs.ai/docs/benchmarks) · [limitations](https://docs.headroomlabs.ai/docs/limitations)
 
 ## Interesting design decisions
 
@@ -191,7 +191,7 @@ See [`docs/macos-release.md`](docs/macos-release.md) for the full release setup.
 
 ### Branching and versioning
 
-Use `./scripts/bump-version.sh <version>` to update all four version files at once (`package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `Cargo.toml`). Accepts `X.Y.Z` or `X.Y.Z-rc.N` (leading `v` is stripped).
+Use `./scripts/bump-version.sh <version>` to update all five version files at once (`package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `Cargo.toml`, `Cargo.lock`). Accepts `X.Y.Z` or `X.Y.Z-rc.N` (leading `v` is stripped).
 
 Two release channels are wired into CI:
 
@@ -203,7 +203,7 @@ Work happens on `feature/*` branches, which merge into `staging` for testing. St
 **Release candidate flow:**
 
 1. Merge work from a feature branch into `staging`.
-2. Bump `package.json` + `src-tauri/tauri.conf.json` to `X.Y.Z-rc.N` (e.g. `0.2.44-rc.1`) and push. `.github/workflows/release-macos-staging.yml` publishes a versioned prerelease tag `vX.Y.Z-rc.N` and mirrors the artifacts to the rolling `staging` release.
+2. Bump `package.json` + `src-tauri/tauri.conf.json` to `X.Y.Z-rc.N` (e.g. `0.9.4-rc.1`) and push. `.github/workflows/release-macos-staging.yml` publishes a versioned prerelease tag `vX.Y.Z-rc.N` and mirrors the artifacts to the rolling `staging` release.
 3. The staging test machine auto-updates (it has both endpoints baked in and routes itself to the staging endpoint because its installed version has an `-rc` suffix).
 4. If something is wrong, bump to `rc.2` and push again. Repeat until the build is good.
 
@@ -263,7 +263,7 @@ cargo clean --manifest-path src-tauri/Cargo.toml
 
 Three constants in [`src-tauri/src/tool_manager.rs`](src-tauri/src/tool_manager.rs) control the pin:
 
-- `HEADROOM_PINNED_VERSION` - the version string (e.g. `"0.8.2"`). Must match the wheel URL.
+- `HEADROOM_PINNED_VERSION` - the version string (e.g. `"0.37.0"`). Must match the wheel URL.
 - `HEADROOM_PINNED_WHEEL_URL` - the exact PyPI wheel URL to download.
 - `HEADROOM_PINNED_SHA256` - the wheel's SHA-256, verified after download.
 

@@ -2121,6 +2121,9 @@ impl AppState {
                     ) | (
                         crate::models::ClaudePlanTier::Max20x,
                         crate::models::ClaudePlanTier::Max20x
+                    ) | (
+                        crate::models::ClaudePlanTier::Api,
+                        crate::models::ClaudePlanTier::Api
                     )
                 ) {
                     return;
@@ -2557,7 +2560,9 @@ impl AppState {
         // show. It renders in the drill-down as "Additional costs saved".
         let lifetime_estimated_savings_usd =
             lifetime_compression_savings_usd + lifetime_output_savings_usd;
-        warn_once_if_savings_rate_implausible(&daily_savings);
+        warn_once_if_savings_rate_implausible(&daily_savings, || {
+            self.tool_manager.installed_headroom_version()
+        });
         // Tokens stay input-only: the card is labelled "Total input tokens
         // saved", and this total also drives the milestone notifications, which
         // must not jump when a new savings layer starts reporting.
@@ -7842,15 +7847,26 @@ fn savings_rate_implausible(daily_savings: &[DailySavingsPoint]) -> Option<f64> 
 /// Warn-only canary, once per process: a contaminated rate silently corrected
 /// is worse than a loud one, so nothing is clamped -- the warn reaches Sentry
 /// through the log bridge and the numbers keep rendering as reported.
-fn warn_once_if_savings_rate_implausible(daily_savings: &[DailySavingsPoint]) {
+fn warn_once_if_savings_rate_implausible(
+    daily_savings: &[DailySavingsPoint],
+    installed_wheel: impl FnOnce() -> Option<String>,
+) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if WARNED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     if let Some(savings_per_m) = savings_rate_implausible(daily_savings) {
         WARNED.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The raw sums and wheel version make the event self-diagnosing: a
+        // legit expensive-model mix, a foreign backend on 6767, and real
+        // contamination are indistinguishable from the rate alone (RUST-89,
+        // 2026-09-01: $93.70/M on a 0.35.0-pinned install, undecidable).
+        let saved_usd: f64 = daily_savings.iter().map(|p| p.estimated_savings_usd).sum();
+        let saved_tokens: u64 = daily_savings.iter().map(|p| p.estimated_tokens_saved).sum();
+        let wheel = installed_wheel().unwrap_or_else(|| "unknown".into());
         log::warn!(
-            "savings rate implausible: buckets imply ${savings_per_m:.2}/M saved, above the \
+            "savings rate implausible: buckets imply ${savings_per_m:.2}/M saved (${saved_usd:.2} \
+             across {saved_tokens} tokens, wheel {wheel}), above the \
              ${MAX_PLAUSIBLE_INPUT_USD_PER_M:.2}/M ceiling for an input token; upstream savings \
              semantics likely changed under the pinned wheel"
         );

@@ -3937,12 +3937,17 @@ export default function App() {
       let latestConnectors = await fetchConnectors();
       applyConnectorsIfChanged(latestConnectors);
 
-      const step = nextAutoConfigureStep(
-        getLauncherAutoConfigureDecision(latestConnectors),
-        latestConnectors
-      );
+      const decision = getLauncherAutoConfigureDecision(latestConnectors);
+      const step = nextAutoConfigureStep(decision, latestConnectors);
 
       if (step.kind === "show_client_setup") {
+        // Landing here at launch means the probe found no installed client
+        // (decision "show_client_setup" is exactly installed.length === 0) --
+        // the biggest unexplained drop in the Windows funnel. Name it so the
+        // per-OS funnel can separate "no editor found" from "found but unused".
+        if (decision === "show_client_setup") {
+          reportFunnelStep("client_setup_no_clients_detected");
+        }
         setLauncherStage("client_setup");
         return;
       }
@@ -3956,7 +3961,6 @@ export default function App() {
         }
         latestConnectors = await fetchConnectors();
         applyConnectorsIfChanged(latestConnectors);
-        reportFunnelStep("client_setup_applied");
 
         const postApplyStep = nextAutoConfigureStepAfterApply(
           getLauncherAutoConfigureDecision(latestConnectors)

@@ -140,7 +140,7 @@ echo "zero-output claude 200s: $(grep -c 'PERF model=claude-[^ ]* .*tok_out=0 ' 
 echo "cache store refusals: $(grep -c 'response_cache_store_refused' "$L")"
 ```
 
-Expect: `empty-200 class` and `cache store refusals` `0` - non-zero is a hard FAIL. `zero-output claude 200s` should also be `0`, but a non-zero count is a tripwire, not yet a verdict: the PERF line carries no status, and an upstream error passed through produces the same shape (a session-start 429 logged `tok_out=0 ttfb_ms=0` on the 0.9.3-rc.5 pass). For each matching PERF line, find the `event=proxy_inbound_response ... path=/v1/messages status=` line at the same timestamp (its `duration_ms` tracks the PERF `total_ms`; the `hr_...` and `id=inbound-...` id namespaces never join, so the timestamp is the key). `status=200` there is the bug class and a hard FAIL; a 4xx/5xx is benign. `discards` may be non-zero on the current wheel pin: FAIL only if a reason other than `output_shaper` / `image_compression` / `structural_diff_vs_original` appears (a new transform joined the silent-discard set). Promote `discards` to "expect 0" at the wheel bump that lands upstream #3015, exactly as in the beta doc; the deeper poisoned-replay probe also lives there.
+Expect: `empty-200 class` and `cache store refusals` `0` - non-zero is a hard FAIL. `zero-output claude 200s` should also be `0`, but a non-zero count is a tripwire, not yet a verdict: the PERF line carries no status, and an upstream error passed through produces the same shape (a session-start 429 logged `tok_out=0 ttfb_ms=0` on the 0.9.3-rc.5 pass). For each matching PERF line, find the `event=proxy_inbound_response ... path=/v1/messages status=` line at the same timestamp (its `duration_ms` tracks the PERF `total_ms`; the `hr_...` and `id=inbound-...` id namespaces never join, so the timestamp is the key). `status=200` there is the bug class and a hard FAIL; a 4xx/5xx is benign. `discards` expects `0` since the 0.37.0 wheel (upstream #3015 landed with the 0.9.4 bump; verified 0 on the 0.9.4-rc.1 pass) - any non-zero count is a FAIL naming the regressed transform in `mutation_reasons`. The deeper poisoned-replay probe lives in the beta doc.
 
 ### 14. User state survived the upgrade
 
@@ -192,6 +192,30 @@ print('corrupt files:', sum(f.endswith('.corrupt') for f in os.listdir(S)))
 The script's snapshot-newer-than-binary guard applies to the **manual** snapshot only. The auto-snapshot in `config\pre-update\` is written on first launch of the new build, so it always postdates the install by construction - its validity check is `meta.json`'s versions, never its mtime.
 
 Expect: three `OK` lines and `corrupt files: 0`. Only `first_seen_at`, the two key sets, and the two activity-facts fields are compared - `paywall_first` (server-owned) and a `schemaVersion` tile reset may legitimately change. The snapshot dir survives across rcs, so check its mtimes first: if they predate the build you just replaced, say so in the report rather than claiming this rc preserved state.
+
+### 15. WinINET registry proxy override (RUST-AY / RUST-B3)
+
+Windows-only code path: a WinINET registry proxy with a scheme httpx cannot parse used to kill backend boot (exit 3 before opening 6768). The desktop now mirrors urllib's `ProxyServer` expansion - including CPython's backfill of missing http/https keys from a keyed `socks=` entry as `socks4://` (the RUST-B3 shape) - and overrides the child env. Three states; for each: quit Headroom, set the registry, relaunch, verify, then continue. Measurement rules learned the hard way on the 0.9.4-rc.1 pass:
+
+- The override line is written by the Rust app to `%LOCALAPPDATA%\Headroom\headroom-desktop.log` - NOT to `%LOCALAPPDATA%\Headroom\headroom\logs\` (those are the Python backend's logs).
+- Never probe with `Invoke-WebRequest`/`curl` while a registry proxy is set - they honor WinINET. Probe 6768 with a raw TCP connect via the bundled Python. 6767 is the intercept and answers even with the backend dead.
+- Expect the 6768 listener to be `runtime\python\python.exe` (the venv `Scripts` launcher spawns the base interpreter) - identity-verify against that path before killing anything.
+
+```powershell
+reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings' /v ProxyEnable /t REG_DWORD /d 1 /f
+# State A: reg add ... /v ProxyServer /t REG_SZ /d "socks4://127.0.0.1:10808" /f   -> boots, override line (NO_PROXY)
+# State B: reg add ... /v ProxyServer /t REG_SZ /d "http=127.0.0.1:8888;socks=127.0.0.1:1080" /f   -> boots, override line (http_proxy). Boot only - the http address is fake.
+# State C: reg add ... /v ProxyServer /t REG_SZ /d "socks=127.0.0.1:1080" /f   -> boots, override line (NO_PROXY)
+```
+
+Expect per state: backend accepting on 6768 within 90s and the log line `WinINET registry proxy carries a scheme httpx cannot parse; overriding N child proxy env var(s)` in the tail written since relaunch. MANDATORY cleanup, even on failure - the box must not keep a bogus system proxy:
+
+```powershell
+reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings' /v ProxyEnable /t REG_DWORD /d 0 /f
+reg delete 'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings' /v ProxyServer /f
+```
+
+Then relaunch once more and prove the end state with `reg query` on both values.
 
 ## Codex checks (Codex pass)
 
