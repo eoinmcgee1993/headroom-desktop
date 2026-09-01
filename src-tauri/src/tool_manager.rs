@@ -3727,6 +3727,7 @@ impl ToolManager {
     {
         let requirements_lock = bootstrap_requirements_lock();
         let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
+        let dep_total = requirements_lock_package_count(requirements_lock);
 
         progress(BootstrapStepUpdate {
             step: "Repairing dependencies",
@@ -3759,9 +3760,14 @@ impl ToolManager {
             ],
             &self.runtime.root_dir,
             |line| {
-                if let Some(update) =
-                    pip_line_to_progress(line, deps_start.elapsed(), &mut dep_counter, 40, 82)
-                {
+                if let Some(update) = pip_line_to_progress(
+                    line,
+                    deps_start.elapsed(),
+                    &mut dep_counter,
+                    40,
+                    82,
+                    dep_total,
+                ) {
                     if let Ok(mut cb) = progress_ref.try_borrow_mut() {
                         (cb)(BootstrapStepUpdate {
                             step: "Repairing dependencies",
@@ -4271,6 +4277,7 @@ impl ToolManager {
     {
         let requirements_lock = bootstrap_requirements_lock();
         let lock_path = self.write_headroom_requirements_lock(requirements_lock)?;
+        let dep_total = requirements_lock_package_count(requirements_lock);
         let wheel_path = self.wheel_download_path(&release.wheel_url);
 
         progress(BootstrapStepUpdate {
@@ -4293,9 +4300,7 @@ impl ToolManager {
                     ));
                 }
                 Err(download_err) => {
-                    log::warn!(
-                    "headroom wheel download failed (will fall back to pip index): {download_err}"
-                );
+                    report_wheel_download_fallback(&release.wheel_url, &download_err);
                     false
                 }
             };
@@ -4340,9 +4345,14 @@ impl ToolManager {
                 if let Some(cap) = pip_capture {
                     cap.borrow_mut().push(line);
                 }
-                if let Some(update) =
-                    pip_line_to_progress(line, deps_start.elapsed(), &mut dep_counter, 55, 80)
-                {
+                if let Some(update) = pip_line_to_progress(
+                    line,
+                    deps_start.elapsed(),
+                    &mut dep_counter,
+                    55,
+                    80,
+                    dep_total,
+                ) {
                     if let Ok(mut cb) = deps_progress_ref.try_borrow_mut() {
                         (cb)(update);
                     }
@@ -5239,6 +5249,7 @@ impl ToolManager {
             });
 
             let requirements_lock = bootstrap_requirements_lock();
+            let dep_total = requirements_lock_package_count(requirements_lock);
             let lock_path = match self.write_headroom_requirements_lock(requirements_lock) {
                 Ok(p) => p,
                 Err(err) => {
@@ -5275,9 +5286,14 @@ impl ToolManager {
                 &self.runtime.root_dir,
                 |line| {
                     pip_capture.borrow_mut().push(line);
-                    if let Some(update) =
-                        pip_line_to_progress(line, deps_start.elapsed(), &mut dep_counter, 15, 55)
-                    {
+                    if let Some(update) = pip_line_to_progress(
+                        line,
+                        deps_start.elapsed(),
+                        &mut dep_counter,
+                        15,
+                        55,
+                        dep_total,
+                    ) {
                         if let Ok(mut cb) = deps_progress_ref.try_borrow_mut() {
                             (cb)(update);
                         }
@@ -5318,9 +5334,7 @@ impl ToolManager {
                 };
                 }
                 Err(download_err) => {
-                    log::warn!(
-                    "headroom wheel download failed (will fall back to pip index): {download_err}"
-                );
+                    report_wheel_download_fallback(&release.wheel_url, &download_err);
                     false
                 }
             };
@@ -9917,49 +9931,119 @@ fn run_pip_install_with_retries(python: &Path, args: &[&str], cwd: &Path) -> Res
     run_pip_install_with_retries_streaming(python, args, cwd, |_| {})
 }
 
+/// Number of requirement lines in a lock, i.e. how many packages pip will
+/// resolve. `requirements_lock_sha` already defines what counts as a
+/// requirement line (non-blank, non-comment); this is the same rule, so the
+/// two can never disagree about the file's contents.
+fn requirements_lock_package_count(lock: &str) -> u32 {
+    lock.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
 /// Translate a pip stdout/stderr line into a progress update, or None for
-/// noise. Counter-based monotonic advance inside `[base_percent, max_percent-1]`:
-/// we don't know the final dep count up-front, so each interesting line nudges
-/// the bar forward and it saturates just below the parent step's ceiling.
+/// noise. Monotonic advance inside `[base_percent, max_percent-1]`.
+///
+/// `total_packages` is the requirement count from the lock we handed pip, so
+/// the bar and the ETA track real progress. Pass 0 when it isn't known and the
+/// old counter heuristic applies: each interesting line nudges the bar forward
+/// and it saturates just below the parent step's ceiling.
+///
+/// Both numbers used to be fictional, and on a slow link that read as a hang.
+/// `remaining` was `90 - elapsed`, floored at 5, so past 90 seconds the UI said
+/// "5 seconds left" forever; the percent saturated at `max_percent - 1` after
+/// `span` lines, which ~170 packages cross in the first minute. The Windows
+/// host in RUST-9Y was pulling torch and opencv at ~60 kB/s -- hours of install
+/// behind a bar frozen at 79% claiming it was finishing up -- and quit. The
+/// funnel calls that `bootstrap_abandoned`; the user was told the wrong thing.
 fn pip_line_to_progress(
     line: &str,
     elapsed: Duration,
     counter: &mut u32,
     base_percent: u8,
     max_percent: u8,
+    total_packages: u32,
 ) -> Option<BootstrapStepUpdate> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let message = if let Some(rest) = trimmed.strip_prefix("Collecting ") {
+    // `resolved` marks the lines that mean every package has been fetched, so
+    // the fraction can jump to 1.0 instead of extrapolating a download rate
+    // through a phase that no longer downloads anything.
+    let (message, collected, resolved) = if let Some(rest) = trimmed.strip_prefix("Collecting ") {
         let spec = rest.split_whitespace().next().unwrap_or(rest);
         let pkg = spec
             .split(|c: char| matches!(c, '=' | '<' | '>' | '!' | '~' | ';' | '['))
             .next()
             .unwrap_or(spec);
-        format!("Fetching {}...", pkg)
+        (format!("Fetching {}...", pkg), true, false)
     } else if let Some(rest) = trimmed.strip_prefix("Downloading ") {
         let file = rest.split_whitespace().next().unwrap_or(rest);
         let name = file.rsplit('/').next().unwrap_or(file);
         let pkg = name.split('-').next().unwrap_or(name);
-        format!("Downloading {}...", pkg)
+        (format!("Downloading {}...", pkg), false, false)
     } else if trimmed.starts_with("Installing collected packages") {
-        "Installing packages...".to_string()
+        ("Installing packages...".to_string(), false, true)
     } else if let Some(rest) = trimmed.strip_prefix("Successfully installed ") {
         let count = rest.split_whitespace().count();
-        format!("Installed {} packages.", count)
+        (format!("Installed {} packages.", count), false, true)
     } else {
         return None;
     };
 
-    *counter = counter.saturating_add(1);
+    // Counts packages, not lines: pip prints a `Collecting` and a `Downloading`
+    // for each one, and counting both made the bar move at twice the true rate.
+    if collected {
+        *counter = counter.saturating_add(1);
+    }
     let span = max_percent.saturating_sub(base_percent).max(1) as u32;
-    let advance = (*counter).min(span.saturating_sub(1));
+
+    // Fraction of the dependency set pip has reached. Transitive deps that are
+    // not in our lock (pip resolves those too) can push the count past the
+    // total, hence the clamp.
+    let fraction = if resolved {
+        1.0
+    } else if total_packages > 0 {
+        (f64::from(*counter) / f64::from(total_packages)).clamp(0.0, 1.0)
+    } else {
+        // Unknown total: the old counter heuristic, which saturates just below
+        // the ceiling once enough packages have gone by.
+        f64::from((*counter).min(span.saturating_sub(1))) / f64::from(span.max(1))
+    };
+
+    let advance = (f64::from(span) * fraction) as u32;
     let percent = (base_percent as u32 + advance).min(max_percent as u32 - 1) as u8;
 
-    let remaining = 90_u64.saturating_sub(elapsed.as_secs()).max(5);
+    // Extrapolate from the rate this machine is actually achieving. A host on a
+    // 60 kB/s link gets an ETA in the hours, which is the truth and reads as
+    // "slow", where the old fixed 90-second budget read as "hung". Needs a real
+    // sample first: the first few packages land before any large wheel and
+    // would project absurdly low.
+    const INITIAL_ETA_SECS: u64 = 90;
+    const MIN_SAMPLE_SECS: u64 = 10;
+    const MIN_SAMPLE_FRACTION: f64 = 0.02;
+    // A whole day, so a genuinely stalled transfer still produces a finite
+    // number rather than saturating into nonsense.
+    const MAX_ETA_SECS: u64 = 24 * 3600;
+    let elapsed_secs = elapsed.as_secs();
+    let remaining = if resolved {
+        // Unpack and install of what is already on disk. Short and roughly
+        // machine-independent next to the download it follows.
+        15
+    } else if elapsed_secs >= MIN_SAMPLE_SECS && fraction >= MIN_SAMPLE_FRACTION {
+        let projected_total = elapsed.as_secs_f64() / fraction;
+        (projected_total - elapsed.as_secs_f64()).clamp(5.0, MAX_ETA_SECS as f64) as u64
+    } else {
+        // Too early to measure. Never floor at a near-zero value the way the
+        // old `.max(5)` did once the budget ran out -- that is what turned a
+        // slow install into an apparently finished one.
+        INITIAL_ETA_SECS.saturating_sub(elapsed_secs).max(30)
+    };
     Some(BootstrapStepUpdate {
         step: "Updating dependencies",
         message,
@@ -10160,6 +10244,102 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
     } else {
         "other"
     }
+}
+
+/// Cause class for a direct-wheel download that fell back to the pip index.
+///
+/// The failure's top context is `downloading <url>`, and that URL carries the
+/// wheel version, the platform tag and PyPI's content hash -- so a
+/// message-grouped report opens a NEW issue on every wheel bump and a separate
+/// one per platform for one underlying condition (RUST-22, reopened at 0.37.0
+/// after the same fallback was already triaged at earlier pins). The cause
+/// class is what triage acts on: a proxy blocking files.pythonhosted.org is a
+/// different problem from a 30-minute transfer timeout on a slow link, and
+/// neither changes when the pin does.
+fn wheel_download_failure_category(detail: &str) -> &'static str {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("operation timed out") || lower.contains("timed out") {
+        "timeout"
+    } else if let Some(code) = http_status_code_in(&lower) {
+        // A status the CDN actually answered with: 403 is a corporate proxy
+        // or a geo block, 404 a pin whose wheel PyPI never published. Keep
+        // them apart -- only one of the two is ours to fix.
+        match code {
+            403 => "http-403",
+            404 => "http-404",
+            _ => "http-other",
+        }
+    } else if lower.contains("dns error")
+        || lower.contains("failed to lookup address")
+        || lower.contains("nodename nor servname")
+    {
+        "dns"
+    } else if lower.contains("certificate")
+        || lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("self-signed")
+    {
+        // A TLS-terminating corporate proxy without its CA in our trust store.
+        "tls"
+    } else if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("error sending request")
+        || lower.contains("channel closed")
+    {
+        "connection"
+    } else if crate::is_disk_full_signal(&lower) {
+        "disk-full"
+    } else if lower.contains("permission denied") || lower.contains("access is denied") {
+        "permission"
+    } else {
+        "other"
+    }
+}
+
+/// First HTTP status code in a reqwest `error_for_status` message, which
+/// renders as `HTTP status client error (403 Forbidden) for url (...)`.
+fn http_status_code_in(lower: &str) -> Option<u16> {
+    let idx = lower.find("http status")?;
+    lower[idx..]
+        .split(|c: char| !c.is_ascii_digit())
+        .find(|tok| tok.len() == 3)
+        .and_then(|tok| tok.parse::<u16>().ok())
+}
+
+/// Report a direct-wheel download that fell back to the pip index.
+///
+/// Warning, not Error: the fallback install that follows normally succeeds, so
+/// this is a degraded path rather than a broken one. It still reports, because
+/// a category that shows up fleet-wide (a blocked CDN, an expired cert) is the
+/// early signal that the *next* release's bootstrap will fail outright.
+fn report_wheel_download_fallback(url: &str, err: &anyhow::Error) {
+    let detail = format!("{err:#}");
+    let category = wheel_download_failure_category(&detail);
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("wheel_download_failure", category);
+            scope.set_extra("wheel_url", url.to_string().into());
+            scope.set_extra(
+                "detail",
+                detail.chars().take(2000).collect::<String>().into(),
+            );
+            scope.set_fingerprint(Some(["wheel-download-fallback", category].as_slice()));
+        },
+        || {
+            sentry::capture_message(
+                &format!(
+                    "headroom wheel download failed ({category}); falling back to the pip index"
+                ),
+                sentry::Level::Warning,
+            );
+        },
+    );
+    // Local only: the fingerprinted capture above is the Sentry path, and the
+    // bridged warn would re-open the URL-grouped issue this replaced. The full
+    // URL and error chain stay in the file log, where triage can still read
+    // them per-machine.
+    log::warn!("headroom wheel download failed (will fall back to pip index): {detail}");
 }
 
 /// Cause class for a partial plugin install, so each shape gets its own Sentry
@@ -10675,18 +10855,18 @@ mod tests {
         looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
         parse_netstat_listener, parse_pid_from_lsof_detail, parse_ss_listener,
         parse_tasklist_image, path_with_binary_dir, pending_addon_update, pinned_headroom_release,
-        pip_failure_category, plugin_install_failure_category, pre_upstream_concurrency,
-        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        pip_failure_category, pip_line_to_progress, plugin_install_failure_category,
+        pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
         purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
         receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
-        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture,
-        PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PLUGIN_ADDONS,
-        PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
+        requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_unowned_port,
+        sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
+        wait_for_port_free, wheel_download_failure_category, CommandFailure, HeadroomRelease,
+        ManagedRuntime, PipOutputCapture, PortState, ToolManager, UpgradeOutcome,
+        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
+        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
+        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -11484,6 +11664,158 @@ mod tests {
             .context("configuring Headroom MCP integration")
             .unwrap_err();
         assert!(looks_like_corrupt_venv_error(&wrapped));
+    }
+
+    #[test]
+    fn requirements_lock_package_count_counts_only_requirement_lines() {
+        let lock =
+            "# header\n\nabsl-py==2.4.0\n# inline note\naiohttp==3.13.5\n  \ntorch==2.12.1\n";
+        assert_eq!(requirements_lock_package_count(lock), 3);
+        // Same rule as requirements_lock_sha, so the two never disagree about
+        // what a requirement line is.
+        assert_eq!(requirements_lock_package_count(""), 0);
+        assert_eq!(requirements_lock_package_count("# only comments\n\n"), 0);
+        // The shipped locks must produce a usable total; a zero here silently
+        // reverts pip progress to the old counter heuristic.
+        for lock in [
+            HEADROOM_REQUIREMENTS_LOCK,
+            HEADROOM_LINUX_REQUIREMENTS_LOCK,
+            HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        ] {
+            assert!(requirements_lock_package_count(lock) > 10);
+        }
+    }
+
+    #[test]
+    fn pip_progress_eta_tracks_a_slow_link_instead_of_claiming_five_seconds() {
+        // RUST-9Y: 168 packages over a ~60 kB/s link. Ten minutes in, a tenth
+        // of the way through, the old code said "5 seconds" and pinned the bar
+        // just under the ceiling. Both numbers now follow the real rate.
+        let mut counter = 0u32;
+        let total = 168;
+        let mut last = None;
+        for _ in 0..17 {
+            last = pip_line_to_progress(
+                "Collecting torch==2.12.1",
+                Duration::from_secs(600),
+                &mut counter,
+                55,
+                80,
+                total,
+            );
+        }
+        let update = last.expect("Collecting is a progress line");
+        // ~10% done in 600s projects ~90 minutes remaining, not 5 seconds.
+        assert!(
+            update.eta_seconds > 3000 && update.eta_seconds < 7200,
+            "eta was {}",
+            update.eta_seconds
+        );
+        // And the bar reflects the tenth actually done, not the ceiling.
+        assert!(
+            (56..=60).contains(&update.percent),
+            "percent was {}",
+            update.percent
+        );
+    }
+
+    #[test]
+    fn pip_progress_never_reports_a_near_zero_eta_before_it_can_measure() {
+        // The old floor was `.max(5)`, which is what made an install that had
+        // outrun its 90s budget look finished.
+        let mut counter = 0u32;
+        let update = pip_line_to_progress(
+            "Collecting absl-py==2.4.0",
+            Duration::from_secs(300),
+            &mut counter,
+            55,
+            80,
+            0,
+        )
+        .expect("Collecting is a progress line");
+        assert!(update.eta_seconds >= 30, "eta was {}", update.eta_seconds);
+    }
+
+    #[test]
+    fn pip_progress_counts_packages_not_lines() {
+        // pip prints Collecting AND Downloading per package; counting both
+        // advanced the bar at twice the true rate.
+        let mut counter = 0u32;
+        let elapsed = Duration::from_secs(60);
+        pip_line_to_progress(
+            "Collecting torch==2.12.1",
+            elapsed,
+            &mut counter,
+            55,
+            80,
+            100,
+        );
+        pip_line_to_progress(
+            "Downloading torch-2.12.1-cp312-cp312-win_amd64.whl (31 kB)",
+            elapsed,
+            &mut counter,
+            55,
+            80,
+            100,
+        );
+        assert_eq!(counter, 1);
+    }
+
+    #[test]
+    fn pip_progress_resolves_to_the_ceiling_once_downloads_are_done() {
+        let mut counter = 0u32;
+        let update = pip_line_to_progress(
+            "Installing collected packages: absl-py, aiohttp",
+            Duration::from_secs(4000),
+            &mut counter,
+            55,
+            80,
+            168,
+        )
+        .expect("Installing is a progress line");
+        assert_eq!(update.percent, 79);
+        // No more downloading, so the download rate must not be extrapolated
+        // into a multi-hour estimate for an unpack.
+        assert!(update.eta_seconds <= 60, "eta was {}", update.eta_seconds);
+    }
+
+    #[test]
+    fn wheel_download_failure_category_splits_causes_not_urls() {
+        // RUST-22: one condition, a new Sentry issue per wheel version and
+        // platform, because the URL was the message.
+        let cases = [
+            ("downloading https://files.pythonhosted.org/a.whl: operation timed out", "timeout"),
+            (
+                "downloading https://files.pythonhosted.org/a.whl: HTTP status client error (403 Forbidden) for url (https://files.pythonhosted.org/a.whl)",
+                "http-403",
+            ),
+            (
+                "downloading https://files.pythonhosted.org/a.whl: HTTP status client error (404 Not Found) for url (https://files.pythonhosted.org/a.whl)",
+                "http-404",
+            ),
+            ("downloading https://x/a.whl: dns error: failed to lookup address information", "dns"),
+            ("downloading https://x/a.whl: invalid peer certificate: UnknownIssuer", "tls"),
+            ("downloading https://x/a.whl: error sending request", "connection"),
+            ("writing /tmp/a.partial: Permission denied (os error 13)", "permission"),
+            ("downloading https://x/a.whl: something new", "other"),
+        ];
+        for (detail, expected) in cases {
+            assert_eq!(
+                wheel_download_failure_category(detail),
+                expected,
+                "for: {detail}"
+            );
+        }
+        // Two different pins of the same platform wheel must land on one
+        // category -- that is the whole point.
+        assert_eq!(
+            wheel_download_failure_category(
+                "downloading https://files.pythonhosted.org/47/21/headroom_ai-0.37.0-cp310-abi3-macosx_11_0_arm64.whl: operation timed out"
+            ),
+            wheel_download_failure_category(
+                "downloading https://files.pythonhosted.org/99/aa/headroom_ai-0.38.0-cp310-abi3-win_amd64.whl: operation timed out"
+            )
+        );
     }
 
     #[test]

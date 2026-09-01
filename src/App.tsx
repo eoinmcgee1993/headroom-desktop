@@ -1789,6 +1789,12 @@ export default function App() {
   const [stepSignature, setStepSignature] = useState("");
   const [stepStartedAtMs, setStepStartedAtMs] = useState<number | null>(null);
   const [stepEtaSeedSeconds, setStepEtaSeedSeconds] = useState(0);
+  // When the current ETA seed arrived. The backend re-estimates the dependency
+  // install continuously, so its ETA is time-remaining-from-that-update, not a
+  // budget measured from the start of the step -- counting it from
+  // stepStartedAtMs double-charged the elapsed time and pinned a long install
+  // at "finishing up" (RUST-9Y).
+  const [stepEtaSeedAtMs, setStepEtaSeedAtMs] = useState<number | null>(null);
   const [stepBasePercent, setStepBasePercent] = useState(0);
   const [chartResetSignal, setChartResetSignal] = useState(0);
   const [chartMode, setChartMode] = useState<SavingsChartMode>("usd");
@@ -2572,14 +2578,17 @@ export default function App() {
     }
 
     const signature = `${bootstrapProgress.currentStep}|${bootstrapProgress.running}|${bootstrapProgress.complete}|${bootstrapProgress.failed}`;
-    if (signature === stepSignature) {
-      return;
+    if (signature !== stepSignature) {
+      setStepSignature(signature);
+      setStepStartedAtMs(Date.now());
+      setStepBasePercent(bootstrapProgress.overallPercent);
     }
-
-    setStepSignature(signature);
-    setStepStartedAtMs(Date.now());
+    // Re-anchor on every new estimate, step change or not. "Updating
+    // dependencies" is one step for the whole install, so without this the
+    // seed froze at the first frame's 90s and every later, truthful estimate
+    // was discarded -- which is what a slow link saw as a hang.
     setStepEtaSeedSeconds(bootstrapProgress.currentStepEtaSeconds);
-    setStepBasePercent(bootstrapProgress.overallPercent);
+    setStepEtaSeedAtMs(Date.now());
   }, [bootstrapProgress, showInstallProgress, stepSignature]);
 
   // Reaching the final screen IS the end of onboarding, so satisfy the tray's
@@ -3546,7 +3555,12 @@ export default function App() {
       return 0;
     }
 
-    const elapsedSeconds = Math.max(0, (Date.now() - stepStartedAtMs) / 1000);
+    // Measured from the latest estimate, not from the start of the step: the
+    // backend's number is time remaining as of that update (see
+    // stepEtaSeedAtMs). Falling back to the step start keeps the old behaviour
+    // for steps that only ever report one, static ETA.
+    const anchorMs = stepEtaSeedAtMs ?? stepStartedAtMs;
+    const elapsedSeconds = Math.max(0, (Date.now() - anchorMs) / 1000);
     const eta = Math.max(8, stepEtaSeedSeconds || progress.currentStepEtaSeconds || 20);
     const linear = Math.min(0.96, elapsedSeconds / eta);
 
@@ -3580,8 +3594,9 @@ export default function App() {
       return "ETA: unavailable";
     }
 
-    const elapsedSeconds = stepStartedAtMs
-      ? Math.max(0, Math.round((Date.now() - stepStartedAtMs) / 1000))
+    const anchorMs = stepEtaSeedAtMs ?? stepStartedAtMs;
+    const elapsedSeconds = anchorMs
+      ? Math.max(0, Math.round((Date.now() - anchorMs) / 1000))
       : 0;
     const baselineEta = Math.max(stepEtaSeedSeconds, seconds);
     const remainingSeconds = Math.max(0, baselineEta - elapsedSeconds);
@@ -3597,6 +3612,12 @@ export default function App() {
     }
     const mins = Math.floor(remainingSeconds / 60);
     const secs = remainingSeconds % 60;
+    // Past an hour the seconds are noise and the minutes read as a wall of
+    // digits. A slow link legitimately lands here, and "1h 20m" is the number
+    // that stops someone concluding the install is wedged and quitting.
+    if (mins >= 60) {
+      return `ETA: ${Math.floor(mins / 60)}h ${mins % 60}m`;
+    }
     return `ETA: ${mins}m ${secs}s`;
   }
 
