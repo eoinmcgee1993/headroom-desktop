@@ -199,7 +199,7 @@ It:
 
 - runs on manual dispatch
 - also runs automatically when a version bump to `package.json` / `src-tauri/tauri.conf.json` is pushed to `main`
-- builds the Apple Silicon (`aarch64-apple-darwin`) release bundle
+- builds the universal macOS (`universal-apple-darwin`, Apple Silicon + Intel) release bundle
 - signs and notarizes the app
 - uploads updater artifacts and `latest.json` to the GitHub Release
 

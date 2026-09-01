@@ -257,7 +257,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports six fixes owed upstream (remove each once a wheel ships it),
+Also ports seven fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -315,6 +315,22 @@ bailout (a heredoc body may contain ; or &&), and delegates each
 segment's program parsing to the original function so wrapper peeling,
 bash -c recursion and the lockfile carve-out stay upstream's. Kill
 switch: HEADROOM_READ_CHAIN_GUARD=0.
+Prefix-replay inflation-skip guard (upstream issue #3379): since the
+0.36.x non-inflation bound (#3052), overlay_cached_prefix declines to
+replay the previously-forwarded prefix whenever background compression
+lands a SMALLER form of already-forwarded history, so the forwarded
+bytes change mid-conversation and the provider prompt cache busts from
+the first changed byte -- measured 2026-09-01 as a 160-210k-token cache
+re-write every 1-2 requests, dollar cache-hit rate 90% -> 52%, billable
+input $/M up 2.2x, across the 0.35.0 -> 0.37.0 wheel swap. The guard
+neuters only the size bound (every alignment guard stays) by stubbing
+_compact_json_bytes for the duration of each overlay call, restoring
+0.35.0's byte-identical replay. The desktop backend serves proxy-mode
+traffic only, whose snapshots refresh from every provider response, so
+byte-identical replay is always the cheaper request here. Gated on the
+runtime NOT having the fix's enforce_non_inflation parameter, so the
+first wheel that ships it keeps its per-caller split and this block
+goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
 cc-switch Official-branch upstream reset (upstream PR #3166): the
 reconciler captures the third-party endpoint cc-switch selected (Kimi,
 DeepSeek, GLM) as this proxy's Anthropic upstream, but switching back to
@@ -879,6 +895,43 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 )
 
             _hd_rc_cr._is_read_command = _hd_rc_is_read
+    except Exception:
+        pass
+
+    # Prefix-replay inflation-skip guard (upstream issue #3379; remove once a
+    # wheel ships the fix -- see the module docstring for the cache-bust loop
+    # this prevents). overlay_cached_prefix's size bound reads
+    # _compact_json_bytes via module globals at call time; stubbing it to
+    # return equal-length bytes for both candidates makes the
+    # len(replayed) > len(optimized) comparison always false, so the replay
+    # proceeds while every alignment/append-only guard still runs. Swap and
+    # restore around each call so any other caller of the helper stays
+    # honest; overlay is synchronous on the proxy's single event loop, so the
+    # swap cannot interleave with another request's overlay. Gated on the
+    # runtime NOT having the fix's enforce_non_inflation parameter, so the
+    # first wheel that ships it keeps its proper per-caller split and this
+    # block goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_PREFIX_REPLAY_GUARD", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import headroom.cache.prefix_tracker as _hd_pr_pt
+
+            if hasattr(_hd_pr_pt, "_compact_json_bytes") and (
+                "enforce_non_inflation"
+                not in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames
+            ):
+                _hd_pr_orig_overlay = _hd_pr_pt.overlay_cached_prefix
+
+                def _hd_pr_overlay(*args, **kwargs):
+                    _hd_pr_saved = _hd_pr_pt._compact_json_bytes
+                    _hd_pr_pt._compact_json_bytes = lambda value: b""
+                    try:
+                        return _hd_pr_orig_overlay(*args, **kwargs)
+                    finally:
+                        _hd_pr_pt._compact_json_bytes = _hd_pr_saved
+
+                _hd_pr_pt.overlay_cached_prefix = _hd_pr_overlay
     except Exception:
         pass
 
@@ -9591,12 +9644,15 @@ fn reg_dword_is_set(value: &str) -> bool {
 }
 
 /// urllib's `getproxies_registry` expansion of the `ProxyServer` string,
-/// restricted to the keys httpx mounts (http/https -- keyed socks entries
-/// never reach httpx and are harmless). A value without `=` applies to every
-/// protocol; `proto=addr` pairs are per-protocol; an address without a scheme
-/// inherits its protocol name as the scheme. Returns None when no override is
-/// needed (nothing mounted, or every mounted entry parses), otherwise the env
-/// vars to set on the child.
+/// restricted to the keys httpx mounts (http/https). A value without `=`
+/// applies to every protocol; `proto=addr` pairs are per-protocol; an address
+/// without a scheme inherits its protocol name as the scheme. A keyed
+/// `socks=` entry is NOT harmless: CPython backfills missing http/https keys
+/// with `socks4://addr` ("the default SOCKS proxy type of Windows is SOCKS4",
+/// urllib/request.py getproxies_registry) -- the RUST-B3 crash was exactly
+/// that backfill reaching httpx via the https mount. Returns None when no
+/// override is needed (nothing mounted, or every mounted entry parses),
+/// otherwise the env vars to set on the child.
 fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, String)>> {
     let server = proxy_server.trim();
     if server.is_empty() {
@@ -9608,12 +9664,13 @@ fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, Strin
         format!("http={server};https={server}")
     };
     let mut mounted: Vec<(String, String)> = Vec::new();
+    let mut socks_url: Option<String> = None;
     for pair in expanded.split(';') {
         let Some((proto, addr)) = pair.split_once('=') else {
             continue;
         };
         let proto = proto.trim().to_ascii_lowercase();
-        if proto != "http" && proto != "https" {
+        if proto != "http" && proto != "https" && proto != "socks" {
             continue;
         }
         let addr = addr.trim();
@@ -9630,7 +9687,26 @@ fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, Strin
         } else {
             format!("{proto}://{addr}")
         };
-        mounted.push((proto, url));
+        if proto == "socks" {
+            // urllib's backfill rewrites a bare `socks://` to `socks4://`;
+            // an explicit scheme (e.g. socks5://) is kept as-is.
+            socks_url = Some(match url.strip_prefix("socks://") {
+                Some(rest) => format!("socks4://{rest}"),
+                None => url,
+            });
+        } else {
+            mounted.push((proto, url));
+        }
+    }
+    // CPython: `proxies['http'] = proxies.get('http') or socks_address` (same
+    // for https), so the socks entry becomes the mount wherever no explicit
+    // http/https pair exists.
+    if let Some(socks) = socks_url {
+        for proto in ["http", "https"] {
+            if !mounted.iter().any(|(p, _)| p == proto) {
+                mounted.push((proto.to_string(), socks.clone()));
+            }
+        }
     }
     if mounted.iter().all(|(_, url)| httpx_supports_proxy_url(url)) {
         return None;
@@ -10886,6 +10962,26 @@ mod tests {
         // rebind covers both in-module call sites via module globals.
         assert!(py.contains("_hd_rc_orig(first)"));
         assert!(py.contains("_hd_rc_cr._is_read_command = _hd_rc_is_read"));
+    }
+
+    #[test]
+    fn sitecustomize_ports_prefix_replay_guard() {
+        // Upstream issue #3379: the 0.36.x non-inflation bound declines the
+        // cached-prefix replay exactly when background compression shrinks
+        // already-forwarded history, busting the provider prompt cache every
+        // time kompress lands. The guard stubs the sizing helper per call so
+        // the bound never fires, and goes inert once a wheel ships the
+        // enforce_non_inflation parameter.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_PREFIX_REPLAY_GUARD"));
+        assert!(py.contains("upstream issue #3379"));
+        // Gated on the fix's parameter being ABSENT, so a fixed wheel keeps
+        // its per-caller split.
+        assert!(py.contains("not in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames"));
+        // Swap-and-restore of the sizing helper, never a permanent stub.
+        assert!(py.contains(r#"_hd_pr_pt._compact_json_bytes = lambda value: b"""#));
+        assert!(py.contains("_hd_pr_pt._compact_json_bytes = _hd_pr_saved"));
+        assert!(py.contains("_hd_pr_pt.overlay_cached_prefix = _hd_pr_overlay"));
     }
 
     #[test]
@@ -13316,13 +13412,43 @@ after
             super::registry_proxy_env_overrides("http=1.2.3.4:8080;https=1.2.3.4:8080"),
             None
         );
-        // Keyed socks entries never reach httpx's mounts.
+        // A keyed socks entry with an explicit httpx-supported scheme is kept
+        // verbatim by urllib's backfill, so both mounts parse: no override.
         assert_eq!(
-            super::registry_proxy_env_overrides("http=1.2.3.4:8080;socks=127.0.0.1:10808"),
+            super::registry_proxy_env_overrides("socks=socks5://127.0.0.1:1080"),
             None
         );
         assert_eq!(super::registry_proxy_env_overrides(""), None);
         assert_eq!(super::registry_proxy_env_overrides("   "), None);
+    }
+
+    /// RUST-B3: CPython backfills missing http/https keys from a keyed
+    /// `socks=` entry as `socks4://addr`, so `http=...;socks=...` mounts
+    /// socks4 on https and crashed the backend despite RUST-AY. The usable
+    /// http half survives as an explicit env var.
+    #[test]
+    fn registry_keyed_socks_backfills_and_overrides() {
+        assert_eq!(
+            super::registry_proxy_env_overrides("http=1.2.3.4:8080;socks=127.0.0.1:1080"),
+            Some(vec![(
+                "http_proxy".to_string(),
+                "http://1.2.3.4:8080".to_string()
+            )])
+        );
+        // socks alone backfills BOTH mounts with socks4: nothing usable.
+        assert_eq!(
+            super::registry_proxy_env_overrides("socks=127.0.0.1:1080"),
+            Some(vec![("NO_PROXY".to_string(), "*".to_string())])
+        );
+        // Explicit http/https pairs win over the backfill (CPython uses
+        // `proxies.get(proto) or socks`), so a fully-specified config with a
+        // stray socks entry keeps its usable halves.
+        assert_eq!(
+            super::registry_proxy_env_overrides(
+                "http=1.2.3.4:8080;https=1.2.3.4:8080;socks=127.0.0.1:1080"
+            ),
+            None
+        );
     }
 
     /// A corporate box with a usable http proxy next to a broken socks4

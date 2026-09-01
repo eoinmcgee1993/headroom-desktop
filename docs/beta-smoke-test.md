@@ -161,19 +161,15 @@ grep -c 'ccr_streaming_retrieve_buffered[^ ]* source=passthrough' \
 ```
 Expect: `0`. Anything above zero means a streaming CCR request forwarded `stream:true` bytes on a buffered path, and the client is about to receive an unparseable, unretryable 200. Verified discriminating: `0` on the current log, `6` across the pre-fix rotated logs.
 
-**11b. General discard rate (regression watch, not yet a FAIL).**
+**11b. General discard rate (hard FAIL since the headroom-ai 0.37.0 wheel).**
 ```bash
 grep -c 'body_mutated=true.*source=passthrough' ~/.headroom/logs/proxy.log
 grep 'body_mutated=true.*source=passthrough' ~/.headroom/logs/proxy.log \
   | sed -n 's/.*mutation_reasons=\([^ ]*\).*/\1/p' | tr ',' '\n' | sort | uniq -c
 ```
-Expect *today*: non-zero, listing only `output_shaper`, `image_compression`, and/or `structural_diff_vs_original`. That is upstream #2990 - on any turn whose history carries a signed `thinking` block, `select_outbound_body` forwards client bytes and discards every mutation, while PERF still counts them as delivered. Baseline observed on 0.8.1-rc.1 / headroom-ai 0.35.0: ~2,900 `output_shaper` and ~765 `image_compression` discards across ~6,400 outbound requests.
+Expect: `0` on the current wheel - the signed-thinking discard fix (upstream #3015, merged upstream in v0.36.0) ships here since the headroom-ai 0.37.0 bump in 0.9.4-rc.1. Scope the count to lines timestamped after the current backend booted: `proxy.log` persists across backend restarts, so pre-bump history keeps the whole-file grep non-zero forever (observed on the 0.9.4-rc.1 pass: 148 `output_shaper` discards from the same morning's 0.35.0 run, 0 since the rc boot). Boot time via `ps -o lstart= -p $(lsof -ti TCP:6768 -sTCP:LISTEN | head -1)`, then filter on the log timestamp before counting.
 
 `structural_diff_vs_original` is the one to read first, not last. The core compression pipeline never calls `mark_mutated` - grep the package and the reason vocabulary has no entry for it - so compression is only ever noticed by the structural safety net at the end of `handle_anthropic_messages`, which fires when no transform reported a mutation but the final body differs from the parsed original bytes. That makes this reason the label core compression lands under by omission, and a discard under it is the pipeline's own work being thrown away, which costs more than losing a shaping pass. It also means the share is not fixed: measured 7.6%-60% of mutated requests across six logs on 0.8.5-rc.1, tracking how much real compression happened. Do not read a ~3% reading as the `HEADROOM_OUTPUT_HOLDOUT=0.03` control arm - the arm gate and this one are unrelated, and the resemblance is a coincidence of whichever subset you counted.
-
-Two things make this a FAIL rather than a known-issue note:
-- any reason appearing that is **not** `output_shaper` / `image_compression` / `structural_diff_vs_original` - a new transform just joined the silent-discard set;
-- a **non-zero count at all**, once a wheel bump lands upstream PR #3015. Delete this paragraph and promote 11b to "expect `0`" at that bump.
 
 Do not try to derive this from PERF `transforms=` instead. That field includes detector-only and no-op entries (`router:noop`, `router:protected:error_output`), so joining it against `source=` reports ~1,100 false positives per log file. `mutation_reasons` is only written when the body actually changed.
 
