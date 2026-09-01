@@ -4223,6 +4223,11 @@ async fn apply_client_setup(
     }
     match client_adapters::apply_client_setup(&client_id) {
         Ok(result) => {
+            // Funnel beacon lives here (not the launcher UI) so every apply
+            // path counts: launcher auto-configure, the manual client-setup
+            // screen, and the dashboard connector toggle. First-write-wins
+            // server-side, so post-onboarding re-applies are no-ops.
+            pricing::report_funnel_step(&state, "client_setup_applied");
             analytics::track_event(
                 &app,
                 "client_setup_applied",
@@ -4293,6 +4298,11 @@ async fn apply_client_setup(
                     },
                 );
             }
+            // Unlike the Sentry capture above, the funnel beacon has no
+            // exclusions: permission-denied and disk-full are environmental,
+            // but the per-OS funnel still needs them counted as "setup was
+            // attempted and did not stick" (invisible on Windows otherwise).
+            pricing::report_funnel_step(&state, "client_setup_failed");
             Err(msg)
         }
     }
