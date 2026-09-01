@@ -328,9 +328,10 @@ _compact_json_bytes for the duration of each overlay call, restoring
 0.35.0's byte-identical replay. The desktop backend serves proxy-mode
 traffic only, whose snapshots refresh from every provider response, so
 byte-identical replay is always the cheaper request here. Gated on the
-runtime NOT having the fix's enforce_non_inflation parameter, so the
-first wheel that ships it keeps its per-caller split and this block
-goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
+runtime NOT having the fix's parameter (enforce_non_inflation in the
+first PR shape, confirmed_frozen_count in the reworked #3380 shape), so
+the first wheel that ships either keeps its own replay policy and this
+block goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
 cc-switch Official-branch upstream reset (upstream PR #3166): the
 reconciler captures the third-party endpoint cc-switch selected (Kimi,
 DeepSeek, GLM) as this proxy's Anthropic upstream, but switching back to
@@ -908,19 +909,21 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     # restore around each call so any other caller of the helper stays
     # honest; overlay is synchronous on the proxy's single event loop, so the
     # swap cannot interleave with another request's overlay. Gated on the
-    # runtime NOT having the fix's enforce_non_inflation parameter, so the
-    # first wheel that ships it keeps its proper per-caller split and this
-    # block goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
+    # runtime NOT having the fix's parameter under either name shipped on
+    # #3380 (enforce_non_inflation / confirmed_frozen_count), so the first
+    # wheel that ships the fix keeps its own replay policy and this block
+    # goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
     try:
         if _hd_os.environ.get(
             "HEADROOM_PREFIX_REPLAY_GUARD", "1"
         ).strip().lower() not in ("0", "false", "no", "off"):
             import headroom.cache.prefix_tracker as _hd_pr_pt
 
-            if hasattr(_hd_pr_pt, "_compact_json_bytes") and (
-                "enforce_non_inflation"
-                not in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames
-            ):
+            _hd_pr_fixed = any(
+                name in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames
+                for name in ("enforce_non_inflation", "confirmed_frozen_count")
+            )
+            if hasattr(_hd_pr_pt, "_compact_json_bytes") and not _hd_pr_fixed:
                 _hd_pr_orig_overlay = _hd_pr_pt.overlay_cached_prefix
 
                 def _hd_pr_overlay(*args, **kwargs):
@@ -10975,9 +10978,11 @@ mod tests {
         let py = super::SITECUSTOMIZE_PY;
         assert!(py.contains("HEADROOM_PREFIX_REPLAY_GUARD"));
         assert!(py.contains("upstream issue #3379"));
-        // Gated on the fix's parameter being ABSENT, so a fixed wheel keeps
-        // its per-caller split.
-        assert!(py.contains("not in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames"));
+        // Gated on the fix's parameter being ABSENT under either name the
+        // upstream PR shipped (v1 flag, reworked floor), so a fixed wheel
+        // keeps its own replay policy.
+        assert!(py.contains("in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames"));
+        assert!(py.contains(r#""enforce_non_inflation", "confirmed_frozen_count""#));
         // Swap-and-restore of the sizing helper, never a permanent stub.
         assert!(py.contains(r#"_hd_pr_pt._compact_json_bytes = lambda value: b"""#));
         assert!(py.contains("_hd_pr_pt._compact_json_bytes = _hd_pr_saved"));
