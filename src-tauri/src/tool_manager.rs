@@ -257,7 +257,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports five fixes owed upstream (remove each once a wheel ships it),
+Also ports six fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -301,6 +301,20 @@ persisted dollar field; tool-schema TOKENS are untouched and the
 desktop keeps pricing those itself at the cache-read rate.
 Self-neutralizes once a wheel ships #3170's disjoint fields. Kill
 switch: HEADROOM_SAVINGS_FOLD_GUARD=0.
+Chained-read protection (upstream PR #2668): _is_read_command
+inspects only the FIRST program and applies its write/redirect check
+to the whole string, so a read batched behind other work
+(`wc -l a.py && sed -n '1,60p' a.py`) classifies as a non-read and the
+file content is lossy-compressed despite read protection -- the agent
+then re-reads the file to recover exact bytes (turn inflation) or
+fails the edit outright (resolve loss). The guard splits on ;/&&/||
+(never on a single |: downstream pipeline stages consume output, not
+files), judges redirects and tee per segment so a sibling write does
+not unprotect the read beside it, keeps the heredoc whole-string
+bailout (a heredoc body may contain ; or &&), and delegates each
+segment's program parsing to the original function so wrapper peeling,
+bash -c recursion and the lockfile carve-out stay upstream's. Kill
+switch: HEADROOM_READ_CHAIN_GUARD=0.
 cc-switch Official-branch upstream reset (upstream PR #3166): the
 reconciler captures the third-party endpoint cc-switch selected (Kimi,
 DeepSeek, GLM) as this proxy's Anthropic upstream, but switching back to
@@ -811,6 +825,60 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     return _hd_sf_orig_record(self, **kwargs)
 
                 _hd_sf_st.SavingsTracker.record_request = _hd_sf_record
+    except Exception:
+        pass
+
+    # Chained-read protection (upstream PR #2668; remove once a wheel ships it
+    # -- see the module docstring for the re-read/resolve-loss failure this
+    # prevents). Rebinding the module-level name covers both in-module call
+    # sites: Python resolves it via module globals at call time, which also
+    # routes the original's own bash -c recursion through the new version.
+    # Kill switch: HEADROOM_READ_CHAIN_GUARD=0.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_READ_CHAIN_GUARD", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import re as _hd_rc_re
+
+            import headroom.transforms.content_router as _hd_rc_cr
+
+            _hd_rc_orig = _hd_rc_cr._is_read_command
+            # ; && and || start a NEW command; a single | deliberately does
+            # not: downstream pipeline stages consume the previous stage's
+            # output, not a file, so `grep -n x a.py | head -40` stays derived
+            # (compressible) while `cat a.py | head -40` reads via stage one.
+            _hd_rc_sep = _hd_rc_re.compile(r"\|\||&&|;")
+            _hd_rc_write = _hd_rc_re.compile(r"(^|\s)(>>?|tee\b)")
+            _hd_rc_heredoc = _hd_rc_re.compile(r"(^|\s)<<")
+
+            def _hd_rc_segment_is_read(seg):
+                # A redirect or tee in THIS segment means it writes a file;
+                # judged on the whole segment -- pipeline included, so
+                # `cat a.py | tee b.py` stays a write -- before reducing to
+                # the stage that touches the file. Sibling segments never
+                # see each other, so `cat a.py && echo done > marker` keeps
+                # its read protected.
+                if _hd_rc_write.search(seg):
+                    return False
+                first = seg.split("|", 1)[0].strip()
+                return bool(first) and _hd_rc_orig(first)
+
+            def _hd_rc_is_read(command):
+                if not command or not isinstance(command, str):
+                    return False
+                c = _hd_rc_cr._strip_cd_prefix(command)
+                # A heredoc is the one WHOLE-STRING bailout: its body can
+                # contain ; or &&, which would split into bogus segments that
+                # look like reads. The command as a whole writes a file.
+                if _hd_rc_heredoc.search(c):
+                    return False
+                return any(
+                    _hd_rc_segment_is_read(seg)
+                    for seg in (s.strip() for s in _hd_rc_sep.split(c))
+                    if seg
+                )
+
+            _hd_rc_cr._is_read_command = _hd_rc_is_read
     except Exception:
         pass
 
@@ -10506,6 +10574,32 @@ mod tests {
         // #3194), so the desktop lift is gone with the pin bump.
         assert!(!py.contains("HEADROOM_ADDITIONAL_TOOLS_GUARD"));
         assert!(!py.contains("additional_tools"));
+    }
+
+    #[test]
+    fn sitecustomize_ports_read_chain_guard() {
+        // Upstream PR #2668 not yet in a wheel: _is_read_command matches only
+        // the first program and applies its write check whole-string, so a
+        // read batched behind other work (`wc -l a.py && sed -n '1,60p'
+        // a.py`) is lossy-compressed despite read protection -- the exact
+        // re-read/resolve-loss failure the protection exists to prevent.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_READ_CHAIN_GUARD"));
+        assert!(py.contains("upstream PR #2668"));
+        // Split on ; && and || -- never on a single | (pipelines reduce to
+        // their first stage instead).
+        assert!(py.contains(r#"_hd_rc_re.compile(r"\|\||&&|;")"#));
+        assert!(py.contains(r#"seg.split("|", 1)[0].strip()"#));
+        // Redirect/tee are judged per SEGMENT so a sibling write cannot
+        // unprotect the read next to it; the heredoc bailout stays
+        // whole-string because its body may contain separators.
+        assert!(py.contains(r#"(^|\s)(>>?|tee\b)"#));
+        assert!(py.contains(r#"(^|\s)<<"#));
+        // Each segment delegates to the ORIGINAL parser (wrapper peeling,
+        // bash -c recursion, lockfile carve-out stay upstream's), and the
+        // rebind covers both in-module call sites via module globals.
+        assert!(py.contains("_hd_rc_orig(first)"));
+        assert!(py.contains("_hd_rc_cr._is_read_command = _hd_rc_is_read"));
     }
 
     #[test]
