@@ -323,11 +323,16 @@ bytes change mid-conversation and the provider prompt cache busts from
 the first changed byte -- measured 2026-09-01 as a 160-210k-token cache
 re-write every 1-2 requests, dollar cache-hit rate 90% -> 52%, billable
 input $/M up 2.2x, across the 0.35.0 -> 0.37.0 wheel swap. The guard
-neuters only the size bound (every alignment guard stays) by stubbing
-_compact_json_bytes for the duration of each overlay call, restoring
-0.35.0's byte-identical replay. The desktop backend serves proxy-mode
-traffic only, whose snapshots refresh from every provider response, so
-byte-identical replay is always the cheaper request here. Gated on the
+ports #3380's reworked floor semantics: the provider-confirmed prefix
+is replayed unconditionally (declining there can only bust the cache),
+while beyond the floor a declined replay ships this turn's fresh bytes
+so background-compression improvements reach the wire, and a collapsed
+floor (cold cache) re-baselines the whole prefix. The confirmed count
+rides a side-channel -- the finalize path hands the overlay the exact
+list object get_last_forwarded_messages() returned, so the patched
+getter records id(list) -> (len, confirmed count) and the overlay
+wrapper pops it by identity; a missed lookup degrades to full replay,
+the cache-safe posture verified live on rc.2. Gated on the
 runtime NOT having the fix's parameter (enforce_non_inflation in the
 first PR shape, confirmed_frozen_count in the reworked #3380 shape), so
 the first wheel that ships either keeps its own replay policy and this
@@ -899,20 +904,24 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     except Exception:
         pass
 
-    # Prefix-replay inflation-skip guard (upstream issue #3379; remove once a
+    # Prefix-replay guard (upstream issue #3379 / PR #3380; remove once a
     # wheel ships the fix -- see the module docstring for the cache-bust loop
-    # this prevents). overlay_cached_prefix's size bound reads
-    # _compact_json_bytes via module globals at call time; stubbing it to
-    # return equal-length bytes for both candidates makes the
-    # len(replayed) > len(optimized) comparison always false, so the replay
-    # proceeds while every alignment/append-only guard still runs. Swap and
-    # restore around each call so any other caller of the helper stays
-    # honest; overlay is synchronous on the proxy's single event loop, so the
-    # swap cannot interleave with another request's overlay. Gated on the
-    # runtime NOT having the fix's parameter under either name shipped on
-    # #3380 (enforce_non_inflation / confirmed_frozen_count), so the first
-    # wheel that ships the fix keeps its own replay policy and this block
-    # goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
+    # this prevents and the floor semantics this ports). The confirmed count
+    # travels by object identity: the wheel's finalize path passes the exact
+    # list get_last_forwarded_messages() returned, so the patched getter
+    # records it and the overlay wrapper pops it one-shot; a miss degrades to
+    # full replay (the cache-safe posture verified live on rc.2). The size
+    # bound is probed by calling the original twice on DECLINED turns only:
+    # once bound-on (a shrinking repair is accepted as-is), once with
+    # _compact_json_bytes stubbed to equal-length bytes (inflation compare
+    # goes false; every alignment guard still runs), then spliced at the
+    # floor so improvements beyond the confirmed prefix ship while confirmed
+    # bytes stay byte-identical. Overlay is synchronous on the proxy's single
+    # event loop, so the stub swap cannot interleave. Gated on the runtime
+    # NOT having the fix's parameter under either name shipped on #3380
+    # (enforce_non_inflation / confirmed_frozen_count), so the first wheel
+    # that ships the fix keeps its own replay policy and this block goes
+    # inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
     try:
         if _hd_os.environ.get(
             "HEADROOM_PREFIX_REPLAY_GUARD", "1"
@@ -923,16 +932,73 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 name in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames
                 for name in ("enforce_non_inflation", "confirmed_frozen_count")
             )
-            if hasattr(_hd_pr_pt, "_compact_json_bytes") and not _hd_pr_fixed:
+            if (
+                hasattr(_hd_pr_pt, "_compact_json_bytes")
+                and not _hd_pr_fixed
+                and hasattr(_hd_pr_pt, "PrefixCacheTracker")
+                and hasattr(_hd_pr_pt.PrefixCacheTracker, "get_last_forwarded_messages")
+                and hasattr(_hd_pr_pt.PrefixCacheTracker, "get_frozen_message_count")
+            ):
+                # id(list) -> (len, provider-confirmed count); one-shot pop.
+                _hd_pr_floors = {}
+                _hd_pr_orig_getter = (
+                    _hd_pr_pt.PrefixCacheTracker.get_last_forwarded_messages
+                )
+
+                def _hd_pr_getter(self):
+                    result = _hd_pr_orig_getter(self)
+                    try:
+                        if len(_hd_pr_floors) > 128:
+                            _hd_pr_floors.clear()
+                        _hd_pr_floors[id(result)] = (
+                            len(result),
+                            max(int(self.get_frozen_message_count() or 0), 0),
+                        )
+                    except Exception:
+                        pass
+                    return result
+
+                _hd_pr_pt.PrefixCacheTracker.get_last_forwarded_messages = _hd_pr_getter
                 _hd_pr_orig_overlay = _hd_pr_pt.overlay_cached_prefix
 
                 def _hd_pr_overlay(*args, **kwargs):
+                    optimized = args[0] if args else kwargs.get("optimized_messages")
+                    prev_fwd = (
+                        args[3]
+                        if len(args) > 3
+                        else kwargs.get("previous_forwarded_messages")
+                    )
+                    ent = (
+                        _hd_pr_floors.pop(id(prev_fwd), None)
+                        if prev_fwd is not None
+                        else None
+                    )
+                    # Pass 1, bound enforced -- identical to stock. A repair
+                    # that shrinks (freeze drift, #1850) is accepted as-is.
+                    r1 = _hd_pr_orig_overlay(*args, **kwargs)
+                    if r1 is not optimized:
+                        return r1
+                    # Pass 2, bound neutered; alignment guards still run.
+                    # Only reached on declined turns (post-kompress, a few
+                    # per minute at most).
                     _hd_pr_saved = _hd_pr_pt._compact_json_bytes
                     _hd_pr_pt._compact_json_bytes = lambda value: b""
                     try:
-                        return _hd_pr_orig_overlay(*args, **kwargs)
+                        r2 = _hd_pr_orig_overlay(*args, **kwargs)
                     finally:
                         _hd_pr_pt._compact_json_bytes = _hd_pr_saved
+                    if r2 is optimized:
+                        return optimized
+                    if ent is None or ent[0] != len(prev_fwd) or len(r2) != len(optimized):
+                        # No trustworthy floor: full replay, the verified
+                        # cache-safe fallback.
+                        return r2
+                    floor = min(ent[1], len(r2))
+                    # Confirmed region keeps last turn's forwarded bytes;
+                    # beyond it this turn's fresh output ships, so the
+                    # improvement that triggered the decline lands (and a
+                    # collapsed floor on a cold cache re-baselines fully).
+                    return list(r2[:floor]) + list(optimized[floor:])
 
                 _hd_pr_pt.overlay_cached_prefix = _hd_pr_overlay
     except Exception:
@@ -10983,9 +11049,19 @@ mod tests {
         // keeps its own replay policy.
         assert!(py.contains("in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames"));
         assert!(py.contains(r#""enforce_non_inflation", "confirmed_frozen_count""#));
-        // Swap-and-restore of the sizing helper, never a permanent stub.
+        // Floor side-channel: the getter records the exact returned list by
+        // identity, the overlay pops it ONE-SHOT (no stale reuse), and a
+        // miss degrades to full replay.
+        assert!(
+            py.contains("_hd_pr_pt.PrefixCacheTracker.get_last_forwarded_messages = _hd_pr_getter")
+        );
+        assert!(py.contains("_hd_pr_floors.pop(id(prev_fwd), None)"));
+        // Two-pass probe: bound-on first (shrinking repair accepted), then
+        // stubbed sizing, then the floor splice that lets improvements ship.
+        assert!(py.contains("if r1 is not optimized:"));
         assert!(py.contains(r#"_hd_pr_pt._compact_json_bytes = lambda value: b"""#));
         assert!(py.contains("_hd_pr_pt._compact_json_bytes = _hd_pr_saved"));
+        assert!(py.contains("return list(r2[:floor]) + list(optimized[floor:])"));
         assert!(py.contains("_hd_pr_pt.overlay_cached_prefix = _hd_pr_overlay"));
     }
 
