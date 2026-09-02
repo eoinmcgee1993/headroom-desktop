@@ -3487,7 +3487,9 @@ impl AppState {
                 format!("{} {args_pattern}", exe.display())
             );
             if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern) {
-                log::warn!("failed to clean detached headroom proxy processes: {err}");
+                // `:#` prints the whole context chain: a spawn failure's io
+                // error (RUST-6H's 0.9.5 wave) is invisible without it.
+                log::warn!("failed to clean detached headroom proxy processes: {err:#}");
             }
         }
         log::info!("stop_headroom: done");
@@ -7832,7 +7834,7 @@ pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     // Empty args pattern makes the exe-path clause the only real filter:
     // any process whose command line mentions the venv dir.
     if let Err(err) = kill_processes_by_command_pattern(venv_dir, "") {
-        log::warn!("killing venv lock holders before venv mutation failed: {err}");
+        log::warn!("killing venv lock holders before venv mutation failed: {err:#}");
     }
 }
 
