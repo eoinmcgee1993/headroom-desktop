@@ -1502,23 +1502,24 @@ def finalize_turn(
         # an opt-in flag.
         _hd_os.environ["HEADROOM_CC_SWITCH_RECONCILE"] = "0"
 "#;
-/// Opt-in passthrough for the rollout registry's `read_maturation` feature.
+/// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
-/// Empty unless the app itself was launched with `HEADROOM_READ_MATURATION`
-/// set to a truthy value, so the default for every install is off. The feature
-/// holds Read results out of the provider cache and relocates the cache
-/// breakpoint; upstream ships it flag-gated default-off, and the desktop's own
-/// 0.9.4 regression came from a cache-breakpoint change that was shipped
-/// broadly before it was measured. This keeps it to one machine at a time
-/// until `bin/rails savings:did` has judged it.
+/// Requested for every install since 0.9.7-rc.1 (2026-09-02): the 0.37.0
+/// freeze policy caps tail-only compression at ~1-2% on big sessions, and
+/// read_maturation is the cache-safe recovery leg (holds Read results out of
+/// the provider cache until they quiesce; never mutates a cached byte). It is
+/// still cache-breakpoint machinery -- the class that cost 89 installs ~17pp
+/// on 0.9.4 -- so the falsey spellings of `HEADROOM_READ_MATURATION` stay a
+/// no-rebuild kill switch, and the rc does not promote to stable until
+/// `bin/rails savings:did` has judged a full staging day on BOTH tok_saved
+/// AND cache_read.
 fn read_maturation_env() -> Vec<(String, String)> {
     read_maturation_env_from(std::env::var("HEADROOM_READ_MATURATION").ok().as_deref())
 }
 
 fn read_maturation_env_from(raw: Option<&str>) -> Vec<(String, String)> {
-    let Some(value) = raw.map(str::trim) else {
-        return Vec::new();
-    };
+    // Absent means on; an explicit value still passes through verbatim.
+    let value = raw.map_or("1", str::trim);
     // Mirror the wheel's own truthiness so "0"/"false"/"off" mean off rather
     // than "the variable is present, therefore on".
     if matches!(
@@ -3210,21 +3211,20 @@ impl ToolManager {
                     // users because of this declaration.
                     .env("HEADROOM_ROLLOUT_CHANNEL", "beta")
                     // read_maturation is the other beta-ring feature the
-                    // registry offers, and it is NOT requested by default on
-                    // purpose. It holds Read results out of the provider cache
-                    // until they quiesce and then RELOCATES the cache
-                    // breakpoint -- the same machinery whose misuse cost 89
-                    // installs ~17pp of their savings rate on 0.9.4. Upstream
-                    // also ships it flag-gated default-off, so it carries no
-                    // broad validation of its own.
-                    //
-                    // Opt-in passthrough instead of a hardcoded "1": launch the
-                    // app with HEADROOM_READ_MATURATION=1 to try it on one
-                    // machine, compare tok_saved AND cache_read in the PERF log
-                    // (both sides -- measuring only the benefit side is what
-                    // shipped the 0.9.4 regression), then let
-                    // `bin/rails savings:did` decide before it becomes a
-                    // default for everyone.
+                    // registry offers, requested by DEFAULT since 0.9.7-rc.1.
+                    // The 0.37.0 freeze policy discards background compression
+                    // of already-forwarded history, capping compression at the
+                    // fresh tail (~1-2% on big sessions); read_maturation is
+                    // the cache-safe recovery leg (holds Read results out of
+                    // the provider cache until they quiesce, then relocates
+                    // the cache breakpoint; invariant: never mutates a cached
+                    // byte). It is still cache-breakpoint machinery -- the
+                    // class that cost 89 installs ~17pp on 0.9.4 -- so two
+                    // guards stay: HEADROOM_READ_MATURATION=0 is a no-rebuild
+                    // kill switch, and promotion to stable waits for
+                    // `bin/rails savings:did` on a full staging day measuring
+                    // BOTH tok_saved AND cache_read (measuring only the
+                    // benefit side is what shipped the 0.9.4 regression).
                     .envs(read_maturation_env())
                     // Pin the steering level explicitly. An explicit env is the
                     // manual-override tier in the shaper's level resolution, so it
@@ -11923,22 +11923,26 @@ mod tests {
     }
 
     #[test]
-    fn read_maturation_stays_off_unless_explicitly_requested() {
-        // Default for every install: absent. The feature relocates provider
-        // cache breakpoints, which is the machinery that cost 89 installs
-        // ~17pp of their savings rate on 0.9.4, so it must never arrive by
-        // accident.
-        assert!(super::read_maturation_env_from(None).is_empty());
+    fn read_maturation_defaults_on_with_falsey_kill_switch() {
+        // Default-on since 0.9.7-rc.1: an untouched install requests the
+        // feature from the wheel's beta ring.
+        assert_eq!(
+            super::read_maturation_env_from(None),
+            vec![("HEADROOM_READ_MATURATION".to_string(), "1".to_string())]
+        );
 
-        // Falsey spellings mean off, not "present therefore on".
+        // The no-rebuild kill switch: falsey spellings mean off. This is
+        // cache-breakpoint machinery (the class that cost 89 installs ~17pp
+        // of their savings rate on 0.9.4), so disabling it must never
+        // require an update.
         for off in ["", "  ", "0", "false", "FALSE", "no", "off", "Off"] {
             assert!(
                 super::read_maturation_env_from(Some(off)).is_empty(),
-                "{off:?} should not enable read maturation"
+                "{off:?} should disable read maturation"
             );
         }
 
-        // Explicit opt-in passes the value through to the backend.
+        // Explicit values still pass through verbatim.
         assert_eq!(
             super::read_maturation_env_from(Some("1")),
             vec![("HEADROOM_READ_MATURATION".to_string(), "1".to_string())]
