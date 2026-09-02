@@ -1666,6 +1666,10 @@ export default function App() {
   // already on screen by then (the deep-link handler shows it), so without this
   // the sign-in ran invisibly behind whatever onboarding stage it landed on.
   const [magicLinkState, setMagicLinkState] = useState<MagicLinkState | null>(null);
+  // The [email, code] parked by a claimed deep link, held until the user
+  // explicitly confirms the sign-in (see the login-CSRF note at the claim
+  // site). Cleared on confirm or dismiss.
+  const [magicLinkPending, setMagicLinkPending] = useState<[string, string] | null>(null);
   // Paywall-first experiment flag, served from the Rust-side cache (never
   // blocks). Gated flow applies only to fresh installs: an installed runtime
   // means the user is grandfathered and sees zero difference.
@@ -4299,7 +4303,11 @@ export default function App() {
   // Magic sign-in link (headroom://auth). The browser deliberately cannot sign
   // anyone in -- it has none of the device fingerprints verify_code needs -- so
   // it only hands over the code and this is the ordinary typed-code flow with
-  // the typing removed.
+  // the typing removed, gated behind one explicit click. The gate is the
+  // login-CSRF defense: any webpage can fire headroom://auth with a live code
+  // for an account the ATTACKER requested, and verifying it unprompted would
+  // silently bind this install (and its usage telemetry, and any future
+  // checkout) to that account. Nothing verifies until the user confirms.
   //
   // Drained on mount as well as on the event: a cold start launched *by* the
   // link delivers the URL before this listener exists, so an event alone would
@@ -4321,14 +4329,8 @@ export default function App() {
       }
       const [email, code] = pending;
       setAuthEmail(email);
-      setMagicLinkState("verifying");
-      const verified = await verifyAuthCode(email, code);
-      if (cancelled) {
-        return;
-      }
-      // Success needs no screen: clearing this drops the user straight onto the
-      // next onboarding step, already signed in.
-      setMagicLinkState(verified ? null : "failed");
+      setMagicLinkPending([email, code]);
+      setMagicLinkState("confirm");
     }
     void claimMagicLink();
     const unlistenPromise = listen("magic-link-auth", () => {
@@ -4339,6 +4341,24 @@ export default function App() {
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, [windowLabel]);
+
+  async function confirmMagicLinkSignIn() {
+    if (!magicLinkPending) {
+      return;
+    }
+    const [email, code] = magicLinkPending;
+    setMagicLinkPending(null);
+    setMagicLinkState("verifying");
+    const verified = await verifyAuthCode(email, code);
+    // Success needs no screen: clearing this drops the user straight onto the
+    // next onboarding step, already signed in.
+    setMagicLinkState(verified ? null : "failed");
+  }
+
+  function dismissMagicLink() {
+    setMagicLinkPending(null);
+    setMagicLinkState(null);
+  }
 
   async function handleSignOutHeadroomAccount() {
     setAuthFlowError(null);
@@ -4862,7 +4882,9 @@ export default function App() {
   if (windowLabel === "launcher" && magicLinkState !== null) {
     const magicLinkCopy = magicLinkScreenCopy(
       magicLinkState,
-      pricingStatus?.account?.email ?? authEmail,
+      // The confirm step must name the deep link's OWN email: the parked link
+      // can be for a different account than whoever is currently signed in.
+      magicLinkPending?.[0] ?? pricingStatus?.account?.email ?? authEmail,
       authFlowError
     );
     return (
@@ -4876,10 +4898,27 @@ export default function App() {
       >
         <h1>{magicLinkCopy.title}</h1>
         <p className="launcher-install-notice">{magicLinkCopy.body}</p>
-        {magicLinkState === "verifying" ? null : (
+        {magicLinkState === "verifying" ? null : magicLinkState === "confirm" ? (
+          <>
+            <button
+              className="primary-button primary-button--large primary-button--success"
+              onClick={() => void confirmMagicLinkSignIn()}
+              type="button"
+            >
+              Sign in
+            </button>
+            <button
+              className="secondary-button"
+              onClick={dismissMagicLink}
+              type="button"
+            >
+              Cancel
+            </button>
+          </>
+        ) : (
           <button
             className="primary-button primary-button--large primary-button--success"
-            onClick={() => setMagicLinkState(null)}
+            onClick={dismissMagicLink}
             type="button"
           >
             Continue

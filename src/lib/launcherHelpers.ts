@@ -161,13 +161,23 @@ export function getLauncherAutoConfigureDecision(
 
 /// Copy for the launcher's magic-link screen (headroom://auth). Success has no
 /// screen of its own - it drops straight through to the next onboarding step.
-export type MagicLinkState = "verifying" | "failed";
+/// The "confirm" step is a security gate, not decoration: any webpage can fire
+/// a headroom://auth URL carrying a live code for an account the *attacker*
+/// requested, and auto-verifying would silently bind this install to that
+/// account (login CSRF). Nothing verifies until the user says so.
+export type MagicLinkState = "confirm" | "verifying" | "failed";
 
 export function magicLinkScreenCopy(
   state: MagicLinkState,
   email: string,
   error: string | null
 ): { title: string; body: string } {
+  if (state === "confirm") {
+    return {
+      title: "Sign in to Headroom?",
+      body: `This link signs this app in as ${email}. Continue only if you just requested it.`,
+    };
+  }
   if (state === "verifying") {
     return { title: "Signing you in…", body: `Finishing sign-in for ${email}.` };
   }

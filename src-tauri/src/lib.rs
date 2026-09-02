@@ -4211,14 +4211,46 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
         );
     }
 
+    // Never route this through `cmd /C start`: cmd re-parses its command line,
+    // so `&`, `|`, `^`, and `%VAR%` inside an otherwise valid URL are live
+    // shell syntax (`https://x/?a=1&calc` runs calc), and legitimate query
+    // strings break the same way. ShellExecuteW gets the URL as one opaque
+    // argument.
     #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = crate::proc::command("cmd");
-        command.args(["/C", "start", "", trimmed]);
-        command
-    };
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    #[cfg(not(target_os = "linux"))]
+        let url_wide = std::ffi::OsStr::new(trimmed)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let operation = "open"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                url_wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // Values above 32 are success per the ShellExecuteW contract.
+        if result as isize > 32 {
+            return Ok(());
+        }
+        return Err(format!(
+            "ShellExecuteW failed to open the link (code {}).",
+            result as isize
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
     {
         let status = command
             .status()

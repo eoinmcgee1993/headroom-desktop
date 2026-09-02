@@ -149,6 +149,12 @@ describe("launcher helpers", () => {
   });
 
   describe("magicLinkScreenCopy", () => {
+    it("asks before signing in, naming the link's account", () => {
+      const copy = magicLinkScreenCopy("confirm", "a@b.com", null);
+      expect(copy.title).toContain("?");
+      expect(copy.body).toContain("a@b.com");
+    });
+
     it("names the account while verifying", () => {
       expect(magicLinkScreenCopy("verifying", "a@b.com", null).body).toContain("a@b.com");
     });
