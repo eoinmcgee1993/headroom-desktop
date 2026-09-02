@@ -500,6 +500,67 @@ fn onboarding_recovery_copy(any_connector_enabled: bool) -> (&'static str, &'sta
     )
 }
 
+/// Evidence-gated sibling of the recovery nudge: Claude Code session files
+/// grew during THIS app run while the proxy forwarded nothing, which is proof
+/// the user is coding AROUND Headroom (almost always a terminal still holding
+/// its pre-Headroom environment) — the condition the generic nudge can only
+/// guess at from a timer. Reports the `unrouted_usage_detected` funnel step
+/// independently of the notification's once-per-install gate, so the fleet
+/// count measures the leak, not the nag budget.
+/// ponytail: reads Claude Code sessions only; Codex/OpenCode usage is
+/// invisible to it until their session paths are taught here.
+fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard: &DashboardState) {
+    static FIRST_POLLED_AT: std::sync::OnceLock<chrono::DateTime<Utc>> = std::sync::OnceLock::new();
+    let since = *FIRST_POLLED_AT.get_or_init(Utc::now);
+    // Let startup settle before trusting anything: connector state is
+    // restored during early boot (see the recovery nudge's ten-minute note),
+    // and the projects cache needs a warmer pass. Three minutes still catches
+    // the first stale-terminal session of the day.
+    if Utc::now() - since < chrono::Duration::minutes(3) {
+        return;
+    }
+    if dashboard.lifetime_requests > 0 || !state.setup_wizard_complete() {
+        return;
+    }
+    // Cached (~90s warmer cadence), so polling this every 5s costs nothing.
+    let Ok(projects) = state.list_claude_code_projects() else {
+        return;
+    };
+    if !claude_sessions_touched_since(&projects, since) {
+        return;
+    }
+    static UNROUTED_BEACON_SENT: AtomicBool = AtomicBool::new(false);
+    if !UNROUTED_BEACON_SENT.swap(true, Ordering::AcqRel) {
+        pricing::report_funnel_step(state, "unrouted_usage_detected");
+    }
+    if !state.try_mark_unrouted_usage_notified() {
+        return;
+    }
+    let _ = show_notification_impl(
+        app,
+        "Claude Code isn't going through Headroom",
+        "You've used Claude Code since Headroom started, but none of that traffic came \
+         through, so nothing was optimized. Restart your terminal or editor so it picks \
+         up the new settings.",
+        None,
+    );
+    analytics::track_event(app, "unrouted_usage_nudge_shown", None);
+}
+
+/// True when any Claude Code project's last session activity is newer than
+/// `since`. `last_worked_at` is the RFC3339 string the project scan derives
+/// from session-file mtimes; unparseable values count as untouched.
+fn claude_sessions_touched_since(
+    projects: &[crate::models::ClaudeCodeProject],
+    since: chrono::DateTime<Utc>,
+) -> bool {
+    projects.iter().any(|project| {
+        chrono::DateTime::parse_from_rfc3339(&project.last_worked_at)
+            .map(|worked_at| worked_at.with_timezone(&Utc) > since)
+            .unwrap_or(false)
+    })
+}
+
 /// The payoff moment: lifetime savings crossed zero during THIS app session.
 /// Gated on the first poll having observed zero, so an upgrade on an install
 /// whose savings predate this session can never fire a fake "first savings"
@@ -688,6 +749,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         check_zero_spend_anomaly(&dashboard);
         check_zero_savings_anomaly(&dashboard);
         maybe_fire_onboarding_recovery_nudge(&app, &state, &dashboard);
+        maybe_fire_unrouted_usage_nudge(&app, &state, &dashboard);
         maybe_fire_first_savings_notification(&app, &state, &dashboard);
 
         // Funnel finish line, keyed on real savings only (before the fake-data
@@ -3276,6 +3338,85 @@ fn get_intercept_request_counts_by_agent() -> std::collections::HashMap<String, 
     proxy_intercept::intercept_request_counts()
 }
 
+/// Running agent processes keyed by connector id, for the verify screen's
+/// "these sessions still hold old settings" callout. Undercounts are fine
+/// (the callout just stays quiet); false positives are not, so matching is
+/// strict on the executable/script basename.
+#[tauri::command]
+fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize> {
+    #[cfg(windows)]
+    {
+        // tasklist reports image names only, so npm installs running under
+        // node.exe are invisible here. ponytail: undercount accepted; teach
+        // this Get-CimInstance CommandLine matching if Windows verify data
+        // says the callout stays too quiet.
+        let output = crate::proc::command("tasklist")
+            .args(["/NH", "/FO", "CSV"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        agent_process_counts_from_lines(
+            output
+                .lines()
+                .filter_map(|line| line.split(',').next())
+                .map(|image| image.trim_matches('"')),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let output = crate::proc::command("ps")
+            .args(["-axo", "args="])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        agent_process_counts_from_lines(output.lines())
+    }
+}
+
+/// One command line (unix `ps -axo args=`) or bare image name (windows
+/// tasklist) per item. An agent counts when the first token's basename is its
+/// binary, or when a node/bun interpreter is running a script whose basename
+/// is the agent (the npm install shape: `node /usr/local/bin/claude`).
+/// Basename-only matching keeps `grep claude` and editors with a file named
+/// "claude" open from counting; paths containing spaces mis-split and are
+/// accepted as an undercount.
+fn agent_process_counts_from_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> std::collections::HashMap<String, usize> {
+    fn basename(token: &str) -> &str {
+        let token = token.trim_end_matches(".exe").trim_end_matches(".EXE");
+        token.rsplit(['/', '\\']).next().unwrap_or(token)
+    }
+    fn connector_for(base: &str) -> Option<&'static str> {
+        match base {
+            "claude" => Some("claude_code"),
+            "codex" => Some("codex"),
+            "opencode" => Some("opencode"),
+            "grok" => Some("grok_build"),
+            _ => None,
+        }
+    }
+    let mut counts = std::collections::HashMap::new();
+    for line in lines {
+        let mut tokens = line.split_whitespace();
+        let Some(first) = tokens.next() else { continue };
+        let first_base = basename(first);
+        let connector = connector_for(first_base).or_else(|| {
+            (first_base == "node" || first_base == "bun")
+                .then(|| tokens.next().map(basename).and_then(connector_for))
+                .flatten()
+        });
+        if let Some(id) = connector {
+            *counts.entry(id.to_string()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchFlags {
@@ -5503,6 +5644,7 @@ pub fn run() {
             get_headroom_request_count,
             get_headroom_request_counts_by_agent,
             get_intercept_request_counts_by_agent,
+            get_running_agent_process_counts,
             get_launch_flags,
             get_rtk_activity,
             get_tool_logs,
@@ -8268,6 +8410,7 @@ fn compute_tray_window_position(
 
 #[cfg(test)]
 mod tests {
+    use super::{agent_process_counts_from_lines, claude_sessions_touched_since};
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
@@ -11460,6 +11603,72 @@ Some unrelated content.
             script[gate..kill].contains("*headroom*)"),
             "force-kill is not inside the matching case arm: {script}"
         );
+    }
+
+    /// The verify-screen callout must never claim an agent is running when it
+    /// is not: only argv[0]'s basename, or an agent script run by node/bun
+    /// (the npm install shape), may count — never a filename later in the
+    /// command line (`grep claude`, an editor on a file named "claude").
+    #[test]
+    fn agent_process_counts_match_binaries_and_interpreter_scripts_only() {
+        let lines = [
+            "/usr/local/bin/claude --resume",
+            "node /Users/x/.nvm/versions/node/v20/bin/claude",
+            "bun /home/y/.local/bin/opencode run",
+            "codex exec",
+            "grep claude proxy.log",
+            "vim claude",
+            "node server.js",
+            "/Applications/Headroom.app/Contents/MacOS/headroom-desktop",
+        ];
+        let counts = agent_process_counts_from_lines(lines.into_iter());
+        assert_eq!(counts.get("claude_code"), Some(&2));
+        assert_eq!(counts.get("codex"), Some(&1));
+        assert_eq!(counts.get("opencode"), Some(&1));
+        assert_eq!(counts.get("grok_build"), None);
+    }
+
+    #[test]
+    fn agent_process_counts_strip_windows_image_extensions() {
+        let counts =
+            agent_process_counts_from_lines(["claude.exe", "node.exe", "codex.EXE"].into_iter());
+        assert_eq!(counts.get("claude_code"), Some(&1));
+        assert_eq!(counts.get("codex"), Some(&1));
+        assert_eq!(counts.len(), 2);
+    }
+
+    /// The unrouted-usage nudge keys on session mtimes newer than app start;
+    /// an unparseable `last_worked_at` must read as untouched, not as fresh.
+    #[test]
+    fn claude_sessions_touched_since_compares_rfc3339_and_ignores_junk() {
+        fn project(last_worked_at: &str) -> crate::models::ClaudeCodeProject {
+            crate::models::ClaudeCodeProject {
+                id: "p".into(),
+                project_path: "/tmp/p".into(),
+                display_name: "p".into(),
+                last_worked_at: last_worked_at.into(),
+                session_count: 1,
+                sessions_today: 1,
+                last_learn_ran_at: None,
+                has_persisted_learnings: false,
+                active_days_since_last_learn: 0,
+                last_learn_pattern_count: None,
+            }
+        }
+        let since = chrono::Utc::now();
+        let before = (since - chrono::Duration::minutes(5)).to_rfc3339();
+        let after = (since + chrono::Duration::minutes(5)).to_rfc3339();
+
+        assert!(!claude_sessions_touched_since(&[project(&before)], since));
+        assert!(claude_sessions_touched_since(
+            &[project(&before), project(&after)],
+            since
+        ));
+        assert!(!claude_sessions_touched_since(
+            &[project("not-a-date")],
+            since
+        ));
+        assert!(!claude_sessions_touched_since(&[], since));
     }
 
     /// An app that exited on its own must be relaunched without any kill at all.

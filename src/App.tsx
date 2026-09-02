@@ -1671,6 +1671,7 @@ export default function App() {
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
   const [connectorsNotice, setConnectorsNotice] = useState<string | null>(null);
   const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
+  const [runningAgentCounts, setRunningAgentCounts] = useState<Record<string, number>>({});
   const [proxyVerificationHint, setProxyVerificationHint] = useState<
     { text: string; tone: "info" | "error" } | null
   >(null);
@@ -2539,6 +2540,30 @@ export default function App() {
       window.clearInterval(interval);
     };
   }, [windowLabel, launcherStage, interceptOnlyVerify]);
+
+  // Live agent processes for the verify screen's restart callout: sessions
+  // started before setup keep their pre-Headroom environment, and naming them
+  // turns "restart each tool" from generic advice into a concrete instruction.
+  // One ps/tasklist spawn per poll, so only while this stage is showing.
+  useEffect(() => {
+    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+      return;
+    }
+    let active = true;
+    const poll = () => {
+      void invoke<Record<string, number>>("get_running_agent_process_counts")
+        .then((counts) => {
+          if (active) setRunningAgentCounts(counts);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const interval = window.setInterval(poll, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [windowLabel, launcherStage]);
 
   // Warm the bootstrap download cache while the user is still signing up.
   // Download-only: nothing is installed until they consent on the install
@@ -5682,6 +5707,9 @@ export default function App() {
     const anyVerified = proxyVerificationRows.some((row) => row.state === "verified");
     const unverified = proxyVerificationRows.filter((row) => row.state !== "verified");
     const unverifiedNames = formatConnectorNameList(unverified.map((row) => row.name));
+    const unverifiedRunning = unverified
+      .map((row) => ({ name: row.name, count: runningAgentCounts[row.clientId] ?? 0 }))
+      .filter((item) => item.count > 0);
     const finishSetup = () => {
       void invoke("complete_setup_wizard");
       setLauncherStage("post_install");
@@ -5710,6 +5738,19 @@ export default function App() {
             </button>{" "}
             for help.
           </p>
+          {unverifiedRunning.length > 0 ? (
+            <p className="launcher-restart-hint">
+              {unverifiedRunning
+                .map(({ name, count }) =>
+                  count === 1
+                    ? `${name} has 1 session running`
+                    : `${name} has ${count} sessions running`
+                )
+                .join("; ")}{" "}
+              right now. Sessions started before this setup keep their old
+              settings until you restart them.
+            </p>
+          ) : null}
           {hasEnabledApps ? (
             <div className="connector-list">
               {proxyVerificationRows.map((row) => (

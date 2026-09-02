@@ -1897,6 +1897,26 @@ impl AppState {
         true
     }
 
+    /// One-shot gate for the evidence-based "coding around Headroom" nudge.
+    /// Unlike the generic recovery nudge it does not require a return launch:
+    /// the evidence (Claude sessions grew during THIS run while the proxy
+    /// forwarded nothing) is exactly as strong on the install-day launch.
+    /// Firing also consumes the generic nudge's flag — both say "restart your
+    /// terminal", and a second notification with the same advice is a nag,
+    /// not a reminder. The reverse does NOT hold: the generic nudge having
+    /// fired earlier does not block this one, because the evidence copy names
+    /// what actually happened and is worth one more attempt.
+    pub fn try_mark_unrouted_usage_notified(&self) -> bool {
+        let mut profile = self.launch_profile.lock();
+        if !unrouted_usage_nudge_due(&profile) {
+            return false;
+        }
+        profile.unrouted_usage_notified = true;
+        profile.onboarding_recovery_notified = true;
+        persist_launch_profile(&self.launch_profile_path, &profile);
+        true
+    }
+
     /// One-shot gate for the first-savings celebration notification: returns
     /// true exactly once per install, persisted like the recovery nudge flag.
     pub fn try_mark_first_savings_notified(&self) -> bool {
@@ -4214,6 +4234,10 @@ struct LaunchProfile {
     /// returning user could be re-congratulated on "first" savings.
     #[serde(default)]
     first_savings_notified: bool,
+    /// One-shot: the evidence-based "coding around Headroom" nudge has fired
+    /// (Claude Code sessions grew during a run that forwarded nothing).
+    #[serde(default)]
+    unrouted_usage_notified: bool,
 }
 
 fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
@@ -4243,6 +4267,7 @@ impl LaunchProfile {
             upstream_override: UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
+            unrouted_usage_notified: false,
         }
     }
 
@@ -4322,6 +4347,14 @@ fn onboarding_recovery_nudge_due(profile: &LaunchProfile) -> bool {
     !profile.onboarding_recovery_notified
         && profile.setup_wizard_complete
         && profile.launch_count >= 2
+}
+
+/// Whether the evidence-based unrouted-usage nudge may still fire: wizard
+/// finished (during the wizard the verify screen owns this moment) and it
+/// never fired before. No return-launch requirement — see
+/// `try_mark_unrouted_usage_notified`.
+fn unrouted_usage_nudge_due(profile: &LaunchProfile) -> bool {
+    !profile.unrouted_usage_notified && profile.setup_wizard_complete
 }
 
 /// Last classification that returned a non-Unknown tier. Persisted so the
@@ -9275,6 +9308,7 @@ mod tests {
             upstream_override: super::UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
+            unrouted_usage_notified: false,
         };
 
         assert!(!super::setup_wizard_satisfied_for_profile(&profile, false));
@@ -9302,22 +9336,30 @@ mod tests {
             upstream_override: super::UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
+            unrouted_usage_notified: false,
         };
         assert!(super::onboarding_recovery_nudge_due(&profile));
 
         // Install session itself never nudges.
         profile.launch_count = 1;
         assert!(!super::onboarding_recovery_nudge_due(&profile));
+        // The evidence-based sibling has no return-launch gate: sessions
+        // growing during the install-day run with zero traffic is exactly the
+        // moment it exists for.
+        assert!(super::unrouted_usage_nudge_due(&profile));
         profile.launch_count = 2;
 
-        // Unfinished wizard never nudges.
+        // Unfinished wizard never nudges, either variant.
         profile.setup_wizard_complete = false;
         assert!(!super::onboarding_recovery_nudge_due(&profile));
+        assert!(!super::unrouted_usage_nudge_due(&profile));
         profile.setup_wizard_complete = true;
 
         // Once fired, never again.
         profile.onboarding_recovery_notified = true;
         assert!(!super::onboarding_recovery_nudge_due(&profile));
+        profile.unrouted_usage_notified = true;
+        assert!(!super::unrouted_usage_nudge_due(&profile));
     }
 
     /// What a user can type into the upstream field. The trailing-slash strip
@@ -9389,6 +9431,7 @@ mod tests {
             },
             onboarding_recovery_notified: true,
             first_savings_notified: true,
+            unrouted_usage_notified: true,
         };
         super::persist_launch_profile(&path, &profile);
 
