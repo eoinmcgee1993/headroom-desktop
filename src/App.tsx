@@ -76,6 +76,7 @@ import {
 import { SetupStallModal } from "./components/SetupStallModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
 import {
+  authCodeSentMessage,
   buildInstallFailureMailto,
   buildSetupStallMailto,
   describeInvokeError,
@@ -1742,7 +1743,6 @@ export default function App() {
   const [authEmail, setAuthEmail] = useState("");
   const [authCode, setAuthCode] = useState("");
   const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
-  const [authCodeExpirySeconds, setAuthCodeExpirySeconds] = useState(authCodeExpiryFallbackSeconds);
   const [authRequestBusy, setAuthRequestBusy] = useState(false);
   const [authVerifyBusy, setAuthVerifyBusy] = useState(false);
   const [authFlowError, setAuthFlowError] = useState<string | null>(null);
@@ -1789,6 +1789,19 @@ export default function App() {
   const [stepSignature, setStepSignature] = useState("");
   const [stepStartedAtMs, setStepStartedAtMs] = useState<number | null>(null);
   const [stepEtaSeedSeconds, setStepEtaSeedSeconds] = useState(0);
+  // When the current ETA seed arrived. The backend re-estimates the dependency
+  // install continuously, so its ETA is time-remaining-from-that-update, not a
+  // budget measured from the start of the step -- counting it from
+  // stepStartedAtMs double-charged the elapsed time and pinned a long install
+  // at "finishing up" (RUST-9Y).
+  const [stepEtaSeedAtMs, setStepEtaSeedAtMs] = useState<number | null>(null);
+  // Highest fraction this step has shown. The ETA anchor above moves on every
+  // estimate, so the time-based fraction restarts near zero each time -- right
+  // for the ETA, wrong for a progress reading, which must never go backwards.
+  // Without this the dependency step reported "0% of this step" for its whole
+  // run, since a pip line (and so a re-anchor) lands more often than once a
+  // second.
+  const stepProgressFloorRef = useRef(0);
   const [stepBasePercent, setStepBasePercent] = useState(0);
   const [chartResetSignal, setChartResetSignal] = useState(0);
   const [chartMode, setChartMode] = useState<SavingsChartMode>("usd");
@@ -2572,14 +2585,18 @@ export default function App() {
     }
 
     const signature = `${bootstrapProgress.currentStep}|${bootstrapProgress.running}|${bootstrapProgress.complete}|${bootstrapProgress.failed}`;
-    if (signature === stepSignature) {
-      return;
+    if (signature !== stepSignature) {
+      setStepSignature(signature);
+      setStepStartedAtMs(Date.now());
+      setStepBasePercent(bootstrapProgress.overallPercent);
+      stepProgressFloorRef.current = 0;
     }
-
-    setStepSignature(signature);
-    setStepStartedAtMs(Date.now());
+    // Re-anchor on every new estimate, step change or not. "Updating
+    // dependencies" is one step for the whole install, so without this the
+    // seed froze at the first frame's 90s and every later, truthful estimate
+    // was discarded -- which is what a slow link saw as a hang.
     setStepEtaSeedSeconds(bootstrapProgress.currentStepEtaSeconds);
-    setStepBasePercent(bootstrapProgress.overallPercent);
+    setStepEtaSeedAtMs(Date.now());
   }, [bootstrapProgress, showInstallProgress, stepSignature]);
 
   // Reaching the final screen IS the end of onboarding, so satisfy the tray's
@@ -3546,17 +3563,23 @@ export default function App() {
       return 0;
     }
 
-    const elapsedSeconds = Math.max(0, (Date.now() - stepStartedAtMs) / 1000);
+    // Measured from the latest estimate, not from the start of the step: the
+    // backend's number is time remaining as of that update (see
+    // stepEtaSeedAtMs). Falling back to the step start keeps the old behaviour
+    // for steps that only ever report one, static ETA.
+    const anchorMs = stepEtaSeedAtMs ?? stepStartedAtMs;
+    const elapsedSeconds = Math.max(0, (Date.now() - anchorMs) / 1000);
     const eta = Math.max(8, stepEtaSeedSeconds || progress.currentStepEtaSeconds || 20);
     const linear = Math.min(0.96, elapsedSeconds / eta);
 
-    if (elapsedSeconds <= eta) {
-      return linear;
+    let fraction = linear;
+    if (elapsedSeconds > eta) {
+      const overtime = elapsedSeconds - eta;
+      fraction = Math.min(0.995, linear + overtime / (eta * 10));
     }
 
-    const overtime = elapsedSeconds - eta;
-    const creep = Math.min(0.995, linear + overtime / (eta * 10));
-    return creep;
+    stepProgressFloorRef.current = Math.max(stepProgressFloorRef.current, fraction);
+    return stepProgressFloorRef.current;
   }
 
   function animatedOverallPercent(progress: BootstrapProgress) {
@@ -3580,8 +3603,9 @@ export default function App() {
       return "ETA: unavailable";
     }
 
-    const elapsedSeconds = stepStartedAtMs
-      ? Math.max(0, Math.round((Date.now() - stepStartedAtMs) / 1000))
+    const anchorMs = stepEtaSeedAtMs ?? stepStartedAtMs;
+    const elapsedSeconds = anchorMs
+      ? Math.max(0, Math.round((Date.now() - anchorMs) / 1000))
       : 0;
     const baselineEta = Math.max(stepEtaSeedSeconds, seconds);
     const remainingSeconds = Math.max(0, baselineEta - elapsedSeconds);
@@ -3597,6 +3621,12 @@ export default function App() {
     }
     const mins = Math.floor(remainingSeconds / 60);
     const secs = remainingSeconds % 60;
+    // Past an hour the seconds are noise and the minutes read as a wall of
+    // digits. A slow link legitimately lands here, and "1h 20m" is the number
+    // that stops someone concluding the install is wedged and quitting.
+    if (mins >= 60) {
+      return `ETA: ${Math.floor(mins / 60)}h ${mins % 60}m`;
+    }
     return `ETA: ${mins}m ${secs}s`;
   }
 
@@ -4167,8 +4197,12 @@ export default function App() {
       });
       reportFunnelStep("email_code_requested");
       setAuthCodeRequestedFor(result.email);
-      setAuthCodeExpirySeconds(result.expiresInSeconds);
-      setAuthFlowSuccess(`We sent a sign-in code to ${result.email}.`);
+      setAuthFlowSuccess(
+        authCodeSentMessage(
+          result.email,
+          result.expiresInSeconds || authCodeExpiryFallbackSeconds
+        )
+      );
     } catch (error) {
       setAuthFlowError(describeInvokeError(error, "Could not send sign-in code."));
     } finally {

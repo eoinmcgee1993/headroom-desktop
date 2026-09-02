@@ -779,3 +779,18 @@ export function buildInstallFailureMailto(context: {
     subject
   )}&body=${encodeURIComponent(body)}`;
 }
+
+// The server keeps exactly one live sign-in code per user: `issue_sign_in_code!`
+// overwrites the previous digest, so a resend silently kills the code in the
+// email still in flight. A stale code then fails with the same "Invalid email
+// or code." as a typo, which is what sends people around the resend loop
+// (identity 3922 asked for eight codes in an hour before one worked). Saying
+// both facts up front is the whole fix.
+export function authCodeSentMessage(email: string, expirySeconds: number): string {
+  const minutes = Math.max(1, Math.round(expirySeconds / 60));
+  const unit = minutes === 1 ? "minute" : "minutes";
+  return (
+    `We sent a sign-in code to ${email}. It expires in ${minutes} ${unit}. ` +
+    "If you ask for another, only the newest code works."
+  );
+}

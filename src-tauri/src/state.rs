@@ -559,6 +559,12 @@ pub struct AppState {
     activity_facts: Mutex<ActivityFacts>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
     cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
+    /// Last `/stats` payload that actually arrived, with the time it did.
+    /// Kept apart from `cached_headroom_stats` so the miss backoff and the
+    /// retention window measure different things: that cache stamps the last
+    /// FETCH (and must expire fast on success, slowly on failure), this one
+    /// stamps the last real ANSWER.
+    last_good_headroom_stats: Mutex<Option<(HeadroomDashboardStats, Instant)>>,
     /// `(history, fetched_at, fresh)` — `fresh` is false when `history` is a
     /// retained last-good value served because the latest fetch failed (proxy
     /// paused/unreachable), so it re-probes on the short miss TTL.
@@ -718,6 +724,7 @@ impl AppState {
             activity_facts: Mutex::new(activity_facts),
             cached_clients: Mutex::new(None),
             cached_headroom_stats: Mutex::new(None),
+            last_good_headroom_stats: Mutex::new(None),
             cached_headroom_history: Mutex::new(None),
             cached_rtk_gain_summary: Mutex::new(None),
             cached_rtk_today_stats: Mutex::new(None),
@@ -2134,15 +2141,59 @@ impl AppState {
         persist_last_known_good_plan(&self.last_known_good_plan_path, &entry);
     }
 
+    /// How long a last-good `/stats` payload may stand in for a failed fetch.
+    ///
+    /// The layers only `/stats` reports (output shaping, tool schema) describe
+    /// configuration, which does not move between polls, so serving the
+    /// previous answer through a transient timeout is honest -- and blanking
+    /// them is the entire harm the warning names ("dashboard loses the
+    /// layers"). Bounded so a backend that is starved for good eventually
+    /// shows absent layers rather than an ever-staler snapshot presented as
+    /// live.
+    const HEADROOM_STATS_RETAIN_LAST_GOOD: Duration = Duration::from_secs(10 * 60);
+
     fn cached_headroom_stats(&self) -> Option<HeadroomDashboardStats> {
+        match self.polled_headroom_stats() {
+            Some(stats) => {
+                *self.last_good_headroom_stats.lock() = Some((stats.clone(), Instant::now()));
+                Some(stats)
+            }
+            // Retain the previous good payload rather than blanking the
+            // dashboard on one timeout. The stamp is the age of the DATA, not
+            // of the failed fetch, so the window counts from the last real
+            // answer and repeated failures cannot extend it.
+            None => self
+                .last_good_headroom_stats
+                .lock()
+                .as_ref()
+                .filter(|(_, at)| at.elapsed() < Self::HEADROOM_STATS_RETAIN_LAST_GOOD)
+                .map(|(stats, _)| stats.clone()),
+        }
+    }
+
+    /// The raw poll behind [`Self::cached_headroom_stats`]: cache lookup, then
+    /// a live fetch on miss. Returns `None` for "this poll had no answer",
+    /// which the caller may still cover with a retained payload.
+    fn polled_headroom_stats(&self) -> Option<HeadroomDashboardStats> {
         // Dashboard polls at 5s; a 4s TTL caused every poll to miss and
         // re-fetch from the proxy. 12s gives at least one cache hit between
         // dashboard refreshes while keeping session savings visibly fresh.
         const TTL: Duration = Duration::from_secs(12);
+        // A failure is held far longer than a success, which is the opposite of
+        // `cached_headroom_history` and deliberate: the dominant failure here
+        // is a `/stats` rebuild that outruns its 15s timeout on a backend busy
+        // serving a session. Re-probing that every 12s keeps a 15s blocking
+        // request in flight essentially all the time, so the poll itself
+        // becomes part of the starvation it is reporting -- RUST-86 shipped
+        // 1601 events that way. At 60s the probe still recovers within a few
+        // seconds of the backend freeing up, at a fifth of the load, and the
+        // retained payload above covers the gap.
+        const MISS_TTL: Duration = Duration::from_secs(60);
         {
             let cache = self.cached_headroom_stats.lock();
             if let Some((stats, at)) = cache.as_ref() {
-                if at.elapsed() < TTL {
+                let ttl = if stats.is_some() { TTL } else { MISS_TTL };
+                if at.elapsed() < ttl {
                     return stats.clone();
                 }
             }
@@ -2632,6 +2683,7 @@ impl AppState {
                 session_estimated_tokens_saved: snapshot.session_estimated_tokens_saved,
                 session_savings_pct: snapshot.session_savings_pct,
                 output_reduction,
+                output_shaper_active: stats.as_ref().and_then(|s| s.output_shaper_active),
                 learner_progress,
                 reread_tokens: stats.as_ref().and_then(|s| s.reread_tokens),
                 reread_compressed_tokens: stats.as_ref().and_then(|s| s.reread_compressed_tokens),
@@ -5657,6 +5709,12 @@ struct HeadroomDashboardStats {
     session_total_tokens_sent: Option<u64>,
     savings_history: Vec<HeadroomSavingsHistoryPoint>,
     output_reduction: Option<OutputReduction>,
+    /// Whether the wheel's rollout gate actually enabled the output shaper
+    /// (`rollout.features[name=="proxy_output_shaper"].enabled`). The desktop
+    /// requests the shaper via HEADROOM_OUTPUT_SHAPER=1, but a wheel's rollout
+    /// registry can block it by channel (the 0.37.0 wheel gates it to beta,
+    /// silently disabling it on stable). None on wheels without the block.
+    output_shaper_active: Option<bool>,
     /// Tool-definition tokens the proxy kept out of the model's context by
     /// deferring heavy tool schemas. Process-cumulative (it resets when the
     /// backend restarts), and the backend never writes it to its rollups, so
@@ -6299,6 +6357,17 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
         .unwrap_or_default();
 
     let output_reduction = parse_output_reduction(&root);
+    // Rollout truth for the shaper: a ledger-recomputed reduction is only a
+    // live claim while the wheel actually runs the shaper. Absent block => None
+    // (older wheels), and the report gate stays open.
+    let output_shaper_active = value_at_path(&root, &["rollout", "features"])
+        .and_then(Value::as_array)
+        .and_then(|features| {
+            features
+                .iter()
+                .find(|f| f.get("name").and_then(Value::as_str) == Some("proxy_output_shaper"))
+        })
+        .and_then(|f| f.get("enabled").and_then(Value::as_bool));
     // `summary.compression` carries the process-cumulative counter. The
     // `savings.by_layer` block reports the same layer but only over the recent
     // request window, so it is a fallback for shape, not a preferred source.
@@ -6347,6 +6416,7 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
             session_total_tokens_sent,
             savings_history,
             output_reduction,
+            output_shaper_active,
             tool_schema_tokens_saved,
         })
     }
@@ -8926,6 +8996,29 @@ mod tests {
     }
 
     #[test]
+    fn classify_startup_error_recognises_a_blocked_stdlib_dll_on_windows() {
+        // RUST-BB verbatim shape: the proxy dies importing `_sqlite3` because
+        // Application Control blocked the DLL. No numeric code, localized
+        // prose, and the chain ALSO matches the generic "exited ... before
+        // opening port" branch -- which would have told the user to read a
+        // traceback instead of naming the policy.
+        let raw = "unable to keep headroom running in background: python.exe -m \
+                   headroom.proxy.server --port 6768 exited with status exit code: 1 \
+                   before opening port 6768\n--- log tail ---\n    from _sqlite3 import *\n\
+                   ImportError: DLL load failed while importing _sqlite3: Una directiva de \
+                   Control de aplicaciones bloqueó este archivo.\n--- end log ---";
+        let hint = classify_startup_error(raw).expect("blocked DLL should classify");
+        assert!(
+            hint.contains("endpoint protection"),
+            "expected the endpoint-protection hint, got: {hint}"
+        );
+        assert!(
+            !hint.contains("see the traceback"),
+            "generic branch won: {hint}"
+        );
+    }
+
+    #[test]
     fn classify_startup_error_endpoint_protection_takes_priority_over_port_path() {
         // SIGKILL while waiting on the port could surface as both a
         // port-timeout AND a kill signature. EDR wins because it points to
@@ -10263,6 +10356,7 @@ mod tests {
         // savings_history backfills the daily buckets the lifetime total (and
         // hence milestones) is derived from; a cumulative 1.5M crosses 100k+1M.
         let stats = HeadroomDashboardStats {
+            output_shaper_active: None,
             reread_tokens: None,
             reread_compressed_tokens: None,
             ccr_retrievals: None,
@@ -10311,6 +10405,7 @@ mod tests {
 
         let first = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10334,6 +10429,7 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10361,6 +10457,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10379,6 +10476,7 @@ mod tests {
 
         let reset = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10405,6 +10503,7 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10476,6 +10575,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10637,7 +10737,16 @@ mod tests {
                     "history_size": 12
                 },
                 "waste_signals": { "reread": 91000, "reread_compressed": 4500 },
-                "compression": { "ccr_retrievals": 6 }
+                "compression": { "ccr_retrievals": 6 },
+                "rollout": {
+                    "features": [
+                        {
+                            "name": "proxy_output_shaper",
+                            "enabled": false,
+                            "decision": "blocked_by_channel"
+                        }
+                    ]
+                }
             }"#,
         )
         .expect("contract fixture must parse");
@@ -10669,6 +10778,10 @@ mod tests {
         let learner = parsed.learner_progress.expect("learner parsed");
         assert_eq!(learner.pending_patterns, 3);
 
+        // The rollout block decides whether the shaper's reduction is a live
+        // claim; blocked_by_channel must parse as an explicit false.
+        assert_eq!(parsed.output_shaper_active, Some(false));
+
         // Retrieval-churn gauges ride the savings report to the server.
         assert_eq!(parsed.reread_tokens, Some(91000));
         assert_eq!(parsed.reread_compressed_tokens, Some(4500));
@@ -10684,6 +10797,9 @@ mod tests {
         )
         .expect("fallback fixture must parse");
         assert_eq!(fallback.tool_schema_tokens_saved, Some(555));
+        // No rollout block (older wheel) => unknown, and the report gate must
+        // stay open rather than mislabel the layer inactive.
+        assert_eq!(fallback.output_shaper_active, None);
     }
 
     #[test]
@@ -10975,6 +11091,51 @@ mod tests {
 
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;
+    }
+
+    #[test]
+    fn stats_miss_serves_the_last_good_payload_and_stops_hammering_the_backend() {
+        // RUST-86: a /stats rebuild that outruns its 15s timeout used to blank
+        // the dashboard layers AND get re-probed every 12s, so a 15s blocking
+        // request was in flight nearly all the time against the very backend
+        // that was already starved.
+        let state = AppState::new().expect("state");
+        let good = HeadroomDashboardStats {
+            output_shaper_active: None,
+            tool_schema_tokens_saved: Some(4_242),
+            ..HeadroomDashboardStats::default()
+        };
+        *state.last_good_headroom_stats.lock() = Some((good.clone(), Instant::now()));
+        // A failed poll, cached as a miss.
+        *state.cached_headroom_stats.lock() = Some((None, Instant::now()));
+
+        let served = state
+            .cached_headroom_stats()
+            .expect("the retained payload covers a transient failure");
+        assert_eq!(served.tool_schema_tokens_saved, Some(4_242));
+
+        // The miss is still cached: no fetch was attempted, so the 15s probe
+        // is not re-armed on the next dashboard poll.
+        let (cached, _) = (*state.cached_headroom_stats.lock())
+            .clone()
+            .expect("miss stays cached");
+        assert!(
+            cached.is_none(),
+            "serving a retained payload must not \
+             overwrite the miss and reset the backoff"
+        );
+
+        // Past the retention window the layers go absent rather than being
+        // presented as live forever.
+        let stale = Instant::now()
+            .checked_sub(AppState::HEADROOM_STATS_RETAIN_LAST_GOOD + Duration::from_secs(1));
+        if let Some(stale) = stale {
+            *state.last_good_headroom_stats.lock() = Some((good, stale));
+            assert!(
+                state.cached_headroom_stats().is_none(),
+                "a retained payload must expire"
+            );
+        }
     }
 
     #[test]
@@ -11558,6 +11719,7 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11584,6 +11746,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11606,6 +11769,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11638,6 +11802,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11659,6 +11824,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11753,6 +11919,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11784,6 +11951,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11806,6 +11974,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11837,6 +12006,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11863,6 +12033,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11929,6 +12100,7 @@ mod tests {
         ] {
             tracker
                 .observe(&HeadroomDashboardStats {
+                    output_shaper_active: None,
                     reread_tokens: None,
                     reread_compressed_tokens: None,
                     ccr_retrievals: None,
@@ -11960,6 +12132,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11982,6 +12155,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12014,6 +12188,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12032,6 +12207,7 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12084,6 +12260,7 @@ mod tests {
 
         let snapshot = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12617,6 +12794,7 @@ mod tests {
 
         // First observation: 1_000 tokens saved, history shows 0→1_000 across hours 9→10.
         tracker.observe(&HeadroomDashboardStats {
+            output_shaper_active: None,
             reread_tokens: None,
             reread_compressed_tokens: None,
             ccr_retrievals: None,
@@ -12639,6 +12817,7 @@ mod tests {
 
         // Second observation: 3_000 tokens saved, history adds hour 11.
         tracker.observe(&HeadroomDashboardStats {
+            output_shaper_active: None,
             reread_tokens: None,
             reread_compressed_tokens: None,
             ccr_retrievals: None,

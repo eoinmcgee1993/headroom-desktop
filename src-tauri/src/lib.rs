@@ -1723,7 +1723,79 @@ fn is_ssl_library_conflict_signal(text: &str) -> bool {
 /// `pip_failure_category`'s `app-control` bucket so the two layers agree.
 fn is_app_control_signal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("application control policy has blocked") || lower.contains("(os error 4551)")
+    lower.contains("application control policy has blocked")
+        || lower.contains("(os error 4551)")
+        // Windows localizes the verdict and only `CreateProcess` failures
+        // carry the numeric code. When the policy blocks a DLL that Python is
+        // importing, CPython reports it as an ImportError with the OS prose
+        // and no code at all (RUST-BB/BA: `_sqlite3`, Spanish Windows). The
+        // Spanish text is verbatim from those events; the structural check in
+        // `is_blocked_runtime_dll_signal` covers every other locale.
+        || lower.contains("control de aplicaciones bloque")
+}
+
+/// True when Windows refused to load one of the bundled interpreter's own
+/// extension DLLs.
+///
+/// CPython reports that as `ImportError: DLL load failed while importing
+/// <module>: <reason>`. The prefix is CPython's and English on every locale;
+/// the reason is Windows' `FormatMessage` prose, localized, and for an
+/// Application Control verdict it carries no numeric code -- so it slips past
+/// `is_app_control_signal` on any non-English machine (RUST-BB/BA/5C: one host,
+/// Spanish Windows, `_sqlite3` blocked, filed as three Error-level issues).
+///
+/// Scoped to the standard-library extensions that python-build-standalone
+/// ships: those are self-contained (their dependent DLLs sit in the same
+/// folder), so a load failure is a policy or antivirus verdict on our freshly
+/// installed files, or a quarantined one -- not a dependency the user could
+/// install. Third-party extensions (onnxruntime, torch) are deliberately NOT
+/// here: their load failures are usually a missing Visual C++ runtime, which
+/// `classify_startup_error` handles from onnxruntime's own English warning.
+pub(crate) fn is_blocked_runtime_dll_signal(text: &str) -> bool {
+    const STDLIB_EXTENSIONS: &[&str] = &[
+        "_sqlite3",
+        "_ssl",
+        "_ctypes",
+        "_socket",
+        "_hashlib",
+        "_bz2",
+        "_lzma",
+        "_decimal",
+        "_multiprocessing",
+        "_asyncio",
+        "_overlapped",
+        "_queue",
+        "_uuid",
+        "_elementtree",
+        "_zoneinfo",
+        "pyexpat",
+        "select",
+        "unicodedata",
+    ];
+    // Anchor on `dll load failed` and step over an optional `while `: CPython
+    // 3.8+ writes "while importing", but the copy of this chain that reaches us
+    // is not always CPython's own -- upstream re-wraps the traceback into
+    // `last_startup_error`, and RUST-5C's event carries both spellings across
+    // its two fields. The module name after it is what makes the match
+    // specific, so tolerating the shorter phrasing costs no precision.
+    const MARKER: &str = "dll load failed ";
+    let lower = text.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(idx) = rest.find(MARKER) {
+        let after = &rest[idx + MARKER.len()..];
+        let after = after.strip_prefix("while ").unwrap_or(after);
+        let module = after
+            .strip_prefix("importing ")
+            .unwrap_or("")
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if STDLIB_EXTENSIONS.contains(&module) {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 /// PATH directories holding an OpenSSL that could be loaded into our
@@ -2279,6 +2351,23 @@ pub(crate) fn child_state_fingerprint_key(
     }
 }
 
+/// Extra fingerprint bucket for a give-up whose `last_startup_error` names a
+/// cause with its own remedy. `None` for the ordinary case (no startup error,
+/// or one we cannot classify), so the fingerprint those events already carry
+/// is untouched.
+pub(crate) fn startup_error_fingerprint_key(
+    last_startup_error: Option<&str>,
+) -> Option<&'static str> {
+    let err = last_startup_error?;
+    if is_endpoint_protection_signal(err) {
+        Some("startup_endpoint_protection")
+    } else if is_port_conflict_failure(err) {
+        Some("startup_port_conflict")
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_watchdog_give_up_report(
     consecutive_failures: u32,
@@ -2546,11 +2635,21 @@ fn capture_watchdog_give_up(
     // network/restart blips stay at Warning so they don't pollute the Error
     // inbox.
     let cpu_deadlock_signal = cpu_actively_burning && report.log_silent_secs.unwrap_or(0) >= 30;
-    let level = if report.last_startup_error.is_some() || cpu_deadlock_signal {
-        sentry::Level::Error
-    } else {
-        sentry::Level::Warning
-    };
+    // A spawn that keeps failing is an Error -- unless the machine's own
+    // security policy is what keeps failing it. That verdict is already
+    // reported once per session by `capture_headroom_start_failure`, has a
+    // user-facing remedy, and cannot be changed by anything we ship; filing
+    // the give-up that follows it as an Error just re-reports the same block
+    // (RUST-5C's latest events were one Spanish Windows host whose `_sqlite3`
+    // was blocked, escalated to Error three times over).
+    let startup_key = startup_error_fingerprint_key(report.last_startup_error.as_deref());
+    let startup_is_policy = startup_key == Some("startup_endpoint_protection");
+    let level =
+        if (report.last_startup_error.is_some() && !startup_is_policy) || cpu_deadlock_signal {
+            sentry::Level::Error
+        } else {
+            sentry::Level::Warning
+        };
 
     sentry::with_scope(
         |scope| {
@@ -2563,8 +2662,16 @@ fn capture_watchdog_give_up(
             let readyz_key = readyz_outcome_fingerprint_key(&report.backend_readyz_outcome);
             let child_key =
                 child_state_fingerprint_key(&report.tracked_child_exit_status, report.tracked_pid);
-            let fp: &[&str] = &["proxy_unreachable_post_boot", readyz_key, child_key];
-            scope.set_fingerprint(Some(fp));
+            // A recognised startup cause gets its own issue: an endpoint
+            // protection block and a port conflict are not the wedge the
+            // readyz/child keys describe, and each has its own lifecycle.
+            // Absent (the common case) the fingerprint is unchanged, so the
+            // existing issues keep their history.
+            let mut fp: Vec<&str> = vec!["proxy_unreachable_post_boot", readyz_key, child_key];
+            if let Some(key) = startup_key {
+                fp.push(key);
+            }
+            scope.set_fingerprint(Some(fp.as_slice()));
             scope.set_extra(
                 "tracked_child_exit_status",
                 report.tracked_child_exit_status.clone().into(),
@@ -2883,6 +2990,11 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     if is_app_control_signal(&lower) {
         return true;
     }
+    // The same verdict seen from inside Python, where the OS prose is
+    // localized and carries no code (RUST-BB/BA/5C).
+    if is_blocked_runtime_dll_signal(&lower) {
+        return true;
+    }
     false
 }
 
@@ -2911,12 +3023,27 @@ const ENDPOINT_PROTECTION_HINT_RUNTIME: &str =
      interfering with freshly-installed code. Allow `~/Library/Application Support/Headroom` \
      in your security software, then click Retry.";
 
+/// The Windows wording: the block there is almost always Application Control
+/// (Smart App Control on a personal PC, WDAC or AppLocker on a managed one),
+/// which has a specific place to look and a specific folder to allow. The
+/// macOS text above named a `~/Library` path to Windows users (RUST-BB).
+const ENDPOINT_PROTECTION_HINT_RUNTIME_WINDOWS: &str =
+    "Windows blocked part of Headroom's runtime from loading — usually Application Control \
+     (Smart App Control, AppLocker, or a company WDAC policy) or antivirus / endpoint protection \
+     acting on freshly-installed files. On a personal PC, check Windows Security > App & browser control; \
+     on a work PC, ask IT to allow %LOCALAPPDATA%\\Headroom. Then click Retry. If nothing is \
+     blocking it, reinstall the runtime from Settings > Advanced.";
+
 pub(crate) fn endpoint_protection_hint_install() -> String {
     ENDPOINT_PROTECTION_HINT_INSTALL.to_string()
 }
 
 pub(crate) fn endpoint_protection_hint_runtime() -> String {
-    ENDPOINT_PROTECTION_HINT_RUNTIME.to_string()
+    if cfg!(windows) {
+        ENDPOINT_PROTECTION_HINT_RUNTIME_WINDOWS.to_string()
+    } else {
+        ENDPOINT_PROTECTION_HINT_RUNTIME.to_string()
+    }
 }
 
 /// Map common runtime-upgrade failure modes to a short user-facing hint.
@@ -5397,6 +5524,26 @@ fn lifetime_token_milestone_kind(milestone_tokens_saved: u64) -> &'static str {
 /// How many recent days of savings travel with the milestone/heartbeat post.
 const SAVINGS_REPORT_DAYS: usize = 30;
 
+/// The output-reduction fields the savings report should carry. The desktop
+/// requests the shaper, but the wheel's rollout gate can block it by channel
+/// (all stable installs on the 0.37.0 wheel). A blocked shaper produces no
+/// live reduction, so the ledger-recomputed figure would report an "estimated"
+/// percentage for a feature that never ran; label it inactive and withhold the
+/// percent instead. Unknown state (older wheels without the rollout block)
+/// reports as before.
+fn reported_output_reduction(
+    reduction: Option<&crate::models::OutputReduction>,
+    shaper_active: Option<bool>,
+) -> (Option<f64>, Option<String>) {
+    if shaper_active == Some(false) {
+        return (None, Some("inactive".to_string()));
+    }
+    (
+        reduction.map(|o| o.reduction_percent),
+        reduction.map(|o| o.method.clone()),
+    )
+}
+
 /// Projects the dashboard's real savings figures into the payload
 /// headroom-web stores for the admin profile. Must be called on the dashboard
 /// BEFORE `maybe_inject_fake_daily_savings`, or demo data reaches the server.
@@ -5409,14 +5556,16 @@ fn savings_report(dashboard: &DashboardState) -> pricing::SavingsReport {
         cache_read_tokens: breakdown.map(|b| b.cache_read_tokens).unwrap_or(0),
         total_input_cost_usd: breakdown.map(|b| b.total_input_cost_usd).unwrap_or(0.0),
         cache_savings_usd: breakdown.map(|b| b.cache_savings_usd).unwrap_or(0.0),
-        output_reduction_percent: dashboard
-            .output_reduction
-            .as_ref()
-            .map(|o| o.reduction_percent),
-        output_reduction_method: dashboard
-            .output_reduction
-            .as_ref()
-            .map(|o| o.method.clone()),
+        output_reduction_percent: reported_output_reduction(
+            dashboard.output_reduction.as_ref(),
+            dashboard.output_shaper_active,
+        )
+        .0,
+        output_reduction_method: reported_output_reduction(
+            dashboard.output_reduction.as_ref(),
+            dashboard.output_shaper_active,
+        )
+        .1,
         reread_tokens: dashboard.reread_tokens,
         reread_compressed_tokens: dashboard.reread_compressed_tokens,
         ccr_retrievals: dashboard.ccr_retrievals,
@@ -5848,6 +5997,104 @@ fn normalize_learn_failure_signature(signature: &str) -> String {
     )
 }
 
+/// True when a `headroom learn` failure was the coding agent's CLI refusing to
+/// run because nobody is signed in to it on this machine.
+///
+/// This is a user-environment condition, not an app bug: the analyzer shells
+/// out to `claude`/`codex`/`opencode`, and if that CLI has no session it exits
+/// non-zero with its own login prompt. RUST-B6 is the whole class -- four
+/// events whose only content was `Not logged in - Please run /login`, which no
+/// change on our side can resolve. It stays out of Sentry and becomes an
+/// actionable message in the UI instead (see `learn_agent_auth_hint`).
+fn learn_failure_is_agent_auth(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // Each needle is a full CLI phrase, not a bare word: "login" alone would
+    // also match a project's own source lines echoed back in the output.
+    const NEEDLES: &[&str] = &[
+        "not logged in",
+        "please run /login",
+        "run /login",
+        "please log in",
+        "not authenticated",
+        "authentication_error",
+        "invalid api key",
+        "oauth token has expired",
+        "credentials have expired",
+        "session has expired",
+        "please run `codex login`",
+        "run `codex login`",
+        "no credentials found",
+    ];
+    NEEDLES.iter().any(|needle| lower.contains(needle))
+}
+
+/// The user-facing remedy for [`learn_failure_is_agent_auth`], naming the CLI
+/// the run actually shelled out to.
+fn learn_agent_auth_hint(agent: LearnAgent) -> String {
+    let (cli, command) = match agent {
+        LearnAgent::Claude => ("Claude Code", "claude"),
+        LearnAgent::Codex => ("Codex", "codex"),
+        LearnAgent::Opencode => ("opencode", "opencode"),
+        LearnAgent::Grok => ("Grok", "grok"),
+    };
+    format!(
+        "{cli} is not signed in on this machine, so headroom learn could not run its analysis. \
+         Open a terminal, run `{command}`, sign in, then start the scan again."
+    )
+}
+
+/// The text a learn failure is fingerprinted on.
+///
+/// Upstream's first stderr line is a marker whose reason is EMPTY -- ``LLM
+/// analysis failed: `claude -p ...` failed (exit 1):`` -- because the child
+/// CLI writes its diagnosis to its own stream, which upstream appends on the
+/// FOLLOWING line. Fingerprinting the marker alone collapsed every distinct
+/// cause onto one issue with nothing in it to tell them apart (RUST-74, then
+/// RUST-B6). The marker's next non-empty line is the actual reason, so join
+/// it in.
+///
+/// The marker is not always the FIRST line: upstream's own logging can precede
+/// it -- RUST-BC's stderr opens with an onnxruntime C-API warning from
+/// `_ort.py`, which is unrelated to the failure and titled the issue anyway.
+/// Preamble like that is per-machine, so fingerprinting it merges every
+/// distinct failure on the hosts that emit it. Scan for the marker instead of
+/// only checking line one.
+///
+/// stderr only at the call site: stdout echoes written memory files back
+/// verbatim and must never reach a Sentry title.
+fn learn_failure_signature_source(text: &str) -> String {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let Some(first) = lines.first() else {
+        return "no output".to_string();
+    };
+    // Only the `failed (exit N):` marker is followed by a one-line diagnosis
+    // worth grouping on. Other markers also end at a colon but introduce a
+    // DUMP -- `returned unparseable output. First 2000 chars:` (RUST-B7) is
+    // followed by the model's raw output, which is derived from the user's
+    // sessions and must not become a Sentry title. With no marker at all the
+    // first line is still the best guess.
+    let Some(marker) = lines
+        .iter()
+        .position(|line| learn_marker_expects_reason_line(line))
+    else {
+        return first.to_string();
+    };
+    match lines.get(marker + 1) {
+        Some(reason) => format!("{} {reason}", lines[marker]),
+        None => lines[marker].to_string(),
+    }
+}
+
+/// True for upstream's ``... `<cli> ...` failed (exit N):`` marker, whose
+/// reason -- the child CLI's own stderr -- lands on the next line.
+fn learn_marker_expects_reason_line(line: &str) -> bool {
+    line.ends_with("):") && line.contains(" failed (exit ")
+}
+
 /// Turn a `headroom learn` stdout line into the step shown under the scan timer,
 /// or None to leave the current step alone.
 ///
@@ -6015,9 +6262,17 @@ fn execute_headroom_learn_run(
     // every release from 0.8.2 to 0.8.6). Same failure the /stats probe had at
     // 500ms -- a cap tight enough to turn "slow" into "broken".
     //
-    // Only the IDLE cap moves. Upstream's 300s hard cap still bounds a genuine
-    // hang, so this trades a slower failure for runs that now finish.
+    // The idle cap is what catches a genuine hang: a wedged CLI stops
+    // streaming, and 180s of silence kills it whatever the wall clock says.
     command.env("HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS", "180");
+    // The hard cap bounds a run that IS still streaming. Upstream's 300s
+    // default was sized for a small digest; a user with 1600 sessions and
+    // 69k calls (RUST-B8) needs the model to read and write for longer than
+    // that while producing events the whole time, and the cap killed a
+    // healthy run at five minutes with a hint to raise this very variable.
+    // Fifteen minutes: this is a background job with its own step timer in
+    // the UI, and the idle cap above still ends a stall within three.
+    command.env("HEADROOM_LEARN_CLI_TIMEOUT_SECS", "900");
     match agent {
         LearnAgent::Claude => {
             // Per-project Claude scan; writes CLAUDE.md / MEMORY.md for the
@@ -6131,50 +6386,81 @@ fn execute_headroom_learn_run(
                     // failure class per user (RUST-A2/RUST-9Z). The unmodified
                     // text stays in `reason` and `stderr_tail` below.
                     let signature = normalize_learn_failure_signature(&raw_signature);
-                    sentry::with_scope(
-                        |scope| {
-                            scope.set_tag("flow", "headroom_learn");
-                            scope.set_tag("learn_outcome", "llm_analysis_failed");
-                            scope.set_tag("learn_agent", agent.as_tag());
-                            scope.set_extra("reason", warnings.clone().into());
-                            scope.set_extra("raw_signature", raw_signature.clone().into());
-                            scope.set_extra("project_name", project_name.to_string().into());
-                            // The marker line ends at its colon: upstream
-                            // appends the child's stderr, and `claude -p
-                            // --output-format stream-json` writes its diagnosis
-                            // to stdout, so `reason` arrives empty and every
-                            // distinct cause -- usage limit, dead local route,
-                            // our own 400 -- collapses onto one fingerprint
-                            // (RUST-74: 14 events over six users' machines with
-                            // nothing in them to tell apart). The analyzer's
-                            // surrounding log lines are the only context left
-                            // on this side of the process boundary.
-                            //
-                            // stderr ONLY. stdout echoes written memory files
-                            // back verbatim (see `learn_step_label`), and that
-                            // is the user's project content -- it must never
-                            // reach Sentry.
-                            scope.set_extra(
-                                "stderr_tail",
-                                crate::state::tail_lines(&stderr, 32).join("\n").into(),
-                            );
-                            scope.set_fingerprint(Some(
-                                ["headroom_learn_llm_failure", signature.as_str()].as_slice(),
-                            ));
-                        },
-                        || {
-                            sentry::capture_message(
-                                &format!("headroom learn produced no recommendations: {signature}"),
-                                sentry::Level::Warning,
-                            );
-                        },
-                    );
+                    // Same user-environment carve-out as the non-zero-exit
+                    // branch below (RUST-B6): when the agent CLI has no signed-in
+                    // session, nothing on our side can change the outcome.
+                    let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
+                    if !agent_not_signed_in {
+                        sentry::with_scope(
+                            |scope| {
+                                scope.set_tag("flow", "headroom_learn");
+                                scope.set_tag("learn_outcome", "llm_analysis_failed");
+                                scope.set_tag("learn_agent", agent.as_tag());
+                                scope.set_extra("reason", warnings.clone().into());
+                                scope.set_extra("raw_signature", raw_signature.clone().into());
+                                scope.set_extra("project_name", project_name.to_string().into());
+                                // The marker line ends at its colon: upstream
+                                // appends the child's stderr, and `claude -p
+                                // --output-format stream-json` writes its diagnosis
+                                // to stdout, so `reason` arrives empty and every
+                                // distinct cause -- usage limit, dead local route,
+                                // our own 400 -- collapses onto one fingerprint
+                                // (RUST-74: 14 events over six users' machines with
+                                // nothing in them to tell apart). The analyzer's
+                                // surrounding log lines are the only context left
+                                // on this side of the process boundary.
+                                //
+                                // stderr ONLY. stdout echoes written memory files
+                                // back verbatim (see `learn_step_label`), and that
+                                // is the user's project content -- it must never
+                                // reach Sentry.
+                                // Pre-redacted, and under a `_redacted` key so
+                                // it can be allowlisted in the project's
+                                // Sentry `safeFields` without also un-scrubbing
+                                // the raw `stderr_tail` that already-shipped
+                                // builds keep sending. Same reasoning as
+                                // `proxy_log_tail`: one `sk-ant-…` anywhere in
+                                // the value and the scrubber replaces the whole
+                                // field with `[Filtered]`, which is how RUST-BC
+                                // arrived undiagnosable.
+                                scope.set_extra(
+                                    "stderr_tail_redacted",
+                                    crate::tool_manager::redact_sensitive(
+                                        &crate::state::tail_lines(&stderr, 32).join("\n"),
+                                    )
+                                    .into(),
+                                );
+                                scope.set_fingerprint(Some(
+                                    ["headroom_learn_llm_failure", signature.as_str()].as_slice(),
+                                ));
+                            },
+                            || {
+                                sentry::capture_message(
+                                    &format!(
+                                        "headroom learn produced no recommendations: {signature}"
+                                    ),
+                                    sentry::Level::Warning,
+                                );
+                            },
+                        );
+                    }
+                    let (summary, detail) = if agent_not_signed_in {
+                        (
+                            format!("headroom learn needs a signed-in agent for {project_name}."),
+                            learn_agent_auth_hint(agent),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "headroom learn could not produce recommendations for {project_name}."
+                            ),
+                            warnings,
+                        )
+                    };
                     (
-                        format!(
-                            "headroom learn could not produce recommendations for {project_name}."
-                        ),
+                        summary,
                         false,
-                        Some(warnings),
+                        Some(detail),
                         output_tail,
                         stdout,
                         stderr,
@@ -6226,18 +6512,39 @@ fn execute_headroom_learn_run(
                 // command-shaped reason, the resolved CLI path in it would
                 // split one failure class per machine. A no-op on any line that
                 // is not command-shaped.
-                let signature: String = normalize_learn_failure_signature(
+                // The marker line's reason sits on the NEXT line, so join it in
+                // when the first line ends at its dangling colon -- but only
+                // for stderr. `signature_source` falls back to stdout when
+                // stderr is empty, and stdout echoes written memory files back
+                // verbatim (see `learn_step_label`): that is the user's project
+                // content and must never reach a Sentry title.
+                let signature_head = if stderr.trim().is_empty() {
                     signature_source
                         .lines()
                         .map(str::trim)
                         .find(|l| !l.is_empty())
                         .unwrap_or("no output")
+                        .to_string()
+                } else {
+                    learn_failure_signature_source(signature_source)
+                };
+                let signature: String = normalize_learn_failure_signature(
+                    signature_head
                         .chars()
                         .take(160)
                         .collect::<String>()
                         .as_str(),
                 );
-                let stderr_head: String = stderr.chars().take(2000).collect();
+                // Redacted before Sentry sees them: the agent CLI's stderr on an
+                // auth failure is exactly where a key can appear, and one
+                // `sk-ant-…` costs the WHOLE field to the scrubber (RUST-BC's
+                // stderr arrived `[Filtered]`, so the failure could not be
+                // diagnosed at all). `stdout_head` stays raw and stays scrubbed:
+                // it echoes the user's memory files, which we do not want
+                // readable in Sentry even when it survives.
+                let stderr_head = crate::tool_manager::redact_sensitive(
+                    &stderr.chars().take(2000).collect::<String>(),
+                );
                 let stdout_head: String = stdout.chars().take(2000).collect();
                 let cli_path_str = cli_path
                     .as_ref()
@@ -6251,7 +6558,14 @@ fn execute_headroom_learn_run(
                 // unreadable between the pre-flight read_dir check and the CLI
                 // run. Click reports that as exit 2 with "is not readable" — a
                 // user-environment condition, not an app bug, so don't report it.
-                let user_env_condition = signature.contains("is not readable");
+                //
+                // The agent CLI having no signed-in session is the same class
+                // (RUST-B6). Matched against the whole stderr rather than the
+                // signature: upstream's marker line ends before the child's
+                // login prompt, which can land several lines further down.
+                let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
+                let user_env_condition =
+                    signature.contains("is not readable") || agent_not_signed_in;
                 if !user_env_condition {
                     sentry::with_scope(
                         |scope| {
@@ -6265,8 +6579,11 @@ fn execute_headroom_learn_run(
                                     .map(|s| s.to_string().into())
                                     .unwrap_or(serde_json::Value::Null),
                             );
-                            scope.set_extra("output_tail", fail_tail.clone().into());
-                            scope.set_extra("stderr_head", stderr_head.into());
+                            scope.set_extra(
+                                "output_tail_redacted",
+                                crate::tool_manager::redact_sensitive(&fail_tail).into(),
+                            );
+                            scope.set_extra("stderr_head_redacted", stderr_head.into());
                             scope.set_extra("stdout_head", stdout_head.into());
                             scope.set_extra("cli_path", cli_path_str.into());
                             scope.set_extra("project_name", project_name.to_string().into());
@@ -6277,13 +6594,25 @@ fn execute_headroom_learn_run(
                         },
                     );
                 }
-                (
-                    format!("headroom learn failed for {project_name}."),
-                    false,
-                    Some(format!(
+                // A missing agent session has a remedy the user can act on;
+                // the raw exit status and output tail do not name it.
+                let user_error = if agent_not_signed_in {
+                    learn_agent_auth_hint(agent)
+                } else {
+                    format!(
                         "headroom learn exited with {}.\n{}",
                         output.status, fail_tail
-                    )),
+                    )
+                };
+                let user_summary = if agent_not_signed_in {
+                    format!("headroom learn needs a signed-in agent for {project_name}.")
+                } else {
+                    format!("headroom learn failed for {project_name}.")
+                };
+                (
+                    user_summary,
+                    false,
+                    Some(user_error),
                     output_tail,
                     stdout,
                     stderr,
@@ -7783,22 +8112,24 @@ mod tests {
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
         fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
-        install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
-        is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
-        learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        install_pending_update, is_blocked_runtime_dll_signal, is_disk_full_signal,
+        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
+        is_prerelease_version, learn_agent_auth_hint, learn_failure_is_agent_auth,
+        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, normalize_learn_failure_signature,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        select_updater_endpoints, store_checked_update, strip_connection_noise,
-        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
-        PENDING_MAGIC_LINK,
+        select_updater_endpoints, startup_error_fingerprint_key, store_checked_update,
+        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link, user_message_for,
+        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -10343,6 +10674,110 @@ Some unrelated content.
     }
 
     #[test]
+    fn learn_failure_is_agent_auth_matches_the_cli_login_prompts() {
+        // RUST-B6 verbatim: four events whose only content was the child CLI
+        // saying nobody is signed in.
+        let stderr = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nNot logged in \u{b7} Please run /login\n";
+        assert!(learn_failure_is_agent_auth(stderr));
+        assert!(learn_failure_is_agent_auth(
+            "Error: not authenticated. Please run `codex login`."
+        ));
+        assert!(learn_failure_is_agent_auth(
+            "AuthenticationError: invalid API key"
+        ));
+        assert!(learn_failure_is_agent_auth("Your OAuth token has expired."));
+    }
+
+    #[test]
+    fn learn_failure_is_agent_auth_does_not_swallow_real_failures() {
+        // These must keep reporting: they are ours to fix.
+        for stderr in [
+            "LLM analysis failed: `claude -p` did not respond within 120s.",
+            "ModuleNotFoundError: No module named 'headroom.learn'",
+            "Error: rate limit exceeded, try again later",
+            "usage limit reached for this session",
+            "",
+        ] {
+            assert!(!learn_failure_is_agent_auth(stderr), "for: {stderr}");
+        }
+    }
+
+    #[test]
+    fn learn_failure_signature_source_joins_the_dangling_marker_line() {
+        // Upstream's marker ends at a colon and appends the child's real
+        // diagnosis on the next line. Fingerprinting the marker alone put every
+        // distinct cause on one issue (RUST-74, then RUST-B6).
+        let stderr = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nNot logged in \u{b7} Please run /login\n";
+        let signature = learn_failure_signature_source(stderr);
+        assert!(signature.contains("Not logged in"), "got: {signature}");
+
+        // Two different causes behind the same marker must not collapse.
+        let other = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nCredit balance is too low\n";
+        assert_ne!(signature, learn_failure_signature_source(other));
+    }
+
+    #[test]
+    fn learn_failure_signature_source_never_joins_a_dump_marker() {
+        // RUST-B7: "First 2000 chars:" introduces the model's raw output,
+        // derived from the user's own sessions. It ends at a colon like the
+        // exit marker does, but must never be pulled into a Sentry title.
+        let stderr = "LLM analysis failed: `claude -p --output-format stream-json --verbose` \
+                      returned unparseable output. First 2000 chars:\n\
+                      {\"type\":\"assistant\",\"text\":\"The auth module in src/login.ts ...\"}\n";
+        let signature = learn_failure_signature_source(stderr);
+        assert!(signature.ends_with("First 2000 chars:"), "got: {signature}");
+        assert!(!signature.contains("login.ts"), "got: {signature}");
+    }
+
+    #[test]
+    fn learn_failure_signature_source_skips_unrelated_stderr_preamble() {
+        // RUST-BC: an onnxruntime C-API warning from upstream's own logger is
+        // the first stderr line on any host with onnxruntime < 1.24. It has
+        // nothing to do with the failure, and fingerprinting it merged every
+        // distinct learn failure on those machines onto one issue.
+        let preamble = "onnxruntime 1.20 exposes an older C API than Rust detection requires (1.24+); leaving ORT_DYLIB_PATH unset and using Python detection\n";
+        let stderr = format!(
+            "{preamble}LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nCredit balance is too low\n"
+        );
+        let signature = learn_failure_signature_source(&stderr);
+        assert!(
+            signature.contains("Credit balance is too low"),
+            "got: {signature}"
+        );
+        assert!(!signature.contains("onnxruntime"), "got: {signature}");
+
+        // Two causes behind the same preamble must still not collapse.
+        let other = format!(
+            "{preamble}LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nNot logged in \u{b7} Please run /login\n"
+        );
+        assert_ne!(signature, learn_failure_signature_source(&other));
+
+        // No marker anywhere: the first line is still all there is.
+        assert!(
+            learn_failure_signature_source(preamble).starts_with("onnxruntime 1.20"),
+            "preamble-only stderr should fall back to line one"
+        );
+    }
+
+    #[test]
+    fn learn_failure_signature_source_leaves_a_self_contained_line_alone() {
+        let stderr = "ModuleNotFoundError: No module named 'headroom'\nTraceback follows\n";
+        assert_eq!(
+            learn_failure_signature_source(stderr),
+            "ModuleNotFoundError: No module named 'headroom'"
+        );
+        assert_eq!(learn_failure_signature_source("   \n\n"), "no output");
+    }
+
+    #[test]
+    fn learn_agent_auth_hint_names_the_cli_the_run_shelled_out_to() {
+        let hint = learn_agent_auth_hint(LearnAgent::Claude);
+        assert!(hint.contains("Claude Code"), "got: {hint}");
+        assert!(hint.contains("`claude`"), "got: {hint}");
+        assert!(learn_agent_auth_hint(LearnAgent::Codex).contains("`codex`"));
+    }
+
+    #[test]
     fn extract_llm_failure_warnings_returns_none_for_clean_stderr() {
         let stderr =
             "2026-05-04 09:00:00,000 - headroom.learn.analyzer - INFO - using claude CLI backend\n";
@@ -10562,6 +10997,88 @@ Some unrelated content.
             "starting headroom background process: port 6768 is occupied by a \
              non-headroom process"
         ));
+    }
+
+    /// RUST-BB/BA/5C verbatim: the App Control verdict seen from inside
+    /// Python. No `os error 4551` -- CPython's ImportError carries Windows'
+    /// localized prose and nothing else -- so the code-based match above
+    /// missed it and one host was filed as three Error-level issues.
+    #[test]
+    fn an_app_control_block_on_a_stdlib_dll_is_recognised_from_the_import_error() {
+        let chain = "unable to keep headroom running in background (prior attempts: \
+                     ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe \
+                     proxy --port 6768 exited with status exit code: 0xffffffff before opening \
+                     port 6768) (onnx probe: onnxruntime imports cleanly): python.exe -m \
+                     headroom.proxy.server exited with status exit code: 1 before opening port 6768\n\
+                     --- log tail ---\n  File \"...\\Lib\\sqlite3\\dbapi2.py\", line 27, in <module>\n    \
+                     from _sqlite3 import *\nImportError: DLL load failed while importing _sqlite3: \
+                     Una directiva de Control de aplicaciones bloqueó este archivo.\n--- end log ---";
+        assert!(is_blocked_runtime_dll_signal(chain));
+        assert!(is_endpoint_protection_signal(chain));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(chain)),
+            Some("startup_endpoint_protection")
+        );
+
+        // Any locale: the structural half needs no prose at all.
+        assert!(is_blocked_runtime_dll_signal(
+            "ImportError: DLL load failed while importing _ssl: 지정된 모듈을 찾을 수 없습니다."
+        ));
+
+        // RUST-5C's `last_startup_error` carries the same verdict without the
+        // `while`, in the copy upstream re-wraps into the error chain. Both
+        // spellings must reach the same verdict or the give-up escalates to
+        // Error for a block we already reported once.
+        let no_while = "ImportError: DLL load failed importing _sqlite3: \
+                        Una directiva de Control de aplicaciones bloqueó este archivo.";
+        assert!(is_blocked_runtime_dll_signal(no_while));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(no_while)),
+            Some("startup_endpoint_protection")
+        );
+        // Still module-scoped, so the looser anchor cannot pull in a
+        // third-party load failure or a bare "DLL load failed:".
+        assert!(!is_blocked_runtime_dll_signal(
+            "ImportError: DLL load failed importing onnxruntime_pybind11_state: not found."
+        ));
+        assert!(!is_blocked_runtime_dll_signal(
+            "ImportError: DLL load failed: The specified module could not be found."
+        ));
+    }
+
+    #[test]
+    fn a_third_party_dll_load_failure_is_not_endpoint_protection() {
+        // onnxruntime/torch failing to load is usually a missing Visual C++
+        // runtime, which has its own hint; it must not be sold as antivirus.
+        for raw in [
+            "ImportError: DLL load failed while importing onnxruntime_pybind11_state: \
+             The specified module could not be found.",
+            "ImportError: DLL load failed while importing _C: The specified module could not be found.",
+            "ModuleNotFoundError: No module named '_sqlite3'",
+        ] {
+            assert!(!is_blocked_runtime_dll_signal(raw), "for: {raw}");
+            assert!(!is_endpoint_protection_signal(raw), "for: {raw}");
+        }
+    }
+
+    #[test]
+    fn startup_error_fingerprint_key_only_names_causes_with_a_remedy() {
+        assert_eq!(startup_error_fingerprint_key(None), None);
+        assert_eq!(
+            startup_error_fingerprint_key(Some(
+                "python.exe -m headroom.proxy.server exited with status exit code: 1 \
+                 before opening port 6768"
+            )),
+            None,
+            "an unclassified crash keeps the fingerprint the existing issues carry"
+        );
+        assert_eq!(
+            startup_error_fingerprint_key(Some(
+                "starting headroom background process: port 6768 is occupied by a \
+                 non-headroom process"
+            )),
+            Some("startup_port_conflict")
+        );
     }
 
     #[test]
@@ -10790,5 +11307,45 @@ Some unrelated content.
             None,
             "a reload must not replay a spent code"
         );
+    }
+}
+
+#[cfg(test)]
+mod output_reduction_report_tests {
+    use super::reported_output_reduction;
+    use crate::models::OutputReduction;
+
+    fn reduction() -> OutputReduction {
+        OutputReduction {
+            method: "estimated".to_string(),
+            reduction_percent: 28.0,
+            ci_low_percent: 20.0,
+            ci_high_percent: 36.0,
+            requests: 19_644,
+        }
+    }
+
+    #[test]
+    fn blocked_shaper_reports_inactive_without_a_percent() {
+        let (pct, method) = reported_output_reduction(Some(&reduction()), Some(false));
+        assert_eq!(pct, None);
+        assert_eq!(method.as_deref(), Some("inactive"));
+    }
+
+    #[test]
+    fn active_shaper_reports_the_reduction_unchanged() {
+        let (pct, method) = reported_output_reduction(Some(&reduction()), Some(true));
+        assert_eq!(pct, Some(28.0));
+        assert_eq!(method.as_deref(), Some("estimated"));
+    }
+
+    #[test]
+    fn unknown_rollout_state_keeps_the_old_behavior() {
+        let (pct, method) = reported_output_reduction(Some(&reduction()), None);
+        assert_eq!(pct, Some(28.0));
+        assert_eq!(method.as_deref(), Some("estimated"));
+        let (none_pct, none_method) = reported_output_reduction(None, None);
+        assert_eq!(none_pct, None);
+        assert_eq!(none_method, None);
     }
 }
