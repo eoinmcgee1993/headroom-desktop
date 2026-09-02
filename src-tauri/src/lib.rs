@@ -6045,6 +6045,47 @@ fn learn_agent_auth_hint(agent: LearnAgent) -> String {
     )
 }
 
+/// The CLI line saying a `headroom learn` failure was the coding agent hitting
+/// its plan's session/usage limit, or None when that is not the cause.
+///
+/// Same user-environment class as [`learn_failure_is_agent_auth`] -- nothing on
+/// our side can change the outcome (RUST-BF: `You've hit your session limit
+/// \u{b7} resets 9:10am (America/Chicago)`) -- but deliberately a separate
+/// classifier, because the auth remedy ("run /login") is wrong advice for a
+/// limit. Staying out of Sentry also sidesteps a grouping break: the reset
+/// clock in the message lands in the fingerprint, so this class could never
+/// group into one issue. Returns the matched line so the UI hint can echo the
+/// CLI's own reset time.
+fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
+    // Full CLI phrases, like the auth needles: "limit" alone would match a
+    // project's own source lines echoed back in the output.
+    const NEEDLES: &[&str] = &[
+        "hit your session limit",
+        "session limit reached",
+        "hit your usage limit",
+        "usage limit reached",
+    ];
+    text.lines().map(str::trim).find(|line| {
+        let lower = line.to_ascii_lowercase();
+        NEEDLES.iter().any(|needle| lower.contains(needle))
+    })
+}
+
+/// The user-facing remedy for [`learn_failure_agent_limit_line`], echoing the
+/// CLI's own line so the reset time survives to the UI.
+fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
+    let cli = match agent {
+        LearnAgent::Claude => "Claude Code",
+        LearnAgent::Codex => "Codex",
+        LearnAgent::Opencode => "opencode",
+        LearnAgent::Grok => "Grok",
+    };
+    format!(
+        "{cli} hit your plan's usage limit, so headroom learn could not run its analysis \
+         (\"{limit_line}\"). Start the scan again after the limit resets."
+    )
+}
+
 /// The text a learn failure is fingerprinted on.
 ///
 /// Upstream's first stderr line is a marker whose reason is EMPTY -- ``LLM
@@ -6389,10 +6430,13 @@ fn execute_headroom_learn_run(
                     // text stays in `reason` and `stderr_tail` below.
                     let signature = normalize_learn_failure_signature(&raw_signature);
                     // Same user-environment carve-out as the non-zero-exit
-                    // branch below (RUST-B6): when the agent CLI has no signed-in
-                    // session, nothing on our side can change the outcome.
+                    // branch below (RUST-B6, RUST-BF): when the agent CLI has no
+                    // signed-in session or its plan hit a usage limit, nothing
+                    // on our side can change the outcome.
                     let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
-                    if !agent_not_signed_in {
+                    let agent_limit_line =
+                        learn_failure_agent_limit_line(&stderr).map(str::to_string);
+                    if !agent_not_signed_in && agent_limit_line.is_none() {
                         sentry::with_scope(
                             |scope| {
                                 scope.set_tag("flow", "headroom_learn");
@@ -6450,6 +6494,13 @@ fn execute_headroom_learn_run(
                         (
                             format!("headroom learn needs a signed-in agent for {project_name}."),
                             learn_agent_auth_hint(agent),
+                        )
+                    } else if let Some(line) = &agent_limit_line {
+                        (
+                            format!(
+                                "headroom learn hit the agent's usage limit for {project_name}."
+                            ),
+                            learn_agent_limit_hint(agent, line),
                         )
                     } else {
                         (
@@ -6562,12 +6613,15 @@ fn execute_headroom_learn_run(
                 // user-environment condition, not an app bug, so don't report it.
                 //
                 // The agent CLI having no signed-in session is the same class
-                // (RUST-B6). Matched against the whole stderr rather than the
-                // signature: upstream's marker line ends before the child's
-                // login prompt, which can land several lines further down.
+                // (RUST-B6), as is its plan hitting a usage limit (RUST-BF).
+                // Matched against the whole stderr rather than the signature:
+                // upstream's marker line ends before the child's diagnosis,
+                // which can land several lines further down.
                 let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
-                let user_env_condition =
-                    signature.contains("is not readable") || agent_not_signed_in;
+                let agent_limit_line = learn_failure_agent_limit_line(&stderr).map(str::to_string);
+                let user_env_condition = signature.contains("is not readable")
+                    || agent_not_signed_in
+                    || agent_limit_line.is_some();
                 if !user_env_condition {
                     sentry::with_scope(
                         |scope| {
@@ -6600,6 +6654,8 @@ fn execute_headroom_learn_run(
                 // the raw exit status and output tail do not name it.
                 let user_error = if agent_not_signed_in {
                     learn_agent_auth_hint(agent)
+                } else if let Some(line) = &agent_limit_line {
+                    learn_agent_limit_hint(agent, line)
                 } else {
                     format!(
                         "headroom learn exited with {}.\n{}",
@@ -6608,6 +6664,8 @@ fn execute_headroom_learn_run(
                 };
                 let user_summary = if agent_not_signed_in {
                     format!("headroom learn needs a signed-in agent for {project_name}.")
+                } else if agent_limit_line.is_some() {
+                    format!("headroom learn hit the agent's usage limit for {project_name}.")
                 } else {
                     format!("headroom learn failed for {project_name}.")
                 };
@@ -8116,7 +8174,8 @@ mod tests {
         fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
         install_pending_update, is_blocked_runtime_dll_signal, is_disk_full_signal,
         is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
-        is_prerelease_version, learn_agent_auth_hint, learn_failure_is_agent_auth,
+        is_prerelease_version, learn_agent_auth_hint, learn_agent_limit_hint,
+        learn_failure_agent_limit_line, learn_failure_is_agent_auth,
         learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
         noop_app_update_progress_emitter, normalize_learn_failure_signature,
         onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
@@ -10694,7 +10753,9 @@ Some unrelated content.
 
     #[test]
     fn learn_failure_is_agent_auth_does_not_swallow_real_failures() {
-        // These must keep reporting: they are ours to fix.
+        // None of these are auth: the "run /login" remedy would be wrong
+        // advice. (The usage-limit line is user-environment too, but it is the
+        // LIMIT classifier's job, with its own remedy.)
         for stderr in [
             "LLM analysis failed: `claude -p` did not respond within 120s.",
             "ModuleNotFoundError: No module named 'headroom.learn'",
@@ -10704,6 +10765,50 @@ Some unrelated content.
         ] {
             assert!(!learn_failure_is_agent_auth(stderr), "for: {stderr}");
         }
+    }
+
+    #[test]
+    fn learn_failure_agent_limit_line_matches_the_cli_limit_messages() {
+        // RUST-BF verbatim: the child CLI's diagnosis on the line after
+        // upstream's marker.
+        let stderr = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nYou've hit your session limit \u{b7} resets 9:10am (America/Chicago)\n";
+        let line = learn_failure_agent_limit_line(stderr).expect("should match");
+        // The matched line (not the marker) so the hint carries the reset time.
+        assert!(line.starts_with("You've hit your session limit"), "{line}");
+        assert!(line.contains("resets 9:10am"), "{line}");
+
+        assert!(learn_failure_agent_limit_line("usage limit reached for this session").is_some());
+        assert!(learn_failure_agent_limit_line("You've hit your usage limit.").is_some());
+    }
+
+    #[test]
+    fn learn_failure_agent_limit_line_does_not_swallow_real_failures() {
+        // These must keep reporting: they are ours to fix (or transient).
+        for stderr in [
+            "LLM analysis failed: `claude -p` did not respond within 120s.",
+            "Error: rate limit exceeded, try again later",
+            "Not logged in \u{b7} Please run /login",
+            "Credit balance is too low",
+            // "limit" in a project's own echoed source must not match.
+            "const SESSION_LIMIT = 5;",
+            "",
+        ] {
+            assert!(
+                learn_failure_agent_limit_line(stderr).is_none(),
+                "for: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn learn_agent_limit_hint_echoes_the_reset_time_and_names_the_cli() {
+        let hint = learn_agent_limit_hint(
+            LearnAgent::Claude,
+            "You've hit your session limit \u{b7} resets 9:10am (America/Chicago)",
+        );
+        assert!(hint.contains("Claude Code"), "{hint}");
+        assert!(hint.contains("resets 9:10am"), "{hint}");
+        assert!(learn_agent_limit_hint(LearnAgent::Codex, "usage limit reached").contains("Codex"));
     }
 
     #[test]
