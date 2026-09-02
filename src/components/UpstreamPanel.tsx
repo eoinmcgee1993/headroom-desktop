@@ -106,8 +106,7 @@ export function UpstreamPanel() {
         <div>
           <h3>Provider</h3>
           <p className="panel-card__subtitle">
-            Route Headroom at an Anthropic-compatible endpoint instead of Anthropic.
-            Pick one and paste its token; pick Anthropic to switch back.
+            Route Headroom to an alternative model that is Anthropic-compatible.
           </p>
         </div>
       </div>
@@ -216,18 +215,9 @@ export function UpstreamPanel() {
 
           {preset ? (
             <p className="upstream-panel__meta">
-              Sets {preset.baseUrl} and {preset.model} in ~/.claude/settings.json. If your
-              plan serves a different model, pick Other and name it.
+              Sets {preset.baseUrl} and {preset.model} in ~/.claude/settings.json.
             </p>
           ) : null}
-
-          {provider === "" ? null : (
-            <p className="upstream-panel__meta">
-              The token is kept in your OS keychain and written to ~/.claude/settings.json,
-              which is where your client reads it from. Headroom forwards the token your
-              client sends and never adds one of its own.
-            </p>
-          )}
 
           <div className="upstream-panel__actions">
             <button
@@ -253,12 +243,6 @@ export function UpstreamPanel() {
             ) : null}
           </div>
 
-          {configured ? (
-            <p className="upstream-panel__meta">
-              Third-party endpoints run lossless compaction only, so payloads stay close
-              to what your client sent.
-            </p>
-          ) : null}
           {error ? <p className="install-progress__error">{error}</p> : null}
           {notice ? <p className="install-progress__notice">{notice}</p> : null}
         </div>
