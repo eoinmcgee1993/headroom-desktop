@@ -4464,6 +4464,17 @@ struct PersistedSavingsState {
     /// local (`local_hour_key`, joining the local-keyed hourly points).
     output_daily_samples: BTreeMap<String, OutputSampleBucket>,
     output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// Locally-sampled tool-schema deferral deltas, keyed exactly like the
+    /// output samples above. The backend exposes tool-schema savings ONLY as a
+    /// lifetime cumulative counter: it is absent from the `history`
+    /// checkpoints, from `series.hourly`, and from that series' `by_model`
+    /// entries (verified against a 0.37.0 wheel, 2026-09-02). Sampling the
+    /// deltas here is therefore the only per-bucket record of this layer that
+    /// can exist, and it necessarily starts empty -- there is nothing to
+    /// backfill from, so any chart that adds the layer steps up on the day
+    /// sampling began and must say so rather than imply a real jump.
+    tool_schema_daily_samples: BTreeMap<String, u64>,
+    tool_schema_hourly_samples: BTreeMap<String, u64>,
     /// See [`OUTPUT_SAMPLE_SERIES_VERSION`]. Container default (0) marks a
     /// file written before the field existed, whose series is in old units.
     output_sample_series_version: u8,
@@ -4509,6 +4520,9 @@ struct SavingsTracker {
     /// See `PersistedSavingsState::output_daily_samples`.
     output_daily_samples: BTreeMap<String, OutputSampleBucket>,
     output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// See `PersistedSavingsState::tool_schema_daily_samples`.
+    tool_schema_daily_samples: BTreeMap<String, u64>,
+    tool_schema_hourly_samples: BTreeMap<String, u64>,
     /// High-water (tokens_saved, baseline_tokens) of the shaper's durable
     /// estimator. Not persisted directly: the first post-launch reading seeds
     /// it (never emitting a delta, so a closed-app gap isn't billed to the
@@ -4661,6 +4675,16 @@ impl SavingsTracker {
                         samples.retain(|key, _| !key.starts_with(&seam_day_local));
                     }
                     samples
+                }),
+            tool_schema_daily_samples: persisted_state
+                .as_ref()
+                .map_or_else(BTreeMap::new, |state| {
+                    state.tool_schema_daily_samples.clone()
+                }),
+            tool_schema_hourly_samples: persisted_state
+                .as_ref()
+                .map_or_else(BTreeMap::new, |state| {
+                    state.tool_schema_hourly_samples.clone()
                 }),
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: persisted_state
@@ -4921,6 +4945,18 @@ impl SavingsTracker {
         self.tool_schema_process_total = Some(reading);
         self.lifetime_tool_schema_tokens_saved =
             self.lifetime_tool_schema_tokens_saved.saturating_add(delta);
+        if delta > 0 {
+            // Same keying as the output samples: UTC day (joins the backend's
+            // UTC daily rollups), local hour (joins the local-keyed hourly
+            // points). Attributed to the moment of observation, so a delta
+            // spanning a bucket edge lands wholly in the later bucket -- the
+            // same approximation the output sampler makes.
+            let now_utc = Utc::now();
+            let day_key = now_utc.format("%Y-%m-%d").to_string();
+            let hour_key = local_hour_key(now_utc.with_timezone(&Local));
+            *self.tool_schema_daily_samples.entry(day_key).or_insert(0) += delta;
+            *self.tool_schema_hourly_samples.entry(hour_key).or_insert(0) += delta;
+        }
     }
 
     fn observe(&mut self, stats: &HeadroomDashboardStats) -> Option<SavingsTotalsSnapshot> {
@@ -5456,6 +5492,8 @@ impl SavingsTracker {
             hourly_savings: self.hourly_savings.clone(),
             output_daily_samples: self.output_daily_samples.clone(),
             output_hourly_samples: self.output_hourly_samples.clone(),
+            tool_schema_daily_samples: self.tool_schema_daily_samples.clone(),
+            tool_schema_hourly_samples: self.tool_schema_hourly_samples.clone(),
             last_output_estimator_tokens_saved: self.last_output_estimator_tokens_saved,
             last_output_estimator_baseline_tokens: self.last_output_estimator_baseline_tokens,
             output_sample_series_version: OUTPUT_SAMPLE_SERIES_VERSION,
@@ -5491,6 +5529,8 @@ impl SavingsTracker {
         self.session_hourly_buckets
             .retain(|key, _| key.as_str() >= cutoff.as_str());
         self.output_hourly_samples
+            .retain(|key, _| key.as_str() >= cutoff.as_str());
+        self.tool_schema_hourly_samples
             .retain(|key, _| key.as_str() >= cutoff.as_str());
     }
 
@@ -9318,6 +9358,51 @@ mod tests {
     }
 
     #[test]
+    fn tool_schema_samples_bucket_deltas_and_survive_a_backend_restart() {
+        let mut tracker = make_tracker();
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+        // First reading of a process is a baseline: it must not bill the whole
+        // cumulative counter to the current bucket.
+        tracker.accumulate_tool_schema_tokens(10_000);
+        assert!(tracker.tool_schema_daily_samples.is_empty());
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 0);
+
+        tracker.accumulate_tool_schema_tokens(10_500);
+        assert_eq!(tracker.tool_schema_daily_samples[&day_key], 500);
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 500);
+
+        // Deltas accumulate into the same bucket.
+        tracker.accumulate_tool_schema_tokens(11_000);
+        assert_eq!(tracker.tool_schema_daily_samples[&day_key], 1_000);
+
+        // A backend restart resets the proxy's counter to a small value. The
+        // decrease must never emit a delta (that would bill the whole new
+        // process total again); it re-anchors, losing at most one poll, and
+        // the NEXT delta must be measured against the new anchor.
+        tracker.accumulate_tool_schema_tokens(200);
+        assert_eq!(
+            tracker.tool_schema_daily_samples[&day_key], 1_000,
+            "a counter reset must not add a phantom delta"
+        );
+        tracker.accumulate_tool_schema_tokens(700);
+        assert_eq!(
+            tracker.tool_schema_daily_samples[&day_key], 1_500,
+            "after re-anchoring, deltas resume from the new process total"
+        );
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 1_500);
+
+        // The hourly bucket carries the same total under a local-hour key.
+        let hour_key = super::local_hour_key(chrono::Utc::now().with_timezone(&chrono::Local));
+        assert_eq!(tracker.tool_schema_hourly_samples[&hour_key], 1_500);
+
+        // Round-trips through the persisted state.
+        let reloaded = tracker.persisted_state();
+        assert_eq!(reloaded.tool_schema_daily_samples[&day_key], 1_500);
+        assert_eq!(reloaded.tool_schema_hourly_samples[&hour_key], 1_500);
+    }
+
+    #[test]
     fn sample_output_reduction_buckets_deltas_and_reseeds_on_reset() {
         let mut tracker = make_tracker();
         // First reading seeds the watermark, never a delta.
@@ -9553,6 +9638,8 @@ mod tests {
             hourly_savings: std::collections::BTreeMap::new(),
             output_daily_samples: std::collections::BTreeMap::new(),
             output_hourly_samples: std::collections::BTreeMap::new(),
+            tool_schema_daily_samples: std::collections::BTreeMap::new(),
+            tool_schema_hourly_samples: std::collections::BTreeMap::new(),
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: None,
             last_output_estimator_baseline_tokens: None,
@@ -12326,6 +12413,8 @@ mod tests {
             lifetime_requests: 12,
             lifetime_token_milestone_high_water: None,
             lifetime_tool_schema_tokens_saved: 0,
+            tool_schema_daily_samples: std::collections::BTreeMap::new(),
+            tool_schema_hourly_samples: std::collections::BTreeMap::new(),
             last_observation: Some(SavingsObservation {
                 observed_at: Utc::now(),
                 last_activity_at: Some(Utc::now()),
