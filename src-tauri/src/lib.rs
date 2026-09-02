@@ -3377,6 +3377,71 @@ fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize
     }
 }
 
+/// Runs the official Claude Code installer, so the no-clients wizard panel
+/// can offer one click instead of a copy-paste terminal round-trip. Exactly
+/// the script the panel shows for manual use; nothing is decided here, the
+/// panel re-probes connectors afterwards and the installer's own output comes
+/// back on failure. Blocking for its ~30-60s is fine: Tauri runs sync
+/// commands off the UI thread and the button holds a busy state. No timeout —
+/// a hung download leaves the button busy, which the user can abandon for the
+/// manual command sitting right under it.
+#[tauri::command]
+fn install_claude_code_cli() -> Result<(), String> {
+    #[cfg(windows)]
+    let output = crate::proc::command("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "irm https://claude.ai/install.ps1 | iex",
+        ])
+        .output();
+    // pipefail so a failed download surfaces as a failure instead of bash
+    // happily interpreting half a script.
+    #[cfg(not(windows))]
+    let output = crate::proc::command("bash")
+        .args([
+            "-c",
+            "set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash",
+        ])
+        .output();
+
+    let output = output.map_err(|err| format!("could not run the installer: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = last_nonempty_lines(
+        if stderr.trim().is_empty() {
+            &stdout
+        } else {
+            &stderr
+        },
+        3,
+    );
+    Err(if detail.is_empty() {
+        format!("the installer exited with {}", output.status)
+    } else {
+        detail
+    })
+}
+
+/// The last `n` non-empty lines joined with spaces — installer output ends
+/// with the useful error, and a wall of curl progress is not a message.
+fn last_nonempty_lines(text: &str, n: usize) -> String {
+    let mut lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(n)
+        .collect();
+    lines.reverse();
+    lines.join(" ")
+}
+
 /// One command line (unix `ps -axo args=`) or bare image name (windows
 /// tasklist) per item. An agent counts when the first token's basename is its
 /// binary, or when a node/bun interpreter is running a script whose basename
@@ -5645,6 +5710,7 @@ pub fn run() {
             get_headroom_request_counts_by_agent,
             get_intercept_request_counts_by_agent,
             get_running_agent_process_counts,
+            install_claude_code_cli,
             get_launch_flags,
             get_rtk_activity,
             get_tool_logs,
@@ -11635,6 +11701,18 @@ Some unrelated content.
         assert_eq!(counts.get("claude_code"), Some(&1));
         assert_eq!(counts.get("codex"), Some(&1));
         assert_eq!(counts.len(), 2);
+    }
+
+    /// Installer failures must surface the installer's words, not curl's
+    /// progress bars; blank output still yields a usable message upstream.
+    #[test]
+    fn last_nonempty_lines_keeps_the_tail_and_drops_noise() {
+        let text = "step one\n\n  progress 42%  \nerror: no network\n\n";
+        assert_eq!(
+            super::last_nonempty_lines(text, 2),
+            "progress 42% error: no network"
+        );
+        assert_eq!(super::last_nonempty_lines("\n \n", 3), "");
     }
 
     /// The unrouted-usage nudge keys on session mtimes newer than app start;

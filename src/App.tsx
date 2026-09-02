@@ -1665,6 +1665,7 @@ export default function App() {
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
   const [connectorsBusy, setConnectorsBusy] = useState(false);
+  const [claudeInstallBusy, setClaudeInstallBusy] = useState(false);
   const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">(
     () => (isConnectorTrafficVerified() ? "healthy" : "verifying")
   );
@@ -4001,6 +4002,28 @@ export default function App() {
     }
   }
 
+  // One-click path for the no-clients panel: run the official installer,
+  // then re-run the same auto-configure "Check again" uses so a successful
+  // install connects and advances without another click.
+  async function installClaudeCodeCli() {
+    setClaudeInstallBusy(true);
+    setConnectorsError(null);
+    setConnectorsNotice(null);
+    try {
+      await invoke("install_claude_code_cli");
+      trackAnalyticsEvent("claude_code_installer_run", { ok: true });
+      setConnectorsNotice("Claude Code installed. Connecting it...");
+      await autoConfigureConnectorsForLauncher();
+    } catch (error) {
+      trackAnalyticsEvent("claude_code_installer_run", { ok: false });
+      setConnectorsError(
+        describeInvokeError(error, "The Claude Code installer failed. Try the command below in your own terminal.")
+      );
+    } finally {
+      setClaudeInstallBusy(false);
+    }
+  }
+
   // Launcher twin of copyLearnInstallCommand: the launcher stages only render
   // connectorsNotice, not the learn panel's notice.
   async function copyAgentInstallCommand(command: string) {
@@ -5444,10 +5467,21 @@ export default function App() {
                 <div className="install-prompt__head-text">
                   <h2 className="install-prompt__title">Install the Claude Code CLI</h2>
                   <p className="install-prompt__body">
-                    Run this in your terminal and follow the sign-in prompts.
+                    One click runs the official installer. Prefer your own
+                    terminal? The command below is the same thing.
                   </p>
                 </div>
               </header>
+              <button
+                className="primary-button"
+                disabled={claudeInstallBusy || connectorsBusy}
+                onClick={() => void installClaudeCodeCli()}
+                type="button"
+              >
+                {claudeInstallBusy
+                  ? "Installing Claude Code... (about a minute)"
+                  : "Install Claude Code for me"}
+              </button>
               <div className="install-prompt__cmd">
                 <code className="install-prompt__cmd-text">{agentInstallCommand}</code>
                 <button

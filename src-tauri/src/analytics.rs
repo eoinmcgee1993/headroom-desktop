@@ -64,6 +64,9 @@ const ALLOWED_EVENTS: &[&str] = &[
     // Feature engagement: learn runs (per run, `agent` property) and Activity
     // tab opens (once per app run, mirroring app_started's cadence).
     "headroom_learn_run",
+    // One-click Claude Code install from the no-clients wizard panel; carries
+    // ok=true/false so the button's success rate is measurable.
+    "claude_code_installer_run",
     "activity_tab_opened",
 ];
 const SESSION_TIMEOUT_SECS: i64 = 4 * 60 * 60;
