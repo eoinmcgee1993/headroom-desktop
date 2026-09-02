@@ -2800,6 +2800,13 @@ fn is_local_proxy_path(path: &str) -> bool {
         "/livez",
         "/health",
         "/stats",
+        // Needs its own entry: the boundary check below treats "-" as a new
+        // path, so "/stats" does not cover it. Its absence made the desktop's
+        // own savings poll count as client traffic — the first one after the
+        // backend came up fired the first_optimized_request beacon in the same
+        // second as bootstrap_completed, for every install, agent or not
+        // (exactly the false positive 1abf148 fixed for /stats).
+        "/stats-history",
         "/transformations",
         "/dashboard",
         "/debug",
@@ -3166,6 +3173,11 @@ mod tests {
         // Codex's own usage tracker endpoints stay local.
         assert!(is_local_proxy_path("/stats"));
         assert!(!is_openai_path("/stats"));
+        // The desktop's own savings poll: "-" is not a path boundary, so this
+        // needs its own prefix entry or it counts as client traffic and fires
+        // the first_optimized_request beacon at bootstrap-complete.
+        assert!(is_local_proxy_path("/stats-history"));
+        assert!(is_local_proxy_path("/stats-history?limit=100"));
     }
 
     #[test]
