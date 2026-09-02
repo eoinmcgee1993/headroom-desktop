@@ -11854,7 +11854,7 @@ mod tests {
         std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
             .expect("write sitecustomize");
 
-        let out = std::process::Command::new(&python)
+        let out = crate::proc::command(&python)
             .arg(&probe)
             .env("PYTHONPATH", &dir)
             .env("HEADROOM_SDK", "headroom-desktop-proxy")
