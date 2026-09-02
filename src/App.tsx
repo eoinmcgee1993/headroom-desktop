@@ -965,7 +965,8 @@ function DailySavingsChart({
   resetSignal,
   chartMode,
   setChartMode,
-  outputReduction
+  outputReduction,
+  sessionNewInput
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
@@ -973,6 +974,11 @@ function DailySavingsChart({
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
+  /** Session-scope compression rate on the new-input basis (saved vs
+   * uncached + cache-write input). The windowed chips cannot use this basis:
+   * history checkpoints carry no per-bucket new-input split, so this is the
+   * one surface where the denominator matches what compression could touch. */
+  sessionNewInput: { pct: number; savedTokens: number } | null;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
@@ -1138,12 +1144,34 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {compressibleRate !== null || windowOutput !== null || outputReduction ? (
+            {sessionNewInput !== null ||
+            compressibleRate !== null ||
+            windowOutput !== null ||
+            outputReduction ? (
               <span
                 className={`savings-chart__overlay-chips${
                   chartMode === "tokens" ? " savings-chart__overlay-chips--tokens" : ""
                 }`}
               >
+                {sessionNewInput !== null && (
+                  <WindowRateChip
+                    dot="input"
+                    label={`New input −${Math.round(sessionNewInput.pct)}%`}
+                    title="New-input compression"
+                    badge="measured"
+                    value={`${percent1(sessionNewInput.pct)}%`}
+                    rows={[
+                      { dt: "Removed", dd: compactNumber(sessionNewInput.savedTokens) },
+                      {
+                        dt: "New input",
+                        dd: compactNumber(
+                          Math.round(sessionNewInput.savedTokens * (100 / sessionNewInput.pct - 1))
+                        )
+                      }
+                    ]}
+                    note="Vs input that newly entered context this session (uncached + cache writes). The re-sent cached prefix is excluded: Headroom never rewrites it, so it carries no compression opportunity."
+                  />
+                )}
                 {compressibleRate !== null && (
                   <WindowRateChip
                     dot="input"
@@ -6841,6 +6869,14 @@ export default function App() {
                 chartMode={chartMode}
                 setChartMode={setChartMode}
                 outputReduction={dashboard.outputReduction}
+                sessionNewInput={
+                  dashboard.sessionSavingsPct > 0 && dashboard.sessionEstimatedTokensSaved > 0
+                    ? {
+                        pct: dashboard.sessionSavingsPct,
+                        savedTokens: dashboard.sessionEstimatedTokensSaved
+                      }
+                    : null
+                }
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">
