@@ -1139,7 +1139,11 @@ function DailySavingsChart({
               {view === "day" ? "saved today" : "saved this month"}
             </span>
             {compressibleRate !== null || windowOutput !== null || outputReduction ? (
-              <span className="savings-chart__overlay-chips">
+              <span
+                className={`savings-chart__overlay-chips${
+                  chartMode === "tokens" ? " savings-chart__overlay-chips--tokens" : ""
+                }`}
+              >
                 {compressibleRate !== null && (
                   <WindowRateChip
                     dot="input"
@@ -1203,9 +1207,16 @@ function DailySavingsChart({
                   <stop offset="0%" stopColor="#c96a30" />
                   <stop offset="100%" stopColor="#ED834E" />
                 </linearGradient>
+                {/* Saved-token golds are solid: the old translucent "ghost"
+                    fills (20-35% opacity pale yellow) were invisible on the
+                    macOS vibrancy surface. This ramp is validated against both
+                    surfaces: light end >= 2:1 contrast, adjacent-step dL and
+                    orange-vs-gold CVD separation all pass. Keep the tooltip
+                    swatch (--saved-tokens) and the chip-dot tokens
+                    (--chart-*-savings-tokens) in sync when changing it. */}
                 <linearGradient id="savingsTokensGradient" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#d4b832" stopOpacity="0.35" />
-                  <stop offset="100%" stopColor="#EBCC6E" stopOpacity="0.25" />
+                  <stop offset="0%" stopColor="#746605" />
+                  <stop offset="100%" stopColor="#8f7d0b" />
                 </linearGradient>
                 {/* Output shaping sits on top of compression in the same hue
                     family, one shade lighter, so it reads as a second layer of
@@ -1215,8 +1226,8 @@ function DailySavingsChart({
                   <stop offset="100%" stopColor="#8CCCBE" />
                 </linearGradient>
                 <linearGradient id="outputTokensGradient" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#e2cf6a" stopOpacity="0.3" />
-                  <stop offset="100%" stopColor="#F3E2A4" stopOpacity="0.22" />
+                  <stop offset="0%" stopColor="#95810c" />
+                  <stop offset="100%" stopColor="#aa9314" />
                 </linearGradient>
                 {/* Tool-schema deferral, the third layer. Same family again,
                     one further step out, so the bar reads as three shades of
@@ -1228,8 +1239,8 @@ function DailySavingsChart({
                   <stop offset="100%" stopColor="#74BDB0" />
                 </linearGradient>
                 <linearGradient id="toolSchemaTokensGradient" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#eddfa0" stopOpacity="0.28" />
-                  <stop offset="100%" stopColor="#F7EEC9" stopOpacity="0.2" />
+                  <stop offset="0%" stopColor="#b0931a" />
+                  <stop offset="100%" stopColor="#bd9e1e" />
                 </linearGradient>
               </defs>
               <CartesianGrid stroke="rgba(36, 31, 29, 0.06)" strokeDasharray="2 8" vertical={false} />
@@ -1299,54 +1310,23 @@ function DailySavingsChart({
                     dataKey="estimatedTokensSaved"
                     fill="url(#savingsTokensGradient)"
                     maxBarSize={16}
+                    radius={[1, 1, 0, 0]}
                     stackId="tokens"
                     yAxisId="tokens"
-                    shape={(props: any) => {
-                      const { x, y, width, height, fill } = props;
-                      if (!width || !height) return <g />;
-                      const sw = 1.5;
-                      return (
-                        <rect
-                          x={x + sw / 2}
-                          y={y + sw / 2}
-                          width={Math.max(0, width - sw)}
-                          height={Math.max(0, height - sw)}
-                          fill={fill}
-                          stroke="#EBCC6E"
-                          strokeWidth={sw}
-                          rx={1}
-                        />
-                      );
-                    }}
                   />
                   <Bar
                     dataKey="outputTokensSaved"
                     fill="url(#outputTokensGradient)"
                     maxBarSize={16}
+                    radius={[1, 1, 0, 0]}
                     stackId="tokens"
                     yAxisId="tokens"
-                    shape={(props: any) => {
-                      const { x, y, width, height, fill } = props;
-                      if (!width || !height) return <g />;
-                      const sw = 1.5;
-                      return (
-                        <rect
-                          x={x + sw / 2}
-                          y={y + sw / 2}
-                          width={Math.max(0, width - sw)}
-                          height={Math.max(0, height - sw)}
-                          fill={fill}
-                          stroke="#F3E2A4"
-                          strokeWidth={sw}
-                          rx={1}
-                        />
-                      );
-                    }}
                   />
                   <Bar
                     dataKey="toolSchemaTokensSaved"
                     fill="url(#toolSchemaTokensGradient)"
                     maxBarSize={16}
+                    radius={[1, 1, 0, 0]}
                     stackId="tokens"
                     yAxisId="tokens"
                   />

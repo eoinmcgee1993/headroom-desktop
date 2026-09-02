@@ -57,6 +57,10 @@
   /* Output-savings bar segment (chart gradients are theme-invariant), so the
      chip legend dots can key to the exact segment hue. */
   --chart-output-savings: #63b3a4;
+  /* Tokens-mode segment golds (gradient midpoints in App.tsx), so the chip
+     legend dots match the bars in tokens view too. */
+  --chart-input-savings-tokens:  #837305;
+  --chart-output-savings-tokens: #a08a10;
   --warning:            #cb8027;
   --warning-tint:       rgba(203, 128, 39, 0.12);
   --danger:             #c14b24;
@@ -104,6 +108,8 @@
     --accent-tint-strong: rgba(79, 158, 145, 0.3);
     /* Same as light: the chart's segment gradients don't change in dark. */
     --chart-output-savings: #63b3a4;
+    --chart-input-savings-tokens:  #837305;
+    --chart-output-savings-tokens: #a08a10;
     --warning:            #e4a84a;
     --warning-tint:       rgba(220, 143, 26, 0.2);
     --danger:             #e76d3d;
@@ -2244,6 +2250,15 @@ select {
   background: var(--accent);
 }
 
+/* Tokens view paints the saved segments gold, so the legend dots follow. */
+.savings-chart__overlay-chips--tokens .output-chip__dot {
+  background: var(--chart-output-savings-tokens);
+}
+
+.savings-chart__overlay-chips--tokens .output-chip__dot--input {
+  background: var(--chart-input-savings-tokens);
+}
+
 .output-chip__popover {
   position: absolute;
   /* Beside the chip, vertically centered: the chips sit over the history
@@ -2537,9 +2552,8 @@ select {
 }
 
 .savings-chart__tooltip-dot--saved-tokens {
-  background: rgba(235, 204, 110, 0.3);
-  border: 1.5px solid #EBCC6E;
-  box-sizing: border-box;
+  /* Matches savingsTokensGradient in App.tsx (theme-invariant chart color). */
+  background: linear-gradient(180deg, #746605, #8f7d0b);
 }
 
 /* Output shaping is the lighter shade of whichever savings colour is active,
