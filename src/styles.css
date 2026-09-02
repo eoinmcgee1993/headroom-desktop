@@ -6429,6 +6429,13 @@ html.window-hiding {
   color: var(--text-secondary);
 }
 
+.upstream-field select {
+  justify-self: start;
+  min-height: 32px;
+  font: inherit;
+  color: var(--text-primary);
+}
+
 .upstream-panel__actions {
   display: flex;
   gap: 12px;

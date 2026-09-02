@@ -4118,7 +4118,11 @@ pub struct UpstreamOverride {
     /// Normalized by `normalize_upstream_base_url`; empty when unset.
     pub base_url: String,
     pub has_token: bool,
-    /// Model id the provider serves, written to every `ANTHROPIC_DEFAULT_*_MODEL`
+    /// Id of the preset in `client_adapters::PROVIDER_PRESETS` this came from,
+    /// or empty for a hand-entered endpoint. Only the dropdown reads it: the
+    /// URL and model below are already resolved.
+    pub provider: String,
+    /// Model id the provider serves, written to every big `ANTHROPIC_DEFAULT_*_MODEL`
     /// slot. Empty when unset, which leaves the provider to map Claude ids.
     pub model: String,
     /// Context window in tokens for `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. Kept as

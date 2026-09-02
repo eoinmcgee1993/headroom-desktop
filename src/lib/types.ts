@@ -729,12 +729,23 @@ export type UpstreamMode = "off" | "fallback" | "override";
  * itself, only whether one is stored: the token lives in the OS keychain and
  * in the client's own settings.json.
  */
+export interface ProviderPresetView {
+  id: string;
+  label: string;
+  baseUrl: string;
+  model: string;
+}
+
 export interface UpstreamOverrideView {
   mode: UpstreamMode;
   baseUrl: string;
   hasToken: boolean;
+  /** Preset id this came from; empty for a hand-entered endpoint. */
+  provider: string;
   /** Written to every ANTHROPIC_DEFAULT_*_MODEL slot; empty leaves them unset. */
   model: string;
   /** CLAUDE_CODE_AUTO_COMPACT_WINDOW in tokens; empty leaves it unset. */
   contextWindow: string;
+  /** Presets the dropdown offers, supplied by the backend that writes them. */
+  providers: ProviderPresetView[];
 }

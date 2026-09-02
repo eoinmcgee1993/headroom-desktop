@@ -2813,38 +2813,103 @@ const PROVIDER_CLIENT_ENV: &[(&str, &str)] = &[
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
 ];
 
-/// Every model slot Claude Code reads (verified against the shipped binary).
-/// All four are written together: leaving one unset sends that slot's Claude
-/// model id to a provider that does not serve it the moment the user switches
-/// model.
+/// The model slots Claude Code reads for its big tiers (verified against the
+/// shipped binary). All are written together: leaving one unset sends that
+/// slot's Claude model id to a provider that does not serve it the moment the
+/// user switches model.
 const PROVIDER_MODEL_SLOT_ENV: &[&str] = &[
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_SONNET_MODEL",
 ];
 
-/// The rest of the client config a configured provider needs, or a clear of all
-/// of it when `configured` is false -- a stale model id must not outlive the
-/// endpoint that served it, same rule as the token.
+/// The cheap tier Claude Code uses for background work (file summaries, title
+/// generation). Kept separate from the big slots because every provider below
+/// serves a smaller, faster model for it, and pointing it at the big model
+/// costs real money and latency on work the user never reads.
+const PROVIDER_SMALL_MODEL_SLOT_ENV: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
+
+/// A provider Headroom can configure from a token alone.
 ///
-/// `model` and `context_window` stay optional even with a provider set: a
-/// provider that maps Claude model ids itself needs neither.
-pub fn apply_upstream_provider_env(
-    configured: bool,
-    model: Option<&str>,
-    context_window: Option<&str>,
-) -> Result<()> {
+/// Every value is from that vendor's own Claude Code documentation, read
+/// 2026-09-02. Model ids age faster than releases do, which is why the panel
+/// also offers Custom: a stale preset is escapable without an app update.
+pub struct ProviderPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub base_url: &'static str,
+    /// Opus, Sonnet and Fable slots.
+    pub model: &'static str,
+    /// Haiku slot.
+    pub small_model: &'static str,
+    pub context_window: &'static str,
+}
+
+pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "glm",
+        label: "GLM (Z.ai)",
+        base_url: "https://api.z.ai/api/anthropic",
+        model: "glm-5.3[1m]",
+        small_model: "glm-4.7",
+        context_window: "1000000",
+    },
+    ProviderPreset {
+        id: "kimi",
+        label: "Kimi (Moonshot)",
+        base_url: "https://api.moonshot.ai/anthropic",
+        model: "kimi-k3[1m]",
+        small_model: "kimi-k2.7-code",
+        context_window: "1000000",
+    },
+    ProviderPreset {
+        id: "minimax",
+        label: "MiniMax",
+        base_url: "https://api.minimax.io/anthropic",
+        model: "MiniMax-M3",
+        small_model: "MiniMax-M3",
+        context_window: "512000",
+    },
+    ProviderPreset {
+        id: "deepseek",
+        label: "DeepSeek",
+        base_url: "https://api.deepseek.com/anthropic",
+        model: "deepseek-v4-pro[1m]",
+        small_model: "deepseek-v4-flash",
+        context_window: "786432",
+    },
+];
+
+pub fn provider_preset(id: &str) -> Option<&'static ProviderPreset> {
+    PROVIDER_PRESETS.iter().find(|preset| preset.id == id)
+}
+
+/// The client config a configured provider needs beyond the credential. An
+/// empty field means "do not write that key", which is what a provider that
+/// maps Claude model ids itself wants.
+pub struct ProviderClientEnv<'a> {
+    pub model: &'a str,
+    pub small_model: &'a str,
+    pub context_window: &'a str,
+}
+
+/// Write the rest of the client config a configured provider needs, or clear
+/// all of it with `None` -- a stale model id must not outlive the endpoint that
+/// served it, same rule as the token.
+pub fn apply_upstream_provider_env(env: Option<ProviderClientEnv<'_>>) -> Result<()> {
     for (env_key, value) in PROVIDER_CLIENT_ENV {
-        set_or_clear_claude_settings_env(env_key, configured.then_some(*value))?;
+        set_or_clear_claude_settings_env(env_key, env.is_some().then_some(*value))?;
     }
-    let model = model.filter(|_| configured);
     for env_key in PROVIDER_MODEL_SLOT_ENV {
-        set_or_clear_claude_settings_env(env_key, model)?;
+        set_or_clear_claude_settings_env(env_key, env.as_ref().map(|env| env.model))?;
     }
     set_or_clear_claude_settings_env(
+        PROVIDER_SMALL_MODEL_SLOT_ENV,
+        env.as_ref().map(|env| env.small_model),
+    )?;
+    set_or_clear_claude_settings_env(
         "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-        context_window.filter(|_| configured),
+        env.as_ref().map(|env| env.context_window),
     )
 }
 
@@ -11520,7 +11585,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(&settings, r#"{"env": {"USER_KEY": "keep me"}}"#).unwrap();
 
-        super::apply_upstream_provider_env(true, Some("glm-4.6"), Some("1000000")).unwrap();
+        let glm = super::provider_preset("glm").expect("glm preset exists");
+        super::apply_upstream_provider_env(Some(super::ProviderClientEnv {
+            model: glm.model,
+            small_model: glm.small_model,
+            context_window: glm.context_window,
+        }))
+        .unwrap();
         let written = read_settings_json(&settings);
         assert_eq!(written["env"]["API_TIMEOUT_MS"].as_str(), Some("3000000"));
         assert_eq!(
@@ -11529,13 +11600,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         assert_eq!(
             written["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"].as_str(),
-            Some("1000000")
+            Some(glm.context_window)
         );
         for slot in super::PROVIDER_MODEL_SLOT_ENV {
-            assert_eq!(written["env"][slot].as_str(), Some("glm-4.6"), "{slot}");
+            assert_eq!(written["env"][slot].as_str(), Some(glm.model), "{slot}");
         }
+        // The cheap tier must NOT be pointed at the big model.
+        assert_eq!(
+            written["env"][super::PROVIDER_SMALL_MODEL_SLOT_ENV].as_str(),
+            Some(glm.small_model)
+        );
 
-        super::apply_upstream_provider_env(false, None, None).unwrap();
+        super::apply_upstream_provider_env(None).unwrap();
         let cleared = read_settings_json(&settings);
         let env = cleared["env"].as_object().expect("env survives");
         for key in super::PROVIDER_MODEL_SLOT_ENV.iter().chain(
