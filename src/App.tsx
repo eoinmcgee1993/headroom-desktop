@@ -115,7 +115,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
-  compressibleInputSavingsRate,
+  newInputSavingsRate,
   allTimeCacheHitPair,
   cacheHitPair,
   outputReductionForWindow,
@@ -965,8 +965,7 @@ function DailySavingsChart({
   resetSignal,
   chartMode,
   setChartMode,
-  outputReduction,
-  sessionNewInput
+  outputReduction
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
@@ -974,11 +973,6 @@ function DailySavingsChart({
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
-  /** Session-scope compression rate on the new-input basis (saved vs
-   * uncached + cache-write input). The windowed chips cannot use this basis:
-   * history checkpoints carry no per-bucket new-input split, so this is the
-   * one surface where the denominator matches what compression could touch. */
-  sessionNewInput: { pct: number; savedTokens: number } | null;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
@@ -1003,13 +997,15 @@ function DailySavingsChart({
   const monthlyData = buildMonthlySavingsChartData(monthlyWindow);
   const hourlyChartData = buildHourlySavingsChartData(hourlyWindow);
   const chartData = view === "month" ? monthlyData : hourlyChartData;
-  // Canonical rate under the headline: input compression as a share of the
-  // BILLABLE input for the visible window. Always priced in dollars regardless
-  // of the chart's unit toggle -- a rate is unit-free, and only the dollar
-  // figures share one scale (see compressibleInputSavingsRate). Output shaping
-  // stays out of every percentage (it keeps its own measured reduction chip);
-  // cache reads stay out of the denominator (~0.1x, deliberately untouched).
-  const compressibleRate = compressibleInputSavingsRate(
+  // Canonical rate under the headline: input compression on the NEW-INPUT
+  // basis for the visible window -- saved tokens vs the input that newly
+  // entered context (uncached + cache writes, locally sampled; see
+  // newInputSavingsRate). The re-sent cached prefix stays out of the
+  // denominator entirely: Headroom never rewrites it, and pricing it in drove
+  // this rate toward zero as sessions grew while compression of the input we
+  // actually touch ran ~30%. Output shaping stays out of every percentage
+  // (it keeps its own measured reduction chip).
+  const windowNewInput = newInputSavingsRate(
     view === "month" ? monthlyWindow : hourlyWindow
   );
   // Window-scoped output reduction from the locally-sampled series, falling
@@ -1144,49 +1140,24 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {sessionNewInput !== null ||
-            compressibleRate !== null ||
-            windowOutput !== null ||
-            outputReduction ? (
+            {windowNewInput !== null || windowOutput !== null || outputReduction ? (
               <span
                 className={`savings-chart__overlay-chips${
                   chartMode === "tokens" ? " savings-chart__overlay-chips--tokens" : ""
                 }`}
               >
-                {sessionNewInput !== null && (
+                {windowNewInput !== null && (
                   <WindowRateChip
                     dot="input"
-                    label={`New input −${Math.round(sessionNewInput.pct)}%`}
-                    title="New-input compression"
-                    badge="measured"
-                    value={`${percent1(sessionNewInput.pct)}%`}
-                    rows={[
-                      { dt: "Removed", dd: compactNumber(sessionNewInput.savedTokens) },
-                      {
-                        dt: "New input",
-                        dd: compactNumber(
-                          Math.round(sessionNewInput.savedTokens * (100 / sessionNewInput.pct - 1))
-                        )
-                      }
-                    ]}
-                    note="Vs input that newly entered context this session (uncached + cache writes). The re-sent cached prefix is excluded: Headroom never rewrites it, so it carries no compression opportunity."
-                  />
-                )}
-                {compressibleRate !== null && (
-                  <WindowRateChip
-                    dot="input"
-                    label={`Input −${Math.round(compressibleRate.pct)}%`}
+                    label={`Input −${Math.round(windowNewInput.pct)}%`}
                     title="Input compression"
                     badge="measured"
-                    value={`${Math.round(compressibleRate.pct)}%`}
+                    value={`${percent1(windowNewInput.pct)}%`}
                     rows={[
-                      { dt: "Removed", dd: currency(compressibleRate.saved) },
-                      {
-                        dt: "Compressible input",
-                        dd: currency(compressibleRate.saved + compressibleRate.remaining)
-                      }
+                      { dt: "Removed", dd: compactNumber(windowNewInput.savedTokens) },
+                      { dt: "New input", dd: compactNumber(windowNewInput.newInputTokens) }
                     ]}
-                    note="Excludes cache reads."
+                    note="Vs input that newly entered context in this window (uncached + cache writes), sampled while the app runs. The re-sent cached prefix is excluded: Headroom never rewrites it, so it carries no compression opportunity."
                   />
                 )}
                 {windowOutput !== null ? (
@@ -6869,14 +6840,6 @@ export default function App() {
                 chartMode={chartMode}
                 setChartMode={setChartMode}
                 outputReduction={dashboard.outputReduction}
-                sessionNewInput={
-                  dashboard.sessionSavingsPct > 0 && dashboard.sessionEstimatedTokensSaved > 0
-                    ? {
-                        pct: dashboard.sessionSavingsPct,
-                        savedTokens: dashboard.sessionEstimatedTokensSaved
-                      }
-                    : null
-                }
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">

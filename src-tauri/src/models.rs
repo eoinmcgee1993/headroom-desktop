@@ -211,6 +211,16 @@ pub struct DailySavingsPoint {
     pub estimated_tokens_saved: u64,
     pub actual_cost_usd: f64,
     pub total_tokens_sent: u64,
+    /// Input that newly entered context inside the bucket (provider-billed
+    /// uncached + cache-write tokens), sampled locally from the proxy's
+    /// cumulative counters. This is the denominator compression had any power
+    /// over: the re-sent cached prefix in `total_tokens_sent` is deliberately
+    /// never rewritten, and counting it drove the displayed input rate toward
+    /// zero as sessions grew (2026-09-02 fleet analysis). Zero = no coverage:
+    /// backend rollups and buckets from older builds have no new-input
+    /// dimension, and the rate skips them rather than mix denominators.
+    #[serde(default)]
+    pub new_input_tokens: u64,
     /// Tool-schema deferral for the bucket, priced at the CACHE-READ rate.
     /// Deferral is real Headroom-caused saving (those definitions are re-sent
     /// on every request unless Headroom holds them back), unlike the provider
@@ -280,6 +290,9 @@ pub struct HourlySavingsPoint {
     pub estimated_tokens_saved: u64,
     pub actual_cost_usd: f64,
     pub total_tokens_sent: u64,
+    /// See `DailySavingsPoint::new_input_tokens`.
+    #[serde(default)]
+    pub new_input_tokens: u64,
     /// See `DailySavingsPoint::tool_schema_savings_usd`.
     #[serde(default)]
     pub tool_schema_savings_usd: f64,

@@ -4419,6 +4419,12 @@ struct DailySavingsBucket {
     estimated_tokens_saved: u64,
     actual_cost_usd: f64,
     total_tokens_sent: u64,
+    // New-input tokens (uncached + cache-write) inside the bucket, written
+    // only by the session sampler. Remote rollups and buckets persisted by
+    // older builds carry `total_tokens_sent` on the FULL-FORWARDED basis
+    // (cache-polluted), so they leave this 0 = "no coverage" and the
+    // new-input rate skips them instead of mixing denominators.
+    new_input_tokens: u64,
     // Output-shaping layer, added after the compression fields existed: buckets
     // persisted by older builds must keep parsing, hence container `default`.
     output_savings_usd: f64,
@@ -4794,6 +4800,7 @@ impl SavingsTracker {
                 tool_schema_tokens_saved: 0,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
+                new_input_tokens: bucket.new_input_tokens,
                 output_savings_usd: bucket.output_savings_usd,
                 output_tokens_saved: bucket.output_tokens_saved,
                 // Archived from the backend-derived deltas at ingest; None for
@@ -4818,6 +4825,7 @@ impl SavingsTracker {
                 tool_schema_tokens_saved: 0,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
+                new_input_tokens: bucket.new_input_tokens,
                 output_savings_usd: bucket.output_savings_usd,
                 output_tokens_saved: bucket.output_tokens_saved,
                 cache_read_tokens: bucket.cache_read_tokens,
@@ -4903,6 +4911,9 @@ impl SavingsTracker {
                 estimated_tokens_saved: point.estimated_tokens_saved,
                 actual_cost_usd: point.actual_cost_usd,
                 total_tokens_sent: point.total_tokens_sent,
+                // Remote rollups carry no new-input dimension; keep whatever
+                // the local session sampler banked for this bucket.
+                new_input_tokens: archived.map_or(0, |b| b.new_input_tokens),
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
                 cache_read_tokens: if live_day {
@@ -4935,6 +4946,9 @@ impl SavingsTracker {
                 estimated_tokens_saved: point.estimated_tokens_saved,
                 actual_cost_usd: point.actual_cost_usd,
                 total_tokens_sent: point.total_tokens_sent,
+                // Remote rollups carry no new-input dimension; keep whatever
+                // the local session sampler banked for this bucket.
+                new_input_tokens: archived.map_or(0, |b| b.new_input_tokens),
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
                 cache_read_tokens: archived
@@ -5284,6 +5298,7 @@ impl SavingsTracker {
                 bucket.estimated_tokens_saved,
                 bucket.actual_cost_usd,
                 bucket.total_tokens_sent,
+                bucket.new_input_tokens,
             );
             self.add_daily_delta(
                 &day_key_from_hour_key(hour_key),
@@ -5291,6 +5306,7 @@ impl SavingsTracker {
                 bucket.estimated_tokens_saved,
                 bucket.actual_cost_usd,
                 bucket.total_tokens_sent,
+                bucket.new_input_tokens,
             );
         }
     }
@@ -5307,6 +5323,7 @@ impl SavingsTracker {
                 bucket.estimated_tokens_saved,
                 bucket.actual_cost_usd,
                 bucket.total_tokens_sent,
+                bucket.new_input_tokens,
             );
             self.subtract_daily_delta(
                 &day_key_from_hour_key(hour_key),
@@ -5314,6 +5331,7 @@ impl SavingsTracker {
                 bucket.estimated_tokens_saved,
                 bucket.actual_cost_usd,
                 bucket.total_tokens_sent,
+                bucket.new_input_tokens,
             );
         }
         self.ingest_hourly_buckets(current);
@@ -5326,6 +5344,7 @@ impl SavingsTracker {
         tokens: u64,
         actual_cost_usd: f64,
         total_tokens_sent: u64,
+        new_input_tokens: u64,
     ) {
         if usd <= 0.0 && tokens == 0 && actual_cost_usd <= 0.0 && total_tokens_sent == 0 {
             return;
@@ -5335,6 +5354,7 @@ impl SavingsTracker {
         entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_add(tokens);
         entry.actual_cost_usd += actual_cost_usd.max(0.0);
         entry.total_tokens_sent = entry.total_tokens_sent.saturating_add(total_tokens_sent);
+        entry.new_input_tokens = entry.new_input_tokens.saturating_add(new_input_tokens);
     }
 
     fn subtract_daily_delta(
@@ -5344,6 +5364,7 @@ impl SavingsTracker {
         tokens: u64,
         actual_cost_usd: f64,
         total_tokens_sent: u64,
+        new_input_tokens: u64,
     ) {
         let mut should_remove = false;
         if let Some(entry) = self.daily_savings.get_mut(day_key) {
@@ -5351,6 +5372,7 @@ impl SavingsTracker {
             entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_sub(tokens);
             entry.actual_cost_usd = (entry.actual_cost_usd - actual_cost_usd.max(0.0)).max(0.0);
             entry.total_tokens_sent = entry.total_tokens_sent.saturating_sub(total_tokens_sent);
+            entry.new_input_tokens = entry.new_input_tokens.saturating_sub(new_input_tokens);
             should_remove = entry.estimated_savings_usd <= 0.0
                 && entry.estimated_tokens_saved == 0
                 && entry.actual_cost_usd <= 0.0
@@ -5368,6 +5390,7 @@ impl SavingsTracker {
         tokens: u64,
         actual_cost_usd: f64,
         total_tokens_sent: u64,
+        new_input_tokens: u64,
     ) {
         if usd <= 0.0 && tokens == 0 && actual_cost_usd <= 0.0 && total_tokens_sent == 0 {
             return;
@@ -5377,6 +5400,7 @@ impl SavingsTracker {
         entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_add(tokens);
         entry.actual_cost_usd += actual_cost_usd.max(0.0);
         entry.total_tokens_sent = entry.total_tokens_sent.saturating_add(total_tokens_sent);
+        entry.new_input_tokens = entry.new_input_tokens.saturating_add(new_input_tokens);
     }
 
     fn subtract_hourly_delta(
@@ -5386,6 +5410,7 @@ impl SavingsTracker {
         tokens: u64,
         actual_cost_usd: f64,
         total_tokens_sent: u64,
+        new_input_tokens: u64,
     ) {
         let mut should_remove = false;
         if let Some(entry) = self.hourly_savings.get_mut(hour_key) {
@@ -5393,6 +5418,7 @@ impl SavingsTracker {
             entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_sub(tokens);
             entry.actual_cost_usd = (entry.actual_cost_usd - actual_cost_usd.max(0.0)).max(0.0);
             entry.total_tokens_sent = entry.total_tokens_sent.saturating_sub(total_tokens_sent);
+            entry.new_input_tokens = entry.new_input_tokens.saturating_sub(new_input_tokens);
             should_remove = entry.estimated_savings_usd <= 0.0
                 && entry.estimated_tokens_saved == 0
                 && entry.actual_cost_usd <= 0.0
@@ -5908,6 +5934,9 @@ impl HeadroomSavingsHistoryResponse {
                 tool_schema_tokens_saved: 0,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
+                // Backend history has no new-input dimension: this point's
+                // sent tokens are full-forwarded (cache-polluted). 0 = no coverage.
+                new_input_tokens: 0,
                 output_savings_usd: point.output_savings_usd_delta,
                 output_tokens_saved: point.output_tokens_saved_delta,
                 cache_read_tokens: point.cache_read_tokens_delta,
@@ -5930,6 +5959,9 @@ impl HeadroomSavingsHistoryResponse {
                 tool_schema_tokens_saved: 0,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
+                // Backend history has no new-input dimension: this point's
+                // sent tokens are full-forwarded (cache-polluted). 0 = no coverage.
+                new_input_tokens: 0,
                 output_savings_usd: point.output_savings_usd_delta,
                 output_tokens_saved: point.output_tokens_saved_delta,
                 cache_read_tokens: point.cache_read_tokens_delta,
@@ -7052,7 +7084,9 @@ where
         // Real per-hour sent. A bucket may appear for an hour with no saved
         // delta — an honest 0%-savings hour.
         for (bucket_key, sent) in sampled_sent {
-            buckets.entry(bucket_key).or_default().total_tokens_sent = sent;
+            let bucket = buckets.entry(bucket_key).or_default();
+            bucket.total_tokens_sent = sent;
+            bucket.new_input_tokens = sent;
         }
     } else if total_tokens > 0 && total_tokens_sent > 0 {
         // Fallback: smear the session total across buckets in proportion to
@@ -7064,6 +7098,10 @@ where
             bucket.total_tokens_sent = ((bucket.estimated_tokens_saved as u128
                 * total_tokens_sent as u128)
                 / total_tokens as u128) as u64;
+            // Same new-input scale (the session cumulative IS the new-input
+            // series), just smeared: window sums stay exact, only the
+            // intra-window attribution is approximate.
+            bucket.new_input_tokens = bucket.total_tokens_sent;
         }
     }
 
@@ -7132,6 +7170,9 @@ fn diff_hourly_buckets(
                 total_tokens_sent: bucket
                     .total_tokens_sent
                     .saturating_sub(prior.total_tokens_sent),
+                new_input_tokens: bucket
+                    .new_input_tokens
+                    .saturating_sub(prior.new_input_tokens),
                 output_savings_usd: (bucket.output_savings_usd - prior.output_savings_usd).max(0.0),
                 output_tokens_saved: bucket
                     .output_tokens_saved
@@ -8141,7 +8182,18 @@ fn merge_daily_savings(
         if p.date.as_str() < cutoff_date {
             by_date.insert(p.date.clone(), p);
         } else {
-            by_date.entry(p.date.clone()).or_insert(p);
+            match by_date.entry(p.date.clone()) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // History wins the bucket, but the backend rollup has no
+                    // new-input dimension: keep the locally-sampled value so
+                    // the new-input rate keeps its coverage.
+                    let merged = entry.get_mut();
+                    merged.new_input_tokens = merged.new_input_tokens.max(p.new_input_tokens);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(p);
+                }
+            }
         }
     }
     by_date.into_values().collect()
@@ -8164,7 +8216,16 @@ fn merge_hourly_savings(
         if p.hour.as_str() < cutoff_hour {
             by_hour.insert(p.hour.clone(), p);
         } else {
-            by_hour.entry(p.hour.clone()).or_insert(p);
+            match by_hour.entry(p.hour.clone()) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // See merge_daily_savings: rollups carry no new-input.
+                    let merged = entry.get_mut();
+                    merged.new_input_tokens = merged.new_input_tokens.max(p.new_input_tokens);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(p);
+                }
+            }
         }
     }
     by_hour.into_values().collect()
@@ -12351,6 +12412,10 @@ mod tests {
         assert_eq!(hourly[0].total_tokens_sent, 6_000);
         assert_eq!(hourly[1].estimated_tokens_saved, 2_000);
         assert_eq!(hourly[1].total_tokens_sent, 4_000);
+        // The same sampled values land in the new-input field: session
+        // buckets are the only writer, and they ARE the new-input basis.
+        assert_eq!(hourly[0].new_input_tokens, 6_000);
+        assert_eq!(hourly[1].new_input_tokens, 4_000);
     }
 
     #[test]
@@ -12598,6 +12663,7 @@ mod tests {
             estimated_savings_usd: usd,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
+            new_input_tokens: 0,
             output_savings_usd: 0.0,
             output_tokens_saved: 0,
             cache_read_tokens: None,
@@ -12616,6 +12682,7 @@ mod tests {
             estimated_savings_usd: 0.0,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
+            new_input_tokens: 0,
             by_provider: Vec::new(),
             output_savings_usd: 0.0,
             output_tokens_saved: 0,
@@ -12846,7 +12913,7 @@ mod tests {
         // must not overwrite a settled local bucket that recorded real spend,
         // or the zero-spend anomaly probe fires on a false positive.
         let mut tracker = make_tracker();
-        tracker.add_daily_delta("2026-06-10", 1.0, 100, 2.5, 5000);
+        tracker.add_daily_delta("2026-06-10", 1.0, 100, 2.5, 5000, 0);
 
         // Desynced backend point for the same day: savings, no spend.
         let desynced = tracker.ingest_native_rollups(
@@ -12921,6 +12988,22 @@ mod tests {
     }
 
     #[test]
+    fn merge_daily_keeps_local_new_input_when_history_wins() {
+        // Backend rollups carry no new-input dimension. If history winning the
+        // bucket dropped the locally-sampled value, every poll would wipe the
+        // new-input rate's coverage for the day the user is looking at.
+        let tracker = vec![DailySavingsPoint {
+            new_input_tokens: 4_000,
+            ..daily("2026-04-20", 100, 0.5)
+        }];
+        let history = vec![daily("2026-04-20", 800, 2.0)];
+        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].estimated_tokens_saved, 800);
+        assert_eq!(result[0].new_input_tokens, 4_000);
+    }
+
+    #[test]
     fn merge_daily_prefers_tracker_when_history_has_savings_but_zero_spend() {
         // Backend rollup desync: savings recorded, tokens/cost zero (RUST-3S/3V).
         let history = vec![daily("2026-04-21", 800, 2.0)];
@@ -12932,6 +13015,7 @@ mod tests {
             estimated_savings_usd: 1.5,
             actual_cost_usd: 9.0,
             total_tokens_sent: 123_456,
+            new_input_tokens: 0,
             output_savings_usd: 0.0,
             output_tokens_saved: 0,
             cache_read_tokens: None,

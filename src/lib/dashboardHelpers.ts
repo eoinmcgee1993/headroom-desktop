@@ -155,42 +155,38 @@ export function allTimeCacheHitPair(
   ]);
 }
 
-/** Canonical input-compression rate for a window of buckets: the share of the
- * COMPRESSIBLE input spend Headroom removed. Cache reads are excluded from the
- * denominator (they bill at ~0.1x and Headroom deliberately never touches the
- * cached prefix); output shaping is never part of this rate.
+/** Canonical input-compression rate over a window of buckets, on the
+ * NEW-INPUT basis: saved tokens vs the input that newly entered context
+ * (provider-billed uncached + cache-write tokens, sampled locally from the
+ * proxy's cumulative counters -- see `newInputTokens`). The re-sent cached
+ * prefix never enters the denominator: Headroom deliberately never rewrites
+ * it, so it carries no compression opportunity, and counting it drove this
+ * rate toward zero as sessions grew (2026-09-02 fleet analysis: displayed ~5%
+ * while compression of actually-touchable input ran ~30%). Both counts come
+ * from the proxy's own tokenizer, so unlike `cacheReadTokens` they may be
+ * summed and ratioed (that provider-scale ban is documented on `cacheHitPair`).
  *
- * Always priced in dollars, whatever unit the chart is showing, because only
- * the dollar figures are on one scale. `totalTokensSent` is our own tokenizer's
- * count of the forwarded prompt while `cacheReadTokens` is the provider's own
- * count of part of it -- upstream keeps them apart on purpose ("must never be
- * differenced", proxy/outcome.py) and on 2026-08-14 a day's derived cache reads
- * (195.8M) genuinely exceeded its forwarded input (163.4M), pinning the token
- * form of this rate at a meaningless 100%. Read cost is recovered from the read
- * discount (`cacheSavingsUsd / 9`) and subtracted from the bucket's actual input
- * cost -- both from the same pricing function, so the subtraction is sound.
- *
- * Only buckets with cache coverage count, so numerator and denominator always
- * describe the same slice; null when the window has no coverage. */
-export function compressibleInputSavingsRate(
-  points: Array<{
-    cacheSavingsUsd?: number | null;
-    actualCostUsd: number;
-    estimatedSavingsUsd: number;
-  }>
+ * Only buckets with sampled coverage count -- numerator included, so both
+ * sides always describe the same slice; null when the window has none.
+ * Buckets from backend rollups or older builds carry 0/absent coverage and
+ * are skipped: their sent count is full-forwarded and must not mix in. */
+export function newInputSavingsRate(
+  points: Array<{ newInputTokens?: number; estimatedTokensSaved: number }>
 ) {
   let saved = 0;
-  // What survived compression and was still paid for at full input price.
-  let remaining = 0;
+  let newInput = 0;
   for (const point of points) {
-    if (point.cacheSavingsUsd == null) continue;
-    const readCostUsd = Math.max(0, point.cacheSavingsUsd) / 9;
-    saved += Math.max(0, point.estimatedSavingsUsd);
-    remaining += Math.max(0, point.actualCostUsd - readCostUsd);
+    if (!point.newInputTokens) continue;
+    saved += Math.max(0, point.estimatedTokensSaved);
+    newInput += point.newInputTokens;
   }
-  const baseline = saved + remaining;
+  const baseline = saved + newInput;
   if (baseline <= 0) return null;
-  return { pct: Math.min(100, (saved / baseline) * 100), saved, remaining };
+  return {
+    pct: Math.min(100, (saved / baseline) * 100),
+    savedTokens: saved,
+    newInputTokens: newInput
+  };
 }
 
 /** Output-shaper reduction over a window of buckets, from the locally-sampled

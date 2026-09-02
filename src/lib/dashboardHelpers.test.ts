@@ -6,7 +6,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
-  compressibleInputSavingsRate,
+  newInputSavingsRate,
   allTimeCacheHitPair,
   cacheHitPair,
   outputReductionForWindow,
@@ -548,33 +548,22 @@ describe("allTimeCacheHitPair", () => {
   });
 });
 
-describe("compressibleInputSavingsRate", () => {
-  const bucket = {
-    cacheReadTokens: 900,
-    cacheSavingsUsd: 9, // read discount $9 -> read cost $1
-    totalTokensSent: 1000,
-    estimatedTokensSaved: 25,
-    actualCostUsd: 3, // $1 reads + $2 billable
-    estimatedSavingsUsd: 0.5
-  };
+describe("newInputSavingsRate", () => {
+  const covered = { newInputTokens: 800, estimatedTokensSaved: 200 };
 
-  it("prices reads via the discount and excludes them", () => {
-    // 0.5 / (0.5 + (3 - 9/9))
-    expect(compressibleInputSavingsRate([bucket])!.pct).toBeCloseTo(20);
+  it("rates saved tokens against sampled new input", () => {
+    expect(newInputSavingsRate([covered])!.pct).toBeCloseTo(20);
+    expect(newInputSavingsRate([covered])!.newInputTokens).toBe(800);
   });
 
-  it("skips buckets without the dollar counter", () => {
-    const uncovered = { ...bucket, cacheReadTokens: null, cacheSavingsUsd: null };
-    expect(compressibleInputSavingsRate([uncovered])).toBeNull();
-    expect(compressibleInputSavingsRate([bucket, uncovered])!.pct).toBeCloseTo(20);
-  });
-
-  it("stays sane when provider cache reads exceed our own input count", () => {
-    // Real 2026-08-14 data: 195.8M derived cache reads against 163.4M forwarded
-    // input tokens, because the two counters use different tokenizers. The old
-    // token-based form clamped the denominator to 0 and reported 100%.
-    const skewed = { ...bucket, cacheReadTokens: 1_200, totalTokensSent: 1_000 };
-    expect(compressibleInputSavingsRate([skewed])!.pct).toBeCloseTo(20);
+  it("skips uncovered buckets on both sides of the ratio", () => {
+    // Backend rollups and old buckets carry 0/absent newInputTokens; their
+    // full-forwarded sent count -- and their saved tokens -- must stay out,
+    // or the covered slice's numerator and denominator drift apart.
+    const uncovered = { newInputTokens: 0, estimatedTokensSaved: 999_999 };
+    const legacy = { estimatedTokensSaved: 5 };
+    expect(newInputSavingsRate([uncovered, legacy])).toBeNull();
+    expect(newInputSavingsRate([covered, uncovered, legacy])!.pct).toBeCloseTo(20);
   });
 });
 
