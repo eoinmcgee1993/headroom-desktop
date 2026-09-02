@@ -660,7 +660,8 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         // Built from the REAL dashboard, before the demo-data injector below.
         let report = (!pending_milestones.token.is_empty()
             || pending_milestones.cumulative_report.is_some())
-        .then(|| savings_report(&dashboard));
+        .then(|| savings_report(&dashboard))
+        .flatten();
 
         for milestone_tokens_saved in &pending_milestones.token {
             analytics::track_event(
@@ -5549,30 +5550,35 @@ fn reported_output_reduction(
 /// Projects the dashboard's real savings figures into the payload
 /// headroom-web stores for the admin profile. Must be called on the dashboard
 /// BEFORE `maybe_inject_fake_daily_savings`, or demo data reaches the server.
-fn savings_report(dashboard: &DashboardState) -> pricing::SavingsReport {
-    let breakdown = dashboard.savings_breakdown.as_ref();
-    pricing::SavingsReport {
+///
+/// `None` until `/stats-history` has hydrated `savings_breakdown`. The first
+/// dashboard render each session fires a report immediately, which on a cold
+/// launch beats the backend; a snapshot built then would carry zero rate
+/// denominators, and the server overwrites its stored snapshot
+/// unconditionally, so those zeros clobber the previous good report and the
+/// admin profile renders blank rates (user 1681, 2026-09-02). The milestone
+/// heartbeat still posts without the snapshot; the next due report carries
+/// the real figures.
+fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> {
+    let breakdown = dashboard.savings_breakdown.as_ref()?;
+    let (output_reduction_percent, output_reduction_method) = reported_output_reduction(
+        dashboard.output_reduction.as_ref(),
+        dashboard.output_shaper_active,
+    );
+    Some(pricing::SavingsReport {
         lifetime_savings_usd: dashboard.lifetime_estimated_savings_usd,
         lifetime_tokens_saved: dashboard.lifetime_estimated_tokens_saved,
-        total_input_tokens: breakdown.map(|b| b.total_input_tokens).unwrap_or(0),
-        cache_read_tokens: breakdown.map(|b| b.cache_read_tokens).unwrap_or(0),
-        total_input_cost_usd: breakdown.map(|b| b.total_input_cost_usd).unwrap_or(0.0),
-        cache_savings_usd: breakdown.map(|b| b.cache_savings_usd).unwrap_or(0.0),
-        output_reduction_percent: reported_output_reduction(
-            dashboard.output_reduction.as_ref(),
-            dashboard.output_shaper_active,
-        )
-        .0,
-        output_reduction_method: reported_output_reduction(
-            dashboard.output_reduction.as_ref(),
-            dashboard.output_shaper_active,
-        )
-        .1,
+        total_input_tokens: breakdown.total_input_tokens,
+        cache_read_tokens: breakdown.cache_read_tokens,
+        total_input_cost_usd: breakdown.total_input_cost_usd,
+        cache_savings_usd: breakdown.cache_savings_usd,
+        output_reduction_percent,
+        output_reduction_method,
         reread_tokens: dashboard.reread_tokens,
         reread_compressed_tokens: dashboard.reread_compressed_tokens,
         ccr_retrievals: dashboard.ccr_retrievals,
         days: recent_savings_days(&dashboard.daily_savings),
-    }
+    })
 }
 
 /// The most recent `SAVINGS_REPORT_DAYS` days that saw any traffic, oldest
@@ -8184,13 +8190,14 @@ mod tests {
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        select_updater_endpoints, startup_error_fingerprint_key, store_checked_update,
-        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link, user_message_for,
-        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
-        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
+        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
+        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
+        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
+        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
+        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
+        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        PENDING_MAGIC_LINK,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -8286,6 +8293,70 @@ mod tests {
     fn recent_savings_days_is_empty_without_traffic() {
         let points = vec![daily_point("2026-06-01", 0.0, 0, 0.0, 0)];
         assert!(recent_savings_days(&points).is_empty());
+    }
+
+    fn dashboard_for_report(
+        breakdown: Option<crate::models::SavingsBreakdown>,
+    ) -> crate::models::DashboardState {
+        crate::models::DashboardState {
+            app_version: "test".into(),
+            launch_experience: crate::models::LaunchExperience::Dashboard,
+            bootstrap_complete: true,
+            python_runtime_installed: true,
+            lifetime_requests: 1,
+            first_prompt_request_seen: true,
+            lifetime_estimated_savings_usd: 307.66,
+            lifetime_estimated_tokens_saved: 63_712_824,
+            session_requests: 0,
+            session_estimated_savings_usd: 0.0,
+            session_estimated_tokens_saved: 0,
+            session_savings_pct: 0.0,
+            output_reduction: None,
+            output_shaper_active: None,
+            learner_progress: None,
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
+            savings_breakdown: breakdown,
+            daily_savings: Vec::new(),
+            hourly_savings: Vec::new(),
+            savings_history_loaded: false,
+            tools: Vec::new(),
+            clients: Vec::new(),
+            recent_usage: Vec::new(),
+            insights: Vec::new(),
+            required_terms_version: 1,
+            accepted_terms_version: 1,
+            terms_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn savings_report_withheld_until_history_hydrates() {
+        // A report built before /stats-history answers would post zero rate
+        // denominators, which the server stores over a previous good snapshot.
+        assert!(savings_report(&dashboard_for_report(None)).is_none());
+    }
+
+    #[test]
+    fn savings_report_carries_breakdown_denominators() {
+        let breakdown = crate::models::SavingsBreakdown {
+            compression_savings_usd: 100.0,
+            output_savings_usd: 0.0,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
+            cache_savings_usd: 30.0,
+            cache_read_tokens: 2_000,
+            total_input_tokens: 1_000,
+            total_input_cost_usd: 11.09,
+            model_rates: Vec::new(),
+        };
+        let report =
+            savings_report(&dashboard_for_report(Some(breakdown))).expect("hydrated report");
+        assert_eq!(report.total_input_cost_usd, 11.09);
+        assert_eq!(report.cache_savings_usd, 30.0);
+        assert_eq!(report.lifetime_savings_usd, 307.66);
+        assert_eq!(report.lifetime_tokens_saved, 63_712_824);
     }
 
     #[test]
