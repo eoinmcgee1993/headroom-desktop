@@ -76,6 +76,7 @@ import {
 import { SetupStallModal } from "./components/SetupStallModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
 import {
+  authCodeSentMessage,
   buildInstallFailureMailto,
   buildSetupStallMailto,
   describeInvokeError,
@@ -1742,7 +1743,6 @@ export default function App() {
   const [authEmail, setAuthEmail] = useState("");
   const [authCode, setAuthCode] = useState("");
   const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
-  const [authCodeExpirySeconds, setAuthCodeExpirySeconds] = useState(authCodeExpiryFallbackSeconds);
   const [authRequestBusy, setAuthRequestBusy] = useState(false);
   const [authVerifyBusy, setAuthVerifyBusy] = useState(false);
   const [authFlowError, setAuthFlowError] = useState<string | null>(null);
@@ -4197,8 +4197,12 @@ export default function App() {
       });
       reportFunnelStep("email_code_requested");
       setAuthCodeRequestedFor(result.email);
-      setAuthCodeExpirySeconds(result.expiresInSeconds);
-      setAuthFlowSuccess(`We sent a sign-in code to ${result.email}.`);
+      setAuthFlowSuccess(
+        authCodeSentMessage(
+          result.email,
+          result.expiresInSeconds || authCodeExpiryFallbackSeconds
+        )
+      );
     } catch (error) {
       setAuthFlowError(describeInvokeError(error, "Could not send sign-in code."));
     } finally {

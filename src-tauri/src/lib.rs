@@ -6050,27 +6050,42 @@ fn learn_agent_auth_hint(agent: LearnAgent) -> String {
 /// CLI writes its diagnosis to its own stream, which upstream appends on the
 /// FOLLOWING line. Fingerprinting the marker alone collapsed every distinct
 /// cause onto one issue with nothing in it to tell them apart (RUST-74, then
-/// RUST-B6). When the first line ends at that dangling colon, the next
-/// non-empty line is the actual reason, so join it in.
+/// RUST-B6). The marker's next non-empty line is the actual reason, so join
+/// it in.
+///
+/// The marker is not always the FIRST line: upstream's own logging can precede
+/// it -- RUST-BC's stderr opens with an onnxruntime C-API warning from
+/// `_ort.py`, which is unrelated to the failure and titled the issue anyway.
+/// Preamble like that is per-machine, so fingerprinting it merges every
+/// distinct failure on the hosts that emit it. Scan for the marker instead of
+/// only checking line one.
 ///
 /// stderr only at the call site: stdout echoes written memory files back
 /// verbatim and must never reach a Sentry title.
 fn learn_failure_signature_source(text: &str) -> String {
-    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-    let Some(first) = lines.next() else {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let Some(first) = lines.first() else {
         return "no output".to_string();
     };
     // Only the `failed (exit N):` marker is followed by a one-line diagnosis
     // worth grouping on. Other markers also end at a colon but introduce a
     // DUMP -- `returned unparseable output. First 2000 chars:` (RUST-B7) is
     // followed by the model's raw output, which is derived from the user's
-    // sessions and must not become a Sentry title.
-    if !learn_marker_expects_reason_line(first) {
+    // sessions and must not become a Sentry title. With no marker at all the
+    // first line is still the best guess.
+    let Some(marker) = lines
+        .iter()
+        .position(|line| learn_marker_expects_reason_line(line))
+    else {
         return first.to_string();
-    }
-    match lines.next() {
-        Some(reason) => format!("{first} {reason}"),
-        None => first.to_string(),
+    };
+    match lines.get(marker + 1) {
+        Some(reason) => format!("{} {reason}", lines[marker]),
+        None => lines[marker].to_string(),
     }
 }
 
@@ -10712,6 +10727,36 @@ Some unrelated content.
         let signature = learn_failure_signature_source(stderr);
         assert!(signature.ends_with("First 2000 chars:"), "got: {signature}");
         assert!(!signature.contains("login.ts"), "got: {signature}");
+    }
+
+    #[test]
+    fn learn_failure_signature_source_skips_unrelated_stderr_preamble() {
+        // RUST-BC: an onnxruntime C-API warning from upstream's own logger is
+        // the first stderr line on any host with onnxruntime < 1.24. It has
+        // nothing to do with the failure, and fingerprinting it merged every
+        // distinct learn failure on those machines onto one issue.
+        let preamble = "onnxruntime 1.20 exposes an older C API than Rust detection requires (1.24+); leaving ORT_DYLIB_PATH unset and using Python detection\n";
+        let stderr = format!(
+            "{preamble}LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nCredit balance is too low\n"
+        );
+        let signature = learn_failure_signature_source(&stderr);
+        assert!(
+            signature.contains("Credit balance is too low"),
+            "got: {signature}"
+        );
+        assert!(!signature.contains("onnxruntime"), "got: {signature}");
+
+        // Two causes behind the same preamble must still not collapse.
+        let other = format!(
+            "{preamble}LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nNot logged in \u{b7} Please run /login\n"
+        );
+        assert_ne!(signature, learn_failure_signature_source(&other));
+
+        // No marker anywhere: the first line is still all there is.
+        assert!(
+            learn_failure_signature_source(preamble).starts_with("onnxruntime 1.20"),
+            "preamble-only stderr should fall back to line one"
+        );
     }
 
     #[test]

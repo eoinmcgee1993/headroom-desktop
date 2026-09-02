@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  authCodeSentMessage,
   buildInstallFailureMailto,
   buildSetupStallMailto,
   describeInvokeError,
@@ -795,5 +796,18 @@ describe("scheduledPlanChange", () => {
         account({ subscriptionPendingTier: "max5x", subscriptionPendingEffectiveAt: "soon" })
       )
     ).toBeNull();
+  });
+});
+
+describe("authCodeSentMessage", () => {
+  it("states the expiry and that a resend invalidates the older code", () => {
+    const message = authCodeSentMessage("dev@example.com", 900);
+    expect(message).toContain("dev@example.com");
+    expect(message).toContain("15 minutes");
+    expect(message).toContain("only the newest code works");
+  });
+
+  it("never rounds a short expiry down to zero minutes", () => {
+    expect(authCodeSentMessage("dev@example.com", 20)).toContain("1 minute.");
   });
 });
