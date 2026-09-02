@@ -10,6 +10,8 @@ import type { UpstreamOverrideView } from "../lib/types";
 /// keeps serving the previous one.
 export function UpstreamPanel() {
   const [baseUrl, setBaseUrl] = useState("");
+  const [model, setModel] = useState("");
+  const [contextWindow, setContextWindow] = useState("");
   const [hasToken, setHasToken] = useState(false);
   // Empty means "leave the stored token alone", which is why the field starts
   // blank even when one is set. Only a touched field is ever sent.
@@ -22,6 +24,8 @@ export function UpstreamPanel() {
 
   const apply = useCallback((next: UpstreamOverrideView) => {
     setBaseUrl(next.baseUrl);
+    setModel(next.model);
+    setContextWindow(next.contextWindow);
     setHasToken(next.hasToken);
     setToken("");
     setTokenTouched(false);
@@ -63,6 +67,8 @@ export function UpstreamPanel() {
         mode: configured ? "override" : "off",
         baseUrl,
         token: tokenTouched ? token : null,
+        model,
+        contextWindow,
       });
       apply(saved);
       setNotice(
@@ -75,7 +81,7 @@ export function UpstreamPanel() {
     } finally {
       setBusy(false);
     }
-  }, [apply, baseUrl, configured, token, tokenTouched]);
+  }, [apply, baseUrl, configured, contextWindow, model, token, tokenTouched]);
 
   return (
     <article className="soft-card panel-card">
@@ -127,6 +133,44 @@ export function UpstreamPanel() {
               />
             </span>
           </label>
+          <label className="upstream-field">
+            <span>Model (optional)</span>
+            <span className="upstream-field__input">
+              <input
+                aria-label="Provider model"
+                autoComplete="off"
+                disabled={busy}
+                onChange={(event) => setModel(event.target.value)}
+                placeholder="glm-5.3[1m]"
+                spellCheck={false}
+                type="text"
+                value={model}
+              />
+            </span>
+          </label>
+
+          <label className="upstream-field">
+            <span>Context window (optional)</span>
+            <span className="upstream-field__input">
+              <input
+                aria-label="Provider context window"
+                autoComplete="off"
+                disabled={busy}
+                inputMode="numeric"
+                onChange={(event) => setContextWindow(event.target.value)}
+                placeholder="1000000"
+                spellCheck={false}
+                type="text"
+                value={contextWindow}
+              />
+            </span>
+          </label>
+          <p className="upstream-panel__meta">
+            Leave both empty if your provider already answers to Claude model names.
+            Filling them in sets every model slot and the auto-compact window, the way
+            a hand-configured setup does.
+          </p>
+
           <p className="upstream-panel__meta">
             Kept in your OS keychain and written to ~/.claude/settings.json, which is
             where your client reads it from. Headroom forwards the token your client

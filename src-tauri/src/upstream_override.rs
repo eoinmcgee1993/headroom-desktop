@@ -75,6 +75,7 @@ mod tests {
             mode: UpstreamOverrideMode::Override,
             base_url: "https://api.z.ai/api/anthropic".into(),
             has_token: true,
+            ..Default::default()
         });
         assert_eq!(
             get().configured_upstream(),

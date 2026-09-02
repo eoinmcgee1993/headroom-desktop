@@ -4118,6 +4118,12 @@ pub struct UpstreamOverride {
     /// Normalized by `normalize_upstream_base_url`; empty when unset.
     pub base_url: String,
     pub has_token: bool,
+    /// Model id the provider serves, written to every `ANTHROPIC_DEFAULT_*_MODEL`
+    /// slot. Empty when unset, which leaves the provider to map Claude ids.
+    pub model: String,
+    /// Context window in tokens for `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. Kept as
+    /// a string because empty means unset; digits are validated on save.
+    pub context_window: String,
 }
 
 impl UpstreamOverride {
@@ -9306,6 +9312,7 @@ mod tests {
                 mode: super::UpstreamOverrideMode::Override,
                 base_url: "https://api.z.ai/api/anthropic".into(),
                 has_token: true,
+                ..Default::default()
             },
             onboarding_recovery_notified: true,
             first_savings_notified: true,

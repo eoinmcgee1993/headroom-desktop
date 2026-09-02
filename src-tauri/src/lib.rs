@@ -4537,6 +4537,8 @@ struct UpstreamOverrideView {
     mode: &'static str,
     base_url: String,
     has_token: bool,
+    model: String,
+    context_window: String,
 }
 
 impl From<crate::state::UpstreamOverride> for UpstreamOverrideView {
@@ -4550,6 +4552,8 @@ impl From<crate::state::UpstreamOverride> for UpstreamOverrideView {
             },
             base_url: value.base_url,
             has_token: value.has_token,
+            model: value.model,
+            context_window: value.context_window,
         }
     }
 }
@@ -4565,12 +4569,18 @@ async fn get_upstream_override(app: AppHandle) -> UpstreamOverrideView {
 /// `token`: `None` leaves the stored one alone (the field renders as "set" and
 /// is only sent when the user types a new one), `Some("")` clears it, anything
 /// else replaces it.
+///
+/// `model` and `context_window` are optional even with a provider configured;
+/// empty means "do not write that key", which leaves a provider that maps
+/// Claude model ids itself alone.
 #[tauri::command]
 async fn save_upstream_override(
     app: AppHandle,
     mode: String,
     base_url: String,
     token: Option<String>,
+    model: Option<String>,
+    context_window: Option<String>,
 ) -> Result<UpstreamOverrideView, String> {
     use crate::state::{UpstreamOverride, UpstreamOverrideMode};
 
@@ -4619,10 +4629,36 @@ async fn save_upstream_override(
         }
     };
 
+    // Same rule as base_url and the token: Off keeps nothing, so a stale model
+    // id cannot outlive the endpoint that served it.
+    let configured = mode != UpstreamOverrideMode::Off;
+    let model = if configured {
+        model.unwrap_or_default().trim().to_string()
+    } else {
+        String::new()
+    };
+    let context_window = if configured {
+        let raw = context_window.unwrap_or_default().trim().to_string();
+        if !raw.is_empty() && !raw.chars().all(|c| c.is_ascii_digit()) {
+            return Err("The context window must be a whole number of tokens.".into());
+        }
+        raw
+    } else {
+        String::new()
+    };
+    client_adapters::apply_upstream_provider_env(
+        configured,
+        Some(model.as_str()).filter(|value| !value.is_empty()),
+        Some(context_window.as_str()).filter(|value| !value.is_empty()),
+    )
+    .map_err(|err| err.to_string())?;
+
     let next = UpstreamOverride {
         mode,
         base_url,
         has_token,
+        model,
+        context_window,
     };
     let state: tauri::State<'_, AppState> = app.state();
     state.set_upstream_override(next.clone());

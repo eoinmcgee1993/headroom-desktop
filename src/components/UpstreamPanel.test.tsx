@@ -10,11 +10,19 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args)
 }));
 
-const off: UpstreamOverrideView = { mode: "off", baseUrl: "", hasToken: false };
+const off: UpstreamOverrideView = {
+  mode: "off",
+  baseUrl: "",
+  hasToken: false,
+  model: "",
+  contextWindow: ""
+};
 const configured: UpstreamOverrideView = {
   mode: "override",
   baseUrl: "https://api.z.ai/api/anthropic",
-  hasToken: true
+  hasToken: true,
+  model: "",
+  contextWindow: ""
 };
 
 function respond(current: UpstreamOverrideView, saved?: UpstreamOverrideView) {
@@ -44,7 +52,9 @@ describe("UpstreamPanel", () => {
       expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
         mode: "override",
         baseUrl: "https://api.z.ai/api/anthropic",
-        token: "secret-token"
+        token: "secret-token",
+        model: "",
+        contextWindow: ""
       });
     });
     expect(await screen.findByText(/restarted on this provider/)).toBeInTheDocument();
@@ -69,7 +79,9 @@ describe("UpstreamPanel", () => {
       expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
         mode: "override",
         baseUrl: "https://api.z.ai/api/anthropic",
-        token: null
+        token: null,
+        model: "",
+        contextWindow: ""
       });
     });
   });
@@ -87,7 +99,9 @@ describe("UpstreamPanel", () => {
       expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
         mode: "override",
         baseUrl: "https://api.z.ai/api/anthropic",
-        token: ""
+        token: "",
+        model: "",
+        contextWindow: ""
       });
     });
   });
@@ -123,9 +137,35 @@ describe("UpstreamPanel", () => {
       expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
         mode: "off",
         baseUrl: "",
-        token: null
+        token: null,
+        model: "",
+        contextWindow: ""
       });
     });
     expect(await screen.findByText(/restarted on Anthropic/)).toBeInTheDocument();
+  });
+  /// The model slots and compact window are what make a provider actually
+  /// answer; they are optional, so an empty field must stay empty rather than
+  /// being sent as a value.
+  it("sends the model and context window when they are filled in", async () => {
+    respond(off, { ...configured, model: "glm-4.6", contextWindow: "1000000" });
+    const user = userEvent.setup();
+    render(<UpstreamPanel />);
+
+    await screen.findByLabelText("Provider base URL");
+    await user.type(screen.getByLabelText("Provider base URL"), "https://api.z.ai/api/anthropic");
+    await user.type(screen.getByLabelText("Provider model"), "glm-4.6");
+    await user.type(screen.getByLabelText("Provider context window"), "1000000");
+    await user.click(screen.getByRole("button", { name: "Save and restart" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
+        mode: "override",
+        baseUrl: "https://api.z.ai/api/anthropic",
+        token: null,
+        model: "glm-4.6",
+        contextWindow: "1000000"
+      });
+    });
   });
 });

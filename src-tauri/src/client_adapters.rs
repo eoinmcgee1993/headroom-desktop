@@ -2782,19 +2782,70 @@ fn ensure_claude_settings_hook(
 /// `None` removes the key -- used when the override is cleared, so a stale
 /// provider token cannot outlive the endpoint it belonged to.
 pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
-    match token {
+    set_or_clear_claude_settings_env("ANTHROPIC_AUTH_TOKEN", token)
+}
+
+/// Set one `env` key in the client's settings, or remove it when the value is
+/// absent or empty. Removal goes through `remove_claude_settings_env`, so a key
+/// the user has since changed by hand is left alone rather than deleted.
+fn set_or_clear_claude_settings_env(env_key: &str, value: Option<&str>) -> Result<()> {
+    match value {
         Some(value) if !value.is_empty() => {
-            configure_claude_settings_env("ANTHROPIC_AUTH_TOKEN", value)?;
+            configure_claude_settings_env(env_key, value)?;
             Ok(())
         }
-        _ => {
-            let existing = read_claude_settings_env("ANTHROPIC_AUTH_TOKEN")?;
-            match existing {
-                Some(current) => remove_claude_settings_env("ANTHROPIC_AUTH_TOKEN", &current, None),
-                None => Ok(()),
-            }
-        }
+        _ => match read_claude_settings_env(env_key)? {
+            Some(current) => remove_claude_settings_env(env_key, &current, None),
+            None => Ok(()),
+        },
     }
+}
+
+/// Client settings any third-party provider needs beyond the credential, taken
+/// from a working GLM setup.
+///
+/// Both are provider-agnostic. Anthropic-compatible endpoints are slower than
+/// Anthropic and the stock client timeout aborts long turns; nonessential
+/// traffic goes to Anthropic endpoints a third-party base URL does not serve,
+/// so leaving it on only produces errors.
+const PROVIDER_CLIENT_ENV: &[(&str, &str)] = &[
+    ("API_TIMEOUT_MS", "3000000"),
+    ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+];
+
+/// Every model slot Claude Code reads (verified against the shipped binary).
+/// All four are written together: leaving one unset sends that slot's Claude
+/// model id to a provider that does not serve it the moment the user switches
+/// model.
+const PROVIDER_MODEL_SLOT_ENV: &[&str] = &[
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+];
+
+/// The rest of the client config a configured provider needs, or a clear of all
+/// of it when `configured` is false -- a stale model id must not outlive the
+/// endpoint that served it, same rule as the token.
+///
+/// `model` and `context_window` stay optional even with a provider set: a
+/// provider that maps Claude model ids itself needs neither.
+pub fn apply_upstream_provider_env(
+    configured: bool,
+    model: Option<&str>,
+    context_window: Option<&str>,
+) -> Result<()> {
+    for (env_key, value) in PROVIDER_CLIENT_ENV {
+        set_or_clear_claude_settings_env(env_key, configured.then_some(*value))?;
+    }
+    let model = model.filter(|_| configured);
+    for env_key in PROVIDER_MODEL_SLOT_ENV {
+        set_or_clear_claude_settings_env(env_key, model)?;
+    }
+    set_or_clear_claude_settings_env(
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+        context_window.filter(|_| configured),
+    )
 }
 
 /// Current value of one `env` key in `~/.claude/settings.json`, if any.
@@ -11456,5 +11507,47 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .any(|w| w.contains("~/.local/bin/headroom")),
             "absorbing the plugin hook must not hide a real OSS CLI"
         );
+    }
+    /// The provider env keys are what make a third-party endpoint actually
+    /// answer (Andrew's GLM setup). Clearing the provider must take all of
+    /// them back out again rather than leaving Claude Code pinned to a model
+    /// Anthropic has never heard of.
+    #[test]
+    #[serial_test::serial]
+    fn provider_env_round_trips_through_claude_settings() {
+        let home = TestHome::new();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, r#"{"env": {"USER_KEY": "keep me"}}"#).unwrap();
+
+        super::apply_upstream_provider_env(true, Some("glm-4.6"), Some("1000000")).unwrap();
+        let written = read_settings_json(&settings);
+        assert_eq!(written["env"]["API_TIMEOUT_MS"].as_str(), Some("3000000"));
+        assert_eq!(
+            written["env"]["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"].as_str(),
+            Some("1")
+        );
+        assert_eq!(
+            written["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"].as_str(),
+            Some("1000000")
+        );
+        for slot in super::PROVIDER_MODEL_SLOT_ENV {
+            assert_eq!(written["env"][slot].as_str(), Some("glm-4.6"), "{slot}");
+        }
+
+        super::apply_upstream_provider_env(false, None, None).unwrap();
+        let cleared = read_settings_json(&settings);
+        let env = cleared["env"].as_object().expect("env survives");
+        for key in super::PROVIDER_MODEL_SLOT_ENV.iter().chain(
+            [
+                "API_TIMEOUT_MS",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+            ]
+            .iter(),
+        ) {
+            assert!(!env.contains_key(*key), "{key} still set after clearing");
+        }
+        assert_eq!(env["USER_KEY"].as_str(), Some("keep me"));
     }
 }

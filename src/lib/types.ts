@@ -733,4 +733,8 @@ export interface UpstreamOverrideView {
   mode: UpstreamMode;
   baseUrl: string;
   hasToken: boolean;
+  /** Written to every ANTHROPIC_DEFAULT_*_MODEL slot; empty leaves them unset. */
+  model: string;
+  /** CLAUDE_CODE_AUTO_COMPACT_WINDOW in tokens; empty leaves it unset. */
+  contextWindow: string;
 }
