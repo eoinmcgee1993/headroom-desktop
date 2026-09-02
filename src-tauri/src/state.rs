@@ -2683,6 +2683,7 @@ impl AppState {
                 session_estimated_tokens_saved: snapshot.session_estimated_tokens_saved,
                 session_savings_pct: snapshot.session_savings_pct,
                 output_reduction,
+                output_shaper_active: stats.as_ref().and_then(|s| s.output_shaper_active),
                 learner_progress,
                 reread_tokens: stats.as_ref().and_then(|s| s.reread_tokens),
                 reread_compressed_tokens: stats.as_ref().and_then(|s| s.reread_compressed_tokens),
@@ -5708,6 +5709,12 @@ struct HeadroomDashboardStats {
     session_total_tokens_sent: Option<u64>,
     savings_history: Vec<HeadroomSavingsHistoryPoint>,
     output_reduction: Option<OutputReduction>,
+    /// Whether the wheel's rollout gate actually enabled the output shaper
+    /// (`rollout.features[name=="proxy_output_shaper"].enabled`). The desktop
+    /// requests the shaper via HEADROOM_OUTPUT_SHAPER=1, but a wheel's rollout
+    /// registry can block it by channel (the 0.37.0 wheel gates it to beta,
+    /// silently disabling it on stable). None on wheels without the block.
+    output_shaper_active: Option<bool>,
     /// Tool-definition tokens the proxy kept out of the model's context by
     /// deferring heavy tool schemas. Process-cumulative (it resets when the
     /// backend restarts), and the backend never writes it to its rollups, so
@@ -6350,6 +6357,17 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
         .unwrap_or_default();
 
     let output_reduction = parse_output_reduction(&root);
+    // Rollout truth for the shaper: a ledger-recomputed reduction is only a
+    // live claim while the wheel actually runs the shaper. Absent block => None
+    // (older wheels), and the report gate stays open.
+    let output_shaper_active = value_at_path(&root, &["rollout", "features"])
+        .and_then(Value::as_array)
+        .and_then(|features| {
+            features
+                .iter()
+                .find(|f| f.get("name").and_then(Value::as_str) == Some("proxy_output_shaper"))
+        })
+        .and_then(|f| f.get("enabled").and_then(Value::as_bool));
     // `summary.compression` carries the process-cumulative counter. The
     // `savings.by_layer` block reports the same layer but only over the recent
     // request window, so it is a fallback for shape, not a preferred source.
@@ -6398,6 +6416,7 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
             session_total_tokens_sent,
             savings_history,
             output_reduction,
+            output_shaper_active,
             tool_schema_tokens_saved,
         })
     }
@@ -10337,6 +10356,7 @@ mod tests {
         // savings_history backfills the daily buckets the lifetime total (and
         // hence milestones) is derived from; a cumulative 1.5M crosses 100k+1M.
         let stats = HeadroomDashboardStats {
+            output_shaper_active: None,
             reread_tokens: None,
             reread_compressed_tokens: None,
             ccr_retrievals: None,
@@ -10385,6 +10405,7 @@ mod tests {
 
         let first = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10408,6 +10429,7 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10435,6 +10457,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10453,6 +10476,7 @@ mod tests {
 
         let reset = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10479,6 +10503,7 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10550,6 +10575,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -10711,7 +10737,16 @@ mod tests {
                     "history_size": 12
                 },
                 "waste_signals": { "reread": 91000, "reread_compressed": 4500 },
-                "compression": { "ccr_retrievals": 6 }
+                "compression": { "ccr_retrievals": 6 },
+                "rollout": {
+                    "features": [
+                        {
+                            "name": "proxy_output_shaper",
+                            "enabled": false,
+                            "decision": "blocked_by_channel"
+                        }
+                    ]
+                }
             }"#,
         )
         .expect("contract fixture must parse");
@@ -10743,6 +10778,10 @@ mod tests {
         let learner = parsed.learner_progress.expect("learner parsed");
         assert_eq!(learner.pending_patterns, 3);
 
+        // The rollout block decides whether the shaper's reduction is a live
+        // claim; blocked_by_channel must parse as an explicit false.
+        assert_eq!(parsed.output_shaper_active, Some(false));
+
         // Retrieval-churn gauges ride the savings report to the server.
         assert_eq!(parsed.reread_tokens, Some(91000));
         assert_eq!(parsed.reread_compressed_tokens, Some(4500));
@@ -10758,6 +10797,9 @@ mod tests {
         )
         .expect("fallback fixture must parse");
         assert_eq!(fallback.tool_schema_tokens_saved, Some(555));
+        // No rollout block (older wheel) => unknown, and the report gate must
+        // stay open rather than mislabel the layer inactive.
+        assert_eq!(fallback.output_shaper_active, None);
     }
 
     #[test]
@@ -11059,6 +11101,7 @@ mod tests {
         // that was already starved.
         let state = AppState::new().expect("state");
         let good = HeadroomDashboardStats {
+            output_shaper_active: None,
             tool_schema_tokens_saved: Some(4_242),
             ..HeadroomDashboardStats::default()
         };
@@ -11676,6 +11719,7 @@ mod tests {
         let mut tracker = make_tracker();
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11702,6 +11746,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11724,6 +11769,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11756,6 +11802,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11777,6 +11824,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11871,6 +11919,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11902,6 +11951,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11924,6 +11974,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11955,6 +12006,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -11981,6 +12033,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12047,6 +12100,7 @@ mod tests {
         ] {
             tracker
                 .observe(&HeadroomDashboardStats {
+                    output_shaper_active: None,
                     reread_tokens: None,
                     reread_compressed_tokens: None,
                     ccr_retrievals: None,
@@ -12078,6 +12132,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12100,6 +12155,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12132,6 +12188,7 @@ mod tests {
 
         tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12150,6 +12207,7 @@ mod tests {
 
         let second = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12202,6 +12260,7 @@ mod tests {
 
         let snapshot = tracker
             .observe(&HeadroomDashboardStats {
+                output_shaper_active: None,
                 reread_tokens: None,
                 reread_compressed_tokens: None,
                 ccr_retrievals: None,
@@ -12735,6 +12794,7 @@ mod tests {
 
         // First observation: 1_000 tokens saved, history shows 0→1_000 across hours 9→10.
         tracker.observe(&HeadroomDashboardStats {
+            output_shaper_active: None,
             reread_tokens: None,
             reread_compressed_tokens: None,
             ccr_retrievals: None,
@@ -12757,6 +12817,7 @@ mod tests {
 
         // Second observation: 3_000 tokens saved, history adds hour 11.
         tracker.observe(&HeadroomDashboardStats {
+            output_shaper_active: None,
             reread_tokens: None,
             reread_compressed_tokens: None,
             ccr_retrievals: None,

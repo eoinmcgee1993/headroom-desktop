@@ -306,6 +306,13 @@ pub struct DashboardState {
     /// `None` until a verbosity baseline is seeded (the dashboard hides the stat
     /// until then). Always honestly labelled (`method` + confidence band).
     pub output_reduction: Option<OutputReduction>,
+    /// Whether the running wheel's rollout gate actually enabled the output
+    /// shaper. `Some(false)` means blocked (e.g. blocked_by_channel on stable
+    /// with the 0.37.0 wheel): the reduction above then describes an inactive
+    /// feature and must not be reported to the server as a live one. `None`
+    /// on wheels that predate the rollout block.
+    #[serde(default)]
+    pub output_shaper_active: Option<bool>,
     /// Auto-learning progress; `None` when the backend doesn't report it.
     #[serde(default)]
     pub learner_progress: Option<LearnerProgress>,
