@@ -31,6 +31,9 @@
   --surface-raised:     rgba(255, 255, 255, 0.55);
   --surface-sunken:     rgba(36, 31, 29, 0.04);
   --surface-overlay:    rgba(255, 255, 255, 0.96);
+  /* Fully opaque floating layer: chip popovers render over the busy history
+     chart, where any glass surface reads as noise. */
+  --surface-popover:    #ffffff;
   --surface-sidebar:    rgba(255, 255, 255, 0.7);
   --surface-tint-warm:  #FAF3E9;
 
@@ -87,6 +90,7 @@
     --surface-raised:     rgba(255, 255, 255, 0.07);
     --surface-sunken:     rgba(255, 255, 255, 0.04);
     --surface-overlay:    rgba(255, 255, 255, 0.14);
+    --surface-popover:    #2e2a27;
     --surface-sidebar:    rgba(255, 255, 255, 0.04);
     --surface-tint-warm:  rgba(255, 255, 255, 0.04);
 
@@ -2272,8 +2276,17 @@ select {
   padding: 12px;
   border-radius: 12px;
   border: 1px solid var(--border-default);
-  background: var(--surface-overlay);
+  background: var(--surface-popover);
   box-shadow: 0 8px 24px rgba(36, 31, 29, 0.16);
+}
+
+/* While a chip popover is open, lift the whole overlay above the chart
+   header: the mode toggle sits at z-index 2 and the overlay at 1, so a tall
+   popover centered on the chip row extends into the header zone and the
+   toggle and nav buttons paint straight through it. Scoped via :has so the
+   overlay keeps its normal stacking whenever no popover is open. */
+.savings-chart__overlay:has(.output-chip__popover) {
+  z-index: 30;
 }
 
 /* Rightmost chip: extend leftward instead, so the panel never overflows the

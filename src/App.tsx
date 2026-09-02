@@ -965,7 +965,8 @@ function DailySavingsChart({
   resetSignal,
   chartMode,
   setChartMode,
-  outputReduction
+  outputReduction,
+  sessionNewInput
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
@@ -973,6 +974,10 @@ function DailySavingsChart({
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
+  /** Session-scope new-input rate; stands in for the windowed chip when the
+   * visible window has no sampled coverage (fresh boot or pre-upgrade
+   * buckets), labeled as such. */
+  sessionNewInput: { pct: number; savedTokens: number } | null;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
@@ -1140,13 +1145,16 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {windowNewInput !== null || windowOutput !== null || outputReduction ? (
+            {windowNewInput !== null ||
+            sessionNewInput !== null ||
+            windowOutput !== null ||
+            outputReduction ? (
               <span
                 className={`savings-chart__overlay-chips${
                   chartMode === "tokens" ? " savings-chart__overlay-chips--tokens" : ""
                 }`}
               >
-                {windowNewInput !== null && (
+                {windowNewInput !== null ? (
                   <WindowRateChip
                     dot="input"
                     label={`Input −${Math.round(windowNewInput.pct)}%`}
@@ -1157,9 +1165,23 @@ function DailySavingsChart({
                       { dt: "Removed", dd: compactNumber(windowNewInput.savedTokens) },
                       { dt: "New input", dd: compactNumber(windowNewInput.newInputTokens) }
                     ]}
-                    note="Vs input that newly entered context in this window (uncached + cache writes), sampled while the app runs. The re-sent cached prefix is excluded: Headroom never rewrites it, so it carries no compression opportunity."
+                    note="Vs input that newly entered context (uncached + cache writes), sampled while the app runs. The cached prefix is excluded: Headroom never rewrites it."
                   />
-                )}
+                ) : sessionNewInput !== null ? (
+                  // No sampled coverage in the visible window yet (fresh boot,
+                  // fresh day, or buckets from before per-bucket sampling).
+                  // The session figure stands in and says so, mirroring the
+                  // output chip's labeled all-time fallback.
+                  <WindowRateChip
+                    dot="input"
+                    label={`Input −${Math.round(sessionNewInput.pct)}%`}
+                    title="Input compression"
+                    badge="session"
+                    value={`${percent1(sessionNewInput.pct)}%`}
+                    rows={[{ dt: "Removed", dd: compactNumber(sessionNewInput.savedTokens) }]}
+                    note="This session's figure standing in: the visible window has no sampled coverage yet. Same basis: new input only (uncached + cache writes)."
+                  />
+                ) : null}
                 {windowOutput !== null ? (
                   <WindowRateChip
                     dot="output"
@@ -6915,6 +6937,14 @@ export default function App() {
                 chartMode={chartMode}
                 setChartMode={setChartMode}
                 outputReduction={dashboard.outputReduction}
+                sessionNewInput={
+                  dashboard.sessionSavingsPct > 0 && dashboard.sessionEstimatedTokensSaved > 0
+                    ? {
+                        pct: dashboard.sessionSavingsPct,
+                        savedTokens: dashboard.sessionEstimatedTokensSaved
+                      }
+                    : null
+                }
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">
