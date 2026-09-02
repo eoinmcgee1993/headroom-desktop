@@ -598,6 +598,7 @@ const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
 
 const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
 const CLAUDE_CODE_INSTALL_CURL_CMD = "curl -fsSL https://claude.ai/install.sh | bash";
+const CLAUDE_CODE_INSTALL_PS_CMD = "irm https://claude.ai/install.ps1 | iex";
 const CODEX_CLI_INSTALL_CMD = "npm install -g @openai/codex";
 const CODEX_CLI_LOGIN_CMD = "codex login";
 const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
@@ -3996,6 +3997,22 @@ export default function App() {
     }
   }
 
+  // Launcher twin of copyLearnInstallCommand: the launcher stages only render
+  // connectorsNotice, not the learn panel's notice.
+  async function copyAgentInstallCommand(command: string) {
+    try {
+      if (!navigator.clipboard) {
+        throw new Error("Clipboard API unavailable");
+      }
+      await navigator.clipboard.writeText(command);
+      setConnectorsNotice("Copied install command.");
+      window.setTimeout(() => setConnectorsNotice(null), 2000);
+    } catch {
+      setConnectorsNotice("Copy failed. Select the command and copy manually.");
+      window.setTimeout(() => setConnectorsNotice(null), 3000);
+    }
+  }
+
   async function autoConfigureConnectorsForLauncher() {
     setConnectorsBusy(true);
     setConnectorsError(null);
@@ -5388,6 +5405,110 @@ export default function App() {
     );
     const enabledConnectorCount = launcherConnectors.filter((connector) => connector.enabled).length;
     const requireSelection = availableConnectors.length > 0;
+    const noClientsInstalled =
+      getLauncherAutoConfigureDecision(launcherConnectors) === "show_client_setup";
+    const agentInstallCommand =
+      runtimeStatus?.platform === "windows"
+        ? CLAUDE_CODE_INSTALL_PS_CMD
+        : CLAUDE_CODE_INSTALL_CURL_CMD;
+
+    // The no-tier segment: nothing to route, so the connector toggle list is
+    // all "not detected" noise and Continue leads nowhere. Guide the install
+    // instead; "Check again" re-runs the same auto-configure the launcher
+    // already uses, so a freshly installed client is applied and advances.
+    if (noClientsInstalled) {
+      return (
+        <LauncherShell
+          shellClassName="intro-shell intro-shell--post-install intro-shell--client-setup"
+          spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
+          copyClassName="intro-shell__copy intro-shell__copy--post-install"
+          onMouseDown={handleLauncherSurfaceMouseDown}
+          version={appSemver}
+        >
+          <div className="post-install__lead">
+            <h1>Install a coding agent first</h1>
+            <p>
+              Headroom saves tokens by routing an AI coding tool you already use
+              through its local proxy, and no supported tool was found on this
+              machine. Install Claude Code, sign in, then check again.
+            </p>
+            <div className="install-prompt" role="status">
+              <header className="install-prompt__head">
+                <span className="install-prompt__icon" aria-hidden="true">
+                  <Terminal weight="duotone" />
+                </span>
+                <div className="install-prompt__head-text">
+                  <h2 className="install-prompt__title">Install the Claude Code CLI</h2>
+                  <p className="install-prompt__body">
+                    Run this in your terminal and follow the sign-in prompts.
+                  </p>
+                </div>
+              </header>
+              <div className="install-prompt__cmd">
+                <code className="install-prompt__cmd-text">{agentInstallCommand}</code>
+                <button
+                  className="install-prompt__cmd-copy"
+                  type="button"
+                  onClick={() => void copyAgentInstallCommand(agentInstallCommand)}
+                >
+                  Copy
+                </button>
+              </div>
+              <div className="install-prompt__foot">
+                <button
+                  className="install-prompt__link"
+                  type="button"
+                  onClick={() => void openLearnInstallDocsLink()}
+                >
+                  Open install docs
+                </button>
+              </div>
+            </div>
+            <p>
+              Also works with ChatGPT Codex, OpenCode, and Grok. Install any of
+              them, then check again.
+            </p>
+            {connectorsError ? (
+              <p className="install-progress__error">{connectorsError}</p>
+            ) : null}
+            {connectorsNotice ? (
+              <p className="install-progress__notice">{connectorsNotice}</p>
+            ) : null}
+          </div>
+          <div className="post-install__actions">
+            <button
+              className="secondary-button post-install__reopen-setup"
+              onClick={() => {
+                setLauncherStage("install");
+              }}
+              type="button"
+            >
+              Back
+            </button>
+            <button
+              className="secondary-button"
+              disabled={connectorsBusy}
+              onClick={() => {
+                void beginProxyVerificationStep();
+              }}
+              type="button"
+            >
+              Skip for now
+            </button>
+            <button
+              className="primary-button primary-button--large primary-button--success"
+              disabled={connectorsBusy}
+              onClick={() => {
+                void autoConfigureConnectorsForLauncher();
+              }}
+              type="button"
+            >
+              Check again
+            </button>
+          </div>
+        </LauncherShell>
+      );
+    }
 
     return (
       <LauncherShell
