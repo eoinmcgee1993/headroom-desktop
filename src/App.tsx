@@ -8110,8 +8110,9 @@ export default function App() {
                           {compactNumber(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0)} tokens
                           of tool definitions Headroom kept out of your requests until they were
                           needed. These sit at the front of the cached prefix, so they are priced at
-                          the provider's cache-read rate rather than the full input rate. Counted in
-                          addition to the Total costs saved figure, not inside it.
+                          the provider's cache-read rate rather than the full input rate. The
+                          history chart shows this layer as its own bar segment; the Total costs
+                          saved figure above does not include it.
                         </p>
                       </>
                     ) : null}
