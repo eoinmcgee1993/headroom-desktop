@@ -257,7 +257,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports seven fixes owed upstream (remove each once a wheel ships it),
+Also ports eight fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -315,6 +315,31 @@ bailout (a heredoc body may contain ; or &&), and delegates each
 segment's program parsing to the original function so wrapper peeling,
 bash -c recursion and the lockfile carve-out stay upstream's. Kill
 switch: HEADROOM_READ_CHAIN_GUARD=0.
+Prefix-floor vendor (upstream PR #3380): 0.37.0 plus the full-replay
+guard below resolve every compressed-vs-replayed conflict in favor of
+the previously-forwarded bytes, so background/cold-start Kompress
+landings are discarded forever and compression sits at ~2 percent while
+the cache stays healthy (measured 2026-09-02, avg_compression_pct 1.9,
+request cache-hit 98.8). The vendor execs the PR's overlay_cached_prefix
+and finalize_turn into the wheel verbatim: inside the provider-confirmed
+floor replay is unconditional, beyond it the size bound arbitrates each
+turn, so a background compression improvement lands ONCE, is recorded as
+the new replay source, and replays stably after -- the 0.35.0
+one-time-bust economics that measured 26 percent input savings WITH 90
+percent dollar cache hits. This is NOT the 0.9.4-rc.4 splice, which
+stitched replayed-bytes-to-the-floor onto this turn's fresh pipeline
+output and so shipped every turn's beyond-floor drift (22 percent fleet
+cache coverage lost, 1.20 -> 0.94 reads/sent, n=17, p=0.007); the
+vendored overlay keeps upstream's full alignment and bound arbitration
+beyond the floor. The confirmed floor is bridged from prepare_turn's
+keyword-only tracker_frozen -- the Anthropic token path is the only
+0.37.0 caller that passes it, with the same pre-clamp value the PR
+stashes in handler locals -- and floorless calls (OpenAI paths, cache
+mode) get len(prev_returned), which through the PR's own mechanism
+reproduces the 0.9.5 full replay: no path gets less cache protection
+than the guard below gave. Gated on wheel version exactly 0.37.0 AND
+the fix parameter absent; the first wheel shipping #3380 keeps its own
+policy. Kill switch: HEADROOM_PR3380_VENDOR=0.
 Prefix-replay inflation-skip guard (upstream issue #3379): since the
 0.36.x non-inflation bound (#3052), overlay_cached_prefix declines to
 replay the previously-forwarded prefix whenever background compression
@@ -337,7 +362,10 @@ that and nothing cleverer. Gated on the
 runtime NOT having the fix's parameter (enforce_non_inflation in the
 first PR shape, confirmed_frozen_count in the reworked #3380 shape), so
 the first wheel that ships either keeps its own replay policy and this
-block goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
+block goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0. Normally inert
+while the prefix-floor vendor above binds (the vendored signature trips
+this guard's fixed-parameter gate); it is the fallback when the vendor
+is killed or fails.
 cc-switch Official-branch upstream reset (upstream PR #3166): the
 reconciler captures the third-party endpoint cc-switch selected (Kimi,
 DeepSeek, GLM) as this proxy's Anthropic upstream, but switching back to
@@ -905,6 +933,370 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     except Exception:
         pass
 
+    # Prefix-floor vendor (upstream PR #3380, still open; remove once a wheel
+    # ships it -- see the module docstring for the compression collapse this
+    # ends). Vendors the PR verbatim against the 0.37.0 pin: the patched
+    # overlay_cached_prefix and finalize_turn are exec'd wholesale into their
+    # modules (no reimplementation -- the 0.9.4-rc.4 splice was one, and lost
+    # 22 percent of fleet cache coverage). The provider-confirmed floor the
+    # PR stashes in handler locals is bridged from the one seam sitecustomize
+    # can reach: prepare_turn's keyword-only tracker_frozen, passed by exactly
+    # one caller in 0.37.0 (the Anthropic token path) with the same pre-clamp
+    # value. Calls with no bridged floor in scope (OpenAI paths, cache mode)
+    # get confirmed_frozen_count=len(prev_returned): through the PR's own
+    # mechanism that floors every replayable position, which IS the full
+    # replay this desktop shipped in 0.9.5 -- no path gets less cache
+    # protection than the prefix-replay guard gave. Binding order matters:
+    # the vendored signature carries confirmed_frozen_count, which flips the
+    # prefix-replay guard below to inert via its own gate. Kill switch:
+    # HEADROOM_PR3380_VENDOR=0 (the guard below then binds as before).
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_PR3380_VENDOR", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            from importlib import metadata as _hd_v_meta
+
+            import headroom.cache.prefix_tracker as _hd_v_pt
+            import headroom.proxy.session_engine as _hd_v_se
+
+            _hd_v_fixed = any(
+                name in _hd_v_pt.overlay_cached_prefix.__code__.co_varnames
+                for name in ("enforce_non_inflation", "confirmed_frozen_count")
+            )
+            # Exact-pin gate: the vendored bodies are v0.37.0 + PR #3380 and
+            # nothing else; any other wheel keeps its own replay policy (a
+            # fixed wheel also trips _hd_v_fixed and needs no vendor).
+            if _hd_v_meta.version("headroom-ai") == "0.37.0" and not _hd_v_fixed:
+                _hd_v_overlay_src = '''
+def overlay_cached_prefix(
+    optimized_messages: list[dict[str, Any]],
+    current_original_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+    *,
+    confirmed_frozen_count: int | None = None,
+) -> list[dict[str, Any]]:
+    """Replay a positional, non-inflating cached prefix when it is safe.
+
+    Provider-agnostic cache-safety guard for the freeze path. When a message is
+    "frozen", the compression pipeline may emit the agent's ORIGINAL bytes for
+    it — but the provider cached whatever we FORWARDED last turn (the compressed
+    form). Forwarding the original then mismatches the cached prefix and busts
+    the prompt cache from that point (100% of observed misses were this
+    ``prefix_change``). This overlays the exact previously-forwarded prefix onto
+    the corresponding leading messages so the forwarded prefix stays byte-for-byte
+    what the provider hashed for its cache key.
+
+    Safe only when this turn extends the previous turn in a proven positional
+    shape: either whole-message append or pure block append inside one message.
+    There must be exactly one previous forwarded message per original. Otherwise
+    the previous bytes may not correspond to the same positions, so we return
+    ``optimized_messages`` unchanged (accept a possible bust rather than forward
+    wrong content).
+
+    The optimized and current-original lists must be positionally aligned, and
+    compact UTF-8 JSON for the replayed result must not exceed the optimized
+    candidate. These bounds prefer a cache miss to corrupting or inflating a
+    client's live history.
+
+    ``confirmed_frozen_count`` bounds UNCONDITIONAL replay. Leading positions
+    the provider has already confirmed cached (a message count derived from
+    ``cache_read_input_tokens``) are always replayed byte-identical: the
+    replay source there is exactly what the provider hashed, so changing
+    those bytes can only bust the cache. Beyond the floor the size bound
+    still arbitrates each turn: a shrinking replay (the pipeline emitted
+    original bytes for a frozen message) is repaired, while an inflating one
+    (fresh compression improved on the forwarded form) is declined so the
+    improvement reaches the wire. When the provider count collapses (cold
+    cache, TTL lapse) the floor collapses with it and every accumulated
+    improvement lands at once - the natural re-baselining that keeps
+    long-session growth bounded (#3026). Callers with no provider-confirmed
+    count pass None and keep the fully size-bounded behavior.
+    """
+    prev_orig = previous_original_messages
+    prev_fwd = previous_forwarded_messages
+    if not prev_orig or not prev_fwd:
+        return optimized_messages
+    if len(optimized_messages) != len(current_original_messages):
+        logger.debug(
+            "overlay: optimized/current-original length mismatch (optimized=%d, current=%d) "
+            "— skipping positional cached-prefix replay",
+            len(optimized_messages),
+            len(current_original_messages),
+        )
+        return optimized_messages
+    n = len(prev_orig)
+    # Positional 1:1 correspondence between prev_orig[i] and prev_fwd[i] holds
+    # only when last turn forwarded exactly one message per original (the
+    # append-only, no-injection shape update_from_response records). If the
+    # counts differ, an injected / dropped / merged message shifted the
+    # mapping, so replaying prev_fwd[i] at position i could forward the wrong
+    # content — bail (leave this turn's output untouched) rather than risk it.
+    if len(prev_fwd) != n:
+        logger.debug(
+            "overlay: forwarded/original count mismatch (prev_fwd=%d, prev_orig=%d) "
+            "— skipping cached-prefix replay (possible bust)",
+            len(prev_fwd),
+            n,
+        )
+        return optimized_messages
+
+    relation = classify_history_relation(current_original_messages, prev_orig)
+    if relation.kind == RELATION_BLOCK_APPEND and relation.message_index is not None:
+        message_index = relation.message_index
+        if message_index < len(optimized_messages):
+            previous_message = prev_fwd[message_index]
+            previous_original_message = prev_orig[message_index]
+            current_message = optimized_messages[message_index]
+            previous_content = (
+                previous_message.get("content") if isinstance(previous_message, dict) else None
+            )
+            previous_original_content = (
+                previous_original_message.get("content")
+                if isinstance(previous_original_message, dict)
+                else None
+            )
+            current_content = (
+                current_message.get("content") if isinstance(current_message, dict) else None
+            )
+            split = (
+                len(previous_original_content)
+                if isinstance(previous_original_content, list)
+                else -1
+            )
+            if (
+                isinstance(previous_content, list)
+                and isinstance(previous_original_content, list)
+                and isinstance(current_content, list)
+                and len(previous_content) == split
+                and len(current_content) >= split
+                and _canonicalize_for_prefix_compare(current_content[:split])
+                == _canonicalize_for_prefix_compare(previous_original_content)
+            ):
+                merged = copy.deepcopy(previous_message)
+                merged["content"] = copy.deepcopy(previous_content) + copy.deepcopy(
+                    current_content[split:]
+                )
+                logger.debug(
+                    "overlay: replayed %d forwarded blocks and appended %d new blocks "
+                    "inside message %d",
+                    split,
+                    len(current_content) - split,
+                    message_index,
+                )
+                replayed = (
+                    list(prev_fwd[:message_index])
+                    + [merged]
+                    + list(optimized_messages[message_index + 1 :])
+                )
+                if message_index >= max(confirmed_frozen_count or 0, 0):
+                    replayed_bytes = _compact_json_bytes(replayed)
+                    optimized_bytes = _compact_json_bytes(optimized_messages)
+                    if (
+                        replayed_bytes is None
+                        or optimized_bytes is None
+                        or len(replayed_bytes) > len(optimized_bytes)
+                    ):
+                        logger.debug("overlay: block replay inflated compact JSON — skipping")
+                        return optimized_messages
+                return replayed
+    # Append-only guard on CONTENT ONLY, message-by-message. Replay the
+    # previously-forwarded (cached, compressed) bytes for the longest LEADING
+    # run of messages that is byte-for-byte (content-canonical) identical to
+    # what we forwarded last turn, and stop at the first divergence.
+    #
+    # This is the cache-safety centerpiece for token mode (which relies solely
+    # on this replay; cache mode is already byte-stable by construction). The
+    # prior all-or-nothing guard busted the ENTIRE cached prefix the moment any
+    # single leading message failed to canonicalize-equal last turn — most
+    # commonly the just-added assistant turn, whose client-resent form can
+    # differ trivially from the copy we reconstructed and recorded. Stopping at
+    # the first divergence instead keeps the (much larger) cache-hit region
+    # up to that point and only re-forwards from the changed message onward.
+    #
+    # Comparison uses the shared canonicalizer (not just cache_control
+    # stripping) so it is robust to ALL per-turn transport / annotation churn —
+    # cache_control movement (Anthropic), litellm `caller`,
+    # provider_specific_fields, streaming `index`, string<->block content shape,
+    # etc. Content stability is what the provider's prefix cache actually keys
+    # on. Safe by construction: we only replay prev_fwd[k] where
+    # current_original[k] canonicalize-equals prev_orig[k], and prev_fwd[k]
+    # positionally corresponds to prev_orig[k] (guaranteed by the count check
+    # above), so no wrong bytes are ever forwarded.
+    limit = min(n, len(current_original_messages))
+    k = 0
+    while k < limit and _canonicalize_for_prefix_compare(
+        current_original_messages[k]
+    ) == _canonicalize_for_prefix_compare(prev_orig[k]):
+        k += 1
+    if k == 0:
+        logger.debug(
+            "overlay: prefix diverged at message 0 — no cached-prefix replay "
+            "(cold prefix or client rewrote history head)"
+        )
+        return optimized_messages
+    if k < n:
+        logger.debug(
+            "overlay: cached-prefix replay for %d/%d leading messages "
+            "(diverged at %d — re-forwarding tail fresh)",
+            k,
+            n,
+            k,
+        )
+    # Replay the cached (compressed) prefix byte-identical up to the first
+    # divergence; keep this turn's freshly-produced output for the rest.
+    replayed = list(prev_fwd[:k]) + list(optimized_messages[k:])
+    replayed_bytes = _compact_json_bytes(replayed)
+    optimized_bytes = _compact_json_bytes(optimized_messages)
+    if (
+        replayed_bytes is None
+        or optimized_bytes is None
+        or len(replayed_bytes) > len(optimized_bytes)
+    ):
+        # Something in the replay is byte-larger than this turn's fresh form:
+        # fresh compression improved on already-forwarded bytes. Landing the
+        # improvement is only safe OUTSIDE the provider-confirmed prefix -
+        # inside it, the improvement would change bytes the provider has
+        # already cached and bust the whole suffix. Split at the confirmed
+        # floor: replay the confirmed region unconditionally, forward
+        # everything beyond it fresh so the improvement reaches the wire.
+        floor = min(k, max(confirmed_frozen_count or 0, 0))
+        if floor <= 0:
+            logger.debug("overlay: replay inflated compact JSON — skipping cached-prefix replay")
+            return optimized_messages
+        logger.debug(
+            "overlay: replay inflated beyond the confirmed floor — replaying %d/%d "
+            "confirmed messages, forwarding the rest fresh",
+            floor,
+            k,
+        )
+        return list(prev_fwd[:floor]) + list(optimized_messages[floor:])
+    return replayed
+'''
+                exec(
+                    compile(_hd_v_overlay_src, "<hd-pr3380-overlay>", "exec"),
+                    _hd_v_pt.__dict__,
+                )
+                # session_engine binds overlay_cached_prefix by value at
+                # module import; repoint it so the vendored finalize_turn
+                # (exec'd below into the same namespace) calls the vendored
+                # overlay.
+                _hd_v_se.overlay_cached_prefix = _hd_v_pt.overlay_cached_prefix
+
+                _hd_v_finalize_src = '''
+def finalize_turn(
+    result_messages: list[dict[str, Any]],
+    original_messages: list[dict[str, Any]],
+    prev_original: list[dict[str, Any]] | None,
+    prev_returned: list[dict[str, Any]] | None,
+    *,
+    count_tokens: Callable[[list[dict[str, Any]]], int] | None = None,
+    confirmed_frozen_count: int | None = None,
+) -> TurnFinal:
+    """Replay last turn's exact forwarded/returned prefix over pipeline drift.
+
+    ``overlay_cached_prefix`` self-guards (positional alignment, append-only
+    shape, non-inflation), so calling this is always safe: when replay is not
+    provably correct it returns the pipeline's own output unchanged.
+
+    ``confirmed_frozen_count`` is forwarded to ``overlay_cached_prefix`` as
+    the unconditional-replay floor: positions the provider has confirmed
+    cached are always replayed byte-identical, while beyond the floor the
+    size bound decides between drift repair (a shrinking replay) and letting
+    a fresh improvement through (an inflating one). Callers with no
+    provider-confirmed count pass None and keep the fully size-bounded
+    behavior.
+
+    ``count_tokens`` is invoked only when the overlay actually replaced
+    bytes — the pipeline's own token count is still accurate otherwise. A
+    failing hook falls back to "no recount" rather than failing the turn.
+    """
+    final = overlay_cached_prefix(
+        result_messages,
+        original_messages,
+        prev_original,
+        prev_returned,
+        confirmed_frozen_count=confirmed_frozen_count,
+    )
+    replayed = final != result_messages
+    tokens: int | None = None
+    if replayed and count_tokens is not None:
+        try:
+            tokens = count_tokens(final)
+        except Exception as e:
+            # Fail-open: the turn still forwards, but the caller keeps the
+            # pipeline's count of messages that are NOT being forwarded —
+            # tokens_saved accounting is stale for this turn. Loud, not
+            # silent: a tokenizer that cannot count the replayed form is a
+            # bug worth surfacing even though it must not fail the request.
+            logger.warning(
+                "finalize_turn: token recount of replayed prefix failed "
+                "(%s: %s); keeping the pipeline's pre-overlay count",
+                type(e).__name__,
+                e,
+            )
+            tokens = None
+    return TurnFinal(messages=final, replayed=replayed, tokens=tokens)
+'''
+                exec(
+                    compile(_hd_v_finalize_src, "<hd-pr3380-finalize>", "exec"),
+                    _hd_v_se.__dict__,
+                )
+
+                import contextvars as _hd_v_cv
+
+                _hd_v_floor = _hd_v_cv.ContextVar("hd_pr3380_floor", default=None)
+
+                _hd_v_orig_prepare = _hd_v_se.prepare_turn
+
+                def _hd_v_prepare(*args, **kwargs):
+                    # The PR stashes max(int(frozen_message_count or 0), 0)
+                    # in the handler BEFORE prepare_turn clamps it against
+                    # the local byte-replay cache; tracker_frozen receives
+                    # that same pre-clamp value. Stash-before-call so a
+                    # failing prepare_turn cannot leave this turn floorless.
+                    if "tracker_frozen" in kwargs:
+                        try:
+                            _hd_v_floor.set(
+                                max(int(kwargs["tracker_frozen"] or 0), 0)
+                            )
+                        except Exception:
+                            _hd_v_floor.set(0)
+                    return _hd_v_orig_prepare(*args, **kwargs)
+
+                _hd_v_se.prepare_turn = _hd_v_prepare
+
+                _hd_v_vendored_finalize = _hd_v_se.finalize_turn
+
+                def _hd_v_finalize(
+                    result_messages,
+                    original_messages,
+                    prev_original,
+                    prev_returned,
+                    **kwargs,
+                ):
+                    if kwargs.get("confirmed_frozen_count") is None:
+                        _hd_v_f = _hd_v_floor.get()
+                        # One-shot: consumed by the finalize of the same
+                        # turn that stashed it, never a later one (keep-alive
+                        # connections run sequential requests on one task
+                        # context).
+                        _hd_v_floor.set(None)
+                        if _hd_v_f is None:
+                            _hd_v_f = len(prev_returned or [])
+                        kwargs["confirmed_frozen_count"] = _hd_v_f
+                    return _hd_v_vendored_finalize(
+                        result_messages,
+                        original_messages,
+                        prev_original,
+                        prev_returned,
+                        **kwargs,
+                    )
+
+                _hd_v_finalize.__wrapped__ = _hd_v_vendored_finalize
+                _hd_v_se.finalize_turn = _hd_v_finalize
+    except Exception:
+        pass
     # Prefix-replay guard (upstream issue #3379 / PR #3380; remove once a
     # wheel ships the fix -- see the module docstring for the cache-bust loop
     # this prevents). Restores v0.35.0's policy: that release has no size
@@ -919,7 +1311,9 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     # NOT having the fix's parameter under either name shipped on #3380
     # (enforce_non_inflation / confirmed_frozen_count), so the first wheel
     # that ships the fix keeps its own replay policy and this block goes
-    # inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
+    # inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0. Normally inert
+    # already: the prefix-floor vendor above installs the parameter; this
+    # binds only when the vendor is killed or fails.
     try:
         if _hd_os.environ.get(
             "HEADROOM_PREFIX_REPLAY_GUARD", "1"
@@ -11359,6 +11753,37 @@ mod tests {
             !py.contains("r2[:floor]"),
             "partial replay leaves busts past the floor"
         );
+    }
+
+    #[test]
+    fn sitecustomize_vendors_pr3380_floor_semantics() {
+        // Upstream PR #3380 vendored verbatim against the 0.37.0 pin: the
+        // patched overlay_cached_prefix + finalize_turn are exec'd wholesale,
+        // never reimplemented (the 0.9.4-rc.4 splice was a reimplementation
+        // and lost 22% of fleet cache coverage). Functional evidence:
+        // scratchpad test_vendor.py T1-T6 against the installed 0.37.0 venv,
+        // 2026-09-02.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_PR3380_VENDOR"));
+        // Exact-pin + fixed-parameter gates: any other wheel keeps its own
+        // replay policy.
+        assert!(py.contains(r#"_hd_v_meta.version("headroom-ai") == "0.37.0""#));
+        assert!(py.contains("in _hd_v_pt.overlay_cached_prefix.__code__.co_varnames"));
+        // The vendored signature is the PR's, which is also what flips the
+        // prefix-replay guard's own gate to inert.
+        assert!(py.contains("confirmed_frozen_count: int | None = None"));
+        // The vendor must BIND before the replay guard reads the signature.
+        let vendor_code = py.rfind("HEADROOM_PR3380_VENDOR").unwrap();
+        let guard_code = py.rfind("HEADROOM_PREFIX_REPLAY_GUARD").unwrap();
+        assert!(
+            vendor_code < guard_code,
+            "vendor block must precede the replay guard"
+        );
+        // Floor bridge: pre-clamp tracker_frozen in, one-shot consume out,
+        // full-replay fallback (the 0.9.5 posture) for floorless callers.
+        assert!(py.contains(r#"if "tracker_frozen" in kwargs:"#));
+        assert!(py.contains("_hd_v_floor.set(None)"));
+        assert!(py.contains("_hd_v_f = len(prev_returned or [])"));
     }
 
     #[test]
