@@ -232,6 +232,15 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // The direct-wheel fallback warn embeds the full PyPI URL, so message
+    // grouping opened a fresh issue per wheel version and per platform tag for
+    // one condition (RUST-22). `report_wheel_download_fallback` captures it
+    // fingerprinted on the cause class instead; this line stays local.
+    if target.starts_with("headroom_desktop_lib::tool_manager")
+        && msg.starts_with("headroom wheel download failed")
+    {
+        return true;
+    }
     // Boot-validation failure reaches Sentry via the fully-tagged Level::Error
     // capture at the same emit site (capture_runtime_upgrade_failure, RUST-4A:
     // versions, boot diagnostics, pip tail); this bridged warn double-reports
@@ -1034,6 +1043,22 @@ mod tests {
         assert!(!skip_sentry(
             "headroom_desktop_lib::state",
             "some other state warning"
+        ));
+    }
+
+    #[test]
+    fn skips_wheel_download_fallback_warn() {
+        // RUST-22: the full PyPI URL was the message, so every wheel bump and
+        // every platform tag opened a new issue for one condition.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "headroom wheel download failed (will fall back to pip index): downloading https://files.pythonhosted.org/packages/47/21/headroom_ai-0.37.0-cp310-abi3-macosx_11_0_arm64.whl"
+        ));
+        // The checksum-mismatch path is a hard failure, not this warn, and
+        // must keep its own reporting.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "Headroom wheel failed checksum verification; refusing unverified fallback"
         ));
     }
 

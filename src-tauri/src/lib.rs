@@ -5848,6 +5848,78 @@ fn normalize_learn_failure_signature(signature: &str) -> String {
     )
 }
 
+/// True when a `headroom learn` failure was the coding agent's CLI refusing to
+/// run because nobody is signed in to it on this machine.
+///
+/// This is a user-environment condition, not an app bug: the analyzer shells
+/// out to `claude`/`codex`/`opencode`, and if that CLI has no session it exits
+/// non-zero with its own login prompt. RUST-B6 is the whole class -- four
+/// events whose only content was `Not logged in - Please run /login`, which no
+/// change on our side can resolve. It stays out of Sentry and becomes an
+/// actionable message in the UI instead (see `learn_agent_auth_hint`).
+fn learn_failure_is_agent_auth(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // Each needle is a full CLI phrase, not a bare word: "login" alone would
+    // also match a project's own source lines echoed back in the output.
+    const NEEDLES: &[&str] = &[
+        "not logged in",
+        "please run /login",
+        "run /login",
+        "please log in",
+        "not authenticated",
+        "authentication_error",
+        "invalid api key",
+        "oauth token has expired",
+        "credentials have expired",
+        "session has expired",
+        "please run `codex login`",
+        "run `codex login`",
+        "no credentials found",
+    ];
+    NEEDLES.iter().any(|needle| lower.contains(needle))
+}
+
+/// The user-facing remedy for [`learn_failure_is_agent_auth`], naming the CLI
+/// the run actually shelled out to.
+fn learn_agent_auth_hint(agent: LearnAgent) -> String {
+    let (cli, command) = match agent {
+        LearnAgent::Claude => ("Claude Code", "claude"),
+        LearnAgent::Codex => ("Codex", "codex"),
+        LearnAgent::Opencode => ("opencode", "opencode"),
+        LearnAgent::Grok => ("Grok", "grok"),
+    };
+    format!(
+        "{cli} is not signed in on this machine, so headroom learn could not run its analysis. \
+         Open a terminal, run `{command}`, sign in, then start the scan again."
+    )
+}
+
+/// The text a learn failure is fingerprinted on.
+///
+/// Upstream's first stderr line is a marker whose reason is EMPTY -- ``LLM
+/// analysis failed: `claude -p ...` failed (exit 1):`` -- because the child
+/// CLI writes its diagnosis to its own stream, which upstream appends on the
+/// FOLLOWING line. Fingerprinting the marker alone collapsed every distinct
+/// cause onto one issue with nothing in it to tell them apart (RUST-74, then
+/// RUST-B6). When the first line ends at that dangling colon, the next
+/// non-empty line is the actual reason, so join it in.
+///
+/// stderr only at the call site: stdout echoes written memory files back
+/// verbatim and must never reach a Sentry title.
+fn learn_failure_signature_source(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let Some(first) = lines.next() else {
+        return "no output".to_string();
+    };
+    if !first.ends_with(':') {
+        return first.to_string();
+    }
+    match lines.next() {
+        Some(reason) => format!("{first} {reason}"),
+        None => first.to_string(),
+    }
+}
+
 /// Turn a `headroom learn` stdout line into the step shown under the scan timer,
 /// or None to leave the current step alone.
 ///
@@ -6131,50 +6203,69 @@ fn execute_headroom_learn_run(
                     // failure class per user (RUST-A2/RUST-9Z). The unmodified
                     // text stays in `reason` and `stderr_tail` below.
                     let signature = normalize_learn_failure_signature(&raw_signature);
-                    sentry::with_scope(
-                        |scope| {
-                            scope.set_tag("flow", "headroom_learn");
-                            scope.set_tag("learn_outcome", "llm_analysis_failed");
-                            scope.set_tag("learn_agent", agent.as_tag());
-                            scope.set_extra("reason", warnings.clone().into());
-                            scope.set_extra("raw_signature", raw_signature.clone().into());
-                            scope.set_extra("project_name", project_name.to_string().into());
-                            // The marker line ends at its colon: upstream
-                            // appends the child's stderr, and `claude -p
-                            // --output-format stream-json` writes its diagnosis
-                            // to stdout, so `reason` arrives empty and every
-                            // distinct cause -- usage limit, dead local route,
-                            // our own 400 -- collapses onto one fingerprint
-                            // (RUST-74: 14 events over six users' machines with
-                            // nothing in them to tell apart). The analyzer's
-                            // surrounding log lines are the only context left
-                            // on this side of the process boundary.
-                            //
-                            // stderr ONLY. stdout echoes written memory files
-                            // back verbatim (see `learn_step_label`), and that
-                            // is the user's project content -- it must never
-                            // reach Sentry.
-                            scope.set_extra(
-                                "stderr_tail",
-                                crate::state::tail_lines(&stderr, 32).join("\n").into(),
-                            );
-                            scope.set_fingerprint(Some(
-                                ["headroom_learn_llm_failure", signature.as_str()].as_slice(),
-                            ));
-                        },
-                        || {
-                            sentry::capture_message(
-                                &format!("headroom learn produced no recommendations: {signature}"),
-                                sentry::Level::Warning,
-                            );
-                        },
-                    );
+                    // Same user-environment carve-out as the non-zero-exit
+                    // branch below (RUST-B6): when the agent CLI has no signed-in
+                    // session, nothing on our side can change the outcome.
+                    let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
+                    if !agent_not_signed_in {
+                        sentry::with_scope(
+                            |scope| {
+                                scope.set_tag("flow", "headroom_learn");
+                                scope.set_tag("learn_outcome", "llm_analysis_failed");
+                                scope.set_tag("learn_agent", agent.as_tag());
+                                scope.set_extra("reason", warnings.clone().into());
+                                scope.set_extra("raw_signature", raw_signature.clone().into());
+                                scope.set_extra("project_name", project_name.to_string().into());
+                                // The marker line ends at its colon: upstream
+                                // appends the child's stderr, and `claude -p
+                                // --output-format stream-json` writes its diagnosis
+                                // to stdout, so `reason` arrives empty and every
+                                // distinct cause -- usage limit, dead local route,
+                                // our own 400 -- collapses onto one fingerprint
+                                // (RUST-74: 14 events over six users' machines with
+                                // nothing in them to tell apart). The analyzer's
+                                // surrounding log lines are the only context left
+                                // on this side of the process boundary.
+                                //
+                                // stderr ONLY. stdout echoes written memory files
+                                // back verbatim (see `learn_step_label`), and that
+                                // is the user's project content -- it must never
+                                // reach Sentry.
+                                scope.set_extra(
+                                    "stderr_tail",
+                                    crate::state::tail_lines(&stderr, 32).join("\n").into(),
+                                );
+                                scope.set_fingerprint(Some(
+                                    ["headroom_learn_llm_failure", signature.as_str()].as_slice(),
+                                ));
+                            },
+                            || {
+                                sentry::capture_message(
+                                    &format!(
+                                        "headroom learn produced no recommendations: {signature}"
+                                    ),
+                                    sentry::Level::Warning,
+                                );
+                            },
+                        );
+                    }
+                    let (summary, detail) = if agent_not_signed_in {
+                        (
+                            format!("headroom learn needs a signed-in agent for {project_name}."),
+                            learn_agent_auth_hint(agent),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "headroom learn could not produce recommendations for {project_name}."
+                            ),
+                            warnings,
+                        )
+                    };
                     (
-                        format!(
-                            "headroom learn could not produce recommendations for {project_name}."
-                        ),
+                        summary,
                         false,
-                        Some(warnings),
+                        Some(detail),
                         output_tail,
                         stdout,
                         stderr,
@@ -6226,12 +6317,24 @@ fn execute_headroom_learn_run(
                 // command-shaped reason, the resolved CLI path in it would
                 // split one failure class per machine. A no-op on any line that
                 // is not command-shaped.
-                let signature: String = normalize_learn_failure_signature(
+                // The marker line's reason sits on the NEXT line, so join it in
+                // when the first line ends at its dangling colon -- but only
+                // for stderr. `signature_source` falls back to stdout when
+                // stderr is empty, and stdout echoes written memory files back
+                // verbatim (see `learn_step_label`): that is the user's project
+                // content and must never reach a Sentry title.
+                let signature_head = if stderr.trim().is_empty() {
                     signature_source
                         .lines()
                         .map(str::trim)
                         .find(|l| !l.is_empty())
                         .unwrap_or("no output")
+                        .to_string()
+                } else {
+                    learn_failure_signature_source(signature_source)
+                };
+                let signature: String = normalize_learn_failure_signature(
+                    signature_head
                         .chars()
                         .take(160)
                         .collect::<String>()
@@ -6251,7 +6354,14 @@ fn execute_headroom_learn_run(
                 // unreadable between the pre-flight read_dir check and the CLI
                 // run. Click reports that as exit 2 with "is not readable" — a
                 // user-environment condition, not an app bug, so don't report it.
-                let user_env_condition = signature.contains("is not readable");
+                //
+                // The agent CLI having no signed-in session is the same class
+                // (RUST-B6). Matched against the whole stderr rather than the
+                // signature: upstream's marker line ends before the child's
+                // login prompt, which can land several lines further down.
+                let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
+                let user_env_condition =
+                    signature.contains("is not readable") || agent_not_signed_in;
                 if !user_env_condition {
                     sentry::with_scope(
                         |scope| {
@@ -6277,13 +6387,25 @@ fn execute_headroom_learn_run(
                         },
                     );
                 }
-                (
-                    format!("headroom learn failed for {project_name}."),
-                    false,
-                    Some(format!(
+                // A missing agent session has a remedy the user can act on;
+                // the raw exit status and output tail do not name it.
+                let user_error = if agent_not_signed_in {
+                    learn_agent_auth_hint(agent)
+                } else {
+                    format!(
                         "headroom learn exited with {}.\n{}",
                         output.status, fail_tail
-                    )),
+                    )
+                };
+                let user_summary = if agent_not_signed_in {
+                    format!("headroom learn needs a signed-in agent for {project_name}.")
+                } else {
+                    format!("headroom learn failed for {project_name}.")
+                };
+                (
+                    user_summary,
+                    false,
+                    Some(user_error),
                     output_tail,
                     stdout,
                     stderr,
@@ -7785,6 +7907,7 @@ mod tests {
         fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
         install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
+        learn_agent_auth_hint, learn_failure_is_agent_auth, learn_failure_signature_source,
         learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
         normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
         parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
@@ -10340,6 +10463,67 @@ Some unrelated content.
             !block.contains("&stdout") && !block.contains("&merged"),
             "stdout carries memory-file contents and must never reach Sentry: {block}"
         );
+    }
+
+    #[test]
+    fn learn_failure_is_agent_auth_matches_the_cli_login_prompts() {
+        // RUST-B6 verbatim: four events whose only content was the child CLI
+        // saying nobody is signed in.
+        let stderr = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nNot logged in \u{b7} Please run /login\n";
+        assert!(learn_failure_is_agent_auth(stderr));
+        assert!(learn_failure_is_agent_auth(
+            "Error: not authenticated. Please run `codex login`."
+        ));
+        assert!(learn_failure_is_agent_auth(
+            "AuthenticationError: invalid API key"
+        ));
+        assert!(learn_failure_is_agent_auth("Your OAuth token has expired."));
+    }
+
+    #[test]
+    fn learn_failure_is_agent_auth_does_not_swallow_real_failures() {
+        // These must keep reporting: they are ours to fix.
+        for stderr in [
+            "LLM analysis failed: `claude -p` did not respond within 120s.",
+            "ModuleNotFoundError: No module named 'headroom.learn'",
+            "Error: rate limit exceeded, try again later",
+            "usage limit reached for this session",
+            "",
+        ] {
+            assert!(!learn_failure_is_agent_auth(stderr), "for: {stderr}");
+        }
+    }
+
+    #[test]
+    fn learn_failure_signature_source_joins_the_dangling_marker_line() {
+        // Upstream's marker ends at a colon and appends the child's real
+        // diagnosis on the next line. Fingerprinting the marker alone put every
+        // distinct cause on one issue (RUST-74, then RUST-B6).
+        let stderr = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nNot logged in \u{b7} Please run /login\n";
+        let signature = learn_failure_signature_source(stderr);
+        assert!(signature.contains("Not logged in"), "got: {signature}");
+
+        // Two different causes behind the same marker must not collapse.
+        let other = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nCredit balance is too low\n";
+        assert_ne!(signature, learn_failure_signature_source(other));
+    }
+
+    #[test]
+    fn learn_failure_signature_source_leaves_a_self_contained_line_alone() {
+        let stderr = "ModuleNotFoundError: No module named 'headroom'\nTraceback follows\n";
+        assert_eq!(
+            learn_failure_signature_source(stderr),
+            "ModuleNotFoundError: No module named 'headroom'"
+        );
+        assert_eq!(learn_failure_signature_source("   \n\n"), "no output");
+    }
+
+    #[test]
+    fn learn_agent_auth_hint_names_the_cli_the_run_shelled_out_to() {
+        let hint = learn_agent_auth_hint(LearnAgent::Claude);
+        assert!(hint.contains("Claude Code"), "got: {hint}");
+        assert!(hint.contains("`claude`"), "got: {hint}");
+        assert!(learn_agent_auth_hint(LearnAgent::Codex).contains("`codex`"));
     }
 
     #[test]

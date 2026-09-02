@@ -559,6 +559,12 @@ pub struct AppState {
     activity_facts: Mutex<ActivityFacts>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
     cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
+    /// Last `/stats` payload that actually arrived, with the time it did.
+    /// Kept apart from `cached_headroom_stats` so the miss backoff and the
+    /// retention window measure different things: that cache stamps the last
+    /// FETCH (and must expire fast on success, slowly on failure), this one
+    /// stamps the last real ANSWER.
+    last_good_headroom_stats: Mutex<Option<(HeadroomDashboardStats, Instant)>>,
     /// `(history, fetched_at, fresh)` — `fresh` is false when `history` is a
     /// retained last-good value served because the latest fetch failed (proxy
     /// paused/unreachable), so it re-probes on the short miss TTL.
@@ -718,6 +724,7 @@ impl AppState {
             activity_facts: Mutex::new(activity_facts),
             cached_clients: Mutex::new(None),
             cached_headroom_stats: Mutex::new(None),
+            last_good_headroom_stats: Mutex::new(None),
             cached_headroom_history: Mutex::new(None),
             cached_rtk_gain_summary: Mutex::new(None),
             cached_rtk_today_stats: Mutex::new(None),
@@ -2134,15 +2141,59 @@ impl AppState {
         persist_last_known_good_plan(&self.last_known_good_plan_path, &entry);
     }
 
+    /// How long a last-good `/stats` payload may stand in for a failed fetch.
+    ///
+    /// The layers only `/stats` reports (output shaping, tool schema) describe
+    /// configuration, which does not move between polls, so serving the
+    /// previous answer through a transient timeout is honest -- and blanking
+    /// them is the entire harm the warning names ("dashboard loses the
+    /// layers"). Bounded so a backend that is starved for good eventually
+    /// shows absent layers rather than an ever-staler snapshot presented as
+    /// live.
+    const HEADROOM_STATS_RETAIN_LAST_GOOD: Duration = Duration::from_secs(10 * 60);
+
     fn cached_headroom_stats(&self) -> Option<HeadroomDashboardStats> {
+        match self.polled_headroom_stats() {
+            Some(stats) => {
+                *self.last_good_headroom_stats.lock() = Some((stats.clone(), Instant::now()));
+                Some(stats)
+            }
+            // Retain the previous good payload rather than blanking the
+            // dashboard on one timeout. The stamp is the age of the DATA, not
+            // of the failed fetch, so the window counts from the last real
+            // answer and repeated failures cannot extend it.
+            None => self
+                .last_good_headroom_stats
+                .lock()
+                .as_ref()
+                .filter(|(_, at)| at.elapsed() < Self::HEADROOM_STATS_RETAIN_LAST_GOOD)
+                .map(|(stats, _)| stats.clone()),
+        }
+    }
+
+    /// The raw poll behind [`Self::cached_headroom_stats`]: cache lookup, then
+    /// a live fetch on miss. Returns `None` for "this poll had no answer",
+    /// which the caller may still cover with a retained payload.
+    fn polled_headroom_stats(&self) -> Option<HeadroomDashboardStats> {
         // Dashboard polls at 5s; a 4s TTL caused every poll to miss and
         // re-fetch from the proxy. 12s gives at least one cache hit between
         // dashboard refreshes while keeping session savings visibly fresh.
         const TTL: Duration = Duration::from_secs(12);
+        // A failure is held far longer than a success, which is the opposite of
+        // `cached_headroom_history` and deliberate: the dominant failure here
+        // is a `/stats` rebuild that outruns its 15s timeout on a backend busy
+        // serving a session. Re-probing that every 12s keeps a 15s blocking
+        // request in flight essentially all the time, so the poll itself
+        // becomes part of the starvation it is reporting -- RUST-86 shipped
+        // 1601 events that way. At 60s the probe still recovers within a few
+        // seconds of the backend freeing up, at a fifth of the load, and the
+        // retained payload above covers the gap.
+        const MISS_TTL: Duration = Duration::from_secs(60);
         {
             let cache = self.cached_headroom_stats.lock();
             if let Some((stats, at)) = cache.as_ref() {
-                if at.elapsed() < TTL {
+                let ttl = if stats.is_some() { TTL } else { MISS_TTL };
+                if at.elapsed() < ttl {
                     return stats.clone();
                 }
             }
@@ -10975,6 +11026,50 @@ mod tests {
 
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;
+    }
+
+    #[test]
+    fn stats_miss_serves_the_last_good_payload_and_stops_hammering_the_backend() {
+        // RUST-86: a /stats rebuild that outruns its 15s timeout used to blank
+        // the dashboard layers AND get re-probed every 12s, so a 15s blocking
+        // request was in flight nearly all the time against the very backend
+        // that was already starved.
+        let state = AppState::new().expect("state");
+        let good = HeadroomDashboardStats {
+            tool_schema_tokens_saved: Some(4_242),
+            ..HeadroomDashboardStats::default()
+        };
+        *state.last_good_headroom_stats.lock() = Some((good.clone(), Instant::now()));
+        // A failed poll, cached as a miss.
+        *state.cached_headroom_stats.lock() = Some((None, Instant::now()));
+
+        let served = state
+            .cached_headroom_stats()
+            .expect("the retained payload covers a transient failure");
+        assert_eq!(served.tool_schema_tokens_saved, Some(4_242));
+
+        // The miss is still cached: no fetch was attempted, so the 15s probe
+        // is not re-armed on the next dashboard poll.
+        let (cached, _) = (*state.cached_headroom_stats.lock())
+            .clone()
+            .expect("miss stays cached");
+        assert!(
+            cached.is_none(),
+            "serving a retained payload must not \
+             overwrite the miss and reset the backoff"
+        );
+
+        // Past the retention window the layers go absent rather than being
+        // presented as live forever.
+        let stale = Instant::now()
+            .checked_sub(AppState::HEADROOM_STATS_RETAIN_LAST_GOOD + Duration::from_secs(1));
+        if let Some(stale) = stale {
+            *state.last_good_headroom_stats.lock() = Some((good, stale));
+            assert!(
+                state.cached_headroom_stats().is_none(),
+                "a retained payload must expire"
+            );
+        }
     }
 
     #[test]
