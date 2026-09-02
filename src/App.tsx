@@ -1795,6 +1795,13 @@ export default function App() {
   // stepStartedAtMs double-charged the elapsed time and pinned a long install
   // at "finishing up" (RUST-9Y).
   const [stepEtaSeedAtMs, setStepEtaSeedAtMs] = useState<number | null>(null);
+  // Highest fraction this step has shown. The ETA anchor above moves on every
+  // estimate, so the time-based fraction restarts near zero each time -- right
+  // for the ETA, wrong for a progress reading, which must never go backwards.
+  // Without this the dependency step reported "0% of this step" for its whole
+  // run, since a pip line (and so a re-anchor) lands more often than once a
+  // second.
+  const stepProgressFloorRef = useRef(0);
   const [stepBasePercent, setStepBasePercent] = useState(0);
   const [chartResetSignal, setChartResetSignal] = useState(0);
   const [chartMode, setChartMode] = useState<SavingsChartMode>("usd");
@@ -2582,6 +2589,7 @@ export default function App() {
       setStepSignature(signature);
       setStepStartedAtMs(Date.now());
       setStepBasePercent(bootstrapProgress.overallPercent);
+      stepProgressFloorRef.current = 0;
     }
     // Re-anchor on every new estimate, step change or not. "Updating
     // dependencies" is one step for the whole install, so without this the
@@ -3564,13 +3572,14 @@ export default function App() {
     const eta = Math.max(8, stepEtaSeedSeconds || progress.currentStepEtaSeconds || 20);
     const linear = Math.min(0.96, elapsedSeconds / eta);
 
-    if (elapsedSeconds <= eta) {
-      return linear;
+    let fraction = linear;
+    if (elapsedSeconds > eta) {
+      const overtime = elapsedSeconds - eta;
+      fraction = Math.min(0.995, linear + overtime / (eta * 10));
     }
 
-    const overtime = elapsedSeconds - eta;
-    const creep = Math.min(0.995, linear + overtime / (eta * 10));
-    return creep;
+    stepProgressFloorRef.current = Math.max(stepProgressFloorRef.current, fraction);
+    return stepProgressFloorRef.current;
   }
 
   function animatedOverallPercent(progress: BootstrapProgress) {
