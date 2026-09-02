@@ -408,8 +408,10 @@ export function getUpgradePlans(
         : subscriptionAmountCents;
 
       // The server's own figure wins when it has one: a discount attached
-      // mid-subscription (the cancellation save offer) can't be dated from
-      // subscriptionStartedAt, so the window check above reads it as expired.
+      // mid-subscription can't be dated from subscriptionStartedAt, so the
+      // window check above reads it as expired. Nothing fills these fields
+      // today (the save offer did, until 2026-09-02), but the contract stays
+      // for the next mid-subscription discount.
       const serverRenewalCents =
         subscriptionRenewalCents != null &&
         subscriptionRenewalEndsAt != null &&

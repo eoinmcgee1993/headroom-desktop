@@ -3661,30 +3661,14 @@ async fn get_headroom_billing_portal_url(target: Option<String>) -> Result<Strin
     pricing::get_billing_portal_url(target)
 }
 
-#[tauri::command]
-async fn get_headroom_save_offer(app: AppHandle) -> Result<Option<pricing::SaveOffer>, String> {
-    let offer = pricing::get_save_offer()?;
-    if offer.is_some() {
-        analytics::track_event(&app, "save_offer_shown", None);
-    }
-    Ok(offer)
-}
-
-/// Step one of cancelling: record the reason, get back the offer (if any) to
-/// pitch. The reason lands server-side even when there is nothing to offer.
+/// Step one of cancelling: record the reason before the client opens the
+/// billing portal, so a user who bails after this point is still counted.
 #[tauri::command]
 async fn submit_headroom_cancellation_intent(
     reason: String,
     note: Option<String>,
-) -> Result<Option<pricing::SaveOffer>, String> {
+) -> Result<(), String> {
     pricing::submit_cancellation_intent(&reason, note.as_deref().unwrap_or_default())
-}
-
-#[tauri::command]
-async fn redeem_headroom_save_offer(app: AppHandle) -> Result<(), String> {
-    pricing::redeem_save_offer()?;
-    analytics::track_event(&app, "save_offer_redeemed", None);
-    Ok(())
 }
 
 #[tauri::command]
@@ -5535,9 +5519,7 @@ pub fn run() {
             change_headroom_subscription_plan,
             reactivate_headroom_subscription,
             get_headroom_billing_portal_url,
-            get_headroom_save_offer,
             submit_headroom_cancellation_intent,
-            redeem_headroom_save_offer,
             get_activity_feed,
             list_live_learnings,
             list_live_learnings_for_projects,

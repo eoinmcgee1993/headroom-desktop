@@ -209,7 +209,6 @@ import type {
   RuntimeStatus,
   RuntimeUpgradeFailure,
   RuntimeUpgradeProgress,
-  SaveOffer,
 } from "./lib/types";
 
 interface NavItem {
@@ -1873,10 +1872,6 @@ export default function App() {
   const [planChangeError, setPlanChangeError] = useState<string | null>(null);
   const [reactivateBusy, setReactivateBusy] = useState(false);
   const [reactivateError, setReactivateError] = useState<string | null>(null);
-  const [saveOffer, setSaveOffer] = useState<SaveOffer | null>(null);
-  const [saveOfferBusy, setSaveOfferBusy] = useState(false);
-  const [saveOfferError, setSaveOfferError] = useState<string | null>(null);
-  const [saveOfferRedeemed, setSaveOfferRedeemed] = useState(false);
   const [cancelReasonOpen, setCancelReasonOpen] = useState(false);
   const [cancelReason, setCancelReason] = useState("");
   const [cancelNote, setCancelNote] = useState("");
@@ -4594,56 +4589,13 @@ export default function App() {
     if (!cancelReason || cancelBusy) return;
     setCancelBusy(true);
     // Fails open: the reason is a nice-to-have, being trapped in the app is not.
-    const offer = await invoke<SaveOffer | null>("submit_headroom_cancellation_intent", {
+    await invoke("submit_headroom_cancellation_intent", {
       reason: cancelReason,
       note: cancelNote.trim() || null
     }).catch(() => null);
     setCancelBusy(false);
     setCancelReasonOpen(false);
 
-    if (offer) {
-      setSaveOfferError(null);
-      setSaveOfferRedeemed(false);
-      setSaveOffer(offer);
-      return;
-    }
-
-    setUpgradeActionBusy("cancel");
-    try {
-      await openBillingPortal();
-    } catch (error) {
-      setUpgradeActionError(
-        describeInvokeError(error, "Could not open billing portal.")
-      );
-    } finally {
-      setUpgradeActionBusy(null);
-    }
-  }
-
-  async function handleRedeemSaveOffer() {
-    if (saveOfferBusy) return;
-    setSaveOfferBusy(true);
-    setSaveOfferError(null);
-    try {
-      await invoke("redeem_headroom_save_offer");
-      setSaveOfferRedeemed(true);
-      await refreshPricingStatus();
-    } catch (error) {
-      setSaveOfferError(
-        error instanceof Error
-          ? error.message
-          : typeof error === "string"
-            ? error
-            : "Could not apply the offer."
-      );
-    } finally {
-      setSaveOfferBusy(false);
-    }
-  }
-
-  async function handleDeclineSaveOffer() {
-    if (saveOfferBusy) return;
-    setSaveOffer(null);
     setUpgradeActionBusy("cancel");
     try {
       await openBillingPortal();
@@ -8516,84 +8468,6 @@ export default function App() {
                     {cancelBusy ? "One moment..." : "Continue"}
                   </button>
                 </div>
-              </div>
-            </div>
-          ) : null}
-
-          {saveOffer ? (
-            <div
-              className="modal-backdrop"
-              role="dialog"
-              aria-modal="true"
-              onClick={() => {
-                if (!saveOfferBusy) setSaveOffer(null);
-              }}
-            >
-              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-                {saveOfferRedeemed ? (
-                  <>
-                    <h3>You're all set</h3>
-                    <p>
-                      Your plan stays active at{" "}
-                      <strong>{formatCents(saveOffer.offerMonthlyCents)} / month</strong>{" "}
-                      for the next {saveOffer.durationMonths} months. The new price
-                      takes effect{" "}
-                      {saveOffer.startsOn ? `on ${saveOffer.startsOn}` : "at your next renewal"}.
-                    </p>
-                    <div className="modal-actions">
-                      <button
-                        className="primary-button"
-                        onClick={() => setSaveOffer(null)}
-                        type="button"
-                      >
-                        Done
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <h3>Before you go: {saveOffer.percentOff}% off for {saveOffer.durationMonths} months</h3>
-                    <p>
-                      Stay on your plan and pay{" "}
-                      <strong>{formatCents(saveOffer.offerMonthlyCents)} / month</strong>{" "}
-                      instead of{" "}
-                      <strong>{formatCents(saveOffer.currentMonthlyCents)} / month</strong>{" "}
-                      for the next {saveOffer.durationMonths} months
-                      {saveOffer.billingPeriod === "annual" ? ", billed annually" : ""}.
-                      That is {saveOffer.percentOff}% off the price your plan renews
-                      at.
-                    </p>
-                    <p>
-                      The new price starts{" "}
-                      {saveOffer.startsOn ? `on ${saveOffer.startsOn}` : "at your next renewal"}
-                      , and any discount you are on until then is unaffected. Nothing
-                      else about your plan changes, and you can still cancel any time.
-                    </p>
-                    {saveOfferError ? (
-                      <p className="install-progress__error">{saveOfferError}</p>
-                    ) : null}
-                    <div className="modal-actions">
-                      <button
-                        className="secondary-button"
-                        disabled={saveOfferBusy}
-                        onClick={() => void handleDeclineSaveOffer()}
-                        type="button"
-                      >
-                        Continue to cancel
-                      </button>
-                      <button
-                        className="primary-button"
-                        disabled={saveOfferBusy}
-                        onClick={() => void handleRedeemSaveOffer()}
-                        type="button"
-                      >
-                        {saveOfferBusy
-                          ? "Applying..."
-                          : `Keep it at ${formatCents(saveOffer.offerMonthlyCents)} / mo`}
-                      </button>
-                    </div>
-                  </>
-                )}
               </div>
             </div>
           ) : null}
