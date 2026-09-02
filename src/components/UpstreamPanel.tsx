@@ -104,7 +104,7 @@ export function UpstreamPanel() {
     <article className="soft-card panel-card">
       <div className="panel-card__header">
         <div>
-          <h3>Provider</h3>
+          <h3>Claude Code Provider</h3>
           <p className="panel-card__subtitle">
             Route Headroom to an alternative model that is Anthropic-compatible.
           </p>
