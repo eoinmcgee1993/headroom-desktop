@@ -8663,6 +8663,24 @@ fn runtime_supports_no_http2(installed_version: Option<&str>) -> bool {
     }
 }
 
+/// Opt-in restore of `--no-ccr`, for reverting the 0.9.6 CCR re-enable without
+/// a rebuild. Empty unless the app was launched with a truthy
+/// `HEADROOM_DESKTOP_NO_CCR`; falsey spellings mean "leave CCR on" rather than
+/// "the variable is present, therefore off".
+fn desktop_forces_no_ccr() -> bool {
+    desktop_forces_no_ccr_from(std::env::var("HEADROOM_DESKTOP_NO_CCR").ok().as_deref())
+}
+
+fn desktop_forces_no_ccr_from(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return false;
+    };
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
 /// The unified `--no-ccr` flag replaced the split `--no-ccr-marker` /
 /// `--no-ccr-inject-tool` pair in headroom-ai 0.31.0 (upstream ecc93991);
 /// 0.30.0 and earlier exit 2 with "No such option", which would fail boot
@@ -8787,22 +8805,48 @@ fn headroom_entrypoint_startup_args(
         args.push("--no-http2".to_string());
     }
     args.push("--log-messages".to_string());
-    // CCR off: with headroom_retrieve injected into the tools array, every
-    // stream:true turn is rewritten to a buffered stream:false upstream call
-    // and re-synthesized as SSE (`buffered_stream_ccr`, upstream #1451/#2479).
-    // That wrapper commits `http.response.start` with status 200 +
-    // text/event-stream after a 1s keepalive, before the upstream outcome is
-    // known; when the buffered call then returns anything that is not a
-    // StreamingResponse (unparseable body, or a real 429/500/529) it can only
-    // emit a bare `event: error` with no message_start, so the client sees
-    // "API returned an empty or malformed response (HTTP 200)" and, because the
-    // status is 200, never retries. Upstream's own help text names --no-ccr as
-    // the right setting for streaming clients. Turning it off also restores
-    // real streaming and puts those turns back through
-    // StreamingMixin._stream_response, which is where SITECUSTOMIZE_PY's
-    // context-limit guard (#2942) attaches — the buffered path bypassed it
-    // entirely. Present since 0.33.0, so this is not a 0.35.0 regression.
-    if runtime_supports_no_ccr(installed_version) {
+    // CCR: both reasons it was disabled are fixed in the 0.37.0 pin, so it is
+    // back ON by default here.
+    //
+    // It was turned off because `headroom_retrieve` in the tools array routes
+    // every stream:true turn through a buffered stream:false upstream call
+    // resynthesized as SSE, and that wrapper committed 200 + text/event-stream
+    // before the upstream outcome was known. A real 429/500/529 then reached
+    // the client as an unretryable 200 ("empty or malformed response"). Both
+    // halves have since landed upstream:
+    //   * #2952/#2953 -- byte-faithful passthrough discarded the stream:false
+    //     flip, which was the actual root cause. Merged, ships from 0.36.0.
+    //   * #2465/#3079 -- liveness vs status fidelity. 0.37.0 carries
+    //     proxy/buffered_ccr_response.py, which holds the response uncommitted
+    //     for DEFAULT_BUFFERED_CCR_GRACE_SECONDS (5.0s) so fast failures keep
+    //     their real status and headers, then commits SSE with a heartbeat so a
+    //     first byte always precedes the client's stream-idle watchdog, and
+    //     translates a post-commit failure into the provider's own typed SSE
+    //     error so client backoff still fires.
+    //
+    // Why turn it back on rather than leave a working setting alone: CCR is
+    // what makes lossy compression RECOVERABLE. Compressed tool output carries
+    // a retrieval marker, so an agent that needs the exact bytes can ask for
+    // them instead of being handed a plausible-but-wrong reconstruction --
+    // upstream #1307, the correctness incident that read protection exists to
+    // prevent. Without recovery there is no safe route to compressing older
+    // reads, and read protection is the largest single cap on compression in
+    // long agentic sessions.
+    //
+    // Known costs, to be measured on staging before this reaches stable:
+    //   * The reversibility guard applies again (content_router.py), so lossy
+    //     compressions that cannot be made recoverable are SKIPPED rather than
+    //     kept. Measured 218 `lossy_unrecoverable_skipped` in ~19h with CCR
+    //     off, all of which come back. tok_saved may fall.
+    //   * The buffered path bypasses StreamingMixin._stream_response, one of
+    //     the three seams SITECUSTOMIZE_PY's context guard (#2942) attaches to.
+    //     Context-limit LEARNING still works (it hangs off
+    //     handle_anthropic_messages and get_context_limit), but the streamed
+    //     usage nudge does not run on those turns.
+    //
+    // Kill switch, no rebuild required: launch the app with
+    // HEADROOM_DESKTOP_NO_CCR=1 to restore the flag.
+    if runtime_supports_no_ccr(installed_version) && desktop_forces_no_ccr() {
         args.push("--no-ccr".to_string());
     }
     if learn_enabled {
@@ -13817,31 +13861,47 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         backend_port::reset_for_tests();
     }
 
-    /// CCR tool injection forces every stream:true turn through the buffered
-    /// non-stream path, whose keepalive wrapper commits HTTP 200 before the
-    /// upstream outcome is known and then cannot report a real error — the
-    /// client sees an empty/malformed 200 and cannot retry. The unified
-    /// `--no-ccr` flag only exists from 0.31.0; on the 0.28.0 fallback runtime
-    /// click would exit 2 and boot validation would fail like RUST-4A.
+    /// CCR is ON by default from 0.9.6: both reasons it was disabled landed
+    /// upstream (#2953 for the discarded stream flip, and 0.37.0's
+    /// buffered_ccr_response grace window for #2465/#3079). `--no-ccr` is now
+    /// only emitted when a machine explicitly asks for it, and the version gate
+    /// still applies because the unified flag only exists from 0.31.0 -- on the
+    /// 0.28.0 fallback runtime click would exit 2 and boot validation would
+    /// fail like RUST-4A.
     #[test]
     #[serial_test::serial]
-    fn entrypoint_args_gate_no_ccr_on_runtime_version() {
+    fn entrypoint_args_omit_no_ccr_unless_explicitly_forced() {
         backend_port::reset_for_tests();
 
-        // 0.30.0 and earlier expose the split --no-ccr-marker /
-        // --no-ccr-inject-tool pair, not the unified flag.
-        assert!(!headroom_entrypoint_startup_args(Some("0.28.0"), true)
-            .contains(&"--no-ccr".to_string()));
-        assert!(!headroom_entrypoint_startup_args(Some("0.30.0"), true)
-            .contains(&"--no-ccr".to_string()));
-        assert!(headroom_entrypoint_startup_args(Some("0.31.0"), true)
-            .contains(&"--no-ccr".to_string()));
-        assert!(headroom_entrypoint_startup_args(Some("0.35.0"), true)
-            .contains(&"--no-ccr".to_string()));
-        // Unknown or malformed receipt version: assume pinned runtime.
-        assert!(headroom_entrypoint_startup_args(None, true).contains(&"--no-ccr".to_string()));
-        assert!(headroom_entrypoint_startup_args(Some("garbage"), true)
-            .contains(&"--no-ccr".to_string()));
+        // Default: CCR stays enabled, so the flag is absent at every version.
+        for v in [
+            None,
+            Some("0.28.0"),
+            Some("0.31.0"),
+            Some("0.37.0"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !headroom_entrypoint_startup_args(v, true).contains(&"--no-ccr".to_string()),
+                "CCR must be on by default (version {v:?})"
+            );
+        }
+
+        // The opt-in restore honours falsey spellings rather than treating the
+        // variable's mere presence as "off".
+        assert!(!super::desktop_forces_no_ccr_from(None));
+        for off in ["", "  ", "0", "false", "FALSE", "no", "off"] {
+            assert!(
+                !super::desktop_forces_no_ccr_from(Some(off)),
+                "{off:?} should keep CCR on"
+            );
+        }
+        for on in ["1", "true", " yes "] {
+            assert!(
+                super::desktop_forces_no_ccr_from(Some(on)),
+                "{on:?} should restore --no-ccr"
+            );
+        }
         // The `python -m headroom.proxy.server` argparse defines no CCR
         // option at all; passing it there would exit 2 on every fallback boot.
         assert!(!headroom_python_startup_args().contains(&"--no-ccr".to_string()));
