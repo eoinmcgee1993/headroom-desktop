@@ -5812,7 +5812,22 @@ impl ToolManager {
             // (claude, codex, etc.) was detected on PATH, it wrote nothing --
             // but the direct JSON write path below can still configure the
             // integration. Fall through instead of surfacing a Sentry warning.
-            if !stdout.contains("not detected on this system") {
+            //
+            // A CLI that died importing its own runtime because the machine's
+            // security policy blocked a DLL is the proxy-start failure seen
+            // from a second angle (RUST-B9: same host, same minute, same
+            // `_sqlite3` block as RUST-BB). That block is reported once per
+            // session by `capture_headroom_start_failure`; a second issue
+            // here adds nothing to act on, and the error still propagates so
+            // the caller records the integration as not configured.
+            let blocked_by_policy = crate::is_endpoint_protection_signal(&stderr);
+            if blocked_by_policy {
+                log::warn!(
+                    "headroom mcp install died loading the runtime (endpoint protection); \
+                     reported via the proxy-start capture"
+                );
+            }
+            if !stdout.contains("not detected on this system") && !blocked_by_policy {
                 let detected = detected_claude
                     .as_ref()
                     .map(|p| p.display().to_string())

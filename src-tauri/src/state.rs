@@ -8977,6 +8977,29 @@ mod tests {
     }
 
     #[test]
+    fn classify_startup_error_recognises_a_blocked_stdlib_dll_on_windows() {
+        // RUST-BB verbatim shape: the proxy dies importing `_sqlite3` because
+        // Application Control blocked the DLL. No numeric code, localized
+        // prose, and the chain ALSO matches the generic "exited ... before
+        // opening port" branch -- which would have told the user to read a
+        // traceback instead of naming the policy.
+        let raw = "unable to keep headroom running in background: python.exe -m \
+                   headroom.proxy.server --port 6768 exited with status exit code: 1 \
+                   before opening port 6768\n--- log tail ---\n    from _sqlite3 import *\n\
+                   ImportError: DLL load failed while importing _sqlite3: Una directiva de \
+                   Control de aplicaciones bloqueó este archivo.\n--- end log ---";
+        let hint = classify_startup_error(raw).expect("blocked DLL should classify");
+        assert!(
+            hint.contains("endpoint protection"),
+            "expected the endpoint-protection hint, got: {hint}"
+        );
+        assert!(
+            !hint.contains("see the traceback"),
+            "generic branch won: {hint}"
+        );
+    }
+
+    #[test]
     fn classify_startup_error_endpoint_protection_takes_priority_over_port_path() {
         // SIGKILL while waiting on the port could surface as both a
         // port-timeout AND a kill signature. EDR wins because it points to

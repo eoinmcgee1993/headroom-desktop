@@ -1723,7 +1723,69 @@ fn is_ssl_library_conflict_signal(text: &str) -> bool {
 /// `pip_failure_category`'s `app-control` bucket so the two layers agree.
 fn is_app_control_signal(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("application control policy has blocked") || lower.contains("(os error 4551)")
+    lower.contains("application control policy has blocked")
+        || lower.contains("(os error 4551)")
+        // Windows localizes the verdict and only `CreateProcess` failures
+        // carry the numeric code. When the policy blocks a DLL that Python is
+        // importing, CPython reports it as an ImportError with the OS prose
+        // and no code at all (RUST-BB/BA: `_sqlite3`, Spanish Windows). The
+        // Spanish text is verbatim from those events; the structural check in
+        // `is_blocked_runtime_dll_signal` covers every other locale.
+        || lower.contains("control de aplicaciones bloque")
+}
+
+/// True when Windows refused to load one of the bundled interpreter's own
+/// extension DLLs.
+///
+/// CPython reports that as `ImportError: DLL load failed while importing
+/// <module>: <reason>`. The prefix is CPython's and English on every locale;
+/// the reason is Windows' `FormatMessage` prose, localized, and for an
+/// Application Control verdict it carries no numeric code -- so it slips past
+/// `is_app_control_signal` on any non-English machine (RUST-BB/BA/5C: one host,
+/// Spanish Windows, `_sqlite3` blocked, filed as three Error-level issues).
+///
+/// Scoped to the standard-library extensions that python-build-standalone
+/// ships: those are self-contained (their dependent DLLs sit in the same
+/// folder), so a load failure is a policy or antivirus verdict on our freshly
+/// installed files, or a quarantined one -- not a dependency the user could
+/// install. Third-party extensions (onnxruntime, torch) are deliberately NOT
+/// here: their load failures are usually a missing Visual C++ runtime, which
+/// `classify_startup_error` handles from onnxruntime's own English warning.
+pub(crate) fn is_blocked_runtime_dll_signal(text: &str) -> bool {
+    const STDLIB_EXTENSIONS: &[&str] = &[
+        "_sqlite3",
+        "_ssl",
+        "_ctypes",
+        "_socket",
+        "_hashlib",
+        "_bz2",
+        "_lzma",
+        "_decimal",
+        "_multiprocessing",
+        "_asyncio",
+        "_overlapped",
+        "_queue",
+        "_uuid",
+        "_elementtree",
+        "_zoneinfo",
+        "pyexpat",
+        "select",
+        "unicodedata",
+    ];
+    let lower = text.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(idx) = rest.find("dll load failed while importing ") {
+        let after = &rest[idx + "dll load failed while importing ".len()..];
+        let module = after
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if STDLIB_EXTENSIONS.contains(&module) {
+            return true;
+        }
+        rest = after;
+    }
+    false
 }
 
 /// PATH directories holding an OpenSSL that could be loaded into our
@@ -2279,6 +2341,23 @@ pub(crate) fn child_state_fingerprint_key(
     }
 }
 
+/// Extra fingerprint bucket for a give-up whose `last_startup_error` names a
+/// cause with its own remedy. `None` for the ordinary case (no startup error,
+/// or one we cannot classify), so the fingerprint those events already carry
+/// is untouched.
+pub(crate) fn startup_error_fingerprint_key(
+    last_startup_error: Option<&str>,
+) -> Option<&'static str> {
+    let err = last_startup_error?;
+    if is_endpoint_protection_signal(err) {
+        Some("startup_endpoint_protection")
+    } else if is_port_conflict_failure(err) {
+        Some("startup_port_conflict")
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_watchdog_give_up_report(
     consecutive_failures: u32,
@@ -2546,11 +2625,21 @@ fn capture_watchdog_give_up(
     // network/restart blips stay at Warning so they don't pollute the Error
     // inbox.
     let cpu_deadlock_signal = cpu_actively_burning && report.log_silent_secs.unwrap_or(0) >= 30;
-    let level = if report.last_startup_error.is_some() || cpu_deadlock_signal {
-        sentry::Level::Error
-    } else {
-        sentry::Level::Warning
-    };
+    // A spawn that keeps failing is an Error -- unless the machine's own
+    // security policy is what keeps failing it. That verdict is already
+    // reported once per session by `capture_headroom_start_failure`, has a
+    // user-facing remedy, and cannot be changed by anything we ship; filing
+    // the give-up that follows it as an Error just re-reports the same block
+    // (RUST-5C's latest events were one Spanish Windows host whose `_sqlite3`
+    // was blocked, escalated to Error three times over).
+    let startup_key = startup_error_fingerprint_key(report.last_startup_error.as_deref());
+    let startup_is_policy = startup_key == Some("startup_endpoint_protection");
+    let level =
+        if (report.last_startup_error.is_some() && !startup_is_policy) || cpu_deadlock_signal {
+            sentry::Level::Error
+        } else {
+            sentry::Level::Warning
+        };
 
     sentry::with_scope(
         |scope| {
@@ -2563,8 +2652,16 @@ fn capture_watchdog_give_up(
             let readyz_key = readyz_outcome_fingerprint_key(&report.backend_readyz_outcome);
             let child_key =
                 child_state_fingerprint_key(&report.tracked_child_exit_status, report.tracked_pid);
-            let fp: &[&str] = &["proxy_unreachable_post_boot", readyz_key, child_key];
-            scope.set_fingerprint(Some(fp));
+            // A recognised startup cause gets its own issue: an endpoint
+            // protection block and a port conflict are not the wedge the
+            // readyz/child keys describe, and each has its own lifecycle.
+            // Absent (the common case) the fingerprint is unchanged, so the
+            // existing issues keep their history.
+            let mut fp: Vec<&str> = vec!["proxy_unreachable_post_boot", readyz_key, child_key];
+            if let Some(key) = startup_key {
+                fp.push(key);
+            }
+            scope.set_fingerprint(Some(fp.as_slice()));
             scope.set_extra(
                 "tracked_child_exit_status",
                 report.tracked_child_exit_status.clone().into(),
@@ -2883,6 +2980,11 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     if is_app_control_signal(&lower) {
         return true;
     }
+    // The same verdict seen from inside Python, where the OS prose is
+    // localized and carries no code (RUST-BB/BA/5C).
+    if is_blocked_runtime_dll_signal(&lower) {
+        return true;
+    }
     false
 }
 
@@ -2911,12 +3013,27 @@ const ENDPOINT_PROTECTION_HINT_RUNTIME: &str =
      interfering with freshly-installed code. Allow `~/Library/Application Support/Headroom` \
      in your security software, then click Retry.";
 
+/// The Windows wording: the block there is almost always Application Control
+/// (Smart App Control on a personal PC, WDAC or AppLocker on a managed one),
+/// which has a specific place to look and a specific folder to allow. The
+/// macOS text above named a `~/Library` path to Windows users (RUST-BB).
+const ENDPOINT_PROTECTION_HINT_RUNTIME_WINDOWS: &str =
+    "Windows blocked part of Headroom's runtime from loading — usually Application Control \
+     (Smart App Control, AppLocker, or a company WDAC policy) or antivirus / endpoint protection \
+     acting on freshly-installed files. On a personal PC, check Windows Security > App & browser control; \
+     on a work PC, ask IT to allow %LOCALAPPDATA%\\Headroom. Then click Retry. If nothing is \
+     blocking it, reinstall the runtime from Settings > Advanced.";
+
 pub(crate) fn endpoint_protection_hint_install() -> String {
     ENDPOINT_PROTECTION_HINT_INSTALL.to_string()
 }
 
 pub(crate) fn endpoint_protection_hint_runtime() -> String {
-    ENDPOINT_PROTECTION_HINT_RUNTIME.to_string()
+    if cfg!(windows) {
+        ENDPOINT_PROTECTION_HINT_RUNTIME_WINDOWS.to_string()
+    } else {
+        ENDPOINT_PROTECTION_HINT_RUNTIME.to_string()
+    }
 }
 
 /// Map common runtime-upgrade failure modes to a short user-facing hint.
@@ -5911,13 +6028,24 @@ fn learn_failure_signature_source(text: &str) -> String {
     let Some(first) = lines.next() else {
         return "no output".to_string();
     };
-    if !first.ends_with(':') {
+    // Only the `failed (exit N):` marker is followed by a one-line diagnosis
+    // worth grouping on. Other markers also end at a colon but introduce a
+    // DUMP -- `returned unparseable output. First 2000 chars:` (RUST-B7) is
+    // followed by the model's raw output, which is derived from the user's
+    // sessions and must not become a Sentry title.
+    if !learn_marker_expects_reason_line(first) {
         return first.to_string();
     }
     match lines.next() {
         Some(reason) => format!("{first} {reason}"),
         None => first.to_string(),
     }
+}
+
+/// True for upstream's ``... `<cli> ...` failed (exit N):`` marker, whose
+/// reason -- the child CLI's own stderr -- lands on the next line.
+fn learn_marker_expects_reason_line(line: &str) -> bool {
+    line.ends_with("):") && line.contains(" failed (exit ")
 }
 
 /// Turn a `headroom learn` stdout line into the step shown under the scan timer,
@@ -6087,9 +6215,17 @@ fn execute_headroom_learn_run(
     // every release from 0.8.2 to 0.8.6). Same failure the /stats probe had at
     // 500ms -- a cap tight enough to turn "slow" into "broken".
     //
-    // Only the IDLE cap moves. Upstream's 300s hard cap still bounds a genuine
-    // hang, so this trades a slower failure for runs that now finish.
+    // The idle cap is what catches a genuine hang: a wedged CLI stops
+    // streaming, and 180s of silence kills it whatever the wall clock says.
     command.env("HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS", "180");
+    // The hard cap bounds a run that IS still streaming. Upstream's 300s
+    // default was sized for a small digest; a user with 1600 sessions and
+    // 69k calls (RUST-B8) needs the model to read and write for longer than
+    // that while producing events the whole time, and the cap killed a
+    // healthy run at five minutes with a hint to raise this very variable.
+    // Fifteen minutes: this is a background job with its own step timer in
+    // the UI, and the idle cap above still ends a stall within three.
+    command.env("HEADROOM_LEARN_CLI_TIMEOUT_SECS", "900");
     match agent {
         LearnAgent::Claude => {
             // Per-project Claude scan; writes CLAUDE.md / MEMORY.md for the
@@ -7905,23 +8041,24 @@ mod tests {
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
         fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
-        install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
-        is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
-        learn_agent_auth_hint, learn_failure_is_agent_auth, learn_failure_signature_source,
-        learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        install_pending_update, is_blocked_runtime_dll_signal, is_disk_full_signal,
+        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
+        is_prerelease_version, learn_agent_auth_hint, learn_failure_is_agent_auth,
+        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, normalize_learn_failure_signature,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        select_updater_endpoints, store_checked_update, strip_connection_noise,
-        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
-        PENDING_MAGIC_LINK,
+        select_updater_endpoints, startup_error_fingerprint_key, store_checked_update,
+        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link, user_message_for,
+        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
+        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
+        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
+        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
+        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -10509,6 +10646,19 @@ Some unrelated content.
     }
 
     #[test]
+    fn learn_failure_signature_source_never_joins_a_dump_marker() {
+        // RUST-B7: "First 2000 chars:" introduces the model's raw output,
+        // derived from the user's own sessions. It ends at a colon like the
+        // exit marker does, but must never be pulled into a Sentry title.
+        let stderr = "LLM analysis failed: `claude -p --output-format stream-json --verbose` \
+                      returned unparseable output. First 2000 chars:\n\
+                      {\"type\":\"assistant\",\"text\":\"The auth module in src/login.ts ...\"}\n";
+        let signature = learn_failure_signature_source(stderr);
+        assert!(signature.ends_with("First 2000 chars:"), "got: {signature}");
+        assert!(!signature.contains("login.ts"), "got: {signature}");
+    }
+
+    #[test]
     fn learn_failure_signature_source_leaves_a_self_contained_line_alone() {
         let stderr = "ModuleNotFoundError: No module named 'headroom'\nTraceback follows\n";
         assert_eq!(
@@ -10746,6 +10896,68 @@ Some unrelated content.
             "starting headroom background process: port 6768 is occupied by a \
              non-headroom process"
         ));
+    }
+
+    /// RUST-BB/BA/5C verbatim: the App Control verdict seen from inside
+    /// Python. No `os error 4551` -- CPython's ImportError carries Windows'
+    /// localized prose and nothing else -- so the code-based match above
+    /// missed it and one host was filed as three Error-level issues.
+    #[test]
+    fn an_app_control_block_on_a_stdlib_dll_is_recognised_from_the_import_error() {
+        let chain = "unable to keep headroom running in background (prior attempts: \
+                     ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe \
+                     proxy --port 6768 exited with status exit code: 0xffffffff before opening \
+                     port 6768) (onnx probe: onnxruntime imports cleanly): python.exe -m \
+                     headroom.proxy.server exited with status exit code: 1 before opening port 6768\n\
+                     --- log tail ---\n  File \"...\\Lib\\sqlite3\\dbapi2.py\", line 27, in <module>\n    \
+                     from _sqlite3 import *\nImportError: DLL load failed while importing _sqlite3: \
+                     Una directiva de Control de aplicaciones bloqueó este archivo.\n--- end log ---";
+        assert!(is_blocked_runtime_dll_signal(chain));
+        assert!(is_endpoint_protection_signal(chain));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(chain)),
+            Some("startup_endpoint_protection")
+        );
+
+        // Any locale: the structural half needs no prose at all.
+        assert!(is_blocked_runtime_dll_signal(
+            "ImportError: DLL load failed while importing _ssl: 지정된 모듈을 찾을 수 없습니다."
+        ));
+    }
+
+    #[test]
+    fn a_third_party_dll_load_failure_is_not_endpoint_protection() {
+        // onnxruntime/torch failing to load is usually a missing Visual C++
+        // runtime, which has its own hint; it must not be sold as antivirus.
+        for raw in [
+            "ImportError: DLL load failed while importing onnxruntime_pybind11_state: \
+             The specified module could not be found.",
+            "ImportError: DLL load failed while importing _C: The specified module could not be found.",
+            "ModuleNotFoundError: No module named '_sqlite3'",
+        ] {
+            assert!(!is_blocked_runtime_dll_signal(raw), "for: {raw}");
+            assert!(!is_endpoint_protection_signal(raw), "for: {raw}");
+        }
+    }
+
+    #[test]
+    fn startup_error_fingerprint_key_only_names_causes_with_a_remedy() {
+        assert_eq!(startup_error_fingerprint_key(None), None);
+        assert_eq!(
+            startup_error_fingerprint_key(Some(
+                "python.exe -m headroom.proxy.server exited with status exit code: 1 \
+                 before opening port 6768"
+            )),
+            None,
+            "an unclassified crash keeps the fingerprint the existing issues carry"
+        );
+        assert_eq!(
+            startup_error_fingerprint_key(Some(
+                "starting headroom background process: port 6768 is occupied by a \
+                 non-headroom process"
+            )),
+            Some("startup_port_conflict")
+        );
     }
 
     #[test]
