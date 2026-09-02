@@ -1025,17 +1025,31 @@ function DailySavingsChart({
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
   const canViewNextDay = visibleDay < today;
   const label = view === "month" ? formatMonthLabel(visibleMonth) : formatSelectedDayLabel(visibleDay);
-  // Headline totals cover both Headroom layers -- input compression plus
-  // output shaping -- matching the breakdown rows in the savings modal and the
-  // segments stacked in the bars below. The live tray figure for today already
-  // sums both, so it can stand in for the bucket sum while today is still open.
+  // Headline totals cover all three Headroom layers -- input compression,
+  // output shaping, and tool-schema deferral -- matching the breakdown rows in
+  // the savings modal and the segments stacked in the bars below. The provider
+  // cache is deliberately NOT among them: it works with Headroom out of the
+  // path entirely, so it is not a benefit of running Headroom. Deferral is the
+  // opposite -- those definitions are re-sent on every request unless Headroom
+  // holds them back -- and it is priced at the cache-read rate upstream, since
+  // they would have been cache reads after the session's first request.
+  // Buckets before 2026-09-02 carry no deferral figure (the backend only ever
+  // exposed a lifetime total), so older bars understate that layer.
+  // The live tray figure for today already sums the layers it knows, so it can
+  // stand in for the bucket sum while today is still open.
   const chartSaved = Math.max(
     0,
     chartMode === "usd"
       ? view === "day" && visibleDay >= today && savingsTodayUsd !== null
         ? savingsTodayUsd
-        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
-      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
+        : chartData.reduce(
+            (s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd + (d.toolSchemaSavingsUsd ?? 0),
+            0
+          )
+      : chartData.reduce(
+          (s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved + (d.toolSchemaTokensSaved ?? 0),
+          0
+        )
   );
 
   useEffect(() => {
@@ -1208,6 +1222,19 @@ function DailySavingsChart({
                   <stop offset="0%" stopColor="#e2cf6a" stopOpacity="0.3" />
                   <stop offset="100%" stopColor="#F3E2A4" stopOpacity="0.22" />
                 </linearGradient>
+                {/* Tool-schema deferral, the third layer. Same family again,
+                    one further step out, so the bar reads as three shades of
+                    "Headroom removed this" rather than three unrelated
+                    metrics. Chart-only SVG gradient stops, matching the two
+                    above -- the CSS token rule covers component CSS. */}
+                <linearGradient id="toolSchemaUsdGradient" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#4f9d8f" />
+                  <stop offset="100%" stopColor="#74BDB0" />
+                </linearGradient>
+                <linearGradient id="toolSchemaTokensGradient" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#eddfa0" stopOpacity="0.28" />
+                  <stop offset="100%" stopColor="#F7EEC9" stopOpacity="0.2" />
+                </linearGradient>
               </defs>
               <CartesianGrid stroke="rgba(36, 31, 29, 0.06)" strokeDasharray="2 8" vertical={false} />
               <XAxis
@@ -1248,6 +1275,14 @@ function DailySavingsChart({
                   <Bar
                     dataKey="outputSavingsUsd"
                     fill="url(#outputUsdGradient)"
+                    maxBarSize={16}
+                    radius={[1, 1, 0, 0]}
+                    stackId="usd"
+                    yAxisId="usd"
+                  />
+                  <Bar
+                    dataKey="toolSchemaSavingsUsd"
+                    fill="url(#toolSchemaUsdGradient)"
                     maxBarSize={16}
                     radius={[1, 1, 0, 0]}
                     stackId="usd"
@@ -1311,6 +1346,13 @@ function DailySavingsChart({
                         />
                       );
                     }}
+                  />
+                  <Bar
+                    dataKey="toolSchemaTokensSaved"
+                    fill="url(#toolSchemaTokensGradient)"
+                    maxBarSize={16}
+                    stackId="tokens"
+                    yAxisId="tokens"
                   />
                 </>
               )}

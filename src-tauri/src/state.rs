@@ -2547,6 +2547,14 @@ impl AppState {
                     point.cache_read_tokens = bucket.cache_read_tokens.or(point.cache_read_tokens);
                     point.cache_savings_usd = bucket.cache_savings_usd.or(point.cache_savings_usd);
                 }
+                if let Some(tokens) = tracker.tool_schema_daily_samples.get(&point.date) {
+                    point.tool_schema_tokens_saved = *tokens;
+                    point.tool_schema_savings_usd = bucket_tool_schema_usd(
+                        point.estimated_savings_usd,
+                        point.estimated_tokens_saved,
+                        *tokens,
+                    );
+                }
             }
             for point in hourly_savings.iter_mut() {
                 if let Some(sample) = tracker.output_hourly_samples.get(&point.hour) {
@@ -2556,6 +2564,14 @@ impl AppState {
                 if let Some(bucket) = tracker.hourly_savings.get(&point.hour) {
                     point.cache_read_tokens = bucket.cache_read_tokens.or(point.cache_read_tokens);
                     point.cache_savings_usd = bucket.cache_savings_usd.or(point.cache_savings_usd);
+                }
+                if let Some(tokens) = tracker.tool_schema_hourly_samples.get(&point.hour) {
+                    point.tool_schema_tokens_saved = *tokens;
+                    point.tool_schema_savings_usd = bucket_tool_schema_usd(
+                        point.estimated_savings_usd,
+                        point.estimated_tokens_saved,
+                        *tokens,
+                    );
                 }
             }
         }
@@ -4756,6 +4772,8 @@ impl SavingsTracker {
                 date: date.clone(),
                 estimated_savings_usd: bucket.estimated_savings_usd,
                 estimated_tokens_saved: bucket.estimated_tokens_saved,
+                tool_schema_savings_usd: 0.0,
+                tool_schema_tokens_saved: 0,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
                 output_savings_usd: bucket.output_savings_usd,
@@ -4778,6 +4796,8 @@ impl SavingsTracker {
                 hour: hour.clone(),
                 estimated_savings_usd: bucket.estimated_savings_usd,
                 estimated_tokens_saved: bucket.estimated_tokens_saved,
+                tool_schema_savings_usd: 0.0,
+                tool_schema_tokens_saved: 0,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
                 output_savings_usd: bucket.output_savings_usd,
@@ -5866,6 +5886,8 @@ impl HeadroomSavingsHistoryResponse {
                 date: point.timestamp.format("%Y-%m-%d").to_string(),
                 estimated_savings_usd: point.compression_savings_usd_delta,
                 estimated_tokens_saved: point.tokens_saved,
+                tool_schema_savings_usd: 0.0,
+                tool_schema_tokens_saved: 0,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
                 output_savings_usd: point.output_savings_usd_delta,
@@ -5886,6 +5908,8 @@ impl HeadroomSavingsHistoryResponse {
                 hour: local_hour_key(point.timestamp.with_timezone(&Local)),
                 estimated_savings_usd: point.compression_savings_usd_delta,
                 estimated_tokens_saved: point.tokens_saved,
+                tool_schema_savings_usd: 0.0,
+                tool_schema_tokens_saved: 0,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
                 output_savings_usd: point.output_savings_usd_delta,
@@ -7995,6 +8019,18 @@ fn warn_once_if_savings_rate_implausible(
 /// from the same buckets, so a user on cheaper models is priced at their own
 /// models' rates. Returns 0 until there are enough compression buckets to
 /// derive a rate from.
+/// Per-bucket twin of [`tool_schema_savings_usd`]: prices one bucket's deferral
+/// with the blended $/token that same bucket's compression implies, at the
+/// cache-read ratio. Falls back to zero rather than guessing when the bucket
+/// has no compression to blend from -- a made-up price on an empty bucket
+/// would be indistinguishable from real savings.
+fn bucket_tool_schema_usd(bucket_usd: f64, bucket_tokens: u64, tool_tokens: u64) -> f64 {
+    if tool_tokens == 0 || bucket_tokens == 0 || bucket_usd <= 0.0 {
+        return 0.0;
+    }
+    (bucket_usd / bucket_tokens as f64) * CACHE_READ_PRICE_RATIO * tool_tokens as f64
+}
+
 fn tool_schema_savings_usd(daily_savings: &[DailySavingsPoint], tokens_saved: u64) -> f64 {
     if tokens_saved == 0 {
         return 0.0;
@@ -9355,6 +9391,29 @@ mod tests {
         std::fs::write(&records_path, "garbage\n").unwrap();
         assert!(rebuild_persisted_savings_from_records(&records_path).is_none());
         let _ = std::fs::remove_file(&records_path);
+    }
+
+    #[test]
+    fn bucket_tool_schema_usd_prices_at_the_cache_read_rate() {
+        // A bucket that saved $1.00 over 1M compression tokens implies
+        // $1/M. Deferral is priced at a TENTH of that, because those schema
+        // tokens would have been cache reads after the first request --
+        // pricing them at full input rate is the 0.36.0 contamination.
+        let priced = super::bucket_tool_schema_usd(1.0, 1_000_000, 1_000_000);
+        assert!(
+            (priced - 0.10).abs() < 1e-9,
+            "expected a tenth of the blended rate, got {priced}"
+        );
+
+        // Ten times the deferral is ten times the dollars.
+        let more = super::bucket_tool_schema_usd(1.0, 1_000_000, 10_000_000);
+        assert!((more - 1.0).abs() < 1e-9, "got {more}");
+
+        // Nothing to blend from -> zero, never a guessed price. A made-up
+        // figure on an empty bucket is indistinguishable from real savings.
+        assert_eq!(super::bucket_tool_schema_usd(0.0, 1_000_000, 5_000), 0.0);
+        assert_eq!(super::bucket_tool_schema_usd(1.0, 0, 5_000), 0.0);
+        assert_eq!(super::bucket_tool_schema_usd(1.0, 1_000_000, 0), 0.0);
     }
 
     #[test]
@@ -12453,6 +12512,8 @@ mod tests {
         DailySavingsPoint {
             date: date.to_string(),
             estimated_tokens_saved: tokens,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
             estimated_savings_usd: usd,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
@@ -12469,6 +12530,8 @@ mod tests {
         HourlySavingsPoint {
             hour: hour.to_string(),
             estimated_tokens_saved: tokens,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
             estimated_savings_usd: 0.0,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
@@ -12783,6 +12846,8 @@ mod tests {
         let tracker = vec![DailySavingsPoint {
             date: "2026-04-21".to_string(),
             estimated_tokens_saved: 400,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
             estimated_savings_usd: 1.5,
             actual_cost_usd: 9.0,
             total_tokens_sent: 123_456,

@@ -76,6 +76,13 @@ export interface DailySavingsPoint {
   // layer existed, or that came from the local tracker.
   outputSavingsUsd?: number;
   outputTokensSaved?: number;
+  // Tool-schema deferral, priced at the cache-read rate. Real Headroom-caused
+  // saving (those definitions are re-sent every request unless Headroom defers
+  // them), unlike the provider cache which works with Headroom out of the path.
+  // Zero for every bucket before per-bucket sampling began (2026-09-02): the
+  // backend only exposed a lifetime total, so there is nothing to backfill.
+  toolSchemaSavingsUsd?: number;
+  toolSchemaTokensSaved?: number;
   // Provider prompt-cache reads inside the bucket, derived from the backend's
   // raw history checkpoints. Null/absent for local-tracker buckets and days
   // that aged out of history retention.
@@ -144,6 +151,9 @@ export interface HourlySavingsPoint {
   totalTokensSent: number;
   outputSavingsUsd?: number;
   outputTokensSaved?: number;
+  /** See the daily point's toolSchemaSavingsUsd. */
+  toolSchemaSavingsUsd?: number;
+  toolSchemaTokensSaved?: number;
   cacheReadTokens?: number | null;
   cacheSavingsUsd?: number | null;
   outputSampledTokensSaved?: number | null;

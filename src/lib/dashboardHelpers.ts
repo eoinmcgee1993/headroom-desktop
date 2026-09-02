@@ -24,6 +24,12 @@ export interface SavingsChartDatum {
   // for buckets predating the layer, so the bar simply shows one segment.
   outputSavingsUsd: number;
   outputTokensSaved: number;
+  // Tool-schema deferral, the third Headroom layer, priced upstream at the
+  // cache-read rate. Zero for buckets before per-bucket sampling began
+  // (2026-09-02) -- the backend only exposed a lifetime total, so those bars
+  // understate this layer rather than misreport it.
+  toolSchemaSavingsUsd: number;
+  toolSchemaTokensSaved: number;
   totalCostBeforeOptimization: number;
   totalTokensBeforeOptimization: number;
   // Per-provider attribution, only populated for hourly buckets (day view).
@@ -374,8 +380,12 @@ export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): Savings
     ...compressibleSpend(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
     outputTokensSaved: point.outputTokensSaved ?? 0,
-    totalCostBeforeOptimization: point.actualCostUsd + point.estimatedSavingsUsd,
-    totalTokensBeforeOptimization: point.totalTokensSent + point.estimatedTokensSaved
+    toolSchemaSavingsUsd: point.toolSchemaSavingsUsd ?? 0,
+    toolSchemaTokensSaved: point.toolSchemaTokensSaved ?? 0,
+    totalCostBeforeOptimization:
+      point.actualCostUsd + point.estimatedSavingsUsd + (point.toolSchemaSavingsUsd ?? 0),
+    totalTokensBeforeOptimization:
+      point.totalTokensSent + point.estimatedTokensSaved + (point.toolSchemaTokensSaved ?? 0)
   }));
 }
 
@@ -457,8 +467,12 @@ export function buildHourlySavingsChartData(data: HourlySavingsPoint[]): Savings
     ...compressibleSpend(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
     outputTokensSaved: point.outputTokensSaved ?? 0,
-    totalCostBeforeOptimization: point.actualCostUsd + point.estimatedSavingsUsd,
-    totalTokensBeforeOptimization: point.totalTokensSent + point.estimatedTokensSaved,
+    toolSchemaSavingsUsd: point.toolSchemaSavingsUsd ?? 0,
+    toolSchemaTokensSaved: point.toolSchemaTokensSaved ?? 0,
+    totalCostBeforeOptimization:
+      point.actualCostUsd + point.estimatedSavingsUsd + (point.toolSchemaSavingsUsd ?? 0),
+    totalTokensBeforeOptimization:
+      point.totalTokensSent + point.estimatedTokensSaved + (point.toolSchemaTokensSaved ?? 0),
     byProvider: point.byProvider ?? []
   }));
 }
