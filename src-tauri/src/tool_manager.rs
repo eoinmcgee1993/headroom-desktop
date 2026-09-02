@@ -257,7 +257,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports seven fixes owed upstream (remove each once a wheel ships it),
+Also ports eight fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -315,6 +315,31 @@ bailout (a heredoc body may contain ; or &&), and delegates each
 segment's program parsing to the original function so wrapper peeling,
 bash -c recursion and the lockfile carve-out stay upstream's. Kill
 switch: HEADROOM_READ_CHAIN_GUARD=0.
+Prefix-floor vendor (upstream PR #3380): 0.37.0 plus the full-replay
+guard below resolve every compressed-vs-replayed conflict in favor of
+the previously-forwarded bytes, so background/cold-start Kompress
+landings are discarded forever and compression sits at ~2 percent while
+the cache stays healthy (measured 2026-09-02, avg_compression_pct 1.9,
+request cache-hit 98.8). The vendor execs the PR's overlay_cached_prefix
+and finalize_turn into the wheel verbatim: inside the provider-confirmed
+floor replay is unconditional, beyond it the size bound arbitrates each
+turn, so a background compression improvement lands ONCE, is recorded as
+the new replay source, and replays stably after -- the 0.35.0
+one-time-bust economics that measured 26 percent input savings WITH 90
+percent dollar cache hits. This is NOT the 0.9.4-rc.4 splice, which
+stitched replayed-bytes-to-the-floor onto this turn's fresh pipeline
+output and so shipped every turn's beyond-floor drift (22 percent fleet
+cache coverage lost, 1.20 -> 0.94 reads/sent, n=17, p=0.007); the
+vendored overlay keeps upstream's full alignment and bound arbitration
+beyond the floor. The confirmed floor is bridged from prepare_turn's
+keyword-only tracker_frozen -- the Anthropic token path is the only
+0.37.0 caller that passes it, with the same pre-clamp value the PR
+stashes in handler locals -- and floorless calls (OpenAI paths, cache
+mode) get len(prev_returned), which through the PR's own mechanism
+reproduces the 0.9.5 full replay: no path gets less cache protection
+than the guard below gave. Gated on wheel version exactly 0.37.0 AND
+the fix parameter absent; the first wheel shipping #3380 keeps its own
+policy. Kill switch: HEADROOM_PR3380_VENDOR=0.
 Prefix-replay inflation-skip guard (upstream issue #3379): since the
 0.36.x non-inflation bound (#3052), overlay_cached_prefix declines to
 replay the previously-forwarded prefix whenever background compression
@@ -337,7 +362,10 @@ that and nothing cleverer. Gated on the
 runtime NOT having the fix's parameter (enforce_non_inflation in the
 first PR shape, confirmed_frozen_count in the reworked #3380 shape), so
 the first wheel that ships either keeps its own replay policy and this
-block goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
+block goes inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0. Normally inert
+while the prefix-floor vendor above binds (the vendored signature trips
+this guard's fixed-parameter gate); it is the fallback when the vendor
+is killed or fails.
 cc-switch Official-branch upstream reset (upstream PR #3166): the
 reconciler captures the third-party endpoint cc-switch selected (Kimi,
 DeepSeek, GLM) as this proxy's Anthropic upstream, but switching back to
@@ -905,6 +933,370 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     except Exception:
         pass
 
+    # Prefix-floor vendor (upstream PR #3380, still open; remove once a wheel
+    # ships it -- see the module docstring for the compression collapse this
+    # ends). Vendors the PR verbatim against the 0.37.0 pin: the patched
+    # overlay_cached_prefix and finalize_turn are exec'd wholesale into their
+    # modules (no reimplementation -- the 0.9.4-rc.4 splice was one, and lost
+    # 22 percent of fleet cache coverage). The provider-confirmed floor the
+    # PR stashes in handler locals is bridged from the one seam sitecustomize
+    # can reach: prepare_turn's keyword-only tracker_frozen, passed by exactly
+    # one caller in 0.37.0 (the Anthropic token path) with the same pre-clamp
+    # value. Calls with no bridged floor in scope (OpenAI paths, cache mode)
+    # get confirmed_frozen_count=len(prev_returned): through the PR's own
+    # mechanism that floors every replayable position, which IS the full
+    # replay this desktop shipped in 0.9.5 -- no path gets less cache
+    # protection than the prefix-replay guard gave. Binding order matters:
+    # the vendored signature carries confirmed_frozen_count, which flips the
+    # prefix-replay guard below to inert via its own gate. Kill switch:
+    # HEADROOM_PR3380_VENDOR=0 (the guard below then binds as before).
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_PR3380_VENDOR", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            from importlib import metadata as _hd_v_meta
+
+            import headroom.cache.prefix_tracker as _hd_v_pt
+            import headroom.proxy.session_engine as _hd_v_se
+
+            _hd_v_fixed = any(
+                name in _hd_v_pt.overlay_cached_prefix.__code__.co_varnames
+                for name in ("enforce_non_inflation", "confirmed_frozen_count")
+            )
+            # Exact-pin gate: the vendored bodies are v0.37.0 + PR #3380 and
+            # nothing else; any other wheel keeps its own replay policy (a
+            # fixed wheel also trips _hd_v_fixed and needs no vendor).
+            if _hd_v_meta.version("headroom-ai") == "0.37.0" and not _hd_v_fixed:
+                _hd_v_overlay_src = '''
+def overlay_cached_prefix(
+    optimized_messages: list[dict[str, Any]],
+    current_original_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+    *,
+    confirmed_frozen_count: int | None = None,
+) -> list[dict[str, Any]]:
+    """Replay a positional, non-inflating cached prefix when it is safe.
+
+    Provider-agnostic cache-safety guard for the freeze path. When a message is
+    "frozen", the compression pipeline may emit the agent's ORIGINAL bytes for
+    it — but the provider cached whatever we FORWARDED last turn (the compressed
+    form). Forwarding the original then mismatches the cached prefix and busts
+    the prompt cache from that point (100% of observed misses were this
+    ``prefix_change``). This overlays the exact previously-forwarded prefix onto
+    the corresponding leading messages so the forwarded prefix stays byte-for-byte
+    what the provider hashed for its cache key.
+
+    Safe only when this turn extends the previous turn in a proven positional
+    shape: either whole-message append or pure block append inside one message.
+    There must be exactly one previous forwarded message per original. Otherwise
+    the previous bytes may not correspond to the same positions, so we return
+    ``optimized_messages`` unchanged (accept a possible bust rather than forward
+    wrong content).
+
+    The optimized and current-original lists must be positionally aligned, and
+    compact UTF-8 JSON for the replayed result must not exceed the optimized
+    candidate. These bounds prefer a cache miss to corrupting or inflating a
+    client's live history.
+
+    ``confirmed_frozen_count`` bounds UNCONDITIONAL replay. Leading positions
+    the provider has already confirmed cached (a message count derived from
+    ``cache_read_input_tokens``) are always replayed byte-identical: the
+    replay source there is exactly what the provider hashed, so changing
+    those bytes can only bust the cache. Beyond the floor the size bound
+    still arbitrates each turn: a shrinking replay (the pipeline emitted
+    original bytes for a frozen message) is repaired, while an inflating one
+    (fresh compression improved on the forwarded form) is declined so the
+    improvement reaches the wire. When the provider count collapses (cold
+    cache, TTL lapse) the floor collapses with it and every accumulated
+    improvement lands at once - the natural re-baselining that keeps
+    long-session growth bounded (#3026). Callers with no provider-confirmed
+    count pass None and keep the fully size-bounded behavior.
+    """
+    prev_orig = previous_original_messages
+    prev_fwd = previous_forwarded_messages
+    if not prev_orig or not prev_fwd:
+        return optimized_messages
+    if len(optimized_messages) != len(current_original_messages):
+        logger.debug(
+            "overlay: optimized/current-original length mismatch (optimized=%d, current=%d) "
+            "— skipping positional cached-prefix replay",
+            len(optimized_messages),
+            len(current_original_messages),
+        )
+        return optimized_messages
+    n = len(prev_orig)
+    # Positional 1:1 correspondence between prev_orig[i] and prev_fwd[i] holds
+    # only when last turn forwarded exactly one message per original (the
+    # append-only, no-injection shape update_from_response records). If the
+    # counts differ, an injected / dropped / merged message shifted the
+    # mapping, so replaying prev_fwd[i] at position i could forward the wrong
+    # content — bail (leave this turn's output untouched) rather than risk it.
+    if len(prev_fwd) != n:
+        logger.debug(
+            "overlay: forwarded/original count mismatch (prev_fwd=%d, prev_orig=%d) "
+            "— skipping cached-prefix replay (possible bust)",
+            len(prev_fwd),
+            n,
+        )
+        return optimized_messages
+
+    relation = classify_history_relation(current_original_messages, prev_orig)
+    if relation.kind == RELATION_BLOCK_APPEND and relation.message_index is not None:
+        message_index = relation.message_index
+        if message_index < len(optimized_messages):
+            previous_message = prev_fwd[message_index]
+            previous_original_message = prev_orig[message_index]
+            current_message = optimized_messages[message_index]
+            previous_content = (
+                previous_message.get("content") if isinstance(previous_message, dict) else None
+            )
+            previous_original_content = (
+                previous_original_message.get("content")
+                if isinstance(previous_original_message, dict)
+                else None
+            )
+            current_content = (
+                current_message.get("content") if isinstance(current_message, dict) else None
+            )
+            split = (
+                len(previous_original_content)
+                if isinstance(previous_original_content, list)
+                else -1
+            )
+            if (
+                isinstance(previous_content, list)
+                and isinstance(previous_original_content, list)
+                and isinstance(current_content, list)
+                and len(previous_content) == split
+                and len(current_content) >= split
+                and _canonicalize_for_prefix_compare(current_content[:split])
+                == _canonicalize_for_prefix_compare(previous_original_content)
+            ):
+                merged = copy.deepcopy(previous_message)
+                merged["content"] = copy.deepcopy(previous_content) + copy.deepcopy(
+                    current_content[split:]
+                )
+                logger.debug(
+                    "overlay: replayed %d forwarded blocks and appended %d new blocks "
+                    "inside message %d",
+                    split,
+                    len(current_content) - split,
+                    message_index,
+                )
+                replayed = (
+                    list(prev_fwd[:message_index])
+                    + [merged]
+                    + list(optimized_messages[message_index + 1 :])
+                )
+                if message_index >= max(confirmed_frozen_count or 0, 0):
+                    replayed_bytes = _compact_json_bytes(replayed)
+                    optimized_bytes = _compact_json_bytes(optimized_messages)
+                    if (
+                        replayed_bytes is None
+                        or optimized_bytes is None
+                        or len(replayed_bytes) > len(optimized_bytes)
+                    ):
+                        logger.debug("overlay: block replay inflated compact JSON — skipping")
+                        return optimized_messages
+                return replayed
+    # Append-only guard on CONTENT ONLY, message-by-message. Replay the
+    # previously-forwarded (cached, compressed) bytes for the longest LEADING
+    # run of messages that is byte-for-byte (content-canonical) identical to
+    # what we forwarded last turn, and stop at the first divergence.
+    #
+    # This is the cache-safety centerpiece for token mode (which relies solely
+    # on this replay; cache mode is already byte-stable by construction). The
+    # prior all-or-nothing guard busted the ENTIRE cached prefix the moment any
+    # single leading message failed to canonicalize-equal last turn — most
+    # commonly the just-added assistant turn, whose client-resent form can
+    # differ trivially from the copy we reconstructed and recorded. Stopping at
+    # the first divergence instead keeps the (much larger) cache-hit region
+    # up to that point and only re-forwards from the changed message onward.
+    #
+    # Comparison uses the shared canonicalizer (not just cache_control
+    # stripping) so it is robust to ALL per-turn transport / annotation churn —
+    # cache_control movement (Anthropic), litellm `caller`,
+    # provider_specific_fields, streaming `index`, string<->block content shape,
+    # etc. Content stability is what the provider's prefix cache actually keys
+    # on. Safe by construction: we only replay prev_fwd[k] where
+    # current_original[k] canonicalize-equals prev_orig[k], and prev_fwd[k]
+    # positionally corresponds to prev_orig[k] (guaranteed by the count check
+    # above), so no wrong bytes are ever forwarded.
+    limit = min(n, len(current_original_messages))
+    k = 0
+    while k < limit and _canonicalize_for_prefix_compare(
+        current_original_messages[k]
+    ) == _canonicalize_for_prefix_compare(prev_orig[k]):
+        k += 1
+    if k == 0:
+        logger.debug(
+            "overlay: prefix diverged at message 0 — no cached-prefix replay "
+            "(cold prefix or client rewrote history head)"
+        )
+        return optimized_messages
+    if k < n:
+        logger.debug(
+            "overlay: cached-prefix replay for %d/%d leading messages "
+            "(diverged at %d — re-forwarding tail fresh)",
+            k,
+            n,
+            k,
+        )
+    # Replay the cached (compressed) prefix byte-identical up to the first
+    # divergence; keep this turn's freshly-produced output for the rest.
+    replayed = list(prev_fwd[:k]) + list(optimized_messages[k:])
+    replayed_bytes = _compact_json_bytes(replayed)
+    optimized_bytes = _compact_json_bytes(optimized_messages)
+    if (
+        replayed_bytes is None
+        or optimized_bytes is None
+        or len(replayed_bytes) > len(optimized_bytes)
+    ):
+        # Something in the replay is byte-larger than this turn's fresh form:
+        # fresh compression improved on already-forwarded bytes. Landing the
+        # improvement is only safe OUTSIDE the provider-confirmed prefix -
+        # inside it, the improvement would change bytes the provider has
+        # already cached and bust the whole suffix. Split at the confirmed
+        # floor: replay the confirmed region unconditionally, forward
+        # everything beyond it fresh so the improvement reaches the wire.
+        floor = min(k, max(confirmed_frozen_count or 0, 0))
+        if floor <= 0:
+            logger.debug("overlay: replay inflated compact JSON — skipping cached-prefix replay")
+            return optimized_messages
+        logger.debug(
+            "overlay: replay inflated beyond the confirmed floor — replaying %d/%d "
+            "confirmed messages, forwarding the rest fresh",
+            floor,
+            k,
+        )
+        return list(prev_fwd[:floor]) + list(optimized_messages[floor:])
+    return replayed
+'''
+                exec(
+                    compile(_hd_v_overlay_src, "<hd-pr3380-overlay>", "exec"),
+                    _hd_v_pt.__dict__,
+                )
+                # session_engine binds overlay_cached_prefix by value at
+                # module import; repoint it so the vendored finalize_turn
+                # (exec'd below into the same namespace) calls the vendored
+                # overlay.
+                _hd_v_se.overlay_cached_prefix = _hd_v_pt.overlay_cached_prefix
+
+                _hd_v_finalize_src = '''
+def finalize_turn(
+    result_messages: list[dict[str, Any]],
+    original_messages: list[dict[str, Any]],
+    prev_original: list[dict[str, Any]] | None,
+    prev_returned: list[dict[str, Any]] | None,
+    *,
+    count_tokens: Callable[[list[dict[str, Any]]], int] | None = None,
+    confirmed_frozen_count: int | None = None,
+) -> TurnFinal:
+    """Replay last turn's exact forwarded/returned prefix over pipeline drift.
+
+    ``overlay_cached_prefix`` self-guards (positional alignment, append-only
+    shape, non-inflation), so calling this is always safe: when replay is not
+    provably correct it returns the pipeline's own output unchanged.
+
+    ``confirmed_frozen_count`` is forwarded to ``overlay_cached_prefix`` as
+    the unconditional-replay floor: positions the provider has confirmed
+    cached are always replayed byte-identical, while beyond the floor the
+    size bound decides between drift repair (a shrinking replay) and letting
+    a fresh improvement through (an inflating one). Callers with no
+    provider-confirmed count pass None and keep the fully size-bounded
+    behavior.
+
+    ``count_tokens`` is invoked only when the overlay actually replaced
+    bytes — the pipeline's own token count is still accurate otherwise. A
+    failing hook falls back to "no recount" rather than failing the turn.
+    """
+    final = overlay_cached_prefix(
+        result_messages,
+        original_messages,
+        prev_original,
+        prev_returned,
+        confirmed_frozen_count=confirmed_frozen_count,
+    )
+    replayed = final != result_messages
+    tokens: int | None = None
+    if replayed and count_tokens is not None:
+        try:
+            tokens = count_tokens(final)
+        except Exception as e:
+            # Fail-open: the turn still forwards, but the caller keeps the
+            # pipeline's count of messages that are NOT being forwarded —
+            # tokens_saved accounting is stale for this turn. Loud, not
+            # silent: a tokenizer that cannot count the replayed form is a
+            # bug worth surfacing even though it must not fail the request.
+            logger.warning(
+                "finalize_turn: token recount of replayed prefix failed "
+                "(%s: %s); keeping the pipeline's pre-overlay count",
+                type(e).__name__,
+                e,
+            )
+            tokens = None
+    return TurnFinal(messages=final, replayed=replayed, tokens=tokens)
+'''
+                exec(
+                    compile(_hd_v_finalize_src, "<hd-pr3380-finalize>", "exec"),
+                    _hd_v_se.__dict__,
+                )
+
+                import contextvars as _hd_v_cv
+
+                _hd_v_floor = _hd_v_cv.ContextVar("hd_pr3380_floor", default=None)
+
+                _hd_v_orig_prepare = _hd_v_se.prepare_turn
+
+                def _hd_v_prepare(*args, **kwargs):
+                    # The PR stashes max(int(frozen_message_count or 0), 0)
+                    # in the handler BEFORE prepare_turn clamps it against
+                    # the local byte-replay cache; tracker_frozen receives
+                    # that same pre-clamp value. Stash-before-call so a
+                    # failing prepare_turn cannot leave this turn floorless.
+                    if "tracker_frozen" in kwargs:
+                        try:
+                            _hd_v_floor.set(
+                                max(int(kwargs["tracker_frozen"] or 0), 0)
+                            )
+                        except Exception:
+                            _hd_v_floor.set(0)
+                    return _hd_v_orig_prepare(*args, **kwargs)
+
+                _hd_v_se.prepare_turn = _hd_v_prepare
+
+                _hd_v_vendored_finalize = _hd_v_se.finalize_turn
+
+                def _hd_v_finalize(
+                    result_messages,
+                    original_messages,
+                    prev_original,
+                    prev_returned,
+                    **kwargs,
+                ):
+                    if kwargs.get("confirmed_frozen_count") is None:
+                        _hd_v_f = _hd_v_floor.get()
+                        # One-shot: consumed by the finalize of the same
+                        # turn that stashed it, never a later one (keep-alive
+                        # connections run sequential requests on one task
+                        # context).
+                        _hd_v_floor.set(None)
+                        if _hd_v_f is None:
+                            _hd_v_f = len(prev_returned or [])
+                        kwargs["confirmed_frozen_count"] = _hd_v_f
+                    return _hd_v_vendored_finalize(
+                        result_messages,
+                        original_messages,
+                        prev_original,
+                        prev_returned,
+                        **kwargs,
+                    )
+
+                _hd_v_finalize.__wrapped__ = _hd_v_vendored_finalize
+                _hd_v_se.finalize_turn = _hd_v_finalize
+    except Exception:
+        pass
     # Prefix-replay guard (upstream issue #3379 / PR #3380; remove once a
     # wheel ships the fix -- see the module docstring for the cache-bust loop
     # this prevents). Restores v0.35.0's policy: that release has no size
@@ -919,7 +1311,9 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     # NOT having the fix's parameter under either name shipped on #3380
     # (enforce_non_inflation / confirmed_frozen_count), so the first wheel
     # that ships the fix keeps its own replay policy and this block goes
-    # inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0.
+    # inert. Kill switch: HEADROOM_PREFIX_REPLAY_GUARD=0. Normally inert
+    # already: the prefix-floor vendor above installs the parameter; this
+    # binds only when the vendor is killed or fails.
     try:
         if _hd_os.environ.get(
             "HEADROOM_PREFIX_REPLAY_GUARD", "1"
@@ -1108,6 +1502,33 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
         # an opt-in flag.
         _hd_os.environ["HEADROOM_CC_SWITCH_RECONCILE"] = "0"
 "#;
+/// Opt-in passthrough for the rollout registry's `read_maturation` feature.
+///
+/// Empty unless the app itself was launched with `HEADROOM_READ_MATURATION`
+/// set to a truthy value, so the default for every install is off. The feature
+/// holds Read results out of the provider cache and relocates the cache
+/// breakpoint; upstream ships it flag-gated default-off, and the desktop's own
+/// 0.9.4 regression came from a cache-breakpoint change that was shipped
+/// broadly before it was measured. This keeps it to one machine at a time
+/// until `bin/rails savings:did` has judged it.
+fn read_maturation_env() -> Vec<(String, String)> {
+    read_maturation_env_from(std::env::var("HEADROOM_READ_MATURATION").ok().as_deref())
+}
+
+fn read_maturation_env_from(raw: Option<&str>) -> Vec<(String, String)> {
+    let Some(value) = raw.map(str::trim) else {
+        return Vec::new();
+    };
+    // Mirror the wheel's own truthiness so "0"/"false"/"off" mean off rather
+    // than "the variable is present, therefore on".
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    ) {
+        return Vec::new();
+    }
+    vec![("HEADROOM_READ_MATURATION".to_string(), value.to_string())]
+}
 
 /// Pre-upstream concurrency passed to the backend: 2x logical cores,
 /// clamped to [8, 64]. See the spawn-site comment for why the proxy's own
@@ -2788,6 +3209,23 @@ impl ToolManager {
                     // with default_enabled_in <= beta would auto-enable for all
                     // users because of this declaration.
                     .env("HEADROOM_ROLLOUT_CHANNEL", "beta")
+                    // read_maturation is the other beta-ring feature the
+                    // registry offers, and it is NOT requested by default on
+                    // purpose. It holds Read results out of the provider cache
+                    // until they quiesce and then RELOCATES the cache
+                    // breakpoint -- the same machinery whose misuse cost 89
+                    // installs ~17pp of their savings rate on 0.9.4. Upstream
+                    // also ships it flag-gated default-off, so it carries no
+                    // broad validation of its own.
+                    //
+                    // Opt-in passthrough instead of a hardcoded "1": launch the
+                    // app with HEADROOM_READ_MATURATION=1 to try it on one
+                    // machine, compare tok_saved AND cache_read in the PERF log
+                    // (both sides -- measuring only the benefit side is what
+                    // shipped the 0.9.4 regression), then let
+                    // `bin/rails savings:did` decide before it becomes a
+                    // default for everyone.
+                    .envs(read_maturation_env())
                     // Pin the steering level explicitly. An explicit env is the
                     // manual-override tier in the shaper's level resolution, so it
                     // wins over the per-user learned level written to verbosity.json
@@ -8225,6 +8663,24 @@ fn runtime_supports_no_http2(installed_version: Option<&str>) -> bool {
     }
 }
 
+/// Opt-in restore of `--no-ccr`, for reverting the 0.9.6 CCR re-enable without
+/// a rebuild. Empty unless the app was launched with a truthy
+/// `HEADROOM_DESKTOP_NO_CCR`; falsey spellings mean "leave CCR on" rather than
+/// "the variable is present, therefore off".
+fn desktop_forces_no_ccr() -> bool {
+    desktop_forces_no_ccr_from(std::env::var("HEADROOM_DESKTOP_NO_CCR").ok().as_deref())
+}
+
+fn desktop_forces_no_ccr_from(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return false;
+    };
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
 /// The unified `--no-ccr` flag replaced the split `--no-ccr-marker` /
 /// `--no-ccr-inject-tool` pair in headroom-ai 0.31.0 (upstream ecc93991);
 /// 0.30.0 and earlier exit 2 with "No such option", which would fail boot
@@ -8349,22 +8805,48 @@ fn headroom_entrypoint_startup_args(
         args.push("--no-http2".to_string());
     }
     args.push("--log-messages".to_string());
-    // CCR off: with headroom_retrieve injected into the tools array, every
-    // stream:true turn is rewritten to a buffered stream:false upstream call
-    // and re-synthesized as SSE (`buffered_stream_ccr`, upstream #1451/#2479).
-    // That wrapper commits `http.response.start` with status 200 +
-    // text/event-stream after a 1s keepalive, before the upstream outcome is
-    // known; when the buffered call then returns anything that is not a
-    // StreamingResponse (unparseable body, or a real 429/500/529) it can only
-    // emit a bare `event: error` with no message_start, so the client sees
-    // "API returned an empty or malformed response (HTTP 200)" and, because the
-    // status is 200, never retries. Upstream's own help text names --no-ccr as
-    // the right setting for streaming clients. Turning it off also restores
-    // real streaming and puts those turns back through
-    // StreamingMixin._stream_response, which is where SITECUSTOMIZE_PY's
-    // context-limit guard (#2942) attaches — the buffered path bypassed it
-    // entirely. Present since 0.33.0, so this is not a 0.35.0 regression.
-    if runtime_supports_no_ccr(installed_version) {
+    // CCR: both reasons it was disabled are fixed in the 0.37.0 pin, so it is
+    // back ON by default here.
+    //
+    // It was turned off because `headroom_retrieve` in the tools array routes
+    // every stream:true turn through a buffered stream:false upstream call
+    // resynthesized as SSE, and that wrapper committed 200 + text/event-stream
+    // before the upstream outcome was known. A real 429/500/529 then reached
+    // the client as an unretryable 200 ("empty or malformed response"). Both
+    // halves have since landed upstream:
+    //   * #2952/#2953 -- byte-faithful passthrough discarded the stream:false
+    //     flip, which was the actual root cause. Merged, ships from 0.36.0.
+    //   * #2465/#3079 -- liveness vs status fidelity. 0.37.0 carries
+    //     proxy/buffered_ccr_response.py, which holds the response uncommitted
+    //     for DEFAULT_BUFFERED_CCR_GRACE_SECONDS (5.0s) so fast failures keep
+    //     their real status and headers, then commits SSE with a heartbeat so a
+    //     first byte always precedes the client's stream-idle watchdog, and
+    //     translates a post-commit failure into the provider's own typed SSE
+    //     error so client backoff still fires.
+    //
+    // Why turn it back on rather than leave a working setting alone: CCR is
+    // what makes lossy compression RECOVERABLE. Compressed tool output carries
+    // a retrieval marker, so an agent that needs the exact bytes can ask for
+    // them instead of being handed a plausible-but-wrong reconstruction --
+    // upstream #1307, the correctness incident that read protection exists to
+    // prevent. Without recovery there is no safe route to compressing older
+    // reads, and read protection is the largest single cap on compression in
+    // long agentic sessions.
+    //
+    // Known costs, to be measured on staging before this reaches stable:
+    //   * The reversibility guard applies again (content_router.py), so lossy
+    //     compressions that cannot be made recoverable are SKIPPED rather than
+    //     kept. Measured 218 `lossy_unrecoverable_skipped` in ~19h with CCR
+    //     off, all of which come back. tok_saved may fall.
+    //   * The buffered path bypasses StreamingMixin._stream_response, one of
+    //     the three seams SITECUSTOMIZE_PY's context guard (#2942) attaches to.
+    //     Context-limit LEARNING still works (it hangs off
+    //     handle_anthropic_messages and get_context_limit), but the streamed
+    //     usage nudge does not run on those turns.
+    //
+    // Kill switch, no rebuild required: launch the app with
+    // HEADROOM_DESKTOP_NO_CCR=1 to restore the flag.
+    if runtime_supports_no_ccr(installed_version) && desktop_forces_no_ccr() {
         args.push("--no-ccr".to_string());
     }
     if learn_enabled {
@@ -11318,6 +11800,37 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_pr3380_floor_semantics() {
+        // Upstream PR #3380 vendored verbatim against the 0.37.0 pin: the
+        // patched overlay_cached_prefix + finalize_turn are exec'd wholesale,
+        // never reimplemented (the 0.9.4-rc.4 splice was a reimplementation
+        // and lost 22% of fleet cache coverage). Functional evidence:
+        // scratchpad test_vendor.py T1-T6 against the installed 0.37.0 venv,
+        // 2026-09-02.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_PR3380_VENDOR"));
+        // Exact-pin + fixed-parameter gates: any other wheel keeps its own
+        // replay policy.
+        assert!(py.contains(r#"_hd_v_meta.version("headroom-ai") == "0.37.0""#));
+        assert!(py.contains("in _hd_v_pt.overlay_cached_prefix.__code__.co_varnames"));
+        // The vendored signature is the PR's, which is also what flips the
+        // prefix-replay guard's own gate to inert.
+        assert!(py.contains("confirmed_frozen_count: int | None = None"));
+        // The vendor must BIND before the replay guard reads the signature.
+        let vendor_code = py.rfind("HEADROOM_PR3380_VENDOR").unwrap();
+        let guard_code = py.rfind("HEADROOM_PREFIX_REPLAY_GUARD").unwrap();
+        assert!(
+            vendor_code < guard_code,
+            "vendor block must precede the replay guard"
+        );
+        // Floor bridge: pre-clamp tracker_frozen in, one-shot consume out,
+        // full-replay fallback (the 0.9.5 posture) for floorless callers.
+        assert!(py.contains(r#"if "tracker_frozen" in kwargs:"#));
+        assert!(py.contains("_hd_v_floor.set(None)"));
+        assert!(py.contains("_hd_v_f = len(prev_returned or [])"));
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -11350,6 +11863,90 @@ mod tests {
         assert!(py.contains("_rewrite_delta"));
         // ...and the kill switch is honored.
         assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
+    }
+
+    /// Behavioural check of the vendored #3380 prefix floor, against the REAL
+    /// installed wheel rather than the string of the file.
+    ///
+    /// Every other test of this machinery asserts `py.contains(...)`. That is
+    /// what the 0.9.4 splice had, and it passed while the change cost 89
+    /// installs ~17pp of their savings rate: presence is not behaviour. This
+    /// writes the SITECUSTOMIZE_PY we are about to ship into a temp dir, points
+    /// the managed venv at it, and asserts the floor's actual properties --
+    /// including the ContextVar bridge from prepare_turn to finalize_turn,
+    /// which is the novel part and the part with no upstream coverage.
+    ///
+    /// Self-skips where the managed runtime is absent (CI, a fresh clone), so
+    /// it costs nothing there and runs automatically on any machine that has
+    /// the backend installed. That is deliberate: an `#[ignore]` test only
+    /// protects you when somebody remembers to type `--ignored`.
+    #[test]
+    fn vendored_prefix_floor_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-prefix-floor.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hd-prefix-floor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run prefix-floor probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that already ships #3380 leaves the vendor inert by design;
+        // that is a pass upstream, not a regression here.
+        if stdout.contains("FAIL vendor bound") && stderr.is_empty() {
+            eprintln!("skipping: vendor did not bind (wheel is not the 0.37.0 pin)");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "vendored prefix floor misbehaved against the installed wheel.\n\
+             This is the machinery that caused the 0.9.4 regression -- do not \
+             silence it.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn read_maturation_stays_off_unless_explicitly_requested() {
+        // Default for every install: absent. The feature relocates provider
+        // cache breakpoints, which is the machinery that cost 89 installs
+        // ~17pp of their savings rate on 0.9.4, so it must never arrive by
+        // accident.
+        assert!(super::read_maturation_env_from(None).is_empty());
+
+        // Falsey spellings mean off, not "present therefore on".
+        for off in ["", "  ", "0", "false", "FALSE", "no", "off", "Off"] {
+            assert!(
+                super::read_maturation_env_from(Some(off)).is_empty(),
+                "{off:?} should not enable read maturation"
+            );
+        }
+
+        // Explicit opt-in passes the value through to the backend.
+        assert_eq!(
+            super::read_maturation_env_from(Some("1")),
+            vec![("HEADROOM_READ_MATURATION".to_string(), "1".to_string())]
+        );
+        assert_eq!(
+            super::read_maturation_env_from(Some(" true ")),
+            vec![("HEADROOM_READ_MATURATION".to_string(), "true".to_string())]
+        );
     }
 
     #[test]
@@ -13264,31 +13861,47 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         backend_port::reset_for_tests();
     }
 
-    /// CCR tool injection forces every stream:true turn through the buffered
-    /// non-stream path, whose keepalive wrapper commits HTTP 200 before the
-    /// upstream outcome is known and then cannot report a real error — the
-    /// client sees an empty/malformed 200 and cannot retry. The unified
-    /// `--no-ccr` flag only exists from 0.31.0; on the 0.28.0 fallback runtime
-    /// click would exit 2 and boot validation would fail like RUST-4A.
+    /// CCR is ON by default from 0.9.6: both reasons it was disabled landed
+    /// upstream (#2953 for the discarded stream flip, and 0.37.0's
+    /// buffered_ccr_response grace window for #2465/#3079). `--no-ccr` is now
+    /// only emitted when a machine explicitly asks for it, and the version gate
+    /// still applies because the unified flag only exists from 0.31.0 -- on the
+    /// 0.28.0 fallback runtime click would exit 2 and boot validation would
+    /// fail like RUST-4A.
     #[test]
     #[serial_test::serial]
-    fn entrypoint_args_gate_no_ccr_on_runtime_version() {
+    fn entrypoint_args_omit_no_ccr_unless_explicitly_forced() {
         backend_port::reset_for_tests();
 
-        // 0.30.0 and earlier expose the split --no-ccr-marker /
-        // --no-ccr-inject-tool pair, not the unified flag.
-        assert!(!headroom_entrypoint_startup_args(Some("0.28.0"), true)
-            .contains(&"--no-ccr".to_string()));
-        assert!(!headroom_entrypoint_startup_args(Some("0.30.0"), true)
-            .contains(&"--no-ccr".to_string()));
-        assert!(headroom_entrypoint_startup_args(Some("0.31.0"), true)
-            .contains(&"--no-ccr".to_string()));
-        assert!(headroom_entrypoint_startup_args(Some("0.35.0"), true)
-            .contains(&"--no-ccr".to_string()));
-        // Unknown or malformed receipt version: assume pinned runtime.
-        assert!(headroom_entrypoint_startup_args(None, true).contains(&"--no-ccr".to_string()));
-        assert!(headroom_entrypoint_startup_args(Some("garbage"), true)
-            .contains(&"--no-ccr".to_string()));
+        // Default: CCR stays enabled, so the flag is absent at every version.
+        for v in [
+            None,
+            Some("0.28.0"),
+            Some("0.31.0"),
+            Some("0.37.0"),
+            Some("garbage"),
+        ] {
+            assert!(
+                !headroom_entrypoint_startup_args(v, true).contains(&"--no-ccr".to_string()),
+                "CCR must be on by default (version {v:?})"
+            );
+        }
+
+        // The opt-in restore honours falsey spellings rather than treating the
+        // variable's mere presence as "off".
+        assert!(!super::desktop_forces_no_ccr_from(None));
+        for off in ["", "  ", "0", "false", "FALSE", "no", "off"] {
+            assert!(
+                !super::desktop_forces_no_ccr_from(Some(off)),
+                "{off:?} should keep CCR on"
+            );
+        }
+        for on in ["1", "true", " yes "] {
+            assert!(
+                super::desktop_forces_no_ccr_from(Some(on)),
+                "{on:?} should restore --no-ccr"
+            );
+        }
         // The `python -m headroom.proxy.server` argparse defines no CCR
         // option at all; passing it there would exit 2 on every fallback boot.
         assert!(!headroom_python_startup_args().contains(&"--no-ccr".to_string()));
@@ -13381,6 +13994,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             mode: UpstreamOverrideMode::Fallback,
             base_url: "https://api.z.ai/api/anthropic".into(),
             has_token: true,
+            ..Default::default()
         });
         assert_eq!(fallback.target_api_url, "https://api.z.ai/api/anthropic");
         // Fallback boots at the endpoint but lets a cc-switch capture win.
@@ -13391,6 +14005,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             mode: UpstreamOverrideMode::Override,
             base_url: "https://api.z.ai/api/anthropic".into(),
             has_token: true,
+            ..Default::default()
         });
         assert_eq!(overridden.pin_upstream, "1");
         assert_eq!(overridden.lossless, "1");
@@ -13401,6 +14016,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             mode: UpstreamOverrideMode::Override,
             base_url: String::new(),
             has_token: false,
+            ..Default::default()
         });
         assert_eq!(empty.target_api_url, "");
         assert_eq!(empty.pin_upstream, "0");

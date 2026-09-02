@@ -76,6 +76,13 @@ export interface DailySavingsPoint {
   // layer existed, or that came from the local tracker.
   outputSavingsUsd?: number;
   outputTokensSaved?: number;
+  // Tool-schema deferral, priced at the cache-read rate. Real Headroom-caused
+  // saving (those definitions are re-sent every request unless Headroom defers
+  // them), unlike the provider cache which works with Headroom out of the path.
+  // Zero for every bucket before per-bucket sampling began (2026-09-02): the
+  // backend only exposed a lifetime total, so there is nothing to backfill.
+  toolSchemaSavingsUsd?: number;
+  toolSchemaTokensSaved?: number;
   // Provider prompt-cache reads inside the bucket, derived from the backend's
   // raw history checkpoints. Null/absent for local-tracker buckets and days
   // that aged out of history retention.
@@ -144,6 +151,9 @@ export interface HourlySavingsPoint {
   totalTokensSent: number;
   outputSavingsUsd?: number;
   outputTokensSaved?: number;
+  /** See the daily point's toolSchemaSavingsUsd. */
+  toolSchemaSavingsUsd?: number;
+  toolSchemaTokensSaved?: number;
   cacheReadTokens?: number | null;
   cacheSavingsUsd?: number | null;
   outputSampledTokensSaved?: number | null;
@@ -679,19 +689,6 @@ export interface IntroOffer {
   durationMonths: number;
 }
 
-/// Cancellation save offer computed by headroom-web: an extra percentOff on
-/// top of whatever the subscriber already pays, for durationMonths. Cents are
-/// per month even on annual plans, matching how the plan cards quote prices.
-export interface SaveOffer {
-  percentOff: number;
-  durationMonths: number;
-  billingPeriod: BillingPeriod;
-  currentMonthlyCents: number;
-  offerMonthlyCents: number;
-  /// Formatted date the offer price first bills; absent on older servers.
-  startsOn?: string | null;
-}
-
 export type TierRecommendationSource = "claude" | "codex" | "both";
 
 export interface TierMismatch {
@@ -719,8 +716,23 @@ export type UpstreamMode = "off" | "fallback" | "override";
  * itself, only whether one is stored: the token lives in the OS keychain and
  * in the client's own settings.json.
  */
+export interface ProviderPresetView {
+  id: string;
+  label: string;
+  baseUrl: string;
+  model: string;
+}
+
 export interface UpstreamOverrideView {
   mode: UpstreamMode;
   baseUrl: string;
   hasToken: boolean;
+  /** Preset id this came from; empty for a hand-entered endpoint. */
+  provider: string;
+  /** Written to every ANTHROPIC_DEFAULT_*_MODEL slot; empty leaves them unset. */
+  model: string;
+  /** CLAUDE_CODE_AUTO_COMPACT_WINDOW in tokens; empty leaves it unset. */
+  contextWindow: string;
+  /** Presets the dropdown offers, supplied by the backend that writes them. */
+  providers: ProviderPresetView[];
 }

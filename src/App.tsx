@@ -209,7 +209,6 @@ import type {
   RuntimeStatus,
   RuntimeUpgradeFailure,
   RuntimeUpgradeProgress,
-  SaveOffer,
 } from "./lib/types";
 
 interface NavItem {
@@ -631,10 +630,6 @@ const CANCELLATION_REASONS: { value: string; label: string }[] = [
 const authCodeExpiryFallbackSeconds = 900;
 const APP_UPDATE_BACKGROUND_INITIAL_DELAY_MS = 12_000;
 const APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS = 60 * 60 * 1000;
-// Provider settings (Settings -> Provider) are hidden while the multi-provider
-// work gets its finishing touches; the upstream-override backend stays live so
-// already-configured setups keep working. Remove the flag when it ships.
-const SHOW_PROVIDER_SETTINGS = false;
 // Desktop activation is a one-shot "this device is live" ping to headroom-web.
 // It is not worth an unbounded retry: a machine that is offline now is usually
 // offline for a while, and every attempt costs a Sentry warning. Five attempts
@@ -1025,17 +1020,31 @@ function DailySavingsChart({
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
   const canViewNextDay = visibleDay < today;
   const label = view === "month" ? formatMonthLabel(visibleMonth) : formatSelectedDayLabel(visibleDay);
-  // Headline totals cover both Headroom layers -- input compression plus
-  // output shaping -- matching the breakdown rows in the savings modal and the
-  // segments stacked in the bars below. The live tray figure for today already
-  // sums both, so it can stand in for the bucket sum while today is still open.
+  // Headline totals cover all three Headroom layers -- input compression,
+  // output shaping, and tool-schema deferral -- matching the breakdown rows in
+  // the savings modal and the segments stacked in the bars below. The provider
+  // cache is deliberately NOT among them: it works with Headroom out of the
+  // path entirely, so it is not a benefit of running Headroom. Deferral is the
+  // opposite -- those definitions are re-sent on every request unless Headroom
+  // holds them back -- and it is priced at the cache-read rate upstream, since
+  // they would have been cache reads after the session's first request.
+  // Buckets before 2026-09-02 carry no deferral figure (the backend only ever
+  // exposed a lifetime total), so older bars understate that layer.
+  // The live tray figure for today already sums the layers it knows, so it can
+  // stand in for the bucket sum while today is still open.
   const chartSaved = Math.max(
     0,
     chartMode === "usd"
       ? view === "day" && visibleDay >= today && savingsTodayUsd !== null
         ? savingsTodayUsd
-        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
-      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
+        : chartData.reduce(
+            (s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd + (d.toolSchemaSavingsUsd ?? 0),
+            0
+          )
+      : chartData.reduce(
+          (s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved + (d.toolSchemaTokensSaved ?? 0),
+          0
+        )
   );
 
   useEffect(() => {
@@ -1208,6 +1217,19 @@ function DailySavingsChart({
                   <stop offset="0%" stopColor="#e2cf6a" stopOpacity="0.3" />
                   <stop offset="100%" stopColor="#F3E2A4" stopOpacity="0.22" />
                 </linearGradient>
+                {/* Tool-schema deferral, the third layer. Same family again,
+                    one further step out, so the bar reads as three shades of
+                    "Headroom removed this" rather than three unrelated
+                    metrics. Chart-only SVG gradient stops, matching the two
+                    above -- the CSS token rule covers component CSS. */}
+                <linearGradient id="toolSchemaUsdGradient" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#4f9d8f" />
+                  <stop offset="100%" stopColor="#74BDB0" />
+                </linearGradient>
+                <linearGradient id="toolSchemaTokensGradient" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="#eddfa0" stopOpacity="0.28" />
+                  <stop offset="100%" stopColor="#F7EEC9" stopOpacity="0.2" />
+                </linearGradient>
               </defs>
               <CartesianGrid stroke="rgba(36, 31, 29, 0.06)" strokeDasharray="2 8" vertical={false} />
               <XAxis
@@ -1248,6 +1270,14 @@ function DailySavingsChart({
                   <Bar
                     dataKey="outputSavingsUsd"
                     fill="url(#outputUsdGradient)"
+                    maxBarSize={16}
+                    radius={[1, 1, 0, 0]}
+                    stackId="usd"
+                    yAxisId="usd"
+                  />
+                  <Bar
+                    dataKey="toolSchemaSavingsUsd"
+                    fill="url(#toolSchemaUsdGradient)"
                     maxBarSize={16}
                     radius={[1, 1, 0, 0]}
                     stackId="usd"
@@ -1311,6 +1341,13 @@ function DailySavingsChart({
                         />
                       );
                     }}
+                  />
+                  <Bar
+                    dataKey="toolSchemaTokensSaved"
+                    fill="url(#toolSchemaTokensGradient)"
+                    maxBarSize={16}
+                    stackId="tokens"
+                    yAxisId="tokens"
                   />
                 </>
               )}
@@ -1628,6 +1665,10 @@ export default function App() {
   // already on screen by then (the deep-link handler shows it), so without this
   // the sign-in ran invisibly behind whatever onboarding stage it landed on.
   const [magicLinkState, setMagicLinkState] = useState<MagicLinkState | null>(null);
+  // The [email, code] parked by a claimed deep link, held until the user
+  // explicitly confirms the sign-in (see the login-CSRF note at the claim
+  // site). Cleared on confirm or dismiss.
+  const [magicLinkPending, setMagicLinkPending] = useState<[string, string] | null>(null);
   // Paywall-first experiment flag, served from the Rust-side cache (never
   // blocks). Gated flow applies only to fresh installs: an installed runtime
   // means the user is grandfathered and sees zero difference.
@@ -1831,10 +1872,6 @@ export default function App() {
   const [planChangeError, setPlanChangeError] = useState<string | null>(null);
   const [reactivateBusy, setReactivateBusy] = useState(false);
   const [reactivateError, setReactivateError] = useState<string | null>(null);
-  const [saveOffer, setSaveOffer] = useState<SaveOffer | null>(null);
-  const [saveOfferBusy, setSaveOfferBusy] = useState(false);
-  const [saveOfferError, setSaveOfferError] = useState<string | null>(null);
-  const [saveOfferRedeemed, setSaveOfferRedeemed] = useState(false);
   const [cancelReasonOpen, setCancelReasonOpen] = useState(false);
   const [cancelReason, setCancelReason] = useState("");
   const [cancelNote, setCancelNote] = useState("");
@@ -4261,7 +4298,11 @@ export default function App() {
   // Magic sign-in link (headroom://auth). The browser deliberately cannot sign
   // anyone in -- it has none of the device fingerprints verify_code needs -- so
   // it only hands over the code and this is the ordinary typed-code flow with
-  // the typing removed.
+  // the typing removed, gated behind one explicit click. The gate is the
+  // login-CSRF defense: any webpage can fire headroom://auth with a live code
+  // for an account the ATTACKER requested, and verifying it unprompted would
+  // silently bind this install (and its usage telemetry, and any future
+  // checkout) to that account. Nothing verifies until the user confirms.
   //
   // Drained on mount as well as on the event: a cold start launched *by* the
   // link delivers the URL before this listener exists, so an event alone would
@@ -4283,14 +4324,8 @@ export default function App() {
       }
       const [email, code] = pending;
       setAuthEmail(email);
-      setMagicLinkState("verifying");
-      const verified = await verifyAuthCode(email, code);
-      if (cancelled) {
-        return;
-      }
-      // Success needs no screen: clearing this drops the user straight onto the
-      // next onboarding step, already signed in.
-      setMagicLinkState(verified ? null : "failed");
+      setMagicLinkPending([email, code]);
+      setMagicLinkState("confirm");
     }
     void claimMagicLink();
     const unlistenPromise = listen("magic-link-auth", () => {
@@ -4301,6 +4336,24 @@ export default function App() {
       void unlistenPromise.then((unlisten) => unlisten());
     };
   }, [windowLabel]);
+
+  async function confirmMagicLinkSignIn() {
+    if (!magicLinkPending) {
+      return;
+    }
+    const [email, code] = magicLinkPending;
+    setMagicLinkPending(null);
+    setMagicLinkState("verifying");
+    const verified = await verifyAuthCode(email, code);
+    // Success needs no screen: clearing this drops the user straight onto the
+    // next onboarding step, already signed in.
+    setMagicLinkState(verified ? null : "failed");
+  }
+
+  function dismissMagicLink() {
+    setMagicLinkPending(null);
+    setMagicLinkState(null);
+  }
 
   async function handleSignOutHeadroomAccount() {
     setAuthFlowError(null);
@@ -4536,56 +4589,13 @@ export default function App() {
     if (!cancelReason || cancelBusy) return;
     setCancelBusy(true);
     // Fails open: the reason is a nice-to-have, being trapped in the app is not.
-    const offer = await invoke<SaveOffer | null>("submit_headroom_cancellation_intent", {
+    await invoke("submit_headroom_cancellation_intent", {
       reason: cancelReason,
       note: cancelNote.trim() || null
     }).catch(() => null);
     setCancelBusy(false);
     setCancelReasonOpen(false);
 
-    if (offer) {
-      setSaveOfferError(null);
-      setSaveOfferRedeemed(false);
-      setSaveOffer(offer);
-      return;
-    }
-
-    setUpgradeActionBusy("cancel");
-    try {
-      await openBillingPortal();
-    } catch (error) {
-      setUpgradeActionError(
-        describeInvokeError(error, "Could not open billing portal.")
-      );
-    } finally {
-      setUpgradeActionBusy(null);
-    }
-  }
-
-  async function handleRedeemSaveOffer() {
-    if (saveOfferBusy) return;
-    setSaveOfferBusy(true);
-    setSaveOfferError(null);
-    try {
-      await invoke("redeem_headroom_save_offer");
-      setSaveOfferRedeemed(true);
-      await refreshPricingStatus();
-    } catch (error) {
-      setSaveOfferError(
-        error instanceof Error
-          ? error.message
-          : typeof error === "string"
-            ? error
-            : "Could not apply the offer."
-      );
-    } finally {
-      setSaveOfferBusy(false);
-    }
-  }
-
-  async function handleDeclineSaveOffer() {
-    if (saveOfferBusy) return;
-    setSaveOffer(null);
     setUpgradeActionBusy("cancel");
     try {
       await openBillingPortal();
@@ -4824,7 +4834,9 @@ export default function App() {
   if (windowLabel === "launcher" && magicLinkState !== null) {
     const magicLinkCopy = magicLinkScreenCopy(
       magicLinkState,
-      pricingStatus?.account?.email ?? authEmail,
+      // The confirm step must name the deep link's OWN email: the parked link
+      // can be for a different account than whoever is currently signed in.
+      magicLinkPending?.[0] ?? pricingStatus?.account?.email ?? authEmail,
       authFlowError
     );
     return (
@@ -4838,10 +4850,27 @@ export default function App() {
       >
         <h1>{magicLinkCopy.title}</h1>
         <p className="launcher-install-notice">{magicLinkCopy.body}</p>
-        {magicLinkState === "verifying" ? null : (
+        {magicLinkState === "verifying" ? null : magicLinkState === "confirm" ? (
+          <>
+            <button
+              className="primary-button primary-button--large primary-button--success"
+              onClick={() => void confirmMagicLinkSignIn()}
+              type="button"
+            >
+              Sign in
+            </button>
+            <button
+              className="secondary-button"
+              onClick={dismissMagicLink}
+              type="button"
+            >
+              Cancel
+            </button>
+          </>
+        ) : (
           <button
             className="primary-button primary-button--large primary-button--success"
-            onClick={() => setMagicLinkState(null)}
+            onClick={dismissMagicLink}
             type="button"
           >
             Continue
@@ -7809,12 +7838,6 @@ export default function App() {
                 ) : null}
               </article>
 
-              {/* Provider settings ship dark for now: the backend default is
-                  Off and explicitly-configured setups keep working, but the
-                  panel stays hidden until the provider work is finished.
-                  Flip to true to restore Settings -> Provider. */}
-              {SHOW_PROVIDER_SETTINGS ? <UpstreamPanel /> : null}
-
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
                   <div>
@@ -7964,6 +7987,16 @@ export default function App() {
                 </div>
               </article>
 
+              {/* Power-user settings almost nobody needs, collapsed so they do
+                  not crowd out the ones people came here for. New ones go
+                  inside; the disclosure state is the browser's own. */}
+              <details className="advanced-section">
+                <summary>Advanced</summary>
+                <div className="advanced-section__body">
+                  <UpstreamPanel />
+                </div>
+              </details>
+
               <article className="soft-card panel-card">
                 <div className="panel-card__header">
                   <div>
@@ -8068,8 +8101,8 @@ export default function App() {
                     {(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0) > 0 ? (
                       <>
                         <div className="savings-breakdown__row">
-                          <span>Additional costs saved (tool schemas deferred)</span>
-                          <strong>{currencyExact(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
+                          <span>Tool schemas deferred (Headroom)</span>
+                          <strong>{currency(dashboard.savingsBreakdown.toolSchemaSavingsUsd ?? 0)}</strong>
                         </div>
                         {/* Priced at the cache-read rate, not the input rate --
                             see tool_schema_savings_usd in state.rs. */}
@@ -8077,8 +8110,7 @@ export default function App() {
                           {compactNumber(dashboard.savingsBreakdown.toolSchemaTokensSaved ?? 0)} tokens
                           of tool definitions Headroom kept out of your requests until they were
                           needed. These sit at the front of the cached prefix, so they are priced at
-                          the provider's cache-read rate rather than the full input rate. Counted in
-                          addition to the Total costs saved figure, not inside it.
+                          the provider's cache-read rate rather than the full input rate.
                         </p>
                       </>
                     ) : null}
@@ -8435,84 +8467,6 @@ export default function App() {
                     {cancelBusy ? "One moment..." : "Continue"}
                   </button>
                 </div>
-              </div>
-            </div>
-          ) : null}
-
-          {saveOffer ? (
-            <div
-              className="modal-backdrop"
-              role="dialog"
-              aria-modal="true"
-              onClick={() => {
-                if (!saveOfferBusy) setSaveOffer(null);
-              }}
-            >
-              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-                {saveOfferRedeemed ? (
-                  <>
-                    <h3>You're all set</h3>
-                    <p>
-                      Your plan stays active at{" "}
-                      <strong>{formatCents(saveOffer.offerMonthlyCents)} / month</strong>{" "}
-                      for the next {saveOffer.durationMonths} months. The new price
-                      takes effect{" "}
-                      {saveOffer.startsOn ? `on ${saveOffer.startsOn}` : "at your next renewal"}.
-                    </p>
-                    <div className="modal-actions">
-                      <button
-                        className="primary-button"
-                        onClick={() => setSaveOffer(null)}
-                        type="button"
-                      >
-                        Done
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <h3>Before you go: {saveOffer.percentOff}% off for {saveOffer.durationMonths} months</h3>
-                    <p>
-                      Stay on your plan and pay{" "}
-                      <strong>{formatCents(saveOffer.offerMonthlyCents)} / month</strong>{" "}
-                      instead of{" "}
-                      <strong>{formatCents(saveOffer.currentMonthlyCents)} / month</strong>{" "}
-                      for the next {saveOffer.durationMonths} months
-                      {saveOffer.billingPeriod === "annual" ? ", billed annually" : ""}.
-                      That is {saveOffer.percentOff}% off the price your plan renews
-                      at.
-                    </p>
-                    <p>
-                      The new price starts{" "}
-                      {saveOffer.startsOn ? `on ${saveOffer.startsOn}` : "at your next renewal"}
-                      , and any discount you are on until then is unaffected. Nothing
-                      else about your plan changes, and you can still cancel any time.
-                    </p>
-                    {saveOfferError ? (
-                      <p className="install-progress__error">{saveOfferError}</p>
-                    ) : null}
-                    <div className="modal-actions">
-                      <button
-                        className="secondary-button"
-                        disabled={saveOfferBusy}
-                        onClick={() => void handleDeclineSaveOffer()}
-                        type="button"
-                      >
-                        Continue to cancel
-                      </button>
-                      <button
-                        className="primary-button"
-                        disabled={saveOfferBusy}
-                        onClick={() => void handleRedeemSaveOffer()}
-                        type="button"
-                      >
-                        {saveOfferBusy
-                          ? "Applying..."
-                          : `Keep it at ${formatCents(saveOffer.offerMonthlyCents)} / mo`}
-                      </button>
-                    </div>
-                  </>
-                )}
               </div>
             </div>
           ) : null}

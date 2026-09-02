@@ -2547,6 +2547,14 @@ impl AppState {
                     point.cache_read_tokens = bucket.cache_read_tokens.or(point.cache_read_tokens);
                     point.cache_savings_usd = bucket.cache_savings_usd.or(point.cache_savings_usd);
                 }
+                if let Some(tokens) = tracker.tool_schema_daily_samples.get(&point.date) {
+                    point.tool_schema_tokens_saved = *tokens;
+                    point.tool_schema_savings_usd = bucket_tool_schema_usd(
+                        point.estimated_savings_usd,
+                        point.estimated_tokens_saved,
+                        *tokens,
+                    );
+                }
             }
             for point in hourly_savings.iter_mut() {
                 if let Some(sample) = tracker.output_hourly_samples.get(&point.hour) {
@@ -2556,6 +2564,14 @@ impl AppState {
                 if let Some(bucket) = tracker.hourly_savings.get(&point.hour) {
                     point.cache_read_tokens = bucket.cache_read_tokens.or(point.cache_read_tokens);
                     point.cache_savings_usd = bucket.cache_savings_usd.or(point.cache_savings_usd);
+                }
+                if let Some(tokens) = tracker.tool_schema_hourly_samples.get(&point.hour) {
+                    point.tool_schema_tokens_saved = *tokens;
+                    point.tool_schema_savings_usd = bucket_tool_schema_usd(
+                        point.estimated_savings_usd,
+                        point.estimated_tokens_saved,
+                        *tokens,
+                    );
                 }
             }
         }
@@ -2605,12 +2621,18 @@ impl AppState {
         );
         let lifetime_tool_schema_savings_usd =
             tool_schema_savings_usd(&daily_savings, lifetime_tool_schema_tokens_saved);
-        // The tool-schema layer is deliberately NOT in the headline card: it
-        // has no time dimension (lifetime counter, no backfill), so including
-        // it made "Total costs saved" exceed anything the history chart can
-        // show. It renders in the drill-down as "Additional costs saved".
-        let lifetime_estimated_savings_usd =
-            lifetime_compression_savings_usd + lifetime_output_savings_usd;
+        // All three Headroom layers. Deferral was excluded while the chart had
+        // no per-bucket record of it -- the headline then claimed savings no
+        // bar could show. The chart gained that segment on 2026-09-02, so the
+        // headline, the chart and the drill-down now count the same layers,
+        // and the drill-down rows genuinely sum to this figure. Expect a
+        // one-time step on upgrade: the lifetime deferral counter reaches back
+        // to 0.7.5. The token total and the reported daily rows stay
+        // layer-unchanged (see the milestone comment below and
+        // recent_savings_days in lib.rs).
+        let lifetime_estimated_savings_usd = lifetime_compression_savings_usd
+            + lifetime_output_savings_usd
+            + lifetime_tool_schema_savings_usd;
         warn_once_if_savings_rate_implausible(&daily_savings, || {
             self.tool_manager.installed_headroom_version()
         });
@@ -2622,7 +2644,7 @@ impl AppState {
             .map(|point| point.estimated_tokens_saved)
             .sum();
 
-        // The drill-down has to add up to the headline it explains, so both
+        // The drill-down has to add up to the headline it explains, so the
         // Headroom rows come from those same buckets rather than the backend's
         // `lifetime` block. That block is stitched differently (it counts the
         // rollup's backfill bucket for a period the tracker also covers), and
@@ -4102,6 +4124,16 @@ pub struct UpstreamOverride {
     /// Normalized by `normalize_upstream_base_url`; empty when unset.
     pub base_url: String,
     pub has_token: bool,
+    /// Id of the preset in `client_adapters::PROVIDER_PRESETS` this came from,
+    /// or empty for a hand-entered endpoint. Only the dropdown reads it: the
+    /// URL and model below are already resolved.
+    pub provider: String,
+    /// Model id the provider serves, written to every big `ANTHROPIC_DEFAULT_*_MODEL`
+    /// slot. Empty when unset, which leaves the provider to map Claude ids.
+    pub model: String,
+    /// Context window in tokens for `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. Kept as
+    /// a string because empty means unset; digits are validated on save.
+    pub context_window: String,
 }
 
 impl UpstreamOverride {
@@ -4464,6 +4496,17 @@ struct PersistedSavingsState {
     /// local (`local_hour_key`, joining the local-keyed hourly points).
     output_daily_samples: BTreeMap<String, OutputSampleBucket>,
     output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// Locally-sampled tool-schema deferral deltas, keyed exactly like the
+    /// output samples above. The backend exposes tool-schema savings ONLY as a
+    /// lifetime cumulative counter: it is absent from the `history`
+    /// checkpoints, from `series.hourly`, and from that series' `by_model`
+    /// entries (verified against a 0.37.0 wheel, 2026-09-02). Sampling the
+    /// deltas here is therefore the only per-bucket record of this layer that
+    /// can exist, and it necessarily starts empty -- there is nothing to
+    /// backfill from, so any chart that adds the layer steps up on the day
+    /// sampling began and must say so rather than imply a real jump.
+    tool_schema_daily_samples: BTreeMap<String, u64>,
+    tool_schema_hourly_samples: BTreeMap<String, u64>,
     /// See [`OUTPUT_SAMPLE_SERIES_VERSION`]. Container default (0) marks a
     /// file written before the field existed, whose series is in old units.
     output_sample_series_version: u8,
@@ -4509,6 +4552,9 @@ struct SavingsTracker {
     /// See `PersistedSavingsState::output_daily_samples`.
     output_daily_samples: BTreeMap<String, OutputSampleBucket>,
     output_hourly_samples: BTreeMap<String, OutputSampleBucket>,
+    /// See `PersistedSavingsState::tool_schema_daily_samples`.
+    tool_schema_daily_samples: BTreeMap<String, u64>,
+    tool_schema_hourly_samples: BTreeMap<String, u64>,
     /// High-water (tokens_saved, baseline_tokens) of the shaper's durable
     /// estimator. Not persisted directly: the first post-launch reading seeds
     /// it (never emitting a delta, so a closed-app gap isn't billed to the
@@ -4662,6 +4708,16 @@ impl SavingsTracker {
                     }
                     samples
                 }),
+            tool_schema_daily_samples: persisted_state
+                .as_ref()
+                .map_or_else(BTreeMap::new, |state| {
+                    state.tool_schema_daily_samples.clone()
+                }),
+            tool_schema_hourly_samples: persisted_state
+                .as_ref()
+                .map_or_else(BTreeMap::new, |state| {
+                    state.tool_schema_hourly_samples.clone()
+                }),
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: persisted_state
                 .as_ref()
@@ -4732,6 +4788,8 @@ impl SavingsTracker {
                 date: date.clone(),
                 estimated_savings_usd: bucket.estimated_savings_usd,
                 estimated_tokens_saved: bucket.estimated_tokens_saved,
+                tool_schema_savings_usd: 0.0,
+                tool_schema_tokens_saved: 0,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
                 output_savings_usd: bucket.output_savings_usd,
@@ -4754,6 +4812,8 @@ impl SavingsTracker {
                 hour: hour.clone(),
                 estimated_savings_usd: bucket.estimated_savings_usd,
                 estimated_tokens_saved: bucket.estimated_tokens_saved,
+                tool_schema_savings_usd: 0.0,
+                tool_schema_tokens_saved: 0,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
                 output_savings_usd: bucket.output_savings_usd,
@@ -4921,6 +4981,18 @@ impl SavingsTracker {
         self.tool_schema_process_total = Some(reading);
         self.lifetime_tool_schema_tokens_saved =
             self.lifetime_tool_schema_tokens_saved.saturating_add(delta);
+        if delta > 0 {
+            // Same keying as the output samples: UTC day (joins the backend's
+            // UTC daily rollups), local hour (joins the local-keyed hourly
+            // points). Attributed to the moment of observation, so a delta
+            // spanning a bucket edge lands wholly in the later bucket -- the
+            // same approximation the output sampler makes.
+            let now_utc = Utc::now();
+            let day_key = now_utc.format("%Y-%m-%d").to_string();
+            let hour_key = local_hour_key(now_utc.with_timezone(&Local));
+            *self.tool_schema_daily_samples.entry(day_key).or_insert(0) += delta;
+            *self.tool_schema_hourly_samples.entry(hour_key).or_insert(0) += delta;
+        }
     }
 
     fn observe(&mut self, stats: &HeadroomDashboardStats) -> Option<SavingsTotalsSnapshot> {
@@ -5456,6 +5528,8 @@ impl SavingsTracker {
             hourly_savings: self.hourly_savings.clone(),
             output_daily_samples: self.output_daily_samples.clone(),
             output_hourly_samples: self.output_hourly_samples.clone(),
+            tool_schema_daily_samples: self.tool_schema_daily_samples.clone(),
+            tool_schema_hourly_samples: self.tool_schema_hourly_samples.clone(),
             last_output_estimator_tokens_saved: self.last_output_estimator_tokens_saved,
             last_output_estimator_baseline_tokens: self.last_output_estimator_baseline_tokens,
             output_sample_series_version: OUTPUT_SAMPLE_SERIES_VERSION,
@@ -5491,6 +5565,8 @@ impl SavingsTracker {
         self.session_hourly_buckets
             .retain(|key, _| key.as_str() >= cutoff.as_str());
         self.output_hourly_samples
+            .retain(|key, _| key.as_str() >= cutoff.as_str());
+        self.tool_schema_hourly_samples
             .retain(|key, _| key.as_str() >= cutoff.as_str());
     }
 
@@ -5826,6 +5902,8 @@ impl HeadroomSavingsHistoryResponse {
                 date: point.timestamp.format("%Y-%m-%d").to_string(),
                 estimated_savings_usd: point.compression_savings_usd_delta,
                 estimated_tokens_saved: point.tokens_saved,
+                tool_schema_savings_usd: 0.0,
+                tool_schema_tokens_saved: 0,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
                 output_savings_usd: point.output_savings_usd_delta,
@@ -5846,6 +5924,8 @@ impl HeadroomSavingsHistoryResponse {
                 hour: local_hour_key(point.timestamp.with_timezone(&Local)),
                 estimated_savings_usd: point.compression_savings_usd_delta,
                 estimated_tokens_saved: point.tokens_saved,
+                tool_schema_savings_usd: 0.0,
+                tool_schema_tokens_saved: 0,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
                 output_savings_usd: point.output_savings_usd_delta,
@@ -7955,6 +8035,18 @@ fn warn_once_if_savings_rate_implausible(
 /// from the same buckets, so a user on cheaper models is priced at their own
 /// models' rates. Returns 0 until there are enough compression buckets to
 /// derive a rate from.
+/// Per-bucket twin of [`tool_schema_savings_usd`]: prices one bucket's deferral
+/// with the blended $/token that same bucket's compression implies, at the
+/// cache-read ratio. Falls back to zero rather than guessing when the bucket
+/// has no compression to blend from -- a made-up price on an empty bucket
+/// would be indistinguishable from real savings.
+fn bucket_tool_schema_usd(bucket_usd: f64, bucket_tokens: u64, tool_tokens: u64) -> f64 {
+    if tool_tokens == 0 || bucket_tokens == 0 || bucket_usd <= 0.0 {
+        return 0.0;
+    }
+    (bucket_usd / bucket_tokens as f64) * CACHE_READ_PRICE_RATIO * tool_tokens as f64
+}
+
 fn tool_schema_savings_usd(daily_savings: &[DailySavingsPoint], tokens_saved: u64) -> f64 {
     if tokens_saved == 0 {
         return 0.0;
@@ -9230,6 +9322,7 @@ mod tests {
                 mode: super::UpstreamOverrideMode::Override,
                 base_url: "https://api.z.ai/api/anthropic".into(),
                 has_token: true,
+                ..Default::default()
             },
             onboarding_recovery_notified: true,
             first_savings_notified: true,
@@ -9315,6 +9408,74 @@ mod tests {
         std::fs::write(&records_path, "garbage\n").unwrap();
         assert!(rebuild_persisted_savings_from_records(&records_path).is_none());
         let _ = std::fs::remove_file(&records_path);
+    }
+
+    #[test]
+    fn bucket_tool_schema_usd_prices_at_the_cache_read_rate() {
+        // A bucket that saved $1.00 over 1M compression tokens implies
+        // $1/M. Deferral is priced at a TENTH of that, because those schema
+        // tokens would have been cache reads after the first request --
+        // pricing them at full input rate is the 0.36.0 contamination.
+        let priced = super::bucket_tool_schema_usd(1.0, 1_000_000, 1_000_000);
+        assert!(
+            (priced - 0.10).abs() < 1e-9,
+            "expected a tenth of the blended rate, got {priced}"
+        );
+
+        // Ten times the deferral is ten times the dollars.
+        let more = super::bucket_tool_schema_usd(1.0, 1_000_000, 10_000_000);
+        assert!((more - 1.0).abs() < 1e-9, "got {more}");
+
+        // Nothing to blend from -> zero, never a guessed price. A made-up
+        // figure on an empty bucket is indistinguishable from real savings.
+        assert_eq!(super::bucket_tool_schema_usd(0.0, 1_000_000, 5_000), 0.0);
+        assert_eq!(super::bucket_tool_schema_usd(1.0, 0, 5_000), 0.0);
+        assert_eq!(super::bucket_tool_schema_usd(1.0, 1_000_000, 0), 0.0);
+    }
+
+    #[test]
+    fn tool_schema_samples_bucket_deltas_and_survive_a_backend_restart() {
+        let mut tracker = make_tracker();
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+        // First reading of a process is a baseline: it must not bill the whole
+        // cumulative counter to the current bucket.
+        tracker.accumulate_tool_schema_tokens(10_000);
+        assert!(tracker.tool_schema_daily_samples.is_empty());
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 0);
+
+        tracker.accumulate_tool_schema_tokens(10_500);
+        assert_eq!(tracker.tool_schema_daily_samples[&day_key], 500);
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 500);
+
+        // Deltas accumulate into the same bucket.
+        tracker.accumulate_tool_schema_tokens(11_000);
+        assert_eq!(tracker.tool_schema_daily_samples[&day_key], 1_000);
+
+        // A backend restart resets the proxy's counter to a small value. The
+        // decrease must never emit a delta (that would bill the whole new
+        // process total again); it re-anchors, losing at most one poll, and
+        // the NEXT delta must be measured against the new anchor.
+        tracker.accumulate_tool_schema_tokens(200);
+        assert_eq!(
+            tracker.tool_schema_daily_samples[&day_key], 1_000,
+            "a counter reset must not add a phantom delta"
+        );
+        tracker.accumulate_tool_schema_tokens(700);
+        assert_eq!(
+            tracker.tool_schema_daily_samples[&day_key], 1_500,
+            "after re-anchoring, deltas resume from the new process total"
+        );
+        assert_eq!(tracker.lifetime_tool_schema_tokens_saved, 1_500);
+
+        // The hourly bucket carries the same total under a local-hour key.
+        let hour_key = super::local_hour_key(chrono::Utc::now().with_timezone(&chrono::Local));
+        assert_eq!(tracker.tool_schema_hourly_samples[&hour_key], 1_500);
+
+        // Round-trips through the persisted state.
+        let reloaded = tracker.persisted_state();
+        assert_eq!(reloaded.tool_schema_daily_samples[&day_key], 1_500);
+        assert_eq!(reloaded.tool_schema_hourly_samples[&hour_key], 1_500);
     }
 
     #[test]
@@ -9553,6 +9714,8 @@ mod tests {
             hourly_savings: std::collections::BTreeMap::new(),
             output_daily_samples: std::collections::BTreeMap::new(),
             output_hourly_samples: std::collections::BTreeMap::new(),
+            tool_schema_daily_samples: std::collections::BTreeMap::new(),
+            tool_schema_hourly_samples: std::collections::BTreeMap::new(),
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: None,
             last_output_estimator_baseline_tokens: None,
@@ -9873,6 +10036,68 @@ mod tests {
             .any(|insight| !insight.title.is_empty()));
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn headline_includes_tool_schema_usd_but_milestone_tokens_do_not() {
+        let base_dir = temp_test_dir("headroom-headline-tool-schema");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        {
+            let mut tracker = state.savings_tracker.lock();
+            tracker.daily_savings.insert(
+                "2026-09-01".to_string(),
+                DailySavingsBucket {
+                    estimated_savings_usd: 2.0,
+                    estimated_tokens_saved: 1_000_000,
+                    ..Default::default()
+                },
+            );
+            tracker.lifetime_tool_schema_tokens_saved = 500_000;
+        }
+        // Prime both poll caches with a fresh miss: on a dev machine the real
+        // proxy answers on 6767, and its live stats would replace the seeded
+        // buckets above.
+        *state.cached_headroom_stats.lock() = Some((None, Instant::now()));
+        *state.cached_headroom_history.lock() = Some((None, Instant::now(), true));
+
+        // The output layer prices off ~/.headroom/output_savings.json; on a
+        // developer machine that real ledger adds hundreds of dollars to the
+        // headline. Swap HOME (restored on drop, panic included) so the
+        // arithmetic below is exact.
+        struct HomeSwap {
+            prev: Option<std::ffi::OsString>,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+        impl Drop for HomeSwap {
+            fn drop(&mut self) {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let fake_home = temp_test_dir("headroom-headline-home");
+        fs::create_dir_all(&fake_home).expect("create fake home");
+        let _home = HomeSwap {
+            prev: std::env::var_os("HOME"),
+            _lock: crate::test_env_lock::lock_home(),
+        };
+        std::env::set_var("HOME", &fake_home);
+
+        let dashboard = state.dashboard();
+        // Deferral priced with the blended $/token the buckets imply, at the
+        // cache-read ratio: (2.0 / 1M) * 0.10 * 500k = 0.10 on top of 2.0.
+        assert!(
+            (dashboard.lifetime_estimated_savings_usd - 2.10).abs() < 1e-9,
+            "headline must include the deferral layer, got {}",
+            dashboard.lifetime_estimated_savings_usd
+        );
+        // Token milestones fire off this total; a savings layer that starts
+        // reporting must not move it (or every user gets a milestone storm).
+        assert_eq!(dashboard.lifetime_estimated_tokens_saved, 1_000_000);
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+        let _ = fs::remove_dir_all(fake_home);
     }
 
     #[test]
@@ -12326,6 +12551,8 @@ mod tests {
             lifetime_requests: 12,
             lifetime_token_milestone_high_water: None,
             lifetime_tool_schema_tokens_saved: 0,
+            tool_schema_daily_samples: std::collections::BTreeMap::new(),
+            tool_schema_hourly_samples: std::collections::BTreeMap::new(),
             last_observation: Some(SavingsObservation {
                 observed_at: Utc::now(),
                 last_activity_at: Some(Utc::now()),
@@ -12364,6 +12591,8 @@ mod tests {
         DailySavingsPoint {
             date: date.to_string(),
             estimated_tokens_saved: tokens,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
             estimated_savings_usd: usd,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
@@ -12380,6 +12609,8 @@ mod tests {
         HourlySavingsPoint {
             hour: hour.to_string(),
             estimated_tokens_saved: tokens,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
             estimated_savings_usd: 0.0,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
@@ -12694,6 +12925,8 @@ mod tests {
         let tracker = vec![DailySavingsPoint {
             date: "2026-04-21".to_string(),
             estimated_tokens_saved: 400,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
             estimated_savings_usd: 1.5,
             actual_cost_usd: 9.0,
             total_tokens_sent: 123_456,

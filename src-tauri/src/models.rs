@@ -211,6 +211,21 @@ pub struct DailySavingsPoint {
     pub estimated_tokens_saved: u64,
     pub actual_cost_usd: f64,
     pub total_tokens_sent: u64,
+    /// Tool-schema deferral for the bucket, priced at the CACHE-READ rate.
+    /// Deferral is real Headroom-caused saving (those definitions are re-sent
+    /// on every request unless Headroom holds them back), unlike the provider
+    /// cache, which works with Headroom out of the path entirely. But the
+    /// tokens sit at the front of the prompt and would have been cache reads
+    /// after the first request, so pricing them at full input rate is the
+    /// 0.36.0 contamination the unfold guard exists to block.
+    ///
+    /// Zero for every bucket before per-bucket sampling began (2026-09-02):
+    /// the backend only ever exposed a lifetime cumulative counter, so there
+    /// is nothing to backfill. Old bars therefore understate this layer.
+    #[serde(default)]
+    pub tool_schema_savings_usd: f64,
+    #[serde(default)]
+    pub tool_schema_tokens_saved: u64,
     /// Output-shaping savings for the bucket, kept separate from the
     /// compression figures above because it is a counterfactual estimate
     /// (synthetic control vs a learned baseline) rather than a measured diff.
@@ -265,6 +280,11 @@ pub struct HourlySavingsPoint {
     pub estimated_tokens_saved: u64,
     pub actual_cost_usd: f64,
     pub total_tokens_sent: u64,
+    /// See `DailySavingsPoint::tool_schema_savings_usd`.
+    #[serde(default)]
+    pub tool_schema_savings_usd: f64,
+    #[serde(default)]
+    pub tool_schema_tokens_saved: u64,
     /// See `DailySavingsPoint::output_savings_usd`.
     #[serde(default)]
     pub output_savings_usd: f64,

@@ -631,6 +631,8 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
                 .to_string(),
             estimated_savings_usd: per_day,
             estimated_tokens_saved: 0,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
             output_savings_usd: 0.0,
@@ -658,7 +660,8 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         // Built from the REAL dashboard, before the demo-data injector below.
         let report = (!pending_milestones.token.is_empty()
             || pending_milestones.cumulative_report.is_some())
-        .then(|| savings_report(&dashboard));
+        .then(|| savings_report(&dashboard))
+        .flatten();
 
         for milestone_tokens_saved in &pending_milestones.token {
             analytics::track_event(
@@ -3658,30 +3661,14 @@ async fn get_headroom_billing_portal_url(target: Option<String>) -> Result<Strin
     pricing::get_billing_portal_url(target)
 }
 
-#[tauri::command]
-async fn get_headroom_save_offer(app: AppHandle) -> Result<Option<pricing::SaveOffer>, String> {
-    let offer = pricing::get_save_offer()?;
-    if offer.is_some() {
-        analytics::track_event(&app, "save_offer_shown", None);
-    }
-    Ok(offer)
-}
-
-/// Step one of cancelling: record the reason, get back the offer (if any) to
-/// pitch. The reason lands server-side even when there is nothing to offer.
+/// Step one of cancelling: record the reason before the client opens the
+/// billing portal, so a user who bails after this point is still counted.
 #[tauri::command]
 async fn submit_headroom_cancellation_intent(
     reason: String,
     note: Option<String>,
-) -> Result<Option<pricing::SaveOffer>, String> {
+) -> Result<(), String> {
     pricing::submit_cancellation_intent(&reason, note.as_deref().unwrap_or_default())
-}
-
-#[tauri::command]
-async fn redeem_headroom_save_offer(app: AppHandle) -> Result<(), String> {
-    pricing::redeem_save_offer()?;
-    analytics::track_event(&app, "save_offer_redeemed", None);
-    Ok(())
 }
 
 #[tauri::command]
@@ -4208,14 +4195,46 @@ fn open_external_link_impl(url: &str) -> Result<(), String> {
         );
     }
 
+    // Never route this through `cmd /C start`: cmd re-parses its command line,
+    // so `&`, `|`, `^`, and `%VAR%` inside an otherwise valid URL are live
+    // shell syntax (`https://x/?a=1&calc` runs calc), and legitimate query
+    // strings break the same way. ShellExecuteW gets the URL as one opaque
+    // argument.
     #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = crate::proc::command("cmd");
-        command.args(["/C", "start", "", trimmed]);
-        command
-    };
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-    #[cfg(not(target_os = "linux"))]
+        let url_wide = std::ffi::OsStr::new(trimmed)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let operation = "open"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                operation.as_ptr(),
+                url_wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // Values above 32 are success per the ShellExecuteW contract.
+        if result as isize > 32 {
+            return Ok(());
+        }
+        return Err(format!(
+            "ShellExecuteW failed to open the link (code {}).",
+            result as isize
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
     {
         let status = command
             .status()
@@ -4502,6 +4521,21 @@ struct UpstreamOverrideView {
     mode: &'static str,
     base_url: String,
     has_token: bool,
+    provider: String,
+    model: String,
+    context_window: String,
+    /// The presets the dropdown offers. Shipped with the view so the labels and
+    /// the values that get written can never drift apart.
+    providers: Vec<ProviderPresetView>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderPresetView {
+    id: &'static str,
+    label: &'static str,
+    base_url: &'static str,
+    model: &'static str,
 }
 
 impl From<crate::state::UpstreamOverride> for UpstreamOverrideView {
@@ -4515,6 +4549,18 @@ impl From<crate::state::UpstreamOverride> for UpstreamOverrideView {
             },
             base_url: value.base_url,
             has_token: value.has_token,
+            provider: value.provider,
+            model: value.model,
+            context_window: value.context_window,
+            providers: client_adapters::PROVIDER_PRESETS
+                .iter()
+                .map(|preset| ProviderPresetView {
+                    id: preset.id,
+                    label: preset.label,
+                    base_url: preset.base_url,
+                    model: preset.model,
+                })
+                .collect(),
         }
     }
 }
@@ -4530,12 +4576,21 @@ async fn get_upstream_override(app: AppHandle) -> UpstreamOverrideView {
 /// `token`: `None` leaves the stored one alone (the field renders as "set" and
 /// is only sent when the user types a new one), `Some("")` clears it, anything
 /// else replaces it.
+///
+/// `provider` is a preset id from `client_adapters::PROVIDER_PRESETS`, and when
+/// set it supplies the URL, the model ids and the context window -- the user
+/// only brings a token. Empty means the endpoint was entered by hand, in which
+/// case `model` and `context_window` are optional: empty means "do not write
+/// that key", which leaves a provider that maps Claude model ids itself alone.
 #[tauri::command]
 async fn save_upstream_override(
     app: AppHandle,
     mode: String,
     base_url: String,
     token: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    context_window: Option<String>,
 ) -> Result<UpstreamOverrideView, String> {
     use crate::state::{UpstreamOverride, UpstreamOverrideMode};
 
@@ -4546,12 +4601,24 @@ async fn save_upstream_override(
         other => return Err(format!("unknown upstream mode: {other}")),
     };
 
+    let provider = provider.unwrap_or_default().trim().to_string();
+    let preset = match provider.as_str() {
+        "" => None,
+        id => Some(
+            client_adapters::provider_preset(id)
+                .ok_or_else(|| format!("unknown provider: {id}"))?,
+        ),
+    };
+
     // Off keeps neither URL nor token: a cleared override must not leave a
     // provider credential behind in the client config for the next launch.
     let base_url = if mode == UpstreamOverrideMode::Off {
         String::new()
     } else {
-        crate::state::normalize_upstream_base_url(&base_url)?
+        match preset {
+            Some(preset) => preset.base_url.to_string(),
+            None => crate::state::normalize_upstream_base_url(&base_url)?,
+        }
     };
 
     let has_token = if mode == UpstreamOverrideMode::Off {
@@ -4584,10 +4651,44 @@ async fn save_upstream_override(
         }
     };
 
+    // Same rule as base_url and the token: Off keeps nothing, so a stale model
+    // id cannot outlive the endpoint that served it.
+    let configured = mode != UpstreamOverrideMode::Off;
+    let (model, small_model, context_window) = match (configured, preset) {
+        (false, _) => (String::new(), String::new(), String::new()),
+        (true, Some(preset)) => (
+            preset.model.to_string(),
+            preset.small_model.to_string(),
+            preset.context_window.to_string(),
+        ),
+        (true, None) => {
+            // A hand-entered endpoint gets the one model id the user gave us in
+            // every slot, cheap tier included: we have no way to know which
+            // smaller model it serves.
+            let model = model.unwrap_or_default().trim().to_string();
+            let window = context_window.unwrap_or_default().trim().to_string();
+            if !window.is_empty() && !window.chars().all(|c| c.is_ascii_digit()) {
+                return Err("The context window must be a whole number of tokens.".into());
+            }
+            (model.clone(), model, window)
+        }
+    };
+    client_adapters::apply_upstream_provider_env(configured.then_some(
+        client_adapters::ProviderClientEnv {
+            model: &model,
+            small_model: &small_model,
+            context_window: &context_window,
+        },
+    ))
+    .map_err(|err| err.to_string())?;
+
     let next = UpstreamOverride {
         mode,
         base_url,
         has_token,
+        provider: if configured { provider } else { String::new() },
+        model,
+        context_window,
     };
     let state: tauri::State<'_, AppState> = app.state();
     state.set_upstream_override(next.clone());
@@ -4615,6 +4716,9 @@ async fn save_upstream_override(
             // a token are set.
             "has_base_url": !next.base_url.is_empty(),
             "has_token": next.has_token,
+            // Which preset, or "custom" -- enough to see whether the dropdown
+            // covers what people actually run without logging endpoints.
+            "provider": if next.provider.is_empty() { "custom" } else { next.provider.as_str() },
         })),
     );
     Ok(next.into())
@@ -5415,9 +5519,7 @@ pub fn run() {
             change_headroom_subscription_plan,
             reactivate_headroom_subscription,
             get_headroom_billing_portal_url,
-            get_headroom_save_offer,
             submit_headroom_cancellation_intent,
-            redeem_headroom_save_offer,
             get_activity_feed,
             list_live_learnings,
             list_live_learnings_for_projects,
@@ -5547,30 +5649,35 @@ fn reported_output_reduction(
 /// Projects the dashboard's real savings figures into the payload
 /// headroom-web stores for the admin profile. Must be called on the dashboard
 /// BEFORE `maybe_inject_fake_daily_savings`, or demo data reaches the server.
-fn savings_report(dashboard: &DashboardState) -> pricing::SavingsReport {
-    let breakdown = dashboard.savings_breakdown.as_ref();
-    pricing::SavingsReport {
+///
+/// `None` until `/stats-history` has hydrated `savings_breakdown`. The first
+/// dashboard render each session fires a report immediately, which on a cold
+/// launch beats the backend; a snapshot built then would carry zero rate
+/// denominators, and the server overwrites its stored snapshot
+/// unconditionally, so those zeros clobber the previous good report and the
+/// admin profile renders blank rates (user 1681, 2026-09-02). The milestone
+/// heartbeat still posts without the snapshot; the next due report carries
+/// the real figures.
+fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> {
+    let breakdown = dashboard.savings_breakdown.as_ref()?;
+    let (output_reduction_percent, output_reduction_method) = reported_output_reduction(
+        dashboard.output_reduction.as_ref(),
+        dashboard.output_shaper_active,
+    );
+    Some(pricing::SavingsReport {
         lifetime_savings_usd: dashboard.lifetime_estimated_savings_usd,
         lifetime_tokens_saved: dashboard.lifetime_estimated_tokens_saved,
-        total_input_tokens: breakdown.map(|b| b.total_input_tokens).unwrap_or(0),
-        cache_read_tokens: breakdown.map(|b| b.cache_read_tokens).unwrap_or(0),
-        total_input_cost_usd: breakdown.map(|b| b.total_input_cost_usd).unwrap_or(0.0),
-        cache_savings_usd: breakdown.map(|b| b.cache_savings_usd).unwrap_or(0.0),
-        output_reduction_percent: reported_output_reduction(
-            dashboard.output_reduction.as_ref(),
-            dashboard.output_shaper_active,
-        )
-        .0,
-        output_reduction_method: reported_output_reduction(
-            dashboard.output_reduction.as_ref(),
-            dashboard.output_shaper_active,
-        )
-        .1,
+        total_input_tokens: breakdown.total_input_tokens,
+        cache_read_tokens: breakdown.cache_read_tokens,
+        total_input_cost_usd: breakdown.total_input_cost_usd,
+        cache_savings_usd: breakdown.cache_savings_usd,
+        output_reduction_percent,
+        output_reduction_method,
         reread_tokens: dashboard.reread_tokens,
         reread_compressed_tokens: dashboard.reread_compressed_tokens,
         ccr_retrievals: dashboard.ccr_retrievals,
         days: recent_savings_days(&dashboard.daily_savings),
-    }
+    })
 }
 
 /// The most recent `SAVINGS_REPORT_DAYS` days that saw any traffic, oldest
@@ -6043,6 +6150,47 @@ fn learn_agent_auth_hint(agent: LearnAgent) -> String {
     )
 }
 
+/// The CLI line saying a `headroom learn` failure was the coding agent hitting
+/// its plan's session/usage limit, or None when that is not the cause.
+///
+/// Same user-environment class as [`learn_failure_is_agent_auth`] -- nothing on
+/// our side can change the outcome (RUST-BF: `You've hit your session limit
+/// \u{b7} resets 9:10am (America/Chicago)`) -- but deliberately a separate
+/// classifier, because the auth remedy ("run /login") is wrong advice for a
+/// limit. Staying out of Sentry also sidesteps a grouping break: the reset
+/// clock in the message lands in the fingerprint, so this class could never
+/// group into one issue. Returns the matched line so the UI hint can echo the
+/// CLI's own reset time.
+fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
+    // Full CLI phrases, like the auth needles: "limit" alone would match a
+    // project's own source lines echoed back in the output.
+    const NEEDLES: &[&str] = &[
+        "hit your session limit",
+        "session limit reached",
+        "hit your usage limit",
+        "usage limit reached",
+    ];
+    text.lines().map(str::trim).find(|line| {
+        let lower = line.to_ascii_lowercase();
+        NEEDLES.iter().any(|needle| lower.contains(needle))
+    })
+}
+
+/// The user-facing remedy for [`learn_failure_agent_limit_line`], echoing the
+/// CLI's own line so the reset time survives to the UI.
+fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
+    let cli = match agent {
+        LearnAgent::Claude => "Claude Code",
+        LearnAgent::Codex => "Codex",
+        LearnAgent::Opencode => "opencode",
+        LearnAgent::Grok => "Grok",
+    };
+    format!(
+        "{cli} hit your plan's usage limit, so headroom learn could not run its analysis \
+         (\"{limit_line}\"). Start the scan again after the limit resets."
+    )
+}
+
 /// The text a learn failure is fingerprinted on.
 ///
 /// Upstream's first stderr line is a marker whose reason is EMPTY -- ``LLM
@@ -6387,10 +6535,13 @@ fn execute_headroom_learn_run(
                     // text stays in `reason` and `stderr_tail` below.
                     let signature = normalize_learn_failure_signature(&raw_signature);
                     // Same user-environment carve-out as the non-zero-exit
-                    // branch below (RUST-B6): when the agent CLI has no signed-in
-                    // session, nothing on our side can change the outcome.
+                    // branch below (RUST-B6, RUST-BF): when the agent CLI has no
+                    // signed-in session or its plan hit a usage limit, nothing
+                    // on our side can change the outcome.
                     let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
-                    if !agent_not_signed_in {
+                    let agent_limit_line =
+                        learn_failure_agent_limit_line(&stderr).map(str::to_string);
+                    if !agent_not_signed_in && agent_limit_line.is_none() {
                         sentry::with_scope(
                             |scope| {
                                 scope.set_tag("flow", "headroom_learn");
@@ -6448,6 +6599,13 @@ fn execute_headroom_learn_run(
                         (
                             format!("headroom learn needs a signed-in agent for {project_name}."),
                             learn_agent_auth_hint(agent),
+                        )
+                    } else if let Some(line) = &agent_limit_line {
+                        (
+                            format!(
+                                "headroom learn hit the agent's usage limit for {project_name}."
+                            ),
+                            learn_agent_limit_hint(agent, line),
                         )
                     } else {
                         (
@@ -6560,12 +6718,15 @@ fn execute_headroom_learn_run(
                 // user-environment condition, not an app bug, so don't report it.
                 //
                 // The agent CLI having no signed-in session is the same class
-                // (RUST-B6). Matched against the whole stderr rather than the
-                // signature: upstream's marker line ends before the child's
-                // login prompt, which can land several lines further down.
+                // (RUST-B6), as is its plan hitting a usage limit (RUST-BF).
+                // Matched against the whole stderr rather than the signature:
+                // upstream's marker line ends before the child's diagnosis,
+                // which can land several lines further down.
                 let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
-                let user_env_condition =
-                    signature.contains("is not readable") || agent_not_signed_in;
+                let agent_limit_line = learn_failure_agent_limit_line(&stderr).map(str::to_string);
+                let user_env_condition = signature.contains("is not readable")
+                    || agent_not_signed_in
+                    || agent_limit_line.is_some();
                 if !user_env_condition {
                     sentry::with_scope(
                         |scope| {
@@ -6598,6 +6759,8 @@ fn execute_headroom_learn_run(
                 // the raw exit status and output tail do not name it.
                 let user_error = if agent_not_signed_in {
                     learn_agent_auth_hint(agent)
+                } else if let Some(line) = &agent_limit_line {
+                    learn_agent_limit_hint(agent, line)
                 } else {
                     format!(
                         "headroom learn exited with {}.\n{}",
@@ -6606,6 +6769,8 @@ fn execute_headroom_learn_run(
                 };
                 let user_summary = if agent_not_signed_in {
                     format!("headroom learn needs a signed-in agent for {project_name}.")
+                } else if agent_limit_line.is_some() {
+                    format!("headroom learn hit the agent's usage limit for {project_name}.")
                 } else {
                     format!("headroom learn failed for {project_name}.")
                 };
@@ -8114,7 +8279,8 @@ mod tests {
         fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
         install_pending_update, is_blocked_runtime_dll_signal, is_disk_full_signal,
         is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
-        is_prerelease_version, learn_agent_auth_hint, learn_failure_is_agent_auth,
+        is_prerelease_version, learn_agent_auth_hint, learn_agent_limit_hint,
+        learn_failure_agent_limit_line, learn_failure_is_agent_auth,
         learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
         noop_app_update_progress_emitter, normalize_learn_failure_signature,
         onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
@@ -8123,13 +8289,14 @@ mod tests {
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
         readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        select_updater_endpoints, startup_error_fingerprint_key, store_checked_update,
-        strip_connection_noise, tail_bytes_for_sentry, take_pending_magic_link, user_message_for,
-        watchdog_should_be_up, zero_spend_affected_days, AppUpdateProgress,
-        AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind, DailySavingsPoint,
-        HeadroomLearnPrereqStatus, InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent,
-        MonitorBounds, PhysicalRect, QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT,
-        DEFAULT_UPDATER_PUBLIC_KEY, PENDING_MAGIC_LINK,
+        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
+        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
+        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
+        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
+        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
+        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        PENDING_MAGIC_LINK,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -8191,6 +8358,8 @@ mod tests {
             date: date.into(),
             estimated_savings_usd: savings_usd,
             estimated_tokens_saved: tokens_saved,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
             actual_cost_usd: cost_usd,
             total_tokens_sent: tokens_sent,
             output_savings_usd: 0.0,
@@ -8223,6 +8392,70 @@ mod tests {
     fn recent_savings_days_is_empty_without_traffic() {
         let points = vec![daily_point("2026-06-01", 0.0, 0, 0.0, 0)];
         assert!(recent_savings_days(&points).is_empty());
+    }
+
+    fn dashboard_for_report(
+        breakdown: Option<crate::models::SavingsBreakdown>,
+    ) -> crate::models::DashboardState {
+        crate::models::DashboardState {
+            app_version: "test".into(),
+            launch_experience: crate::models::LaunchExperience::Dashboard,
+            bootstrap_complete: true,
+            python_runtime_installed: true,
+            lifetime_requests: 1,
+            first_prompt_request_seen: true,
+            lifetime_estimated_savings_usd: 307.66,
+            lifetime_estimated_tokens_saved: 63_712_824,
+            session_requests: 0,
+            session_estimated_savings_usd: 0.0,
+            session_estimated_tokens_saved: 0,
+            session_savings_pct: 0.0,
+            output_reduction: None,
+            output_shaper_active: None,
+            learner_progress: None,
+            reread_tokens: None,
+            reread_compressed_tokens: None,
+            ccr_retrievals: None,
+            savings_breakdown: breakdown,
+            daily_savings: Vec::new(),
+            hourly_savings: Vec::new(),
+            savings_history_loaded: false,
+            tools: Vec::new(),
+            clients: Vec::new(),
+            recent_usage: Vec::new(),
+            insights: Vec::new(),
+            required_terms_version: 1,
+            accepted_terms_version: 1,
+            terms_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn savings_report_withheld_until_history_hydrates() {
+        // A report built before /stats-history answers would post zero rate
+        // denominators, which the server stores over a previous good snapshot.
+        assert!(savings_report(&dashboard_for_report(None)).is_none());
+    }
+
+    #[test]
+    fn savings_report_carries_breakdown_denominators() {
+        let breakdown = crate::models::SavingsBreakdown {
+            compression_savings_usd: 100.0,
+            output_savings_usd: 0.0,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
+            cache_savings_usd: 30.0,
+            cache_read_tokens: 2_000,
+            total_input_tokens: 1_000,
+            total_input_cost_usd: 11.09,
+            model_rates: Vec::new(),
+        };
+        let report =
+            savings_report(&dashboard_for_report(Some(breakdown))).expect("hydrated report");
+        assert_eq!(report.total_input_cost_usd, 11.09);
+        assert_eq!(report.cache_savings_usd, 30.0);
+        assert_eq!(report.lifetime_savings_usd, 307.66);
+        assert_eq!(report.lifetime_tokens_saved, 63_712_824);
     }
 
     #[test]
@@ -10690,7 +10923,9 @@ Some unrelated content.
 
     #[test]
     fn learn_failure_is_agent_auth_does_not_swallow_real_failures() {
-        // These must keep reporting: they are ours to fix.
+        // None of these are auth: the "run /login" remedy would be wrong
+        // advice. (The usage-limit line is user-environment too, but it is the
+        // LIMIT classifier's job, with its own remedy.)
         for stderr in [
             "LLM analysis failed: `claude -p` did not respond within 120s.",
             "ModuleNotFoundError: No module named 'headroom.learn'",
@@ -10700,6 +10935,50 @@ Some unrelated content.
         ] {
             assert!(!learn_failure_is_agent_auth(stderr), "for: {stderr}");
         }
+    }
+
+    #[test]
+    fn learn_failure_agent_limit_line_matches_the_cli_limit_messages() {
+        // RUST-BF verbatim: the child CLI's diagnosis on the line after
+        // upstream's marker.
+        let stderr = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nYou've hit your session limit \u{b7} resets 9:10am (America/Chicago)\n";
+        let line = learn_failure_agent_limit_line(stderr).expect("should match");
+        // The matched line (not the marker) so the hint carries the reset time.
+        assert!(line.starts_with("You've hit your session limit"), "{line}");
+        assert!(line.contains("resets 9:10am"), "{line}");
+
+        assert!(learn_failure_agent_limit_line("usage limit reached for this session").is_some());
+        assert!(learn_failure_agent_limit_line("You've hit your usage limit.").is_some());
+    }
+
+    #[test]
+    fn learn_failure_agent_limit_line_does_not_swallow_real_failures() {
+        // These must keep reporting: they are ours to fix (or transient).
+        for stderr in [
+            "LLM analysis failed: `claude -p` did not respond within 120s.",
+            "Error: rate limit exceeded, try again later",
+            "Not logged in \u{b7} Please run /login",
+            "Credit balance is too low",
+            // "limit" in a project's own echoed source must not match.
+            "const SESSION_LIMIT = 5;",
+            "",
+        ] {
+            assert!(
+                learn_failure_agent_limit_line(stderr).is_none(),
+                "for: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn learn_agent_limit_hint_echoes_the_reset_time_and_names_the_cli() {
+        let hint = learn_agent_limit_hint(
+            LearnAgent::Claude,
+            "You've hit your session limit \u{b7} resets 9:10am (America/Chicago)",
+        );
+        assert!(hint.contains("Claude Code"), "{hint}");
+        assert!(hint.contains("resets 9:10am"), "{hint}");
+        assert!(learn_agent_limit_hint(LearnAgent::Codex, "usage limit reached").contains("Codex"));
     }
 
     #[test]
