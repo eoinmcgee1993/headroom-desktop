@@ -2621,12 +2621,18 @@ impl AppState {
         );
         let lifetime_tool_schema_savings_usd =
             tool_schema_savings_usd(&daily_savings, lifetime_tool_schema_tokens_saved);
-        // The tool-schema layer is deliberately NOT in the headline card: it
-        // has no time dimension (lifetime counter, no backfill), so including
-        // it made "Total costs saved" exceed anything the history chart can
-        // show. It renders in the drill-down as "Additional costs saved".
-        let lifetime_estimated_savings_usd =
-            lifetime_compression_savings_usd + lifetime_output_savings_usd;
+        // All three Headroom layers. Deferral was excluded while the chart had
+        // no per-bucket record of it -- the headline then claimed savings no
+        // bar could show. The chart gained that segment on 2026-09-02, so the
+        // headline, the chart and the drill-down now count the same layers,
+        // and the drill-down rows genuinely sum to this figure. Expect a
+        // one-time step on upgrade: the lifetime deferral counter reaches back
+        // to 0.7.5. The token total and the reported daily rows stay
+        // layer-unchanged (see the milestone comment below and
+        // recent_savings_days in lib.rs).
+        let lifetime_estimated_savings_usd = lifetime_compression_savings_usd
+            + lifetime_output_savings_usd
+            + lifetime_tool_schema_savings_usd;
         warn_once_if_savings_rate_implausible(&daily_savings, || {
             self.tool_manager.installed_headroom_version()
         });
@@ -2638,7 +2644,7 @@ impl AppState {
             .map(|point| point.estimated_tokens_saved)
             .sum();
 
-        // The drill-down has to add up to the headline it explains, so both
+        // The drill-down has to add up to the headline it explains, so the
         // Headroom rows come from those same buckets rather than the backend's
         // `lifetime` block. That block is stitched differently (it counts the
         // rollup's backfill bucket for a period the tracker also covers), and
@@ -10030,6 +10036,68 @@ mod tests {
             .any(|insight| !insight.title.is_empty()));
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn headline_includes_tool_schema_usd_but_milestone_tokens_do_not() {
+        let base_dir = temp_test_dir("headroom-headline-tool-schema");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        {
+            let mut tracker = state.savings_tracker.lock();
+            tracker.daily_savings.insert(
+                "2026-09-01".to_string(),
+                DailySavingsBucket {
+                    estimated_savings_usd: 2.0,
+                    estimated_tokens_saved: 1_000_000,
+                    ..Default::default()
+                },
+            );
+            tracker.lifetime_tool_schema_tokens_saved = 500_000;
+        }
+        // Prime both poll caches with a fresh miss: on a dev machine the real
+        // proxy answers on 6767, and its live stats would replace the seeded
+        // buckets above.
+        *state.cached_headroom_stats.lock() = Some((None, Instant::now()));
+        *state.cached_headroom_history.lock() = Some((None, Instant::now(), true));
+
+        // The output layer prices off ~/.headroom/output_savings.json; on a
+        // developer machine that real ledger adds hundreds of dollars to the
+        // headline. Swap HOME (restored on drop, panic included) so the
+        // arithmetic below is exact.
+        struct HomeSwap {
+            prev: Option<std::ffi::OsString>,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+        impl Drop for HomeSwap {
+            fn drop(&mut self) {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let fake_home = temp_test_dir("headroom-headline-home");
+        fs::create_dir_all(&fake_home).expect("create fake home");
+        let _home = HomeSwap {
+            prev: std::env::var_os("HOME"),
+            _lock: crate::test_env_lock::lock_home(),
+        };
+        std::env::set_var("HOME", &fake_home);
+
+        let dashboard = state.dashboard();
+        // Deferral priced with the blended $/token the buckets imply, at the
+        // cache-read ratio: (2.0 / 1M) * 0.10 * 500k = 0.10 on top of 2.0.
+        assert!(
+            (dashboard.lifetime_estimated_savings_usd - 2.10).abs() < 1e-9,
+            "headline must include the deferral layer, got {}",
+            dashboard.lifetime_estimated_savings_usd
+        );
+        // Token milestones fire off this total; a savings layer that starts
+        // reporting must not move it (or every user gets a milestone storm).
+        assert_eq!(dashboard.lifetime_estimated_tokens_saved, 1_000_000);
+
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+        let _ = fs::remove_dir_all(fake_home);
     }
 
     #[test]
