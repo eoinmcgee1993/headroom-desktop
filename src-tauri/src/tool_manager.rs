@@ -323,16 +323,17 @@ bytes change mid-conversation and the provider prompt cache busts from
 the first changed byte -- measured 2026-09-01 as a 160-210k-token cache
 re-write every 1-2 requests, dollar cache-hit rate 90% -> 52%, billable
 input $/M up 2.2x, across the 0.35.0 -> 0.37.0 wheel swap. The guard
-ports #3380's reworked floor semantics: the provider-confirmed prefix
-is replayed unconditionally (declining there can only bust the cache),
-while beyond the floor a declined replay ships this turn's fresh bytes
-so background-compression improvements reach the wire, and a collapsed
-floor (cold cache) re-baselines the whole prefix. The confirmed count
-rides a side-channel -- the finalize path hands the overlay the exact
-list object get_last_forwarded_messages() returned, so the patched
-getter records id(list) -> (len, confirmed count) and the overlay
-wrapper pops it by identity; a missed lookup degrades to full replay,
-the cache-safe posture verified live on rc.2. Gated on the
+restores the 0.35.0 replay policy wholesale: v0.35.0's prefix_tracker
+carries NO size bound at all (`_compact_json_bytes` does not exist
+there), so it replayed the cached prefix whenever alignment allowed.
+The bound arrived with #3052 and is what declines -- and a decline over
+already-cached bytes IS the bust. A floor-limited port was shipped in
+0.9.4 and measured WORSE than no guard: replaying only up to the
+confirmed floor leaves every byte past it free to bust, and the fleet
+lost 22% of cache coverage (1.20 -> 0.94 reads/sent, n=17, p=0.007)
+against 4% for users who stayed on 0.9.3. Full replay is the state that
+measured 26% input savings on 0.35.0, so the guard reproduces exactly
+that and nothing cleverer. Gated on the
 runtime NOT having the fix's parameter (enforce_non_inflation in the
 first PR shape, confirmed_frozen_count in the reworked #3380 shape), so
 the first wheel that ships either keeps its own replay policy and this
@@ -906,18 +907,15 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 
     # Prefix-replay guard (upstream issue #3379 / PR #3380; remove once a
     # wheel ships the fix -- see the module docstring for the cache-bust loop
-    # this prevents and the floor semantics this ports). The confirmed count
-    # travels by object identity: the wheel's finalize path passes the exact
-    # list get_last_forwarded_messages() returned, so the patched getter
-    # records it and the overlay wrapper pops it one-shot; a miss degrades to
-    # full replay (the cache-safe posture verified live on rc.2). The size
-    # bound is probed by calling the original twice on DECLINED turns only:
-    # once bound-on (a shrinking repair is accepted as-is), once with
-    # _compact_json_bytes stubbed to equal-length bytes (inflation compare
-    # goes false; every alignment guard still runs), then spliced at the
-    # floor so improvements beyond the confirmed prefix ship while confirmed
-    # bytes stay byte-identical. Overlay is synchronous on the proxy's single
-    # event loop, so the stub swap cannot interleave. Gated on the runtime
+    # this prevents). Restores v0.35.0's policy: that release has no size
+    # bound at all, so it replayed the cached prefix whenever alignment
+    # allowed. The bound (#3052) declines instead, and declining over
+    # already-cached bytes is the bust. Probed by calling the original twice
+    # on DECLINED turns only: once bound-on (a shrinking repair is accepted
+    # as-is), once with _compact_json_bytes stubbed to equal-length bytes so
+    # the inflation compare goes false while every alignment guard still
+    # runs. Overlay is synchronous on the proxy's single event loop, so the
+    # stub swap cannot interleave. Gated on the runtime
     # NOT having the fix's parameter under either name shipped on #3380
     # (enforce_non_inflation / confirmed_frozen_count), so the first wheel
     # that ships the fix keeps its own replay policy and this block goes
@@ -932,73 +930,26 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 name in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames
                 for name in ("enforce_non_inflation", "confirmed_frozen_count")
             )
-            if (
-                hasattr(_hd_pr_pt, "_compact_json_bytes")
-                and not _hd_pr_fixed
-                and hasattr(_hd_pr_pt, "PrefixCacheTracker")
-                and hasattr(_hd_pr_pt.PrefixCacheTracker, "get_last_forwarded_messages")
-                and hasattr(_hd_pr_pt.PrefixCacheTracker, "get_frozen_message_count")
-            ):
-                # id(list) -> (len, provider-confirmed count); one-shot pop.
-                _hd_pr_floors = {}
-                _hd_pr_orig_getter = (
-                    _hd_pr_pt.PrefixCacheTracker.get_last_forwarded_messages
-                )
-
-                def _hd_pr_getter(self):
-                    result = _hd_pr_orig_getter(self)
-                    try:
-                        if len(_hd_pr_floors) > 128:
-                            _hd_pr_floors.clear()
-                        _hd_pr_floors[id(result)] = (
-                            len(result),
-                            max(int(self.get_frozen_message_count() or 0), 0),
-                        )
-                    except Exception:
-                        pass
-                    return result
-
-                _hd_pr_pt.PrefixCacheTracker.get_last_forwarded_messages = _hd_pr_getter
+            if hasattr(_hd_pr_pt, "_compact_json_bytes") and not _hd_pr_fixed:
                 _hd_pr_orig_overlay = _hd_pr_pt.overlay_cached_prefix
 
                 def _hd_pr_overlay(*args, **kwargs):
                     optimized = args[0] if args else kwargs.get("optimized_messages")
-                    prev_fwd = (
-                        args[3]
-                        if len(args) > 3
-                        else kwargs.get("previous_forwarded_messages")
-                    )
-                    ent = (
-                        _hd_pr_floors.pop(id(prev_fwd), None)
-                        if prev_fwd is not None
-                        else None
-                    )
                     # Pass 1, bound enforced -- identical to stock. A repair
                     # that shrinks (freeze drift, #1850) is accepted as-is.
                     r1 = _hd_pr_orig_overlay(*args, **kwargs)
                     if r1 is not optimized:
                         return r1
-                    # Pass 2, bound neutered; alignment guards still run.
-                    # Only reached on declined turns (post-kompress, a few
-                    # per minute at most).
+                    # Pass 2, bound neutered; every alignment guard still
+                    # runs, so a replay that is not provably correct still
+                    # returns optimized untouched. Reached only on declined
+                    # turns (post-kompress, a few per minute at most).
                     _hd_pr_saved = _hd_pr_pt._compact_json_bytes
                     _hd_pr_pt._compact_json_bytes = lambda value: b""
                     try:
-                        r2 = _hd_pr_orig_overlay(*args, **kwargs)
+                        return _hd_pr_orig_overlay(*args, **kwargs)
                     finally:
                         _hd_pr_pt._compact_json_bytes = _hd_pr_saved
-                    if r2 is optimized:
-                        return optimized
-                    if ent is None or ent[0] != len(prev_fwd) or len(r2) != len(optimized):
-                        # No trustworthy floor: full replay, the verified
-                        # cache-safe fallback.
-                        return r2
-                    floor = min(ent[1], len(r2))
-                    # Confirmed region keeps last turn's forwarded bytes;
-                    # beyond it this turn's fresh output ships, so the
-                    # improvement that triggered the decline lands (and a
-                    # collapsed floor on a cold cache re-baselines fully).
-                    return list(r2[:floor]) + list(optimized[floor:])
 
                 _hd_pr_pt.overlay_cached_prefix = _hd_pr_overlay
     except Exception:
@@ -6275,7 +6226,7 @@ impl ToolManager {
                 &format!("markitdown[all]=={MARKITDOWN_PINNED_VERSION}"),
             ],
             &self.runtime.root_dir,
-            |line| log::info!("markitdown pip: {line}"),
+            |line| log_pip_line("markitdown pip", line),
         )?;
         if !self.markitdown_entrypoint().exists() {
             bail!(
@@ -6315,7 +6266,7 @@ impl ToolManager {
             &["-m", "pip", "uninstall", "-y", "markitdown"],
             &self.runtime.root_dir,
             Some(PIP_OUTPUT_SILENCE_TIMEOUT),
-            &mut |line: &str| log::info!("markitdown pip uninstall: {line}"),
+            &mut |line: &str| log_pip_line("markitdown pip uninstall", line),
         );
         let shim = self.markitdown_shim_path();
         if shim.symlink_metadata().is_ok() {
@@ -6381,7 +6332,7 @@ impl ToolManager {
                 &format!("serena-agent=={SERENA_PINNED_VERSION}"),
             ],
             &self.runtime.root_dir,
-            |line| log::info!("serena pip: {line}"),
+            |line| log_pip_line("serena pip", line),
         )?;
         if !self.serena_entrypoint().exists() {
             bail!(
@@ -8700,6 +8651,12 @@ impl PipOutputCapture {
     }
 
     pub(crate) fn push(&mut self, line: &str) {
+        // pip's `--progress-bar raw` byte counter fires ~4x/second, so 100 of
+        // them is 25 seconds of a single wheel -- it would evict every
+        // Collecting/ERROR line this ring exists to carry into Sentry.
+        if line.starts_with("Progress ") {
+            return;
+        }
         if self.lines.len() >= self.max_lines {
             self.lines.pop_front();
         }
@@ -9936,6 +9893,20 @@ fn build_command(binary: &Path, args: &[&str], cwd: &Path) -> Command {
         .env("LANG", "C.UTF-8")
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         .env("PIP_NO_INPUT", "1")
+        // pip's default rich progress bar renders nothing at all to a pipe
+        // until a wheel finishes, so a large one is pure silence: torch is
+        // 123 MB and the RUST-9Y host was pulling at ~60 kB/s, i.e. 34 minutes
+        // with no output. That froze the wizard (reads as a hang, the user
+        // quits) and starved `PIP_OUTPUT_SILENCE_TIMEOUT`, which killed a
+        // download that was progressing fine. `raw` prints
+        // "Progress <bytes> of <total>" ~4x/second instead; `pip_line_to_progress`
+        // turns it into the MB counter and `PipOutputCapture` filters it out.
+        //
+        // `raw` needs pip >= 24.1 and an older pip rejects the value outright,
+        // failing every install. Safe here because every pip we run lives in a
+        // venv built from `PYTHON_STANDALONE_RELEASE`, whose ensurepip bundles
+        // pip 25.0.1. Re-check that if the interpreter pin ever moves back.
+        .env("PIP_PROGRESS_BAR", "raw")
         // A host-level pip config (`user = true` in pip.conf, or PIP_USER in
         // the environment) leaks into the managed venv's pip and fails every
         // install with "Can not perform a '--user' install. User site-packages
@@ -10019,6 +9990,16 @@ fn pip_line_to_progress(
         let name = file.rsplit('/').next().unwrap_or(file);
         let pkg = name.split('-').next().unwrap_or(name);
         (format!("Downloading {}...", pkg), false, false)
+    } else if let Some(message) = trimmed
+        .strip_prefix("Progress ")
+        .and_then(raw_progress_message)
+    {
+        // The only output pip produces while a single wheel downloads. It does
+        // not advance the package counter -- the same wheel is still in flight
+        // -- but it keeps the message moving and lets the ETA below re-project
+        // off the growing elapsed time, which is what turns a 34-minute torch
+        // download from "hung at 79%" into "slow".
+        (message, false, false)
     } else if trimmed.starts_with("Installing collected packages") {
         ("Installing packages...".to_string(), false, true)
     } else if let Some(rest) = trimmed.strip_prefix("Successfully installed ") {
@@ -10081,6 +10062,32 @@ fn pip_line_to_progress(
         message,
         eta_seconds: remaining,
         percent,
+    })
+}
+
+/// A pip line into the app log, minus the `PIP_PROGRESS_BAR=raw` byte counter.
+/// That fires ~4x/second per wheel, and the app log's tail is the evidence
+/// `bootstrap_abandoned` ships to Sentry -- one addon install would flush it.
+fn log_pip_line(label: &str, line: &str) {
+    if line.starts_with("Progress ") {
+        return;
+    }
+    log::info!("{label}: {line}");
+}
+
+/// Body of a pip `--progress-bar raw` line ("<bytes> of <total>") as a
+/// user-facing MB counter. `None` for anything that does not parse, so an
+/// unrelated line starting with "Progress " cannot fake download progress.
+/// pip reports 0 as the total when the server sends no Content-Length.
+fn raw_progress_message(rest: &str) -> Option<String> {
+    let (current, total) = rest.split_once(" of ")?;
+    let current: u64 = current.trim().parse().ok()?;
+    let total: u64 = total.trim().parse().ok()?;
+    let mb = |bytes: u64| bytes as f64 / 1_048_576.0;
+    Some(if total > 0 {
+        format!("Downloading {:.1} / {:.1} MB...", mb(current), mb(total))
+    } else {
+        format!("Downloading {:.1} MB...", mb(current))
     })
 }
 
@@ -10418,9 +10425,16 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
 /// user-facing progress updates instead of staring at a static message for
 /// the 60–90 seconds a large pip install takes.
 /// Kill a pip child that has produced no output at all for this long. pip
-/// streams constantly when healthy (Collecting/Downloading/Installing lines),
-/// so total silence this long means wedged, not slow. Generous enough for the
-/// quietest legitimate gap we ship (large wheel extract on a slow disk).
+/// streams constantly when healthy (Collecting/Downloading/Installing lines,
+/// plus the `PIP_PROGRESS_BAR=raw` byte counter ~4x/second while a wheel is in
+/// flight), so total silence this long means wedged, not slow. Generous enough
+/// for the quietest legitimate gap we ship (large wheel extract on a slow disk).
+///
+/// That env var is load-bearing here, not cosmetic: without it pip renders
+/// nothing to a pipe for the whole of a wheel transfer, so any wheel bigger
+/// than 600s of link -- opencv's 40 MB at the 60 kB/s of RUST-9Y, 11 minutes --
+/// tripped this watchdog and failed an install that was working. Do not drop
+/// the flag without raising this timeout.
 const PIP_OUTPUT_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn run_pip_install_with_retries_streaming<F>(
@@ -10511,6 +10525,27 @@ where
 /// Like `run_command` but streams stdout + stderr line-by-line through
 /// `on_line` in real time. Captures everything for the structured failure
 /// payload so error reporting is unchanged.
+/// Upper bound on each captured stream. Every consumer (`CommandFailure`'s
+/// Display, which the retry path dumps into the app log, and
+/// `compact_pip_failure`) reads the tail, and pip's raw progress counter emits
+/// ~4 lines a second, so an unbounded buffer would hold -- and log -- megabytes
+/// of "Progress N of M" after an hour on a slow link.
+const STREAM_CAPTURE_CAP: usize = 64 * 1024;
+
+/// Drop the head of `sink` down to `STREAM_CAPTURE_CAP`, cutting at a line
+/// boundary (always a char boundary, so this can never split a UTF-8 sequence).
+fn cap_capture(sink: &mut String) {
+    if sink.len() <= STREAM_CAPTURE_CAP {
+        return;
+    }
+    let cut = sink.len() - STREAM_CAPTURE_CAP;
+    let start = sink.as_bytes()[cut..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(sink.len(), |offset| cut + offset + 1);
+    sink.drain(..start);
+}
+
 fn run_command_streaming<F>(
     binary: &Path,
     args: &[&str],
@@ -10580,6 +10615,7 @@ where
                 };
                 sink.push_str(&streamed.line);
                 sink.push('\n');
+                cap_capture(sink);
             }
             // Pipes closed: the child is exiting; fall through to wait().
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -11261,20 +11297,24 @@ mod tests {
         // keeps its own replay policy.
         assert!(py.contains("in _hd_pr_pt.overlay_cached_prefix.__code__.co_varnames"));
         assert!(py.contains(r#""enforce_non_inflation", "confirmed_frozen_count""#));
-        // Floor side-channel: the getter records the exact returned list by
-        // identity, the overlay pops it ONE-SHOT (no stale reuse), and a
-        // miss degrades to full replay.
-        assert!(
-            py.contains("_hd_pr_pt.PrefixCacheTracker.get_last_forwarded_messages = _hd_pr_getter")
-        );
-        assert!(py.contains("_hd_pr_floors.pop(id(prev_fwd), None)"));
-        // Two-pass probe: bound-on first (shrinking repair accepted), then
-        // stubbed sizing, then the floor splice that lets improvements ship.
+        // Two-pass probe: bound-on first (a shrinking repair is accepted
+        // as-is), then stubbed sizing so the replay always wins -- v0.35.0's
+        // policy, which has no bound at all. The floor-limited variant
+        // shipped in 0.9.4 measured WORSE than no guard (fleet cache
+        // coverage 1.20 -> 0.94) because bytes past the floor still bust, so
+        // there must be no partial splice here.
         assert!(py.contains("if r1 is not optimized:"));
         assert!(py.contains(r#"_hd_pr_pt._compact_json_bytes = lambda value: b"""#));
         assert!(py.contains("_hd_pr_pt._compact_json_bytes = _hd_pr_saved"));
-        assert!(py.contains("return list(r2[:floor]) + list(optimized[floor:])"));
         assert!(py.contains("_hd_pr_pt.overlay_cached_prefix = _hd_pr_overlay"));
+        assert!(
+            !py.contains("_hd_pr_floors"),
+            "floor splice must not come back"
+        );
+        assert!(
+            !py.contains("r2[:floor]"),
+            "partial replay leaves busts past the floor"
+        );
     }
 
     #[test]
@@ -11809,6 +11849,87 @@ mod tests {
         // No more downloading, so the download rate must not be extrapolated
         // into a multi-hour estimate for an unpack.
         assert!(update.eta_seconds <= 60, "eta was {}", update.eta_seconds);
+    }
+
+    #[test]
+    fn pip_progress_keeps_moving_while_one_big_wheel_downloads() {
+        // torch is 123 MB; at the ~60 kB/s RUST-9Y measured that is 34 minutes
+        // in which pip prints no Collecting/Downloading line at all. The raw
+        // byte counter is the only thing keeping the wizard -- and the silence
+        // watchdog -- alive through it.
+        let mut counter = 84u32;
+        let first = pip_line_to_progress(
+            "Progress 47185920 of 128974848",
+            Duration::from_secs(1200),
+            &mut counter,
+            55,
+            80,
+            168,
+        )
+        .expect("a raw progress line is a progress line");
+        assert_eq!(first.message, "Downloading 45.0 / 123.0 MB...");
+        // The same wheel is still in flight, so the package count must not move.
+        assert_eq!(counter, 84);
+
+        let later = pip_line_to_progress(
+            "Progress 52428800 of 128974848",
+            Duration::from_secs(1800),
+            &mut counter,
+            55,
+            80,
+            168,
+        )
+        .expect("a raw progress line is a progress line");
+        assert!(
+            later.eta_seconds > first.eta_seconds,
+            "eta must grow while the same wheel drags on: {} -> {}",
+            first.eta_seconds,
+            later.eta_seconds
+        );
+    }
+
+    #[test]
+    fn pip_progress_ignores_prose_that_merely_starts_with_progress() {
+        let mut counter = 0u32;
+        assert!(pip_line_to_progress(
+            "Progress report written",
+            Duration::from_secs(10),
+            &mut counter,
+            55,
+            80,
+            168,
+        )
+        .is_none());
+        assert_eq!(counter, 0);
+    }
+
+    #[test]
+    fn stream_capture_keeps_the_tail_within_the_cap() {
+        // 4 lines/second for an hour would otherwise be held in memory and
+        // dumped into the app log by the first retry's CommandFailure Display.
+        let mut sink = String::new();
+        for i in 0..20_000 {
+            sink.push_str(&format!("Progress {i} of 128974848 \u{2713}\n"));
+            super::cap_capture(&mut sink);
+        }
+        assert!(sink.len() <= super::STREAM_CAPTURE_CAP);
+        assert!(sink.ends_with("Progress 19999 of 128974848 \u{2713}\n"));
+        // Cut on a line boundary, so a multi-byte char is never split.
+        assert!(sink.starts_with("Progress "));
+    }
+
+    #[test]
+    fn pip_output_capture_drops_raw_progress_lines() {
+        let mut capture = super::PipOutputCapture::new(3);
+        capture.push("Collecting torch==2.12.1");
+        for i in 0..50 {
+            capture.push(&format!("Progress {i} of 128974848"));
+        }
+        capture.push("ERROR: No matching distribution found for torch==2.12.1");
+        let out = capture.into_string();
+        assert!(out.contains("Collecting torch"), "{out}");
+        assert!(out.contains("ERROR: No matching"), "{out}");
+        assert!(!out.contains("Progress "), "{out}");
     }
 
     #[test]
