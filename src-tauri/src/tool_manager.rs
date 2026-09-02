@@ -2820,6 +2820,23 @@ impl ToolManager {
                     // never toggles thinking.type, so it cannot 400 a model that
                     // lacks effort support.
                     .env("HEADROOM_OUTPUT_SHAPER", "1")
+                    // The 0.37.0 wheel added a rollout registry that gates
+                    // proxy_output_shaper to the beta channel and defaults the
+                    // channel to stable, which silently disabled the shaper on
+                    // every install despite the request above (/stats showed
+                    // decision: blocked_by_channel). Declaring the beta ring is
+                    // the sanctioned lever: this app pins and qualifies the
+                    // exact wheel it ships through its own rc pipeline, which
+                    // is what the wheel's "beta" ring means. Verified on the
+                    // pinned wheel: flips exactly proxy_output_shaper to
+                    // enabled (decision: legacy_alias); every other feature
+                    // stays not_requested, and qualification_eligible stays
+                    // true (unlike HEADROOM_UNSAFE_ALLOW_UNSTABLE_FEATURES,
+                    // which marks the install ineligible). Wheel Bump Rules:
+                    // diff the FEATURES registry on every bump - a new feature
+                    // with default_enabled_in <= beta would auto-enable for all
+                    // users because of this declaration.
+                    .env("HEADROOM_ROLLOUT_CHANNEL", "beta")
                     // Pin the steering level explicitly. An explicit env is the
                     // manual-override tier in the shaper's level resolution, so it
                     // wins over the per-user learned level written to verbosity.json
