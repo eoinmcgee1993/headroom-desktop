@@ -1772,11 +1772,21 @@ pub(crate) fn is_blocked_runtime_dll_signal(text: &str) -> bool {
         "select",
         "unicodedata",
     ];
+    // Anchor on `dll load failed` and step over an optional `while `: CPython
+    // 3.8+ writes "while importing", but the copy of this chain that reaches us
+    // is not always CPython's own -- upstream re-wraps the traceback into
+    // `last_startup_error`, and RUST-5C's event carries both spellings across
+    // its two fields. The module name after it is what makes the match
+    // specific, so tolerating the shorter phrasing costs no precision.
+    const MARKER: &str = "dll load failed ";
     let lower = text.to_ascii_lowercase();
     let mut rest = lower.as_str();
-    while let Some(idx) = rest.find("dll load failed while importing ") {
-        let after = &rest[idx + "dll load failed while importing ".len()..];
+    while let Some(idx) = rest.find(MARKER) {
+        let after = &rest[idx + MARKER.len()..];
+        let after = after.strip_prefix("while ").unwrap_or(after);
         let module = after
+            .strip_prefix("importing ")
+            .unwrap_or("")
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .next()
             .unwrap_or("");
@@ -6367,9 +6377,21 @@ fn execute_headroom_learn_run(
                                 // back verbatim (see `learn_step_label`), and that
                                 // is the user's project content -- it must never
                                 // reach Sentry.
+                                // Pre-redacted, and under a `_redacted` key so
+                                // it can be allowlisted in the project's
+                                // Sentry `safeFields` without also un-scrubbing
+                                // the raw `stderr_tail` that already-shipped
+                                // builds keep sending. Same reasoning as
+                                // `proxy_log_tail`: one `sk-ant-…` anywhere in
+                                // the value and the scrubber replaces the whole
+                                // field with `[Filtered]`, which is how RUST-BC
+                                // arrived undiagnosable.
                                 scope.set_extra(
-                                    "stderr_tail",
-                                    crate::state::tail_lines(&stderr, 32).join("\n").into(),
+                                    "stderr_tail_redacted",
+                                    crate::tool_manager::redact_sensitive(
+                                        &crate::state::tail_lines(&stderr, 32).join("\n"),
+                                    )
+                                    .into(),
                                 );
                                 scope.set_fingerprint(Some(
                                     ["headroom_learn_llm_failure", signature.as_str()].as_slice(),
@@ -6476,7 +6498,16 @@ fn execute_headroom_learn_run(
                         .collect::<String>()
                         .as_str(),
                 );
-                let stderr_head: String = stderr.chars().take(2000).collect();
+                // Redacted before Sentry sees them: the agent CLI's stderr on an
+                // auth failure is exactly where a key can appear, and one
+                // `sk-ant-…` costs the WHOLE field to the scrubber (RUST-BC's
+                // stderr arrived `[Filtered]`, so the failure could not be
+                // diagnosed at all). `stdout_head` stays raw and stays scrubbed:
+                // it echoes the user's memory files, which we do not want
+                // readable in Sentry even when it survives.
+                let stderr_head = crate::tool_manager::redact_sensitive(
+                    &stderr.chars().take(2000).collect::<String>(),
+                );
                 let stdout_head: String = stdout.chars().take(2000).collect();
                 let cli_path_str = cli_path
                     .as_ref()
@@ -6511,8 +6542,11 @@ fn execute_headroom_learn_run(
                                     .map(|s| s.to_string().into())
                                     .unwrap_or(serde_json::Value::Null),
                             );
-                            scope.set_extra("output_tail", fail_tail.clone().into());
-                            scope.set_extra("stderr_head", stderr_head.into());
+                            scope.set_extra(
+                                "output_tail_redacted",
+                                crate::tool_manager::redact_sensitive(&fail_tail).into(),
+                            );
+                            scope.set_extra("stderr_head_redacted", stderr_head.into());
                             scope.set_extra("stdout_head", stdout_head.into());
                             scope.set_extra("cli_path", cli_path_str.into());
                             scope.set_extra("project_name", project_name.to_string().into());
@@ -10922,6 +10956,26 @@ Some unrelated content.
         // Any locale: the structural half needs no prose at all.
         assert!(is_blocked_runtime_dll_signal(
             "ImportError: DLL load failed while importing _ssl: 지정된 모듈을 찾을 수 없습니다."
+        ));
+
+        // RUST-5C's `last_startup_error` carries the same verdict without the
+        // `while`, in the copy upstream re-wraps into the error chain. Both
+        // spellings must reach the same verdict or the give-up escalates to
+        // Error for a block we already reported once.
+        let no_while = "ImportError: DLL load failed importing _sqlite3: \
+                        Una directiva de Control de aplicaciones bloqueó este archivo.";
+        assert!(is_blocked_runtime_dll_signal(no_while));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(no_while)),
+            Some("startup_endpoint_protection")
+        );
+        // Still module-scoped, so the looser anchor cannot pull in a
+        // third-party load failure or a bare "DLL load failed:".
+        assert!(!is_blocked_runtime_dll_signal(
+            "ImportError: DLL load failed importing onnxruntime_pybind11_state: not found."
+        ));
+        assert!(!is_blocked_runtime_dll_signal(
+            "ImportError: DLL load failed: The specified module could not be found."
         ));
     }
 

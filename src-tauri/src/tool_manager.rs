@@ -8156,7 +8156,7 @@ pub(crate) fn tail_log_file(path: &Path, max_lines: usize) -> String {
 /// `sk-ant-…` and replaces the entire `proxy_log_tail` field with `[Filtered]`,
 /// which is the single most diagnostic field in `proxy_unreachable_post_boot`.
 /// Pre-redact so the rest of the line survives the scrubber.
-fn redact_sensitive(line: &str) -> String {
+pub(crate) fn redact_sensitive(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let bytes = line.as_bytes();
     let mut i = 0;
