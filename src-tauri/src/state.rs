@@ -6459,10 +6459,27 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
         .filter(|value| *value > 0)
         .or(total_after_compression)
         .filter(|value| *value > 0);
-    // Ratio against new input: saved / (saved + uncached_forwarded). The
-    // proxy's own `tokens.savings_percent` is computed against the cache-
-    // polluted denominator, so it is only a last-resort fallback.
+    // `summary.compression` carries the process-cumulative counter. The
+    // `savings.by_layer` block reports the same layer but only over the recent
+    // request window, so it is a fallback for shape, not a preferred source.
+    let tool_schema_tokens_saved = value_at_path_u64(
+        &root,
+        &["summary", "compression", "tool_schema_tokens_saved"],
+    )
+    .or_else(|| {
+        value_at_path_u64(
+            &root,
+            &["savings", "by_layer", "tool_search", "tokens_saved"],
+        )
+    });
+    // Ratio against new input: compression-only saved / (saved + new input).
+    // `tokens.saved` is ALL-LAYERS -- it includes tool-schema deferral, which
+    // is disjoint from the checkpoint series and never part of new input
+    // (schemas ride the cached prefix) -- so subtract it; the wheel's own
+    // `new_input_savings_percent` pairs compression-only the same way. The
+    // proxy's `tokens.savings_percent` stays a last-resort fallback.
     let session_savings_pct = tokens
+        .map(|saved| saved.saturating_sub(tool_schema_tokens_saved.unwrap_or(0)))
         .and_then(|saved| {
             session_total_tokens_sent.and_then(|sent| {
                 let total_before = saved.saturating_add(sent);
@@ -6515,19 +6532,6 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
                 .find(|f| f.get("name").and_then(Value::as_str) == Some("proxy_output_shaper"))
         })
         .and_then(|f| f.get("enabled").and_then(Value::as_bool));
-    // `summary.compression` carries the process-cumulative counter. The
-    // `savings.by_layer` block reports the same layer but only over the recent
-    // request window, so it is a fallback for shape, not a preferred source.
-    let tool_schema_tokens_saved = value_at_path_u64(
-        &root,
-        &["summary", "compression", "tool_schema_tokens_saved"],
-    )
-    .or_else(|| {
-        value_at_path_u64(
-            &root,
-            &["savings", "by_layer", "tool_search", "tokens_saved"],
-        )
-    });
 
     let learner_progress = parse_learner_progress(&root);
 
@@ -7053,6 +7057,13 @@ where
         return Vec::new();
     }
 
+    // The session saved counter is all-layers while the checkpoint series is
+    // compression-only ("bare message figure", tool_search disjoint), so
+    // proportions over the raw session total dropped the tool-schema share of
+    // sent on the floor even at full history coverage.
+    let compression_total =
+        total_tokens.saturating_sub(stats.tool_schema_tokens_saved.unwrap_or(0));
+
     let mut buckets = BTreeMap::<String, DailySavingsBucket>::new();
     let Some(first_point) = history.first().copied() else {
         return Vec::new();
@@ -7121,16 +7132,20 @@ where
             bucket.total_tokens_sent = sent;
             bucket.new_input_tokens = sent;
         }
-    } else if total_tokens > 0 && total_tokens_sent > 0 {
+    } else if compression_total > 0 && total_tokens_sent > 0 {
         // Fallback: smear the session total across buckets in proportion to
         // savings. Every hour reads the session-wide ratio, but nothing is
         // dumped or under-counted while sampling coverage is still thin.
         let keys = buckets.keys().cloned().collect::<Vec<_>>();
         for key in keys.iter() {
             let bucket = buckets.get_mut(key).expect("bucket exists");
+            // Proportions over the compression-only session total: this
+            // preserves the unattributable-remainder design (history covering
+            // a fraction of the session attributes only that fraction of
+            // sent) without the tool-schema layer skewing the fraction.
             bucket.total_tokens_sent = ((bucket.estimated_tokens_saved as u128
                 * total_tokens_sent as u128)
-                / total_tokens as u128) as u64;
+                / compression_total as u128) as u64;
             // Same new-input scale (the session cumulative IS the new-input
             // series), just smeared: window sums stay exact, only the
             // intra-window attribution is approximate.
@@ -11090,7 +11105,9 @@ mod tests {
         // tokens.input -- re-sent cached prefix must not dilute the ratio.
         assert_eq!(parsed.session_total_tokens_sent, Some(1000));
         let pct = parsed.session_savings_pct.expect("pct derived");
-        assert!((pct - 1200.0 / 2200.0 * 100.0).abs() < 1e-9, "{pct}");
+        // Compression-only numerator: all-layers saved (1200) minus the
+        // tool-schema cumulative (777), over itself plus new input (1000).
+        assert!((pct - 423.0 / 1423.0 * 100.0).abs() < 1e-9, "{pct}");
 
         assert_eq!(parsed.savings_history.len(), 2);
         assert_eq!(parsed.savings_history[0].total_tokens_saved, 700);

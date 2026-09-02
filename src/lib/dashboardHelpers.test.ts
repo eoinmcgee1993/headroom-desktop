@@ -6,6 +6,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
+  compressibleInputSavingsRate,
   newInputSavingsRate,
   allTimeCacheHitPair,
   cacheHitPair,
@@ -545,6 +546,36 @@ describe("allTimeCacheHitPair", () => {
     expect(allTimeCacheHitPair({ ...breakdown, cacheReadTokens: 0 }, 4)).toBeNull();
     expect(allTimeCacheHitPair(null, 4)).toBeNull();
     expect(allTimeCacheHitPair(undefined, 4)).toBeNull();
+  });
+});
+
+describe("compressibleInputSavingsRate", () => {
+  const bucket = {
+    cacheReadTokens: 900,
+    cacheSavingsUsd: 9, // read discount $9 -> read cost $1
+    totalTokensSent: 1000,
+    estimatedTokensSaved: 25,
+    actualCostUsd: 3, // $1 reads + $2 billable
+    estimatedSavingsUsd: 0.5
+  };
+
+  it("prices reads via the discount and excludes them", () => {
+    // 0.5 / (0.5 + (3 - 9/9))
+    expect(compressibleInputSavingsRate([bucket])!.pct).toBeCloseTo(20);
+  });
+
+  it("skips buckets without the dollar counter", () => {
+    const uncovered = { ...bucket, cacheReadTokens: null, cacheSavingsUsd: null };
+    expect(compressibleInputSavingsRate([uncovered])).toBeNull();
+    expect(compressibleInputSavingsRate([bucket, uncovered])!.pct).toBeCloseTo(20);
+  });
+
+  it("stays sane when provider cache reads exceed our own input count", () => {
+    // Real 2026-08-14 data: 195.8M derived cache reads against 163.4M forwarded
+    // input tokens, because the two counters use different tokenizers. The old
+    // token-based form clamped the denominator to 0 and reported 100%.
+    const skewed = { ...bucket, cacheReadTokens: 1_200, totalTokensSent: 1_000 };
+    expect(compressibleInputSavingsRate([skewed])!.pct).toBeCloseTo(20);
   });
 });
 

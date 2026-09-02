@@ -155,6 +155,44 @@ export function allTimeCacheHitPair(
   ]);
 }
 
+/** Billable-dollar input-compression rate: the share of the COMPRESSIBLE
+ * input spend Headroom removed. Cache reads are excluded from the denominator
+ * (they bill at ~0.1x and Headroom deliberately never touches the cached
+ * prefix); output shaping is never part of this rate.
+ *
+ * Superseded by `newInputSavingsRate` as the headline basis, but kept as the
+ * FALLBACK for windows without sampled new-input coverage (pre-sampling
+ * buckets have archived cache coverage going back months, so this rate can
+ * always be computed for them). Priced in dollars because only the dollar
+ * figures are on one scale: `totalTokensSent` is our own tokenizer's count
+ * while `cacheReadTokens` is the provider's ("must never be differenced",
+ * proxy/outcome.py; see cacheHitPair). Read cost is recovered from the read
+ * discount (`cacheSavingsUsd / 9`) and subtracted from the bucket's actual
+ * input cost -- both from one pricing function, so the subtraction is sound.
+ *
+ * Only buckets with cache coverage count, so numerator and denominator always
+ * describe the same slice; null when the window has no coverage. */
+export function compressibleInputSavingsRate(
+  points: Array<{
+    cacheSavingsUsd?: number | null;
+    actualCostUsd: number;
+    estimatedSavingsUsd: number;
+  }>
+) {
+  let saved = 0;
+  // What survived compression and was still paid for at full input price.
+  let remaining = 0;
+  for (const point of points) {
+    if (point.cacheSavingsUsd == null) continue;
+    const readCostUsd = Math.max(0, point.cacheSavingsUsd) / 9;
+    saved += Math.max(0, point.estimatedSavingsUsd);
+    remaining += Math.max(0, point.actualCostUsd - readCostUsd);
+  }
+  const baseline = saved + remaining;
+  if (baseline <= 0) return null;
+  return { pct: Math.min(100, (saved / baseline) * 100), saved, remaining };
+}
+
 /** Canonical input-compression rate over a window of buckets, on the
  * NEW-INPUT basis: saved tokens vs the input that newly entered context
  * (provider-billed uncached + cache-write tokens, sampled locally from the

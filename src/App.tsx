@@ -115,6 +115,7 @@ import {
   buildHourlySavingsWindow,
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
+  compressibleInputSavingsRate,
   newInputSavingsRate,
   allTimeCacheHitPair,
   cacheHitPair,
@@ -965,8 +966,7 @@ function DailySavingsChart({
   resetSignal,
   chartMode,
   setChartMode,
-  outputReduction,
-  sessionNewInput
+  outputReduction
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
@@ -974,10 +974,6 @@ function DailySavingsChart({
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
-  /** Session-scope new-input rate; stands in for the windowed chip when the
-   * visible window has no sampled coverage (fresh boot or pre-upgrade
-   * buckets), labeled as such. */
-  sessionNewInput: { pct: number; savedTokens: number } | null;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
@@ -1013,6 +1009,14 @@ function DailySavingsChart({
   const windowNewInput = newInputSavingsRate(
     view === "month" ? monthlyWindow : hourlyWindow
   );
+  // Fallback for windows without sampled new-input coverage (fresh boot, or
+  // buckets from before per-bucket sampling): the previous billable-dollar
+  // rate, whose archived cache coverage goes back months -- the numbers this
+  // surface showed before the basis change.
+  const windowBillable =
+    windowNewInput === null
+      ? compressibleInputSavingsRate(view === "month" ? monthlyWindow : hourlyWindow)
+      : null;
   // Window-scoped output reduction from the locally-sampled series, falling
   // back to the all-time figure for any window without samples of its own.
   // The fallback labels itself all-time (see OutputReductionChip) so it can't
@@ -1146,7 +1150,7 @@ function DailySavingsChart({
               {view === "day" ? "saved today" : "saved this month"}
             </span>
             {windowNewInput !== null ||
-            sessionNewInput !== null ||
+            windowBillable !== null ||
             windowOutput !== null ||
             outputReduction ? (
               <span
@@ -1163,23 +1167,33 @@ function DailySavingsChart({
                     value={`${percent1(windowNewInput.pct)}%`}
                     rows={[
                       { dt: "Removed", dd: compactNumber(windowNewInput.savedTokens) },
-                      { dt: "New input", dd: compactNumber(windowNewInput.newInputTokens) }
+                      {
+                        dt: "Baseline",
+                        dd: compactNumber(
+                          windowNewInput.savedTokens + windowNewInput.newInputTokens
+                        )
+                      }
                     ]}
-                    note="Vs input that newly entered context (uncached + cache writes), sampled while the app runs. The cached prefix is excluded: Headroom never rewrites it."
+                    note="Baseline = new input that reached the provider (uncached + cache writes) plus the tokens Headroom removed. The re-sent cached prefix is excluded from both sides. Sampled while the app runs."
                   />
-                ) : sessionNewInput !== null ? (
-                  // No sampled coverage in the visible window yet (fresh boot,
-                  // fresh day, or buckets from before per-bucket sampling).
-                  // The session figure stands in and says so, mirroring the
-                  // output chip's labeled all-time fallback.
+                ) : windowBillable !== null ? (
+                  // No sampled new-input coverage in this window: show the
+                  // billable-dollar rate this surface reported before the
+                  // basis change, computable from archived cache coverage.
                   <WindowRateChip
                     dot="input"
-                    label={`Input −${Math.round(sessionNewInput.pct)}%`}
+                    label={`Input −${Math.round(windowBillable.pct)}%`}
                     title="Input compression"
-                    badge="session"
-                    value={`${percent1(sessionNewInput.pct)}%`}
-                    rows={[{ dt: "Removed", dd: compactNumber(sessionNewInput.savedTokens) }]}
-                    note="This session's figure standing in: the visible window has no sampled coverage yet. Same basis: new input only (uncached + cache writes)."
+                    badge="measured"
+                    value={`${Math.round(windowBillable.pct)}%`}
+                    rows={[
+                      { dt: "Removed", dd: currency(windowBillable.saved) },
+                      {
+                        dt: "Compressible input",
+                        dd: currency(windowBillable.saved + windowBillable.remaining)
+                      }
+                    ]}
+                    note="Billable-input basis (no new-input samples in this window yet). Excludes cache reads."
                   />
                 ) : null}
                 {windowOutput !== null ? (
@@ -6937,14 +6951,6 @@ export default function App() {
                 chartMode={chartMode}
                 setChartMode={setChartMode}
                 outputReduction={dashboard.outputReduction}
-                sessionNewInput={
-                  dashboard.sessionSavingsPct > 0 && dashboard.sessionEstimatedTokensSaved > 0
-                    ? {
-                        pct: dashboard.sessionSavingsPct,
-                        savedTokens: dashboard.sessionEstimatedTokensSaved
-                      }
-                    : null
-                }
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">
