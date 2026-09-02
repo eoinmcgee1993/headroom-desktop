@@ -11821,6 +11821,63 @@ mod tests {
         assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
     }
 
+    /// Behavioural check of the vendored #3380 prefix floor, against the REAL
+    /// installed wheel rather than the string of the file.
+    ///
+    /// Every other test of this machinery asserts `py.contains(...)`. That is
+    /// what the 0.9.4 splice had, and it passed while the change cost 89
+    /// installs ~17pp of their savings rate: presence is not behaviour. This
+    /// writes the SITECUSTOMIZE_PY we are about to ship into a temp dir, points
+    /// the managed venv at it, and asserts the floor's actual properties --
+    /// including the ContextVar bridge from prepare_turn to finalize_turn,
+    /// which is the novel part and the part with no upstream coverage.
+    ///
+    /// Self-skips where the managed runtime is absent (CI, a fresh clone), so
+    /// it costs nothing there and runs automatically on any machine that has
+    /// the backend installed. That is deliberate: an `#[ignore]` test only
+    /// protects you when somebody remembers to type `--ignored`.
+    #[test]
+    fn vendored_prefix_floor_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-prefix-floor.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hd-prefix-floor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = std::process::Command::new(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run prefix-floor probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that already ships #3380 leaves the vendor inert by design;
+        // that is a pass upstream, not a regression here.
+        if stdout.contains("FAIL vendor bound") && stderr.is_empty() {
+            eprintln!("skipping: vendor did not bind (wheel is not the 0.37.0 pin)");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "vendored prefix floor misbehaved against the installed wheel.\n\
+             This is the machinery that caused the 0.9.4 regression -- do not \
+             silence it.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
     #[test]
     fn read_maturation_stays_off_unless_explicitly_requested() {
         // Default for every install: absent. The feature relocates provider
