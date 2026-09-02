@@ -5524,6 +5524,26 @@ fn lifetime_token_milestone_kind(milestone_tokens_saved: u64) -> &'static str {
 /// How many recent days of savings travel with the milestone/heartbeat post.
 const SAVINGS_REPORT_DAYS: usize = 30;
 
+/// The output-reduction fields the savings report should carry. The desktop
+/// requests the shaper, but the wheel's rollout gate can block it by channel
+/// (all stable installs on the 0.37.0 wheel). A blocked shaper produces no
+/// live reduction, so the ledger-recomputed figure would report an "estimated"
+/// percentage for a feature that never ran; label it inactive and withhold the
+/// percent instead. Unknown state (older wheels without the rollout block)
+/// reports as before.
+fn reported_output_reduction(
+    reduction: Option<&crate::models::OutputReduction>,
+    shaper_active: Option<bool>,
+) -> (Option<f64>, Option<String>) {
+    if shaper_active == Some(false) {
+        return (None, Some("inactive".to_string()));
+    }
+    (
+        reduction.map(|o| o.reduction_percent),
+        reduction.map(|o| o.method.clone()),
+    )
+}
+
 /// Projects the dashboard's real savings figures into the payload
 /// headroom-web stores for the admin profile. Must be called on the dashboard
 /// BEFORE `maybe_inject_fake_daily_savings`, or demo data reaches the server.
@@ -5536,14 +5556,16 @@ fn savings_report(dashboard: &DashboardState) -> pricing::SavingsReport {
         cache_read_tokens: breakdown.map(|b| b.cache_read_tokens).unwrap_or(0),
         total_input_cost_usd: breakdown.map(|b| b.total_input_cost_usd).unwrap_or(0.0),
         cache_savings_usd: breakdown.map(|b| b.cache_savings_usd).unwrap_or(0.0),
-        output_reduction_percent: dashboard
-            .output_reduction
-            .as_ref()
-            .map(|o| o.reduction_percent),
-        output_reduction_method: dashboard
-            .output_reduction
-            .as_ref()
-            .map(|o| o.method.clone()),
+        output_reduction_percent: reported_output_reduction(
+            dashboard.output_reduction.as_ref(),
+            dashboard.output_shaper_active,
+        )
+        .0,
+        output_reduction_method: reported_output_reduction(
+            dashboard.output_reduction.as_ref(),
+            dashboard.output_shaper_active,
+        )
+        .1,
         reread_tokens: dashboard.reread_tokens,
         reread_compressed_tokens: dashboard.reread_compressed_tokens,
         ccr_retrievals: dashboard.ccr_retrievals,
@@ -11240,5 +11262,45 @@ Some unrelated content.
             None,
             "a reload must not replay a spent code"
         );
+    }
+}
+
+#[cfg(test)]
+mod output_reduction_report_tests {
+    use super::reported_output_reduction;
+    use crate::models::OutputReduction;
+
+    fn reduction() -> OutputReduction {
+        OutputReduction {
+            method: "estimated".to_string(),
+            reduction_percent: 28.0,
+            ci_low_percent: 20.0,
+            ci_high_percent: 36.0,
+            requests: 19_644,
+        }
+    }
+
+    #[test]
+    fn blocked_shaper_reports_inactive_without_a_percent() {
+        let (pct, method) = reported_output_reduction(Some(&reduction()), Some(false));
+        assert_eq!(pct, None);
+        assert_eq!(method.as_deref(), Some("inactive"));
+    }
+
+    #[test]
+    fn active_shaper_reports_the_reduction_unchanged() {
+        let (pct, method) = reported_output_reduction(Some(&reduction()), Some(true));
+        assert_eq!(pct, Some(28.0));
+        assert_eq!(method.as_deref(), Some("estimated"));
+    }
+
+    #[test]
+    fn unknown_rollout_state_keeps_the_old_behavior() {
+        let (pct, method) = reported_output_reduction(Some(&reduction()), None);
+        assert_eq!(pct, Some(28.0));
+        assert_eq!(method.as_deref(), Some("estimated"));
+        let (none_pct, none_method) = reported_output_reduction(None, None);
+        assert_eq!(none_pct, None);
+        assert_eq!(none_method, None);
     }
 }
