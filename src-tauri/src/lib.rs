@@ -4537,6 +4537,21 @@ struct UpstreamOverrideView {
     mode: &'static str,
     base_url: String,
     has_token: bool,
+    provider: String,
+    model: String,
+    context_window: String,
+    /// The presets the dropdown offers. Shipped with the view so the labels and
+    /// the values that get written can never drift apart.
+    providers: Vec<ProviderPresetView>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderPresetView {
+    id: &'static str,
+    label: &'static str,
+    base_url: &'static str,
+    model: &'static str,
 }
 
 impl From<crate::state::UpstreamOverride> for UpstreamOverrideView {
@@ -4550,6 +4565,18 @@ impl From<crate::state::UpstreamOverride> for UpstreamOverrideView {
             },
             base_url: value.base_url,
             has_token: value.has_token,
+            provider: value.provider,
+            model: value.model,
+            context_window: value.context_window,
+            providers: client_adapters::PROVIDER_PRESETS
+                .iter()
+                .map(|preset| ProviderPresetView {
+                    id: preset.id,
+                    label: preset.label,
+                    base_url: preset.base_url,
+                    model: preset.model,
+                })
+                .collect(),
         }
     }
 }
@@ -4565,12 +4592,21 @@ async fn get_upstream_override(app: AppHandle) -> UpstreamOverrideView {
 /// `token`: `None` leaves the stored one alone (the field renders as "set" and
 /// is only sent when the user types a new one), `Some("")` clears it, anything
 /// else replaces it.
+///
+/// `provider` is a preset id from `client_adapters::PROVIDER_PRESETS`, and when
+/// set it supplies the URL, the model ids and the context window -- the user
+/// only brings a token. Empty means the endpoint was entered by hand, in which
+/// case `model` and `context_window` are optional: empty means "do not write
+/// that key", which leaves a provider that maps Claude model ids itself alone.
 #[tauri::command]
 async fn save_upstream_override(
     app: AppHandle,
     mode: String,
     base_url: String,
     token: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    context_window: Option<String>,
 ) -> Result<UpstreamOverrideView, String> {
     use crate::state::{UpstreamOverride, UpstreamOverrideMode};
 
@@ -4581,12 +4617,24 @@ async fn save_upstream_override(
         other => return Err(format!("unknown upstream mode: {other}")),
     };
 
+    let provider = provider.unwrap_or_default().trim().to_string();
+    let preset = match provider.as_str() {
+        "" => None,
+        id => Some(
+            client_adapters::provider_preset(id)
+                .ok_or_else(|| format!("unknown provider: {id}"))?,
+        ),
+    };
+
     // Off keeps neither URL nor token: a cleared override must not leave a
     // provider credential behind in the client config for the next launch.
     let base_url = if mode == UpstreamOverrideMode::Off {
         String::new()
     } else {
-        crate::state::normalize_upstream_base_url(&base_url)?
+        match preset {
+            Some(preset) => preset.base_url.to_string(),
+            None => crate::state::normalize_upstream_base_url(&base_url)?,
+        }
     };
 
     let has_token = if mode == UpstreamOverrideMode::Off {
@@ -4619,10 +4667,44 @@ async fn save_upstream_override(
         }
     };
 
+    // Same rule as base_url and the token: Off keeps nothing, so a stale model
+    // id cannot outlive the endpoint that served it.
+    let configured = mode != UpstreamOverrideMode::Off;
+    let (model, small_model, context_window) = match (configured, preset) {
+        (false, _) => (String::new(), String::new(), String::new()),
+        (true, Some(preset)) => (
+            preset.model.to_string(),
+            preset.small_model.to_string(),
+            preset.context_window.to_string(),
+        ),
+        (true, None) => {
+            // A hand-entered endpoint gets the one model id the user gave us in
+            // every slot, cheap tier included: we have no way to know which
+            // smaller model it serves.
+            let model = model.unwrap_or_default().trim().to_string();
+            let window = context_window.unwrap_or_default().trim().to_string();
+            if !window.is_empty() && !window.chars().all(|c| c.is_ascii_digit()) {
+                return Err("The context window must be a whole number of tokens.".into());
+            }
+            (model.clone(), model, window)
+        }
+    };
+    client_adapters::apply_upstream_provider_env(configured.then_some(
+        client_adapters::ProviderClientEnv {
+            model: &model,
+            small_model: &small_model,
+            context_window: &context_window,
+        },
+    ))
+    .map_err(|err| err.to_string())?;
+
     let next = UpstreamOverride {
         mode,
         base_url,
         has_token,
+        provider: if configured { provider } else { String::new() },
+        model,
+        context_window,
     };
     let state: tauri::State<'_, AppState> = app.state();
     state.set_upstream_override(next.clone());
@@ -4650,6 +4732,9 @@ async fn save_upstream_override(
             // a token are set.
             "has_base_url": !next.base_url.is_empty(),
             "has_token": next.has_token,
+            // Which preset, or "custom" -- enough to see whether the dropdown
+            // covers what people actually run without logging endpoints.
+            "provider": if next.provider.is_empty() { "custom" } else { next.provider.as_str() },
         })),
     );
     Ok(next.into())

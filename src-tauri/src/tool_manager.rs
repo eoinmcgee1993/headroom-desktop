@@ -13934,6 +13934,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             mode: UpstreamOverrideMode::Fallback,
             base_url: "https://api.z.ai/api/anthropic".into(),
             has_token: true,
+            ..Default::default()
         });
         assert_eq!(fallback.target_api_url, "https://api.z.ai/api/anthropic");
         // Fallback boots at the endpoint but lets a cc-switch capture win.
@@ -13944,6 +13945,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             mode: UpstreamOverrideMode::Override,
             base_url: "https://api.z.ai/api/anthropic".into(),
             has_token: true,
+            ..Default::default()
         });
         assert_eq!(overridden.pin_upstream, "1");
         assert_eq!(overridden.lossless, "1");
@@ -13954,6 +13956,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             mode: UpstreamOverrideMode::Override,
             base_url: String::new(),
             has_token: false,
+            ..Default::default()
         });
         assert_eq!(empty.target_api_url, "");
         assert_eq!(empty.pin_upstream, "0");

@@ -10,11 +10,38 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args)
 }));
 
-const off: UpstreamOverrideView = { mode: "off", baseUrl: "", hasToken: false };
+const providers = [
+  {
+    id: "glm",
+    label: "GLM (Z.ai)",
+    baseUrl: "https://api.z.ai/api/anthropic",
+    model: "glm-5.3[1m]"
+  },
+  {
+    id: "kimi",
+    label: "Kimi (Moonshot)",
+    baseUrl: "https://api.moonshot.ai/anthropic",
+    model: "kimi-k3[1m]"
+  }
+];
+
+const off: UpstreamOverrideView = {
+  mode: "off",
+  baseUrl: "",
+  hasToken: false,
+  provider: "",
+  model: "",
+  contextWindow: "",
+  providers
+};
 const configured: UpstreamOverrideView = {
   mode: "override",
   baseUrl: "https://api.z.ai/api/anthropic",
-  hasToken: true
+  hasToken: true,
+  provider: "glm",
+  model: "glm-5.3[1m]",
+  contextWindow: "1000000",
+  providers
 };
 
 function respond(current: UpstreamOverrideView, saved?: UpstreamOverrideView) {
@@ -30,24 +57,41 @@ describe("UpstreamPanel", () => {
     invokeMock.mockReset();
   });
 
-  it("sends what the user typed, and restarts onto it", async () => {
-    respond(off, { ...configured, hasToken: true });
+  /// The whole point of the dropdown: a preset needs a token and nothing else,
+  /// and the URL and model ids come from the backend that writes them.
+  it("sends the picked preset and a token, and restarts onto it", async () => {
+    respond(off, configured);
     const user = userEvent.setup();
     render(<UpstreamPanel />);
 
-    await screen.findByLabelText("Provider base URL");
-    await user.type(screen.getByLabelText("Provider base URL"), "https://api.z.ai/api/anthropic");
+    await screen.findByLabelText("Provider");
+    await user.selectOptions(screen.getByLabelText("Provider"), "glm");
     await user.type(screen.getByLabelText("Provider auth token"), "secret-token");
     await user.click(screen.getByRole("button", { name: "Save and restart" }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
         mode: "override",
-        baseUrl: "https://api.z.ai/api/anthropic",
-        token: "secret-token"
+        provider: "glm",
+        baseUrl: "",
+        token: "secret-token",
+        model: "",
+        contextWindow: ""
       });
     });
     expect(await screen.findByText(/restarted on this provider/)).toBeInTheDocument();
+  });
+
+  /// A preset asks for a token and nothing else -- the fields it fills in for
+  /// the user must not be on screen.
+  it("hides the URL and model fields behind a preset", async () => {
+    respond(configured);
+    render(<UpstreamPanel />);
+
+    await screen.findByLabelText("Provider auth token");
+    expect(screen.queryByLabelText("Provider base URL")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Provider model")).not.toBeInTheDocument();
+    expect(screen.getByText(/glm-5.3\[1m\]/)).toBeInTheDocument();
   });
 
   /// The token field starts blank even when one is stored, so an untouched
@@ -68,8 +112,11 @@ describe("UpstreamPanel", () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
         mode: "override",
+        provider: "glm",
         baseUrl: "https://api.z.ai/api/anthropic",
-        token: null
+        token: null,
+        model: "glm-5.3[1m]",
+        contextWindow: "1000000"
       });
     });
   });
@@ -84,10 +131,35 @@ describe("UpstreamPanel", () => {
     await user.click(screen.getByRole("button", { name: "Save and restart" }));
 
     await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith(
+        "save_upstream_override",
+        expect.objectContaining({ provider: "glm", token: "" })
+      );
+    });
+  });
+
+  /// An endpoint the presets do not cover still has to be reachable, with its
+  /// own model id -- otherwise a stale preset would be a dead end.
+  it("takes a hand-entered endpoint under Other", async () => {
+    respond(off, { ...configured, provider: "", model: "custom-model" });
+    const user = userEvent.setup();
+    render(<UpstreamPanel />);
+
+    await screen.findByLabelText("Provider");
+    await user.selectOptions(screen.getByLabelText("Provider"), "custom");
+    await user.type(screen.getByLabelText("Provider base URL"), "https://api.example.com/anthropic");
+    await user.type(screen.getByLabelText("Provider model"), "custom-model");
+    await user.type(screen.getByLabelText("Provider context window"), "200000");
+    await user.click(screen.getByRole("button", { name: "Save and restart" }));
+
+    await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
         mode: "override",
-        baseUrl: "https://api.z.ai/api/anthropic",
-        token: ""
+        provider: "",
+        baseUrl: "https://api.example.com/anthropic",
+        token: null,
+        model: "custom-model",
+        contextWindow: "200000"
       });
     });
   });
@@ -100,7 +172,8 @@ describe("UpstreamPanel", () => {
     const user = userEvent.setup();
     render(<UpstreamPanel />);
 
-    await screen.findByLabelText("Provider base URL");
+    await screen.findByLabelText("Provider");
+    await user.selectOptions(screen.getByLabelText("Provider"), "custom");
     await user.type(screen.getByLabelText("Provider base URL"), "api.z.ai");
     await user.click(screen.getByRole("button", { name: "Save and restart" }));
 
@@ -108,23 +181,22 @@ describe("UpstreamPanel", () => {
     expect(screen.queryByText(/restarted/)).not.toBeInTheDocument();
   });
 
-  /// Clearing the URL is the only way to turn the provider back off, so it has
-  /// to reach the backend as "off" -- that is what drops the stored token too.
-  it("turns the provider off when the URL is emptied", async () => {
+  /// Picking Anthropic is the only way back off, so it has to reach the backend
+  /// as "off" -- that is what drops the stored token and model ids too.
+  it("turns the provider off when Anthropic is picked", async () => {
     respond(configured, off);
     const user = userEvent.setup();
     render(<UpstreamPanel />);
 
-    await screen.findByDisplayValue("https://api.z.ai/api/anthropic");
-    await user.clear(screen.getByLabelText("Provider base URL"));
+    await screen.findByLabelText("Provider");
+    await user.selectOptions(screen.getByLabelText("Provider"), "");
     await user.click(screen.getByRole("button", { name: "Save and restart" }));
 
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("save_upstream_override", {
-        mode: "off",
-        baseUrl: "",
-        token: null
-      });
+      expect(invokeMock).toHaveBeenCalledWith(
+        "save_upstream_override",
+        expect.objectContaining({ mode: "off", provider: "" })
+      );
     });
     expect(await screen.findByText(/restarted on Anthropic/)).toBeInTheDocument();
   });
