@@ -10652,9 +10652,20 @@ fn pip_line_to_progress(
     const MAX_ETA_SECS: u64 = 24 * 3600;
     let elapsed_secs = elapsed.as_secs();
     let remaining = if resolved {
-        // Unpack and install of what is already on disk. Short and roughly
-        // machine-independent next to the download it follows.
-        15
+        // Unpack and install of what is already on disk. Not machine-
+        // independent at all: Windows Defender scans every extracted file, so
+        // the ~424 MB payload takes minutes there (a full pip step measured
+        // 6m35s on a healthy Win11 box, most of it this phase) while an
+        // AV-free SSD finishes in well under a minute. The old flat 15 here
+        // put the wizard on "finishing up" for the whole unpack and read as a
+        // hang.
+        // ponytail: fixed per-platform seed, derive from payload size if the
+        // lock ever changes materially.
+        if cfg!(windows) {
+            240
+        } else {
+            60
+        }
     } else if elapsed_secs >= MIN_SAMPLE_SECS && fraction >= MIN_SAMPLE_FRACTION {
         let projected_total = elapsed.as_secs_f64() / fraction;
         (projected_total - elapsed.as_secs_f64()).clamp(5.0, MAX_ETA_SECS as f64) as u64
@@ -11044,6 +11055,27 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
 /// the flag without raising this timeout.
 const PIP_OUTPUT_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Silence window once pip has printed "Installing collected packages". From
+/// that line until "Successfully installed" pip emits nothing at all, and the
+/// unpack of the ~424 MB dependency payload under Windows Defender is minutes
+/// of legitimate silence -- a box only slightly slower than the 6m35s one
+/// measured 2026-09-03 would have had a healthy install killed mid-unpack by
+/// the default window above.
+const PIP_UNPACK_SILENCE_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// Widen `limit` for the rest of the run once `line` marks the start of pip's
+/// silent unpack phase. `None` (wait forever) stays `None`.
+fn widen_silence_for_unpack(limit: Option<Duration>, line: &str) -> Option<Duration> {
+    if line
+        .trim_start()
+        .starts_with("Installing collected packages")
+    {
+        limit.map(|l| l.max(PIP_UNPACK_SILENCE_TIMEOUT))
+    } else {
+        limit
+    }
+}
+
 fn run_pip_install_with_retries_streaming<F>(
     python: &Path,
     args: &[&str],
@@ -11210,10 +11242,14 @@ where
     // old wait-forever behavior for callers whose children are legitimately
     // quiet for long stretches.
     let mut last_output = Instant::now();
+    // Every caller of this function runs pip, so the unpack-phase check lives
+    // here rather than behind a caller knob.
+    let mut silence_limit = silence_timeout;
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(streamed) => {
                 last_output = Instant::now();
+                silence_limit = widen_silence_for_unpack(silence_limit, &streamed.line);
                 on_line(&streamed.line);
                 let sink = if streamed.is_stderr {
                     &mut stderr_buf
@@ -11227,7 +11263,7 @@ where
             // Pipes closed: the child is exiting; fall through to wait().
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let Some(limit) = silence_timeout else {
+                let Some(limit) = silence_limit else {
                     continue;
                 };
                 if last_output.elapsed() >= limit {
@@ -11537,11 +11573,12 @@ mod tests {
         requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
         run_command, sanitize_log_variant, savings_profile_for_runtime, settle_unowned_port,
         sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, wheel_download_failure_category, CommandFailure, HeadroomRelease,
-        ManagedRuntime, PipOutputCapture, PortState, ToolManager, UpgradeOutcome,
-        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
-        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
-        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
+        wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS,
+        PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -12615,8 +12652,35 @@ mod tests {
         .expect("Installing is a progress line");
         assert_eq!(update.percent, 79);
         // No more downloading, so the download rate must not be extrapolated
-        // into a multi-hour estimate for an unpack.
-        assert!(update.eta_seconds <= 60, "eta was {}", update.eta_seconds);
+        // into a multi-hour estimate for an unpack. The seed is the fixed
+        // per-platform unpack budget, never elapsed-derived.
+        let expected = if cfg!(windows) { 240 } else { 60 };
+        assert_eq!(update.eta_seconds, expected);
+    }
+
+    #[test]
+    fn unpack_phase_widens_the_silence_window_and_only_then() {
+        let base = Some(Duration::from_secs(600));
+        assert_eq!(
+            widen_silence_for_unpack(base, "Installing collected packages: absl-py, torch"),
+            Some(PIP_UNPACK_SILENCE_TIMEOUT)
+        );
+        // Anything else leaves the window alone.
+        assert_eq!(
+            widen_silence_for_unpack(base, "Collecting torch==2.12.1"),
+            base
+        );
+        // A caller that opted out of the watchdog stays opted out.
+        assert_eq!(
+            widen_silence_for_unpack(None, "Installing collected packages: absl-py"),
+            None
+        );
+        // Never narrow a window that is already wider.
+        let wide = Some(Duration::from_secs(3600));
+        assert_eq!(
+            widen_silence_for_unpack(wide, "Installing collected packages: absl-py"),
+            wide
+        );
     }
 
     #[test]

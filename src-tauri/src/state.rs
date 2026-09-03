@@ -3048,6 +3048,16 @@ impl AppState {
 
     pub fn update_bootstrap_step(&self, step: BootstrapStepUpdate) {
         let mut progress = self.bootstrap_progress.lock();
+        // The success-path install otherwise writes no timeline to the app log
+        // at all (pip lines go only to the failure-time capture, updates only
+        // to the frontend), which left a 6m35s dependency step forensically
+        // blank. Dedup against the previous update; the raw download counter
+        // rewrites its message ~4x/s and is skipped.
+        if (progress.current_step != step.step || progress.message != step.message)
+            && !step.message.starts_with("Downloading ")
+        {
+            log::info!("bootstrap step: {} - {}", step.step, step.message);
+        }
         *progress = apply_bootstrap_step(&progress, step);
     }
 
