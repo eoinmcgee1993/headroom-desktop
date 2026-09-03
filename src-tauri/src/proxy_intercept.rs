@@ -1333,9 +1333,14 @@ async fn handle(
         let downstream = async {
             // Local proxy paths (/stats, /readyz probes) are our own traffic;
             // a 404 there is the squatter case (RUST-87), not a client error.
+            // /api/hello is Claude Code's connectivity probe: the Python
+            // backend has no route for it and 404s, Claude Code accepts any
+            // HTTP status as proof of reachability, so the error is expected
+            // noise (RUST-BS). Not in is_local_proxy_path: bypass mode must
+            // keep forwarding it upstream (where it 200s), not answer 503.
             let error_path = parsed_head
                 .as_ref()
-                .filter(|head| !is_local_proxy_path(&head.path))
+                .filter(|head| !is_local_proxy_path(&head.path) && head.path != "/api/hello")
                 .map(|head| head.path.clone());
             let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path);
             let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
