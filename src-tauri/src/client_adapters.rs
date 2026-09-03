@@ -2662,8 +2662,8 @@ fn windows_bash_command() -> String {
 }
 
 /// The command Claude Code runs for a Headroom PreToolUse hook. The hooks are
-/// bash scripts; on Windows they are launched through PowerShell, which needs
-/// the call operator in front of a quoted interpreter path (see
+/// bash scripts; Claude Code launches them through bash on Windows too, so the
+/// interpreter and script are quoted but carry no call operator (see
 /// [`join_guard_command`]).
 fn hook_shell_command(hook_path: &Path) -> Result<String> {
     if cfg!(target_os = "windows") {
@@ -2671,6 +2671,7 @@ fn hook_shell_command(hook_path: &Path) -> Result<String> {
             &windows_bash_command(),
             &hook_path.to_string_lossy(),
             true,
+            false,
         ));
     }
     hook_path
@@ -4535,34 +4536,43 @@ fn guard_python_command() -> String {
 }
 
 /// Join the guard interpreter and its script into a command string the host
-/// shell can actually run. Claude Code and Codex launch hooks through
-/// PowerShell on Windows, where a command that *starts* with a quoted path
-/// parses as a string literal rather than a command ("At line:1 char:81" --
-/// the offset lands on the unquoted script path), so the call operator is
-/// required and the script path needs quoting too because profile directories
+/// shell can actually run. The shell is the client's choice, not ours, and the
+/// two clients no longer agree on Windows:
+///
+/// * Codex runs hook commands through PowerShell (its shell probe list ends
+///   `pwsh`/`powershell`, prefixed with `$ErrorActionPreference = 'Stop'`).
+///   There a command that *starts* with a quoted path parses as a string
+///   literal rather than a command ("At line:1 char:81" -- the offset lands on
+///   the unquoted script path), so the call operator is required.
+/// * Claude Code runs them through bash (observed on v2.1.259: `/usr/bin/bash:
+///   -c: line 1: syntax error near unexpected token`), where a leading `&` is
+///   that syntax error. It gets the same string minus the call operator.
+///
+/// Either way the script path needs quoting, because profile directories
 /// contain spaces. Deliberately not `shell_double_quote`: that escapes
-/// backslashes POSIX-style and would mangle every Windows path. PowerShell
-/// escapes with a backtick, and both `"` and backtick are invalid in Windows
-/// filenames, so bare double quotes are already sufficient.
-fn guard_command(script_path: &Path) -> String {
+/// backslashes POSIX-style and would mangle every Windows path. Both shells
+/// leave backslashes alone inside double quotes, and `"` and backtick are
+/// invalid in Windows filenames, so bare double quotes are sufficient for both.
+fn guard_command(script_path: &Path, powershell: bool) -> String {
     join_guard_command(
         &guard_python_command(),
         &script_path.to_string_lossy(),
         cfg!(target_os = "windows"),
+        powershell,
     )
 }
 
-/// Pure so the Windows branch is exercised by tests on every platform.
-fn join_guard_command(python: &str, script: &str, windows: bool) -> String {
-    if windows {
-        format!("& {python} \"{script}\"")
-    } else {
-        format!("{python} {script}")
+/// Pure so the Windows branches are exercised by tests on every platform.
+fn join_guard_command(python: &str, script: &str, windows: bool, powershell: bool) -> String {
+    match (windows, powershell) {
+        (true, true) => format!("& {python} \"{script}\""),
+        (true, false) => format!("{python} \"{script}\""),
+        (false, _) => format!("{python} {script}"),
     }
 }
 
 fn codex_guard_command() -> String {
-    guard_command(&codex_guard_hook_path())
+    guard_command(&codex_guard_hook_path(), true)
 }
 
 /// Informational guard that Codex runs at session start: it checks that
@@ -4962,7 +4972,7 @@ fn claude_guard_hook_path() -> PathBuf {
 }
 
 fn claude_guard_command() -> String {
-    guard_command(&claude_guard_hook_path())
+    guard_command(&claude_guard_hook_path(), false)
 }
 
 /// Loud-fail guard that Claude Code runs at session start (SessionStart only:
@@ -5141,6 +5151,7 @@ fn ensure_claude_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
         CLAUDE_GUARD_STATUS_MESSAGE,
         &[("SessionStart", Some("startup|resume|clear|compact"))],
     )?;
+    report_unparseable_guard_command(&claude_guard_command());
     if script_changed {
         changed.insert(0, script_path.display().to_string());
     }
@@ -5148,6 +5159,44 @@ fn ensure_claude_guard_hook() -> Result<(Vec<String>, Vec<String>)> {
         backups.insert(0, backup.display().to_string());
     }
     Ok((changed, backups))
+}
+
+/// Which shell a client feeds hook commands to is the client's choice and it
+/// changes without notice: the PowerShell call operator Codex still needs became
+/// a bash syntax error in Claude Code v2.1.259, and every Windows install
+/// errored at session start for weeks with the only evidence a screenshot.
+/// `bash -n` parses without executing, so this is a free canary that turns the
+/// next such switch into a Sentry warning. Windows only, once per process: on
+/// macOS and Linux the command is a bare interpreter and path that always
+/// parses. The command string itself is not logged -- it carries the user's
+/// profile path -- only the shape that decides it.
+fn report_unparseable_guard_command(command: &str) {
+    use std::sync::Once;
+
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+    static CHECKED: Once = Once::new();
+    CHECKED.call_once(|| {
+        let bash = windows_bash_command();
+        let status = crate::proc::command(bash.trim_matches('"'))
+            .arg("-n")
+            .arg("-c")
+            .arg(command)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Ok(status) = status {
+            if !status.success() {
+                log::warn!(
+                    "claude guard command does not parse under bash (exit {:?}, call_operator={}); \
+                     SessionStart hooks will fail until the command form is fixed",
+                    status.code(),
+                    command.starts_with('&')
+                );
+            }
+        }
+    });
 }
 
 fn claude_guard_registered() -> Result<bool> {
@@ -9823,9 +9872,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         }
     }
 
-    /// Regression: Claude Code runs SessionStart hooks through PowerShell on
-    /// Windows. A command that starts with a quoted interpreter path parses as
-    /// a string literal, not a command, so the guard died with
+    /// Regression: Codex runs SessionStart hooks through PowerShell on Windows.
+    /// A command that starts with a quoted interpreter path parses as a string
+    /// literal, not a command, so the guard died with
     /// "SessionStart:startup hook error / Failed with non-blocking status code:
     /// At line:1 char:81" -- char 81 being the first character of the unquoted
     /// script path that followed the 79-char quoted python path plus a space.
@@ -9836,6 +9885,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let cmd = super::join_guard_command(
             "\"C:\\Users\\garm\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe\"",
             "C:\\Users\\garm space\\.claude\\hooks\\headroom-claude-guard.py",
+            true,
             true,
         );
         assert!(
@@ -9856,8 +9906,41 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     fn unix_guard_command_is_unquoted() {
-        let cmd = super::join_guard_command("/usr/bin/python3", "/home/g/.claude/guard.py", false);
+        let cmd =
+            super::join_guard_command("/usr/bin/python3", "/home/g/.claude/guard.py", false, false);
         assert_eq!(cmd, "/usr/bin/python3 /home/g/.claude/guard.py");
+    }
+
+    /// Regression: Claude Code moved to bash for hook commands on Windows
+    /// (v2.1.259), where the PowerShell call operator above is a syntax error --
+    /// "/usr/bin/bash: -c: line 1: syntax error near unexpected token" at every
+    /// session start, with the guard never running. Its command is the same
+    /// quoted pair without the operator, which bash executes and PowerShell no
+    /// longer has to parse.
+    #[test]
+    fn windows_claude_guard_command_is_bash_callable() {
+        let cmd = super::join_guard_command(
+            "\"C:\\Users\\garm\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe\"",
+            "C:\\Users\\garm space\\.claude\\hooks\\headroom-claude-guard.py",
+            true,
+            false,
+        );
+        assert!(
+            !cmd.starts_with('&'),
+            "bash reads a leading & as a syntax error, got: {cmd}"
+        );
+        assert!(
+            cmd.starts_with("\"C:"),
+            "the interpreter path must stay quoted, got: {cmd}"
+        );
+        assert!(
+            cmd.ends_with("headroom-claude-guard.py\""),
+            "script path must be quoted so spaces survive, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("\\\\"),
+            "path must not be POSIX-escaped: {cmd}"
+        );
     }
 
     #[cfg(target_os = "windows")]

@@ -226,7 +226,7 @@ export function UpstreamPanel() {
               onClick={() => void save()}
               type="button"
             >
-              {busy ? "Saving…" : "Save and restart"}
+              {busy ? "Restarting Headroom…" : "Save and restart"}
             </button>
             {hasToken && configured ? (
               <button
