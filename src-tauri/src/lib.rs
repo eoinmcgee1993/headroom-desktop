@@ -6335,6 +6335,8 @@ fn learn_failure_is_agent_auth(text: &str) -> bool {
         "authentication_error",
         "invalid api key",
         "oauth token has expired",
+        "oauth session expired",
+        "failed to authenticate",
         "credentials have expired",
         "session has expired",
         "please run `codex login`",
@@ -6398,6 +6400,18 @@ fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
         "{cli} hit your plan's usage limit, so headroom learn could not run its analysis \
          (\"{limit_line}\"). Start the scan again after the limit resets."
     )
+}
+
+/// True when a `headroom learn` failure was the agent CLI's own backend
+/// rejecting the user's configured model override -- the same
+/// user-environment class as [`learn_failure_is_agent_auth`] (RUST-BQ:
+/// `[claude-code:unrecognized_model] {"model":"mimo-v2.5",...}` from a
+/// custom model/router setup). Nothing on our side can change the outcome,
+/// and the model name would land in the fingerprint, so this class could
+/// never group into one Sentry issue anyway. The default failure message
+/// echoes the CLI's own line, which names the rejected model.
+fn learn_failure_is_agent_model_rejected(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("unrecognized_model")
 }
 
 /// The text a learn failure is fingerprinted on.
@@ -6933,9 +6947,11 @@ fn execute_headroom_learn_run(
                 // which can land several lines further down.
                 let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
                 let agent_limit_line = learn_failure_agent_limit_line(&stderr).map(str::to_string);
+                let agent_model_rejected = learn_failure_is_agent_model_rejected(&stderr);
                 let user_env_condition = signature.contains("is not readable")
                     || agent_not_signed_in
-                    || agent_limit_line.is_some();
+                    || agent_limit_line.is_some()
+                    || agent_model_rejected;
                 if !user_env_condition {
                     sentry::with_scope(
                         |scope| {
@@ -8491,10 +8507,10 @@ mod tests {
         is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
         is_prerelease_version, learn_agent_auth_hint, learn_agent_limit_hint,
         learn_failure_agent_limit_line, learn_failure_is_agent_auth,
-        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        noop_app_update_progress_emitter, normalize_learn_failure_signature,
-        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
-        parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        learn_failure_is_agent_model_rejected, learn_failure_signature_source, learn_step_label,
+        lifetime_token_milestone_kind, noop_app_update_progress_emitter,
+        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
+        parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
@@ -11130,6 +11146,10 @@ Some unrelated content.
             "AuthenticationError: invalid API key"
         ));
         assert!(learn_failure_is_agent_auth("Your OAuth token has expired."));
+        // RUST-BN verbatim: expired session the CLI could not refresh.
+        assert!(learn_failure_is_agent_auth(
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nFailed to authenticate: OAuth session expired and could not be refreshed"
+        ));
     }
 
     #[test]
@@ -11176,6 +11196,26 @@ Some unrelated content.
         ] {
             assert!(
                 learn_failure_agent_limit_line(stderr).is_none(),
+                "for: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn learn_failure_is_agent_model_rejected_matches_the_cli_tag_only() {
+        // RUST-BQ verbatim: a custom model override the CLI's backend rejects.
+        assert!(learn_failure_is_agent_model_rejected(
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\n[claude-code:unrecognized_model] {\"model\":\"mimo-v2.5\",\"query_source\":\"generate_session_title\"}\nAPI Error: 400 status code (no body)"
+        ));
+        // These must keep reporting: they are ours to fix (or transient).
+        for stderr in [
+            "LLM analysis failed: `claude -p` did not respond within 120s.",
+            "API Error: 400 status code (no body)",
+            "Prompt is too long",
+            "",
+        ] {
+            assert!(
+                !learn_failure_is_agent_model_rejected(stderr),
                 "for: {stderr}"
             );
         }
