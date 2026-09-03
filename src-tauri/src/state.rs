@@ -6482,6 +6482,13 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
             &["savings", "by_layer", "tool_search", "tokens_saved"],
         )
     });
+    // INVARIANT (set with Garm 2026-09-03; do NOT change the basis without
+    // asking him first): every displayed input-savings figure is measured
+    // against JUST the new input Headroom can compress, on both numerator and
+    // denominator. See the banner on `newInputSavingsRate` in
+    // dashboardHelpers.ts for the full rule and why the 0.9.2->0.9.4 drift to
+    // a whole-request denominator was a regression, not an improvement.
+    //
     // Ratio against new input: compression-only saved / (saved + new input).
     // `tokens.saved` is ALL-LAYERS -- it includes tool-schema deferral, which
     // is disjoint from the checkpoint series and never part of new input

@@ -193,7 +193,23 @@ export function compressibleInputSavingsRate(
   return { pct: Math.min(100, (saved / baseline) * 100), saved, remaining };
 }
 
-/** Canonical input-compression rate over a window of buckets, on the
+/**
+ * INVARIANT (set with Garm, 2026-09-03; do NOT change the basis without asking
+ * him first). Every input-savings number the user sees -- this rate, the
+ * headline input % chip, AND the history chart's saved/spent bars -- is
+ * measured against JUST the new input Headroom can compress, on BOTH sides:
+ *   numerator   = tokens Headroom removed from that new input
+ *   denominator = the new input that reached the model (uncached + cache-write)
+ * The re-sent cached prefix and provider cache reads are excluded from both;
+ * layers that ride the cached prefix (tool-schema deferral) are excluded too.
+ * This basis drifted between 0.9.2 and 0.9.4 toward a whole-request/billable
+ * denominator on a hunch that it was "more accurate"; it was not -- it counted
+ * cached input Headroom cannot touch and collapsed the displayed rate to ~5%
+ * while real compression of touchable input ran ~30%. That was a regression,
+ * reverted here. A denominator change like that is a product decision, not a
+ * cleanup: ask Garm before making one.
+ *
+ * Canonical input-compression rate over a window of buckets, on the
  * NEW-INPUT basis: saved tokens vs the input that newly entered context
  * (provider-billed uncached + cache-write tokens, sampled locally from the
  * proxy's cumulative counters -- see `newInputTokens`). The re-sent cached
