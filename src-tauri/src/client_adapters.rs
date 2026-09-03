@@ -608,7 +608,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             }
             if !toml_ok {
                 failures.push(
-                    "Headroom-managed provider block was not found in ~/.codex/config.toml.".into(),
+                    "Headroom-managed provider block in ~/.codex/config.toml is missing or stale (e.g. Codex login state changed since it was written).".into(),
                 );
             }
             // Shell export is convenience, not routing: config.toml is what routes
@@ -3339,8 +3339,19 @@ fn codex_marker_block(block_id: &str, body: &str) -> String {
 /// managed marker blocks, plus any orphan root keys an older (buggy) build may
 /// have left absorbed into a preceding table. Leaves all other content intact.
 fn strip_codex_managed_toml(content: &str) -> String {
+    // Codex's TOML writer appends new tables *before* a trailing comment, and
+    // our table block's closing marker is the last line of the file -- so
+    // Codex-owned tables ([projects.*] trust, [hooks.state], [windows]) end up
+    // trapped INSIDE the managed block. Pull them out before stripping, or a
+    // disable/rewrite silently deletes the user's trust and sandbox state.
+    let rescued = rescue_foreign_toml_from_block(content, CODEX_ROOT_BLOCK_ID, None);
+    let rescued = rescue_foreign_toml_from_block(
+        &rescued,
+        CODEX_TABLE_BLOCK_ID,
+        Some("[model_providers.headroom]"),
+    );
     let without_blocks = strip_marker_block(
-        &strip_marker_block(content, CODEX_ROOT_BLOCK_ID),
+        &strip_marker_block(&rescued, CODEX_ROOT_BLOCK_ID),
         CODEX_TABLE_BLOCK_ID,
     );
     let openai_orphan_prefix = "openai_base_url = \"http://127.0.0.1:";
@@ -3353,6 +3364,63 @@ fn strip_codex_managed_toml(content: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Move every TOML table we do not own out of a managed marker block, re-emitting
+/// it after the closing marker (byte-preserved, order kept). `owned_table` is the
+/// one table header the block legitimately contains (`None` for the root-keys
+/// block). Lines before the first header inside the block stay put: they are root
+/// keys, which are ours by construction. Handles repeated blocks in one pass
+/// since classification is line-state based, not index based.
+// ponytail: a comment line directly above a trapped table stays with the block
+// (and is dropped on strip); attach comment-carrying to the following header if
+// a real config ever shows up with one.
+fn rescue_foreign_toml_from_block(
+    content: &str,
+    block_id: &str,
+    owned_table: Option<&str>,
+) -> String {
+    let start = format!("# >>> headroom:{block_id} >>>");
+    let end = format!("# <<< headroom:{block_id} <<<");
+    let mut out: Vec<&str> = Vec::new();
+    let mut rescued: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    let mut in_foreign_table = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == start {
+            in_block = true;
+            in_foreign_table = false;
+            out.push(line);
+            continue;
+        }
+        if trimmed == end {
+            in_block = false;
+            out.push(line);
+            if !rescued.is_empty() {
+                out.push("");
+                out.append(&mut rescued);
+            }
+            continue;
+        }
+        if in_block {
+            let code = line.split('#').next().unwrap_or("").trim();
+            if code.starts_with('[') && code.ends_with(']') {
+                in_foreign_table = owned_table != Some(code);
+            }
+            if in_foreign_table {
+                rescued.push(line);
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    // Unterminated block (missing end marker): don't lose what we set aside.
+    if !rescued.is_empty() {
+        out.push("");
+        out.append(&mut rescued);
+    }
+    out.join("\n")
 }
 
 /// Pure-text removal of every `# >>> headroom:<id> >>> ... <<<` block. Loops so
@@ -4437,7 +4505,15 @@ fn codex_provider_block_matches() -> Result<bool> {
             CODEX_TABLE_BLOCK_ID,
             "supports_websockets = false",
         );
-    Ok(root_ok && table_ok)
+    // The flag must track the CURRENT auth mode, not the one at write time. A
+    // block written before `codex login` omits `requires_openai_auth`, so Codex
+    // never attaches the ChatGPT bearer and every request 401s with "Missing
+    // bearer"; failing verify here makes hourly repair rewrite the block after
+    // the user logs in. Symmetrically, a leftover flag after a switch to
+    // API-key auth would force an OAuth login screen (#406).
+    let auth_ok = marker_block_contains(&content, CODEX_TABLE_BLOCK_ID, "requires_openai_auth")
+        == codex_uses_chatgpt_auth();
+    Ok(root_ok && table_ok && auth_ok)
 }
 
 fn marker_block_contains(content: &str, block_id: &str, needle: &str) -> bool {
@@ -10352,6 +10428,110 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             rendered.contains("model = \"gpt-5.4\""),
             "user content between the duplicates is preserved, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_codex_config_rescues_codex_tables_trapped_in_the_block() {
+        // Regression (Windows repro, 2026-09-03): Codex's TOML writer appends
+        // new tables before a trailing comment, and our provider block's closing
+        // marker is the last line of the file -- so Codex's own [projects.*]
+        // trust, [hooks.state] and [windows] tables land INSIDE the managed
+        // block. A rewrite (or disable) then deleted them silently.
+        let existing = "# >>> headroom:codex_cli >>>\n\
+                        model_provider = \"headroom\"\n\
+                        openai_base_url = \"http://127.0.0.1:6767/v1\"\n\
+                        # <<< headroom:codex_cli <<<\n\
+                        \n\
+                        # >>> headroom:codex_cli_provider >>>\n\
+                        [model_providers.headroom]\n\
+                        name = \"Headroom persistent proxy\"\n\
+                        base_url = \"http://127.0.0.1:6767/v1\"\n\
+                        supports_websockets = false\n\
+                        \n\
+                        [projects.'c:\\users\\garm\\code\\headroom-desktop']\n\
+                        trust_level = \"trusted\"\n\
+                        \n\
+                        [hooks.state]\n\
+                        \n\
+                        [windows]\n\
+                        sandbox = \"elevated\"\n\
+                        # <<< headroom:codex_cli_provider <<<\n";
+
+        let rendered = render_codex_config(existing);
+
+        assert!(
+            rendered.parse::<toml::Value>().is_ok(),
+            "rendered config is valid toml, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("trust_level = \"trusted\"")
+                && rendered.contains("[hooks.state]")
+                && rendered.contains("sandbox = \"elevated\""),
+            "Codex-owned tables trapped in the block are preserved, got:\n{rendered}"
+        );
+        // ...and they must live OUTSIDE the regenerated block, or the next
+        // rewrite faces the same trap.
+        let block_start = rendered
+            .find("# >>> headroom:codex_cli_provider >>>")
+            .unwrap();
+        let block_end = rendered
+            .find("# <<< headroom:codex_cli_provider <<<")
+            .unwrap();
+        let block = &rendered[block_start..block_end];
+        assert!(
+            !block.contains("[projects") && !block.contains("[windows"),
+            "rescued tables sit outside the managed block, got:\n{rendered}"
+        );
+
+        // The disable path routes through the same strip: nothing Codex owns
+        // may vanish there either.
+        let stripped = super::strip_codex_managed_toml(existing);
+        assert!(
+            stripped.contains("trust_level = \"trusted\"")
+                && stripped.contains("sandbox = \"elevated\"")
+                && !stripped.contains("model_providers.headroom"),
+            "disable keeps Codex-owned tables and drops only ours, got:\n{stripped}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_block_goes_stale_when_login_postdates_it_and_repair_upgrades_it() {
+        // The enable-before-login hole: the block is written while auth.json is
+        // absent, so it omits requires_openai_auth. Codex then sends no bearer
+        // and every request 401s ("Missing bearer"). A later `codex login` must
+        // flip verify to failing so hourly repair rewrites the block.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+
+        super::apply_client_setup("codex").expect("apply_client_setup succeeds");
+        assert!(
+            super::codex_provider_block_matches().unwrap(),
+            "flagless block matches while logged out"
+        );
+
+        fs::write(
+            codex_dir.join("auth.json"),
+            "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"account_id\":\"acct_123\"}}",
+        )
+        .unwrap();
+        assert!(
+            !super::codex_provider_block_matches().unwrap(),
+            "block written before login is stale once ChatGPT auth appears"
+        );
+
+        super::apply_client_setup("codex").expect("re-apply succeeds");
+        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(
+            toml.contains("requires_openai_auth = true"),
+            "re-apply upgrades the block with the flag, got:\n{toml}"
+        );
+        assert!(
+            super::codex_provider_block_matches().unwrap(),
+            "upgraded block matches again"
         );
     }
 
