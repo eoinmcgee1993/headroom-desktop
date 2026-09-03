@@ -1032,16 +1032,19 @@ function DailySavingsChart({
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
   const canViewNextDay = visibleDay < today;
   const label = view === "month" ? formatMonthLabel(visibleMonth) : formatSelectedDayLabel(visibleDay);
-  // Headline totals cover all three Headroom layers -- input compression,
-  // output shaping, and tool-schema deferral -- matching the breakdown rows in
-  // the savings modal and the segments stacked in the bars below. The provider
-  // cache is deliberately NOT among them: it works with Headroom out of the
-  // path entirely, so it is not a benefit of running Headroom. Deferral is the
-  // opposite -- those definitions are re-sent on every request unless Headroom
-  // holds them back -- and it is priced at the cache-read rate upstream, since
-  // they would have been cache reads after the session's first request.
-  // Buckets before 2026-09-02 carry no deferral figure (the backend only ever
-  // exposed a lifetime total), so older bars understate that layer.
+  // Headline totals and the stacked bars cover the two layers that measure
+  // NEW input -- input compression and output shaping. Tool-schema deferral is
+  // deliberately excluded: the tool definitions ride the cached prefix, so the
+  // backend re-books their full token count on every turn (measured ~82% of
+  // the raw saved total, a per-turn recount of a stable saving), which is the
+  // same reason the headline input-rate chip excludes it. It is still an
+  // honest saving on first appearance and keeps its own labeled row in the
+  // savings modal; it just cannot share a token axis with per-turn figures
+  // without dwarfing them. On the dollar axis it was already invisible -- it
+  // prices at the cache-read rate, since those tokens would have been cache
+  // reads after the session's first request -- so this only visibly changes
+  // the tokens bars. The provider cache is NOT a layer here either: it works
+  // with Headroom out of the path, so it is not a benefit of running Headroom.
   // The live tray figure for today already sums the layers it knows, so it can
   // stand in for the bucket sum while today is still open.
   const chartSaved = Math.max(
@@ -1049,14 +1052,8 @@ function DailySavingsChart({
     chartMode === "usd"
       ? view === "day" && visibleDay >= today && savingsTodayUsd !== null
         ? savingsTodayUsd
-        : chartData.reduce(
-            (s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd + (d.toolSchemaSavingsUsd ?? 0),
-            0
-          )
-      : chartData.reduce(
-          (s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved + (d.toolSchemaTokensSaved ?? 0),
-          0
-        )
+        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
+      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
   );
 
   useEffect(() => {
@@ -1264,19 +1261,6 @@ function DailySavingsChart({
                   <stop offset="0%" stopColor="#95810c" />
                   <stop offset="100%" stopColor="#aa9314" />
                 </linearGradient>
-                {/* Tool-schema deferral, the third layer. Same family again,
-                    one further step out, so the bar reads as three shades of
-                    "Headroom removed this" rather than three unrelated
-                    metrics. Chart-only SVG gradient stops, matching the two
-                    above -- the CSS token rule covers component CSS. */}
-                <linearGradient id="toolSchemaUsdGradient" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#4f9d8f" />
-                  <stop offset="100%" stopColor="#74BDB0" />
-                </linearGradient>
-                <linearGradient id="toolSchemaTokensGradient" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#b0931a" />
-                  <stop offset="100%" stopColor="#bd9e1e" />
-                </linearGradient>
               </defs>
               <CartesianGrid stroke="rgba(36, 31, 29, 0.06)" strokeDasharray="2 8" vertical={false} />
               <XAxis
@@ -1322,14 +1306,6 @@ function DailySavingsChart({
                     stackId="usd"
                     yAxisId="usd"
                   />
-                  <Bar
-                    dataKey="toolSchemaSavingsUsd"
-                    fill="url(#toolSchemaUsdGradient)"
-                    maxBarSize={16}
-                    radius={[1, 1, 0, 0]}
-                    stackId="usd"
-                    yAxisId="usd"
-                  />
                 </>
               )}
               {chartMode === "tokens" && (
@@ -1352,14 +1328,6 @@ function DailySavingsChart({
                   <Bar
                     dataKey="outputTokensSaved"
                     fill="url(#outputTokensGradient)"
-                    maxBarSize={16}
-                    radius={[1, 1, 0, 0]}
-                    stackId="tokens"
-                    yAxisId="tokens"
-                  />
-                  <Bar
-                    dataKey="toolSchemaTokensSaved"
-                    fill="url(#toolSchemaTokensGradient)"
                     maxBarSize={16}
                     radius={[1, 1, 0, 0]}
                     stackId="tokens"
@@ -3690,7 +3658,12 @@ export default function App() {
     const remainingSeconds = Math.max(0, baselineEta - elapsedSeconds);
 
     if (remainingSeconds <= 0 && progress.running) {
-      return "ETA: finishing up";
+      // Past the estimate. "finishing up" is only honest briefly; pip's unpack
+      // phase can silently overrun the seed by minutes on a Defender-scanned
+      // Windows box, and a stale "finishing up" reads as a hang.
+      return elapsedSeconds - baselineEta > 30
+        ? "ETA: still working, slower than usual"
+        : "ETA: finishing up";
     }
     if (remainingSeconds <= 0) {
       return "ETA: --";
@@ -5503,8 +5476,7 @@ export default function App() {
                 <div className="install-prompt__head-text">
                   <h2 className="install-prompt__title">Install the Claude Code CLI</h2>
                   <p className="install-prompt__body">
-                    One click runs the official installer. Prefer your own
-                    terminal? The command below is the same thing.
+                    Click to run the official installer or copy paste the command below into your terminal.
                   </p>
                 </div>
               </header>
@@ -5865,7 +5837,7 @@ export default function App() {
                 : "Headroom has nothing to optimize until a coding agent is connected and its requests flow through our savings pipeline. Your savings will stay at zero. You can connect one later from within the app if you prefer."}
               <br />
               <br />
-              <strong>Note:</strong> does not work with Claude Desktop app due to
+              <strong>Note:</strong> Headroom does not work with Claude Desktop app due to
               limitations by Anthropic. You need to use Claude Code{" "}
               <button
                 className="install-progress__notice-link"
@@ -5886,7 +5858,7 @@ export default function App() {
                   })}
                 type="button"
               >
-                as part of VS Code
+                in VS Code
               </button>
             </p>
           ) : null}
@@ -8337,34 +8309,6 @@ export default function App() {
                           it only touches content outside the cache.
                         </p>
                       </>
-                    ) : null}
-                    {(dashboard.savingsBreakdown.modelRates?.length ?? 0) > 1 ? (
-                      <details className="savings-breakdown__models">
-                        <summary>Compression rate by model</summary>
-                        <div className="savings-breakdown__models-body">
-                          {dashboard.savingsBreakdown.modelRates?.map((row) => (
-                            <div className="savings-breakdown__row" key={row.model}>
-                              <span>
-                                {row.model}{" "}
-                                <span className="savings-breakdown__sample">
-                                  {compactNumber(row.requests)} requests
-                                </span>
-                              </span>
-                              <strong>{percent1(row.savingsPercent)}%</strong>
-                            </div>
-                          ))}
-                          {/* Rates only -- by_model covers a fraction of lifetime
-                              history, so its dollars would not add up to the rows
-                              above. See ModelSavingsRate in models.rs. */}
-                          <p className="savings-breakdown__note">
-                            How much of each model's input Headroom removed. The spread is mostly
-                            workload, not model: long tool output and logs compress far better than
-                            prose, so the blended figure tracks whichever models you use most rather
-                            than how hard Headroom is working. Models with under 100 requests are
-                            left out.
-                          </p>
-                        </div>
-                      </details>
                     ) : null}
                   </div>
                 ) : null}
