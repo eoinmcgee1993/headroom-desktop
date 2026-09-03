@@ -9938,9 +9938,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let path = PathBuf::from("/home/g/.claude/hooks/headroom-rtk-rewrite.sh");
         let cmd = super::hook_shell_command(&path).expect("hook command");
         if cfg!(target_os = "windows") {
-            // Same PowerShell contract as the guard: call operator, quoted
-            // interpreter, quoted script.
-            assert!(cmd.starts_with("& "), "{cmd}");
+            // Claude Code runs hooks through bash on Windows: quoted
+            // interpreter, quoted script, NO call operator (bash rejects a
+            // leading `&` as a syntax error).
+            assert!(!cmd.starts_with("& "), "{cmd}");
             assert!(cmd.ends_with("\"/home/g/.claude/hooks/headroom-rtk-rewrite.sh\""));
             assert!(cmd.contains("bash"), "{cmd}");
         } else {
