@@ -5514,6 +5514,10 @@ export default function App() {
               Also works with ChatGPT Codex, OpenCode, and Grok. Install any of
               them, then check again.
             </p>
+            <p>
+              Note: unfortunately Headroom does not work with the Claude Desktop
+              app due to design decisions by Anthropic.
+            </p>
             {connectorsError ? (
               <p className="install-progress__error">{connectorsError}</p>
             ) : null}
@@ -5837,8 +5841,8 @@ export default function App() {
                 : "Headroom has nothing to optimize until a coding agent is connected and its requests flow through our savings pipeline. Your savings will stay at zero. You can connect one later from within the app if you prefer."}
               <br />
               <br />
-              <strong>Note:</strong> Headroom does not work with Claude Desktop app due to
-              limitations by Anthropic. You need to use Claude Code{" "}
+              <strong>Note:</strong> Headroom does not work with the Claude Desktop app due to
+              design decisions by Anthropic. You need to use Claude Code{" "}
               <button
                 className="install-progress__notice-link"
                 onClick={() =>
