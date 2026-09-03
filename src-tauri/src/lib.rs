@@ -1526,7 +1526,33 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
             });
             if let Err(err) = result {
                 let kind = classify_bootstrap_failure(&err);
-                capture_bootstrap_failure(&err, kind);
+                // Dedupe repeat captures per machine: a policy verdict (e.g.
+                // Application Control) fails identically on every relaunch,
+                // and RUST-AN was one machine re-filing it 21 times in a day.
+                // `Other` is a grab-bag split by pip category in the
+                // fingerprint, so the dedupe key carries the category too --
+                // a different cause within 24h must still report.
+                let capture_key = match kind {
+                    BootstrapFailureKind::Other => format!(
+                        "other:{}",
+                        tool_manager::pip_failure_category(&tool_manager::compact_pip_failure(
+                            &err
+                        ))
+                    ),
+                    _ => kind.as_str().to_string(),
+                };
+                if state
+                    .tool_manager
+                    .should_capture_bootstrap_failure(&capture_key)
+                {
+                    capture_bootstrap_failure(&err, kind);
+                } else {
+                    log::warn!(
+                        "skipping Sentry capture for bootstrap_failed ({}): same failure \
+                         reported within 24h",
+                        kind.as_str()
+                    );
+                }
                 // This failure got a verdict and a Sentry event; drop the
                 // attempt marker so the next launch does not also report it
                 // as bootstrap_abandoned.

@@ -6614,6 +6614,53 @@ impl ToolManager {
         serde_json::from_slice(&raw).ok()
     }
 
+    /// Marker recording the last bootstrap failure reported to Sentry. Policy
+    /// verdicts (Application Control, WDAC) fail identically on every launch,
+    /// and each launch re-captured them: RUST-AN was one blocked laptop filing
+    /// 21 identical events in a day, which escalated the issue with zero new
+    /// information.
+    fn bootstrap_failure_capture_marker_path(&self) -> PathBuf {
+        self.runtime.root_dir.join("bootstrap-failure-capture.json")
+    }
+
+    /// True when this bootstrap failure should reach Sentry: first occurrence,
+    /// a different `key` than the last capture, or the last capture is over
+    /// 24h old -- so a machine stuck on the same wall still reports once a day
+    /// (keeping the issue's lastSeen honest) instead of once per relaunch.
+    /// Best-effort on I/O: an unreadable marker reports rather than
+    /// suppresses.
+    pub fn should_capture_bootstrap_failure(&self, key: &str) -> bool {
+        #[derive(Default, Serialize, Deserialize)]
+        #[serde(default)]
+        struct CaptureMarker {
+            key: String,
+            unix_ts: u64,
+        }
+        const DEDUPE_WINDOW_SECS: u64 = 24 * 60 * 60;
+        let path = self.bootstrap_failure_capture_marker_path();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let is_repeat = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<CaptureMarker>(&raw).ok())
+            .is_some_and(|m| m.key == key && now.saturating_sub(m.unix_ts) < DEDUPE_WINDOW_SECS);
+        if is_repeat {
+            return false;
+        }
+        // Written only on capture, not refreshed on suppressed repeats, so the
+        // window is fixed rather than sliding: a permanently stuck machine
+        // reports daily instead of going silent forever.
+        if let Ok(json) = serde_json::to_vec(&CaptureMarker {
+            key: key.to_string(),
+            unix_ts: now,
+        }) {
+            let _ = crate::client_adapters::atomic_write(&path, &json);
+        }
+        true
+    }
+
     fn write_bootstrap_receipt(&self) -> Result<()> {
         let receipt = self.runtime.root_dir.join("bootstrap-receipt.json");
         // Receipts/flags gate bootstrap and upgrade decisions: a truncated one
@@ -12938,6 +12985,34 @@ mod tests {
         manager.note_bootstrap_attempt("Updating dependencies", 60);
         manager.clear_bootstrap_attempt();
         assert!(manager.take_abandoned_bootstrap().is_none());
+    }
+
+    /// One machine relaunching into the same wall must not re-file the same
+    /// Sentry event every launch (RUST-AN: 21 identical app_control_blocked
+    /// events from one laptop in a day). First capture and a changed cause
+    /// always report; a same-key repeat inside 24h does not; a stale marker
+    /// (over 24h) reports again.
+    #[test]
+    fn bootstrap_failure_capture_dedupes_same_key_within_a_day() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(dir.path()));
+
+        assert!(manager.should_capture_bootstrap_failure("app_control_blocked"));
+        assert!(!manager.should_capture_bootstrap_failure("app_control_blocked"));
+        // A different cause is a different story.
+        assert!(manager.should_capture_bootstrap_failure("permission"));
+        // ... and it replaced the marker, so the original kind reports again.
+        assert!(manager.should_capture_bootstrap_failure("app_control_blocked"));
+
+        // Backdate the marker past the window: the daily heartbeat reports.
+        let path = manager.bootstrap_failure_capture_marker_path();
+        std::fs::write(&path, r#"{"key":"app_control_blocked","unix_ts":1}"#)
+            .expect("backdate marker");
+        assert!(manager.should_capture_bootstrap_failure("app_control_blocked"));
+
+        // A corrupt marker reports rather than suppresses.
+        std::fs::write(&path, b"not json").expect("corrupt marker");
+        assert!(manager.should_capture_bootstrap_failure("app_control_blocked"));
     }
 
     /// Downloads keep PyPI's filename so pip's own platform check stays a
