@@ -422,6 +422,30 @@ export function compressibleSpend(point: {
   };
 }
 
+/**
+ * Tokens the "spent" bar plots, on the NEW-INPUT basis (see the invariant on
+ * `newInputSavingsRate`). Exact new input (uncached + cache-write) when the
+ * bucket was sampled for it; otherwise the cache-read-stripped dollar-share
+ * approximation from `compressibleSpend`.
+ *
+ * The one thing it must NEVER return is the full forwarded count: that puts the
+ * re-sent cached prefix into the denominator, which is the 2026-09-02
+ * inflation (a cache-heavy bucket forwarded 928M tokens, 681M of them cache
+ * reads Headroom never touches -- see `bar_spent_never_counts_cache_reads`).
+ * `compressibleSpend`'s no-coverage branch returns the full count on purpose
+ * for buckets with genuinely no caching, where full == new input; the guard
+ * test pins that the moment cache reads exist, they are excluded.
+ */
+export function newInputTokensForBar(point: {
+  newInputTokens?: number;
+  cacheSavingsUsd?: number | null;
+  actualCostUsd: number;
+  totalTokensSent: number;
+}) {
+  if (point.newInputTokens && point.newInputTokens > 0) return point.newInputTokens;
+  return compressibleSpend(point).compressibleTokensSent;
+}
+
 export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): SavingsChartDatum[] {
   return data.map((point) => ({
     bucketKey: point.date,
@@ -431,6 +455,10 @@ export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): Savings
     actualCostUsd: point.actualCostUsd,
     totalTokensSent: point.totalTokensSent,
     ...compressibleSpend(point),
+    // New-input basis: what the bar plots is the new input, never the
+    // cache-read-inflated forwarded count. Overrides compressibleSpend's
+    // token figure with the exact per-bucket count when it was sampled.
+    compressibleTokensSent: newInputTokensForBar(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
     outputTokensSaved: point.outputTokensSaved ?? 0,
     toolSchemaSavingsUsd: point.toolSchemaSavingsUsd ?? 0,
@@ -518,6 +546,8 @@ export function buildHourlySavingsChartData(data: HourlySavingsPoint[]): Savings
     actualCostUsd: point.actualCostUsd,
     totalTokensSent: point.totalTokensSent,
     ...compressibleSpend(point),
+    // New-input basis (see the monthly builder and newInputSavingsRate).
+    compressibleTokensSent: newInputTokensForBar(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
     outputTokensSaved: point.outputTokensSaved ?? 0,
     toolSchemaSavingsUsd: point.toolSchemaSavingsUsd ?? 0,

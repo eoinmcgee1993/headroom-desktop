@@ -8,6 +8,7 @@ import {
   buildMonthlySavingsWindow,
   compressibleInputSavingsRate,
   newInputSavingsRate,
+  newInputTokensForBar,
   allTimeCacheHitPair,
   cacheHitPair,
   outputReductionForWindow,
@@ -163,6 +164,42 @@ describe("dashboard helpers", () => {
     // No cache coverage: nothing to subtract, bars keep the full figure.
     const uncovered = buildHourlySavingsChartData([{ ...covered[0], cacheReadTokens: undefined, cacheSavingsUsd: undefined }]);
     expect(uncovered[0]).toMatchObject({ compressibleCostUsd: 10, compressibleTokensSent: 1000 });
+  });
+
+  // Regression guard for the 2026-09-02 spent inflation: the history chart
+  // must plot NEW input as "spent", never the full forwarded count (which
+  // carries the re-sent cached prefix). See the invariant on
+  // `newInputSavingsRate` and the memory `savings-spent-inflation-guard`.
+  it("bar_spent_never_counts_cache_reads: plots exact new input, excludes the cached prefix", () => {
+    // The real shape that inflated Garm's chart: a cache-heavy hour forwarded
+    // 928M tokens, 681M of them cache reads. Spent must show the ~247M of new
+    // input, nowhere near 928M.
+    const point = {
+      hour: "2026-09-02T14:00",
+      estimatedSavingsUsd: 50,
+      estimatedTokensSaved: 5_000_000,
+      actualCostUsd: 2451,
+      totalTokensSent: 928_000_000,
+      cacheReadTokens: 681_000_000,
+      cacheSavingsUsd: 3651,
+      newInputTokens: 247_000_000,
+      byProvider: []
+    };
+    const [datum] = buildHourlySavingsChartData([point]);
+    expect(datum.compressibleTokensSent).toBe(247_000_000);
+    // The load-bearing assertion: spent is a small slice of forwarded, so the
+    // 681M cache reads cannot have leaked back into the denominator.
+    expect(datum.compressibleTokensSent).toBeLessThan(point.totalTokensSent / 3);
+    expect(newInputTokensForBar(point)).toBe(247_000_000);
+  });
+
+  it("newInputTokensForBar strips cache reads via the dollar share when no per-bucket new-input sample exists", () => {
+    // No newInputTokens yet, but cache coverage is present: fall back to the
+    // stripped approximation (474 of 1000), never leave the reads in.
+    const point = { actualCostUsd: 10, totalTokensSent: 1000, cacheSavingsUsd: 9 };
+    const spent = newInputTokensForBar(point);
+    expect(spent).toBe(474);
+    expect(spent).toBeLessThan(point.totalTokensSent);
   });
 
   it("keeps the token bar non-zero when provider cache reads exceed forwarded input", () => {
