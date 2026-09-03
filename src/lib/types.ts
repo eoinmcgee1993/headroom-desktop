@@ -71,6 +71,11 @@ export interface DailySavingsPoint {
   estimatedTokensSaved: number;
   actualCostUsd: number;
   totalTokensSent: number;
+  /** Input that newly entered context in the bucket (uncached + cache-write
+   * tokens, locally sampled). The denominator of the input-compression chip.
+   * 0/absent = no coverage: backend rollups and old buckets carry only the
+   * full-forwarded count, which must never feed this rate. */
+  newInputTokens?: number;
   // Output-shaping layer, tracked separately from compression because it is a
   // counterfactual estimate. Zero for buckets the backend rolled up before the
   // layer existed, or that came from the local tracker.
@@ -149,6 +154,8 @@ export interface HourlySavingsPoint {
   estimatedTokensSaved: number;
   actualCostUsd: number;
   totalTokensSent: number;
+  /** See the daily point's newInputTokens. */
+  newInputTokens?: number;
   outputSavingsUsd?: number;
   outputTokensSaved?: number;
   /** See the daily point's toolSchemaSavingsUsd. */

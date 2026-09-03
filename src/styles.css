@@ -31,6 +31,9 @@
   --surface-raised:     rgba(255, 255, 255, 0.55);
   --surface-sunken:     rgba(36, 31, 29, 0.04);
   --surface-overlay:    rgba(255, 255, 255, 0.96);
+  /* Fully opaque floating layer: chip popovers render over the busy history
+     chart, where any glass surface reads as noise. */
+  --surface-popover:    #ffffff;
   --surface-sidebar:    rgba(255, 255, 255, 0.7);
   --surface-tint-warm:  #FAF3E9;
 
@@ -57,6 +60,10 @@
   /* Output-savings bar segment (chart gradients are theme-invariant), so the
      chip legend dots can key to the exact segment hue. */
   --chart-output-savings: #63b3a4;
+  /* Tokens-mode segment golds (gradient midpoints in App.tsx), so the chip
+     legend dots match the bars in tokens view too. */
+  --chart-input-savings-tokens:  #837305;
+  --chart-output-savings-tokens: #a08a10;
   --warning:            #cb8027;
   --warning-tint:       rgba(203, 128, 39, 0.12);
   --danger:             #c14b24;
@@ -83,6 +90,7 @@
     --surface-raised:     rgba(255, 255, 255, 0.07);
     --surface-sunken:     rgba(255, 255, 255, 0.04);
     --surface-overlay:    rgba(255, 255, 255, 0.14);
+    --surface-popover:    #2e2a27;
     --surface-sidebar:    rgba(255, 255, 255, 0.04);
     --surface-tint-warm:  rgba(255, 255, 255, 0.04);
 
@@ -104,6 +112,8 @@
     --accent-tint-strong: rgba(79, 158, 145, 0.3);
     /* Same as light: the chart's segment gradients don't change in dark. */
     --chart-output-savings: #63b3a4;
+    --chart-input-savings-tokens:  #837305;
+    --chart-output-savings-tokens: #a08a10;
     --warning:            #e4a84a;
     --warning-tint:       rgba(220, 143, 26, 0.2);
     --danger:             #e76d3d;
@@ -2244,6 +2254,15 @@ select {
   background: var(--accent);
 }
 
+/* Tokens view paints the saved segments gold, so the legend dots follow. */
+.savings-chart__overlay-chips--tokens .output-chip__dot {
+  background: var(--chart-output-savings-tokens);
+}
+
+.savings-chart__overlay-chips--tokens .output-chip__dot--input {
+  background: var(--chart-input-savings-tokens);
+}
+
 .output-chip__popover {
   position: absolute;
   /* Beside the chip, vertically centered: the chips sit over the history
@@ -2257,8 +2276,17 @@ select {
   padding: 12px;
   border-radius: 12px;
   border: 1px solid var(--border-default);
-  background: var(--surface-overlay);
+  background: var(--surface-popover);
   box-shadow: 0 8px 24px rgba(36, 31, 29, 0.16);
+}
+
+/* While a chip popover is open, lift the whole overlay above the chart
+   header: the mode toggle sits at z-index 2 and the overlay at 1, so a tall
+   popover centered on the chip row extends into the header zone and the
+   toggle and nav buttons paint straight through it. Scoped via :has so the
+   overlay keeps its normal stacking whenever no popover is open. */
+.savings-chart__overlay:has(.output-chip__popover) {
+  z-index: 30;
 }
 
 /* Rightmost chip: extend leftward instead, so the panel never overflows the
@@ -2537,9 +2565,8 @@ select {
 }
 
 .savings-chart__tooltip-dot--saved-tokens {
-  background: rgba(235, 204, 110, 0.3);
-  border: 1.5px solid #EBCC6E;
-  box-sizing: border-box;
+  /* Matches savingsTokensGradient in App.tsx (theme-invariant chart color). */
+  background: linear-gradient(180deg, #746605, #8f7d0b);
 }
 
 /* Output shaping is the lighter shade of whichever savings colour is active,

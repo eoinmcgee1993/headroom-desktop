@@ -1501,24 +1501,150 @@ def finalize_turn(
         # Anthropic OAuth traffic follows it. Off is always the safe answer for
         # an opt-in flag.
         _hd_os.environ["HEADROOM_CC_SWITCH_RECONCILE"] = "0"
+
+
+# ─── Read-maturation first-appearance accounting (desktop-only vendor) ───
+# The pipeline books tokens_saved per request as the raw-vs-forwarded token
+# diff, so a matured Read's removal is re-booked on EVERY later turn when its
+# recorded marker is replayed (read_maturation._handle_read replay branch;
+# the client re-sends the raw conversation each turn). Measured 2026-09-02 on
+# one machine, same day: new_input_savings_percent 31.8 percent before
+# maturation, 78.15 percent after - the gap is recounting, not new removal.
+#
+# This section subtracts the replayed-marker share at the ONE metrics seam,
+# PrometheusMetrics.record_request: it owns tokens_saved_total (which feeds
+# /stats tokens.saved and new_input_savings_percent) and forwards to
+# SavingsTracker (checkpoints, per-model, web rollups), so every book gets
+# first-appearance counting coherently. Newly-matured and fresh-tail savings
+# are untouched; matured content books exactly once, on the turn it matures.
+#
+# Bridge: a lock-guarded module-global pending counter, drained (clamped at
+# the request's own tokens_saved) by the next record_request. Deliberately
+# NOT task/context-scoped: the transform may run on a different task or
+# thread than the recording, and a context-scoped bridge silently no-ops
+# there. Cost of the global: with two sessions in flight, one request's
+# replay share can drain against the other's record, smearing per-model and
+# per-request attribution slightly - the cumulative books stay exact, which
+# is what the bars, checkpoints and rollups sum. A request that dies between
+# transform and record leaves its share pending; the next request drains it.
+#
+# Traffic neutrality: the wrapped transform method delegates unchanged and
+# only OBSERVES (the transform itself skips the frozen prefix, so observed
+# replay events align 1:1 with router-visible diffs); the subtraction happens
+# after the response on numbers no request-path decision reads. The token
+# delta uses the wheel's EstimatingTokenCounter (~90 percent of the booked
+# scale; drift moves only the subtracted share and the per-request clamp
+# keeps books non-negative). The upstream counterpart is PR #3414
+# (fix(read-maturation): book matured Read savings once) - token-exact at
+# the handler seam, no bridge needed. Drop this section when a wheel ships
+# it; until then re-pin on every bump like the #3380 vendor above.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_MATURATION_FIRST_APPEARANCE=0.
+_hd_fa_flag = _hd_os.environ.get("HEADROOM_MATURATION_FIRST_APPEARANCE", "1")
+if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_fa_meta
+        import threading as _hd_fa_threading
+
+        if _hd_fa_meta.version("headroom-ai") == "0.37.0":
+            from headroom.proxy import prometheus_metrics as _hd_fa_pm
+            from headroom.transforms import read_maturation as _hd_fa_rm
+
+            _hd_fa_lock = _hd_fa_threading.Lock()
+            # Replayed-but-not-yet-drained token total, in a one-slot list so
+            # the probe (and this module's wrappers) share one mutable cell.
+            _hd_fa_pending = [0]
+            # Per-tool-call replay deltas, computed once (content and marker
+            # are stable per tc_id). Cleared wholesale at 4096 entries so a
+            # long-lived proxy cannot grow it without bound.
+            _hd_fa_deltas = {}
+
+            try:
+                from headroom.tokenizers.estimator import (
+                    EstimatingTokenCounter as _hd_fa_ETC,
+                )
+
+                _hd_fa_counter = _hd_fa_ETC()
+
+                def _hd_fa_count(text):
+                    return int(_hd_fa_counter.count_text(text))
+
+            except Exception:
+
+                def _hd_fa_count(text):
+                    return max(1, len(text) // 4)
+
+            _hd_fa_orig_handle = _hd_fa_rm.ReadMaturationManager._handle_read
+            _hd_fa_orig_record = _hd_fa_pm.PrometheusMetrics.record_request
+
+            def _hd_fa_handle(self, tc_id, content, activity, result):
+                matured_before = self._matured.get(tc_id)
+                out = _hd_fa_orig_handle(self, tc_id, content, activity, result)
+                try:
+                    # Replay branch only: matured on an EARLIER request and
+                    # replaced again now. Newly-matured stays fully booked.
+                    if matured_before is not None and out[0] is not None:
+                        delta = _hd_fa_deltas.get(tc_id)
+                        if delta is None:
+                            if len(_hd_fa_deltas) >= 4096:
+                                _hd_fa_deltas.clear()
+                            delta = max(
+                                0,
+                                _hd_fa_count(content)
+                                - _hd_fa_count(matured_before.marker),
+                            )
+                            _hd_fa_deltas[tc_id] = delta
+                        if delta > 0:
+                            with _hd_fa_lock:
+                                _hd_fa_pending[0] += delta
+                except Exception:
+                    # Accounting-only: never let bookkeeping break a request.
+                    pass
+                return out
+
+            async def _hd_fa_record(self, *args, **kwargs):
+                try:
+                    if "tokens_saved" in kwargs:
+                        with _hd_fa_lock:
+                            take = min(
+                                _hd_fa_pending[0], max(0, int(kwargs["tokens_saved"]))
+                            )
+                            if take > 0:
+                                _hd_fa_pending[0] -= take
+                        if take > 0:
+                            kwargs = dict(kwargs)
+                            kwargs["tokens_saved"] = int(kwargs["tokens_saved"]) - take
+                except Exception:
+                    pass
+                # Late-bound module-global lookup on purpose: the functional
+                # probe swaps _hd_fa_orig_record to verify subtract-once.
+                return await _hd_fa_orig_record(self, *args, **kwargs)
+
+            _hd_fa_rm.ReadMaturationManager._handle_read = _hd_fa_handle
+            _hd_fa_pm.PrometheusMetrics.record_request = _hd_fa_record
+    except Exception:
+        # Accounting-only vendor: any binding failure leaves the books
+        # exactly as upstream writes them. The request path is never touched
+        # from this section, so there is nothing to fail closed FOR.
+        pass
 "#;
-/// Opt-in passthrough for the rollout registry's `read_maturation` feature.
+/// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
-/// Empty unless the app itself was launched with `HEADROOM_READ_MATURATION`
-/// set to a truthy value, so the default for every install is off. The feature
-/// holds Read results out of the provider cache and relocates the cache
-/// breakpoint; upstream ships it flag-gated default-off, and the desktop's own
-/// 0.9.4 regression came from a cache-breakpoint change that was shipped
-/// broadly before it was measured. This keeps it to one machine at a time
-/// until `bin/rails savings:did` has judged it.
+/// Requested for every install since 0.9.7-rc.1 (2026-09-02): the 0.37.0
+/// freeze policy caps tail-only compression at ~1-2% on big sessions, and
+/// read_maturation is the cache-safe recovery leg (holds Read results out of
+/// the provider cache until they quiesce; never mutates a cached byte). It is
+/// still cache-breakpoint machinery -- the class that cost 89 installs ~17pp
+/// on 0.9.4 -- so the falsey spellings of `HEADROOM_READ_MATURATION` stay a
+/// no-rebuild kill switch, and the rc does not promote to stable until
+/// `bin/rails savings:did` has judged a full staging day on BOTH tok_saved
+/// AND cache_read.
 fn read_maturation_env() -> Vec<(String, String)> {
     read_maturation_env_from(std::env::var("HEADROOM_READ_MATURATION").ok().as_deref())
 }
 
 fn read_maturation_env_from(raw: Option<&str>) -> Vec<(String, String)> {
-    let Some(value) = raw.map(str::trim) else {
-        return Vec::new();
-    };
+    // Absent means on; an explicit value still passes through verbatim.
+    let value = raw.map_or("1", str::trim);
     // Mirror the wheel's own truthiness so "0"/"false"/"off" mean off rather
     // than "the variable is present, therefore on".
     if matches!(
@@ -3210,21 +3336,20 @@ impl ToolManager {
                     // users because of this declaration.
                     .env("HEADROOM_ROLLOUT_CHANNEL", "beta")
                     // read_maturation is the other beta-ring feature the
-                    // registry offers, and it is NOT requested by default on
-                    // purpose. It holds Read results out of the provider cache
-                    // until they quiesce and then RELOCATES the cache
-                    // breakpoint -- the same machinery whose misuse cost 89
-                    // installs ~17pp of their savings rate on 0.9.4. Upstream
-                    // also ships it flag-gated default-off, so it carries no
-                    // broad validation of its own.
-                    //
-                    // Opt-in passthrough instead of a hardcoded "1": launch the
-                    // app with HEADROOM_READ_MATURATION=1 to try it on one
-                    // machine, compare tok_saved AND cache_read in the PERF log
-                    // (both sides -- measuring only the benefit side is what
-                    // shipped the 0.9.4 regression), then let
-                    // `bin/rails savings:did` decide before it becomes a
-                    // default for everyone.
+                    // registry offers, requested by DEFAULT since 0.9.7-rc.1.
+                    // The 0.37.0 freeze policy discards background compression
+                    // of already-forwarded history, capping compression at the
+                    // fresh tail (~1-2% on big sessions); read_maturation is
+                    // the cache-safe recovery leg (holds Read results out of
+                    // the provider cache until they quiesce, then relocates
+                    // the cache breakpoint; invariant: never mutates a cached
+                    // byte). It is still cache-breakpoint machinery -- the
+                    // class that cost 89 installs ~17pp on 0.9.4 -- so two
+                    // guards stay: HEADROOM_READ_MATURATION=0 is a no-rebuild
+                    // kill switch, and promotion to stable waits for
+                    // `bin/rails savings:did` on a full staging day measuring
+                    // BOTH tok_saved AND cache_read (measuring only the
+                    // benefit side is what shipped the 0.9.4 regression).
                     .envs(read_maturation_env())
                     // Pin the steering level explicitly. An explicit env is the
                     // manual-override tier in the shaper's level resolution, so it
@@ -6487,6 +6612,53 @@ impl ToolManager {
             return None;
         }
         serde_json::from_slice(&raw).ok()
+    }
+
+    /// Marker recording the last bootstrap failure reported to Sentry. Policy
+    /// verdicts (Application Control, WDAC) fail identically on every launch,
+    /// and each launch re-captured them: RUST-AN was one blocked laptop filing
+    /// 21 identical events in a day, which escalated the issue with zero new
+    /// information.
+    fn bootstrap_failure_capture_marker_path(&self) -> PathBuf {
+        self.runtime.root_dir.join("bootstrap-failure-capture.json")
+    }
+
+    /// True when this bootstrap failure should reach Sentry: first occurrence,
+    /// a different `key` than the last capture, or the last capture is over
+    /// 24h old -- so a machine stuck on the same wall still reports once a day
+    /// (keeping the issue's lastSeen honest) instead of once per relaunch.
+    /// Best-effort on I/O: an unreadable marker reports rather than
+    /// suppresses.
+    pub fn should_capture_bootstrap_failure(&self, key: &str) -> bool {
+        #[derive(Default, Serialize, Deserialize)]
+        #[serde(default)]
+        struct CaptureMarker {
+            key: String,
+            unix_ts: u64,
+        }
+        const DEDUPE_WINDOW_SECS: u64 = 24 * 60 * 60;
+        let path = self.bootstrap_failure_capture_marker_path();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let is_repeat = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<CaptureMarker>(&raw).ok())
+            .is_some_and(|m| m.key == key && now.saturating_sub(m.unix_ts) < DEDUPE_WINDOW_SECS);
+        if is_repeat {
+            return false;
+        }
+        // Written only on capture, not refreshed on suppressed repeats, so the
+        // window is fixed rather than sliding: a permanently stuck machine
+        // reports daily instead of going silent forever.
+        if let Ok(json) = serde_json::to_vec(&CaptureMarker {
+            key: key.to_string(),
+            unix_ts: now,
+        }) {
+            let _ = crate::client_adapters::atomic_write(&path, &json);
+        }
+        true
     }
 
     fn write_bootstrap_receipt(&self) -> Result<()> {
@@ -10527,9 +10699,20 @@ fn pip_line_to_progress(
     const MAX_ETA_SECS: u64 = 24 * 3600;
     let elapsed_secs = elapsed.as_secs();
     let remaining = if resolved {
-        // Unpack and install of what is already on disk. Short and roughly
-        // machine-independent next to the download it follows.
-        15
+        // Unpack and install of what is already on disk. Not machine-
+        // independent at all: Windows Defender scans every extracted file, so
+        // the ~424 MB payload takes minutes there (a full pip step measured
+        // 6m35s on a healthy Win11 box, most of it this phase) while an
+        // AV-free SSD finishes in well under a minute. The old flat 15 here
+        // put the wizard on "finishing up" for the whole unpack and read as a
+        // hang.
+        // ponytail: fixed per-platform seed, derive from payload size if the
+        // lock ever changes materially.
+        if cfg!(windows) {
+            240
+        } else {
+            60
+        }
     } else if elapsed_secs >= MIN_SAMPLE_SECS && fraction >= MIN_SAMPLE_FRACTION {
         let projected_total = elapsed.as_secs_f64() / fraction;
         (projected_total - elapsed.as_secs_f64()).clamp(5.0, MAX_ETA_SECS as f64) as u64
@@ -10919,6 +11102,27 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
 /// the flag without raising this timeout.
 const PIP_OUTPUT_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Silence window once pip has printed "Installing collected packages". From
+/// that line until "Successfully installed" pip emits nothing at all, and the
+/// unpack of the ~424 MB dependency payload under Windows Defender is minutes
+/// of legitimate silence -- a box only slightly slower than the 6m35s one
+/// measured 2026-09-03 would have had a healthy install killed mid-unpack by
+/// the default window above.
+const PIP_UNPACK_SILENCE_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// Widen `limit` for the rest of the run once `line` marks the start of pip's
+/// silent unpack phase. `None` (wait forever) stays `None`.
+fn widen_silence_for_unpack(limit: Option<Duration>, line: &str) -> Option<Duration> {
+    if line
+        .trim_start()
+        .starts_with("Installing collected packages")
+    {
+        limit.map(|l| l.max(PIP_UNPACK_SILENCE_TIMEOUT))
+    } else {
+        limit
+    }
+}
+
 fn run_pip_install_with_retries_streaming<F>(
     python: &Path,
     args: &[&str],
@@ -11085,10 +11289,14 @@ where
     // old wait-forever behavior for callers whose children are legitimately
     // quiet for long stretches.
     let mut last_output = Instant::now();
+    // Every caller of this function runs pip, so the unpack-phase check lives
+    // here rather than behind a caller knob.
+    let mut silence_limit = silence_timeout;
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(streamed) => {
                 last_output = Instant::now();
+                silence_limit = widen_silence_for_unpack(silence_limit, &streamed.line);
                 on_line(&streamed.line);
                 let sink = if streamed.is_stderr {
                     &mut stderr_buf
@@ -11102,7 +11310,7 @@ where
             // Pipes closed: the child is exiting; fall through to wait().
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let Some(limit) = silence_timeout else {
+                let Some(limit) = silence_limit else {
                     continue;
                 };
                 if last_output.elapsed() >= limit {
@@ -11412,11 +11620,12 @@ mod tests {
         requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
         run_command, sanitize_log_variant, savings_profile_for_runtime, settle_unowned_port,
         sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, wheel_download_failure_category, CommandFailure, HeadroomRelease,
-        ManagedRuntime, PipOutputCapture, PortState, ToolManager, UpgradeOutcome,
-        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
-        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
-        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
+        wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
+        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
+        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS,
+        PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -11923,22 +12132,68 @@ mod tests {
     }
 
     #[test]
-    fn read_maturation_stays_off_unless_explicitly_requested() {
-        // Default for every install: absent. The feature relocates provider
-        // cache breakpoints, which is the machinery that cost 89 installs
-        // ~17pp of their savings rate on 0.9.4, so it must never arrive by
-        // accident.
-        assert!(super::read_maturation_env_from(None).is_empty());
+    fn first_appearance_accounting_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-first-appearance.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
 
-        // Falsey spellings mean off, not "present therefore on".
+        let dir = std::env::temp_dir().join(format!("hd-first-appear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run first-appearance probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that ships first-appearance counting upstream (or a bump
+        // past the 0.37.0 pin) leaves this vendor inert by design.
+        if stdout.contains("FAIL fa bound") && stderr.is_empty() {
+            eprintln!("skipping: first-appearance vendor did not bind (not the 0.37.0 pin)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK first-appearance"),
+            "first-appearance accounting misbehaved against the installed wheel.\n\
+             If traffic neutrality failed, do NOT ship: that is the 0.9.4 class\n\
+             of mistake.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn read_maturation_defaults_on_with_falsey_kill_switch() {
+        // Default-on since 0.9.7-rc.1: an untouched install requests the
+        // feature from the wheel's beta ring.
+        assert_eq!(
+            super::read_maturation_env_from(None),
+            vec![("HEADROOM_READ_MATURATION".to_string(), "1".to_string())]
+        );
+
+        // The no-rebuild kill switch: falsey spellings mean off. This is
+        // cache-breakpoint machinery (the class that cost 89 installs ~17pp
+        // of their savings rate on 0.9.4), so disabling it must never
+        // require an update.
         for off in ["", "  ", "0", "false", "FALSE", "no", "off", "Off"] {
             assert!(
                 super::read_maturation_env_from(Some(off)).is_empty(),
-                "{off:?} should not enable read maturation"
+                "{off:?} should disable read maturation"
             );
         }
 
-        // Explicit opt-in passes the value through to the backend.
+        // Explicit values still pass through verbatim.
         assert_eq!(
             super::read_maturation_env_from(Some("1")),
             vec![("HEADROOM_READ_MATURATION".to_string(), "1".to_string())]
@@ -12444,8 +12699,35 @@ mod tests {
         .expect("Installing is a progress line");
         assert_eq!(update.percent, 79);
         // No more downloading, so the download rate must not be extrapolated
-        // into a multi-hour estimate for an unpack.
-        assert!(update.eta_seconds <= 60, "eta was {}", update.eta_seconds);
+        // into a multi-hour estimate for an unpack. The seed is the fixed
+        // per-platform unpack budget, never elapsed-derived.
+        let expected = if cfg!(windows) { 240 } else { 60 };
+        assert_eq!(update.eta_seconds, expected);
+    }
+
+    #[test]
+    fn unpack_phase_widens_the_silence_window_and_only_then() {
+        let base = Some(Duration::from_secs(600));
+        assert_eq!(
+            widen_silence_for_unpack(base, "Installing collected packages: absl-py, torch"),
+            Some(PIP_UNPACK_SILENCE_TIMEOUT)
+        );
+        // Anything else leaves the window alone.
+        assert_eq!(
+            widen_silence_for_unpack(base, "Collecting torch==2.12.1"),
+            base
+        );
+        // A caller that opted out of the watchdog stays opted out.
+        assert_eq!(
+            widen_silence_for_unpack(None, "Installing collected packages: absl-py"),
+            None
+        );
+        // Never narrow a window that is already wider.
+        let wide = Some(Duration::from_secs(3600));
+        assert_eq!(
+            widen_silence_for_unpack(wide, "Installing collected packages: absl-py"),
+            wide
+        );
     }
 
     #[test]
@@ -12703,6 +12985,34 @@ mod tests {
         manager.note_bootstrap_attempt("Updating dependencies", 60);
         manager.clear_bootstrap_attempt();
         assert!(manager.take_abandoned_bootstrap().is_none());
+    }
+
+    /// One machine relaunching into the same wall must not re-file the same
+    /// Sentry event every launch (RUST-AN: 21 identical app_control_blocked
+    /// events from one laptop in a day). First capture and a changed cause
+    /// always report; a same-key repeat inside 24h does not; a stale marker
+    /// (over 24h) reports again.
+    #[test]
+    fn bootstrap_failure_capture_dedupes_same_key_within_a_day() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(dir.path()));
+
+        assert!(manager.should_capture_bootstrap_failure("app_control_blocked"));
+        assert!(!manager.should_capture_bootstrap_failure("app_control_blocked"));
+        // A different cause is a different story.
+        assert!(manager.should_capture_bootstrap_failure("permission"));
+        // ... and it replaced the marker, so the original kind reports again.
+        assert!(manager.should_capture_bootstrap_failure("app_control_blocked"));
+
+        // Backdate the marker past the window: the daily heartbeat reports.
+        let path = manager.bootstrap_failure_capture_marker_path();
+        std::fs::write(&path, r#"{"key":"app_control_blocked","unix_ts":1}"#)
+            .expect("backdate marker");
+        assert!(manager.should_capture_bootstrap_failure("app_control_blocked"));
+
+        // A corrupt marker reports rather than suppresses.
+        std::fs::write(&path, b"not json").expect("corrupt marker");
+        assert!(manager.should_capture_bootstrap_failure("app_control_blocked"));
     }
 
     /// Downloads keep PyPI's filename so pip's own platform check stays a

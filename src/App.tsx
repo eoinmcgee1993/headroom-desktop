@@ -116,6 +116,7 @@ import {
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
   compressibleInputSavingsRate,
+  newInputSavingsRate,
   allTimeCacheHitPair,
   cacheHitPair,
   outputReductionForWindow,
@@ -598,6 +599,7 @@ const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
 
 const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
 const CLAUDE_CODE_INSTALL_CURL_CMD = "curl -fsSL https://claude.ai/install.sh | bash";
+const CLAUDE_CODE_INSTALL_PS_CMD = "irm https://claude.ai/install.ps1 | iex";
 const CODEX_CLI_INSTALL_CMD = "npm install -g @openai/codex";
 const CODEX_CLI_LOGIN_CMD = "codex login";
 const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
@@ -996,15 +998,25 @@ function DailySavingsChart({
   const monthlyData = buildMonthlySavingsChartData(monthlyWindow);
   const hourlyChartData = buildHourlySavingsChartData(hourlyWindow);
   const chartData = view === "month" ? monthlyData : hourlyChartData;
-  // Canonical rate under the headline: input compression as a share of the
-  // BILLABLE input for the visible window. Always priced in dollars regardless
-  // of the chart's unit toggle -- a rate is unit-free, and only the dollar
-  // figures share one scale (see compressibleInputSavingsRate). Output shaping
-  // stays out of every percentage (it keeps its own measured reduction chip);
-  // cache reads stay out of the denominator (~0.1x, deliberately untouched).
-  const compressibleRate = compressibleInputSavingsRate(
+  // Canonical rate under the headline: input compression on the NEW-INPUT
+  // basis for the visible window -- saved tokens vs the input that newly
+  // entered context (uncached + cache writes, locally sampled; see
+  // newInputSavingsRate). The re-sent cached prefix stays out of the
+  // denominator entirely: Headroom never rewrites it, and pricing it in drove
+  // this rate toward zero as sessions grew while compression of the input we
+  // actually touch ran ~30%. Output shaping stays out of every percentage
+  // (it keeps its own measured reduction chip).
+  const windowNewInput = newInputSavingsRate(
     view === "month" ? monthlyWindow : hourlyWindow
   );
+  // Fallback for windows without sampled new-input coverage (fresh boot, or
+  // buckets from before per-bucket sampling): the previous billable-dollar
+  // rate, whose archived cache coverage goes back months -- the numbers this
+  // surface showed before the basis change.
+  const windowBillable =
+    windowNewInput === null
+      ? compressibleInputSavingsRate(view === "month" ? monthlyWindow : hourlyWindow)
+      : null;
   // Window-scoped output reduction from the locally-sampled series, falling
   // back to the all-time figure for any window without samples of its own.
   // The fallback labels itself all-time (see OutputReductionChip) so it can't
@@ -1020,16 +1032,19 @@ function DailySavingsChart({
   const canViewPreviousDay = firstHourlyDay ? visibleDay > firstHourlyDay : false;
   const canViewNextDay = visibleDay < today;
   const label = view === "month" ? formatMonthLabel(visibleMonth) : formatSelectedDayLabel(visibleDay);
-  // Headline totals cover all three Headroom layers -- input compression,
-  // output shaping, and tool-schema deferral -- matching the breakdown rows in
-  // the savings modal and the segments stacked in the bars below. The provider
-  // cache is deliberately NOT among them: it works with Headroom out of the
-  // path entirely, so it is not a benefit of running Headroom. Deferral is the
-  // opposite -- those definitions are re-sent on every request unless Headroom
-  // holds them back -- and it is priced at the cache-read rate upstream, since
-  // they would have been cache reads after the session's first request.
-  // Buckets before 2026-09-02 carry no deferral figure (the backend only ever
-  // exposed a lifetime total), so older bars understate that layer.
+  // Headline totals and the stacked bars cover the two layers that measure
+  // NEW input -- input compression and output shaping. Tool-schema deferral is
+  // deliberately excluded: the tool definitions ride the cached prefix, so the
+  // backend re-books their full token count on every turn (measured ~82% of
+  // the raw saved total, a per-turn recount of a stable saving), which is the
+  // same reason the headline input-rate chip excludes it. It is still an
+  // honest saving on first appearance and keeps its own labeled row in the
+  // savings modal; it just cannot share a token axis with per-turn figures
+  // without dwarfing them. On the dollar axis it was already invisible -- it
+  // prices at the cache-read rate, since those tokens would have been cache
+  // reads after the session's first request -- so this only visibly changes
+  // the tokens bars. The provider cache is NOT a layer here either: it works
+  // with Headroom out of the path, so it is not a benefit of running Headroom.
   // The live tray figure for today already sums the layers it knows, so it can
   // stand in for the bucket sum while today is still open.
   const chartSaved = Math.max(
@@ -1037,14 +1052,8 @@ function DailySavingsChart({
     chartMode === "usd"
       ? view === "day" && visibleDay >= today && savingsTodayUsd !== null
         ? savingsTodayUsd
-        : chartData.reduce(
-            (s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd + (d.toolSchemaSavingsUsd ?? 0),
-            0
-          )
-      : chartData.reduce(
-          (s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved + (d.toolSchemaTokensSaved ?? 0),
-          0
-        )
+        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
+      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
   );
 
   useEffect(() => {
@@ -1137,25 +1146,53 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
-            {compressibleRate !== null || windowOutput !== null || outputReduction ? (
-              <span className="savings-chart__overlay-chips">
-                {compressibleRate !== null && (
+            {windowNewInput !== null ||
+            windowBillable !== null ||
+            windowOutput !== null ||
+            outputReduction ? (
+              <span
+                className={`savings-chart__overlay-chips${
+                  chartMode === "tokens" ? " savings-chart__overlay-chips--tokens" : ""
+                }`}
+              >
+                {windowNewInput !== null ? (
                   <WindowRateChip
                     dot="input"
-                    label={`Input −${Math.round(compressibleRate.pct)}%`}
+                    label={`Input −${Math.round(windowNewInput.pct)}%`}
                     title="Input compression"
                     badge="measured"
-                    value={`${Math.round(compressibleRate.pct)}%`}
+                    value={`${percent1(windowNewInput.pct)}%`}
                     rows={[
-                      { dt: "Removed", dd: currency(compressibleRate.saved) },
+                      { dt: "Removed", dd: compactNumber(windowNewInput.savedTokens) },
                       {
-                        dt: "Compressible input",
-                        dd: currency(compressibleRate.saved + compressibleRate.remaining)
+                        dt: "Baseline",
+                        dd: compactNumber(
+                          windowNewInput.savedTokens + windowNewInput.newInputTokens
+                        )
                       }
                     ]}
-                    note="Excludes cache reads."
+                    note="Baseline = new input that reached the provider (uncached + cache writes) plus the tokens Headroom removed. The re-sent cached prefix is excluded from both sides. Sampled while the app runs."
                   />
-                )}
+                ) : windowBillable !== null ? (
+                  // No sampled new-input coverage in this window: show the
+                  // billable-dollar rate this surface reported before the
+                  // basis change, computable from archived cache coverage.
+                  <WindowRateChip
+                    dot="input"
+                    label={`Input −${Math.round(windowBillable.pct)}%`}
+                    title="Input compression"
+                    badge="measured"
+                    value={`${Math.round(windowBillable.pct)}%`}
+                    rows={[
+                      { dt: "Removed", dd: currency(windowBillable.saved) },
+                      {
+                        dt: "Compressible input",
+                        dd: currency(windowBillable.saved + windowBillable.remaining)
+                      }
+                    ]}
+                    note="Billable-input basis (no new-input samples in this window yet). Excludes cache reads."
+                  />
+                ) : null}
                 {windowOutput !== null ? (
                   <WindowRateChip
                     dot="output"
@@ -1202,9 +1239,16 @@ function DailySavingsChart({
                   <stop offset="0%" stopColor="#c96a30" />
                   <stop offset="100%" stopColor="#ED834E" />
                 </linearGradient>
+                {/* Saved-token golds are solid: the old translucent "ghost"
+                    fills (20-35% opacity pale yellow) were invisible on the
+                    macOS vibrancy surface. This ramp is validated against both
+                    surfaces: light end >= 2:1 contrast, adjacent-step dL and
+                    orange-vs-gold CVD separation all pass. Keep the tooltip
+                    swatch (--saved-tokens) and the chip-dot tokens
+                    (--chart-*-savings-tokens) in sync when changing it. */}
                 <linearGradient id="savingsTokensGradient" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#d4b832" stopOpacity="0.35" />
-                  <stop offset="100%" stopColor="#EBCC6E" stopOpacity="0.25" />
+                  <stop offset="0%" stopColor="#746605" />
+                  <stop offset="100%" stopColor="#8f7d0b" />
                 </linearGradient>
                 {/* Output shaping sits on top of compression in the same hue
                     family, one shade lighter, so it reads as a second layer of
@@ -1214,21 +1258,8 @@ function DailySavingsChart({
                   <stop offset="100%" stopColor="#8CCCBE" />
                 </linearGradient>
                 <linearGradient id="outputTokensGradient" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#e2cf6a" stopOpacity="0.3" />
-                  <stop offset="100%" stopColor="#F3E2A4" stopOpacity="0.22" />
-                </linearGradient>
-                {/* Tool-schema deferral, the third layer. Same family again,
-                    one further step out, so the bar reads as three shades of
-                    "Headroom removed this" rather than three unrelated
-                    metrics. Chart-only SVG gradient stops, matching the two
-                    above -- the CSS token rule covers component CSS. */}
-                <linearGradient id="toolSchemaUsdGradient" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#4f9d8f" />
-                  <stop offset="100%" stopColor="#74BDB0" />
-                </linearGradient>
-                <linearGradient id="toolSchemaTokensGradient" x1="0" x2="0" y1="0" y2="1">
-                  <stop offset="0%" stopColor="#eddfa0" stopOpacity="0.28" />
-                  <stop offset="100%" stopColor="#F7EEC9" stopOpacity="0.2" />
+                  <stop offset="0%" stopColor="#95810c" />
+                  <stop offset="100%" stopColor="#aa9314" />
                 </linearGradient>
               </defs>
               <CartesianGrid stroke="rgba(36, 31, 29, 0.06)" strokeDasharray="2 8" vertical={false} />
@@ -1275,14 +1306,6 @@ function DailySavingsChart({
                     stackId="usd"
                     yAxisId="usd"
                   />
-                  <Bar
-                    dataKey="toolSchemaSavingsUsd"
-                    fill="url(#toolSchemaUsdGradient)"
-                    maxBarSize={16}
-                    radius={[1, 1, 0, 0]}
-                    stackId="usd"
-                    yAxisId="usd"
-                  />
                 </>
               )}
               {chartMode === "tokens" && (
@@ -1298,54 +1321,15 @@ function DailySavingsChart({
                     dataKey="estimatedTokensSaved"
                     fill="url(#savingsTokensGradient)"
                     maxBarSize={16}
+                    radius={[1, 1, 0, 0]}
                     stackId="tokens"
                     yAxisId="tokens"
-                    shape={(props: any) => {
-                      const { x, y, width, height, fill } = props;
-                      if (!width || !height) return <g />;
-                      const sw = 1.5;
-                      return (
-                        <rect
-                          x={x + sw / 2}
-                          y={y + sw / 2}
-                          width={Math.max(0, width - sw)}
-                          height={Math.max(0, height - sw)}
-                          fill={fill}
-                          stroke="#EBCC6E"
-                          strokeWidth={sw}
-                          rx={1}
-                        />
-                      );
-                    }}
                   />
                   <Bar
                     dataKey="outputTokensSaved"
                     fill="url(#outputTokensGradient)"
                     maxBarSize={16}
-                    stackId="tokens"
-                    yAxisId="tokens"
-                    shape={(props: any) => {
-                      const { x, y, width, height, fill } = props;
-                      if (!width || !height) return <g />;
-                      const sw = 1.5;
-                      return (
-                        <rect
-                          x={x + sw / 2}
-                          y={y + sw / 2}
-                          width={Math.max(0, width - sw)}
-                          height={Math.max(0, height - sw)}
-                          fill={fill}
-                          stroke="#F3E2A4"
-                          strokeWidth={sw}
-                          rx={1}
-                        />
-                      );
-                    }}
-                  />
-                  <Bar
-                    dataKey="toolSchemaTokensSaved"
-                    fill="url(#toolSchemaTokensGradient)"
-                    maxBarSize={16}
+                    radius={[1, 1, 0, 0]}
                     stackId="tokens"
                     yAxisId="tokens"
                   />
@@ -1685,12 +1669,14 @@ export default function App() {
   const [openConnectorHelpId, setOpenConnectorHelpId] = useState<string | null>(null);
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
   const [connectorsBusy, setConnectorsBusy] = useState(false);
+  const [claudeInstallBusy, setClaudeInstallBusy] = useState(false);
   const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">(
     () => (isConnectorTrafficVerified() ? "healthy" : "verifying")
   );
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
   const [connectorsNotice, setConnectorsNotice] = useState<string | null>(null);
   const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
+  const [runningAgentCounts, setRunningAgentCounts] = useState<Record<string, number>>({});
   const [proxyVerificationHint, setProxyVerificationHint] = useState<
     { text: string; tone: "info" | "error" } | null
   >(null);
@@ -2559,6 +2545,30 @@ export default function App() {
       window.clearInterval(interval);
     };
   }, [windowLabel, launcherStage, interceptOnlyVerify]);
+
+  // Live agent processes for the verify screen's restart callout: sessions
+  // started before setup keep their pre-Headroom environment, and naming them
+  // turns "restart each tool" from generic advice into a concrete instruction.
+  // One ps/tasklist spawn per poll, so only while this stage is showing.
+  useEffect(() => {
+    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+      return;
+    }
+    let active = true;
+    const poll = () => {
+      void invoke<Record<string, number>>("get_running_agent_process_counts")
+        .then((counts) => {
+          if (active) setRunningAgentCounts(counts);
+        })
+        .catch(() => {});
+    };
+    poll();
+    const interval = window.setInterval(poll, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [windowLabel, launcherStage]);
 
   // Warm the bootstrap download cache while the user is still signing up.
   // Download-only: nothing is installed until they consent on the install
@@ -3648,7 +3658,12 @@ export default function App() {
     const remainingSeconds = Math.max(0, baselineEta - elapsedSeconds);
 
     if (remainingSeconds <= 0 && progress.running) {
-      return "ETA: finishing up";
+      // Past the estimate. "finishing up" is only honest briefly; pip's unpack
+      // phase can silently overrun the seed by minutes on a Defender-scanned
+      // Windows box, and a stale "finishing up" reads as a hang.
+      return elapsedSeconds - baselineEta > 30
+        ? "ETA: still working, slower than usual"
+        : "ETA: finishing up";
     }
     if (remainingSeconds <= 0) {
       return "ETA: --";
@@ -3993,6 +4008,44 @@ export default function App() {
     } catch {
       setLearnInstallCopyNotice("Copy failed. Select the command and copy manually.");
       window.setTimeout(() => setLearnInstallCopyNotice(null), 3000);
+    }
+  }
+
+  // One-click path for the no-clients panel: run the official installer,
+  // then re-run the same auto-configure "Check again" uses so a successful
+  // install connects and advances without another click.
+  async function installClaudeCodeCli() {
+    setClaudeInstallBusy(true);
+    setConnectorsError(null);
+    setConnectorsNotice(null);
+    try {
+      await invoke("install_claude_code_cli");
+      trackAnalyticsEvent("claude_code_installer_run", { ok: true });
+      setConnectorsNotice("Claude Code installed. Connecting it...");
+      await autoConfigureConnectorsForLauncher();
+    } catch (error) {
+      trackAnalyticsEvent("claude_code_installer_run", { ok: false });
+      setConnectorsError(
+        describeInvokeError(error, "The Claude Code installer failed. Try the command below in your own terminal.")
+      );
+    } finally {
+      setClaudeInstallBusy(false);
+    }
+  }
+
+  // Launcher twin of copyLearnInstallCommand: the launcher stages only render
+  // connectorsNotice, not the learn panel's notice.
+  async function copyAgentInstallCommand(command: string) {
+    try {
+      if (!navigator.clipboard) {
+        throw new Error("Clipboard API unavailable");
+      }
+      await navigator.clipboard.writeText(command);
+      setConnectorsNotice("Copied install command.");
+      window.setTimeout(() => setConnectorsNotice(null), 2000);
+    } catch {
+      setConnectorsNotice("Copy failed. Select the command and copy manually.");
+      window.setTimeout(() => setConnectorsNotice(null), 3000);
     }
   }
 
@@ -5388,6 +5441,124 @@ export default function App() {
     );
     const enabledConnectorCount = launcherConnectors.filter((connector) => connector.enabled).length;
     const requireSelection = availableConnectors.length > 0;
+    const noClientsInstalled =
+      getLauncherAutoConfigureDecision(launcherConnectors) === "show_client_setup";
+    const agentInstallCommand =
+      runtimeStatus?.platform === "windows"
+        ? CLAUDE_CODE_INSTALL_PS_CMD
+        : CLAUDE_CODE_INSTALL_CURL_CMD;
+
+    // The no-tier segment: nothing to route, so the connector toggle list is
+    // all "not detected" noise and Continue leads nowhere. Guide the install
+    // instead; "Check again" re-runs the same auto-configure the launcher
+    // already uses, so a freshly installed client is applied and advances.
+    if (noClientsInstalled) {
+      return (
+        <LauncherShell
+          shellClassName="intro-shell intro-shell--post-install intro-shell--client-setup"
+          spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
+          copyClassName="intro-shell__copy intro-shell__copy--post-install"
+          onMouseDown={handleLauncherSurfaceMouseDown}
+          version={appSemver}
+        >
+          <div className="post-install__lead">
+            <h1>Install a coding agent first</h1>
+            <p>
+              Headroom saves tokens by routing an AI coding tool you already use
+              through its local proxy, and no supported tool was found on this
+              machine. Install Claude Code, sign in, then check again.
+            </p>
+            <div className="install-prompt" role="status">
+              <header className="install-prompt__head">
+                <span className="install-prompt__icon" aria-hidden="true">
+                  <Terminal weight="duotone" />
+                </span>
+                <div className="install-prompt__head-text">
+                  <h2 className="install-prompt__title">Install the Claude Code CLI</h2>
+                  <p className="install-prompt__body">
+                    Click to run the official installer or copy paste the command below into your terminal.
+                  </p>
+                </div>
+              </header>
+              <button
+                className="primary-button"
+                disabled={claudeInstallBusy || connectorsBusy}
+                onClick={() => void installClaudeCodeCli()}
+                type="button"
+              >
+                {claudeInstallBusy
+                  ? "Installing Claude Code... (about a minute)"
+                  : "Install Claude Code for me"}
+              </button>
+              <div className="install-prompt__cmd">
+                <code className="install-prompt__cmd-text">{agentInstallCommand}</code>
+                <button
+                  className="install-prompt__cmd-copy"
+                  type="button"
+                  onClick={() => void copyAgentInstallCommand(agentInstallCommand)}
+                >
+                  Copy
+                </button>
+              </div>
+              <div className="install-prompt__foot">
+                <button
+                  className="install-prompt__link"
+                  type="button"
+                  onClick={() => void openLearnInstallDocsLink()}
+                >
+                  Open install docs
+                </button>
+              </div>
+            </div>
+            <p>
+              Also works with ChatGPT Codex, OpenCode, and Grok. Install any of
+              them, then check again.
+            </p>
+            <p>
+              Note: unfortunately Headroom does not work with the Claude Desktop
+              app due to design decisions by Anthropic.
+            </p>
+            {connectorsError ? (
+              <p className="install-progress__error">{connectorsError}</p>
+            ) : null}
+            {connectorsNotice ? (
+              <p className="install-progress__notice">{connectorsNotice}</p>
+            ) : null}
+          </div>
+          <div className="post-install__actions">
+            <button
+              className="secondary-button post-install__reopen-setup"
+              onClick={() => {
+                setLauncherStage("install");
+              }}
+              type="button"
+            >
+              Back
+            </button>
+            <button
+              className="secondary-button"
+              disabled={connectorsBusy}
+              onClick={() => {
+                void beginProxyVerificationStep();
+              }}
+              type="button"
+            >
+              Skip for now
+            </button>
+            <button
+              className="primary-button primary-button--large primary-button--success"
+              disabled={connectorsBusy}
+              onClick={() => {
+                void autoConfigureConnectorsForLauncher();
+              }}
+              type="button"
+            >
+              Check again
+            </button>
+          </div>
+        </LauncherShell>
+      );
+    }
 
     return (
       <LauncherShell
@@ -5582,6 +5753,9 @@ export default function App() {
     const anyVerified = proxyVerificationRows.some((row) => row.state === "verified");
     const unverified = proxyVerificationRows.filter((row) => row.state !== "verified");
     const unverifiedNames = formatConnectorNameList(unverified.map((row) => row.name));
+    const unverifiedRunning = unverified
+      .map((row) => ({ name: row.name, count: runningAgentCounts[row.clientId] ?? 0 }))
+      .filter((item) => item.count > 0);
     const finishSetup = () => {
       void invoke("complete_setup_wizard");
       setLauncherStage("post_install");
@@ -5610,6 +5784,19 @@ export default function App() {
             </button>{" "}
             for help.
           </p>
+          {unverifiedRunning.length > 0 ? (
+            <p className="launcher-restart-hint">
+              {unverifiedRunning
+                .map(({ name, count }) =>
+                  count === 1
+                    ? `${name} has 1 session running`
+                    : `${name} has ${count} sessions running`
+                )
+                .join("; ")}{" "}
+              right now. Sessions started before this setup keep their old
+              settings until you restart them.
+            </p>
+          ) : null}
           {hasEnabledApps ? (
             <div className="connector-list">
               {proxyVerificationRows.map((row) => (
@@ -5654,8 +5841,8 @@ export default function App() {
                 : "Headroom has nothing to optimize until a coding agent is connected and its requests flow through our savings pipeline. Your savings will stay at zero. You can connect one later from within the app if you prefer."}
               <br />
               <br />
-              <strong>Note:</strong> does not work with Claude Desktop app due to
-              limitations by Anthropic. You need to use Claude Code{" "}
+              <strong>Note:</strong> Headroom does not work with the Claude Desktop app due to
+              design decisions by Anthropic. You need to use Claude Code{" "}
               <button
                 className="install-progress__notice-link"
                 onClick={() =>
@@ -5675,7 +5862,7 @@ export default function App() {
                   })}
                 type="button"
               >
-                as part of VS Code
+                in VS Code
               </button>
             </p>
           ) : null}
@@ -8126,34 +8313,6 @@ export default function App() {
                           it only touches content outside the cache.
                         </p>
                       </>
-                    ) : null}
-                    {(dashboard.savingsBreakdown.modelRates?.length ?? 0) > 1 ? (
-                      <details className="savings-breakdown__models">
-                        <summary>Compression rate by model</summary>
-                        <div className="savings-breakdown__models-body">
-                          {dashboard.savingsBreakdown.modelRates?.map((row) => (
-                            <div className="savings-breakdown__row" key={row.model}>
-                              <span>
-                                {row.model}{" "}
-                                <span className="savings-breakdown__sample">
-                                  {compactNumber(row.requests)} requests
-                                </span>
-                              </span>
-                              <strong>{percent1(row.savingsPercent)}%</strong>
-                            </div>
-                          ))}
-                          {/* Rates only -- by_model covers a fraction of lifetime
-                              history, so its dollars would not add up to the rows
-                              above. See ModelSavingsRate in models.rs. */}
-                          <p className="savings-breakdown__note">
-                            How much of each model's input Headroom removed. The spread is mostly
-                            workload, not model: long tool output and logs compress far better than
-                            prose, so the blended figure tracks whichever models you use most rather
-                            than how hard Headroom is working. Models with under 100 requests are
-                            left out.
-                          </p>
-                        </div>
-                      </details>
                     ) : null}
                   </div>
                 ) : null}

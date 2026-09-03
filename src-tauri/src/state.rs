@@ -1897,6 +1897,26 @@ impl AppState {
         true
     }
 
+    /// One-shot gate for the evidence-based "coding around Headroom" nudge.
+    /// Unlike the generic recovery nudge it does not require a return launch:
+    /// the evidence (Claude sessions grew during THIS run while the proxy
+    /// forwarded nothing) is exactly as strong on the install-day launch.
+    /// Firing also consumes the generic nudge's flag — both say "restart your
+    /// terminal", and a second notification with the same advice is a nag,
+    /// not a reminder. The reverse does NOT hold: the generic nudge having
+    /// fired earlier does not block this one, because the evidence copy names
+    /// what actually happened and is worth one more attempt.
+    pub fn try_mark_unrouted_usage_notified(&self) -> bool {
+        let mut profile = self.launch_profile.lock();
+        if !unrouted_usage_nudge_due(&profile) {
+            return false;
+        }
+        profile.unrouted_usage_notified = true;
+        profile.onboarding_recovery_notified = true;
+        persist_launch_profile(&self.launch_profile_path, &profile);
+        true
+    }
+
     /// One-shot gate for the first-savings celebration notification: returns
     /// true exactly once per install, persisted like the recovery nudge flag.
     pub fn try_mark_first_savings_notified(&self) -> bool {
@@ -2445,9 +2465,19 @@ impl AppState {
         // Recomputed from the shaper's own ledger rather than taken from
         // `/stats`, which credits strata the baseline never observed against a
         // global mean and flips to the A/B number on a single sample per arm.
-        // See `output_savings`. Falls back to the backend's figure when the
-        // ledger is missing or mid-write, so a torn read never blanks the tile.
-        let ledger_estimate = crate::output_savings::estimate();
+        // See `output_savings`. The backend's figure is a fallback ONLY when
+        // the ledger carries no evidence at all (missing, mid-write, or no
+        // shaped traffic yet), so a torn read never blanks the tile. A
+        // readable ledger that scores nothing shows nothing: falling back
+        // there put the credited number on exactly the machines the recompute
+        // refuses to score (all-codex traffic vs a claude-seeded baseline
+        // read as "Output -100%" on Windows, 0.9.7-rc.7).
+        let ledger_read = crate::output_savings::estimate();
+        let backend_output_fallback_allowed = matches!(
+            ledger_read,
+            crate::output_savings::LedgerEstimate::NoEvidence
+        );
+        let ledger_estimate = ledger_read.scored();
         let output_reduction = ledger_estimate
             .as_ref()
             .map(|e| crate::models::OutputReduction {
@@ -2458,6 +2488,9 @@ impl AppState {
                 requests: e.requests,
             })
             .or_else(|| {
+                if !backend_output_fallback_allowed {
+                    return None;
+                }
                 stats
                     .as_ref()
                     .and_then(|s| s.output_reduction.as_ref())
@@ -2612,6 +2645,12 @@ impl AppState {
                 .as_ref()
                 .map(|e| e.tokens_saved)
                 .or_else(|| {
+                    // Same gate as the tile above: the backend's token total
+                    // carries the global-mean credit, so it may only stand in
+                    // when the ledger itself has nothing to say.
+                    if !backend_output_fallback_allowed {
+                        return None;
+                    }
                     stats
                         .as_ref()
                         .and_then(|s| s.output_reduction.as_ref())
@@ -3028,6 +3067,16 @@ impl AppState {
 
     pub fn update_bootstrap_step(&self, step: BootstrapStepUpdate) {
         let mut progress = self.bootstrap_progress.lock();
+        // The success-path install otherwise writes no timeline to the app log
+        // at all (pip lines go only to the failure-time capture, updates only
+        // to the frontend), which left a 6m35s dependency step forensically
+        // blank. Dedup against the previous update; the raw download counter
+        // rewrites its message ~4x/s and is skipped.
+        if (progress.current_step != step.step || progress.message != step.message)
+            && !step.message.starts_with("Downloading ")
+        {
+            log::info!("bootstrap step: {} - {}", step.step, step.message);
+        }
         *progress = apply_bootstrap_step(&progress, step);
     }
 
@@ -3487,7 +3536,9 @@ impl AppState {
                 format!("{} {args_pattern}", exe.display())
             );
             if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern) {
-                log::warn!("failed to clean detached headroom proxy processes: {err}");
+                // `:#` prints the whole context chain: a spawn failure's io
+                // error (RUST-6H's 0.9.5 wave) is invisible without it.
+                log::warn!("failed to clean detached headroom proxy processes: {err:#}");
             }
         }
         log::info!("stop_headroom: done");
@@ -4212,6 +4263,10 @@ struct LaunchProfile {
     /// returning user could be re-congratulated on "first" savings.
     #[serde(default)]
     first_savings_notified: bool,
+    /// One-shot: the evidence-based "coding around Headroom" nudge has fired
+    /// (Claude Code sessions grew during a run that forwarded nothing).
+    #[serde(default)]
+    unrouted_usage_notified: bool,
 }
 
 fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
@@ -4241,6 +4296,7 @@ impl LaunchProfile {
             upstream_override: UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
+            unrouted_usage_notified: false,
         }
     }
 
@@ -4320,6 +4376,14 @@ fn onboarding_recovery_nudge_due(profile: &LaunchProfile) -> bool {
     !profile.onboarding_recovery_notified
         && profile.setup_wizard_complete
         && profile.launch_count >= 2
+}
+
+/// Whether the evidence-based unrouted-usage nudge may still fire: wizard
+/// finished (during the wizard the verify screen owns this moment) and it
+/// never fired before. No return-launch requirement — see
+/// `try_mark_unrouted_usage_notified`.
+fn unrouted_usage_nudge_due(profile: &LaunchProfile) -> bool {
+    !profile.unrouted_usage_notified && profile.setup_wizard_complete
 }
 
 /// Last classification that returned a non-Unknown tier. Persisted so the
@@ -4417,6 +4481,12 @@ struct DailySavingsBucket {
     estimated_tokens_saved: u64,
     actual_cost_usd: f64,
     total_tokens_sent: u64,
+    // New-input tokens (uncached + cache-write) inside the bucket, written
+    // only by the session sampler. Remote rollups and buckets persisted by
+    // older builds carry `total_tokens_sent` on the FULL-FORWARDED basis
+    // (cache-polluted), so they leave this 0 = "no coverage" and the
+    // new-input rate skips them instead of mixing denominators.
+    new_input_tokens: u64,
     // Output-shaping layer, added after the compression fields existed: buckets
     // persisted by older builds must keep parsing, hence container `default`.
     output_savings_usd: f64,
@@ -4792,6 +4862,7 @@ impl SavingsTracker {
                 tool_schema_tokens_saved: 0,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
+                new_input_tokens: bucket.new_input_tokens,
                 output_savings_usd: bucket.output_savings_usd,
                 output_tokens_saved: bucket.output_tokens_saved,
                 // Archived from the backend-derived deltas at ingest; None for
@@ -4816,6 +4887,7 @@ impl SavingsTracker {
                 tool_schema_tokens_saved: 0,
                 actual_cost_usd: bucket.actual_cost_usd,
                 total_tokens_sent: bucket.total_tokens_sent,
+                new_input_tokens: bucket.new_input_tokens,
                 output_savings_usd: bucket.output_savings_usd,
                 output_tokens_saved: bucket.output_tokens_saved,
                 cache_read_tokens: bucket.cache_read_tokens,
@@ -4901,6 +4973,9 @@ impl SavingsTracker {
                 estimated_tokens_saved: point.estimated_tokens_saved,
                 actual_cost_usd: point.actual_cost_usd,
                 total_tokens_sent: point.total_tokens_sent,
+                // Remote rollups carry no new-input dimension; keep whatever
+                // the local session sampler banked for this bucket.
+                new_input_tokens: archived.map_or(0, |b| b.new_input_tokens),
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
                 cache_read_tokens: if live_day {
@@ -4933,6 +5008,9 @@ impl SavingsTracker {
                 estimated_tokens_saved: point.estimated_tokens_saved,
                 actual_cost_usd: point.actual_cost_usd,
                 total_tokens_sent: point.total_tokens_sent,
+                // Remote rollups carry no new-input dimension; keep whatever
+                // the local session sampler banked for this bucket.
+                new_input_tokens: archived.map_or(0, |b| b.new_input_tokens),
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
                 cache_read_tokens: archived
@@ -4999,20 +5077,24 @@ impl SavingsTracker {
         if let Some(reading) = stats.tool_schema_tokens_saved {
             self.accumulate_tool_schema_tokens(reading);
         }
-        // Sampled from the locally recomputed estimate, not the backend's, so
-        // the daily bars and the headline describe one number -- and so the
-        // A/B holdout switching `/stats` to its "measured" figure can never
-        // show up as a phantom delta here.
-        self.sample_output_reduction(
-            crate::output_savings::estimate()
-                .map(|e| (e.tokens_saved, e.baseline_tokens))
-                .or_else(|| {
-                    stats
-                        .output_reduction
-                        .as_ref()
-                        .map(|r| (r.tokens_saved, r.baseline_tokens))
-                }),
-        );
+        // Sampled from the locally recomputed estimate ONLY, never the
+        // backend's `/stats` figure: its global-mean credit is what the
+        // recompute exists to remove, and sampling it as a fallback booked an
+        // Opus-mean "reduction" into the daily buckets of exactly the machines
+        // the recompute refuses to score (read as "Output -100%" on an
+        // all-codex Windows machine, 0.9.7-rc.7). A ledger with no evidence
+        // just skips this poll's sample; a readable ledger that scores nothing
+        // also convicts every sample the retired fallback recorded -- see
+        // `drop_unscoreable_output_samples`.
+        match crate::output_savings::estimate() {
+            crate::output_savings::LedgerEstimate::Scored(e) => {
+                self.sample_output_reduction(Some((e.tokens_saved, e.baseline_tokens)));
+            }
+            crate::output_savings::LedgerEstimate::Unscored => {
+                self.drop_unscoreable_output_samples();
+            }
+            crate::output_savings::LedgerEstimate::NoEvidence => {}
+        }
         let session_tokens_saved = stats.session_estimated_tokens_saved?;
         let session_savings_usd = stats.session_estimated_savings_usd.unwrap_or(0.0).max(0.0);
         let session_requests = stats.session_requests.unwrap_or(0);
@@ -5282,6 +5364,7 @@ impl SavingsTracker {
                 bucket.estimated_tokens_saved,
                 bucket.actual_cost_usd,
                 bucket.total_tokens_sent,
+                bucket.new_input_tokens,
             );
             self.add_daily_delta(
                 &day_key_from_hour_key(hour_key),
@@ -5289,6 +5372,7 @@ impl SavingsTracker {
                 bucket.estimated_tokens_saved,
                 bucket.actual_cost_usd,
                 bucket.total_tokens_sent,
+                bucket.new_input_tokens,
             );
         }
     }
@@ -5305,6 +5389,7 @@ impl SavingsTracker {
                 bucket.estimated_tokens_saved,
                 bucket.actual_cost_usd,
                 bucket.total_tokens_sent,
+                bucket.new_input_tokens,
             );
             self.subtract_daily_delta(
                 &day_key_from_hour_key(hour_key),
@@ -5312,6 +5397,7 @@ impl SavingsTracker {
                 bucket.estimated_tokens_saved,
                 bucket.actual_cost_usd,
                 bucket.total_tokens_sent,
+                bucket.new_input_tokens,
             );
         }
         self.ingest_hourly_buckets(current);
@@ -5324,6 +5410,7 @@ impl SavingsTracker {
         tokens: u64,
         actual_cost_usd: f64,
         total_tokens_sent: u64,
+        new_input_tokens: u64,
     ) {
         if usd <= 0.0 && tokens == 0 && actual_cost_usd <= 0.0 && total_tokens_sent == 0 {
             return;
@@ -5333,6 +5420,7 @@ impl SavingsTracker {
         entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_add(tokens);
         entry.actual_cost_usd += actual_cost_usd.max(0.0);
         entry.total_tokens_sent = entry.total_tokens_sent.saturating_add(total_tokens_sent);
+        entry.new_input_tokens = entry.new_input_tokens.saturating_add(new_input_tokens);
     }
 
     fn subtract_daily_delta(
@@ -5342,6 +5430,7 @@ impl SavingsTracker {
         tokens: u64,
         actual_cost_usd: f64,
         total_tokens_sent: u64,
+        new_input_tokens: u64,
     ) {
         let mut should_remove = false;
         if let Some(entry) = self.daily_savings.get_mut(day_key) {
@@ -5349,6 +5438,7 @@ impl SavingsTracker {
             entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_sub(tokens);
             entry.actual_cost_usd = (entry.actual_cost_usd - actual_cost_usd.max(0.0)).max(0.0);
             entry.total_tokens_sent = entry.total_tokens_sent.saturating_sub(total_tokens_sent);
+            entry.new_input_tokens = entry.new_input_tokens.saturating_sub(new_input_tokens);
             should_remove = entry.estimated_savings_usd <= 0.0
                 && entry.estimated_tokens_saved == 0
                 && entry.actual_cost_usd <= 0.0
@@ -5366,6 +5456,7 @@ impl SavingsTracker {
         tokens: u64,
         actual_cost_usd: f64,
         total_tokens_sent: u64,
+        new_input_tokens: u64,
     ) {
         if usd <= 0.0 && tokens == 0 && actual_cost_usd <= 0.0 && total_tokens_sent == 0 {
             return;
@@ -5375,6 +5466,7 @@ impl SavingsTracker {
         entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_add(tokens);
         entry.actual_cost_usd += actual_cost_usd.max(0.0);
         entry.total_tokens_sent = entry.total_tokens_sent.saturating_add(total_tokens_sent);
+        entry.new_input_tokens = entry.new_input_tokens.saturating_add(new_input_tokens);
     }
 
     fn subtract_hourly_delta(
@@ -5384,6 +5476,7 @@ impl SavingsTracker {
         tokens: u64,
         actual_cost_usd: f64,
         total_tokens_sent: u64,
+        new_input_tokens: u64,
     ) {
         let mut should_remove = false;
         if let Some(entry) = self.hourly_savings.get_mut(hour_key) {
@@ -5391,6 +5484,7 @@ impl SavingsTracker {
             entry.estimated_tokens_saved = entry.estimated_tokens_saved.saturating_sub(tokens);
             entry.actual_cost_usd = (entry.actual_cost_usd - actual_cost_usd.max(0.0)).max(0.0);
             entry.total_tokens_sent = entry.total_tokens_sent.saturating_sub(total_tokens_sent);
+            entry.new_input_tokens = entry.new_input_tokens.saturating_sub(new_input_tokens);
             should_remove = entry.estimated_savings_usd <= 0.0
                 && entry.estimated_tokens_saved == 0
                 && entry.actual_cost_usd <= 0.0
@@ -5507,6 +5601,40 @@ impl SavingsTracker {
             entry.saved_tokens += delta_saved;
             entry.baseline_tokens += delta_baseline;
         }
+    }
+
+    /// A readable ledger that scores no strata convicts this machine's entire
+    /// sampled output series. Scoreability only grows -- the verbosity
+    /// baseline is seeded once and never relearned, control accumulators only
+    /// accumulate, and the qualifying thresholds are constants -- so a machine
+    /// unscoreable today was unscoreable when every existing bucket was
+    /// recorded, and an unscoreable local estimate never emits samples. The
+    /// only possible source is therefore the backend-figure fallback that
+    /// shipped through 0.9.7-rc (global-mean credit; the Windows "Output
+    /// -100%" chip), so the buckets are dropped rather than kept as history.
+    /// The cold-start estimator cache and the watermark go with them: both
+    /// were seeded from the same credited cumulative, and a mark parked at
+    /// that larger figure would silence the sampler long after the control
+    /// arm makes this machine scoreable. Runs every poll; a no-op once clean.
+    fn drop_unscoreable_output_samples(&mut self) {
+        if self.output_daily_samples.is_empty()
+            && self.output_hourly_samples.is_empty()
+            && self.last_output_estimator_tokens_saved.is_none()
+            && self.last_output_estimator_baseline_tokens.is_none()
+            && self.output_sample_watermark.is_none()
+        {
+            return;
+        }
+        log::info!(
+            "output ledger scores no strata; dropping {} daily / {} hourly sampled buckets recorded by the retired backend-figure fallback",
+            self.output_daily_samples.len(),
+            self.output_hourly_samples.len()
+        );
+        self.output_daily_samples.clear();
+        self.output_hourly_samples.clear();
+        self.last_output_estimator_tokens_saved = None;
+        self.last_output_estimator_baseline_tokens = None;
+        self.output_sample_watermark = None;
     }
 
     fn persisted_state(&self) -> PersistedSavingsState {
@@ -5906,6 +6034,9 @@ impl HeadroomSavingsHistoryResponse {
                 tool_schema_tokens_saved: 0,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
+                // Backend history has no new-input dimension: this point's
+                // sent tokens are full-forwarded (cache-polluted). 0 = no coverage.
+                new_input_tokens: 0,
                 output_savings_usd: point.output_savings_usd_delta,
                 output_tokens_saved: point.output_tokens_saved_delta,
                 cache_read_tokens: point.cache_read_tokens_delta,
@@ -5928,6 +6059,9 @@ impl HeadroomSavingsHistoryResponse {
                 tool_schema_tokens_saved: 0,
                 actual_cost_usd: point.total_input_cost_usd_delta,
                 total_tokens_sent: point.total_input_tokens_delta,
+                // Backend history has no new-input dimension: this point's
+                // sent tokens are full-forwarded (cache-polluted). 0 = no coverage.
+                new_input_tokens: 0,
                 output_savings_usd: point.output_savings_usd_delta,
                 output_tokens_saved: point.output_tokens_saved_delta,
                 cache_read_tokens: point.cache_read_tokens_delta,
@@ -6392,10 +6526,36 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
         .filter(|value| *value > 0)
         .or(total_after_compression)
         .filter(|value| *value > 0);
-    // Ratio against new input: saved / (saved + uncached_forwarded). The
-    // proxy's own `tokens.savings_percent` is computed against the cache-
-    // polluted denominator, so it is only a last-resort fallback.
+    // `summary.compression` carries the process-cumulative counter. The
+    // `savings.by_layer` block reports the same layer but only over the recent
+    // request window, so it is a fallback for shape, not a preferred source.
+    let tool_schema_tokens_saved = value_at_path_u64(
+        &root,
+        &["summary", "compression", "tool_schema_tokens_saved"],
+    )
+    .or_else(|| {
+        value_at_path_u64(
+            &root,
+            &["savings", "by_layer", "tool_search", "tokens_saved"],
+        )
+    });
+    // INVARIANT (set with Garm 2026-09-03; do NOT change the basis without
+    // asking him first): every displayed input-savings figure is measured
+    // against JUST the new input Headroom can compress, on both numerator and
+    // denominator. See the banner on `newInputSavingsRate` in
+    // dashboardHelpers.ts for the full rule. This denominator (new_input_tokens
+    // below) is byte-identical at 0.9.2 and 0.9.4 -- the ~25%->~5% drop in that
+    // era was compression collapsing on the wheel swap, NOT a denominator
+    // change. A denominator change is a product decision: ask first.
+    //
+    // Ratio against new input: compression-only saved / (saved + new input).
+    // `tokens.saved` is ALL-LAYERS -- it includes tool-schema deferral, which
+    // is disjoint from the checkpoint series and never part of new input
+    // (schemas ride the cached prefix) -- so subtract it; the wheel's own
+    // `new_input_savings_percent` pairs compression-only the same way. The
+    // proxy's `tokens.savings_percent` stays a last-resort fallback.
     let session_savings_pct = tokens
+        .map(|saved| saved.saturating_sub(tool_schema_tokens_saved.unwrap_or(0)))
         .and_then(|saved| {
             session_total_tokens_sent.and_then(|sent| {
                 let total_before = saved.saturating_add(sent);
@@ -6448,19 +6608,6 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
                 .find(|f| f.get("name").and_then(Value::as_str) == Some("proxy_output_shaper"))
         })
         .and_then(|f| f.get("enabled").and_then(Value::as_bool));
-    // `summary.compression` carries the process-cumulative counter. The
-    // `savings.by_layer` block reports the same layer but only over the recent
-    // request window, so it is a fallback for shape, not a preferred source.
-    let tool_schema_tokens_saved = value_at_path_u64(
-        &root,
-        &["summary", "compression", "tool_schema_tokens_saved"],
-    )
-    .or_else(|| {
-        value_at_path_u64(
-            &root,
-            &["savings", "by_layer", "tool_search", "tokens_saved"],
-        )
-    });
 
     let learner_progress = parse_learner_progress(&root);
 
@@ -6986,6 +7133,13 @@ where
         return Vec::new();
     }
 
+    // The session saved counter is all-layers while the checkpoint series is
+    // compression-only ("bare message figure", tool_search disjoint), so
+    // proportions over the raw session total dropped the tool-schema share of
+    // sent on the floor even at full history coverage.
+    let compression_total =
+        total_tokens.saturating_sub(stats.tool_schema_tokens_saved.unwrap_or(0));
+
     let mut buckets = BTreeMap::<String, DailySavingsBucket>::new();
     let Some(first_point) = history.first().copied() else {
         return Vec::new();
@@ -7050,18 +7204,28 @@ where
         // Real per-hour sent. A bucket may appear for an hour with no saved
         // delta — an honest 0%-savings hour.
         for (bucket_key, sent) in sampled_sent {
-            buckets.entry(bucket_key).or_default().total_tokens_sent = sent;
+            let bucket = buckets.entry(bucket_key).or_default();
+            bucket.total_tokens_sent = sent;
+            bucket.new_input_tokens = sent;
         }
-    } else if total_tokens > 0 && total_tokens_sent > 0 {
+    } else if compression_total > 0 && total_tokens_sent > 0 {
         // Fallback: smear the session total across buckets in proportion to
         // savings. Every hour reads the session-wide ratio, but nothing is
         // dumped or under-counted while sampling coverage is still thin.
         let keys = buckets.keys().cloned().collect::<Vec<_>>();
         for key in keys.iter() {
             let bucket = buckets.get_mut(key).expect("bucket exists");
+            // Proportions over the compression-only session total: this
+            // preserves the unattributable-remainder design (history covering
+            // a fraction of the session attributes only that fraction of
+            // sent) without the tool-schema layer skewing the fraction.
             bucket.total_tokens_sent = ((bucket.estimated_tokens_saved as u128
                 * total_tokens_sent as u128)
-                / total_tokens as u128) as u64;
+                / compression_total as u128) as u64;
+            // Same new-input scale (the session cumulative IS the new-input
+            // series), just smeared: window sums stay exact, only the
+            // intra-window attribution is approximate.
+            bucket.new_input_tokens = bucket.total_tokens_sent;
         }
     }
 
@@ -7130,6 +7294,9 @@ fn diff_hourly_buckets(
                 total_tokens_sent: bucket
                     .total_tokens_sent
                     .saturating_sub(prior.total_tokens_sent),
+                new_input_tokens: bucket
+                    .new_input_tokens
+                    .saturating_sub(prior.new_input_tokens),
                 output_savings_usd: (bucket.output_savings_usd - prior.output_savings_usd).max(0.0),
                 output_tokens_saved: bucket
                     .output_tokens_saved
@@ -7832,7 +7999,7 @@ pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     // Empty args pattern makes the exe-path clause the only real filter:
     // any process whose command line mentions the venv dir.
     if let Err(err) = kill_processes_by_command_pattern(venv_dir, "") {
-        log::warn!("killing venv lock holders before venv mutation failed: {err}");
+        log::warn!("killing venv lock holders before venv mutation failed: {err:#}");
     }
 }
 
@@ -8139,7 +8306,18 @@ fn merge_daily_savings(
         if p.date.as_str() < cutoff_date {
             by_date.insert(p.date.clone(), p);
         } else {
-            by_date.entry(p.date.clone()).or_insert(p);
+            match by_date.entry(p.date.clone()) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // History wins the bucket, but the backend rollup has no
+                    // new-input dimension: keep the locally-sampled value so
+                    // the new-input rate keeps its coverage.
+                    let merged = entry.get_mut();
+                    merged.new_input_tokens = merged.new_input_tokens.max(p.new_input_tokens);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(p);
+                }
+            }
         }
     }
     by_date.into_values().collect()
@@ -8162,7 +8340,16 @@ fn merge_hourly_savings(
         if p.hour.as_str() < cutoff_hour {
             by_hour.insert(p.hour.clone(), p);
         } else {
-            by_hour.entry(p.hour.clone()).or_insert(p);
+            match by_hour.entry(p.hour.clone()) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    // See merge_daily_savings: rollups carry no new-input.
+                    let merged = entry.get_mut();
+                    merged.new_input_tokens = merged.new_input_tokens.max(p.new_input_tokens);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(p);
+                }
+            }
         }
     }
     by_hour.into_values().collect()
@@ -9212,6 +9399,7 @@ mod tests {
             upstream_override: super::UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
+            unrouted_usage_notified: false,
         };
 
         assert!(!super::setup_wizard_satisfied_for_profile(&profile, false));
@@ -9239,22 +9427,30 @@ mod tests {
             upstream_override: super::UpstreamOverride::default(),
             onboarding_recovery_notified: false,
             first_savings_notified: false,
+            unrouted_usage_notified: false,
         };
         assert!(super::onboarding_recovery_nudge_due(&profile));
 
         // Install session itself never nudges.
         profile.launch_count = 1;
         assert!(!super::onboarding_recovery_nudge_due(&profile));
+        // The evidence-based sibling has no return-launch gate: sessions
+        // growing during the install-day run with zero traffic is exactly the
+        // moment it exists for.
+        assert!(super::unrouted_usage_nudge_due(&profile));
         profile.launch_count = 2;
 
-        // Unfinished wizard never nudges.
+        // Unfinished wizard never nudges, either variant.
         profile.setup_wizard_complete = false;
         assert!(!super::onboarding_recovery_nudge_due(&profile));
+        assert!(!super::unrouted_usage_nudge_due(&profile));
         profile.setup_wizard_complete = true;
 
         // Once fired, never again.
         profile.onboarding_recovery_notified = true;
         assert!(!super::onboarding_recovery_nudge_due(&profile));
+        profile.unrouted_usage_notified = true;
+        assert!(!super::unrouted_usage_nudge_due(&profile));
     }
 
     /// What a user can type into the upstream field. The trailing-slash strip
@@ -9326,6 +9522,7 @@ mod tests {
             },
             onboarding_recovery_notified: true,
             first_savings_notified: true,
+            unrouted_usage_notified: true,
         };
         super::persist_launch_profile(&path, &profile);
 
@@ -9514,6 +9711,41 @@ mod tests {
             .map(|bucket| bucket.saved_tokens)
             .sum();
         assert_eq!(hourly_total, 450);
+    }
+
+    #[test]
+    fn unscoreable_ledger_purges_the_fallback_recorded_output_series() {
+        let mut tracker = make_tracker();
+        // Buckets and marks as the retired backend-figure fallback left them
+        // on an rc.7 machine.
+        tracker.sample_output_reduction(Some((1_000, 3_000)));
+        tracker.sample_output_reduction(Some((1_400, 4_000)));
+        assert!(!tracker.output_daily_samples.is_empty());
+        assert!(!tracker.output_hourly_samples.is_empty());
+
+        tracker.drop_unscoreable_output_samples();
+        assert!(tracker.output_daily_samples.is_empty());
+        assert!(tracker.output_hourly_samples.is_empty());
+        assert_eq!(tracker.last_output_estimator_tokens_saved, None);
+        assert_eq!(tracker.last_output_estimator_baseline_tokens, None);
+        assert_eq!(tracker.output_sample_watermark, None);
+        // The purge reaches the persisted state, not just this launch.
+        assert!(tracker.persisted_state().output_daily_samples.is_empty());
+
+        // Once the control arm makes the machine scoreable, sampling reseeds
+        // from the (smaller) local cumulative without a phantom delta: the
+        // first reading seeds, only the second emits.
+        tracker.sample_output_reduction(Some((100, 200)));
+        assert!(tracker.output_daily_samples.is_empty());
+        tracker.sample_output_reduction(Some((160, 300)));
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let day = tracker
+            .output_daily_samples
+            .get(&day_key)
+            .copied()
+            .expect("day bucket");
+        assert_eq!(day.saved_tokens, 60);
+        assert_eq!(day.baseline_tokens, 100);
     }
 
     #[test]
@@ -10984,7 +11216,9 @@ mod tests {
         // tokens.input -- re-sent cached prefix must not dilute the ratio.
         assert_eq!(parsed.session_total_tokens_sent, Some(1000));
         let pct = parsed.session_savings_pct.expect("pct derived");
-        assert!((pct - 1200.0 / 2200.0 * 100.0).abs() < 1e-9, "{pct}");
+        // Compression-only numerator: all-layers saved (1200) minus the
+        // tool-schema cumulative (777), over itself plus new input (1000).
+        assert!((pct - 423.0 / 1423.0 * 100.0).abs() < 1e-9, "{pct}");
 
         assert_eq!(parsed.savings_history.len(), 2);
         assert_eq!(parsed.savings_history[0].total_tokens_saved, 700);
@@ -12349,6 +12583,10 @@ mod tests {
         assert_eq!(hourly[0].total_tokens_sent, 6_000);
         assert_eq!(hourly[1].estimated_tokens_saved, 2_000);
         assert_eq!(hourly[1].total_tokens_sent, 4_000);
+        // The same sampled values land in the new-input field: session
+        // buckets are the only writer, and they ARE the new-input basis.
+        assert_eq!(hourly[0].new_input_tokens, 6_000);
+        assert_eq!(hourly[1].new_input_tokens, 4_000);
     }
 
     #[test]
@@ -12596,6 +12834,7 @@ mod tests {
             estimated_savings_usd: usd,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
+            new_input_tokens: 0,
             output_savings_usd: 0.0,
             output_tokens_saved: 0,
             cache_read_tokens: None,
@@ -12614,6 +12853,7 @@ mod tests {
             estimated_savings_usd: 0.0,
             actual_cost_usd: 0.0,
             total_tokens_sent: 0,
+            new_input_tokens: 0,
             by_provider: Vec::new(),
             output_savings_usd: 0.0,
             output_tokens_saved: 0,
@@ -12844,7 +13084,7 @@ mod tests {
         // must not overwrite a settled local bucket that recorded real spend,
         // or the zero-spend anomaly probe fires on a false positive.
         let mut tracker = make_tracker();
-        tracker.add_daily_delta("2026-06-10", 1.0, 100, 2.5, 5000);
+        tracker.add_daily_delta("2026-06-10", 1.0, 100, 2.5, 5000, 0);
 
         // Desynced backend point for the same day: savings, no spend.
         let desynced = tracker.ingest_native_rollups(
@@ -12919,6 +13159,22 @@ mod tests {
     }
 
     #[test]
+    fn merge_daily_keeps_local_new_input_when_history_wins() {
+        // Backend rollups carry no new-input dimension. If history winning the
+        // bucket dropped the locally-sampled value, every poll would wipe the
+        // new-input rate's coverage for the day the user is looking at.
+        let tracker = vec![DailySavingsPoint {
+            new_input_tokens: 4_000,
+            ..daily("2026-04-20", 100, 0.5)
+        }];
+        let history = vec![daily("2026-04-20", 800, 2.0)];
+        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].estimated_tokens_saved, 800);
+        assert_eq!(result[0].new_input_tokens, 4_000);
+    }
+
+    #[test]
     fn merge_daily_prefers_tracker_when_history_has_savings_but_zero_spend() {
         // Backend rollup desync: savings recorded, tokens/cost zero (RUST-3S/3V).
         let history = vec![daily("2026-04-21", 800, 2.0)];
@@ -12930,6 +13186,7 @@ mod tests {
             estimated_savings_usd: 1.5,
             actual_cost_usd: 9.0,
             total_tokens_sent: 123_456,
+            new_input_tokens: 0,
             output_savings_usd: 0.0,
             output_tokens_saved: 0,
             cache_read_tokens: None,

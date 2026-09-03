@@ -155,20 +155,20 @@ export function allTimeCacheHitPair(
   ]);
 }
 
-/** Canonical input-compression rate for a window of buckets: the share of the
- * COMPRESSIBLE input spend Headroom removed. Cache reads are excluded from the
- * denominator (they bill at ~0.1x and Headroom deliberately never touches the
- * cached prefix); output shaping is never part of this rate.
+/** Billable-dollar input-compression rate: the share of the COMPRESSIBLE
+ * input spend Headroom removed. Cache reads are excluded from the denominator
+ * (they bill at ~0.1x and Headroom deliberately never touches the cached
+ * prefix); output shaping is never part of this rate.
  *
- * Always priced in dollars, whatever unit the chart is showing, because only
- * the dollar figures are on one scale. `totalTokensSent` is our own tokenizer's
- * count of the forwarded prompt while `cacheReadTokens` is the provider's own
- * count of part of it -- upstream keeps them apart on purpose ("must never be
- * differenced", proxy/outcome.py) and on 2026-08-14 a day's derived cache reads
- * (195.8M) genuinely exceeded its forwarded input (163.4M), pinning the token
- * form of this rate at a meaningless 100%. Read cost is recovered from the read
- * discount (`cacheSavingsUsd / 9`) and subtracted from the bucket's actual input
- * cost -- both from the same pricing function, so the subtraction is sound.
+ * Superseded by `newInputSavingsRate` as the headline basis, but kept as the
+ * FALLBACK for windows without sampled new-input coverage (pre-sampling
+ * buckets have archived cache coverage going back months, so this rate can
+ * always be computed for them). Priced in dollars because only the dollar
+ * figures are on one scale: `totalTokensSent` is our own tokenizer's count
+ * while `cacheReadTokens` is the provider's ("must never be differenced",
+ * proxy/outcome.py; see cacheHitPair). Read cost is recovered from the read
+ * discount (`cacheSavingsUsd / 9`) and subtracted from the bucket's actual
+ * input cost -- both from one pricing function, so the subtraction is sound.
  *
  * Only buckets with cache coverage count, so numerator and denominator always
  * describe the same slice; null when the window has no coverage. */
@@ -191,6 +191,59 @@ export function compressibleInputSavingsRate(
   const baseline = saved + remaining;
   if (baseline <= 0) return null;
   return { pct: Math.min(100, (saved / baseline) * 100), saved, remaining };
+}
+
+/**
+ * INVARIANT (set with Garm, 2026-09-03; do NOT change the basis without asking
+ * him first). Every input-savings number the user sees -- this rate, the
+ * headline input % chip, AND the history chart's saved/spent bars -- is
+ * measured against JUST the new input Headroom can compress, on BOTH sides:
+ *   numerator   = tokens Headroom removed from that new input
+ *   denominator = the new input that reached the model (uncached + cache-write)
+ * The re-sent cached prefix and provider cache reads are excluded from both;
+ * layers that ride the cached prefix (tool-schema deferral) are excluded too.
+ * History: the session rate (state.rs `session_savings_pct`) has used this
+ * basis since at least 0.9.2; the history chart chip used the billable-dollar
+ * `compressibleInputSavingsRate` (diluted by cache-read-bearing spend) until
+ * 2026-09-03, when it was aligned onto this basis. NOTE (verified, do not
+ * misremember): the ~25%->~5-10% fleet drop across 0.9.3->0.9.5 was NOT a
+ * denominator change -- the denominator logic is byte-identical at 0.9.2 and
+ * 0.9.4 -- it was compression (the numerator) collapsing on the 0.35->0.37
+ * wheel swap, shown through an unchanged formula. A denominator change is a
+ * product decision, not a cleanup: ask Garm before making one.
+ *
+ * Canonical input-compression rate over a window of buckets, on the
+ * NEW-INPUT basis: saved tokens vs the input that newly entered context
+ * (provider-billed uncached + cache-write tokens, sampled locally from the
+ * proxy's cumulative counters -- see `newInputTokens`). The re-sent cached
+ * prefix never enters the denominator: Headroom deliberately never rewrites
+ * it, so it carries no compression opportunity, and counting it drove this
+ * rate toward zero as sessions grew (2026-09-02 fleet analysis: displayed ~5%
+ * while compression of actually-touchable input ran ~30%). Both counts come
+ * from the proxy's own tokenizer, so unlike `cacheReadTokens` they may be
+ * summed and ratioed (that provider-scale ban is documented on `cacheHitPair`).
+ *
+ * Only buckets with sampled coverage count -- numerator included, so both
+ * sides always describe the same slice; null when the window has none.
+ * Buckets from backend rollups or older builds carry 0/absent coverage and
+ * are skipped: their sent count is full-forwarded and must not mix in. */
+export function newInputSavingsRate(
+  points: Array<{ newInputTokens?: number; estimatedTokensSaved: number }>
+) {
+  let saved = 0;
+  let newInput = 0;
+  for (const point of points) {
+    if (!point.newInputTokens) continue;
+    saved += Math.max(0, point.estimatedTokensSaved);
+    newInput += point.newInputTokens;
+  }
+  const baseline = saved + newInput;
+  if (baseline <= 0) return null;
+  return {
+    pct: Math.min(100, (saved / baseline) * 100),
+    savedTokens: saved,
+    newInputTokens: newInput
+  };
 }
 
 /** Output-shaper reduction over a window of buckets, from the locally-sampled
@@ -369,6 +422,30 @@ export function compressibleSpend(point: {
   };
 }
 
+/**
+ * Tokens the "spent" bar plots, on the NEW-INPUT basis (see the invariant on
+ * `newInputSavingsRate`). Exact new input (uncached + cache-write) when the
+ * bucket was sampled for it; otherwise the cache-read-stripped dollar-share
+ * approximation from `compressibleSpend`.
+ *
+ * The one thing it must NEVER return is the full forwarded count: that puts the
+ * re-sent cached prefix into the denominator, which is the 2026-09-02
+ * inflation (a cache-heavy bucket forwarded 928M tokens, 681M of them cache
+ * reads Headroom never touches -- see `bar_spent_never_counts_cache_reads`).
+ * `compressibleSpend`'s no-coverage branch returns the full count on purpose
+ * for buckets with genuinely no caching, where full == new input; the guard
+ * test pins that the moment cache reads exist, they are excluded.
+ */
+export function newInputTokensForBar(point: {
+  newInputTokens?: number;
+  cacheSavingsUsd?: number | null;
+  actualCostUsd: number;
+  totalTokensSent: number;
+}) {
+  if (point.newInputTokens && point.newInputTokens > 0) return point.newInputTokens;
+  return compressibleSpend(point).compressibleTokensSent;
+}
+
 export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): SavingsChartDatum[] {
   return data.map((point) => ({
     bucketKey: point.date,
@@ -378,6 +455,10 @@ export function buildMonthlySavingsChartData(data: DailySavingsPoint[]): Savings
     actualCostUsd: point.actualCostUsd,
     totalTokensSent: point.totalTokensSent,
     ...compressibleSpend(point),
+    // New-input basis: what the bar plots is the new input, never the
+    // cache-read-inflated forwarded count. Overrides compressibleSpend's
+    // token figure with the exact per-bucket count when it was sampled.
+    compressibleTokensSent: newInputTokensForBar(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
     outputTokensSaved: point.outputTokensSaved ?? 0,
     toolSchemaSavingsUsd: point.toolSchemaSavingsUsd ?? 0,
@@ -465,6 +546,8 @@ export function buildHourlySavingsChartData(data: HourlySavingsPoint[]): Savings
     actualCostUsd: point.actualCostUsd,
     totalTokensSent: point.totalTokensSent,
     ...compressibleSpend(point),
+    // New-input basis (see the monthly builder and newInputSavingsRate).
+    compressibleTokensSent: newInputTokensForBar(point),
     outputSavingsUsd: point.outputSavingsUsd ?? 0,
     outputTokensSaved: point.outputTokensSaved ?? 0,
     toolSchemaSavingsUsd: point.toolSchemaSavingsUsd ?? 0,

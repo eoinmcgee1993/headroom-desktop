@@ -199,8 +199,14 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // quotes the user's request fields — left the machine, and because this
     // line carries no fingerprint Sentry parameterized it into one grab-bag
     // mixing 400/403/503/507. The capture at the emit site is the Sentry path.
+    // Matched as "<client> upstream error " rather than a per-client prefix
+    // list: report_upstream_error emits one line per client_key
+    // (claude-code/codex/opencode/grok-build), and a hardcoded list here is
+    // exactly what let the bypass-forward variant slip through as RUST-2R.
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
-        && msg.starts_with("codex upstream error ")
+        && msg
+            .split_once(' ')
+            .is_some_and(|(_, rest)| rest.starts_with("upstream error "))
     {
         return true;
     }
@@ -957,6 +963,11 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
             "codex upstream error 503 on /v1/responses: upstream connect error"
+        ));
+        // The Claude-side sibling logs the same shape under its client key.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "claude-code upstream error 400 on /v1/messages: {\"error\":{\"message\":\"max_tokens\"}}"
         ));
         assert!(!skip_sentry(
             "headroom_desktop_lib::proxy_intercept",

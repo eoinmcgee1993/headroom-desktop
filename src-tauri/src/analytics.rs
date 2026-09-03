@@ -31,6 +31,8 @@ const ALLOWED_EVENTS: &[&str] = &[
     // At most once per install (persisted flag); measures how many users hit
     // the "setup finished but no traffic ever" state.
     "onboarding_recovery_nudge_shown",
+    // Evidence-based sibling: Claude sessions grew while nothing was routed.
+    "unrouted_usage_nudge_shown",
     // Emitted by the apply_client_setup command / watchdog repair since 0.8.x
     // but missing here, so they were silently dropped by the gate below.
     // Carries client_id + verified + proxy_reachable: the per-OS
@@ -62,6 +64,9 @@ const ALLOWED_EVENTS: &[&str] = &[
     // Feature engagement: learn runs (per run, `agent` property) and Activity
     // tab opens (once per app run, mirroring app_started's cadence).
     "headroom_learn_run",
+    // One-click Claude Code install from the no-clients wizard panel; carries
+    // ok=true/false so the button's success rate is measurable.
+    "claude_code_installer_run",
     "activity_tab_opened",
 ];
 const SESSION_TIMEOUT_SECS: i64 = 4 * 60 * 60;
