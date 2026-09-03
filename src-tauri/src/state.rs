@@ -6486,8 +6486,10 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
     // asking him first): every displayed input-savings figure is measured
     // against JUST the new input Headroom can compress, on both numerator and
     // denominator. See the banner on `newInputSavingsRate` in
-    // dashboardHelpers.ts for the full rule and why the 0.9.2->0.9.4 drift to
-    // a whole-request denominator was a regression, not an improvement.
+    // dashboardHelpers.ts for the full rule. This denominator (new_input_tokens
+    // below) is byte-identical at 0.9.2 and 0.9.4 -- the ~25%->~5% drop in that
+    // era was compression collapsing on the wheel swap, NOT a denominator
+    // change. A denominator change is a product decision: ask first.
     //
     // Ratio against new input: compression-only saved / (saved + new input).
     // `tokens.saved` is ALL-LAYERS -- it includes tool-schema deferral, which

@@ -202,12 +202,15 @@ export function compressibleInputSavingsRate(
  *   denominator = the new input that reached the model (uncached + cache-write)
  * The re-sent cached prefix and provider cache reads are excluded from both;
  * layers that ride the cached prefix (tool-schema deferral) are excluded too.
- * This basis drifted between 0.9.2 and 0.9.4 toward a whole-request/billable
- * denominator on a hunch that it was "more accurate"; it was not -- it counted
- * cached input Headroom cannot touch and collapsed the displayed rate to ~5%
- * while real compression of touchable input ran ~30%. That was a regression,
- * reverted here. A denominator change like that is a product decision, not a
- * cleanup: ask Garm before making one.
+ * History: the session rate (state.rs `session_savings_pct`) has used this
+ * basis since at least 0.9.2; the history chart chip used the billable-dollar
+ * `compressibleInputSavingsRate` (diluted by cache-read-bearing spend) until
+ * 2026-09-03, when it was aligned onto this basis. NOTE (verified, do not
+ * misremember): the ~25%->~5-10% fleet drop across 0.9.3->0.9.5 was NOT a
+ * denominator change -- the denominator logic is byte-identical at 0.9.2 and
+ * 0.9.4 -- it was compression (the numerator) collapsing on the 0.35->0.37
+ * wheel swap, shown through an unchanged formula. A denominator change is a
+ * product decision, not a cleanup: ask Garm before making one.
  *
  * Canonical input-compression rate over a window of buckets, on the
  * NEW-INPUT basis: saved tokens vs the input that newly entered context
