@@ -2465,9 +2465,19 @@ impl AppState {
         // Recomputed from the shaper's own ledger rather than taken from
         // `/stats`, which credits strata the baseline never observed against a
         // global mean and flips to the A/B number on a single sample per arm.
-        // See `output_savings`. Falls back to the backend's figure when the
-        // ledger is missing or mid-write, so a torn read never blanks the tile.
-        let ledger_estimate = crate::output_savings::estimate();
+        // See `output_savings`. The backend's figure is a fallback ONLY when
+        // the ledger carries no evidence at all (missing, mid-write, or no
+        // shaped traffic yet), so a torn read never blanks the tile. A
+        // readable ledger that scores nothing shows nothing: falling back
+        // there put the credited number on exactly the machines the recompute
+        // refuses to score (all-codex traffic vs a claude-seeded baseline
+        // read as "Output -100%" on Windows, 0.9.7-rc.7).
+        let ledger_read = crate::output_savings::estimate();
+        let backend_output_fallback_allowed = matches!(
+            ledger_read,
+            crate::output_savings::LedgerEstimate::NoEvidence
+        );
+        let ledger_estimate = ledger_read.scored();
         let output_reduction = ledger_estimate
             .as_ref()
             .map(|e| crate::models::OutputReduction {
@@ -2478,6 +2488,9 @@ impl AppState {
                 requests: e.requests,
             })
             .or_else(|| {
+                if !backend_output_fallback_allowed {
+                    return None;
+                }
                 stats
                     .as_ref()
                     .and_then(|s| s.output_reduction.as_ref())
@@ -2632,6 +2645,12 @@ impl AppState {
                 .as_ref()
                 .map(|e| e.tokens_saved)
                 .or_else(|| {
+                    // Same gate as the tile above: the backend's token total
+                    // carries the global-mean credit, so it may only stand in
+                    // when the ledger itself has nothing to say.
+                    if !backend_output_fallback_allowed {
+                        return None;
+                    }
                     stats
                         .as_ref()
                         .and_then(|s| s.output_reduction.as_ref())
@@ -5058,20 +5077,24 @@ impl SavingsTracker {
         if let Some(reading) = stats.tool_schema_tokens_saved {
             self.accumulate_tool_schema_tokens(reading);
         }
-        // Sampled from the locally recomputed estimate, not the backend's, so
-        // the daily bars and the headline describe one number -- and so the
-        // A/B holdout switching `/stats` to its "measured" figure can never
-        // show up as a phantom delta here.
-        self.sample_output_reduction(
-            crate::output_savings::estimate()
-                .map(|e| (e.tokens_saved, e.baseline_tokens))
-                .or_else(|| {
-                    stats
-                        .output_reduction
-                        .as_ref()
-                        .map(|r| (r.tokens_saved, r.baseline_tokens))
-                }),
-        );
+        // Sampled from the locally recomputed estimate ONLY, never the
+        // backend's `/stats` figure: its global-mean credit is what the
+        // recompute exists to remove, and sampling it as a fallback booked an
+        // Opus-mean "reduction" into the daily buckets of exactly the machines
+        // the recompute refuses to score (read as "Output -100%" on an
+        // all-codex Windows machine, 0.9.7-rc.7). A ledger with no evidence
+        // just skips this poll's sample; a readable ledger that scores nothing
+        // also convicts every sample the retired fallback recorded -- see
+        // `drop_unscoreable_output_samples`.
+        match crate::output_savings::estimate() {
+            crate::output_savings::LedgerEstimate::Scored(e) => {
+                self.sample_output_reduction(Some((e.tokens_saved, e.baseline_tokens)));
+            }
+            crate::output_savings::LedgerEstimate::Unscored => {
+                self.drop_unscoreable_output_samples();
+            }
+            crate::output_savings::LedgerEstimate::NoEvidence => {}
+        }
         let session_tokens_saved = stats.session_estimated_tokens_saved?;
         let session_savings_usd = stats.session_estimated_savings_usd.unwrap_or(0.0).max(0.0);
         let session_requests = stats.session_requests.unwrap_or(0);
@@ -5578,6 +5601,40 @@ impl SavingsTracker {
             entry.saved_tokens += delta_saved;
             entry.baseline_tokens += delta_baseline;
         }
+    }
+
+    /// A readable ledger that scores no strata convicts this machine's entire
+    /// sampled output series. Scoreability only grows -- the verbosity
+    /// baseline is seeded once and never relearned, control accumulators only
+    /// accumulate, and the qualifying thresholds are constants -- so a machine
+    /// unscoreable today was unscoreable when every existing bucket was
+    /// recorded, and an unscoreable local estimate never emits samples. The
+    /// only possible source is therefore the backend-figure fallback that
+    /// shipped through 0.9.7-rc (global-mean credit; the Windows "Output
+    /// -100%" chip), so the buckets are dropped rather than kept as history.
+    /// The cold-start estimator cache and the watermark go with them: both
+    /// were seeded from the same credited cumulative, and a mark parked at
+    /// that larger figure would silence the sampler long after the control
+    /// arm makes this machine scoreable. Runs every poll; a no-op once clean.
+    fn drop_unscoreable_output_samples(&mut self) {
+        if self.output_daily_samples.is_empty()
+            && self.output_hourly_samples.is_empty()
+            && self.last_output_estimator_tokens_saved.is_none()
+            && self.last_output_estimator_baseline_tokens.is_none()
+            && self.output_sample_watermark.is_none()
+        {
+            return;
+        }
+        log::info!(
+            "output ledger scores no strata; dropping {} daily / {} hourly sampled buckets recorded by the retired backend-figure fallback",
+            self.output_daily_samples.len(),
+            self.output_hourly_samples.len()
+        );
+        self.output_daily_samples.clear();
+        self.output_hourly_samples.clear();
+        self.last_output_estimator_tokens_saved = None;
+        self.last_output_estimator_baseline_tokens = None;
+        self.output_sample_watermark = None;
     }
 
     fn persisted_state(&self) -> PersistedSavingsState {
@@ -9654,6 +9711,41 @@ mod tests {
             .map(|bucket| bucket.saved_tokens)
             .sum();
         assert_eq!(hourly_total, 450);
+    }
+
+    #[test]
+    fn unscoreable_ledger_purges_the_fallback_recorded_output_series() {
+        let mut tracker = make_tracker();
+        // Buckets and marks as the retired backend-figure fallback left them
+        // on an rc.7 machine.
+        tracker.sample_output_reduction(Some((1_000, 3_000)));
+        tracker.sample_output_reduction(Some((1_400, 4_000)));
+        assert!(!tracker.output_daily_samples.is_empty());
+        assert!(!tracker.output_hourly_samples.is_empty());
+
+        tracker.drop_unscoreable_output_samples();
+        assert!(tracker.output_daily_samples.is_empty());
+        assert!(tracker.output_hourly_samples.is_empty());
+        assert_eq!(tracker.last_output_estimator_tokens_saved, None);
+        assert_eq!(tracker.last_output_estimator_baseline_tokens, None);
+        assert_eq!(tracker.output_sample_watermark, None);
+        // The purge reaches the persisted state, not just this launch.
+        assert!(tracker.persisted_state().output_daily_samples.is_empty());
+
+        // Once the control arm makes the machine scoreable, sampling reseeds
+        // from the (smaller) local cumulative without a phantom delta: the
+        // first reading seeds, only the second emits.
+        tracker.sample_output_reduction(Some((100, 200)));
+        assert!(tracker.output_daily_samples.is_empty());
+        tracker.sample_output_reduction(Some((160, 300)));
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let day = tracker
+            .output_daily_samples
+            .get(&day_key)
+            .copied()
+            .expect("day bucket");
+        assert_eq!(day.saved_tokens, 60);
+        assert_eq!(day.baseline_tokens, 100);
     }
 
     #[test]

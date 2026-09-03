@@ -167,24 +167,71 @@ pub fn ledger_path() -> Option<PathBuf> {
     Some(home.join(".headroom").join("output_savings.json"))
 }
 
-/// Best available estimate from the on-disk ledger, or `None` when there is no
-/// readable ledger, no baseline evidence, or the result fails a sanity check.
+/// Outcome of one read of the on-disk ledger. `NoEvidence` and `Unscored` are
+/// deliberately distinct: a missing, torn, or empty ledger says nothing about
+/// this machine's traffic, while a healthy ledger that scores no strata is a
+/// positive finding -- the only other number on offer (the backend's
+/// global-mean-credited `/stats` figure) is exactly the overcount this module
+/// exists to remove, so callers must show nothing there rather than fall back
+/// to it. That fallback rendered an Opus-mean vs 4-token-GPT-replies
+/// comparison as "Output -100%" on an all-codex Windows machine (0.9.7-rc.7).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LedgerEstimate {
+    /// No ledger, an unparseable (likely mid-write) one, or one with no shaped
+    /// traffic yet. Falling back to the backend's figure is harmless here: it
+    /// reads the same file, so it cannot know more than we do.
+    NoEvidence,
+    /// The ledger is healthy and holds shaped traffic, but not one stratum of
+    /// it has baseline or control evidence (e.g. an all-gpt machine whose
+    /// seeded baseline covers only pre-install claude traffic). Resolves
+    /// itself once the holdout's control arm feeds a live stratum past
+    /// [`MIN_BASELINE_N`].
+    Unscored,
+    Scored(OutputEstimate),
+}
+
+impl LedgerEstimate {
+    pub fn scored(self) -> Option<OutputEstimate> {
+        match self {
+            LedgerEstimate::Scored(estimate) => Some(estimate),
+            _ => None,
+        }
+    }
+}
+
+/// Best available estimate from the on-disk ledger.
 ///
 /// Cheap enough to call per dashboard build (a few KB of JSON), and tolerant of
 /// a torn read: the backend writes this file with a plain `write_text`, so a
-/// concurrent flush can hand us a truncated document. That parses to `None` and
-/// the caller falls back to the previous value rather than showing a wrong one.
-pub fn estimate() -> Option<OutputEstimate> {
-    let bytes = std::fs::read(ledger_path()?).ok()?;
-    estimate_from_bytes(&bytes)
+/// concurrent flush can hand us a truncated document. That reads as
+/// [`LedgerEstimate::NoEvidence`] and the caller keeps its previous value
+/// rather than showing a wrong one.
+pub fn estimate() -> LedgerEstimate {
+    let Some(path) = ledger_path() else {
+        return LedgerEstimate::NoEvidence;
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => estimate_from_bytes(&bytes),
+        Err(_) => LedgerEstimate::NoEvidence,
+    }
 }
 
-fn estimate_from_bytes(bytes: &[u8]) -> Option<OutputEstimate> {
-    let ledger: Ledger = serde_json::from_slice(bytes).ok()?;
+fn estimate_from_bytes(bytes: &[u8]) -> LedgerEstimate {
+    let Ok(ledger) = serde_json::from_slice::<Ledger>(bytes) else {
+        return LedgerEstimate::NoEvidence;
+    };
     let estimated = estimate_from_baseline(&ledger);
-    match measured_if_ready(&ledger, &estimated) {
+    let best = match measured_if_ready(&ledger, &estimated) {
         Some(measured) => Some(measured),
         None => estimated,
+    };
+    if let Some(best) = best {
+        return LedgerEstimate::Scored(best);
+    }
+    if ledger.treatment.values().any(|acc| acc.n > 0) {
+        LedgerEstimate::Unscored
+    } else {
+        LedgerEstimate::NoEvidence
     }
 }
 
@@ -281,10 +328,10 @@ fn measured_if_ready(
 ///
 /// A NEGATIVE result floors to 0% instead of returning `None`. "No reduction"
 /// is an answer, not an error: discarding it meant a holdout measuring ~0
-/// could never replace the estimate, and a `None` from this module lets the
-/// caller fall back to the backend's global-mean-credited number — strictly
-/// worse than an honest zero. The CI is left unclamped so the gate in
-/// [`measured_if_ready`] still sees the real band.
+/// could never replace the estimate, and a `None` here demotes a scoreable
+/// ledger to [`LedgerEstimate::Unscored`], hiding a tile whose honest value is
+/// zero. The CI is left unclamped so the gate in [`measured_if_ready`] still
+/// sees the real band.
 fn finalize(
     method: &'static str,
     saved: f64,
@@ -356,7 +403,9 @@ mod tests {
     }
 
     fn estimate(json: &str) -> OutputEstimate {
-        estimate_from_bytes(json.as_bytes()).expect("estimate")
+        estimate_from_bytes(json.as_bytes())
+            .scored()
+            .expect("estimate")
     }
 
     #[test]
@@ -453,30 +502,52 @@ mod tests {
     }
 
     #[test]
-    fn no_baseline_evidence_yields_nothing() {
+    fn shaped_traffic_with_no_baseline_evidence_is_unscored_not_no_evidence() {
+        // The exact state of an all-codex machine: shaped gpt traffic against
+        // a claude-seeded baseline. Unscored -- NOT NoEvidence -- so callers
+        // hide the number instead of falling back to the backend's
+        // global-mean-credited one (the Windows "Output -100%" chip).
         let json = r#"{"baseline": {"strata": {}, "glob": {"n": 15, "sum": 20000, "sumsq": 30700000}},
                        "treatment": {"fable|ask|l|tools": {"n": 3, "sum": 2100, "sumsq": 1490000}}}"#;
-        assert!(estimate_from_bytes(json.as_bytes()).is_none());
+        assert_eq!(
+            estimate_from_bytes(json.as_bytes()),
+            LedgerEstimate::Unscored
+        );
     }
 
     #[test]
-    fn a_torn_or_absent_ledger_is_not_an_estimate() {
-        assert!(estimate_from_bytes(b"").is_none());
-        assert!(estimate_from_bytes(br#"{"baseline": {"strata": {"opus|ask|l|to"#).is_none());
-        assert!(estimate_from_bytes(b"{}").is_none());
+    fn a_torn_absent_or_traffic_free_ledger_carries_no_evidence() {
+        // Unreadable documents and ledgers without shaped traffic say nothing
+        // about this machine, so the backend fallback stays available there.
+        assert_eq!(estimate_from_bytes(b""), LedgerEstimate::NoEvidence);
+        assert_eq!(
+            estimate_from_bytes(br#"{"baseline": {"strata": {"opus|ask|l|to"#),
+            LedgerEstimate::NoEvidence
+        );
+        assert_eq!(estimate_from_bytes(b"{}"), LedgerEstimate::NoEvidence);
+        let seeded_but_idle = r#"{
+          "baseline": {"strata": {"opus|ask|l|tools": {"n": 10, "sum": 10000, "sumsq": 10200000}}, "glob": {"n": 10, "sum": 10000, "sumsq": 10200000}},
+          "treatment": {"opus|ask|l|tools": {"n": 0, "sum": 0, "sumsq": 0}}
+        }"#;
+        assert_eq!(
+            estimate_from_bytes(seeded_but_idle.as_bytes()),
+            LedgerEstimate::NoEvidence
+        );
     }
 
     #[test]
     fn a_shaper_that_made_replies_longer_floors_at_zero() {
         // Treatment above baseline gives a negative percent, which the tile
         // used to render as "Output --6,130.7%". It floors to an honest 0%
-        // rather than vanishing: a None here makes the dashboard fall back to
-        // the backend's global-mean-credited number, which is worse than zero.
+        // rather than vanishing: reading Unscored here hides a tile whose
+        // honest value is zero.
         let json = r#"{
           "baseline": {"strata": {"opus|ask|l|tools": {"n": 10, "sum": 1000, "sumsq": 110000}}, "glob": {"n": 0, "sum": 0, "sumsq": 0}},
           "treatment": {"opus|ask|l|tools": {"n": 4, "sum": 3200, "sumsq": 2580000}}
         }"#;
-        let e = estimate_from_bytes(json.as_bytes()).expect("floored estimate");
+        let e = estimate_from_bytes(json.as_bytes())
+            .scored()
+            .expect("floored estimate");
         assert_eq!(e.method, "estimated");
         assert_eq!(e.reduction_percent, 0.0);
         assert_eq!(e.tokens_saved, 0);

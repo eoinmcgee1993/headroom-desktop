@@ -128,6 +128,7 @@ static BACKEND_DOWN_CODEX_RETRY_503S: AtomicU64 = AtomicU64::new(0);
 static CODEX_INFLIGHT_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 static CODEX_GLOBAL_BYPASS_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 static CODEX_STREAM_NO_TERMINAL_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
+static MISSING_AUTH_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 const CODEX_RECONNECT_REPORT_MIN_INTERVAL_SECS: u64 = 60;
 
 /// Epoch-second until which Codex reconnect warnings are suppressed. Set by the
@@ -296,24 +297,38 @@ impl<R: AsyncRead + Unpin> AsyncRead for StampReader<R> {
 /// AsyncRead wrapper that watches the first bytes of a spliced response for
 /// the status line and records an upstream 429 for the request's client
 /// bucket. Buffers at most one status line's worth of bytes, never content.
-struct Status429Sniffer<R> {
+/// Sniffs the backend->client response on the zero-copy splice every non-Codex
+/// client uses: counts 429s for the usage gauge and, when the status is a
+/// reportable upstream error (see [`is_reportable_upstream_error`]), buffers a
+/// bounded slice of the response so [`report_upstream_error`] can fire when the
+/// stream ends (`Drop`). This is the Claude-side sibling of
+/// `splice_with_codex_capture`'s error peek: without it, a Claude client
+/// looping on a 4xx was invisible in Sentry (the 2026-09-03 Codex 401 loop had
+/// no Claude equivalent only by luck).
+struct ResponseSniffer<R> {
     inner: R,
-    head: Vec<u8>,
+    buf: Vec<u8>,
+    status: Option<u16>,
     done: bool,
     client_key: &'static str,
+    /// Request path for error attribution; `None` disables error capture
+    /// (local proxy paths like /stats, or an unparseable request head).
+    capture_path: Option<String>,
 }
 
 /// A real status line ("HTTP/1.1 429 Too Many Requests\r\n") fits well within
 /// this; hitting the cap without a CRLF means a non-HTTP stream — stop looking.
 const STATUS_LINE_SNIFF_CAP: usize = 64;
 
-impl<R> Status429Sniffer<R> {
-    fn new(inner: R, client_key: &'static str) -> Self {
+impl<R> ResponseSniffer<R> {
+    fn new(inner: R, client_key: &'static str, capture_path: Option<String>) -> Self {
         Self {
             inner,
-            head: Vec::new(),
+            buf: Vec::new(),
+            status: None,
             done: false,
             client_key,
+            capture_path,
         }
     }
 
@@ -321,20 +336,55 @@ impl<R> Status429Sniffer<R> {
         if self.done || bytes.is_empty() {
             return;
         }
-        let take = STATUS_LINE_SNIFF_CAP.saturating_sub(self.head.len());
-        self.head.extend_from_slice(&bytes[..take.min(bytes.len())]);
-        let line_complete = self.head.windows(2).any(|w| w == b"\r\n");
-        if line_complete || self.head.len() >= STATUS_LINE_SNIFF_CAP {
-            if line_complete && parse_response_status(&self.head) == Some(429) {
+        let take = MAX_ERROR_BODY
+            .saturating_sub(self.buf.len())
+            .min(bytes.len());
+        self.buf.extend_from_slice(&bytes[..take]);
+        if self.status.is_none() {
+            if !self.buf.windows(2).any(|w| w == b"\r\n") {
+                if self.buf.len() >= STATUS_LINE_SNIFF_CAP {
+                    // Non-HTTP stream — stop looking.
+                    self.done = true;
+                    self.buf = Vec::new();
+                }
+                return;
+            }
+            self.status = parse_response_status(&self.buf);
+            if self.status == Some(429) {
                 crate::usage_counters::record_429(self.client_key);
             }
+            let capture = self.capture_path.is_some()
+                && self
+                    .status
+                    .is_some_and(|s| is_reportable_upstream_error(&s));
+            if !capture {
+                self.done = true;
+                self.buf = Vec::new();
+                return;
+            }
+        }
+        // Capturing: keep the bounded slice; stop observing once full. Error
+        // responses are small JSON, so the cap is about hostile inputs, not a
+        // truncation we expect to hit.
+        if self.buf.len() >= MAX_ERROR_BODY {
             self.done = true;
-            self.head = Vec::new();
         }
     }
 }
 
-impl<R: AsyncRead + Unpin> AsyncRead for Status429Sniffer<R> {
+impl<R> Drop for ResponseSniffer<R> {
+    fn drop(&mut self) {
+        let (Some(status), Some(path)) = (self.status, self.capture_path.as_deref()) else {
+            return;
+        };
+        if !is_reportable_upstream_error(&status) || self.buf.is_empty() {
+            return;
+        }
+        report_upstream_error(self.client_key, status, path, &self.buf, &[]);
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ResponseSniffer<R> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1281,7 +1331,13 @@ async fn handle(
             let _ = backend_wr.shutdown().await;
         };
         let downstream = async {
-            let mut stamped = Status429Sniffer::new(StampReader(backend_rd), client_key);
+            // Local proxy paths (/stats, /readyz probes) are our own traffic;
+            // a 404 there is the squatter case (RUST-87), not a client error.
+            let error_path = parsed_head
+                .as_ref()
+                .filter(|head| !is_local_proxy_path(&head.path))
+                .map(|head| head.path.clone());
+            let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path);
             let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
             let _ = client_wr.shutdown().await;
         };
@@ -1456,7 +1512,7 @@ fn rewrite_use_responses_lite(body: &[u8]) -> ModelsRewrite {
 /// Report a models-rewrite event to Sentry. `kind` is one of `applied`,
 /// `unparseable_json`, `truncated_body`, `compressed`, `no_content_length`,
 /// `oversize` — fingerprinted per kind so each failure class is its own issue
-/// (mirrors report_codex_upstream_error's grouping rationale).
+/// (mirrors report_upstream_error's grouping rationale).
 fn report_models_rewrite(kind: &str, level: sentry::Level, detail: &str) {
     sentry::with_scope(
         |scope| {
@@ -1546,7 +1602,7 @@ async fn splice_with_codex_capture(
         // body for a Sentry report and forward it immediately. Codex error
         // responses are small JSON (not the SSE stream), so the streaming
         // happy path never takes this branch.
-        if let Some(status) = parse_response_status(&head).filter(is_reportable_codex_error) {
+        if let Some(status) = parse_response_status(&head).filter(is_reportable_upstream_error) {
             let mut chunk = vec![0u8; MAX_ERROR_BODY];
             let n = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, backend_rd.read(&mut chunk))
                 .await
@@ -1558,7 +1614,7 @@ async fn splice_with_codex_capture(
             if client_wr.write_all(&chunk).await.is_err() {
                 return;
             }
-            report_codex_upstream_error(status, req_path, &head, &chunk);
+            report_upstream_error("codex", status, req_path, &head, &chunk);
         }
         let monitor_terminal = is_codex_sse_response(&head, req_path);
         let mut streamed = CodexTerminalReader::new(backend_rd);
@@ -1632,19 +1688,50 @@ fn parse_response_status(head: &[u8]) -> Option<u16> {
     first.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// Whether an upstream status is worth a Sentry event. 429 (rate limit) and 401
-/// (the client's own API key is invalid/expired — RUST-46) are routine and not
-/// actionable on our side, so they are excluded to avoid noise; everything
-/// >= 400 otherwise is a real client/server failure we want to see.
-fn is_reportable_codex_error(status: &u16) -> bool {
-    *status >= 400 && *status != 429 && *status != 401
+/// Whether an upstream status is worth peeking the error body for a possible
+/// Sentry event. 429 (rate limit) is routine and excluded outright. 401 gets
+/// the peek but is only reported when the body says NO auth header was sent at
+/// all (a setup bug on our side: the 2026-09-03 Windows case, where a Codex
+/// provider block written before `codex login` omitted `requires_openai_auth`
+/// and every request 401'd invisibly) -- an invalid/expired key 401 stays
+/// unreported (RUST-46), see [`report_upstream_error`].
+fn is_reportable_upstream_error(status: &u16) -> bool {
+    *status >= 400 && *status != 429
 }
 
-/// Report a Codex upstream error to Sentry with the status, request path and a
-/// structural summary of the error body (never the raw body: OpenAI 400s
+/// True when a 401 body says the request carried no credentials at all. That
+/// means the CLIENT attached nothing -- a configuration bug we likely caused --
+/// as opposed to an invalid or expired key, which only the user can fix.
+/// Matches the providers' static message strings via the structural
+/// `error.message` field; no free text is kept:
+/// - OpenAI: "Missing bearer or basic authentication in header"
+/// - Anthropic: "Could not resolve authentication method. Expected either
+///   x-api-key or authorization header to be provided."
+fn is_missing_auth_error(body: &[u8]) -> bool {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let err = json.get("error").unwrap_or(&json);
+    err.get("message")
+        .and_then(|v| v.as_str())
+        .map(|m| m.to_ascii_lowercase())
+        .is_some_and(|m| {
+            m.contains("missing bearer") || m.contains("could not resolve authentication")
+        })
+}
+
+/// Report an upstream error to Sentry with the client, status, request path and
+/// a structural summary of the error body (never the raw body: provider 400s
 /// frequently echo request fields, so raw attachment would leak prompt
-/// fragments into Sentry).
-fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: &[u8]) {
+/// fragments into Sentry). `client` is one of the `client_key` values
+/// ("claude-code", "codex", "opencode", "grok-build").
+fn report_upstream_error(
+    client: &'static str,
+    status: u16,
+    req_path: &str,
+    head: &[u8],
+    chunk: &[u8],
+) {
     let head_body = find_header_end(head)
         .map(|e| &head[(e + 4).min(head.len())..])
         .unwrap_or(&[]);
@@ -1654,10 +1741,12 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     let snippet = codex_error_summary(&body);
     let path = req_path.to_string();
     // The raw body stays on-device: the local log keeps full debugging detail
-    // (OpenAI 400s often quote request fields, so only the structural summary
-    // above may leave the machine via Sentry).
+    // (provider 400s often quote request fields, so only the structural summary
+    // above may leave the machine via Sentry). The "<client> upstream error"
+    // prefix is what the logging.rs bridge skip rule keys on (RUST-5Q) -- the
+    // explicit capture below is the only Sentry path.
     let raw_snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
-    log::warn!("codex upstream error {status} on {path}: {raw_snippet}");
+    log::warn!("{client} upstream error {status} on {path}: {raw_snippet}");
     // Upstream 5xx is a provider-side transient (502/503/504/500 proxy_error)
     // that Headroom neither caused nor can fix. Capturing every one just burns
     // Sentry quota (RUST-46/4G/4T were all this). Keep full detail in the local
@@ -1677,31 +1766,50 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     if is_geo_blocked_codex_error(&body) {
         return;
     }
-    // Group by status so each upstream failure class is its own Sentry issue.
-    // Without an explicit fingerprint, Sentry parameterizes the message
-    // ("codex upstream error {status} on {path}") and collapses 401 noise, 403
-    // challenges and real 502/503 connection errors into one un-triageable
-    // bucket that regresses the moment any sibling status reappears (RUST-46).
+    // 401 splits on the body, like the geo-block above: "Missing bearer" means
+    // the client sent NO credentials -- a setup bug (ours to fix, and worth an
+    // issue: the 2026-09-03 flagless-provider-block loop was invisible in
+    // Sentry precisely because 401 was excluded wholesale). Any other 401 is an
+    // invalid/expired key, which is the user's to fix (RUST-46 noise). Codex
+    // retries a failing request in a tight loop, so the reportable kind is
+    // throttled to one event per interval.
+    if status == 401 {
+        if !is_missing_auth_error(&body) || !should_report_throttled(&MISSING_AUTH_LAST_REPORTED) {
+            return;
+        }
+    }
+    // Group by client and status so each upstream failure class is its own
+    // Sentry issue. Without an explicit fingerprint, Sentry parameterizes the
+    // message and collapses 401 noise, 403 challenges and real 502/503
+    // connection errors into one un-triageable bucket that regresses the moment
+    // any sibling status reappears (RUST-46). Codex keeps its historical
+    // fingerprint so existing issues and their triage state carry over.
     let status_str = status.to_string();
+    let fingerprint: Vec<&str> = if client == "codex" {
+        vec!["codex-upstream-error", status_str.as_str()]
+    } else {
+        vec!["upstream-error", client, status_str.as_str()]
+    };
     // Tags, not extras: an extra can only be read one event at a time, so the
     // shape RUST-4V's 578 events shared was never visible from the issue view.
-    // Both values are bounded and content-free, so they stay aggregatable.
+    // All values are bounded and content-free, so they stay aggregatable.
     let shape = codex_error_shape_tag(&body);
     let content_type = response_content_type(head);
     sentry::with_scope(
         |scope| {
-            scope.set_tag("codex_upstream_status", status);
-            scope.set_tag("codex_request_path", &path);
-            scope.set_tag("codex_error_shape", &shape);
+            scope.set_tag("upstream_client", client);
+            scope.set_tag("upstream_status", status);
+            scope.set_tag("upstream_request_path", &path);
+            scope.set_tag("upstream_error_shape", &shape);
             if let Some(content_type) = content_type.as_deref() {
-                scope.set_tag("codex_response_content_type", content_type);
+                scope.set_tag("upstream_response_content_type", content_type);
             }
             scope.set_extra("error_body", snippet.clone().into());
-            scope.set_fingerprint(Some(&["codex-upstream-error", status_str.as_str()]));
+            scope.set_fingerprint(Some(&fingerprint));
         },
         || {
             sentry::capture_message(
-                &format!("codex upstream error {status} on {path}"),
+                &format!("{client} upstream error {status} on {path}"),
                 sentry::Level::Warning,
             );
         },
@@ -2948,14 +3056,15 @@ mod tests {
         decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
         intercept_request_counts, is_codex_request_head, is_codex_sse_response,
         is_geo_blocked_codex_error, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
-        is_local_proxy_path, is_openai_path, is_prompt_request_head, is_reportable_codex_error,
-        os_error_key, parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
-        response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        is_reportable_upstream_error, os_error_key, parse_codex_rate_limit_headers,
+        parse_request_head, parse_response_status, read_http_headers, request_has_header,
+        request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
+        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, stamp_client_header,
         stamp_codex_client_header, stamp_headroom_bypass_header, stamp_request_header,
         strip_request_header, verdict_permits_reuse, BypassFlag, CodexTerminalReader,
-        HeldPortVerdict, ModelsRewrite, ParsedRequestHead, SharedToken,
+        HeldPortVerdict, ModelsRewrite, ParsedRequestHead, ResponseSniffer, SharedToken,
         FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
@@ -3946,12 +4055,69 @@ mod tests {
     }
 
     #[test]
-    fn is_reportable_codex_error_excludes_2xx_429_and_401() {
-        assert!(is_reportable_codex_error(&400));
-        assert!(is_reportable_codex_error(&500));
-        assert!(!is_reportable_codex_error(&200));
-        assert!(!is_reportable_codex_error(&429));
-        assert!(!is_reportable_codex_error(&401));
+    fn is_reportable_upstream_error_excludes_2xx_and_429() {
+        assert!(is_reportable_upstream_error(&400));
+        assert!(is_reportable_upstream_error(&500));
+        assert!(!is_reportable_upstream_error(&200));
+        assert!(!is_reportable_upstream_error(&429));
+        // 401 gets the body peek; report_upstream_error drops the
+        // invalid-key kind and keeps only the missing-auth-header kind.
+        assert!(is_reportable_upstream_error(&401));
+    }
+
+    #[test]
+    fn is_missing_auth_error_splits_setup_bugs_from_bad_keys() {
+        // The 2026-09-03 Windows loop: client sent NO auth header at all.
+        assert!(is_missing_auth_error(
+            br#"{"error":{"message":"Missing bearer or basic authentication in header","type":"invalid_request_error","param":null,"code":null}}"#
+        ));
+        // Anthropic's no-credentials variant (Claude client sent no header).
+        assert!(is_missing_auth_error(
+            br#"{"type":"error","error":{"type":"authentication_error","message":"Could not resolve authentication method. Expected either x-api-key or authorization header to be provided."}}"#
+        ));
+        // Invalid/expired key is the user's problem, not reportable (RUST-46).
+        assert!(!is_missing_auth_error(
+            br#"{"error":{"message":"Incorrect API key provided: sk-abc...","type":"invalid_request_error","code":"invalid_api_key"}}"#
+        ));
+        assert!(!is_missing_auth_error(
+            br#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#
+        ));
+        assert!(!is_missing_auth_error(b"<html>401</html>"));
+        assert!(!is_missing_auth_error(b""));
+    }
+
+    #[test]
+    fn response_sniffer_captures_reportable_errors_only() {
+        // 200: nothing buffered, nothing to report on drop.
+        let mut ok = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()));
+        ok.observe(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: x");
+        assert!(ok.done && ok.buf.is_empty() && ok.status == Some(200));
+
+        // 400 on a client path: bounded capture retained for the Drop report.
+        let mut err = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()));
+        err.observe(b"HTTP/1.1 400 Bad Request\r\n");
+        err.observe(b"Content-Type: application/json\r\n\r\n{\"error\":{}}");
+        assert_eq!(err.status, Some(400));
+        assert!(!err.done, "keeps observing until the cap");
+        assert!(err.buf.ends_with(b"{\"error\":{}}"), "body slice captured");
+        // Neutralize the Drop report: unit tests must not emit Sentry events.
+        err.capture_path = None;
+
+        // Local proxy path (capture disabled): 404 is the RUST-87 squatter
+        // case, not a client error.
+        let mut local = ResponseSniffer::new((), "claude-code", None);
+        local.observe(b"HTTP/1.1 404 Not Found\r\n\r\n");
+        assert!(local.done && local.buf.is_empty());
+
+        // 429 is counted, never captured.
+        let mut limited = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()));
+        limited.observe(b"HTTP/1.1 429 Too Many Requests\r\n\r\n");
+        assert!(limited.done && limited.buf.is_empty());
+
+        // Non-HTTP stream: stops looking at the cap.
+        let mut raw = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()));
+        raw.observe(&[0u8; 128]);
+        assert!(raw.done && raw.status.is_none() && raw.buf.is_empty());
     }
 
     #[test]

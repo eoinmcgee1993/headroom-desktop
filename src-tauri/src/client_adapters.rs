@@ -747,7 +747,11 @@ pub fn repair_client_setups() -> Vec<String> {
         }
         match verify_client_setup(&client_id) {
             Ok(verification) if verification.failures.is_empty() => {
-                log::info!("repair_client_setups: repaired {client_id}");
+                // warn, not info: the log bridge forwards warns to Sentry, and
+                // a successful self-repair is the only fleet-visible trace of a
+                // config that was silently broken (e.g. the stale flagless
+                // Codex block, which 401'd every request until repaired).
+                log::warn!("repair_client_setups: repaired {client_id}");
                 repaired.push(client_id);
             }
             Ok(verification) => log::warn!(
