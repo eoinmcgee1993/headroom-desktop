@@ -1501,6 +1501,129 @@ def finalize_turn(
         # Anthropic OAuth traffic follows it. Off is always the safe answer for
         # an opt-in flag.
         _hd_os.environ["HEADROOM_CC_SWITCH_RECONCILE"] = "0"
+
+
+# ─── Read-maturation first-appearance accounting (desktop-only vendor) ───
+# The pipeline books tokens_saved per request as the raw-vs-forwarded token
+# diff, so a matured Read's removal is re-booked on EVERY later turn when its
+# recorded marker is replayed (read_maturation._handle_read replay branch;
+# the client re-sends the raw conversation each turn). Measured 2026-09-02 on
+# one machine, same day: new_input_savings_percent 31.8 percent before
+# maturation, 78.15 percent after - the gap is recounting, not new removal.
+#
+# This section subtracts the replayed-marker share at the ONE metrics seam,
+# PrometheusMetrics.record_request: it owns tokens_saved_total (which feeds
+# /stats tokens.saved and new_input_savings_percent) and forwards to
+# SavingsTracker (checkpoints, per-model, web rollups), so every book gets
+# first-appearance counting coherently. Newly-matured and fresh-tail savings
+# are untouched; matured content books exactly once, on the turn it matures.
+#
+# Bridge: a lock-guarded module-global pending counter, drained (clamped at
+# the request's own tokens_saved) by the next record_request. Deliberately
+# NOT task/context-scoped: the transform may run on a different task or
+# thread than the recording, and a context-scoped bridge silently no-ops
+# there. Cost of the global: with two sessions in flight, one request's
+# replay share can drain against the other's record, smearing per-model and
+# per-request attribution slightly - the cumulative books stay exact, which
+# is what the bars, checkpoints and rollups sum. A request that dies between
+# transform and record leaves its share pending; the next request drains it.
+#
+# Traffic neutrality: the wrapped transform method delegates unchanged and
+# only OBSERVES (the transform itself skips the frozen prefix, so observed
+# replay events align 1:1 with router-visible diffs); the subtraction happens
+# after the response on numbers no request-path decision reads. The token
+# delta uses the wheel's EstimatingTokenCounter (~90 percent of the booked
+# scale; drift moves only the subtracted share and the per-request clamp
+# keeps books non-negative). No upstream counterpart exists yet - drop this
+# section when the wheel ships first-appearance counting.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_MATURATION_FIRST_APPEARANCE=0.
+_hd_fa_flag = _hd_os.environ.get("HEADROOM_MATURATION_FIRST_APPEARANCE", "1")
+if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_fa_meta
+        import threading as _hd_fa_threading
+
+        if _hd_fa_meta.version("headroom-ai") == "0.37.0":
+            from headroom.proxy import prometheus_metrics as _hd_fa_pm
+            from headroom.transforms import read_maturation as _hd_fa_rm
+
+            _hd_fa_lock = _hd_fa_threading.Lock()
+            # Replayed-but-not-yet-drained token total, in a one-slot list so
+            # the probe (and this module's wrappers) share one mutable cell.
+            _hd_fa_pending = [0]
+            # Per-tool-call replay deltas, computed once (content and marker
+            # are stable per tc_id). Cleared wholesale at 4096 entries so a
+            # long-lived proxy cannot grow it without bound.
+            _hd_fa_deltas = {}
+
+            try:
+                from headroom.tokenizers.estimator import (
+                    EstimatingTokenCounter as _hd_fa_ETC,
+                )
+
+                _hd_fa_counter = _hd_fa_ETC()
+
+                def _hd_fa_count(text):
+                    return int(_hd_fa_counter.count_text(text))
+
+            except Exception:
+
+                def _hd_fa_count(text):
+                    return max(1, len(text) // 4)
+
+            _hd_fa_orig_handle = _hd_fa_rm.ReadMaturationManager._handle_read
+            _hd_fa_orig_record = _hd_fa_pm.PrometheusMetrics.record_request
+
+            def _hd_fa_handle(self, tc_id, content, activity, result):
+                matured_before = self._matured.get(tc_id)
+                out = _hd_fa_orig_handle(self, tc_id, content, activity, result)
+                try:
+                    # Replay branch only: matured on an EARLIER request and
+                    # replaced again now. Newly-matured stays fully booked.
+                    if matured_before is not None and out[0] is not None:
+                        delta = _hd_fa_deltas.get(tc_id)
+                        if delta is None:
+                            if len(_hd_fa_deltas) >= 4096:
+                                _hd_fa_deltas.clear()
+                            delta = max(
+                                0,
+                                _hd_fa_count(content)
+                                - _hd_fa_count(matured_before.marker),
+                            )
+                            _hd_fa_deltas[tc_id] = delta
+                        if delta > 0:
+                            with _hd_fa_lock:
+                                _hd_fa_pending[0] += delta
+                except Exception:
+                    # Accounting-only: never let bookkeeping break a request.
+                    pass
+                return out
+
+            async def _hd_fa_record(self, *args, **kwargs):
+                try:
+                    if "tokens_saved" in kwargs:
+                        with _hd_fa_lock:
+                            take = min(
+                                _hd_fa_pending[0], max(0, int(kwargs["tokens_saved"]))
+                            )
+                            if take > 0:
+                                _hd_fa_pending[0] -= take
+                        if take > 0:
+                            kwargs = dict(kwargs)
+                            kwargs["tokens_saved"] = int(kwargs["tokens_saved"]) - take
+                except Exception:
+                    pass
+                # Late-bound module-global lookup on purpose: the functional
+                # probe swaps _hd_fa_orig_record to verify subtract-once.
+                return await _hd_fa_orig_record(self, *args, **kwargs)
+
+            _hd_fa_rm.ReadMaturationManager._handle_read = _hd_fa_handle
+            _hd_fa_pm.PrometheusMetrics.record_request = _hd_fa_record
+    except Exception:
+        # Accounting-only vendor: any binding failure leaves the books
+        # exactly as upstream writes them. The request path is never touched
+        # from this section, so there is nothing to fail closed FOR.
+        pass
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
@@ -11919,6 +12042,48 @@ mod tests {
             "vendored prefix floor misbehaved against the installed wheel.\n\
              This is the machinery that caused the 0.9.4 regression -- do not \
              silence it.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn first_appearance_accounting_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-first-appearance.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hd-first-appear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run first-appearance probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that ships first-appearance counting upstream (or a bump
+        // past the 0.37.0 pin) leaves this vendor inert by design.
+        if stdout.contains("FAIL fa bound") && stderr.is_empty() {
+            eprintln!("skipping: first-appearance vendor did not bind (not the 0.37.0 pin)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK first-appearance"),
+            "first-appearance accounting misbehaved against the installed wheel.\n\
+             If traffic neutrality failed, do NOT ship: that is the 0.9.4 class\n\
+             of mistake.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
