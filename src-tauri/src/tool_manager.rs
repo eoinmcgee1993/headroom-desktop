@@ -1534,8 +1534,10 @@ def finalize_turn(
 # after the response on numbers no request-path decision reads. The token
 # delta uses the wheel's EstimatingTokenCounter (~90 percent of the booked
 # scale; drift moves only the subtracted share and the per-request clamp
-# keeps books non-negative). No upstream counterpart exists yet - drop this
-# section when the wheel ships first-appearance counting.
+# keeps books non-negative). The upstream counterpart is PR #3414
+# (fix(read-maturation): book matured Read savings once) - token-exact at
+# the handler seam, no bridge needed. Drop this section when a wheel ships
+# it; until then re-pin on every bump like the #3380 vendor above.
 # Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_MATURATION_FIRST_APPEARANCE=0.
 _hd_fa_flag = _hd_os.environ.get("HEADROOM_MATURATION_FIRST_APPEARANCE", "1")
 if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
