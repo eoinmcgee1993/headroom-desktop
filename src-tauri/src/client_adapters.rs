@@ -16,6 +16,15 @@ use crate::storage::{app_data_dir, config_file};
 // Raw proxy base — use provider-specific constants below when configuring client endpoints.
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6767";
 const HEADROOM_ANTHROPIC_BASE_URL: &str = "http://127.0.0.1:6767";
+// Companion to ANTHROPIC_BASE_URL. With a custom base URL and ENABLE_TOOL_SEARCH
+// unset, Claude Code stops deferring MCP/system tool schemas behind its
+// server-side Tool Search Tool and front-loads every tool definition into the
+// local context window (issue #746). A heavy MCP setup then spends tens of
+// thousands of tokens per turn on tool schemas alone, and small sessions fall
+// into an auto-compact loop. `headroom wrap claude` sets this; the settings.json
+// wiring must too. We write it only when unset so a user's own value wins.
+const HEADROOM_ENABLE_TOOL_SEARCH_KEY: &str = "ENABLE_TOOL_SEARCH";
+const HEADROOM_ENABLE_TOOL_SEARCH_VALUE: &str = "true";
 const HEADROOM_OPENAI_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const HEADROOM_GROK_PROXY_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const ZSH_PROFILE_FILE: &str = ".zprofile";
@@ -323,6 +332,15 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                     .insert(state_id.clone(), original.clone());
                 replaced_base_url = Some(original);
             }
+            // Ride ENABLE_TOOL_SEARCH alongside the base URL so Claude Code keeps
+            // deferring tool schemas (issue #746). If-absent so a user's own value
+            // wins.
+            let mut tool_search = configure_claude_settings_env_if_absent(
+                HEADROOM_ENABLE_TOOL_SEARCH_KEY,
+                HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
+            )?;
+            updates.0.append(&mut tool_search.0);
+            updates.1.append(&mut tool_search.1);
             let mut legacy_updates = remove_legacy_vscode_base_url_keys()?;
             updates.0.append(&mut legacy_updates.0);
             updates.1.append(&mut legacy_updates.1);
@@ -874,6 +892,12 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
                 HEADROOM_ANTHROPIC_BASE_URL,
                 preserved.as_deref(),
             )?;
+            // Drop the ENABLE_TOOL_SEARCH we planted (no-op unless still ours).
+            let _ = remove_claude_settings_env(
+                HEADROOM_ENABLE_TOOL_SEARCH_KEY,
+                HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
+                None,
+            );
             let _ = remove_legacy_vscode_base_url_keys()?;
             // Strip the PreToolUse hook entry and delete the hook script so CC
             // behaves exactly as it did before Headroom was launched.
@@ -1214,6 +1238,13 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
         preserved.as_deref(),
     ) {
         log::warn!("cleanup: removing ANTHROPIC_BASE_URL from Claude settings failed: {err}");
+    }
+    if let Err(err) = remove_claude_settings_env(
+        HEADROOM_ENABLE_TOOL_SEARCH_KEY,
+        HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
+        None,
+    ) {
+        log::warn!("cleanup: removing ENABLE_TOOL_SEARCH from Claude settings failed: {err}");
     }
     if let Err(err) = remove_claude_guard_hook() {
         log::warn!("cleanup: removing Claude guard hook failed: {err}");
@@ -2527,6 +2558,12 @@ fn clear_legacy_codex_gui_launch_env() -> Result<()> {
 fn configure_vscode_settings() -> Result<(Vec<String>, Vec<String>, Option<String>)> {
     let (mut changed_files, mut backup_files, replaced) =
         configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+    let (ts_changed, ts_backups, _) = configure_claude_settings_env_if_absent(
+        HEADROOM_ENABLE_TOOL_SEARCH_KEY,
+        HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
+    )?;
+    changed_files.extend(ts_changed);
+    backup_files.extend(ts_backups);
     let (legacy_changed, legacy_backups) = remove_legacy_vscode_base_url_keys()?;
     changed_files.extend(legacy_changed);
     backup_files.extend(legacy_backups);
@@ -2539,6 +2576,11 @@ fn remove_vscode_connector_keys(restore_value: Option<&str>) -> Result<()> {
         HEADROOM_ANTHROPIC_BASE_URL,
         restore_value,
     )?;
+    let _ = remove_claude_settings_env(
+        HEADROOM_ENABLE_TOOL_SEARCH_KEY,
+        HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
+        None,
+    );
     let _ = remove_legacy_vscode_base_url_keys()?;
     Ok(())
 }
@@ -2577,6 +2619,25 @@ fn configure_claude_settings_env(
     env_key: &str,
     env_value: &str,
 ) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+    configure_claude_settings_env_impl(env_key, env_value, true)
+}
+
+/// Like `configure_claude_settings_env`, but leaves a pre-existing, non-empty
+/// value in place. Used for ENABLE_TOOL_SEARCH: we default it on, but a value
+/// the user set themselves (e.g. `false` as the LSP tool_reference-400 fallback)
+/// wins, mirroring `headroom wrap claude`'s precedence.
+fn configure_claude_settings_env_if_absent(
+    env_key: &str,
+    env_value: &str,
+) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+    configure_claude_settings_env_impl(env_key, env_value, false)
+}
+
+fn configure_claude_settings_env_impl(
+    env_key: &str,
+    env_value: &str,
+    overwrite_existing: bool,
+) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
     let settings_path = claude_settings_path();
     let mut content = if settings_path.exists() {
         let raw = std::fs::read_to_string(&settings_path)
@@ -2605,6 +2666,17 @@ fn configure_claude_settings_env(
     let Some(env_obj) = root.get_mut("env").and_then(|value| value.as_object_mut()) else {
         return Err(anyhow!("unable to write Claude env settings"));
     };
+
+    if !overwrite_existing {
+        let has_value = env_obj
+            .get(env_key)
+            .and_then(|value| value.as_str())
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if has_value {
+            return Ok((Vec::new(), Vec::new(), None));
+        }
+    }
 
     let replaced_foreign_value = env_obj
         .get(env_key)
@@ -8619,6 +8691,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             Some("http://127.0.0.1:6767"),
             "claude settings.json points env at headroom proxy"
         );
+        assert_eq!(
+            settings["env"]["ENABLE_TOOL_SEARCH"].as_str(),
+            Some("true"),
+            "claude settings.json keeps tool-schema deferral on (issue #746)"
+        );
         let pre_tool_use = &settings["hooks"]["PreToolUse"];
         assert!(
             pre_tool_use.is_array() && !pre_tool_use.as_array().unwrap().is_empty(),
@@ -8656,6 +8733,73 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .any(|c| c.contains("RTK Claude hook")),
             "verification reports the hook check, got: {:?}",
             verification.checks
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn enable_tool_search_defaults_on_but_respects_user_value() {
+        let home = TestHome::new();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::write(
+            &settings,
+            r#"{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767"}}"#,
+        )
+        .unwrap();
+
+        // Absent -> we plant our default.
+        super::configure_claude_settings_env_if_absent(
+            super::HEADROOM_ENABLE_TOOL_SEARCH_KEY,
+            super::HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_claude_settings_env("ENABLE_TOOL_SEARCH").unwrap(),
+            Some("true".to_string())
+        );
+
+        // User set it themselves (e.g. "false" as the LSP-400 fallback) -> untouched.
+        fs::write(
+            &settings,
+            r#"{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767", "ENABLE_TOOL_SEARCH": "false"}}"#,
+        )
+        .unwrap();
+        super::configure_claude_settings_env_if_absent(
+            super::HEADROOM_ENABLE_TOOL_SEARCH_KEY,
+            super::HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_claude_settings_env("ENABLE_TOOL_SEARCH").unwrap(),
+            Some("false".to_string()),
+            "a user-owned value must not be clobbered"
+        );
+
+        // Cleanup only strips our own value, so the user's "false" survives.
+        super::remove_claude_settings_env(
+            super::HEADROOM_ENABLE_TOOL_SEARCH_KEY,
+            super::HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_claude_settings_env("ENABLE_TOOL_SEARCH").unwrap(),
+            Some("false".to_string()),
+            "cleanup must not delete a user-owned value"
+        );
+
+        // Our own planted value, though, is removed on cleanup.
+        super::configure_claude_settings_env("ENABLE_TOOL_SEARCH", "true").unwrap();
+        super::remove_claude_settings_env(
+            super::HEADROOM_ENABLE_TOOL_SEARCH_KEY,
+            super::HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_claude_settings_env("ENABLE_TOOL_SEARCH").unwrap(),
+            None
         );
     }
 
