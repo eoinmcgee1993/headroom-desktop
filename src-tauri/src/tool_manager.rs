@@ -1626,6 +1626,65 @@ if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # exactly as upstream writes them. The request path is never touched
         # from this section, so there is nothing to fail closed FOR.
         pass
+
+
+# ─── Tool-search history repair: deferred tools are not available (vendor) ───
+# With ENABLE_TOOL_SEARCH=true the Claude Code client runs its OWN tool search:
+# it sends the full tools array with most tools marked defer_loading=true, plus
+# a tool_search_tool_* mechanism tool, and persists tool_search_tool_result
+# blocks (each carrying tool_reference entries) into the transcript as tools
+# load on demand. Headroom's wire deferral stands down in this case, so the
+# client's array reaches the upstream with its defer markers intact.
+#
+# Anthropic rejects a historical tool_reference whose target is currently
+# deferred: "400 Tool reference 'CronCreate' not found in available tools". The
+# wheel's strip_unsupported_tool_search_blocks is meant to drop exactly those
+# stale blocks, but it builds `available` from every named non-search tool
+# REGARDLESS of defer_loading, so it counts a still-deferred tool as available,
+# keeps the block, and the request 400s. This bricked heavy-MCP users the moment
+# 0.9.8-rc.3 planted ENABLE_TOOL_SEARCH=true.
+#
+# Fix: hand the repair a tools view with defer_loading=true entries removed, so
+# `available` matches Anthropic's own availability semantics. The function only
+# READS tools (to compute `available` and `has_search_tool`) and returns
+# (messages, removed) -- it never returns or mutates tools -- so the forwarded
+# body["tools"] is untouched and only the keep/drop decision changes. The
+# tool_search_tool_* mechanism tool is never defer_loading, so has_search_tool
+# stays true and healthy loaded/absent transcripts behave exactly as before.
+# Self-heals a session poisoned before this shipped, on its next request. The
+# handler late-imports this symbol per request, so a module-level reassign here
+# is picked up. Upstream fix owed; drop this section when a wheel ships it.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_TOOL_SEARCH_DEFER_REPAIR=0.
+_hd_tsr_flag = _hd_os.environ.get("HEADROOM_TOOL_SEARCH_DEFER_REPAIR", "1")
+if _hd_tsr_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_tsr_meta
+
+        if _hd_tsr_meta.version("headroom-ai") == "0.37.0":
+            from headroom.proxy import helpers as _hd_tsr_helpers
+
+            _hd_tsr_orig = _hd_tsr_helpers.strip_unsupported_tool_search_blocks
+
+            def _hd_tsr_wrapped(messages, tools):
+                # A deferred tool is not loaded, so a historical tool_reference
+                # to it is unsupportable on THIS request; hide deferred tools
+                # from the availability check so the repair drops the stale
+                # block instead of forwarding a 400. `tools` itself is untouched.
+                filtered = tools
+                if isinstance(tools, list):
+                    filtered = [
+                        t
+                        for t in tools
+                        if not (isinstance(t, dict) and t.get("defer_loading"))
+                    ]
+                return _hd_tsr_orig(messages, filtered)
+
+            _hd_tsr_helpers.strip_unsupported_tool_search_blocks = _hd_tsr_wrapped
+    except Exception:
+        # Request-path wrapper: on any binding failure fall back to the wheel's
+        # own repair unchanged. The wrapper only narrows the availability input,
+        # so the worst case is the pre-fix behavior, never a new failure mode.
+        pass
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
@@ -12142,6 +12201,27 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_tool_search_deferred_repair() {
+        // The rc.3 "Tool reference 'CronCreate' not found in available tools"
+        // 400 came from the wheel's strip_unsupported_tool_search_blocks
+        // counting a defer_loading=true tool as available. The vendor narrows
+        // the availability input to drop deferred tools. Behaviour is proven by
+        // tool_search_deferred_repair_behaves_against_the_installed_wheel; this
+        // pins the shape.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_TOOL_SEARCH_DEFER_REPAIR"));
+        // Exact-pin gated: any other wheel keeps its own repair.
+        assert!(py.contains(r#"_hd_tsr_meta.version("headroom-ai") == "0.37.0""#));
+        // The wrapper filters defer_loading and delegates to the wheel's repair.
+        assert!(py.contains(r#"t.get("defer_loading")"#));
+        assert!(py.contains("_hd_tsr_orig(messages, filtered)"));
+        // It must reassign the module symbol the handler late-imports.
+        assert!(
+            py.contains("_hd_tsr_helpers.strip_unsupported_tool_search_blocks = _hd_tsr_wrapped")
+        );
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -12272,6 +12352,54 @@ mod tests {
             "first-appearance accounting misbehaved against the installed wheel.\n\
              If traffic neutrality failed, do NOT ship: that is the 0.9.4 class\n\
              of mistake.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn tool_search_deferred_repair_behaves_against_the_installed_wheel() {
+        // The rc.3 400 regression ("Tool reference 'CronCreate' not found in
+        // available tools") lived in the WHEEL's history repair, not the string
+        // blob. This runs the shipped sitecustomize against the installed wheel
+        // and asserts a deferred tool is hidden from the availability check
+        // (deferred reference dropped, loaded kept, kill switch reverts).
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-tool-search-repair.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("hd-tool-search-repair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run tool-search-repair probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that ships the fix upstream (or a bump past the 0.37.0 pin)
+        // leaves this vendor inert by design.
+        if stdout.contains("FAIL tsr bound") && stderr.is_empty() {
+            eprintln!("skipping: tool-search repair vendor did not bind (not the 0.37.0 pin)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK tool-search repair"),
+            "tool-search deferred-availability repair misbehaved against the\n\
+             installed wheel. If the deferred reference was kept, the rc.3 400\n\
+             regression is back.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
