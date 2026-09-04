@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { AppUpdateConfiguration, AvailableAppUpdate } from "./types";
 import {
+  displayAppUpdateNotes,
   formatAppUpdateProgressCopy,
   getAppUpdateInstallStatusCopy,
   getBlockedAppUpdateCheckPatch,
+  isLoudAppUpdate,
   loadAppUpdateConfiguration,
   maybeFireStaleAppUpdateNotification,
   runAppUpdateCheck,
@@ -39,6 +41,7 @@ const disabledConfig: AppUpdateConfiguration = {
   endpointCount: 0,
   configurationError: null,
   betaChannelEnabled: false,
+  silentInstallSupported: false,
 };
 
 const brokenConfig: AppUpdateConfiguration = {
@@ -47,6 +50,7 @@ const brokenConfig: AppUpdateConfiguration = {
   endpointCount: 0,
   configurationError: "HEADROOM_UPDATER_PUBLIC_KEY is missing.",
   betaChannelEnabled: false,
+  silentInstallSupported: false,
 };
 
 const availableUpdate: AvailableAppUpdate = {
@@ -54,6 +58,11 @@ const availableUpdate: AvailableAppUpdate = {
   version: "0.3.0",
   publishedAt: "2026-04-02T12:00:00Z",
   notes: "Bug fixes.",
+};
+
+const loudUpdate: AvailableAppUpdate = {
+  ...availableUpdate,
+  notes: "Critical fix.\n\n<!-- headroom:loud -->",
 };
 
 describe("app update helpers", () => {
@@ -99,6 +108,55 @@ describe("app update helpers", () => {
       availableUpdate,
       readyToRestart: false,
       showDialog: true,
+      statusCopy: "Update available: 0.3.0.",
+    });
+  });
+
+  it("keeps quiet background updates out of the dialog entirely", async () => {
+    const invokeFn = vi.fn().mockResolvedValueOnce(availableUpdate);
+
+    const result = await runAppUpdateCheck({
+      background: true,
+      knownUpdateVersion: null,
+      invokeFn,
+    });
+
+    expect(result).toEqual({
+      availableUpdate,
+      readyToRestart: false,
+      statusCopy: "Update available: 0.3.0.",
+    });
+  });
+
+  it("opens the dialog for newly discovered loud background updates", async () => {
+    const invokeFn = vi.fn().mockResolvedValueOnce(loudUpdate);
+
+    const result = await runAppUpdateCheck({
+      background: true,
+      knownUpdateVersion: null,
+      invokeFn,
+    });
+
+    expect(result).toEqual({
+      availableUpdate: loudUpdate,
+      readyToRestart: false,
+      showDialog: true,
+      statusCopy: "Update available: 0.3.0.",
+    });
+  });
+
+  it("keeps background checks from reopening the same loud update dialog every hour", async () => {
+    const invokeFn = vi.fn().mockResolvedValueOnce(loudUpdate);
+
+    const result = await runAppUpdateCheck({
+      background: true,
+      knownUpdateVersion: "0.3.0",
+      invokeFn,
+    });
+
+    expect(result).toEqual({
+      availableUpdate: loudUpdate,
+      readyToRestart: false,
       statusCopy: "Update available: 0.3.0.",
     });
   });
@@ -149,7 +207,16 @@ describe("app update helpers", () => {
     });
   });
 
-  it("notifies only for newly discovered background updates while the window is hidden", () => {
+  it("notifies only for newly discovered loud background updates while the window is hidden", () => {
+    expect(
+      shouldNotifyAboutAvailableAppUpdate({
+        background: true,
+        availableUpdate: loudUpdate,
+        knownUpdateVersion: null,
+        windowVisible: false,
+      })
+    ).toBe(true);
+    // Quiet releases never fire the fresh-update notification.
     expect(
       shouldNotifyAboutAvailableAppUpdate({
         background: true,
@@ -157,11 +224,11 @@ describe("app update helpers", () => {
         knownUpdateVersion: null,
         windowVisible: false,
       })
-    ).toBe(true);
+    ).toBe(false);
     expect(
       shouldNotifyAboutAvailableAppUpdate({
         background: true,
-        availableUpdate,
+        availableUpdate: loudUpdate,
         knownUpdateVersion: "0.3.0",
         windowVisible: false,
       })
@@ -169,7 +236,7 @@ describe("app update helpers", () => {
     expect(
       shouldNotifyAboutAvailableAppUpdate({
         background: true,
-        availableUpdate,
+        availableUpdate: loudUpdate,
         knownUpdateVersion: null,
         windowVisible: true,
       })
@@ -177,7 +244,7 @@ describe("app update helpers", () => {
     expect(
       shouldNotifyAboutAvailableAppUpdate({
         background: false,
-        availableUpdate,
+        availableUpdate: loudUpdate,
         knownUpdateVersion: null,
         windowVisible: false,
       })
@@ -203,6 +270,31 @@ describe("app update helpers", () => {
       showDialog: true,
       statusCopy: "Headroom 0.3.0 is installed and ready to restart.",
     });
+  });
+
+  it("skips the dialog when a quiet install finishes in the background", async () => {
+    const invokeFn = vi.fn().mockResolvedValueOnce(undefined);
+
+    const result = await runAppUpdateInstall({
+      availableUpdate,
+      quiet: true,
+      invokeFn,
+    });
+
+    expect(result).toEqual({
+      readyToRestart: true,
+      statusCopy: "Headroom 0.3.0 is installed and ready to restart.",
+    });
+  });
+
+  it("detects the loud marker and strips it from displayed notes", () => {
+    expect(isLoudAppUpdate(loudUpdate)).toBe(true);
+    expect(isLoudAppUpdate(availableUpdate)).toBe(false);
+    expect(isLoudAppUpdate(null)).toBe(false);
+    expect(isLoudAppUpdate({ ...availableUpdate, notes: null })).toBe(false);
+    expect(displayAppUpdateNotes(loudUpdate.notes)).toBe("Critical fix.");
+    expect(displayAppUpdateNotes("Bug fixes.")).toBe("Bug fixes.");
+    expect(displayAppUpdateNotes(null)).toBe("");
   });
 
   it("surfaces install errors without mutating update state", async () => {

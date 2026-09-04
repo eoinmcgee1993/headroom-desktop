@@ -209,6 +209,11 @@ struct AppUpdateConfiguration {
     endpoint_count: usize,
     configuration_error: Option<String>,
     beta_channel_enabled: bool,
+    // macOS install() swaps the .app in place with no privilege prompt, so the
+    // frontend may stage updates silently. Windows install() exits the app to
+    // run the installer, and Linux .deb raises a polkit prompt - both must
+    // stay behind an explicit user click.
+    silent_install_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -781,6 +786,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
             endpoint_count: config.endpoints.len(),
             configuration_error: None,
             beta_channel_enabled,
+            silent_install_supported: cfg!(target_os = "macos"),
         },
         Ok(None) => AppUpdateConfiguration {
             enabled: false,
@@ -788,6 +794,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
             endpoint_count: 0,
             configuration_error: None,
             beta_channel_enabled,
+            silent_install_supported: cfg!(target_os = "macos"),
         },
         Err(ref err) => {
             sentry::capture_message(
@@ -800,6 +807,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
                 endpoint_count: 0,
                 configuration_error: Some(err.clone()),
                 beta_channel_enabled,
+                silent_install_supported: cfg!(target_os = "macos"),
             }
         }
     }

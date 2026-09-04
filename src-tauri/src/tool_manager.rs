@@ -3585,16 +3585,7 @@ impl ToolManager {
                 .rposition(|f| !f.log_tail.is_empty())
                 .unwrap_or(failures.len() - 1);
             let last = failures.remove(chosen);
-            let prior_summary = if failures.is_empty() {
-                String::new()
-            } else {
-                let joined = failures
-                    .iter()
-                    .map(|f| format!("{} {} {}", f.program, f.args.join(" "), f.reason))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                format!(" (prior attempts: {})", joined)
-            };
+            let prior_summary = prior_attempts_summary(&failures);
             // Silent-crash instrumentation (RUST-9F / RUST-9T): on Windows,
             // python dying with exit code 0xffffffff before opening the port
             // leaves no traceback -- faulthandler never runs when a native DLL
@@ -3610,9 +3601,13 @@ impl ToolManager {
             } else {
                 String::new()
             };
+            // Probe verdict before the attempt list: the log bridge caps a
+            // Sentry message at 400 chars, and RUST-BX/RUST-BV arrived as
+            // "(onnx probe: o" -- the one diagnostic the whole instrumentation
+            // exists for, cut off behind a Windows venv path.
             return Err(anyhow::Error::from(last).context(format!(
                 "unable to keep headroom running in background{}{}",
-                prior_summary, onnx_note
+                onnx_note, prior_summary
             )));
         }
     }
@@ -11566,14 +11561,40 @@ pub struct HeadroomStartupFailure {
     pub reason: String,
 }
 
+/// The attempts that failed before the reported one, as "<exe>: <reason>"
+/// pairs. Program basename and reason only: the args are the same spawn line
+/// every variant shares, and a Windows venv path plus that line is ~210 chars
+/// of noise per attempt, which is what pushed the reason and the onnx verdict
+/// past the 400-char Sentry message cap (RUST-BX, RUST-BV). Full command
+/// lines stay in the local log.
+fn prior_attempts_summary(failures: &[HeadroomStartupFailure]) -> String {
+    if failures.is_empty() {
+        return String::new();
+    }
+    let joined = failures
+        .iter()
+        .map(|f| {
+            let exe = std::path::Path::new(&f.program)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| f.program.clone());
+            format!("{exe}: {}", f.reason)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(" (prior attempts: {joined})")
+}
+
 impl std::fmt::Display for HeadroomStartupFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Reason first: this Display is the tail of the Sentry message and
+        // the program path plus args alone can exhaust the 400-char cap.
         write!(
             f,
-            "{} {} {} (log: {}){}",
+            "{} ({} {}; log: {}){}",
+            self.reason,
             self.program,
             self.args.join(" "),
-            self.reason,
             self.log_path,
             if self.log_tail.is_empty() {
                 String::new()
@@ -12368,6 +12389,63 @@ mod tests {
     /// RUST-75 arrived as a bare torch DLL error. The ONNX failure that
     /// preceded it -- same missing MSVC redistributable, and the actual first
     /// cause -- was dropped, so the report pointed at the wrong library.
+    #[test]
+    fn startup_failure_summary_keeps_reason_and_probe_inside_the_sentry_cap() {
+        // RUST-BX / RUST-BV: a Windows venv path plus the spawn args ran the
+        // message past the 400-char log-bridge cap before the reason or the
+        // onnx verdict appeared.
+        let exe = r"C:\Users\jao\AppData\Local\Headroom\headroom\runtime\venv\Scripts\headroom.exe";
+        let args: Vec<String> = [
+            "proxy",
+            "--port",
+            "6768",
+            "--no-http2",
+            "--log-messages",
+            "--learn",
+            "--no-memory-tools",
+            "--no-memory-context",
+            "--memory-db-path",
+            r"C:\Users\jao\AppData\Local\Headroom\memory.db",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let failure = |reason: &str| super::HeadroomStartupFailure {
+            program: exe.to_string(),
+            args: args.clone(),
+            log_path: r"C:\Users\jao\AppData\Local\Headroom\logs\proxy.log".to_string(),
+            log_tail: String::new(),
+            reason: reason.to_string(),
+        };
+        let prior = vec![failure(
+            "exited with status exit code: 0xffffffff before opening port 6768",
+        )];
+        let last = failure("never opened port 6768 within 300000ms");
+        let err = anyhow::Error::from(last).context(format!(
+            "unable to keep headroom running in background{}{}",
+            " (onnx probe: import onnxruntime failed (exit 0xffffffff): <no stderr>)",
+            super::prior_attempts_summary(&prior)
+        ));
+        let message = format!("watchdog: hung-kill restart failed: {err:#}");
+        let head: String = message.chars().take(400).collect();
+        assert!(
+            head.contains("onnx probe: import onnxruntime failed"),
+            "{head}"
+        );
+        assert!(
+            head.contains("headroom.exe: exited with status exit code: 0xffffffff"),
+            "{head}"
+        );
+        assert!(
+            head.contains("never opened port 6768 within 300000ms"),
+            "{head}"
+        );
+        assert!(
+            !head.contains("--memory-db-path"),
+            "args must not lead: {head}"
+        );
+    }
+
     #[test]
     fn summarize_kompress_prefetch_failure_carries_the_earlier_onnx_cause() {
         let dir = std::env::temp_dir().join(format!(

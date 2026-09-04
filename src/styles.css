@@ -281,30 +281,11 @@ select {
   gap: 14px;
 }
 
-.post-install__steps {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+.post-install__checklist > p {
   margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.post-install__step {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  text-align: left;
-}
-
-.post-install__step strong {
   font-size: var(--text-sm);
-  color: var(--text-primary);
-}
-
-.post-install__step p {
-  margin: 2px 0 0;
-  font-size: var(--text-xs);
+  line-height: 1.4;
+  text-align: left;
   color: var(--text-muted);
 }
 
