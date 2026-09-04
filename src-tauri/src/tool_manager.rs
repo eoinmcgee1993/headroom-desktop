@@ -2183,6 +2183,37 @@ impl ManagedRuntime {
         }
     }
 
+    /// True when the base interpreter's stdlib is where CPython's own getpath
+    /// looks for it (`Lib\os.py` on Windows, `lib/python3.X/os.py` elsewhere).
+    /// A base whose `python.exe` survived but whose `Lib` tree did not (AV
+    /// quarantine, disk cleanup: RUST-C8) passes the executable check, then
+    /// every spawn dies in `init_fs_encoding` with `No module named
+    /// 'encodings'`; getpath falls back to the child's cwd as prefix, which
+    /// is why that log blames `<root>\Lib`. Any `python3.*` dir counts, so a
+    /// pinned-Python bump cannot flip every install to "not installed".
+    pub fn standalone_stdlib_present(&self) -> bool {
+        if cfg!(target_os = "windows") {
+            return self.python_dir.join("Lib").join("os.py").is_file();
+        }
+        let Ok(entries) = std::fs::read_dir(self.python_dir.join("lib")) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry.file_name().to_string_lossy().starts_with("python3")
+                && entry.path().join("os.py").is_file()
+        })
+    }
+
+    /// Base interpreter present and able to boot (see
+    /// [`Self::standalone_stdlib_present`]). This, not `standalone_python()`
+    /// alone, is the gate for both "installed" and "skip the download":
+    /// bootstrap used to skip the only repair path for `runtime/python` as
+    /// soon as `python.exe` existed, so a stdlib-less base stayed broken until
+    /// someone deleted the directory by hand.
+    pub fn standalone_runtime_intact(&self) -> bool {
+        self.standalone_python().exists() && self.standalone_stdlib_present()
+    }
+
     pub fn managed_python(&self) -> PathBuf {
         self.venv_dir.join(bin_subdir()).join(python_exe_name())
     }
@@ -2794,9 +2825,11 @@ impl ToolManager {
         // every pip) dies with exit 106 / `No pyvenv.cfg file` (RUST-6S,
         // third shape). Checking it here is what routes that machine back to
         // bootstrap's rebuild instead of a permanent pip-retry loop.
+        // RUST-C8: the base can also lose its stdlib while keeping python.exe
+        // (same routing, one directory deeper), hence `intact`, not `exists`.
         self.runtime.ready_flag().exists()
             && self.runtime.managed_python().exists()
-            && self.runtime.standalone_python().exists()
+            && self.runtime.standalone_runtime_intact()
             && self.runtime.venv_dir.join("pyvenv.cfg").exists()
     }
 
@@ -3543,7 +3576,7 @@ impl ToolManager {
                     program: executable.display().to_string(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                     log_path: log_path.display().to_string(),
-                    log_tail: tail_log_file(&log_path, 80),
+                    log_tail: crash_log_excerpt(&log_path),
                     reason,
                 });
             }
@@ -4366,7 +4399,7 @@ impl ToolManager {
         });
         self.runtime.ensure_layout()?;
 
-        if !self.runtime.standalone_python().exists() {
+        if !self.runtime.standalone_runtime_intact() {
             log::info!("bootstrap: downloading standalone Python runtime");
             progress(BootstrapStepUpdate {
                 step: "Downloading Python",
@@ -8550,6 +8583,10 @@ fn kill_pid(pid: u32, force: bool) {
         if force {
             command.arg("-KILL");
         }
+        crate::state::note_app_kill(
+            "kill_pid",
+            format!("{} pid {pid}", if force { "-KILL" } else { "-TERM" }),
+        );
         let _ = command.arg(pid.to_string()).status();
     }
 }
@@ -8707,6 +8744,50 @@ fn format_all_foreign_bail(default_port: u16, occupant: &str, range: (u16, u16))
         "port {default_port} is occupied by a non-headroom process ({occupant}) and fallback ports {start}-{end} are also unavailable; cannot start proxy. \
          Reboot to clear stuck listeners, then relaunch Headroom."
     )
+}
+
+/// The lines that name the fatal condition behind a faulthandler dump. The
+/// all-threads dump that follows them runs well past the 80-line tail Sentry
+/// gets (RUST-C7: seven idle threads plus a 100-frame import chain), so the one
+/// line that says access violation / Aborted / OMP error was exactly what got
+/// cut. Keeps the last few matches: the log is append-only across attempts and
+/// the newest dump is the one being reported.
+fn fatal_header_lines(path: &Path) -> Vec<String> {
+    const MARKERS: &[&str] = &[
+        "Fatal Python error",
+        "Windows fatal exception",
+        "OMP: Error",
+        "Current thread 0x",
+    ];
+    const KEEP: usize = 6;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if MARKERS.iter().any(|m| line.contains(m)) {
+            if kept.len() == KEEP {
+                kept.pop_front();
+            }
+            kept.push_back(redact_sensitive(&line));
+        }
+    }
+    kept.into_iter().collect()
+}
+
+/// The 80-line tail a startup failure carries to Sentry, led by the fatal
+/// marker lines when the log holds a crash dump (see [`fatal_header_lines`]).
+fn crash_log_excerpt(path: &Path) -> String {
+    let tail = tail_log_file(path, 80);
+    let header = fatal_header_lines(path);
+    if header.is_empty() {
+        tail
+    } else {
+        format!(
+            "--- fatal markers ---\n{}\n--- tail ---\n{tail}",
+            header.join("\n")
+        )
+    }
 }
 
 pub(crate) fn tail_log_file(path: &Path, max_lines: usize) -> String {
@@ -12390,6 +12471,37 @@ mod tests {
     /// preceded it -- same missing MSVC redistributable, and the actual first
     /// cause -- was dropped, so the report pointed at the wrong library.
     #[test]
+    fn crash_log_excerpt_leads_with_the_dump_header_the_tail_drops() {
+        // RUST-C7 shape: header, then a dump long enough that an 80-line
+        // tail starts mid-traceback.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("headroom-proxy.log");
+        let mut body = String::from("banner line\nFatal Python error: Aborted\n\n");
+        body.push_str("Current thread 0x00001234 (most recent call first):\n");
+        for i in 0..150 {
+            body.push_str(&format!(
+                "  File \"sklearn/__init__.py\", line {i} in <module>\n"
+            ));
+        }
+        std::fs::write(&log, body).unwrap();
+        let excerpt = super::crash_log_excerpt(&log);
+        assert!(
+            excerpt.starts_with(
+                "--- fatal markers ---\nFatal Python error: Aborted\nCurrent thread 0x00001234"
+            ),
+            "{excerpt}"
+        );
+        assert!(excerpt.contains("--- tail ---\n"), "{excerpt}");
+        assert!(
+            !excerpt.contains("banner line"),
+            "tail must stay the last 80 lines: {excerpt}"
+        );
+        // No dump: plain tail, no marker section.
+        std::fs::write(&log, "just\na\nlog\n").unwrap();
+        assert_eq!(super::crash_log_excerpt(&log), "just\na\nlog");
+    }
+
+    #[test]
     fn startup_failure_summary_keeps_reason_and_probe_inside_the_sentry_cap() {
         // RUST-BX / RUST-BV: a Windows venv path plus the spawn args ran the
         // message past the 400-char log-bridge cap before the reason or the
@@ -14835,10 +14947,37 @@ after
             "a venv missing pyvenv.cfg must not read as installed"
         );
         fs::write(runtime.venv_dir.join("pyvenv.cfg"), b"").expect("pyvenv.cfg");
+        // RUST-C8: python.exe survived but the stdlib next to it did not.
+        // Every spawn dies with `No module named 'encodings'`, and bootstrap
+        // skipped the reinstall because the executable existed.
+        assert!(
+            !manager.python_runtime_installed(),
+            "a base whose stdlib is gone must not read as installed"
+        );
+        let landmark = seed_stdlib_landmark(&runtime);
         assert!(
             manager.python_runtime_installed(),
-            "all four markers present must read as installed"
+            "all markers present must read as installed"
         );
+        fs::remove_file(&landmark).expect("remove landmark");
+        assert!(!runtime.standalone_runtime_intact());
+    }
+
+    /// Creates the `os.py` landmark CPython's getpath looks for next to the
+    /// base interpreter, and returns its path.
+    fn seed_stdlib_landmark(runtime: &ManagedRuntime) -> PathBuf {
+        let landmark = if cfg!(target_os = "windows") {
+            runtime.python_dir.join("Lib").join("os.py")
+        } else {
+            runtime
+                .python_dir
+                .join("lib")
+                .join("python3.12")
+                .join("os.py")
+        };
+        fs::create_dir_all(landmark.parent().expect("parent")).expect("mkdir");
+        fs::write(&landmark, b"").expect("landmark");
+        landmark
     }
 
     /// RUST-82: `python -m venv` runs ensurepip through `check_output` and

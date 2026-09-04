@@ -2353,6 +2353,12 @@ pub(crate) fn capture_headroom_start_failure(context: &str, err: &anyhow::Error)
                 // launch/tray lifecycles apart; `category` is the cause class.
                 // Neither can fragment, unlike the argv in the message text.
                 scope.set_fingerprint(Some(&["headroom-start-failed", context, &category]));
+                // Who signalled a child that died before binding: our own
+                // recent kills, oldest first, or empty when we sent none.
+                scope.set_extra(
+                    "recent_app_kills",
+                    state::recent_app_kills_summary().join("\n").into(),
+                );
                 scope.set_extra("program", failure.program.clone().into());
                 scope.set_extra("args", failure.args.join(" ").into());
                 scope.set_extra("log_path", failure.log_path.clone().into());
@@ -3093,6 +3099,17 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     // The same verdict seen from inside Python, where the OS prose is
     // localized and carries no code (RUST-BB/BA/5C).
     if is_blocked_runtime_dll_signal(&lower) {
+        return true;
+    }
+    // The RUST-9F probe (tool_manager::probe_onnx_import) importing
+    // onnxruntime in a bare interpreter and hitting its 15s kill: a native
+    // DLL that neither loads nor fails is being scanned or held by something
+    // outside the process. First seen on a corporate-asset Windows 11 host
+    // (RUST-C7) whose backend had also aborted while sklearn pre-loaded its
+    // OpenMP DLL. The probe only runs after a 0xffffffff exit, and "killed"
+    // only comes from the timeout (Windows has no signals), so the phrase is
+    // specific. An `(exit N)` verdict is a broken venv, not this.
+    if lower.contains("import onnxruntime failed (killed)") {
         return true;
     }
     false
@@ -11643,6 +11660,23 @@ Some unrelated content.
             )),
             Some("startup_port_conflict")
         );
+    }
+
+    #[test]
+    fn is_endpoint_protection_signal_matches_a_killed_onnx_probe() {
+        // RUST-C7 verbatim: both spawn variants 0xffffffff, probe timed out.
+        assert!(is_endpoint_protection_signal(
+            "unable to keep headroom running in background (onnx probe: import onnxruntime \
+             failed (killed): command timed out after 15000ms) (prior attempts: headroom.exe: \
+             exited with status exit code: 0xffffffff before opening port 6768)"
+        ));
+        // A clean probe or a real import error is not endpoint protection.
+        assert!(!is_endpoint_protection_signal(
+            "(onnx probe: onnxruntime imports cleanly)"
+        ));
+        assert!(!is_endpoint_protection_signal(
+            "(onnx probe: import onnxruntime failed (exit 1): ModuleNotFoundError: No module named 'onnxruntime')"
+        ));
     }
 
     #[test]
