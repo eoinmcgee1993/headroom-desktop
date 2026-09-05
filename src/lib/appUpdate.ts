@@ -21,6 +21,24 @@ export type AppUpdateProgressListener = (
 
 const APP_UPDATE_PROGRESS_EVENT = "app-update://progress";
 
+// Releases are quiet by default: no dialog, no notification, and (on macOS)
+// a silent background install that only asks for a restart. A release that
+// users must take promptly opts back into the old loud flow by carrying this
+// marker anywhere in its release notes (put `<!-- headroom:loud -->` in
+// .github/release-notes/<VERSION>.md; it flows into latest.json `notes`).
+export const LOUD_UPDATE_MARKER = "headroom:loud";
+
+export function isLoudAppUpdate(update: AvailableAppUpdate | null | undefined): boolean {
+  return update?.notes?.includes(LOUD_UPDATE_MARKER) ?? false;
+}
+
+export function displayAppUpdateNotes(notes: string | null | undefined): string {
+  if (!notes) {
+    return "";
+  }
+  return notes.replace(/<!--[^>]*headroom:loud[^>]*-->/g, "").trim();
+}
+
 export interface AppUpdateStatePatch {
   config?: AppUpdateConfiguration;
   availableUpdate?: AvailableAppUpdate | null;
@@ -73,7 +91,11 @@ export async function runAppUpdateCheck({
     const update = await invokeFn<AvailableAppUpdate | null>("check_for_app_update");
 
     if (update) {
-      const shouldShowDialog = !background || update.version !== knownUpdateVersion;
+      // Background-found updates only interrupt when the release is marked
+      // loud; quiet releases surface passively (Settings copy, stale nag,
+      // and on macOS a silent install). Manual checks always show the dialog.
+      const shouldShowDialog =
+        !background || (isLoudAppUpdate(update) && update.version !== knownUpdateVersion);
       return {
         availableUpdate: update,
         readyToRestart: false,
@@ -110,6 +132,12 @@ export function shouldNotifyAboutAvailableAppUpdate({
   windowVisible: boolean;
 }): boolean {
   if (!background || windowVisible || !availableUpdate) {
+    return false;
+  }
+
+  // Quiet releases never fire the "new version" notification; the 5-day
+  // stale nag remains the fallback on platforms without silent install.
+  if (!isLoudAppUpdate(availableUpdate)) {
     return false;
   }
 
@@ -187,11 +215,13 @@ export function formatAppUpdateProgressCopy(
 
 export async function runAppUpdateInstall({
   availableUpdate,
+  quiet = false,
   invokeFn = invoke,
   listenFn = listen as AppUpdateProgressListener,
   onProgress,
 }: {
   availableUpdate: AvailableAppUpdate | null;
+  quiet?: boolean;
   invokeFn?: AppUpdateInvoker;
   listenFn?: AppUpdateProgressListener;
   onProgress?: (progress: AppUpdateProgress) => void;
@@ -215,7 +245,7 @@ export async function runAppUpdateInstall({
     await invokeFn("install_app_update");
     return {
       readyToRestart: true,
-      showDialog: true,
+      ...(quiet ? {} : { showDialog: true }),
       statusCopy: `Headroom ${availableUpdate.version} is installed and ready to restart.`,
     };
   } catch (error) {

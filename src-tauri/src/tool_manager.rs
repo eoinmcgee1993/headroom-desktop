@@ -1626,6 +1626,65 @@ if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # exactly as upstream writes them. The request path is never touched
         # from this section, so there is nothing to fail closed FOR.
         pass
+
+
+# ─── Tool-search history repair: deferred tools are not available (vendor) ───
+# With ENABLE_TOOL_SEARCH=true the Claude Code client runs its OWN tool search:
+# it sends the full tools array with most tools marked defer_loading=true, plus
+# a tool_search_tool_* mechanism tool, and persists tool_search_tool_result
+# blocks (each carrying tool_reference entries) into the transcript as tools
+# load on demand. Headroom's wire deferral stands down in this case, so the
+# client's array reaches the upstream with its defer markers intact.
+#
+# Anthropic rejects a historical tool_reference whose target is currently
+# deferred: "400 Tool reference 'CronCreate' not found in available tools". The
+# wheel's strip_unsupported_tool_search_blocks is meant to drop exactly those
+# stale blocks, but it builds `available` from every named non-search tool
+# REGARDLESS of defer_loading, so it counts a still-deferred tool as available,
+# keeps the block, and the request 400s. This bricked heavy-MCP users the moment
+# 0.9.8-rc.3 planted ENABLE_TOOL_SEARCH=true.
+#
+# Fix: hand the repair a tools view with defer_loading=true entries removed, so
+# `available` matches Anthropic's own availability semantics. The function only
+# READS tools (to compute `available` and `has_search_tool`) and returns
+# (messages, removed) -- it never returns or mutates tools -- so the forwarded
+# body["tools"] is untouched and only the keep/drop decision changes. The
+# tool_search_tool_* mechanism tool is never defer_loading, so has_search_tool
+# stays true and healthy loaded/absent transcripts behave exactly as before.
+# Self-heals a session poisoned before this shipped, on its next request. The
+# handler late-imports this symbol per request, so a module-level reassign here
+# is picked up. Upstream fix owed; drop this section when a wheel ships it.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_TOOL_SEARCH_DEFER_REPAIR=0.
+_hd_tsr_flag = _hd_os.environ.get("HEADROOM_TOOL_SEARCH_DEFER_REPAIR", "1")
+if _hd_tsr_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_tsr_meta
+
+        if _hd_tsr_meta.version("headroom-ai") == "0.37.0":
+            from headroom.proxy import helpers as _hd_tsr_helpers
+
+            _hd_tsr_orig = _hd_tsr_helpers.strip_unsupported_tool_search_blocks
+
+            def _hd_tsr_wrapped(messages, tools):
+                # A deferred tool is not loaded, so a historical tool_reference
+                # to it is unsupportable on THIS request; hide deferred tools
+                # from the availability check so the repair drops the stale
+                # block instead of forwarding a 400. `tools` itself is untouched.
+                filtered = tools
+                if isinstance(tools, list):
+                    filtered = [
+                        t
+                        for t in tools
+                        if not (isinstance(t, dict) and t.get("defer_loading"))
+                    ]
+                return _hd_tsr_orig(messages, filtered)
+
+            _hd_tsr_helpers.strip_unsupported_tool_search_blocks = _hd_tsr_wrapped
+    except Exception:
+        # Request-path wrapper: on any binding failure fall back to the wheel's
+        # own repair unchanged. The wrapper only narrows the availability input,
+        # so the worst case is the pre-fix behavior, never a new failure mode.
+        pass
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
@@ -2181,6 +2240,37 @@ impl ManagedRuntime {
         } else {
             self.python_dir.join("bin").join("python3")
         }
+    }
+
+    /// True when the base interpreter's stdlib is where CPython's own getpath
+    /// looks for it (`Lib\os.py` on Windows, `lib/python3.X/os.py` elsewhere).
+    /// A base whose `python.exe` survived but whose `Lib` tree did not (AV
+    /// quarantine, disk cleanup: RUST-C8) passes the executable check, then
+    /// every spawn dies in `init_fs_encoding` with `No module named
+    /// 'encodings'`; getpath falls back to the child's cwd as prefix, which
+    /// is why that log blames `<root>\Lib`. Any `python3.*` dir counts, so a
+    /// pinned-Python bump cannot flip every install to "not installed".
+    pub fn standalone_stdlib_present(&self) -> bool {
+        if cfg!(target_os = "windows") {
+            return self.python_dir.join("Lib").join("os.py").is_file();
+        }
+        let Ok(entries) = std::fs::read_dir(self.python_dir.join("lib")) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry.file_name().to_string_lossy().starts_with("python3")
+                && entry.path().join("os.py").is_file()
+        })
+    }
+
+    /// Base interpreter present and able to boot (see
+    /// [`Self::standalone_stdlib_present`]). This, not `standalone_python()`
+    /// alone, is the gate for both "installed" and "skip the download":
+    /// bootstrap used to skip the only repair path for `runtime/python` as
+    /// soon as `python.exe` existed, so a stdlib-less base stayed broken until
+    /// someone deleted the directory by hand.
+    pub fn standalone_runtime_intact(&self) -> bool {
+        self.standalone_python().exists() && self.standalone_stdlib_present()
     }
 
     pub fn managed_python(&self) -> PathBuf {
@@ -2794,9 +2884,11 @@ impl ToolManager {
         // every pip) dies with exit 106 / `No pyvenv.cfg file` (RUST-6S,
         // third shape). Checking it here is what routes that machine back to
         // bootstrap's rebuild instead of a permanent pip-retry loop.
+        // RUST-C8: the base can also lose its stdlib while keeping python.exe
+        // (same routing, one directory deeper), hence `intact`, not `exists`.
         self.runtime.ready_flag().exists()
             && self.runtime.managed_python().exists()
-            && self.runtime.standalone_python().exists()
+            && self.runtime.standalone_runtime_intact()
             && self.runtime.venv_dir.join("pyvenv.cfg").exists()
     }
 
@@ -3543,7 +3635,7 @@ impl ToolManager {
                     program: executable.display().to_string(),
                     args: args.iter().map(|s| s.to_string()).collect(),
                     log_path: log_path.display().to_string(),
-                    log_tail: tail_log_file(&log_path, 80),
+                    log_tail: crash_log_excerpt(&log_path),
                     reason,
                 });
             }
@@ -3585,16 +3677,7 @@ impl ToolManager {
                 .rposition(|f| !f.log_tail.is_empty())
                 .unwrap_or(failures.len() - 1);
             let last = failures.remove(chosen);
-            let prior_summary = if failures.is_empty() {
-                String::new()
-            } else {
-                let joined = failures
-                    .iter()
-                    .map(|f| format!("{} {} {}", f.program, f.args.join(" "), f.reason))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                format!(" (prior attempts: {})", joined)
-            };
+            let prior_summary = prior_attempts_summary(&failures);
             // Silent-crash instrumentation (RUST-9F / RUST-9T): on Windows,
             // python dying with exit code 0xffffffff before opening the port
             // leaves no traceback -- faulthandler never runs when a native DLL
@@ -3610,9 +3693,13 @@ impl ToolManager {
             } else {
                 String::new()
             };
+            // Probe verdict before the attempt list: the log bridge caps a
+            // Sentry message at 400 chars, and RUST-BX/RUST-BV arrived as
+            // "(onnx probe: o" -- the one diagnostic the whole instrumentation
+            // exists for, cut off behind a Windows venv path.
             return Err(anyhow::Error::from(last).context(format!(
                 "unable to keep headroom running in background{}{}",
-                prior_summary, onnx_note
+                onnx_note, prior_summary
             )));
         }
     }
@@ -4371,7 +4458,7 @@ impl ToolManager {
         });
         self.runtime.ensure_layout()?;
 
-        if !self.runtime.standalone_python().exists() {
+        if !self.runtime.standalone_runtime_intact() {
             log::info!("bootstrap: downloading standalone Python runtime");
             progress(BootstrapStepUpdate {
                 step: "Downloading Python",
@@ -7344,9 +7431,29 @@ impl ToolManager {
             // reports only "plugin <x> was not found in marketplace <y>", which
             // names a consequence and hides every cause (Sentry RUST-6K). Carry
             // the add error and attach it if the install then fails.
-            let marketplace_err = self
+            let mut marketplace_err = self
                 .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
                 .err();
+            // "marketplace 'x' is already added from a different source": the
+            // host has our marketplace recorded under another spelling of the
+            // same repo (RUST-AG: both of ours on one host at once, so a Codex
+            // normalisation change, not a user fork) and the install below then
+            // fails "not found in marketplace". The name is ours; re-register
+            // it from the canonical source and let the install decide.
+            if marketplace_err.as_ref().is_some_and(|err| {
+                format!("{err:#}").contains("already added from a different source")
+            }) {
+                log::info!(
+                    "{} [{}]: marketplace registered from another source; re-adding",
+                    plugin.id,
+                    host.label()
+                );
+                let _ =
+                    self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_remove_args(plugin));
+                marketplace_err = self
+                    .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
+                    .err();
+            }
             self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))
                 .map_err(|err| match marketplace_err {
                     Some(add_err) => {
@@ -8555,6 +8662,10 @@ fn kill_pid(pid: u32, force: bool) {
         if force {
             command.arg("-KILL");
         }
+        crate::state::note_app_kill(
+            "kill_pid",
+            format!("{} pid {pid}", if force { "-KILL" } else { "-TERM" }),
+        );
         let _ = command.arg(pid.to_string()).status();
     }
 }
@@ -8712,6 +8823,50 @@ fn format_all_foreign_bail(default_port: u16, occupant: &str, range: (u16, u16))
         "port {default_port} is occupied by a non-headroom process ({occupant}) and fallback ports {start}-{end} are also unavailable; cannot start proxy. \
          Reboot to clear stuck listeners, then relaunch Headroom."
     )
+}
+
+/// The lines that name the fatal condition behind a faulthandler dump. The
+/// all-threads dump that follows them runs well past the 80-line tail Sentry
+/// gets (RUST-C7: seven idle threads plus a 100-frame import chain), so the one
+/// line that says access violation / Aborted / OMP error was exactly what got
+/// cut. Keeps the last few matches: the log is append-only across attempts and
+/// the newest dump is the one being reported.
+fn fatal_header_lines(path: &Path) -> Vec<String> {
+    const MARKERS: &[&str] = &[
+        "Fatal Python error",
+        "Windows fatal exception",
+        "OMP: Error",
+        "Current thread 0x",
+    ];
+    const KEEP: usize = 6;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut kept: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if MARKERS.iter().any(|m| line.contains(m)) {
+            if kept.len() == KEEP {
+                kept.pop_front();
+            }
+            kept.push_back(redact_sensitive(&line));
+        }
+    }
+    kept.into_iter().collect()
+}
+
+/// The 80-line tail a startup failure carries to Sentry, led by the fatal
+/// marker lines when the log holds a crash dump (see [`fatal_header_lines`]).
+fn crash_log_excerpt(path: &Path) -> String {
+    let tail = tail_log_file(path, 80);
+    let header = fatal_header_lines(path);
+    if header.is_empty() {
+        tail
+    } else {
+        format!(
+            "--- fatal markers ---\n{}\n--- tail ---\n{tail}",
+            header.join("\n")
+        )
+    }
 }
 
 pub(crate) fn tail_log_file(path: &Path, max_lines: usize) -> String {
@@ -10187,6 +10342,10 @@ fn is_python_interpreter(binary: &Path) -> bool {
 /// same abort with a WAMP PHP directory on PATH. Until now all we could do was
 /// name the directory in the failure report and ask the user to change their
 /// own PATH; dropping it from the *child's* environment fixes it for them.
+/// (Refuted for the ensurepip abort, 2026-09-05: RUST-A0 recurred on 0.9.7
+/// with this filter applied and the VanDyke dir named. That abort is the
+/// SSLKEYLOGFILE keylog path, see `strip_unusable_sslkeylogfile`. The filter
+/// stays: harmless, and still right for a DLL genuinely resolved by PATH.)
 ///
 /// Scoped deliberately. Only the child's PATH changes -- the user's is
 /// untouched -- and only for the interpreter, because a directory is dropped
@@ -10496,16 +10655,43 @@ fn sslkeylogfile_is_usable(path: &str) -> bool {
         .is_ok()
 }
 
-/// Remove SSLKEYLOGFILE from the child env when its path cannot be opened.
-/// urllib3 (vendored in pip) and httpx both honor the variable by assigning
+/// Why `value` must not reach a managed-interpreter child, or `None` when it
+/// may. Pure so the Windows rule is testable from any platform.
+fn sslkeylogfile_strip_reason(value: &str, windows: bool) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    if windows {
+        return Some(
+            "python-build-standalone's python.exe lacks OPENSSL_Applink, so a keylog file aborts pip/backend at TLS-context creation (RUST-A0)",
+        );
+    }
+    if sslkeylogfile_is_usable(value) {
+        return None;
+    }
+    Some("its path cannot be opened (would crash pip/backend at TLS-context creation)")
+}
+
+/// Remove SSLKEYLOGFILE from the child env when the interpreter cannot honor
+/// it. urllib3 (vendored in pip), truststore and httpx all assign
 /// `context.keylog_filename` at TLS-context creation, and CPython opens the
 /// file eagerly there -- so a machine-wide SSLKEYLOGFILE pointing at an
 /// inaccessible path (RUST-A8: `\\?\Volume{...}\virtual_file.log`, set by a
 /// TLS-inspection tool) kills ensurepip/pip during bootstrap and would kill
-/// the backend's AsyncClient the same way. A path that opens fine passes
-/// through: deliberate Wireshark-style key logging keeps working. Empty
-/// values pass too -- Python skips them. Name matching is case-insensitive
-/// because Windows envs carry arbitrary casings.
+/// the backend's AsyncClient the same way.
+///
+/// On Windows the variable is dropped even when the path opens fine. CPython
+/// hands the opened FILE* to OpenSSL's `BIO_new_fp`, which on Windows routes
+/// through OpenSSL's uplink table and needs the host EXE to export
+/// `OPENSSL_Applink`; python-build-standalone's `python.exe` does not, so the
+/// first TLS context dies with `OPENSSL_Uplink(...,08): no OPENSSL_Applink`
+/// and exit 1 -- pip's vendored truststore does this at import. RUST-8K and
+/// RUST-A0 (3 hosts, 11 events, all Windows) are that abort; the 0.9.7 event
+/// had the foreign-DLL PATH filter applied, so the DLL theory was wrong. Key
+/// logging can never work from that interpreter, so nothing is lost. Off
+/// Windows a path that opens fine passes through: deliberate Wireshark-style
+/// key logging keeps working. Empty values pass too -- Python skips them. Name
+/// matching is case-insensitive because Windows envs carry arbitrary casings.
 fn strip_unusable_sslkeylogfile(command: &mut Command) {
     for (name, value) in std::env::vars_os() {
         let Some(name) = name.to_str() else { continue };
@@ -10513,14 +10699,12 @@ fn strip_unusable_sslkeylogfile(command: &mut Command) {
             continue;
         }
         let value = value.to_string_lossy();
-        if value.trim().is_empty() || sslkeylogfile_is_usable(&value) {
+        let Some(reason) = sslkeylogfile_strip_reason(&value, cfg!(windows)) else {
             continue;
-        }
+        };
         // info, not warn: warn is bridged to Sentry and would re-report on
         // every launch of an affected machine, forever.
-        log::info!(
-            "[tool_manager] dropping {name} from child env: its path cannot be opened (would crash pip/backend at TLS-context creation)"
-        );
+        log::info!("[tool_manager] dropping {name} from child env: {reason}");
         command.env_remove(name);
     }
 }
@@ -11566,14 +11750,40 @@ pub struct HeadroomStartupFailure {
     pub reason: String,
 }
 
+/// The attempts that failed before the reported one, as "<exe>: <reason>"
+/// pairs. Program basename and reason only: the args are the same spawn line
+/// every variant shares, and a Windows venv path plus that line is ~210 chars
+/// of noise per attempt, which is what pushed the reason and the onnx verdict
+/// past the 400-char Sentry message cap (RUST-BX, RUST-BV). Full command
+/// lines stay in the local log.
+fn prior_attempts_summary(failures: &[HeadroomStartupFailure]) -> String {
+    if failures.is_empty() {
+        return String::new();
+    }
+    let joined = failures
+        .iter()
+        .map(|f| {
+            let exe = std::path::Path::new(&f.program)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| f.program.clone());
+            format!("{exe}: {}", f.reason)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(" (prior attempts: {joined})")
+}
+
 impl std::fmt::Display for HeadroomStartupFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Reason first: this Display is the tail of the Sentry message and
+        // the program path plus args alone can exhaust the 400-char cap.
         write!(
             f,
-            "{} {} {} (log: {}){}",
+            "{} ({} {}; log: {}){}",
+            self.reason,
             self.program,
             self.args.join(" "),
-            self.reason,
             self.log_path,
             if self.log_tail.is_empty() {
                 String::new()
@@ -12040,6 +12250,27 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_tool_search_deferred_repair() {
+        // The rc.3 "Tool reference 'CronCreate' not found in available tools"
+        // 400 came from the wheel's strip_unsupported_tool_search_blocks
+        // counting a defer_loading=true tool as available. The vendor narrows
+        // the availability input to drop deferred tools. Behaviour is proven by
+        // tool_search_deferred_repair_behaves_against_the_installed_wheel; this
+        // pins the shape.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_TOOL_SEARCH_DEFER_REPAIR"));
+        // Exact-pin gated: any other wheel keeps its own repair.
+        assert!(py.contains(r#"_hd_tsr_meta.version("headroom-ai") == "0.37.0""#));
+        // The wrapper filters defer_loading and delegates to the wheel's repair.
+        assert!(py.contains(r#"t.get("defer_loading")"#));
+        assert!(py.contains("_hd_tsr_orig(messages, filtered)"));
+        // It must reassign the module symbol the handler late-imports.
+        assert!(
+            py.contains("_hd_tsr_helpers.strip_unsupported_tool_search_blocks = _hd_tsr_wrapped")
+        );
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -12170,6 +12401,54 @@ mod tests {
             "first-appearance accounting misbehaved against the installed wheel.\n\
              If traffic neutrality failed, do NOT ship: that is the 0.9.4 class\n\
              of mistake.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn tool_search_deferred_repair_behaves_against_the_installed_wheel() {
+        // The rc.3 400 regression ("Tool reference 'CronCreate' not found in
+        // available tools") lived in the WHEEL's history repair, not the string
+        // blob. This runs the shipped sitecustomize against the installed wheel
+        // and asserts a deferred tool is hidden from the availability check
+        // (deferred reference dropped, loaded kept, kill switch reverts).
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-tool-search-repair.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("hd-tool-search-repair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run tool-search-repair probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that ships the fix upstream (or a bump past the 0.37.0 pin)
+        // leaves this vendor inert by design.
+        if stdout.contains("FAIL tsr bound") && stderr.is_empty() {
+            eprintln!("skipping: tool-search repair vendor did not bind (not the 0.37.0 pin)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK tool-search repair"),
+            "tool-search deferred-availability repair misbehaved against the\n\
+             installed wheel. If the deferred reference was kept, the rc.3 400\n\
+             regression is back.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
@@ -12368,6 +12647,94 @@ mod tests {
     /// RUST-75 arrived as a bare torch DLL error. The ONNX failure that
     /// preceded it -- same missing MSVC redistributable, and the actual first
     /// cause -- was dropped, so the report pointed at the wrong library.
+    #[test]
+    fn crash_log_excerpt_leads_with_the_dump_header_the_tail_drops() {
+        // RUST-C7 shape: header, then a dump long enough that an 80-line
+        // tail starts mid-traceback.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("headroom-proxy.log");
+        let mut body = String::from("banner line\nFatal Python error: Aborted\n\n");
+        body.push_str("Current thread 0x00001234 (most recent call first):\n");
+        for i in 0..150 {
+            body.push_str(&format!(
+                "  File \"sklearn/__init__.py\", line {i} in <module>\n"
+            ));
+        }
+        std::fs::write(&log, body).unwrap();
+        let excerpt = super::crash_log_excerpt(&log);
+        assert!(
+            excerpt.starts_with(
+                "--- fatal markers ---\nFatal Python error: Aborted\nCurrent thread 0x00001234"
+            ),
+            "{excerpt}"
+        );
+        assert!(excerpt.contains("--- tail ---\n"), "{excerpt}");
+        assert!(
+            !excerpt.contains("banner line"),
+            "tail must stay the last 80 lines: {excerpt}"
+        );
+        // No dump: plain tail, no marker section.
+        std::fs::write(&log, "just\na\nlog\n").unwrap();
+        assert_eq!(super::crash_log_excerpt(&log), "just\na\nlog");
+    }
+
+    #[test]
+    fn startup_failure_summary_keeps_reason_and_probe_inside_the_sentry_cap() {
+        // RUST-BX / RUST-BV: a Windows venv path plus the spawn args ran the
+        // message past the 400-char log-bridge cap before the reason or the
+        // onnx verdict appeared.
+        let exe = r"C:\Users\jao\AppData\Local\Headroom\headroom\runtime\venv\Scripts\headroom.exe";
+        let args: Vec<String> = [
+            "proxy",
+            "--port",
+            "6768",
+            "--no-http2",
+            "--log-messages",
+            "--learn",
+            "--no-memory-tools",
+            "--no-memory-context",
+            "--memory-db-path",
+            r"C:\Users\jao\AppData\Local\Headroom\memory.db",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let failure = |reason: &str| super::HeadroomStartupFailure {
+            program: exe.to_string(),
+            args: args.clone(),
+            log_path: r"C:\Users\jao\AppData\Local\Headroom\logs\proxy.log".to_string(),
+            log_tail: String::new(),
+            reason: reason.to_string(),
+        };
+        let prior = vec![failure(
+            "exited with status exit code: 0xffffffff before opening port 6768",
+        )];
+        let last = failure("never opened port 6768 within 300000ms");
+        let err = anyhow::Error::from(last).context(format!(
+            "unable to keep headroom running in background{}{}",
+            " (onnx probe: import onnxruntime failed (exit 0xffffffff): <no stderr>)",
+            super::prior_attempts_summary(&prior)
+        ));
+        let message = format!("watchdog: hung-kill restart failed: {err:#}");
+        let head: String = message.chars().take(400).collect();
+        assert!(
+            head.contains("onnx probe: import onnxruntime failed"),
+            "{head}"
+        );
+        assert!(
+            head.contains("headroom.exe: exited with status exit code: 0xffffffff"),
+            "{head}"
+        );
+        assert!(
+            head.contains("never opened port 6768 within 300000ms"),
+            "{head}"
+        );
+        assert!(
+            !head.contains("--memory-db-path"),
+            "args must not lead: {head}"
+        );
+    }
+
     #[test]
     fn summarize_kompress_prefetch_failure_carries_the_earlier_onnx_cause() {
         let dir = std::env::temp_dir().join(format!(
@@ -14757,10 +15124,37 @@ after
             "a venv missing pyvenv.cfg must not read as installed"
         );
         fs::write(runtime.venv_dir.join("pyvenv.cfg"), b"").expect("pyvenv.cfg");
+        // RUST-C8: python.exe survived but the stdlib next to it did not.
+        // Every spawn dies with `No module named 'encodings'`, and bootstrap
+        // skipped the reinstall because the executable existed.
+        assert!(
+            !manager.python_runtime_installed(),
+            "a base whose stdlib is gone must not read as installed"
+        );
+        let landmark = seed_stdlib_landmark(&runtime);
         assert!(
             manager.python_runtime_installed(),
-            "all four markers present must read as installed"
+            "all markers present must read as installed"
         );
+        fs::remove_file(&landmark).expect("remove landmark");
+        assert!(!runtime.standalone_runtime_intact());
+    }
+
+    /// Creates the `os.py` landmark CPython's getpath looks for next to the
+    /// base interpreter, and returns its path.
+    fn seed_stdlib_landmark(runtime: &ManagedRuntime) -> PathBuf {
+        let landmark = if cfg!(target_os = "windows") {
+            runtime.python_dir.join("Lib").join("os.py")
+        } else {
+            runtime
+                .python_dir
+                .join("lib")
+                .join("python3.12")
+                .join("os.py")
+        };
+        fs::create_dir_all(landmark.parent().expect("parent")).expect("mkdir");
+        fs::write(&landmark, b"").expect("landmark");
+        landmark
     }
 
     /// RUST-82: `python -m venv` runs ensurepip through `check_output` and
@@ -14997,6 +15391,21 @@ after
             !super::sslkeylogfile_is_usable(unopenable.to_str().unwrap()),
             "path in a missing directory fails python's eager open and should be stripped"
         );
+    }
+
+    /// RUST-A0 / RUST-8K: on Windows the variable is dropped even when the
+    /// path opens, because the standalone python.exe cannot honor it (no
+    /// OPENSSL_Applink); elsewhere only an unopenable path is stripped.
+    #[test]
+    fn sslkeylogfile_is_always_stripped_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let creatable = dir.path().join("keylog.txt");
+        let creatable = creatable.to_str().unwrap();
+        assert!(super::sslkeylogfile_strip_reason(creatable, true).is_some());
+        assert!(super::sslkeylogfile_strip_reason(creatable, false).is_none());
+        let unopenable = dir.path().join("no-such-dir").join("keylog.txt");
+        assert!(super::sslkeylogfile_strip_reason(unopenable.to_str().unwrap(), false).is_some());
+        assert!(super::sslkeylogfile_strip_reason("  ", true).is_none());
     }
 
     #[test]

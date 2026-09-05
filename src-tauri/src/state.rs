@@ -3471,6 +3471,11 @@ impl AppState {
                 );
                 None
             });
+        // Without the lock, another lifecycle transition in THIS app is mid-
+        // spawn, and its child is exactly what the sweep below would match:
+        // it has our pid as parent and has not bound the port yet. Reap only
+        // true orphans in that case (see kill_processes_by_command_pattern).
+        let lock_held = _lifecycle_guard.is_some();
         // Every app-initiated stop is a down window we caused: a watchdog
         // restart, a pricing-gate pause, a port rebind, quit. The down->up
         // transition that follows is not an outage worth paging, and when the
@@ -3483,7 +3488,13 @@ impl AppState {
         crate::proxy_intercept::suppress_codex_reconnect_reports_for(
             std::time::Duration::from_secs(300),
         );
-        self.set_runtime_starting(false);
+        // `starting` belongs to the transition holding the lifecycle lock. An
+        // unguarded stop clearing it mid-spawn told the watchdog the runtime
+        // should be up, so 15s later it hung-killed the spawn it should have
+        // been waiting for (RUST-CD: three stops in 12s, then 0xffffffff).
+        if lock_held {
+            self.set_runtime_starting(false);
+        }
         let mut process = self.headroom_process.lock();
 
         if let Some(mut child) = process.take() {
@@ -3529,13 +3540,19 @@ impl AppState {
         let command_patterns = [
             (managed_python.as_path(), "-m headroom.proxy.server"),
             (headroom_entrypoint.as_path(), "proxy --port"),
+            // On macOS the entrypoint re-execs itself as `python -m
+            // headroom.cli proxy ...` for malloc tuning (upstream
+            // cli/proxy.py `_reexec_with_malloc_tuning`), so that is what a
+            // live or orphaned backend's argv actually reads there; neither
+            // pattern above matches it.
+            (managed_python.as_path(), "-m headroom.cli proxy"),
         ];
         for (exe, args_pattern) in command_patterns {
             log::info!(
                 "stop_headroom: pkill -f {:?}",
                 format!("{} {args_pattern}", exe.display())
             );
-            if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern) {
+            if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern, lock_held) {
                 // `:#` prints the whole context chain: a spawn failure's io
                 // error (RUST-6H's 0.9.5 wave) is invisible without it.
                 log::warn!("failed to clean detached headroom proxy processes: {err:#}");
@@ -7652,7 +7669,13 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
                 .into(),
         );
     }
-    if raw.contains("ModuleNotFoundError: No module named 'headroom") {
+    // `encodings` is the first stdlib module CPython imports; its absence is
+    // the base runtime's `Lib` tree being gone while `python.exe` survived
+    // (RUST-C8). Same remedy as a missing headroom.* module, and the
+    // installed gate now routes the next launch to bootstrap's reinstall.
+    if raw.contains("ModuleNotFoundError: No module named 'headroom")
+        || raw.contains("No module named 'encodings'")
+    {
         return Some(
             "Headroom's runtime is missing some of its own files, so it can't start \
              -- the install looks incomplete or was interrupted. \
@@ -7770,6 +7793,37 @@ fn proxy_readyz_503_body_is_upstream_only(body: &str) -> bool {
 /// stopping the backend anyway.
 const STOP_LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The last few app-initiated kills, for attribution when a spawn dies by
+/// signal before binding (RUST-CA/CB/1K: SIGTERM after the banner on five
+/// macOS hosts, sender unknown). A kill we sent moments earlier is the first
+/// suspect; an empty or stale ring says the sender was external.
+static RECENT_APP_KILLS: Mutex<std::collections::VecDeque<(Instant, &'static str, String)>> =
+    Mutex::new(std::collections::VecDeque::new());
+const RECENT_APP_KILLS_CAP: usize = 8;
+
+pub(crate) fn note_app_kill(source: &'static str, detail: String) {
+    let mut ring = RECENT_APP_KILLS.lock();
+    if ring.len() == RECENT_APP_KILLS_CAP {
+        ring.pop_front();
+    }
+    ring.push_back((Instant::now(), source, detail));
+}
+
+/// Oldest first, each as "<age>s ago <source>: <detail>".
+pub(crate) fn recent_app_kills_summary() -> Vec<String> {
+    let now = Instant::now();
+    RECENT_APP_KILLS
+        .lock()
+        .iter()
+        .map(|(at, source, detail)| {
+            format!(
+                "{}s ago {source}: {detail}",
+                now.duration_since(*at).as_secs()
+            )
+        })
+        .collect()
+}
+
 fn terminate_process_tree(pid: i32, force: bool) {
     if cfg!(target_os = "windows") {
         let mut command = crate::proc::command("taskkill");
@@ -7787,6 +7841,7 @@ fn terminate_process_tree(pid: i32, force: bool) {
         // Attribution: this is the only signal we send that reaches processes we
         // did not spawn, so the group has to be in the log to be provable later.
         log::info!("terminate_process_tree: {signal} to process group {target}");
+        note_app_kill("terminate_process_tree", format!("{signal} group {target}"));
         let _ = crate::proc::command("/bin/kill")
             .arg(signal)
             .arg(target)
@@ -7881,21 +7936,76 @@ fn escape_powershell_like(value: &str) -> String {
 /// kill_venv_lock_holders the follow-up pip run fails loudly on the held
 /// lock, which is where that case surfaces today; count failed kills in the
 /// script if that ever stops being true.
+///
+/// Parent filter (same rule as the unix sweep, see `sweep_should_kill`): a
+/// match is killed only when its parent is gone (Windows never reparents an
+/// orphan, so its ParentProcessId names a dead pid) or, when
+/// `include_own_children`, when its parent is this app (`self_pid`). A match
+/// whose parent is another live process is a relaunched instance's backend or
+/// a sibling thread's in-flight spawn. `Stop-Process` is `TerminateProcess(-1)`,
+/// so that victim reports `exit code: 0xffffffff before opening port` with the
+/// banner printed and a clean onnx probe -- the "silent" half of RUST-9F
+/// (RUST-CD: three unguarded stops in 12s, then exactly that failure).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn windows_process_sweep_script(exe: &std::path::Path, args_pattern: &str) -> String {
+fn windows_process_sweep_script(
+    exe: &std::path::Path,
+    args_pattern: &str,
+    self_pid: u32,
+    include_own_children: bool,
+) -> String {
     let exe_pattern = escape_powershell_like(&exe.display().to_string());
     let args_escaped = escape_powershell_like(args_pattern);
+    let own = if include_own_children {
+        "$true"
+    } else {
+        "$false"
+    };
     format!(
-        "try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
-         | Where-Object {{ $_.ProcessId -ne $PID \
+        "try {{ $me = {self_pid}; Get-CimInstance Win32_Process -ErrorAction Stop \
+         | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
          -and $_.CommandLine -like '*{exe_pattern}*' \
-         -and $_.CommandLine -like '*{args_escaped}*' }} \
+         -and $_.CommandLine -like '*{args_escaped}*' \
+         -and (($_.ParentProcessId -eq $me -and {own}) \
+         -or -not (Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue)) }} \
          | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
          catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
     )
 }
 
-fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) -> Result<()> {
+/// Whether the sweep may signal a matching process, given who its parent is.
+///
+/// The sweep exists to reap proxies nobody holds a handle to: orphans of a
+/// previous app instance (reparented to pid 1) and children of this process
+/// whose handle was lost. A match whose parent is some OTHER live process is
+/// not ours to kill: the command line is the same for every Headroom instance,
+/// and a quitting instance's sweep was landing on the proxy the freshly
+/// relaunched instance was still bringing up - SIGTERM after the banner,
+/// before the port, on both spawn variants (RUST-CA/CB, RUST-1K: five macOS
+/// hosts). `include_own_children` is false when the caller could not take the
+/// lifecycle lock: then a sibling transition in this process is mid-spawn and
+/// its child is likewise off limits.
+fn sweep_should_kill(ppid: u32, self_pid: u32, include_own_children: bool) -> bool {
+    ppid <= 1 || (include_own_children && ppid == self_pid)
+}
+
+/// Parses `ps -o pid=,ppid=` output into `(pid, ppid)` pairs; junk lines skip.
+fn parse_pid_ppid(output: &str) -> Vec<(u32, u32)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            Some((pid, ppid))
+        })
+        .collect()
+}
+
+fn kill_processes_by_command_pattern(
+    exe: &std::path::Path,
+    args_pattern: &str,
+    include_own_children: bool,
+) -> Result<()> {
     // An unresolved runtime path degrades the pattern from "our backend at this
     // exact path" to a loose substring, and `pkill -f` applies it to every
     // process the user owns. Refuse rather than guess.
@@ -7907,26 +8017,62 @@ fn kill_processes_by_command_pattern(exe: &std::path::Path, args_pattern: &str) 
 
     #[cfg(unix)]
     {
+        // pgrep + a parent check instead of pkill: see sweep_should_kill.
         let pattern = format!("{} {args_pattern}", exe.display());
-        let status = crate::proc::command("pkill")
+        let found = crate::proc::command("pgrep")
             .args(["-f", &pattern])
-            .status()
-            .with_context(|| format!("running pkill for pattern '{pattern}'"))?;
-
-        if status.success() || status.code() == Some(1) {
+            .output()
+            .with_context(|| format!("running pgrep for pattern '{pattern}'"))?;
+        // pgrep exits 1 for "no match".
+        if !found.status.success() {
+            if found.status.code() == Some(1) {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "pgrep exited with status {:?} for pattern '{}'",
+                found.status.code(),
+                pattern
+            ));
+        }
+        let pids: Vec<String> = String::from_utf8_lossy(&found.stdout)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        if pids.is_empty() {
             return Ok(());
         }
-
-        return Err(anyhow!(
-            "pkill exited with status {:?} for pattern '{}'",
-            status.code(),
-            pattern
-        ));
+        let listed = crate::proc::command("ps")
+            .args(["-o", "pid=,ppid=", "-p", &pids.join(",")])
+            .output()
+            .with_context(|| format!("running ps for pids {pids:?}"))?;
+        let self_pid = std::process::id();
+        for (pid, ppid) in parse_pid_ppid(&String::from_utf8_lossy(&listed.stdout)) {
+            if pid == self_pid {
+                continue;
+            }
+            if !sweep_should_kill(ppid, self_pid, include_own_children) {
+                log::info!(
+                    "process sweep: leaving pid {pid} (parent {ppid} is alive and not us) for '{pattern}'"
+                );
+                continue;
+            }
+            log::info!("process sweep: -TERM pid {pid} (parent {ppid}) for '{pattern}'");
+            note_app_kill("process_sweep", format!("-TERM pid {pid} (parent {ppid})"));
+            let _ = crate::proc::command("/bin/kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+        return Ok(());
     }
 
     #[cfg(target_os = "windows")]
     {
-        let script = windows_process_sweep_script(exe, args_pattern);
+        let script = windows_process_sweep_script(
+            exe,
+            args_pattern,
+            std::process::id(),
+            include_own_children,
+        );
         let status = crate::proc::command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status()
@@ -7998,7 +8144,7 @@ pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     }
     // Empty args pattern makes the exe-path clause the only real filter:
     // any process whose command line mentions the venv dir.
-    if let Err(err) = kill_processes_by_command_pattern(venv_dir, "") {
+    if let Err(err) = kill_processes_by_command_pattern(venv_dir, "", true) {
         log::warn!("killing venv lock holders before venv mutation failed: {err:#}");
     }
 }
@@ -9189,6 +9335,25 @@ mod tests {
         assert!(!hint.contains("crashed at startup"), "got: {hint}");
     }
 
+    #[test]
+    fn classify_startup_error_missing_stdlib_encodings() {
+        // RUST-C8 verbatim shape: getpath fell back to the cwd as prefix, then
+        // core init died before any Python frame existed.
+        let raw = "unable to keep headroom running in background: \
+            C:\\U\\venv\\Scripts\\python.exe -m headroom.proxy.server --port 6768 exited with \
+            status exit code: 1 before opening port 6768\n--- log tail ---\n\
+            Could not find platform independent libraries <prefix>\n\
+            Fatal Python error: init_fs_encoding: failed to get the Python codec of the \
+            filesystem encoding\nPython runtime state: core initialized\n\
+            ModuleNotFoundError: No module named 'encodings'\n--- end log ---";
+        let hint = classify_startup_error(raw).expect("missing stdlib should classify");
+        assert!(
+            hint.contains("missing some of its own files"),
+            "got: {hint}"
+        );
+        assert!(!hint.contains("crashed at startup"), "got: {hint}");
+    }
+
     /// RUST-8V/8W: the runtime prints its full banner and then dies before
     /// binding, because its native deps cannot load without the MSVC
     /// redistributable. The log names the cause; the hint must too, instead of
@@ -10133,6 +10298,52 @@ mod tests {
     /// A launch racing a quit used to strand the app: `stop_headroom` waited on
     /// `lifecycle_lock` forever, so `restart_app` never reached the exit request
     /// and the window sat on "Restarting..." until it was killed by hand.
+    #[test]
+    fn recent_app_kills_keeps_the_newest_with_ages() {
+        for i in 0..12 {
+            super::note_app_kill("ring-test", format!("entry {i}"));
+        }
+        let summary = super::recent_app_kills_summary();
+        assert!(summary.len() <= super::RECENT_APP_KILLS_CAP, "{summary:?}");
+        assert!(
+            summary.last().unwrap().ends_with("ring-test: entry 11"),
+            "{summary:?}"
+        );
+        assert!(summary.iter().all(|l| l.contains("s ago ")), "{summary:?}");
+        assert!(
+            !summary.iter().any(|l| l.ends_with("entry 3")),
+            "oldest must roll off: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_only_reaps_orphans_and_optionally_own_children() {
+        use super::sweep_should_kill;
+        let me = 4242;
+        // Orphan of a previous instance (reparented to launchd/init).
+        assert!(sweep_should_kill(1, me, true));
+        assert!(sweep_should_kill(1, me, false));
+        assert!(sweep_should_kill(0, me, false));
+        // Our own untracked child: ours to kill only when we hold the
+        // lifecycle lock; otherwise a sibling transition is mid-spawn on it.
+        assert!(sweep_should_kill(me, me, true));
+        assert!(!sweep_should_kill(me, me, false));
+        // Another live process's child (a relaunched Headroom instance, or a
+        // shell running the venv by hand): never ours.
+        assert!(!sweep_should_kill(777, me, true));
+        assert!(!sweep_should_kill(777, me, false));
+    }
+
+    #[test]
+    fn parse_pid_ppid_reads_ps_output_and_skips_junk() {
+        let out = "  501     1\n 502   501\n\nPID PPID\n  abc 12\n 503  4242\n";
+        assert_eq!(
+            super::parse_pid_ppid(out),
+            vec![(501, 1), (502, 501), (503, 4242)]
+        );
+        assert!(super::parse_pid_ppid("").is_empty());
+    }
+
     #[test]
     fn stop_headroom_gives_up_on_a_held_lifecycle_lock() {
         let base_dir = temp_test_dir("headroom-stop-lifecycle-lock");
@@ -11377,6 +11588,8 @@ mod tests {
         let script = windows_process_sweep_script(
             std::path::Path::new(r"C:\Users\a\venv\Scripts\headroom.exe"),
             "proxy --port",
+            4242,
+            true,
         );
 
         assert!(
@@ -11430,6 +11643,34 @@ mod tests {
         );
     }
 
+    /// RUST-CD: `Stop-Process` on a sibling instance's (or sibling thread's)
+    /// in-flight backend is the 0xffffffff-after-banner failure. The script
+    /// must carry the parent rule, and must drop our own children when the
+    /// caller does not hold the lifecycle lock.
+    #[test]
+    fn the_windows_sweep_script_filters_on_parent() {
+        use super::windows_process_sweep_script;
+        let exe = std::path::Path::new(r"C:\Users\a\venv\Scripts\headroom.exe");
+        let held = windows_process_sweep_script(exe, "proxy --port", 4242, true);
+        assert!(held.contains("$me = 4242;"), "{held}");
+        assert!(held.contains("$_.ProcessId -ne $me"), "{held}");
+        assert!(
+            held.contains("($_.ParentProcessId -eq $me -and $true)"),
+            "{held}"
+        );
+        assert!(
+            held.contains(
+                "-not (Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue)"
+            ),
+            "orphans (dead parent) must still be reaped: {held}"
+        );
+        let unheld = windows_process_sweep_script(exe, "proxy --port", 4242, false);
+        assert!(
+            unheld.contains("($_.ParentProcessId -eq $me -and $false)"),
+            "{unheld}"
+        );
+    }
+
     /// A `'` in a Windows username would close the single-quoted `-like`
     /// literal early, and `[`/`]` are wildcards to `-like`.
     #[test]
@@ -11438,6 +11679,8 @@ mod tests {
         let script = windows_process_sweep_script(
             std::path::Path::new(r"C:\Users\O'Brien [dev]\venv\Scripts\headroom.exe"),
             "proxy --port",
+            4242,
+            true,
         );
         assert!(script.contains("O''Brien"), "unescaped quote: {script}");
         assert!(script.contains("`[dev`]"), "unescaped wildcard: {script}");

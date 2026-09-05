@@ -345,6 +345,7 @@ export interface AppUpdateConfiguration {
   endpointCount: number;
   configurationError?: string | null;
   betaChannelEnabled: boolean;
+  silentInstallSupported: boolean;
 }
 
 export interface AvailableAppUpdate {

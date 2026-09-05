@@ -128,8 +128,17 @@ static BACKEND_DOWN_CODEX_RETRY_503S: AtomicU64 = AtomicU64::new(0);
 static CODEX_INFLIGHT_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 static CODEX_GLOBAL_BYPASS_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 static CODEX_STREAM_NO_TERMINAL_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
-static MISSING_AUTH_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 const CODEX_RECONNECT_REPORT_MIN_INTERVAL_SECS: u64 = 60;
+/// Last-reported epoch-seconds per (client, status) for `report_upstream_error`:
+/// one Sentry event per error class per interval. A client looping on a 4xx
+/// (RUST-BT: one host, 472 events of the same 400 in 19h, 4/min in bursts)
+/// otherwise turns the capture into a quota drain; the signal is the fleet-wide
+/// host spread, not the per-host retry rate, and every occurrence still lands
+/// in the local log. A Vec, not a map: at most a handful of (client, status)
+/// pairs ever exist, and `Mutex::new(Vec::new())` is const.
+static UPSTREAM_ERROR_LAST_REPORTED: Mutex<Vec<((&'static str, u16), u64)>> =
+    Mutex::new(Vec::new());
+const UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS: u64 = 300;
 
 /// Epoch-second until which Codex reconnect warnings are suppressed. Set by the
 /// runtime lifecycle when it *intentionally* stops+restarts the backend (an
@@ -167,6 +176,23 @@ fn should_report_throttled(slot: &AtomicU64) -> bool {
             Err(current) => last = current,
         }
     }
+}
+
+/// True when (`client`, `status`) has not been reported within
+/// `UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS`; claims the slot when it returns true.
+fn should_report_upstream_error(client: &'static str, status: u16) -> bool {
+    let now = now_epoch_secs();
+    let mut slots = UPSTREAM_ERROR_LAST_REPORTED.lock();
+    match slots.iter_mut().find(|(key, _)| *key == (client, status)) {
+        Some((_, last)) => {
+            if now.saturating_sub(*last) < UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS {
+                return false;
+            }
+            *last = now;
+        }
+        None => slots.push(((client, status), now)),
+    }
+    true
 }
 
 fn report_codex_reconnect_incident(
@@ -1333,14 +1359,13 @@ async fn handle(
         let downstream = async {
             // Local proxy paths (/stats, /readyz probes) are our own traffic;
             // a 404 there is the squatter case (RUST-87), not a client error.
-            // /api/hello is Claude Code's connectivity probe: the Python
-            // backend has no route for it and 404s, Claude Code accepts any
-            // HTTP status as proof of reachability, so the error is expected
-            // noise (RUST-BS). Not in is_local_proxy_path: bypass mode must
-            // keep forwarding it upstream (where it 200s), not answer 503.
+            // Client reachability probes are expected noise, see
+            // is_client_probe_path.
             let error_path = parsed_head
                 .as_ref()
-                .filter(|head| !is_local_proxy_path(&head.path) && head.path != "/api/hello")
+                .filter(|head| {
+                    !is_local_proxy_path(&head.path) && !is_client_probe_path(&head.path)
+                })
                 .map(|head| head.path.clone());
             let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path);
             let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
@@ -1775,13 +1800,15 @@ fn report_upstream_error(
     // the client sent NO credentials -- a setup bug (ours to fix, and worth an
     // issue: the 2026-09-03 flagless-provider-block loop was invisible in
     // Sentry precisely because 401 was excluded wholesale). Any other 401 is an
-    // invalid/expired key, which is the user's to fix (RUST-46 noise). Codex
-    // retries a failing request in a tight loop, so the reportable kind is
-    // throttled to one event per interval.
-    if status == 401 {
-        if !is_missing_auth_error(&body) || !should_report_throttled(&MISSING_AUTH_LAST_REPORTED) {
-            return;
-        }
+    // invalid/expired key, which is the user's to fix (RUST-46 noise).
+    if status == 401 && !is_missing_auth_error(&body) {
+        return;
+    }
+    // After the drop filters, so a discarded class never claims the slot of a
+    // reportable one; before the capture, so a retry loop costs one event per
+    // interval instead of one per request (RUST-BT).
+    if !should_report_upstream_error(client, status) {
+        return;
     }
     // Group by client and status so each upstream failure class is its own
     // Sentry issue. Without an explicit fingerprint, Sentry parameterizes the
@@ -2907,6 +2934,20 @@ fn stamp_headroom_bypass_header(buf: &mut Vec<u8>) {
 /// so sub-paths (e.g. `/transformations/feed`) and query strings are covered,
 /// while preventing partial matches (e.g. `/healthcheck` does not match
 /// `/health`).
+/// Paths a client requests to check reachability, never to reach a provider.
+/// The backend has no route for them, so the status is always an error and
+/// never one a release of ours can change: /api/hello is Claude Code's
+/// connectivity probe (backend 404s, Claude Code accepts any status as proof
+/// of life: RUST-BS); the bare root draws the backend's 421 unrouted-path gate
+/// (RUST-BY: 25 events across 7 hosts in 12h, every one on "/"); /v1/settings
+/// is grok-build's startup config fetch, which api.x.ai answers 404 text/plain
+/// with or without us (RUST-CG: 4 same-second events on one host). Deliberately
+/// NOT folded into is_local_proxy_path: bypass mode must keep forwarding these
+/// upstream (where /api/hello 200s), not answer 503.
+fn is_client_probe_path(path: &str) -> bool {
+    matches!(path, "/" | "/api/hello" | "/v1/settings")
+}
+
 fn is_local_proxy_path(path: &str) -> bool {
     const LOCAL_PREFIXES: &[&str] = &[
         "/readyz",
@@ -3059,18 +3100,18 @@ mod tests {
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
         codex_error_summary, codex_snapshot_from_usage_payload, codex_window_label,
         decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
-        intercept_request_counts, is_codex_request_head, is_codex_sse_response,
-        is_geo_blocked_codex_error, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
-        is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
-        is_reportable_upstream_error, os_error_key, parse_codex_rate_limit_headers,
-        parse_request_head, parse_response_status, read_http_headers, request_has_header,
-        request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
-        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
-        set_response_content_length, should_report_throttled, stamp_client_header,
-        stamp_codex_client_header, stamp_headroom_bypass_header, stamp_request_header,
-        strip_request_header, verdict_permits_reuse, BypassFlag, CodexTerminalReader,
-        HeldPortVerdict, ModelsRewrite, ParsedRequestHead, ResponseSniffer, SharedToken,
-        FIRST_OPTIMIZED_REQUEST_REPORTED,
+        intercept_request_counts, is_client_probe_path, is_codex_request_head,
+        is_codex_sse_response, is_geo_blocked_codex_error, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
+        is_prompt_request_head, is_reportable_upstream_error, os_error_key,
+        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
+        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
+        response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        set_response_content_length, should_report_throttled, should_report_upstream_error,
+        stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
+        stamp_request_header, strip_request_header, verdict_permits_reuse, BypassFlag,
+        CodexTerminalReader, HeldPortVerdict, ModelsRewrite, ParsedRequestHead, ResponseSniffer,
+        SharedToken, FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -4025,6 +4066,36 @@ mod tests {
         assert!(!errored.saw_terminal());
         errored.observe(b"event: error\ndata: {\"type\":\"error\"}\n\n");
         assert!(errored.saw_terminal());
+    }
+
+    #[test]
+    fn upstream_error_reports_are_throttled_per_client_and_status() {
+        // Unique keys: the table is process-global and other tests share it.
+        assert!(should_report_upstream_error("throttle-test", 498));
+        assert!(!should_report_upstream_error("throttle-test", 498));
+        // A different status on the same client is its own class.
+        assert!(should_report_upstream_error("throttle-test", 497));
+        // Same status on another client too: the fingerprint keys on both.
+        assert!(should_report_upstream_error("throttle-test-2", 498));
+    }
+
+    #[test]
+    fn client_probe_paths_are_excluded_from_error_capture_but_not_local() {
+        for probe in ["/", "/api/hello", "/v1/settings"] {
+            assert!(is_client_probe_path(probe), "{probe}");
+            assert!(
+                !is_local_proxy_path(probe),
+                "{probe} must still forward in bypass"
+            );
+        }
+        for real in [
+            "/v1/messages",
+            "/v1/messages?beta=true",
+            "/v1/responses",
+            "/api/hello/x",
+        ] {
+            assert!(!is_client_probe_path(real), "{real}");
+        }
     }
 
     #[test]

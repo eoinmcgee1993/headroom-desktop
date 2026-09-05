@@ -23,7 +23,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Drop-in replacement for `std::process::Command::new`.
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     #[allow(unused_mut)]
-    let mut command = Command::new(program);
+    let mut command = Command::new(resolve_system_tool(
+        program.as_ref(),
+        std::env::var_os("SystemRoot").as_deref(),
+    ));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -41,6 +44,30 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     // the thing that kills the process (a lone surrogate still encodes).
     command.env("PYTHONIOENCODING", "utf-8:backslashreplace");
     command
+}
+
+/// `powershell` by its canonical absolute path when `system_root` has one.
+///
+/// A bare name resolves through PATH, and a user-edited PATH that lost
+/// `System32\WindowsPowerShell\v1.0` turned every sweep, kill, and port-owner
+/// lookup into "program not found" (RUST-CH/CJ/CK: one 0.9.7 host, three
+/// issues, all this one spawn). Every other program passes through untouched;
+/// a missing canonical file falls back to the bare name so the error stays the
+/// one it is today.
+fn resolve_system_tool(program: &OsStr, system_root: Option<&OsStr>) -> OsString {
+    if program.eq_ignore_ascii_case("powershell") {
+        if let Some(root) = system_root {
+            let full = Path::new(root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe");
+            if full.is_file() {
+                return full.into_os_string();
+            }
+        }
+    }
+    program.to_os_string()
 }
 
 /// Current PATH with `dir` prepended, joined with the platform separator
@@ -73,6 +100,45 @@ mod tests {
         let existing: Vec<_> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
         assert_eq!(entries.len(), existing.len() + 1);
+    }
+
+    /// RUST-CH/CJ/CK: "powershell" must not depend on the user's PATH.
+    #[test]
+    fn powershell_resolves_to_system_root_when_present() {
+        use std::ffi::OsStr;
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root
+            .path()
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let exe = dir.join("powershell.exe");
+        std::fs::write(&exe, b"x").expect("write");
+        let root_os = Some(root.path().as_os_str());
+        assert_eq!(
+            super::resolve_system_tool(OsStr::new("powershell"), root_os),
+            exe.as_os_str()
+        );
+        assert_eq!(
+            super::resolve_system_tool(OsStr::new("PowerShell"), root_os),
+            exe.as_os_str()
+        );
+        // Other programs, no SystemRoot, and a SystemRoot without the file all
+        // pass the bare name through.
+        assert_eq!(
+            super::resolve_system_tool(OsStr::new("cmd"), root_os),
+            OsStr::new("cmd")
+        );
+        assert_eq!(
+            super::resolve_system_tool(OsStr::new("powershell"), None),
+            OsStr::new("powershell")
+        );
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            super::resolve_system_tool(OsStr::new("powershell"), Some(empty.path().as_os_str())),
+            OsStr::new("powershell")
+        );
     }
 
     #[test]

@@ -48,9 +48,11 @@ import {
 import headroomLogo from "./assets/headroom-logo.svg";
 import packageJson from "../package.json";
 import {
+  displayAppUpdateNotes,
   formatAppUpdateProgressCopy,
   getAppUpdateInstallStatusCopy,
   getBlockedAppUpdateCheckPatch,
+  isLoudAppUpdate,
   loadAppUpdateConfiguration,
   runAppUpdateCheck,
   runAppUpdateInstall,
@@ -495,22 +497,24 @@ const LAUNCHER_STAGE_STEP: Partial<Record<LauncherStage, InstallWizardStep>> = {
 const STARTER_PROMPT =
   "Read this project's main source file and its README in full, then explain what it does and one thing worth improving.";
 
-// Live first-savings checklist. Rendered on the launcher's post-install stage
-// AND as a Home card in the tray window: the launcher hides on click-away and
-// the menu bar icon reopens the tray window, so without the Home card there
-// is no way back to the checklist once it's been dismissed.
-function FirstSavingsChecklist({
-  dashboard,
-  onReopenSetup
-}: {
-  dashboard: DashboardState;
-  onReopenSetup: () => void;
-}) {
+// Waiting-for-first-savings prompt on the launcher's post-install stage. Only
+// renders while `awaitingFirstSavings` holds, so it is replaced by the real
+// savings figures the moment any land.
+//
+// This used to be a three-dot checklist ("agent connected" / "first prompt
+// sent" / "first savings recorded"). Deleted 2026-09-03: the first two rows
+// re-tested what the preceding verify stage had just proven per connector, and
+// the third could never turn green at all, because savings landing is exactly
+// what unmounts this component. A permanently gray final step reads as a
+// broken indicator. What earned its place is the starter prompt: sending one
+// real prompt is the actual gap here (10% of mature signups send exactly one
+// prompt ever), so hand over something paste-able that works in any repo.
+function FirstSavingsChecklist({ onReopenSetup }: { onReopenSetup: () => void }) {
   const [copied, setCopied] = useState(false);
-  // A step stuck gray usually means traffic isn't reaching Headroom, not that
-  // the user hasn't acted yet. Offer a setup re-check, but only after a grace
-  // window: proxyReachable is false for ~1min on a healthy install while the
-  // backend binds, so an immediate prompt would nag on good installs.
+  // No traffic yet usually means it isn't reaching Headroom, not that the user
+  // hasn't acted. Offer a setup re-check, but only after a grace window:
+  // proxyReachable is false for ~1min on a healthy install while the backend
+  // binds, so an immediate prompt would nag on good installs.
   const [showTroubleshoot, setShowTroubleshoot] = useState(false);
   useEffect(() => {
     const timer = window.setTimeout(() => setShowTroubleshoot(true), 20000);
@@ -518,64 +522,32 @@ function FirstSavingsChecklist({
   }, []);
   return (
     <div className="post-install__checklist">
-      <ol className="post-install__steps">
-        <li className="post-install__step">
-          <span
-            className={`callout-banner__dot ${dashboard.lifetimeRequests > 0 ? "callout-banner__dot--healthy" : "callout-banner__dot--disconnected"}`}
-            aria-hidden="true"
-          />
-          <div>
-            <strong>Coding agent connected</strong>
-            {dashboard.lifetimeRequests <= 0 && (
-              <p>Open a terminal and start your agent — Headroom picks it up automatically.</p>
-            )}
-          </div>
-        </li>
-        <li className="post-install__step">
-          <span
-            className={`callout-banner__dot ${dashboard.firstPromptRequestSeen ? "callout-banner__dot--healthy" : "callout-banner__dot--disconnected"}`}
-            aria-hidden="true"
-          />
-          <div>
-            <strong>First prompt sent</strong>
-            {!dashboard.firstPromptRequestSeen && (
-              <p>Ask it anything, or paste the starter prompt below.</p>
-            )}
-          </div>
-        </li>
-        <li className="post-install__step">
-          <span className="callout-banner__dot callout-banner__dot--disconnected" aria-hidden="true" />
-          <div>
-            <strong>First savings recorded</strong>
-            <p>Use your AI coding agent as normal or paste the starter prompt below.</p>
-          </div>
-        </li>
-      </ol>
-      {dashboard.lifetimeEstimatedTokensSaved <= 0 &&
-        dashboard.lifetimeEstimatedSavingsUsd <= 0 && (
-        <div className="post-install__starter">
-          <code>{STARTER_PROMPT}</code>
-          <button
-            className="secondary-button"
-            onClick={() => {
-              void navigator.clipboard?.writeText(STARTER_PROMPT).then(() => {
-                setCopied(true);
-                window.setTimeout(() => setCopied(false), 2000);
-              });
-            }}
-            type="button"
-          >
-            {copied ? "Copied" : "Copy prompt"}
-          </button>
-        </div>
-      )}
+      <p>
+        Use a connected coding agent as normal and your savings appear here. No
+        project in mind? Paste this into your agent to see it work.
+      </p>
+      <div className="post-install__starter">
+        <code>{STARTER_PROMPT}</code>
+        <button
+          className="secondary-button"
+          onClick={() => {
+            void navigator.clipboard?.writeText(STARTER_PROMPT).then(() => {
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 2000);
+            });
+          }}
+          type="button"
+        >
+          {copied ? "Copied" : "Copy prompt"}
+        </button>
+      </div>
       {showTroubleshoot && (
         <button
           type="button"
           className="post-install__troubleshoot"
           onClick={onReopenSetup}
         >
-          Not turning green? Re-check setup.
+          Nothing showing up? Re-check setup.
         </button>
       )}
     </div>
@@ -3797,6 +3769,17 @@ export default function App() {
       applyAppUpdatePatch(patch);
 
       if (background && patch.availableUpdate) {
+        // Quiet releases on macOS stage themselves: silent download+install,
+        // then only a passive "restart to finish" state. No dialog, no
+        // notification. Loud releases keep the interrupting flow.
+        if (
+          !isLoudAppUpdate(patch.availableUpdate) &&
+          config.silentInstallSupported &&
+          !appUpdateInstallBusyRef.current
+        ) {
+          void installAvailableUpdate(patch.availableUpdate, { quiet: true });
+          return;
+        }
         const windowVisible = await getCurrentWindow().isVisible().catch(() => false);
         const notifyFresh = shouldNotifyAboutAvailableAppUpdate({
           background,
@@ -3819,22 +3802,27 @@ export default function App() {
     }
   }
 
-  async function installAvailableUpdate() {
-    if (!appUpdateAvailable) {
+  async function installAvailableUpdate(
+    target?: AvailableAppUpdate,
+    { quiet = false }: { quiet?: boolean } = {}
+  ) {
+    const update = target ?? appUpdateAvailable;
+    if (!update) {
       return;
     }
 
     setAppUpdateInstallBusy(true);
-    const installStatusCopy = getAppUpdateInstallStatusCopy(appUpdateAvailable);
+    const installStatusCopy = getAppUpdateInstallStatusCopy(update);
     if (installStatusCopy) {
       setAppUpdateStatusCopy(installStatusCopy);
     }
 
     try {
-      const versionForCopy = appUpdateAvailable.version;
+      const versionForCopy = update.version;
       applyAppUpdatePatch(
         await runAppUpdateInstall({
-          availableUpdate: appUpdateAvailable,
+          availableUpdate: update,
+          quiet,
           onProgress: (progress) => {
             setAppUpdateStatusCopy(formatAppUpdateProgressCopy(versionForCopy, progress));
           },
@@ -6086,7 +6074,6 @@ export default function App() {
           </h1>
           {awaitingFirstSavings ? (
             <FirstSavingsChecklist
-              dashboard={dashboard}
               onReopenSetup={() => setLauncherStage("client_setup")}
             />
           ) : (
@@ -8043,11 +8030,21 @@ export default function App() {
                   <div className="runtime-status__section-action-row">
                     <button
                       className="secondary-button secondary-button--small"
-                      disabled={appUpdateBusy || appUpdateInstallBusy}
-                      onClick={() => void checkForAppUpdate()}
+                      disabled={appUpdateBusy || appUpdateInstallBusy || appUpdateRestartBusy}
+                      onClick={() =>
+                        appUpdateReadyToRestart
+                          ? restartIntoInstalledUpdate()
+                          : void checkForAppUpdate()
+                      }
                       type="button"
                     >
-                      {appUpdateBusy ? "Checking…" : "Check for updates"}
+                      {appUpdateReadyToRestart
+                        ? appUpdateRestartBusy
+                          ? "Restarting…"
+                          : "Restart to update"
+                        : appUpdateBusy
+                          ? "Checking…"
+                          : "Check for updates"}
                     </button>
                     {appUpdateStatusCopy ? (
                       <p className="app-update-card__summary runtime-status__summary">
@@ -8650,10 +8647,10 @@ export default function App() {
                     Published: {formatDateTime(appUpdateAvailable.publishedAt ?? null)}
                   </li>
                 </ul>
-                {appUpdateAvailable.notes && appUpdateAvailable.notes.trim() ? (
+                {displayAppUpdateNotes(appUpdateAvailable.notes) ? (
                   <div className="release-notes">
                     <h4>What&apos;s new</h4>
-                    <pre>{appUpdateAvailable.notes.trim()}</pre>
+                    <pre>{displayAppUpdateNotes(appUpdateAvailable.notes)}</pre>
                   </div>
                 ) : null}
                 {appUpdateStatusCopy ? (
