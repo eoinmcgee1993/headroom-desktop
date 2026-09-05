@@ -2173,6 +2173,19 @@ fn capture_bootstrap_failure(err: &anyhow::Error, kind: BootstrapFailureKind) {
                         }
                         .into(),
                     );
+                    // The abort is the keylog FILE* path whenever this is set
+                    // (see tool_manager::strip_unusable_sslkeylogfile). Name
+                    // only: the value is a user path.
+                    scope.set_extra(
+                        "sslkeylogfile_set",
+                        std::env::vars_os()
+                            .any(|(k, v)| {
+                                k.to_str()
+                                    .is_some_and(|k| k.eq_ignore_ascii_case("SSLKEYLOGFILE"))
+                                    && !v.to_string_lossy().trim().is_empty()
+                            })
+                            .into(),
+                    );
                 }
             },
             || {

@@ -2939,11 +2939,13 @@ fn stamp_headroom_bypass_header(buf: &mut Vec<u8>) {
 /// never one a release of ours can change: /api/hello is Claude Code's
 /// connectivity probe (backend 404s, Claude Code accepts any status as proof
 /// of life: RUST-BS); the bare root draws the backend's 421 unrouted-path gate
-/// (RUST-BY: 25 events across 7 hosts in 12h, every one on "/"). Deliberately
+/// (RUST-BY: 25 events across 7 hosts in 12h, every one on "/"); /v1/settings
+/// is grok-build's startup config fetch, which api.x.ai answers 404 text/plain
+/// with or without us (RUST-CG: 4 same-second events on one host). Deliberately
 /// NOT folded into is_local_proxy_path: bypass mode must keep forwarding these
 /// upstream (where /api/hello 200s), not answer 503.
 fn is_client_probe_path(path: &str) -> bool {
-    matches!(path, "/" | "/api/hello")
+    matches!(path, "/" | "/api/hello" | "/v1/settings")
 }
 
 fn is_local_proxy_path(path: &str) -> bool {
@@ -4079,7 +4081,7 @@ mod tests {
 
     #[test]
     fn client_probe_paths_are_excluded_from_error_capture_but_not_local() {
-        for probe in ["/", "/api/hello"] {
+        for probe in ["/", "/api/hello", "/v1/settings"] {
             assert!(is_client_probe_path(probe), "{probe}");
             assert!(
                 !is_local_proxy_path(probe),

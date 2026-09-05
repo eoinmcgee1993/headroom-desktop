@@ -7431,9 +7431,29 @@ impl ToolManager {
             // reports only "plugin <x> was not found in marketplace <y>", which
             // names a consequence and hides every cause (Sentry RUST-6K). Carry
             // the add error and attach it if the install then fails.
-            let marketplace_err = self
+            let mut marketplace_err = self
                 .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
                 .err();
+            // "marketplace 'x' is already added from a different source": the
+            // host has our marketplace recorded under another spelling of the
+            // same repo (RUST-AG: both of ours on one host at once, so a Codex
+            // normalisation change, not a user fork) and the install below then
+            // fails "not found in marketplace". The name is ours; re-register
+            // it from the canonical source and let the install decide.
+            if marketplace_err.as_ref().is_some_and(|err| {
+                format!("{err:#}").contains("already added from a different source")
+            }) {
+                log::info!(
+                    "{} [{}]: marketplace registered from another source; re-adding",
+                    plugin.id,
+                    host.label()
+                );
+                let _ =
+                    self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_remove_args(plugin));
+                marketplace_err = self
+                    .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
+                    .err();
+            }
             self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))
                 .map_err(|err| match marketplace_err {
                     Some(add_err) => {
@@ -10322,6 +10342,10 @@ fn is_python_interpreter(binary: &Path) -> bool {
 /// same abort with a WAMP PHP directory on PATH. Until now all we could do was
 /// name the directory in the failure report and ask the user to change their
 /// own PATH; dropping it from the *child's* environment fixes it for them.
+/// (Refuted for the ensurepip abort, 2026-09-05: RUST-A0 recurred on 0.9.7
+/// with this filter applied and the VanDyke dir named. That abort is the
+/// SSLKEYLOGFILE keylog path, see `strip_unusable_sslkeylogfile`. The filter
+/// stays: harmless, and still right for a DLL genuinely resolved by PATH.)
 ///
 /// Scoped deliberately. Only the child's PATH changes -- the user's is
 /// untouched -- and only for the interpreter, because a directory is dropped
@@ -10631,16 +10655,43 @@ fn sslkeylogfile_is_usable(path: &str) -> bool {
         .is_ok()
 }
 
-/// Remove SSLKEYLOGFILE from the child env when its path cannot be opened.
-/// urllib3 (vendored in pip) and httpx both honor the variable by assigning
+/// Why `value` must not reach a managed-interpreter child, or `None` when it
+/// may. Pure so the Windows rule is testable from any platform.
+fn sslkeylogfile_strip_reason(value: &str, windows: bool) -> Option<&'static str> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    if windows {
+        return Some(
+            "python-build-standalone's python.exe lacks OPENSSL_Applink, so a keylog file aborts pip/backend at TLS-context creation (RUST-A0)",
+        );
+    }
+    if sslkeylogfile_is_usable(value) {
+        return None;
+    }
+    Some("its path cannot be opened (would crash pip/backend at TLS-context creation)")
+}
+
+/// Remove SSLKEYLOGFILE from the child env when the interpreter cannot honor
+/// it. urllib3 (vendored in pip), truststore and httpx all assign
 /// `context.keylog_filename` at TLS-context creation, and CPython opens the
 /// file eagerly there -- so a machine-wide SSLKEYLOGFILE pointing at an
 /// inaccessible path (RUST-A8: `\\?\Volume{...}\virtual_file.log`, set by a
 /// TLS-inspection tool) kills ensurepip/pip during bootstrap and would kill
-/// the backend's AsyncClient the same way. A path that opens fine passes
-/// through: deliberate Wireshark-style key logging keeps working. Empty
-/// values pass too -- Python skips them. Name matching is case-insensitive
-/// because Windows envs carry arbitrary casings.
+/// the backend's AsyncClient the same way.
+///
+/// On Windows the variable is dropped even when the path opens fine. CPython
+/// hands the opened FILE* to OpenSSL's `BIO_new_fp`, which on Windows routes
+/// through OpenSSL's uplink table and needs the host EXE to export
+/// `OPENSSL_Applink`; python-build-standalone's `python.exe` does not, so the
+/// first TLS context dies with `OPENSSL_Uplink(...,08): no OPENSSL_Applink`
+/// and exit 1 -- pip's vendored truststore does this at import. RUST-8K and
+/// RUST-A0 (3 hosts, 11 events, all Windows) are that abort; the 0.9.7 event
+/// had the foreign-DLL PATH filter applied, so the DLL theory was wrong. Key
+/// logging can never work from that interpreter, so nothing is lost. Off
+/// Windows a path that opens fine passes through: deliberate Wireshark-style
+/// key logging keeps working. Empty values pass too -- Python skips them. Name
+/// matching is case-insensitive because Windows envs carry arbitrary casings.
 fn strip_unusable_sslkeylogfile(command: &mut Command) {
     for (name, value) in std::env::vars_os() {
         let Some(name) = name.to_str() else { continue };
@@ -10648,14 +10699,12 @@ fn strip_unusable_sslkeylogfile(command: &mut Command) {
             continue;
         }
         let value = value.to_string_lossy();
-        if value.trim().is_empty() || sslkeylogfile_is_usable(&value) {
+        let Some(reason) = sslkeylogfile_strip_reason(&value, cfg!(windows)) else {
             continue;
-        }
+        };
         // info, not warn: warn is bridged to Sentry and would re-report on
         // every launch of an affected machine, forever.
-        log::info!(
-            "[tool_manager] dropping {name} from child env: its path cannot be opened (would crash pip/backend at TLS-context creation)"
-        );
+        log::info!("[tool_manager] dropping {name} from child env: {reason}");
         command.env_remove(name);
     }
 }
@@ -15342,6 +15391,21 @@ after
             !super::sslkeylogfile_is_usable(unopenable.to_str().unwrap()),
             "path in a missing directory fails python's eager open and should be stripped"
         );
+    }
+
+    /// RUST-A0 / RUST-8K: on Windows the variable is dropped even when the
+    /// path opens, because the standalone python.exe cannot honor it (no
+    /// OPENSSL_Applink); elsewhere only an unopenable path is stripped.
+    #[test]
+    fn sslkeylogfile_is_always_stripped_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let creatable = dir.path().join("keylog.txt");
+        let creatable = creatable.to_str().unwrap();
+        assert!(super::sslkeylogfile_strip_reason(creatable, true).is_some());
+        assert!(super::sslkeylogfile_strip_reason(creatable, false).is_none());
+        let unopenable = dir.path().join("no-such-dir").join("keylog.txt");
+        assert!(super::sslkeylogfile_strip_reason(unopenable.to_str().unwrap(), false).is_some());
+        assert!(super::sslkeylogfile_strip_reason("  ", true).is_none());
     }
 
     #[test]
