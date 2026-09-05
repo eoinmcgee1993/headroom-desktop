@@ -25,6 +25,16 @@ name: Release App
 # (classify_update_check in lib.rs treats a missing platform entry as a no-op)
 # and stay put until the next full release converges everyone. Installs older
 # than 0.8.4 predate that no-op and will log an update-check error instead.
+#
+# Download-only publish: a release commit can carry `[publish: download-only]`
+# (or a manual run can pass publish=download-only) to build and attach every
+# platform but leave the release a PRERELEASE. `releases/latest` and its
+# latest.json keep naming the previous stable, so no existing install is
+# offered anything; only new downloads pinned to the tag get it (headroom-web
+# reads HEADROOM_DOWNLOAD_TAG for that). staging-rolling is not refreshed
+# either. Promote later without a rebuild:
+#   gh release edit vX.Y.Z --repo gglucass/headroom-desktop --prerelease=false --latest
+# Beta installs then pick it up on the next release's staging-rolling refresh.
 
 on:
   push:
@@ -39,6 +49,12 @@ on:
         description: 'Platforms offered this update: "all", or a comma list of macos,windows,linux'
         required: false
         default: all
+      publish:
+        description: '"stable" flips the release to latest; "download-only" leaves it a prerelease no existing install is offered'
+        required: false
+        type: choice
+        options: [stable, download-only]
+        default: stable
 
 concurrency:
   group: macos-release-${{ github.ref }}
@@ -56,6 +72,7 @@ jobs:
       should_release: ${{ steps.release_guard.outputs.should_release }}
       package_version: ${{ steps.release_guard.outputs.package_version }}
       release_platforms: ${{ steps.release_guard.outputs.release_platforms }}
+      release_publish: ${{ steps.release_guard.outputs.release_publish }}
 
     env:
       HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
@@ -158,8 +175,13 @@ jobs:
           # forgetting the marker ships to everyone rather than stranding a
           # platform.
           release_platforms="${{ github.event.inputs.platforms || 'all' }}"
+          # Whether the finished release is flipped to `latest` (stable) or left
+          # a prerelease only pinned new downloads can reach (download-only).
+          # Same marker idiom: `[publish: download-only]`.
+          release_publish="${{ github.event.inputs.publish || 'stable' }}"
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             release_platforms=all
+            release_publish=stable
             range_msgs="$(git log -1 --pretty=%B "${GITHUB_SHA}")"
             if [[ -n "${before_sha:-}" ]] && git cat-file -e "${before_sha}^{commit}" 2>/dev/null; then
               range_msgs="$(git log --pretty=%B "${before_sha}..${GITHUB_SHA}")"
@@ -167,6 +189,10 @@ jobs:
             marker="$(grep -oiE '\[platforms:[^]]+\]' <<< "$range_msgs" | tail -1 || true)"
             if [[ -n "$marker" ]]; then
               release_platforms="$(sed -E 's/^\[[Pp]latforms:[[:space:]]*//; s/\][[:space:]]*$//; s/[[:space:]]//g' <<< "$marker")"
+            fi
+            marker="$(grep -oiE '\[publish:[^]]+\]' <<< "$range_msgs" | tail -1 || true)"
+            if [[ -n "$marker" ]]; then
+              release_publish="$(sed -E 's/^\[[Pp]ublish:[[:space:]]*//; s/\][[:space:]]*$//; s/[[:space:]]//g' <<< "$marker")"
             fi
           fi
 
@@ -180,10 +206,19 @@ jobs:
             esac
           done
           echo "Platforms offered this release: ${release_platforms}"
+          case "$release_publish" in
+            stable|download-only) ;;
+            *)
+              echo "Unknown publish mode '${release_publish}'. Use 'stable' or 'download-only'." >&2
+              exit 1
+              ;;
+          esac
+          echo "Publish mode: ${release_publish}"
 
           echo "package_version=${package_version}" >> "$GITHUB_OUTPUT"
           echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
           echo "release_platforms=${release_platforms}" >> "$GITHUB_OUTPUT"
+          echo "release_publish=${release_publish}" >> "$GITHUB_OUTPUT"
 
       - name: Require validated release candidate
         if: steps.release_guard.outputs.should_release == 'true'
@@ -561,6 +596,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STABLE_TAG: v${{ needs.release.outputs.package_version }}
           RELEASE_PLATFORMS: ${{ needs.release.outputs.release_platforms }}
+          RELEASE_PUBLISH: ${{ needs.release.outputs.release_publish }}
         run: |
           set -euo pipefail
           workdir="$(mktemp -d)"
@@ -623,6 +659,14 @@ jobs:
           done
 
           gh release upload "$STABLE_TAG" "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+
+          # Download-only: everything is attached, but the release stays a
+          # prerelease and no rolling channel is refreshed, so no existing
+          # install is offered it. See the header for how to promote it later.
+          if [ "${RELEASE_PUBLISH:-stable}" = download-only ]; then
+            echo "download-only publish: ${STABLE_TAG} stays a prerelease; releases/latest still serves the previous stable."
+            exit 0
+          fi
 
           # Manifest complete: hand the release to the stable updater endpoint.
           gh release edit "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest

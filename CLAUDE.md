@@ -28,6 +28,7 @@ The 0.9.4 prefix-replay regression cost every upgraded user ~17pp of their input
 
 ## Release Cadence / Update Loudness
 - Stable releases batch weekly; out-of-band stable releases are for regressions and security only (user feedback 2026-09-03: daily update prompts read as churn). Daily rc's on the beta channel are fine.
+- A stable can be built without being offered to anyone: put `[publish: download-only]` in the release commit (or dispatch release-macos.yml with publish=download-only). The release stays a prerelease, `releases/latest` keeps the previous stable, and only new downloads reach it via `HEADROOM_DOWNLOAD_TAG=vX.Y.Z` on the headroom-web Railway `web` service. Promote with `gh release edit vX.Y.Z --prerelease=false --latest` and clear the variable. New installs have no pre-period, so this is NOT a substitute for the staging soak + savings:did gate on compression changes.
 - Updates are quiet by default: no dialog/notification, and on macOS they silently download+install with only a passive "Restart to update" affordance. To make a release loud (old interrupting flow, for must-take updates), put `<!-- headroom:loud -->` anywhere in `.github/release-notes/<VERSION>.md` - the marker flows through latest.json `notes` and is stripped from the displayed notes.
 
 ## Persistence Rules
