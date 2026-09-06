@@ -9433,7 +9433,48 @@ fn argv_contains_flag(argv: &str, flag: &str) -> bool {
     argv.split_whitespace().any(|tok| tok == flag)
 }
 
+/// argv of `pid`, for the argv gate and the listener diagnostics.
+///
+/// This used to shell `/bin/ps` unconditionally, so on Windows it was always
+/// `None` and `running_proxy_matches_expected_args` failed open: the one
+/// platform where the healthy-backend adoption in `ensure_headroom_running`
+/// matters had no argv gate at all, and every occupant string Sentry saw from
+/// Windows was a bare image name. `Win32_Process.CommandLine` is the argv
+/// there, same shape as `ps -o command=` (quoted exe, then the flags).
+///
+/// One-entry cache keyed on pid: the gate runs on every ensure pass while the
+/// backend is up, and the Windows lookup is a PowerShell spawn. A live process
+/// never changes its argv, so a repeat pid answers from cache. Pid reuse after
+/// the backend exits can only fail in the safe direction: a stale argv reads
+/// as "not this build", which respawns.
 fn ps_command(pid: u32) -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<(u32, String)>> = std::sync::Mutex::new(None);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((cached_pid, argv)) = guard.as_ref() {
+            if *cached_pid == pid {
+                return Some(argv.clone());
+            }
+        }
+    }
+    let argv = ps_command_uncached(pid)?;
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((pid, argv.clone()));
+    }
+    Some(argv)
+}
+
+fn ps_command_uncached(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    let output = crate::proc::command("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"),
+        ])
+        .output()
+        .ok()?;
+    #[cfg(not(windows))]
     let output = crate::proc::command("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
@@ -11590,6 +11631,40 @@ const PIP_OUTPUT_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
 /// the default window above.
 const PIP_UNPACK_SILENCE_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Retry schedule for a failed pip run, indexed by the attempt that just
+/// failed: `Some(backoff)` means try again after it, `None` means that was the
+/// last attempt.
+///
+/// Two tables. The default is the long-standing 3 attempts. A Windows sharing
+/// violation gets more room: on a fresh install it is almost always antivirus
+/// scanning the wheel pip just wrote (torch alone is ~200MB), it clears on its
+/// own in seconds to tens of seconds, and 2s+5s was not enough for it
+/// (RUST-6Z, 3 attempts burned inside 7 seconds). Windows is where bootstrap
+/// dies: 11% of Windows installs never complete it against 4% on macOS, and
+/// pip failures run 7 Windows users to 2.
+const PIP_RETRY_BACKOFFS_SECS: &[u64] = &[2, 5];
+const PIP_SHARING_VIOLATION_BACKOFFS_SECS: &[u64] = &[2, 5, 10, 20, 30];
+
+fn pip_retry_backoff(failed_attempt: u32, failure_text: &str) -> Option<Duration> {
+    let table = if pip_failure_is_sharing_violation(failure_text) {
+        PIP_SHARING_VIOLATION_BACKOFFS_SECS
+    } else {
+        PIP_RETRY_BACKOFFS_SECS
+    };
+    table
+        .get(failed_attempt.checked_sub(1)? as usize)
+        .map(|secs| Duration::from_secs(*secs))
+}
+
+/// ERROR_SHARING_VIOLATION, "the process cannot access the file because it is
+/// being used by another process". Matched on the numeric code only: the
+/// sentence is localized (RUST-6Z arrived in Portuguese) and the code is not.
+/// The bracket after 32 keeps 320-329 out.
+fn pip_failure_is_sharing_violation(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("winerror 32]") || lower.contains("os error 32)")
+}
+
 /// Widen `limit` for the rest of the run once `line` marks the start of pip's
 /// silent unpack phase. `None` (wait forever) stays `None`.
 fn widen_silence_for_unpack(limit: Option<Duration>, line: &str) -> Option<Duration> {
@@ -11612,11 +11687,10 @@ fn run_pip_install_with_retries_streaming<F>(
 where
     F: FnMut(&str),
 {
-    const MAX_ATTEMPTS: u32 = 3;
-    const BACKOFFS_SECS: &[u64] = &[2, 5];
-    let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match run_command_streaming(
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let err = match run_command_streaming(
             python,
             args,
             cwd,
@@ -11624,68 +11698,49 @@ where
             &mut on_line,
         ) {
             Ok(()) => return Ok(()),
-            Err(err) => {
-                if attempt < MAX_ATTEMPTS {
-                    log::info!(
-                        "pip install attempt {}/{} failed (will retry): {}",
-                        attempt,
-                        MAX_ATTEMPTS,
-                        err
-                    );
-                } else {
-                    let compact = compact_pip_failure(&err);
-                    if crate::is_disk_full_signal(&compact)
-                        || crate::is_disk_full_signal(&format!("{err:#}"))
-                    {
-                        // ENOSPC is environmental and already surfaced + Sentry-
-                        // suppressed by the caller's runtime_upgrade_failed /
-                        // bootstrap_failed guard. Drop this per-attempt warn to
-                        // info so the log->Sentry bridge doesn't recapture it
-                        // (RUST-4C).
-                        log::info!(
-                            "pip install attempt {}/{} failed (final): disk full (ENOSPC)",
-                            attempt,
-                            MAX_ATTEMPTS
-                        );
-                    } else {
-                        // Explicit per-category fingerprint; the bridged warn is
-                        // local-only (skip_sentry rule) so this doesn't double-
-                        // report. See `pip_failure_category`.
-                        let category = pip_failure_category_with_evidence(
-                            &compact,
-                            &pip_failure_evidence(&err, &compact),
-                        );
-                        sentry::with_scope(
-                            |scope| {
-                                scope.set_fingerprint(Some(&["pip-install-failed", category]));
-                            },
-                            || {
-                                sentry::capture_message(
-                                    &format!(
-                                        "pip install failed after {MAX_ATTEMPTS} attempts \
-                                         [{category}]: {compact}"
-                                    ),
-                                    sentry::Level::Warning,
-                                );
-                            },
-                        );
-                        log::warn!(
-                            "pip install attempt {}/{} failed (final): {}",
-                            attempt,
-                            MAX_ATTEMPTS,
-                            compact
-                        );
-                    }
-                }
-                last_err = Some(err);
-                if attempt < MAX_ATTEMPTS {
-                    let idx = (attempt as usize - 1).min(BACKOFFS_SECS.len() - 1);
-                    std::thread::sleep(std::time::Duration::from_secs(BACKOFFS_SECS[idx]));
-                }
-            }
+            Err(err) => err,
+        };
+        let compact = compact_pip_failure(&err);
+        let evidence = pip_failure_evidence(&err, &compact);
+        // The schedule depends on WHAT failed, so classify before deciding
+        // whether this attempt was the last one (see `pip_retry_backoff`).
+        if let Some(backoff) = pip_retry_backoff(attempt, &evidence) {
+            log::info!(
+                "pip install attempt {attempt} failed (will retry in {}s): {err}",
+                backoff.as_secs()
+            );
+            std::thread::sleep(backoff);
+            continue;
         }
+        if crate::is_disk_full_signal(&compact) || crate::is_disk_full_signal(&format!("{err:#}")) {
+            // ENOSPC is environmental and already surfaced + Sentry-
+            // suppressed by the caller's runtime_upgrade_failed /
+            // bootstrap_failed guard. Drop this per-attempt warn to
+            // info so the log->Sentry bridge doesn't recapture it
+            // (RUST-4C).
+            log::info!("pip install attempt {attempt} failed (final): disk full (ENOSPC)");
+        } else {
+            // Explicit per-category fingerprint; the bridged warn is
+            // local-only (skip_sentry rule) so this doesn't double-
+            // report. See `pip_failure_category`.
+            let category = pip_failure_category_with_evidence(&compact, &evidence);
+            sentry::with_scope(
+                |scope| {
+                    scope.set_fingerprint(Some(&["pip-install-failed", category]));
+                },
+                || {
+                    sentry::capture_message(
+                        &format!(
+                            "pip install failed after {attempt} attempts [{category}]: {compact}"
+                        ),
+                        sentry::Level::Warning,
+                    );
+                },
+            );
+            log::warn!("pip install attempt {attempt} failed (final): {compact}");
+        }
+        return Err(err);
     }
-    Err(last_err.expect("at least one attempt was made"))
 }
 
 /// Like `run_command` but streams stdout + stderr line-by-line through
@@ -17739,6 +17794,37 @@ exit 0
         let compact = compact_pip_failure(&pip_failure(&stderr));
         assert!(compact.starts_with("exit=1; stderr tail: "));
         assert!(compact.contains("エラー"));
+    }
+
+    /// A sharing violation is antivirus holding a freshly written wheel; the
+    /// old 2s+5s schedule burned all its attempts before the scan finished
+    /// (RUST-6Z). Everything else keeps the original three attempts.
+    #[test]
+    fn pip_retry_backoff_gives_sharing_violations_more_room() {
+        use super::pip_retry_backoff as backoff;
+        let plain = "exit=1; stderr tail: ERROR: No matching distribution found";
+        assert_eq!(backoff(1, plain), Some(Duration::from_secs(2)));
+        assert_eq!(backoff(2, plain), Some(Duration::from_secs(5)));
+        assert_eq!(backoff(3, plain), None, "third failure is final");
+
+        // Localized stderr: only the code identifies it.
+        let locked = "ERROR: Could not install packages due to an OSError: [WinError 32] \
+                      O arquivo já está sendo usado por outro processo: 'C:\\x\\torch.dll'";
+        assert_eq!(backoff(3, locked), Some(Duration::from_secs(10)));
+        assert_eq!(backoff(5, locked), Some(Duration::from_secs(30)));
+        assert_eq!(backoff(6, locked), None);
+        // Rust-side io error shape.
+        assert!(super::pip_failure_is_sharing_violation(
+            "renaming x: (os error 32)"
+        ));
+        // 320-329 are different errors.
+        assert!(!super::pip_failure_is_sharing_violation(
+            "[WinError 3] path not found"
+        ));
+        assert!(!super::pip_failure_is_sharing_violation(
+            "[WinError 320] whatever"
+        ));
+        assert_eq!(backoff(0, locked), None, "attempt numbering starts at 1");
     }
 
     #[test]
