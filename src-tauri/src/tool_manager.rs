@@ -1297,6 +1297,55 @@ def finalize_turn(
                 _hd_v_se.finalize_turn = _hd_v_finalize
     except Exception:
         pass
+    # Claude Code can replace a trailing system reminder on every turn. Keep
+    # its unchanged history attached to the cached tracker. This fallback only
+    # affects lineage selection, never wire messages or the #3380 replay body.
+    # Remove when the pinned wheel handles transient system tails itself.
+    try:
+        from importlib import metadata as _hd_ts_meta
+        if (_hd_ts_meta.version("headroom-ai") == "0.37.0" and
+            _hd_os.environ.get("HEADROOM_TRANSIENT_SYSTEM_LINEAGE", "1").strip().lower()
+                not in ("0", "false", "no", "off")):
+            import headroom.cache.prefix_tracker as _hd_ts_pt
+            _hd_ts_resolve = _hd_ts_pt.SessionTrackerStore.resolve_tracker
+            def _hd_ts_resolve_tracker(self, session_id, provider, messages=None,
+                                       cache_affinity=None):
+                if provider != "anthropic" or not messages or not self._default_config.enabled:
+                    return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
+                self._maybe_cleanup()
+                snap = _hd_ts_pt._lineage_snapshot(
+                    _hd_ts_pt._canonicalize_for_prefix_compare(messages))
+                family = self._lineages.get(session_id, {})
+                candidates = []
+                for key, chain in family.items():
+                    if self._lineage_affinities.get(key) != cache_affinity:
+                        continue
+                    # Every existing match takes precedence, including ambiguous
+                    # block rewrites: let the wheel apply its own tie policy.
+                    if _hd_ts_pt._classify_history_canonical(snap, chain).kind != "diverged":
+                        return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
+                    if (len(chain) > 1 and chain[-1].get("role") == "system"
+                        and any(m.get("role") in ("user", "assistant") for m in chain[:-1])
+                        and len(snap) >= len(chain) and snap[:len(chain) - 1] == chain[:-1]):
+                        candidates.append((len(chain), key))
+                candidates.sort(reverse=True)
+                if candidates and (len(candidates) == 1 or candidates[0][0] > candidates[1][0]):
+                    key = candidates[0][1]
+                    previous = family[key]
+                    trimmed = previous[:-1]
+                    # Synchronous resolver: expose only the proven prefix for
+                    # selection, then let the wheel store the FULL current snap.
+                    family[key] = trimmed
+                    try:
+                        return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
+                    finally:
+                        if family.get(key) is trimmed:
+                            family[key] = previous
+                return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
+            _hd_ts_pt.SessionTrackerStore.resolve_tracker = _hd_ts_resolve_tracker
+    except Exception:
+        pass
+
     # Prefix-replay guard (upstream issue #3379 / PR #3380; remove once a
     # wheel ships the fix -- see the module docstring for the cache-bust loop
     # this prevents). Restores v0.35.0's policy: that release has no size
@@ -12756,6 +12805,38 @@ mod tests {
         assert!(py.contains("_rewrite_delta"));
         // ...and the kill switch is honored.
         assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
+    }
+
+    #[test]
+    fn transient_system_lineage_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-transient-lineage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let out = crate::proc::command(&python)
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../scripts/reproduce-transient-system-cache.py"),
+            )
+            .arg("--sitecustomize")
+            .arg(dir.join("sitecustomize.py"))
+            .arg("--expect-fixed")
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            .output()
+            .expect("run transient-system lineage probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "transient-system lineage regression\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Behavioural check of the vendored #3380 prefix floor, against the REAL
