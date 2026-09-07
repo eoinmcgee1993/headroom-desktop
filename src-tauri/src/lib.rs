@@ -7010,8 +7010,16 @@ fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
 /// and the model name would land in the fingerprint, so this class could
 /// never group into one Sentry issue anyway. The default failure message
 /// echoes the CLI's own line, which names the rejected model.
+///
+/// A CLI too old for the model the user's own config selects is the same
+/// class (RUST-DE: "Claude Code 2.1.228 does not support this model; version
+/// 2.1.251 or newer is required. Run 'claude update'"). We never pin a model
+/// for the Claude agent -- `ANTHROPIC_MODEL` is explicitly removed before the
+/// spawn -- the remedy is in the CLI's own line, and the version pair in it
+/// would split the fingerprint per machine.
 fn learn_failure_is_agent_model_rejected(text: &str) -> bool {
-    text.to_ascii_lowercase().contains("unrecognized_model")
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("unrecognized_model") || lowered.contains("does not support this model")
 }
 
 /// The text a learn failure is fingerprinted on.
@@ -9115,12 +9123,12 @@ mod tests {
         compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
-        fake_override, feed_pull_due, fetch_transformations_feed_from, first_savings_body,
-        format_token_count, install_pending_update, is_blocked_runtime_dll_signal,
-        is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
-        is_loopback_socket_denied_signal, is_network_download_signal, is_port_conflict_failure,
-        is_prerelease_version, learn_agent_auth_hint, learn_agent_limit_hint,
-        learn_failure_agent_limit_line, learn_failure_is_agent_auth,
+        fake_override, feed_failure_is_persistent, feed_pull_due, fetch_transformations_feed_from,
+        first_savings_body, format_token_count, install_pending_update,
+        is_blocked_runtime_dll_signal, is_disk_full_signal, is_endpoint_protection_signal,
+        is_environmental_startup_key, is_loopback_socket_denied_signal, is_network_download_signal,
+        is_port_conflict_failure, is_prerelease_version, learn_agent_auth_hint,
+        learn_agent_limit_hint, learn_failure_agent_limit_line, learn_failure_is_agent_auth,
         learn_failure_is_agent_model_rejected, learn_failure_signature_source, learn_step_label,
         lifetime_token_milestone_kind, noop_app_update_progress_emitter,
         normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
@@ -10425,6 +10433,21 @@ mod tests {
             Some((42, crate::ACTIVITY_OBSERVER_MAX_FEED_GAP)),
             42
         ));
+    }
+
+    /// A backend restart 503s the feed for its whole down window, and every
+    /// launch starts in one. Only a failure that outlives that is the dead
+    /// feed the canary reports (RUST-DD).
+    #[test]
+    fn feed_failure_reports_only_after_it_outlives_a_backend_restart() {
+        use std::time::Duration;
+        // The observed RUST-DD window: 503 at :07, backend back at :18.
+        assert!(!feed_failure_is_persistent(Duration::from_secs(11)));
+        // A slow cold boot is still a restart, not a dead feed.
+        assert!(!feed_failure_is_persistent(Duration::from_secs(120)));
+        // Failing across at least two forced pulls with no success between.
+        assert!(feed_failure_is_persistent(crate::FEED_FETCH_FAILURE_GRACE));
+        assert!(feed_failure_is_persistent(Duration::from_secs(3600)));
     }
 
     #[test]
@@ -11840,6 +11863,10 @@ Some unrelated content.
         // RUST-BQ verbatim: a custom model override the CLI's backend rejects.
         assert!(learn_failure_is_agent_model_rejected(
             "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\n[claude-code:unrecognized_model] {\"model\":\"mimo-v2.5\",\"query_source\":\"generate_session_title\"}\nAPI Error: 400 status code (no body)"
+        ));
+        // RUST-DE verbatim: the user's CLI is older than the model needs.
+        assert!(learn_failure_is_agent_model_rejected(
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nAPI Error: 400 Claude Code 2.1.228 does not support this model; version 2.1.251 or newer is required. Run 'claude update', or update the Claude desktop app, then try again."
         ));
         // These must keep reporting: they are ours to fix (or transient).
         for stderr in [
