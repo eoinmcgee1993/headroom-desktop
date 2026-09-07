@@ -1466,6 +1466,107 @@ def finalize_turn(
     except Exception:
         pass
 
+    # Responses compression fans one request out across many router/Kompress
+    # calls. The wheel resets its 20s budget per call, so a timed-out request
+    # keeps doing inference for minutes and quarantines unrelated requests.
+    # Share one cooperative budget across both executor hops. Finished work
+    # survives; unstarted content passes through byte-for-byte. No inference
+    # thread is killed, and the existing cache/replay policy is unchanged.
+    try:
+        from importlib import metadata as _hd_cb_meta
+        if (_hd_cb_meta.version("headroom-ai") == "0.37.0" and
+            _hd_os.environ.get("HEADROOM_RESPONSES_SHARED_BUDGET", "1").strip().lower()
+                not in ("0", "false", "no", "off")):
+            import contextvars as _hd_cb_context
+            import threading as _hd_cb_threading
+            import time as _hd_cb_time
+            from headroom.proxy import server as _hd_cb_server
+            from headroom.proxy.handlers import openai as _hd_cb_oa
+            from headroom.transforms import content_router as _hd_cb_router
+            from headroom.transforms import kompress_compressor as _hd_cb_kc
+            _hd_cb_budget = _hd_cb_context.ContextVar("desktop_responses_budget", default=None)
+            _hd_cb_responses = _hd_cb_oa.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor
+            _hd_cb_executor = _hd_cb_server.HeadroomProxy._run_compression_in_executor
+            _hd_cb_units = _hd_cb_oa._openai_responses_unit_executor
+            _hd_cb_compress = _hd_cb_router.ContentRouter.compress
+            _hd_cb_units_lock = _hd_cb_threading.Lock()
+
+            async def _hd_cb_responses_bounded(self, payload, **kwargs):
+                seconds = _hd_cb_router._compression_deadline_seconds()
+                if seconds <= 0:
+                    return await _hd_cb_responses(self, payload, **kwargs)
+                # Leave time to finish the current non-preemptible inference,
+                # merge results and serialize before the outer timeout fires.
+                timeout = kwargs.get("timeout", _hd_cb_oa.COMPRESSION_TIMEOUT_SECONDS)
+                seconds = min(seconds, max(0.0, timeout * 0.75))
+                cancelled = _hd_cb_threading.Event()
+                token = _hd_cb_budget.set((_hd_cb_time.perf_counter() + seconds, cancelled))
+                try:
+                    return await _hd_cb_responses(self, payload, **kwargs)
+                finally:
+                    cancelled.set()
+                    _hd_cb_budget.reset(token)
+
+            async def _hd_cb_run_executor(self, fn, *, timeout):
+                if _hd_cb_budget.get() is None:
+                    return await _hd_cb_executor(self, fn, timeout=timeout)
+                context = _hd_cb_context.copy_context()
+                return await _hd_cb_executor(self, lambda: context.run(fn), timeout=timeout)
+
+            def _hd_cb_unit_executor():
+                executor = _hd_cb_units()
+                with _hd_cb_units_lock:
+                    if not getattr(executor, "_desktop_budget_context", False):
+                        submit = executor.submit
+                        def submit_with_context(fn, *args, **kwargs):
+                            context = _hd_cb_context.copy_context()
+                            return submit(context.run, fn, *args, **kwargs)
+                        executor.submit = submit_with_context
+                        executor._desktop_budget_context = True
+                return executor
+
+            def _hd_cb_expired(budget):
+                return budget and (budget[1].is_set() or _hd_cb_time.perf_counter() >= budget[0])
+
+            def _hd_cb_router_compress(self, content, *args, **kwargs):
+                if _hd_cb_expired(_hd_cb_budget.get()):
+                    return _hd_cb_router.RouterCompressionResult(
+                        compressed=content, original=content,
+                        strategy_used=_hd_cb_router.CompressionStrategy.PASSTHROUGH,
+                        routing_log=[])
+                return _hd_cb_compress(self, content, *args, **kwargs)
+
+            def _hd_cb_kompress_wrapper(original, batch=False):
+                def bounded(self, *args, **kwargs):
+                    content = args[0] if args else kwargs["contents" if batch else "content"]
+                    budget = _hd_cb_budget.get()
+                    if _hd_cb_expired(budget):
+                        if batch:
+                            return [self._passthrough(text, len(text.split())) for text in content]
+                        return self._passthrough(content, len(content.split()))
+                    if budget is not None:
+                        seconds = getattr(self, "_deadline_s", None)
+                        if seconds is None:
+                            seconds = _hd_cb_kc._request_deadline_seconds()
+                        if seconds > 0:
+                            # Feed the native chunk/acquire deadline, including
+                            # nested compress_batch -> compress calls. Never
+                            # extend an earlier deadline supplied by the caller.
+                            started = budget[0] - seconds
+                            previous = kwargs.get("_deadline_started_at")
+                            kwargs["_deadline_started_at"] = min(started, previous) if previous is not None else started
+                    return original(self, *args, **kwargs)
+                return bounded
+
+            _hd_cb_oa.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = _hd_cb_responses_bounded
+            _hd_cb_server.HeadroomProxy._run_compression_in_executor = _hd_cb_run_executor
+            _hd_cb_oa._openai_responses_unit_executor = _hd_cb_unit_executor
+            _hd_cb_router.ContentRouter.compress = _hd_cb_router_compress
+            _hd_cb_kc.KompressCompressor.compress = _hd_cb_kompress_wrapper(_hd_cb_kc.KompressCompressor.compress)
+            _hd_cb_kc.KompressCompressor.compress_batch = _hd_cb_kompress_wrapper(_hd_cb_kc.KompressCompressor.compress_batch, batch=True)
+    except Exception:
+        pass
+
     # Prefix-replay guard (upstream issue #3379 / PR #3380; remove once a
     # wheel ships the fix -- see the module docstring for the cache-bust loop
     # this prevents). Restores v0.35.0's policy: that release has no size
@@ -12987,6 +13088,41 @@ mod tests {
             assert!(
                 out.status.success(),
                 "cache-integrity regression (broken={broken})\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn responses_shared_budget_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-responses-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        for disabled in [false, true] {
+            let mut command = crate::proc::command(&python);
+            command
+                .arg(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../scripts/verify-responses-budget.py"),
+                )
+                .arg("--sitecustomize")
+                .arg(dir.join("sitecustomize.py"));
+            if disabled {
+                command.arg("--disabled");
+            }
+            let out = command.output().expect("run Responses budget probe");
+            assert!(
+                out.status.success(),
+                "Responses budget regression (disabled={disabled})\n{}\n{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
