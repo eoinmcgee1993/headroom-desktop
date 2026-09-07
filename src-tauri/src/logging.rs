@@ -428,6 +428,13 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Same split, same reason: the observer captures this one at the emit site
+    // with the cause class as the fingerprint and the raw error as an extra.
+    // The local line keeps the full error text -- which is exactly what would
+    // parameterize the bridged twin into a fresh group per machine.
+    if msg.starts_with("transformations feed fetch failed") {
+        return true;
+    }
     // Routing a missing managed runtime back to setup is the RECOVERY path, and
     // the emit site says so: `ensure_runtime_ready_for_tray` deliberately logs
     // instead of calling `capture_headroom_start_failure`, because capturing a
@@ -731,6 +738,19 @@ mod tests {
     /// One detection, two issues: the fully-scoped capture at the emit site
     /// (RUST-A5) and this bridged log line (RUST-A4). The capture is the Sentry
     /// path; the warn is local only.
+    #[test]
+    fn skips_the_transformations_feed_fetch_log_twin() {
+        assert!(super::skip_sentry(
+            "headroom_desktop_lib",
+            "transformations feed fetch failed (operation timed out); activity observation and the zero-savings canary see nothing on this machine"
+        ));
+        // A different feed problem still reaches Sentry through the bridge.
+        assert!(!super::skip_sentry(
+            "headroom_desktop_lib",
+            "transformations feed returned an unparseable payload"
+        ));
+    }
+
     #[test]
     fn skips_the_zero_savings_canary_log_twin() {
         assert!(skip_sentry(

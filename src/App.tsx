@@ -6954,7 +6954,14 @@ export default function App() {
                 resetSignal={chartResetSignal}
                 chartMode={chartMode}
                 setChartMode={setChartMode}
-                outputReduction={dashboard.outputReduction}
+                // Withheld when the estimate covers too thin a slice of this
+                // machine's traffic to be its headline. The per-window chip is
+                // a different lineage (sampled buckets) and stands either way.
+                outputReduction={
+                  dashboard.outputReduction?.publishable === false
+                    ? null
+                    : dashboard.outputReduction
+                }
               />
             ) : (
               <div className="savings-chart__skeleton" role="status">

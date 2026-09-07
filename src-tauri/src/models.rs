@@ -149,6 +149,16 @@ pub struct OutputReduction {
     pub ci_low_percent: f64,
     pub ci_high_percent: f64,
     pub requests: u64,
+    /// `requests` as a share of every shaped request. `None` when the figure
+    /// came from the backend's `/stats` rather than the local ledger recompute,
+    /// which is the only place the denominator is visible.
+    pub coverage_percent: Option<f64>,
+    /// False when that share is too thin for the percentage to describe the
+    /// machine (`output_savings::OutputEstimate::covers_enough`). The tile and
+    /// the server report withhold the percentage; the counters above still
+    /// travel, so the floor can be tuned against fleet data rather than guessed
+    /// at twice. The threshold lives in one place, not in every caller.
+    pub publishable: bool,
 }
 
 /// Auto-learning progress from the backend's `/stats` `traffic_learner` block.

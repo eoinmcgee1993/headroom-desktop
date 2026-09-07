@@ -30,12 +30,25 @@ use serde::Deserialize;
 /// once strata with data in both arms account for this share of treatment
 /// volume. Below it the holdout describes a corner of the traffic, not the
 /// traffic.
-const MEASURED_MIN_COVERAGE: f64 = 0.5;
+const MEASURED_MIN_COVERAGE_PCT: f64 = 50.0;
 
 /// ...and only once its 95% band is this tight. At a 3% holdout this takes a
 /// heavy user a couple of months; a lighter one may never reach it, which is
 /// the correct outcome -- they keep the synthetic-control number.
 const MEASURED_MAX_CI_HALF_WIDTH_PCT: f64 = 10.0;
+
+/// The synthetic-control estimate is published only once the strata it can
+/// score account for this share of shaped traffic. Below it the number
+/// describes a corner of the machine and is read as if it described all of it.
+/// A fleet snapshot on 2026-09-07 had 23 of 312 reporting users above 90%
+/// reduction, which no shaper mechanism produces: it lowers verbosity, it does
+/// not delete 19 of every 20 output tokens. Those are thin slices of scoreable
+/// traffic whose baseline strata were seeded on a different request class.
+///
+/// ponytail: provisional value. Coverage only starts travelling to the server
+/// in this same change, so there is no fleet distribution to tune against yet;
+/// revisit once `output_reduction_coverage_pct` has a fortnight of data.
+const ESTIMATED_MIN_COVERAGE_PCT: f64 = 20.0;
 
 /// A baseline stratum speaks for a treatment stratum only with this many
 /// observations behind it. Below it, one long pre-install reply becomes the
@@ -140,6 +153,12 @@ impl Ledger {
             (c.n >= MIN_BASELINE_N).then(|| (c.mean(), c.var(), c.n))
         })
     }
+
+    /// Every shaped request in the ledger, scored or not: the denominator
+    /// both coverage gates measure against.
+    fn shaped(&self) -> u64 {
+        self.treatment.values().map(|acc| acc.n).sum()
+    }
 }
 
 /// One side of the counterfactual, ready for the dashboard.
@@ -153,6 +172,10 @@ pub struct OutputEstimate {
     /// Treatment requests the estimate actually covers -- not every shaped
     /// request, since strata without baseline evidence are excluded.
     pub requests: u64,
+    /// `requests` as a share of every shaped request, so a reader can tell a
+    /// number about all of this machine's traffic from one about a corner of
+    /// it. Travels to the server with the percentage for the same reason.
+    pub coverage_percent: f64,
     pub tokens_saved: u64,
     pub baseline_tokens: u64,
 }
@@ -186,8 +209,21 @@ pub enum LedgerEstimate {
     /// seeded baseline covers only pre-install claude traffic). Resolves
     /// itself once the holdout's control arm feeds a live stratum past
     /// [`MIN_BASELINE_N`].
+    ///
+    /// A merely THIN estimate is not this: it stays [`LedgerEstimate::Scored`]
+    /// and reports [`OutputEstimate::covers_enough`] false, because this
+    /// variant makes the tracker discard every sampled output bucket it holds.
     Unscored,
     Scored(OutputEstimate),
+}
+
+impl OutputEstimate {
+    /// Whether this estimate speaks for the machine or for a corner of it.
+    /// False withholds the PERCENTAGE from the tile and the server report; the
+    /// coverage counters still travel, and the dollar series is untouched.
+    pub fn covers_enough(&self) -> bool {
+        self.coverage_percent >= ESTIMATED_MIN_COVERAGE_PCT
+    }
 }
 
 impl LedgerEstimate {
@@ -260,7 +296,14 @@ fn estimate_from_baseline(ledger: &Ledger) -> Option<OutputEstimate> {
         var += n * acc.var() + (n * n) * (mu_var / m as f64);
     }
 
-    finalize("estimated", saved, baseline_tokens, var, requests)
+    finalize(
+        "estimated",
+        saved,
+        baseline_tokens,
+        var,
+        requests,
+        ledger.shaped(),
+    )
 }
 
 /// A/B measurement: per-stratum control mean minus treatment mean, over strata
@@ -285,11 +328,18 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
         var += (n * n) * (c.var() / c.n as f64 + t.var() / t.n as f64);
     }
 
-    finalize("measured", saved, baseline_tokens, var, requests)
+    finalize(
+        "measured",
+        saved,
+        baseline_tokens,
+        var,
+        requests,
+        ledger.shaped(),
+    )
 }
 
 /// The measured estimate, but only once it is worth showing: it must cover
-/// [`MEASURED_MIN_COVERAGE`] of the shaped traffic and carry a band no wider
+/// [`MEASURED_MIN_COVERAGE_PCT`] of the shaped traffic and carry a band no wider
 /// than [`MEASURED_MAX_CI_HALF_WIDTH_PCT`].
 ///
 /// Coverage is measured against the same denominator the synthetic control
@@ -299,12 +349,7 @@ fn measured_if_ready(
     estimated: &Option<OutputEstimate>,
 ) -> Option<OutputEstimate> {
     let measured = estimate_from_holdout(ledger)?;
-    let shaped: u64 = ledger.treatment.values().map(|acc| acc.n).sum();
-    if shaped == 0 {
-        return None;
-    }
-    let covered = measured.requests as f64 / shaped as f64;
-    if covered < MEASURED_MIN_COVERAGE {
+    if measured.coverage_percent < MEASURED_MIN_COVERAGE_PCT {
         return None;
     }
     let half_width = (measured.ci_high_percent - measured.ci_low_percent) / 2.0;
@@ -338,8 +383,9 @@ fn finalize(
     baseline_tokens: f64,
     var: f64,
     requests: u64,
+    shaped: u64,
 ) -> Option<OutputEstimate> {
-    if requests == 0 || baseline_tokens <= 0.0 || !baseline_tokens.is_finite() {
+    if requests == 0 || shaped == 0 || baseline_tokens <= 0.0 || !baseline_tokens.is_finite() {
         return None;
     }
     let pct = saved / baseline_tokens * 100.0;
@@ -353,6 +399,7 @@ fn finalize(
         ci_low_percent: (saved - 1.96 * se) / baseline_tokens * 100.0,
         ci_high_percent: (saved + 1.96 * se) / baseline_tokens * 100.0,
         requests,
+        coverage_percent: requests as f64 / shaped as f64 * 100.0,
         tokens_saved: saved.max(0.0).round() as u64,
         baseline_tokens: baseline_tokens.round() as u64,
     })
@@ -416,6 +463,8 @@ mod tests {
         // baseline stratum. The 2 opus|ask|l|notools (no exact stratum) and
         // the 3 fable requests (no evidence at all) stay out.
         assert_eq!(e.requests, 4);
+        // 4 of the 9 shaped requests are scoreable.
+        assert!((e.coverage_percent - 44.444_444).abs() < 1e-5);
         assert_eq!(e.tokens_saved, 800);
         assert_eq!(e.baseline_tokens, 4000);
         assert!((e.reduction_percent - 20.0).abs() < 1e-9);
@@ -499,6 +548,33 @@ mod tests {
         let e = estimate(&json);
         assert_eq!(e.method, "estimated");
         assert_eq!(e.requests, 5000);
+    }
+
+    #[test]
+    fn an_estimate_covering_a_corner_of_traffic_is_not_publishable() {
+        // The 90-100% fleet tail: a well-fed baseline stratum scores 4 of 104
+        // shaped requests, and the percentage gets read as if it described the
+        // machine. It stays SCORED -- demoting it to Unscored would make the
+        // tracker discard the machine's sampled output buckets -- but it is
+        // not publishable.
+        let json = MIXED.replace(
+            r#""fable|ask|l|tools":  {"n": 3, "sum": 2100, "sumsq": 1490000}"#,
+            r#""fable|ask|l|tools":  {"n": 98, "sum": 68600, "sumsq": 48706000}"#,
+        );
+        let thin = estimate(&json);
+        assert_eq!(thin.requests, 4);
+        assert!((thin.coverage_percent - 3.846_153).abs() < 1e-5);
+        assert!(!thin.covers_enough());
+
+        // Its own control arm restores coverage, and with it the headline.
+        let scored = estimate(&json.replace(
+            r#""control": {}"#,
+            r#""control": {"fable|ask|l|tools": {"n": 10, "sum": 10000, "sumsq": 10200000}}"#,
+        ));
+        // 102 of 104: the 2 opus|ask|l|notools still have no evidence.
+        assert_eq!(scored.requests, 102);
+        assert!((scored.coverage_percent - 98.076_923).abs() < 1e-5);
+        assert!(scored.covers_enough());
     }
 
     #[test]

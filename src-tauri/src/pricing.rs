@@ -1619,6 +1619,11 @@ pub struct SavingsReport {
     pub cache_savings_usd: f64,
     pub output_reduction_percent: Option<f64>,
     pub output_reduction_method: Option<String>,
+    /// How much of the machine's shaped traffic that percentage actually
+    /// covers. Without it the server cannot tell a solid 43% from a 97% drawn
+    /// from 3% of requests, and both render identically in the admin.
+    pub output_reduction_requests: Option<u64>,
+    pub output_reduction_coverage_percent: Option<f64>,
     /// Retrieval-churn gauges (see `DashboardState`): how much compressed-away
     /// content came back. The over-compression tripwire behind "context filled
     /// up faster with Headroom" reports.

@@ -4177,9 +4177,16 @@ const ACTIVITY_OBSERVER_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// Rescan cadence for the Claude projects cache. This keeps Optimize mostly
 /// warm without doing filesystem-heavy project scans every minute forever.
 const CLAUDE_PROJECTS_WARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(75);
-/// Matches the frontend's `ACTIVITY_FEED_WINDOW` in App.tsx so the observer
-/// sees the same transformations the UI will display.
-const ACTIVITY_OBSERVER_LIMIT: u32 = 150;
+/// The backend hard-caps `/transformations/feed?limit=` at 100, so asking for
+/// more only made the constant lie (it used to claim it matched a frontend
+/// `ACTIVITY_FEED_WINDOW` that no longer exists). 100 is also above the busiest
+/// 20s window measured on a heavy machine (p50 3 requests, p90 8, p99 35, max
+/// 66), so a tick still sees every request that landed since the last one.
+const ACTIVITY_OBSERVER_LIMIT: u32 = 100;
+/// Pull the feed at least this often even when the intercept counters have not
+/// moved, so a producer the intercept cannot see (anything reaching the backend
+/// on 6768 directly) is still observed within a few minutes.
+const ACTIVITY_OBSERVER_MAX_FEED_GAP: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn spawn_activity_observer(app: AppHandle) {
     std::thread::spawn(move || {
@@ -4211,16 +4218,107 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
     });
 }
 
+/// Whether this tick should pull the transformations feed, given the intercept's
+/// forwarded-request total the last pull saw and how long ago that pull was.
+///
+/// One pull costs far more than what is read off it: measured 2026-09-07,
+/// `limit=100` returns ~44 MB because every event carries `request_messages`
+/// plus a byte-identical `compressed_messages` (~160 KB per event, and the
+/// backend has no parameter to omit them) while the observer and the canary
+/// between them read ~403 bytes of each. The backend serializes all of it on
+/// its event loop, and `/stats` -- which the dashboard polls on its own cadence
+/// -- queues behind it: 45 ms idle against 1.3 s with three pulls in flight, on
+/// an otherwise idle machine. That is the shape behind RUST-86's 15s `/stats`
+/// timeouts (122 hosts), so the observer stops paying it for nothing.
+///
+/// Unchanged counters mean every event in the window has already been observed.
+/// The elapsed arm still forces a pull, so a producer the intercept cannot see
+/// (anything reaching the backend on 6768 directly) is not missed forever.
+fn feed_pull_due(last: Option<(u64, std::time::Duration)>, forwarded: u64) -> bool {
+    match last {
+        Some((seen, since)) => seen != forwarded || since >= ACTIVITY_OBSERVER_MAX_FEED_GAP,
+        // First tick of the process: the window holds requests from before
+        // launch that nothing here has observed yet.
+        None => true,
+    }
+}
+
+fn should_pull_transformations_feed() -> bool {
+    static LAST_PULL: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
+    let forwarded: u64 = crate::proxy_intercept::intercept_request_counts()
+        .values()
+        .sum();
+    let mut last = LAST_PULL.lock();
+    let due = feed_pull_due(
+        last.map(|(seen, at): (u64, std::time::Instant)| (seen, at.elapsed())),
+        forwarded,
+    );
+    if due {
+        *last = Some((forwarded, std::time::Instant::now()));
+    }
+    due
+}
+
 fn run_activity_observation(app: &AppHandle) {
     let state: tauri::State<'_, AppState> = app.state();
 
     let _ = state.maybe_emit_weekly_recap();
 
-    if let Ok(feed) = fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
-        let _ = state.observe_activity_from_transformations(&feed.transformations);
-        // Same batch, second reader: flags a client whose requests all stopped
-        // compressing (see savings_canary for why the server cannot see this).
-        savings_canary::observe(&feed.transformations);
+    if should_pull_transformations_feed() {
+        match fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
+            Ok(feed) => {
+                let _ = state.observe_activity_from_transformations(&feed.transformations);
+                // Same batch, second reader: flags a client whose requests all
+                // stopped compressing (see savings_canary for why the server
+                // cannot see this).
+                savings_canary::observe(&feed.transformations);
+            }
+            // This used to be an `if let Ok`, which is how a permanently
+            // failing fetch stayed invisible: both readers above simply never
+            // ran, on exactly the heaviest machines. Once per process is the
+            // whole signal -- the failure repeats every tick, and a warn per
+            // tick would drown Sentry for one machine's one condition.
+            Err(err) => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    // Fingerprint on the cause class, with the detail in an
+                    // extra. Baking `err` into the message text is what split
+                    // one canary into RUST-A5 + RUST-A4; a timeout (payload too
+                    // big for the window) and an HTTP status (backend answering
+                    // wrong) are different bugs and need separate lifecycles.
+                    let category = if err.contains("timed out") {
+                        "timeout"
+                    } else if err.starts_with("proxy returned HTTP ") {
+                        "http"
+                    } else {
+                        "other"
+                    };
+                    sentry::with_scope(
+                        |scope| {
+                            scope.set_tag("flow", "transformations_feed_fetch");
+                            scope.set_extra("error", err.clone().into());
+                            scope.set_extra("limit", u64::from(ACTIVITY_OBSERVER_LIMIT).into());
+                            scope.set_fingerprint(Some(&["transformations-feed-fetch", category]));
+                        },
+                        || {
+                            sentry::capture_message(
+                                &format!(
+                                    "transformations feed fetch failed ({category}); activity \
+                                     observation and the zero-savings canary see nothing on this \
+                                     machine"
+                                ),
+                                sentry::Level::Warning,
+                            );
+                        },
+                    );
+                    log::warn!(
+                        "transformations feed fetch failed ({err}); activity observation and the \
+                         zero-savings canary see nothing on this machine"
+                    );
+                }
+            }
+        }
     }
 
     let projects = state.list_claude_code_projects().unwrap_or_default();
@@ -6271,13 +6369,18 @@ fn lifetime_token_milestone_kind(milestone_tokens_saved: u64) -> &'static str {
 /// How many recent days of savings travel with the milestone/heartbeat post.
 const SAVINGS_REPORT_DAYS: usize = 30;
 
-/// The output-reduction fields the savings report should carry. The desktop
-/// requests the shaper, but the wheel's rollout gate can block it by channel
-/// (all stable installs on the 0.37.0 wheel). A blocked shaper produces no
-/// live reduction, so the ledger-recomputed figure would report an "estimated"
-/// percentage for a feature that never ran; label it inactive and withhold the
-/// percent instead. Unknown state (older wheels without the rollout block)
-/// reports as before.
+/// The output-reduction percent + method the savings report should carry. Two
+/// states withhold the percent and say why in the method label instead:
+///
+/// - `inactive`: the desktop requests the shaper, but the wheel's rollout gate
+///   can block it by channel (all stable installs on the 0.37.0 wheel). A
+///   blocked shaper produces no live reduction, so the ledger-recomputed figure
+///   would report an "estimated" percentage for a feature that never ran.
+/// - `low_coverage`: the estimate covers too thin a slice of this machine's
+///   shaped traffic to describe it. The counters that prove it travel
+///   separately (see `savings_report`), so the floor can be tuned on real data.
+///
+/// Unknown rollout state (older wheels without the block) reports as before.
 fn reported_output_reduction(
     reduction: Option<&crate::models::OutputReduction>,
     shaper_active: Option<bool>,
@@ -6285,9 +6388,15 @@ fn reported_output_reduction(
     if shaper_active == Some(false) {
         return (None, Some("inactive".to_string()));
     }
+    let Some(reduction) = reduction else {
+        return (None, None);
+    };
+    if !reduction.publishable {
+        return (None, Some("low_coverage".to_string()));
+    }
     (
-        reduction.map(|o| o.reduction_percent),
-        reduction.map(|o| o.method.clone()),
+        Some(reduction.reduction_percent),
+        Some(reduction.method.clone()),
     )
 }
 
@@ -6318,6 +6427,13 @@ fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> 
         cache_savings_usd: breakdown.cache_savings_usd,
         output_reduction_percent,
         output_reduction_method,
+        // Unconditional, unlike the percent: a withheld `low_coverage` figure
+        // is exactly the case the server needs the denominator for.
+        output_reduction_requests: dashboard.output_reduction.as_ref().map(|o| o.requests),
+        output_reduction_coverage_percent: dashboard
+            .output_reduction
+            .as_ref()
+            .and_then(|o| o.coverage_percent),
         reread_tokens: dashboard.reread_tokens,
         reread_compressed_tokens: dashboard.reread_compressed_tokens,
         ccr_retrievals: dashboard.ccr_retrievals,
@@ -6652,12 +6768,22 @@ struct RawTransformationsFeedResponse {
     transformations: Vec<crate::models::TransformationFeedEvent>,
 }
 
+/// 2s was silently fatal on exactly the users whose data matters most. The feed
+/// ships every event's full message bodies (~160 KB each, no way to ask the
+/// backend for less), so `limit=100` measured 44 MB / 0.38s on a heavy machine
+/// here -- and a machine with conversations a few times larger crosses 2s, at
+/// which point the activity observer AND the zero-savings canary get nothing,
+/// every tick, forever. Raising this costs the backend nothing: it serializes
+/// the whole response either way, we were only throwing the result away. Half
+/// the observer's 20s tick, so a slow fetch still cannot let ticks pile up.
+const TRANSFORMATIONS_FEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn fetch_transformations_feed_from(
     base_url: &str,
     limit: u32,
 ) -> Result<TransformationFeedResponse, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_millis(2000))
+        .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
         .build()
         .map_err(|err| err.to_string())?;
     let url = format!("{base_url}/transformations/feed?limit={limit}");
@@ -8951,9 +9077,9 @@ mod tests {
         compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
-        fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
-        install_pending_update, is_blocked_runtime_dll_signal, is_disk_full_signal,
-        is_endpoint_protection_signal, is_environmental_startup_key,
+        fake_override, feed_pull_due, fetch_transformations_feed_from, first_savings_body,
+        format_token_count, install_pending_update, is_blocked_runtime_dll_signal,
+        is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
         is_loopback_socket_denied_signal, is_network_download_signal, is_port_conflict_failure,
         is_prerelease_version, learn_agent_auth_hint, learn_agent_limit_hint,
         learn_failure_agent_limit_line, learn_failure_is_agent_auth,
@@ -10241,6 +10367,26 @@ mod tests {
             err.contains("Sign in to the Codex CLI"),
             "expected codex sign-in hint, got: {err}"
         );
+    }
+
+    /// The feed pull is ~44 MB and the observer reads ~0.25% of it, so an idle
+    /// tick must not pay for it -- but an unseen producer must not be able to
+    /// hide behind unchanged counters forever either (RUST-86).
+    #[test]
+    fn feed_pull_skips_idle_ticks_but_never_stalls_past_the_gap() {
+        use std::time::Duration;
+        // First tick of the process: the window predates us, always pull.
+        assert!(feed_pull_due(None, 0));
+        // Nothing forwarded since the last pull, and well inside the gap.
+        assert!(!feed_pull_due(Some((42, Duration::from_secs(20))), 42));
+        // New traffic; pull immediately rather than waiting out the gap.
+        assert!(feed_pull_due(Some((42, Duration::from_secs(20))), 43));
+        // Counters idle but the gap elapsed: pull anyway, in case something
+        // reached the backend without passing the intercept.
+        assert!(feed_pull_due(
+            Some((42, crate::ACTIVITY_OBSERVER_MAX_FEED_GAP)),
+            42
+        ));
     }
 
     #[test]
@@ -12488,6 +12634,8 @@ mod output_reduction_report_tests {
             ci_low_percent: 20.0,
             ci_high_percent: 36.0,
             requests: 19_644,
+            coverage_percent: Some(63.5),
+            publishable: true,
         }
     }
 
@@ -12503,6 +12651,18 @@ mod output_reduction_report_tests {
         let (pct, method) = reported_output_reduction(Some(&reduction()), Some(true));
         assert_eq!(pct, Some(28.0));
         assert_eq!(method.as_deref(), Some("estimated"));
+    }
+
+    #[test]
+    fn a_thinly_covered_estimate_withholds_the_percent_and_says_why() {
+        let thin = OutputReduction {
+            coverage_percent: Some(3.8),
+            publishable: false,
+            ..reduction()
+        };
+        let (pct, method) = reported_output_reduction(Some(&thin), Some(true));
+        assert_eq!(pct, None);
+        assert_eq!(method.as_deref(), Some("low_coverage"));
     }
 
     #[test]

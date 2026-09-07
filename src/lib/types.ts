@@ -111,6 +111,12 @@ export interface OutputReduction {
   ciLowPercent: number;
   ciHighPercent: number;
   requests: number;
+  // `requests` as a share of every shaped request, and whether that share is
+  // thick enough for the percentage to describe the machine rather than a
+  // corner of it. Rust owns the threshold (output_savings.rs); the UI only
+  // obeys the verdict. Optional: older payloads predate both.
+  coveragePercent?: number | null;
+  publishable?: boolean;
 }
 
 // Lifetime savings decomposition behind the headline card. cacheSavingsUsd is

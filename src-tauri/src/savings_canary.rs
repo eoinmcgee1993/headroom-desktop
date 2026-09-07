@@ -47,6 +47,14 @@ pub struct Anomaly {
     pub strata: Vec<String>,
     /// Distinct `provider/model` pairs, to point at which client broke.
     pub models: Vec<String>,
+    /// Distinct transform families that ran on the zero-saved requests, with
+    /// per-request parameters trimmed off. This is the discriminator the first
+    /// ten reports lacked: a wire-format regression leaves the router with
+    /// nothing to match (`router:noop` alone next to the output shaper), while
+    /// a compressor that ran and returned nothing shows its real stages. Every
+    /// report so far spanned every provider at once, which no single client's
+    /// wire format can explain -- the transforms say which of the two it was.
+    pub transforms: Vec<String>,
 }
 
 /// Pick out the anomaly, or `None` when the batch looks healthy or is too
@@ -80,11 +88,23 @@ pub fn detect(events: &[TransformationFeedEvent]) -> Option<Anomaly> {
     // machines instead of reshuffling per batch.
     let mut strata = BTreeSet::new();
     let mut models = BTreeSet::new();
+    let mut transforms = BTreeSet::new();
     for event in &zeroed {
         for transform in &event.transforms_applied {
             if let Some(stratum) = transform.strip_prefix("output_shaper:stratum:") {
                 strata.insert(stratum.to_string());
+                continue;
             }
+            // First two segments only: `router:tool_search_deferral:9tools:
+            // 14341tok` carries per-request counts that would make every
+            // machine's set unique and the fleet view unreadable.
+            transforms.insert(
+                transform
+                    .split(':')
+                    .take(2)
+                    .collect::<Vec<&str>>()
+                    .join(":"),
+            );
         }
         let provider = event.provider.as_deref().unwrap_or("?");
         let model = event.model.as_deref().unwrap_or("?");
@@ -96,6 +116,7 @@ pub fn detect(events: &[TransformationFeedEvent]) -> Option<Anomaly> {
         zero: zeroed.len(),
         strata: strata.into_iter().take(5).collect(),
         models: models.into_iter().take(5).collect(),
+        transforms: transforms.into_iter().take(6).collect(),
     })
 }
 
@@ -110,6 +131,7 @@ pub fn observe(events: &[TransformationFeedEvent]) {
 
     let strata = anomaly.strata.join(", ");
     let models = anomaly.models.join(", ");
+    let transforms = anomaly.transforms.join(", ");
     // Fixed fingerprint: every affected machine lands in one issue, so the
     // event count is the blast radius. Counts stay out of it deliberately.
     let fingerprint: [&str; 1] = ["zero_savings_canary"];
@@ -121,13 +143,14 @@ pub fn observe(events: &[TransformationFeedEvent]) {
             scope.set_extra("min_input_tokens", MIN_INPUT_TOKENS.into());
             scope.set_extra("strata", strata.clone().into());
             scope.set_extra("models", models.clone().into());
+            scope.set_extra("transforms", transforms.clone().into());
             scope.set_fingerprint(Some(fingerprint.as_slice()));
         },
         || {
             sentry::capture_message(
                 &format!(
                     "zero_savings_canary: {}/{} large requests compressed to nothing \
-                     (models: {models}; strata: {strata})",
+                     (models: {models}; strata: {strata}; transforms: {transforms})",
                     anomaly.zero, anomaly.sample
                 ),
                 sentry::Level::Warning,
@@ -136,7 +159,7 @@ pub fn observe(events: &[TransformationFeedEvent]) {
     );
     log::warn!(
         "zero-savings canary: {}/{} requests over {MIN_INPUT_TOKENS} tokens saved nothing \
-         (models: {models}; strata: {strata})",
+         (models: {models}; strata: {strata}; transforms: {transforms})",
         anomaly.zero,
         anomaly.sample
     );
@@ -187,6 +210,31 @@ mod tests {
         assert_eq!(anomaly.zero, MIN_SAMPLE);
         assert_eq!(anomaly.strata, vec!["gpt|new_user_ask|m|notools"]);
         assert_eq!(anomaly.models, vec!["openai/gpt-5.6-sol"]);
+        assert_eq!(anomaly.transforms, vec!["output_shaper:verbosity"]);
+    }
+
+    /// The two shapes the first ten reports could not be told apart by: a
+    /// router that matched nothing, versus stages that ran and returned zero.
+    /// Per-request parameters are trimmed so the sets collapse across machines.
+    #[test]
+    fn names_the_transform_families_behind_the_zeroes() {
+        let batch: Vec<_> = (0..MIN_SAMPLE)
+            .map(|_| {
+                event(
+                    40_000,
+                    0,
+                    &[
+                        "router:noop",
+                        "router:tool_search_deferral:9tools:14341tok",
+                        "output_shaper:stratum:gpt|new_user_ask|m|notools",
+                    ],
+                )
+            })
+            .collect();
+        assert_eq!(
+            detect(&batch).expect("anomaly").transforms,
+            vec!["router:noop", "router:tool_search_deferral"]
+        );
     }
 
     #[test]

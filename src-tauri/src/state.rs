@@ -2493,6 +2493,8 @@ impl AppState {
                 ci_low_percent: e.ci_low_percent,
                 ci_high_percent: e.ci_high_percent,
                 requests: e.requests,
+                coverage_percent: Some(e.coverage_percent),
+                publishable: e.covers_enough(),
             })
             .or_else(|| {
                 if !backend_output_fallback_allowed {
@@ -2507,6 +2509,8 @@ impl AppState {
                         ci_low_percent: o.ci_low_percent,
                         ci_high_percent: o.ci_high_percent,
                         requests: o.requests,
+                        coverage_percent: None,
+                        publishable: true,
                     })
             });
 
@@ -8604,14 +8608,39 @@ fn warn_once_if_savings_rate_implausible(
         // legit expensive-model mix, a foreign backend on 6767, and real
         // contamination are indistinguishable from the rate alone (RUST-89,
         // 2026-09-01: $93.70/M on a 0.35.0-pinned install, undecidable).
+        //
+        // The lifetime rate alone still could not separate the two shapes this
+        // canary has churned through four resolve/regress cycles on: one
+        // contaminated day dragging an otherwise-sane series up, versus every
+        // day sitting above the ceiling. The worst bucket says which, and the
+        // configured upstream says whether Anthropic rates were applied to a
+        // third-party endpoint's traffic -- both read off state already in hand.
         let saved_usd: f64 = daily_savings.iter().map(|p| p.estimated_savings_usd).sum();
         let saved_tokens: u64 = daily_savings.iter().map(|p| p.estimated_tokens_saved).sum();
         let wheel = installed_wheel().unwrap_or_else(|| "unknown".into());
+        let bucket_rate =
+            |p: &DailySavingsPoint| p.estimated_savings_usd / p.estimated_tokens_saved as f64 * 1e6;
+        let worst = daily_savings
+            .iter()
+            .filter(|p| p.estimated_tokens_saved > 0)
+            .max_by(|a, b| bucket_rate(a).total_cmp(&bucket_rate(b)))
+            .map(|p| {
+                format!(
+                    "{} at ${:.2}/M (${:.2} / {} tok)",
+                    p.date,
+                    bucket_rate(p),
+                    p.estimated_savings_usd,
+                    p.estimated_tokens_saved
+                )
+            })
+            .unwrap_or_else(|| "none".into());
+        let upstream = crate::upstream_override::get().mode;
         log::warn!(
             "savings rate implausible: buckets imply ${savings_per_m:.2}/M saved (${saved_usd:.2} \
              across {saved_tokens} tokens, wheel {wheel}), above the \
              ${MAX_PLAUSIBLE_INPUT_USD_PER_M:.2}/M ceiling for an input token; upstream savings \
-             semantics likely changed under the pinned wheel"
+             semantics likely changed under the pinned wheel; worst bucket {worst}, upstream \
+             {upstream:?}"
         );
     }
 }
