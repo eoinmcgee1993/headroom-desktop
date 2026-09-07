@@ -63,6 +63,15 @@ model benchmark.
 
 ## Mechanism and offline reproduction
 
+Follow-up chronology check: the incident conversation records Claude Code
+2.1.241 on September 2 and 2.1.259 from September 3 at 10:29 Amsterdam onward.
+The retained proxy captures already contain the batching reminder on September 6
+at 17:29:46 Amsterdam, the start of the retained capture window. It therefore
+predates the reported September 7 hour; this retention window cannot establish
+its first-ever appearance. The exact string is also present in the currently
+available desktop-bundled 2.1.258 and 2.1.260 binaries. The specific release or
+feature rollout that activated it remains unverified.
+
 The installed wheel is `headroom-ai==0.37.0`. The running proxy started on
 September 6 at 17:28:28 Amsterdam time, before September 7's desktop commits.
 The installed desktop prefix-floor vendor is bound to that wheel.
@@ -160,8 +169,72 @@ Validation on September 7, 2026:
   different accounting method from the recorded 2.93% above.
 
 Pairwise replay seeds a confirmed floor and uses captured compressor output; it
-does not rerun the entire pipeline or measure actual provider cache reads. The
-patch is not installed into the running proxy, released, or provider-soaked.
-The required full staging day and fleet DiD remain release-promotion gates.
+does not rerun the entire pipeline or measure actual provider cache reads.
+The live test below subsequently verified the installed lineage fix. The required
+full staging day and fleet DiD remain release-promotion gates.
 The investigation does not establish the date this client behavior first rolled
 out or the exact extra subscription quota charged.
+
+## Live verification, September 7, 11:28-11:34 Amsterdam
+
+The restarted proxy contains the transient-system lineage repair. The user's
+three test prompts produced 13 main Fable model requests, with input growing
+from about 32k to 82k estimated tokens. Nine transitions replaced a trailing
+system reminder. Across 157 unchanged historical message positions, there were
+zero canonical changes to forwarded content.
+
+The 12 requests after the initial cold request report 664,386 cache-read tokens,
+49,646 cache-write tokens, and 472 uncached input tokens: 92.99% provider cache
+reuse. Absolute reads grow from 32,789 to 80,423 per request. The proxy records
+7,002 gross compression tokens removed across 715,612 original input tokens
+(0.98%); this repeats historical removals and is not first-appearance savings.
+This verifies cache retention at the tested size, not the entire fleet or the
+earlier 500k-token size band.
+
+## Fleet investigation and new Sentry diagnostic
+
+Read-only production queries used daily aggregates, with no user IDs or request
+contents exported. During September 1-7 (September 7 incomplete), 248 non-admin
+accounts had at least one day with >=1 million tokens sent and reported cache
+counts. Twelve had at least one day where cache reads / tokens sent was below
+0.2, comprising 14 user-days. One such user-day falls on September 6 and none
+on September 7 so far. Fleet daily median coverage remained around 0.91-0.93
+over September 3-7. The daily keys can mix local and UTC attribution; they are
+not exact UTC windows. This coverage metric is not provider cache-hit rate.
+
+These are low-coverage candidates, not confirmed instances of this defect.
+Existing fleet data combines models and conversations and lacks the historical
+prefix comparisons needed for attribution. Searching recent Sentry cache issues
+did not identify a report diagnosing this mechanism.
+
+The new observer in `SITECUSTOMIZE_PY` independently watches tracker selection
+and successful response accounting. It records a diagnostic when an unchanged
+original message inside the prior confirmed cache floor has different forwarded
+content, cache reads fell below the previous cached amount, and new cache writes
+occurred before the conservative TTL deadline. It checks retained trackers and
+can recover evidence after a reset for the proven system-tail shape. Arbitrary
+new sibling lineages are intentionally not classified as regressions.
+
+Only counters, positions, a reason enum, and a random proxy boot identifier
+leave the observer through `prefix_cache.desktop_integrity` in `/stats`. The
+desktop parses an allowlist and emits the Warning-level Sentry message
+`Headroom rewrote an unchanged cached prefix`, grouped by
+`cache-prefix-integrity` plus `tracker_reset` or `prefix_rewrite`. The first
+observation reports on the next successful dashboard stats poll. Unchanged
+snapshots are deduplicated; additional observations are limited to one event
+per hour per desktop process, even across proxy restarts.
+
+The observer neither changes traffic nor sends network requests. It is gated
+to wheel 0.37.0 with kill switch `HEADROOM_CACHE_INTEGRITY=0`; wheel upgrades
+must revalidate the hook. It does not diagnose provider eviction, changed tools
+or system headers, all possible lineage resets, or failures that never produce
+usage. Its in-memory diagnostics do not survive a proxy restart before polling.
+
+Validation: synthetic checks pass with the repair on and off; the captured
+original failure is detected at message index 3. Stable replay, beyond-floor
+compression, uncached assistant responses, changed originals/affinity, expiry,
+concurrent contexts, and
+observer exceptions are checked. A local Sentry transport test captures one
+properly grouped event with no prompt text and no network delivery. Relevant
+Rust tests, formatting, and cross-module `cargo check` pass. The new observer
+and desktop Sentry reporter are implemented in source, not yet deployed.

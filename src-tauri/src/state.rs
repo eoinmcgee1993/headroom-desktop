@@ -6348,6 +6348,111 @@ fn note_stats_fetch_success() {
     }
 }
 
+// A structural failure signal from the proxy, not a savings-rate canary.
+// Deserialize an allowlist so request text or arbitrary extras can never enter
+// Sentry through this endpoint. Empty/old-wheel payloads are simply absent.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CacheIntegrityKind {
+    TrackerReset,
+    PrefixRewrite,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CacheIntegrityReport {
+    boot_id: String,
+    count: u64,
+    kind: CacheIntegrityKind,
+    stable_messages: u64,
+    first_changed_message: u64,
+    previously_cached_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+impl CacheIntegrityReport {
+    fn from_stats(body: &str) -> Option<Self> {
+        let stats: Value = serde_json::from_str(body).ok()?;
+        let report: Self =
+            serde_json::from_value(stats.get("prefix_cache")?.get("desktop_integrity")?.clone())
+                .ok()?;
+        (report.boot_id.len() == 32
+            && report.boot_id.bytes().all(|c| c.is_ascii_hexdigit())
+            && report.count > 0
+            && report.first_changed_message < report.stable_messages
+            && report.cache_read_tokens < report.previously_cached_tokens
+            && report.cache_write_tokens > 0)
+            .then_some(report)
+    }
+}
+
+#[derive(Default)]
+struct CacheIntegrityReporter {
+    seen: Option<(String, u64)>,
+    last_reported: Option<Instant>,
+}
+
+impl CacheIntegrityReporter {
+    fn should_report(&mut self, report: &CacheIntegrityReport, now: Instant) -> bool {
+        if self
+            .seen
+            .as_ref()
+            .is_some_and(|(boot, count)| boot == &report.boot_id && *count >= report.count)
+        {
+            return false;
+        }
+        self.seen = Some((report.boot_id.clone(), report.count));
+        // A broken loop should create one grouped issue, not an event per turn.
+        // Proxy restarts do not bypass the desktop's one-hour throttle.
+        if self
+            .last_reported
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(3600))
+        {
+            return false;
+        }
+        self.last_reported = Some(now);
+        true
+    }
+}
+
+fn report_cache_integrity(body: &str) {
+    static REPORTER: Mutex<CacheIntegrityReporter> = Mutex::new(CacheIntegrityReporter {
+        seen: None,
+        last_reported: None,
+    });
+    let Some(report) = CacheIntegrityReport::from_stats(body) else {
+        return;
+    };
+    if !REPORTER.lock().should_report(&report, Instant::now()) {
+        return;
+    }
+    let kind = match report.kind {
+        CacheIntegrityKind::TrackerReset => "tracker_reset",
+        CacheIntegrityKind::PrefixRewrite => "prefix_rewrite",
+    };
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["cache-prefix-integrity", kind]));
+            scope.set_tag("cache_integrity_kind", kind);
+            scope.set_tag("provider", "anthropic");
+            scope.set_extra(
+                "cache_integrity",
+                serde_json::to_value(&report).unwrap_or_default(),
+            );
+        },
+        || {
+            sentry::capture_message(
+                "Headroom rewrote an unchanged cached prefix",
+                sentry::Level::Warning,
+            );
+        },
+    );
+    log::info!(
+        "cache-prefix-integrity: {kind}, observation {}",
+        report.count
+    );
+}
+
 fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     if !is_headroom_proxy_reachable() {
         return None;
@@ -6401,6 +6506,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
         };
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
+            report_cache_integrity(&body);
             // Only a SUSTAINED recovery resets the backoff; a lone success
             // between two timeouts must not (see STATS_FETCH_RECOVERY_WINDOW).
             note_stats_fetch_success();
@@ -8753,6 +8859,97 @@ fn bootstrap_failed_state(current: &BootstrapProgress, message: String) -> Boots
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn cache_integrity_report_is_allowlisted_and_throttled() {
+        use super::{CacheIntegrityReport, CacheIntegrityReporter, Duration, Instant};
+        let mut payload = serde_json::json!({"prefix_cache": {"desktop_integrity": {
+            "boot_id": "0123456789abcdef0123456789abcdef", "count": 1,
+            "kind": "tracker_reset", "stable_messages": 861, "first_changed_message": 3,
+            "previously_cached_tokens": 503505, "cache_read_tokens": 7259,
+            "cache_write_tokens": 491260, "unexpected_prompt": "private content"
+        }}});
+        let mut report = CacheIntegrityReport::from_stats(&payload.to_string()).unwrap();
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("private content"));
+        let mut reporter = CacheIntegrityReporter::default();
+        let start = Instant::now();
+        assert!(reporter.should_report(&report, start));
+        assert!(!reporter.should_report(&report, start + Duration::from_secs(3601)));
+        report.count = 2;
+        assert!(!reporter.should_report(&report, start + Duration::from_secs(12)));
+        report.boot_id = "fedcba9876543210fedcba9876543210".into();
+        report.count = 1;
+        assert!(!reporter.should_report(&report, start + Duration::from_secs(24)));
+        report.count = 2;
+        assert!(reporter.should_report(&report, start + Duration::from_secs(3601)));
+
+        assert!(CacheIntegrityReport::from_stats("{}").is_none());
+        assert!(CacheIntegrityReport::from_stats("not json").is_none());
+        for (key, value) in [
+            ("boot_id", serde_json::json!("user-supplied-content")),
+            ("count", serde_json::json!(0)),
+            ("kind", serde_json::json!("arbitrary-message")),
+            ("first_changed_message", serde_json::json!(861)),
+            ("cache_read_tokens", serde_json::json!(503505)),
+            ("cache_write_tokens", serde_json::json!(0)),
+        ] {
+            let previous = payload["prefix_cache"]["desktop_integrity"][key].clone();
+            payload["prefix_cache"]["desktop_integrity"][key] = value;
+            assert!(
+                CacheIntegrityReport::from_stats(&payload.to_string()).is_none(),
+                "{key}"
+            );
+            payload["prefix_cache"]["desktop_integrity"][key] = previous;
+        }
+    }
+
+    #[test]
+    fn cache_integrity_sentry_event_is_grouped_and_contains_no_prompt() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<sentry::protocol::Event<'static>>>);
+        impl sentry::Transport for Recorder {
+            fn send_envelope(&self, envelope: sentry::Envelope) {
+                if let Some(event) = envelope.event() {
+                    self.0.lock().unwrap().push(event.clone());
+                }
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let client = sentry::Client::from(sentry::ClientOptions {
+            dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+            transport: Some(Arc::new(recorder.clone())),
+            ..Default::default()
+        });
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::new(client)),
+            Arc::new(Default::default()),
+        ));
+        let payload = serde_json::json!({"prefix_cache": {"desktop_integrity": {
+            "boot_id": "0123456789abcdef0123456789abcdef", "count": 1,
+            "kind": "tracker_reset", "stable_messages": 861, "first_changed_message": 3,
+            "previously_cached_tokens": 503505, "cache_read_tokens": 7259,
+            "cache_write_tokens": 491260, "unexpected_prompt": "private content"
+        }}})
+        .to_string();
+        sentry::Hub::run(hub, || {
+            super::report_cache_integrity(&payload);
+            super::report_cache_integrity(&payload);
+        });
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].fingerprint.as_ref(),
+            ["cache-prefix-integrity", "tracker_reset"]
+        );
+        assert_eq!(events[0].level, sentry::Level::Warning);
+        assert_eq!(events[0].tags["provider"], "anthropic");
+        assert!(!serde_json::to_string(&events[0])
+            .unwrap()
+            .contains("private content"));
+    }
 
     #[test]
     fn strip_extended_length_prefix_handles_windows_and_unix_forms() {

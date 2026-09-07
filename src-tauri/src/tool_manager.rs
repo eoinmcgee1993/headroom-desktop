@@ -1346,6 +1346,126 @@ def finalize_turn(
     except Exception:
         pass
 
+    # Observe confirmed prefix rewrites independently of the replay/lineage
+    # fixes. Only numeric diagnostics cross /stats to the desktop's Sentry SDK.
+    # No provider calls, disk writes, or request mutations in this observer.
+    try:
+        from importlib import metadata as _hd_ci_meta
+        if (_hd_ci_meta.version("headroom-ai") == "0.37.0" and
+            _hd_os.environ.get("HEADROOM_CACHE_INTEGRITY", "1").strip().lower()
+                not in ("0", "false", "no", "off")):
+            import contextvars as _hd_ci_cv
+            import time as _hd_ci_time
+            import uuid as _hd_ci_uuid
+            import sys as _hd_ci_sys
+            from headroom.cache import prefix_tracker as _hd_ci_pt
+            from headroom.proxy import cost as _hd_ci_cost
+            _hd_ci_pending = _hd_ci_cv.ContextVar("desktop_cache_integrity", default=None)
+            _hd_ci_stats = {"boot_id": _hd_ci_uuid.uuid4().hex, "count": 0}
+            _hd_ci_resolve = _hd_ci_pt.SessionTrackerStore.resolve_tracker
+            _hd_ci_update = _hd_ci_pt.PrefixCacheTracker.update_from_response
+            _hd_ci_build_stats = _hd_ci_cost.build_prefix_cache_stats
+
+            def _hd_ci_resolve_tracker(self, session_id, provider, messages=None, cache_affinity=None):
+                _hd_ci_pending.set(None)
+                tracker = _hd_ci_resolve(self, session_id, provider, messages, cache_affinity)
+                try:
+                    if provider != "anthropic" or not messages or not self._default_config.enabled:
+                        return tracker
+                    prior = tracker
+                    if not prior.get_frozen_message_count():
+                        # A lost tracker has no history to check. Recover evidence
+                        # ONLY for the proven disappearing-system-tail shape;
+                        # arbitrary sibling branches must not raise an alarm.
+                        snap = _hd_ci_pt._lineage_snapshot(
+                            _hd_ci_pt._canonicalize_for_prefix_compare(messages))
+                        candidates = []
+                        for key, chain in self._lineages.get(session_id, {}).items():
+                            candidate = self.peek(key)
+                            if (candidate is None or candidate is tracker
+                                or self._lineage_affinities.get(key) != cache_affinity
+                                or not candidate.get_frozen_message_count()):
+                                continue
+                            if (len(chain) > 1 and chain[-1].get("role") == "system"
+                                and any(m.get("role") in ("user", "assistant") for m in chain[:-1])
+                                and len(snap) >= len(chain) and snap[:len(chain)-1] == chain[:-1]):
+                                candidates.append((len(chain), key, candidate))
+                        candidates.sort(key=lambda x: x[0], reverse=True)
+                        if not candidates or (len(candidates) > 1 and candidates[0][0] == candidates[1][0]):
+                            return tracker
+                        prior = candidates[0][2]
+                    idle = (prior._idle_seconds_at_fetch if prior is tracker
+                            else prior.seconds_since_activity())
+                    ttl = prior.resolved_cache_ttl_seconds()
+                    if idle >= ttl or not prior.get_frozen_message_count():
+                        return tracker
+                    original = prior._last_original_messages
+                    frozen = prior.get_frozen_message_count()
+                    # The handler appends the assistant RESPONSE to tracker
+                    # history. Those bytes were never in the previous request;
+                    # an estimated floor can overshoot into this fresh message.
+                    if original and original[-1].get("role") == "assistant":
+                        frozen = min(frozen, len(original) - 1)
+                    # Tracker updates replace these lists instead of mutating
+                    # them. Hold references for this request, not another copy
+                    # of a potentially million-token conversation.
+                    _hd_ci_pending.set((tracker, original,
+                        prior._last_forwarded_messages, frozen,
+                        prior._cached_token_count, _hd_ci_time.monotonic() + ttl - idle,
+                        prior is not tracker))
+                except Exception:
+                    pass
+                return tracker
+
+            def _hd_ci_update_tracker(self, cache_read_tokens, cache_write_tokens, messages,
+                                      message_token_counts=None, original_messages=None):
+                evidence = _hd_ci_pending.get()
+                _hd_ci_pending.set(None)
+                try:
+                    if (evidence is not None and evidence[0] is self
+                        and original_messages and cache_write_tokens > 0
+                        and cache_read_tokens < evidence[4]
+                        and _hd_ci_time.monotonic() < evidence[5]):
+                        _, old_original, old_forwarded, frozen, expected, _, reset = evidence
+                        stable = 0
+                        first_changed = None
+                        canon = _hd_ci_pt._canonicalize_for_prefix_compare
+                        for i in range(min(frozen, len(old_original), len(old_forwarded),
+                                           len(original_messages), len(messages))):
+                            if canon([old_original[i]]) != canon([original_messages[i]]):
+                                break
+                            stable += 1
+                            if first_changed is None and canon([old_forwarded[i]]) != canon([messages[i]]):
+                                first_changed = i
+                        if first_changed is not None:
+                            _hd_ci_stats.update(count=_hd_ci_stats["count"] + 1,
+                                kind="tracker_reset" if reset else "prefix_rewrite",
+                                stable_messages=stable, first_changed_message=first_changed,
+                                previously_cached_tokens=expected,
+                                cache_read_tokens=cache_read_tokens,
+                                cache_write_tokens=cache_write_tokens)
+                except Exception:
+                    pass
+                return _hd_ci_update(self, cache_read_tokens, cache_write_tokens, messages,
+                                     message_token_counts, original_messages)
+
+            def _hd_ci_prefix_stats(*args, **kwargs):
+                result = _hd_ci_build_stats(*args, **kwargs)
+                result["desktop_integrity"] = dict(_hd_ci_stats)
+                return result
+
+            _hd_ci_pt.SessionTrackerStore.resolve_tracker = _hd_ci_resolve_tracker
+            _hd_ci_pt.PrefixCacheTracker.update_from_response = _hd_ci_update_tracker
+            _hd_ci_cost.build_prefix_cache_stats = _hd_ci_prefix_stats
+            # Usually server imports cost after sitecustomize; cover an already
+            # loaded server too without importing it just for instrumentation.
+            _hd_ci_server = _hd_ci_sys.modules.get("headroom.proxy.server")
+            if _hd_ci_server is not None:
+                _hd_ci_server.build_prefix_cache_stats = _hd_ci_prefix_stats
+                _hd_ci_server._build_prefix_cache_stats = _hd_ci_prefix_stats
+    except Exception:
+        pass
+
     # Prefix-replay guard (upstream issue #3379 / PR #3380; remove once a
     # wheel ships the fix -- see the module docstring for the cache-bust loop
     # this prevents). Restores v0.35.0's policy: that release has no size
@@ -12837,6 +12957,41 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn cache_integrity_observer_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-cache-integrity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        for broken in [false, true] {
+            let mut command = crate::proc::command(&python);
+            command
+                .arg(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../scripts/verify-cache-integrity.py"),
+                )
+                .arg("--sitecustomize")
+                .arg(dir.join("sitecustomize.py"));
+            if broken {
+                command.arg("--broken-lineage");
+            }
+            let out = command.output().expect("run cache-integrity probe");
+            assert!(
+                out.status.success(),
+                "cache-integrity regression (broken={broken})\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Behavioural check of the vendored #3380 prefix floor, against the REAL
