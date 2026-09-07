@@ -12,7 +12,7 @@ After installing a new beta (`-rc.N`) build, paste this file into Claude Code an
 
 ## Checks (Claude Code pass)
 
-Run these from a Claude Code session and report PASS / FAIL with the observed value. Check 14 has a step that must run **before** you install the rc - read it first. Checks 1, 5, 8, 9, 10, 11, 12, 14, 15, and 16 are client-agnostic — run them once in either client. Codex has very different wiring (no RTK, no `~/.claude/settings.json`, pay-per-token), so its equivalents of checks 6 and 7 live in the **Codex pass** below; run that whole section from a Codex session.
+Run these from a Claude Code session and report PASS / FAIL with the observed value. Checks 1, 5, 8, 9, 10, 11, 12, 14, 15, and 16 are client-agnostic - run them once in either client. Codex has very different wiring (no RTK, no `~/.claude/settings.json`, pay-per-token), so its equivalents of checks 6 and 7 live in the **Codex pass** below; run that whole section from a Codex session.
 
 ### 1. Version matches the new beta
 ```bash
@@ -55,6 +55,8 @@ AX 'to get {name, size, position} of every window'                             #
 ```
 Then screenshot just the window rather than the whole screen - `screencapture -x -o -R<x>,<y>,<w>,<h> shot.png` using the position/size from the last line above.
 
+The window is a tray popover and hides 150 ms after losing focus (`MAIN_WINDOW_BLUR_HIDE_DELAY_MS`, `handle_window_event` in lib.rs), so anyone clicking elsewhere on the machine between Show Headroom and the AX read turns a healthy build into "no window" - the 0.9.11-rc.5 quick re-run failed exactly this way while the full run minutes earlier had passed. A timed replay showed the window up 14/14 times at +0.3s and gone by +1.5s only when the frontmost app changed. Read the geometry and take the screenshot as soon as the window appears (the script polls every 250 ms for up to 5 s); before calling a miss a render failure, confirm with the CG window list that the window never came onscreen rather than came up and blurred away.
+
 ### 6. Pause / resume cleanly strips and restores interception
 In Settings (or via the tray menu, see check 5), toggle Pause then Resume, checking after each:
 ```bash
@@ -87,8 +89,9 @@ Generate the payload with a real `Read` tool call. Dumping the file through Bash
 **Claude Code subscription/OAuth traffic** (UA `claude-code/`, classified `SUBSCRIPTION`):
 1. Capture the baseline:
    ```bash
-   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, cache_savings_usd: .summary.cost.breakdown.cache_savings_usd, total_tokens_before: .summary.compression.total_tokens_before}'
+   rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, total_tokens_before: .summary.compression.total_tokens_before}'
    ```
+   Capture it after any backend restart. `/stats` is in-memory per boot, so a baseline taken before checks 6 or 9 scores the re-check against reset counters (the script runs this check after the disruptive block for exactly that reason).
 2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1300-1500 lines is plenty).
 3. On the *next* turn, re-run the same `jq` command.
 
@@ -97,7 +100,16 @@ Generate the payload with a real `Read` tool call. Dumping the file through Bash
 curl -s http://127.0.0.1:6767/stats | jq '.requests.by_model | with_entries(select(.key|startswith("claude-")))'
 ```
 
-Expect: at least one `claude-*` entry whose count increased, `cache_savings_usd` is strictly greater (the cached prefix was preserved, not busted), `total_tokens_before` jumped by at least the size of the Read, and `prefix_frozen` + `requests_compressed` together increased by at least 1. The large Read all but guarantees live-zone savings, so in practice the increment lands in `requests_compressed`; `prefix_frozen` only counts requests returned fully unchanged, so it can legitimately stay flat for a whole session (observed on a healthy 0.6.9-rc.1: `prefix_frozen` flat at 17 while cache savings climbed). A bumped mtime on `activity-facts.json` is not enough — interception alone would still touch that file without delivering savings.
+Expect: at least one `claude-*` entry whose count increased, `total_tokens_before` jumped by at least the size of the Read, and `prefix_frozen` + `requests_compressed` together increased by at least 1. The large Read all but guarantees live-zone savings, so in practice the increment lands in `requests_compressed`; `prefix_frozen` only counts requests returned fully unchanged, so it can legitimately stay flat for a whole session (observed on a healthy 0.6.9-rc.1: `prefix_frozen` flat at 17 while cache savings climbed). A bumped mtime on `activity-facts.json` is not enough - interception alone would still touch that file without delivering savings.
+
+The cache side of the trade is read per request from the proxy log, not from `/stats`. Do not gate on `.summary.cost.breakdown.cache_savings_usd`: it is `prefix_cache_stats.totals.net_savings_usd` (`cost.py`), provider read savings MINUS the cache-write premium over the cost window, so it moves both ways by design (0.31 -> 2.87 -> 0.90 -> 12.93 inside ten minutes with no restart, 0.9.11-rc.5 pass) and reads as a FAIL on a healthy build. The PERF line of the request that carried the Read settles it:
+```bash
+grep 'PERF model=claude-' ~/.headroom/logs/proxy.log | tail -12 \
+  | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^(model|tok_before|tok_saved|cache_read|cache_write)=/) printf "%s ", $i; print substr($0, 1, 19) }'
+```
+Expect: `cache_read` on the request carrying the Read in the same band as the previous request of that session (the frozen prefix was replayed, not busted); a bust reads as `cache_read` collapsing towards the system-prompt size with a `cache_write` the size of the whole prompt. `cache_hit_pct` on that line is read/(read+write) and ignores the uncached tail, so it is not a hit rate. The script prints the same figures on its `7 cache side` row (per-request cache_read/cache_write, tok_saved/tok_before), which is the minimum both-sides evidence the compression rules in CLAUDE.md ask for.
+
+A `cache_read` that stays flat for several turns with `cache_write=0` while `tok_before` grows is a different shape, and on this wheel it is expected: `relocate_cache_breakpoint` in upstream `read_maturation.py` (requested by the desktop via `HEADROOM_READ_MATURATION=1` since 0.9.7) parks the client's tail cache breakpoint before any held first-appearance Read, so nothing after the Read is cache-written until it matures (`quiesce_turns`, 5 quiet turns). The proxy logs each occurrence as `event=cache_breakpoints ... dropped=true tail_grew=true`, and the script counts them on the `7 cache side` row. Measured on the 0.9.11-rc.5 pass: four turns pinned at `cache_read=66061`, `cache_write=0`, uncached tail growing 5k -> 35k, then one 33,945-token write when the Read matured. Not a build regression (the rc.4 -> rc.5 diff never touched the wheel or the vendor), but it is the 0.9.4 plateau shape, so a change in that count across a wheel bump is a real signal. Kill switch: `HEADROOM_READ_MATURATION=0`.
 
 **Pay-per-token API-key traffic** (classified `PAYG`/`OAUTH` — this is also the branch Codex hits; the Codex pass below adds a Codex-attributed version):
 1. Capture the baseline:

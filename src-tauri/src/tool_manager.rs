@@ -3922,7 +3922,7 @@ impl ToolManager {
                     // baseline still feeds the /stats savings estimate. Level 2 =
                     // skip pre/postamble, don't restate in-context code/tool output.
                     .env("HEADROOM_VERBOSITY_LEVEL", "2")
-                    // 3% of conversations run unshaped, as the control arm of a
+                    // 3-10% of conversations run unshaped, as the control arm of a
                     // standing A/B. This is the only way the output-shaping
                     // number ever stops being a counterfactual: the seeded
                     // baseline is frozen at install time and cannot be relearned
@@ -3947,12 +3947,20 @@ impl ToolManager {
                     // never gets there; 3% reaches the same precision in ~30 days
                     // and still costs only 3% of conversations.
                     //
+                    // The fraction is boosted to 10% until this machine's ledger
+                    // can promote the measured estimator, then drops back to 3%
+                    // (`output_holdout_for`). Per-conversation hashing hides
+                    // whole model classes at 3%: one real ledger had 51% of its
+                    // shaped traffic (every fable and sonnet stratum) with zero
+                    // control observations after weeks, which no amount of
+                    // waiting fixes for a machine with ~20 sessions in a class.
+                    //
                     // Invisible to the compression figures: the arm gates the
                     // `shape_request` call alone, so control conversations are
                     // compressed, memory-augmented and cache-aligned exactly like
                     // any other, and the input-savings rate is priced off
                     // `cost.total_input_cost_usd`, which no output token enters.
-                    .env("HEADROOM_OUTPUT_HOLDOUT", "0.03")
+                    .env("HEADROOM_OUTPUT_HOLDOUT", output_holdout_fraction())
                     // Agent savings persona (new in headroom-ai 0.30.0). The
                     // `proxy` entrypoint reads HEADROOM_SAVINGS_PROFILE into
                     // config.savings_profile, and proxy_pipeline_kwargs() applies
@@ -10867,6 +10875,37 @@ fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
 /// Best-effort throughout: never touch a missing or unparseable ledger, and
 /// only rewrite when there is control data to drop. Uses `atomic_write` so a
 /// crash mid-write cannot truncate the ledger.
+/// Holdout once this machine's measured estimate is promotable.
+const OUTPUT_HOLDOUT_STEADY: &str = "0.03";
+/// Holdout until then. `assign_arm` is one nested threshold on one hash
+/// (`frac < holdout`), so the 3% set is a subset of the 10% set and dropping
+/// back never flips a conversation that was already in control. At ~140
+/// sessions a week (this machine), 3% lands ~4 in control and 10% ~14, so a
+/// stratum clears #3460's 5-conversation gate in a fortnight instead of two
+/// months; the price is the shaper's own effect (measured +3 to +12% on the
+/// continuations it targets) on 7pp more conversations, well under 1% of
+/// output tokens.
+const OUTPUT_HOLDOUT_BOOSTED: &str = "0.10";
+
+/// Evidence-driven, not time-driven: boosted until `output_savings` promotes
+/// the measured estimator over the synthetic control, steady from then on.
+/// Coverage is cumulative, so it stays steady unless a new model class shows
+/// up with no control data, which re-boosts -- exactly the correction wanted.
+fn output_holdout_for(estimate: &crate::output_savings::LedgerEstimate) -> &'static str {
+    match estimate {
+        crate::output_savings::LedgerEstimate::Scored(e) if e.method == "measured" => {
+            OUTPUT_HOLDOUT_STEADY
+        }
+        _ => OUTPUT_HOLDOUT_BOOSTED,
+    }
+}
+
+fn output_holdout_fraction() -> &'static str {
+    let holdout = output_holdout_for(&crate::output_savings::estimate());
+    log::info!("[tool_manager] output-shaper holdout {holdout}");
+    holdout
+}
+
 fn purge_legacy_output_savings_control_arm_once() {
     let Some(path) = output_savings_ledger_path() else {
         return;
@@ -12734,6 +12773,30 @@ mod tests {
         assert_eq!(std::fs::read(&ledger).unwrap(), with_control);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn output_holdout_boosts_until_the_measured_estimate_is_promotable() {
+        use crate::output_savings::{LedgerEstimate, OutputEstimate};
+        let scored = |method: &'static str| {
+            LedgerEstimate::Scored(OutputEstimate {
+                method,
+                reduction_percent: 3.0,
+                ci_low_percent: 0.0,
+                ci_high_percent: 6.0,
+                requests: 100,
+                coverage_percent: 60.0,
+                tokens_saved: 10,
+                baseline_tokens: 300,
+            })
+        };
+        assert_eq!(
+            super::output_holdout_for(&LedgerEstimate::NoEvidence),
+            "0.10"
+        );
+        assert_eq!(super::output_holdout_for(&LedgerEstimate::Unscored), "0.10");
+        assert_eq!(super::output_holdout_for(&scored("estimated")), "0.10");
+        assert_eq!(super::output_holdout_for(&scored("measured")), "0.03");
     }
 
     #[test]
