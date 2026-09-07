@@ -121,6 +121,10 @@ struct IdentityPayload {
     /// captures acceptance. `None` (omitted) when nothing accepted yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     accepted_terms_version: Option<u32>,
+    /// Windows only: what the WSL probe found (`wsl_probe`). Omitted until the
+    /// probe finishes and on every other platform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wsl_agents: Option<String>,
 }
 
 /// Reqwest errors caused by the user's environment (offline, captive portal,
@@ -304,6 +308,7 @@ impl IdentityPayload {
             codex_usage_windows: None,
             tier_mismatch_since: None,
             accepted_terms_version: None,
+            wsl_agents: crate::wsl_probe::result(),
         }
     }
 

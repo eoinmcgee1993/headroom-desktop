@@ -46,6 +46,75 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// Why a spawned child did not produce an `Output`.
+#[derive(Debug)]
+pub enum OutputError {
+    Spawn(std::io::Error),
+    TimedOut,
+}
+
+/// `Command::output()` with a deadline. `std` has no `wait_timeout`, so this
+/// is the same try_wait/kill loop `tool_manager::run_command_with_timeout`
+/// uses, minus the pip-specific error shaping, for probes that must never
+/// hang the caller (a WSL distro that is still booting, a PowerShell that
+/// blocks on a profile). Stdin is closed so a child that reads it cannot wait
+/// on us either. On timeout the child is killed and reaped; whatever it
+/// wrote is discarded, because a partial answer is not an answer.
+pub fn output_with_timeout(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, OutputError> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(OutputError::Spawn)?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    // Drain both pipes off-thread: a child that fills one while we wait on
+    // the other deadlocks against the pipe buffer.
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(OutputError::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(OutputError::Spawn(err));
+            }
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_handle.join().unwrap_or_default(),
+        stderr: stderr_handle.join().unwrap_or_default(),
+    })
+}
+
 /// `powershell` by its canonical absolute path when `system_root` has one.
 ///
 /// A bare name resolves through PATH, and a user-edited PATH that lost

@@ -21,6 +21,7 @@ mod storage;
 mod tool_manager;
 mod upstream_override;
 mod usage_counters;
+mod wsl_probe;
 
 /// Cross-module lock for tests that repoint $HOME / $CODEX_HOME. Env vars are
 /// process-global, so home-mutating tests in different modules (client_adapters
@@ -532,28 +533,86 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         return;
     }
     // Cached (~90s warmer cadence), so polling this every 5s costs nothing.
-    let Ok(projects) = state.list_claude_code_projects() else {
-        return;
-    };
-    if !claude_sessions_touched_since(&projects, since) {
+    let claude = state
+        .list_claude_code_projects()
+        .map(|projects| claude_sessions_touched_since(&projects, since))
+        .unwrap_or(false);
+    // Shared with the hourly self-heal in `detect_unrouted_clients`: the one
+    // helper that knows Codex's session dir AND its GUI thread store, and how
+    // to ignore Headroom's own writes to it. It walks, so it is re-asked at
+    // most once a minute, not on every 5s poll.
+    let codex = codex_ran_locally_since(since);
+    if !claude && !codex {
         return;
     }
-    static UNROUTED_BEACON_SENT: AtomicBool = AtomicBool::new(false);
-    if !UNROUTED_BEACON_SENT.swap(true, Ordering::AcqRel) {
+    // One beacon per agent: Codex users save at 55-66% against ~90% for
+    // Claude Code on both platforms, with 25-35% never producing traffic, and
+    // server-side data cannot tell "routing failed" from "logged in once,
+    // codes with Cursor". Sessions growing while nothing reaches the proxy is
+    // the only honest instrument for that, so it must be attributable by agent.
+    static CLAUDE_BEACON_SENT: AtomicBool = AtomicBool::new(false);
+    static CODEX_BEACON_SENT: AtomicBool = AtomicBool::new(false);
+    if claude && !CLAUDE_BEACON_SENT.swap(true, Ordering::AcqRel) {
         pricing::report_funnel_step(state, "unrouted_usage_detected");
+    }
+    if codex && !CODEX_BEACON_SENT.swap(true, Ordering::AcqRel) {
+        pricing::report_funnel_step(state, "unrouted_codex_usage_detected");
     }
     if !state.try_mark_unrouted_usage_notified() {
         return;
     }
-    let _ = show_notification_impl(
+    let (title, body) = unrouted_usage_copy(claude, codex);
+    let _ = show_notification_impl(app, title, body, None);
+    analytics::track_event(
         app,
-        "Claude Code isn't going through Headroom",
-        "You've used Claude Code since Headroom started, but none of that traffic came \
-         through, so nothing was optimized. Restart your terminal or editor so it picks \
-         up the new settings.",
-        None,
+        "unrouted_usage_nudge_shown",
+        Some(json!({ "claude": claude, "codex": codex })),
     );
-    analytics::track_event(app, "unrouted_usage_nudge_shown", None);
+}
+
+/// Names the agent whose sessions grew: telling a Codex user to restart
+/// "Claude Code" reads as a notification meant for someone else.
+fn unrouted_usage_copy(claude: bool, codex: bool) -> (&'static str, &'static str) {
+    match (claude, codex) {
+        (true, true) => (
+            "Your coding agents aren't going through Headroom",
+            "You've used Claude Code and Codex since Headroom started, but none of that \
+             traffic came through, so nothing was optimized. Restart your terminal or \
+             editor so they pick up the new settings.",
+        ),
+        (false, true) => (
+            "Codex isn't going through Headroom",
+            "You've used Codex since Headroom started, but none of that traffic came \
+             through, so nothing was optimized. Restart Codex, or the terminal it runs \
+             in, so it picks up the new settings.",
+        ),
+        _ => (
+            "Claude Code isn't going through Headroom",
+            "You've used Claude Code since Headroom started, but none of that traffic came \
+             through, so nothing was optimized. Restart your terminal or editor so it picks \
+             up the new settings.",
+        ),
+    }
+}
+
+/// `client_local_activity_at("codex")` against `since`, memoized for a
+/// minute: the helper walks the sessions tree and the thread store (capped),
+/// which is too much for the 5s dashboard poll that drives the nudge. A
+/// cached `false` delays detection by at most that minute; the beacon and the
+/// notification are one-shot anyway.
+fn codex_ran_locally_since(since: chrono::DateTime<Utc>) -> bool {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((asked_at, answer)) = *last {
+        if asked_at.elapsed() < std::time::Duration::from_secs(60) {
+            return answer;
+        }
+    }
+    let answer = client_adapters::client_local_activity_at("codex")
+        .map(|at| chrono::DateTime::<Utc>::from(at) > since)
+        .unwrap_or(false);
+    *last = Some((std::time::Instant::now(), answer));
+    answer
 }
 
 /// True when any Claude Code project's last session activity is newer than
@@ -5783,6 +5842,7 @@ pub fn run() {
             spawn_proxy_watchdog(app.handle().clone());
             spawn_activity_observer(app.handle().clone());
             spawn_claude_projects_warmer(app.handle().clone());
+            wsl_probe::spawn_probe();
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
             analytics::set_headroom_ai_version(
@@ -12217,6 +12277,15 @@ Some unrelated content.
             since
         ));
         assert!(!claude_sessions_touched_since(&[], since));
+    }
+
+    #[test]
+    fn unrouted_usage_copy_names_the_agent() {
+        use super::unrouted_usage_copy as copy;
+        assert!(copy(true, false).0.contains("Claude Code"));
+        assert!(copy(false, true).0.contains("Codex"));
+        assert!(!copy(false, true).1.contains("Claude"));
+        assert!(copy(true, true).1.contains("Claude Code and Codex"));
     }
 
     /// An app that exited on its own must be relaunched without any kill at all.

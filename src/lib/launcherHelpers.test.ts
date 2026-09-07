@@ -36,6 +36,7 @@ describe("install-wizard funnel steps", () => {
       "bootstrap_failed",
       "post_install_shown",
       "unrouted_usage_detected",
+      "unrouted_codex_usage_detected",
       "first_optimized_request",
       "first_prompt_request",
       "first_savings_recorded"
