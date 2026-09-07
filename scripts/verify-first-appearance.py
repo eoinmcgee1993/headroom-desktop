@@ -14,10 +14,13 @@ wheel:
      two-request sequence are byte-identical to a control subprocess running
      with HEADROOM_MATURATION_FIRST_APPEARANCE=0. The vendor must only
      observe the transform, never change what is forwarded.
-  3. accounting: the newly-matured request accumulates nothing; the replay
-     request accumulates a positive token delta; the record_request wrapper
-     subtracts it from tokens_saved exactly once and drains, so the next
-     request passes through untouched.
+  3. accounting: the newly-matured request accumulates nothing; BOTH replay
+     shapes accumulate a positive token delta -- the pass swapping the raw
+     content out itself, and the marker arriving already in place from the
+     cached-prefix replay (the shape that actually runs in production, and
+     the one the original vendor missed entirely) -- and the record_request
+     wrapper subtracts the total from tokens_saved exactly once and drains,
+     so the next request passes through untouched.
 """
 
 import json
@@ -54,7 +57,7 @@ def build_messages():
     ]
 
 
-def run_transform():
+def run_transform(observe=None):
     import sitecustomize  # noqa: F401  (auto-imported anyway; explicit for clarity)
     from headroom.transforms import read_maturation as rm
 
@@ -69,17 +72,34 @@ def run_transform():
                 pass
     mgr = rm.ReadMaturationManager(cfg, compression_store=None)
     msgs = build_messages()
+
+    def step(payload):
+        out = mgr.apply([dict(m) for m in payload])
+        if observe is not None:
+            observe()
+        return out
+
     # Request 1: the Read has been quiet for 2 assistant turns -> matures.
-    r1 = mgr.apply([dict(m) for m in msgs])
-    # Request 2: the client re-sends the raw conversation -> replay branch.
-    r2 = mgr.apply([dict(m) for m in msgs])
-    return r1, r2
+    r1 = step(msgs)
+    # Request 2: raw conversation again and no cached prefix covering it, so
+    # this pass swaps the content out itself.
+    r2 = step(msgs)
+    # Request 3: the marker is ALREADY in place on the way in, exactly as the
+    # cached-prefix replay leaves it once a Read has matured. This is the
+    # steady state in production and it must still be charged.
+    r3 = step(r1.messages)
+    return r1, r2, r3
 
 
 def main() -> int:
     if os.environ.get("HD_FA_PROBE_MODE") == "control":
-        r1, r2 = run_transform()
-        print(json.dumps({"r1": r1.messages, "r2": r2.messages}, sort_keys=True))
+        r1, r2, r3 = run_transform()
+        print(
+            json.dumps(
+                {"r1": r1.messages, "r2": r2.messages, "r3": r3.messages},
+                sort_keys=True,
+            )
+        )
         return 0
 
     import sitecustomize as sc
@@ -90,21 +110,23 @@ def main() -> int:
 
     from headroom.proxy import prometheus_metrics as pm
 
-    r1, r2 = run_transform()
+    pending = []
+    r1, r2, r3 = run_transform(observe=lambda: pending.append(sc._hd_fa_pending[0]))
     marker_seen = json.dumps(r2.messages)
     if "Retrieve original: hash=" not in marker_seen:
         print("FAIL maturation did not run (no marker in replay output)")
         return 1
 
-    delta = sc._hd_fa_pending[0]
+    delta = sc._hd_fa_deltas.get("tc_1", 0)
     if delta <= 0:
-        print("FAIL replay delta not accumulated")
+        print("FAIL replay delta never learned")
         return 1
-    # Exactly ONE replay's worth: request 1 (newly matured) must have
-    # contributed nothing.
-    if delta != sc._hd_fa_deltas.get("tc_1"):
-        print("FAIL newly-matured request contributed to pending:", delta)
+    # Request 1 newly matured, so it books in full and accrues nothing.
+    # Requests 2 and 3 are the two replay shapes, one debt each.
+    if pending != [0, delta, 2 * delta]:
+        print("FAIL accrual per request:", pending, "delta", delta)
         return 1
+    total = sc._hd_fa_pending[0]
 
     # 2. Traffic neutrality against an unpatched control run.
     env = dict(os.environ)
@@ -120,7 +142,9 @@ def main() -> int:
     if control.returncode != 0:
         print("FAIL control run errored:", control.stderr[-400:])
         return 1
-    ours = json.dumps({"r1": r1.messages, "r2": r2.messages}, sort_keys=True)
+    ours = json.dumps(
+        {"r1": r1.messages, "r2": r2.messages, "r3": r3.messages}, sort_keys=True
+    )
     if ours != control.stdout.strip():
         print("FAIL transformed messages differ from unpatched control")
         return 1
@@ -147,12 +171,12 @@ def main() -> int:
                 model="probe",
                 input_tokens=10,
                 output_tokens=1,
-                tokens_saved=delta + 250,
+                tokens_saved=total + 250,
                 latency_ms=1.0,
             )
         )
         if captured.get("tokens_saved") != 250:
-            print("FAIL subtraction:", captured.get("tokens_saved"), "delta", delta)
+            print("FAIL subtraction:", captured.get("tokens_saved"), "total", total)
             return 1
         if sc._hd_fa_pending[0] != 0:
             print("FAIL pending not drained:", sc._hd_fa_pending[0])
@@ -174,7 +198,7 @@ def main() -> int:
     finally:
         sc._hd_fa_orig_record = real
 
-    print("OK first-appearance accounting: bind, neutrality, subtract-once")
+    print("OK first-appearance accounting: bind, neutrality, both replay shapes, subtract-once")
     return 0
 
 

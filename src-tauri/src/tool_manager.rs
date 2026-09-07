@@ -1518,6 +1518,25 @@ def finalize_turn(
 # first-appearance counting coherently. Newly-matured and fresh-tail savings
 # are untouched; matured content books exactly once, on the turn it matures.
 #
+# TWO paths re-remove an already-booked Read, and the second is the one that
+# actually runs in production (verified 2026-09-07 by driving a 5-turn session
+# through the real Anthropic handler and reading x-headroom-tokens-saved:
+# [0, 0, 11863, 11863, 11863], turns 3 and 4 re-booking with
+# transforms=router:noop):
+#   * _handle_read swaps the raw content out itself - only when the cached
+#     prefix did not already cover the Read;
+#   * the marker is ALREADY in _handle_read's input, put there by the
+#     cached-prefix replay before maturation ran. _handle_read returns None
+#     and the ORIGINAL vendor accrued nothing here, which is why watching its
+#     replay branch alone left this whole section inert from the turn after
+#     maturation onward.
+# The second path is detected on the apply() seam instead of _handle_read's,
+# because a matured Read eventually falls inside frozen_message_count and
+# apply() skips those messages without ever calling _handle_read for them -
+# the scan below reads the request's full message list, frozen region
+# included. A marker in that input is always Headroom's own re-removal: the
+# client's transcript holds what IT sent (raw), never what we forwarded.
+#
 # Bridge: a lock-guarded module-global pending counter, drained (clamped at
 # the request's own tokens_saved) by the next record_request. Deliberately
 # NOT task/context-scoped: the transform may run on a different task or
@@ -1574,30 +1593,87 @@ if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                     return max(1, len(text) // 4)
 
             _hd_fa_orig_handle = _hd_fa_rm.ReadMaturationManager._handle_read
+            _hd_fa_orig_apply = _hd_fa_rm.ReadMaturationManager.apply
             _hd_fa_orig_record = _hd_fa_pm.PrometheusMetrics.record_request
+
+            def _hd_fa_delta(tc_id, content, marker):
+                delta = _hd_fa_deltas.get(tc_id)
+                if delta is None:
+                    if len(_hd_fa_deltas) >= 4096:
+                        _hd_fa_deltas.clear()
+                    delta = max(0, _hd_fa_count(content) - _hd_fa_count(marker))
+                    _hd_fa_deltas[tc_id] = delta
+                return delta
+
+            def _hd_fa_tool_results(messages):
+                # (tool_call_id, content) for every string tool result, in both
+                # the Anthropic block and OpenAI role="tool" shapes.
+                for msg in messages or ():
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get("content")
+                    if msg.get("role") == "tool":
+                        if isinstance(content, str):
+                            yield str(msg.get("tool_call_id", "")), content
+                        continue
+                    if isinstance(content, list):
+                        for block in content:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_result"
+                                and isinstance(block.get("content"), str)
+                            ):
+                                yield str(block.get("tool_use_id", "")), block["content"]
+
+            def _hd_fa_accrue(delta):
+                if delta > 0:
+                    with _hd_fa_lock:
+                        _hd_fa_pending[0] += delta
 
             def _hd_fa_handle(self, tc_id, content, activity, result):
                 matured_before = self._matured.get(tc_id)
                 out = _hd_fa_orig_handle(self, tc_id, content, activity, result)
                 try:
-                    # Replay branch only: matured on an EARLIER request and
-                    # replaced again now. Newly-matured stays fully booked.
-                    if matured_before is not None and out[0] is not None:
-                        delta = _hd_fa_deltas.get(tc_id)
-                        if delta is None:
-                            if len(_hd_fa_deltas) >= 4096:
-                                _hd_fa_deltas.clear()
-                            delta = max(
-                                0,
-                                _hd_fa_count(content)
-                                - _hd_fa_count(matured_before.marker),
-                            )
-                            _hd_fa_deltas[tc_id] = delta
-                        if delta > 0:
-                            with _hd_fa_lock:
-                                _hd_fa_pending[0] += delta
+                    if matured_before is None:
+                        # This request matured the Read, so it books the
+                        # removal in full. Learn the token delta here: it is
+                        # the last time the raw content is in hand, and the
+                        # apply() scan below only ever sees the marker.
+                        matured = self._matured.get(tc_id)
+                        if matured is not None and out[0] is not None:
+                            _hd_fa_delta(tc_id, content, matured.marker)
+                    elif out[0] is not None:
+                        # Matured earlier and swapped out by THIS pass (the
+                        # cached prefix did not cover it): already booked.
+                        _hd_fa_accrue(
+                            _hd_fa_delta(tc_id, content, matured_before.marker)
+                        )
                 except Exception:
                     # Accounting-only: never let bookkeeping break a request.
+                    pass
+                return out
+
+            def _hd_fa_apply(self, messages, *args, **kwargs):
+                # Markers already present on the way IN were put there by the
+                # cached-prefix replay, so their removal was booked on an
+                # earlier request. Snapshot _matured first: a Read maturing on
+                # THIS request must not be charged for its own first
+                # appearance. Reads the full list, frozen region included.
+                known = dict(self._matured) if self._matured else None
+                out = _hd_fa_orig_apply(self, messages, *args, **kwargs)
+                try:
+                    if known:
+                        debt = 0
+                        for tc_id, content in _hd_fa_tool_results(messages):
+                            matured = known.get(tc_id)
+                            if matured is not None and content == matured.marker:
+                                # 0 when the delta was never learned in this
+                                # process (proxy restart, cache cleared): the
+                                # books then stay as upstream writes them
+                                # rather than guessing a share.
+                                debt += _hd_fa_deltas.get(tc_id, 0)
+                        _hd_fa_accrue(debt)
+                except Exception:
                     pass
                 return out
 
@@ -1620,6 +1696,7 @@ if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 return await _hd_fa_orig_record(self, *args, **kwargs)
 
             _hd_fa_rm.ReadMaturationManager._handle_read = _hd_fa_handle
+            _hd_fa_rm.ReadMaturationManager.apply = _hd_fa_apply
             _hd_fa_pm.PrometheusMetrics.record_request = _hd_fa_record
     except Exception:
         # Accounting-only vendor: any binding failure leaves the books
