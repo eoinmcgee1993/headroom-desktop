@@ -75,12 +75,13 @@ quit_app() {
 # proxy.log survives backend restarts, so every count in checks 11 and 13 has to
 # be scoped to the current boot or pre-fix history keeps them non-zero forever.
 # Untimestamped continuation lines inherit the state of the line above them.
-since_boot() {
+since_ts() { # "YYYY-mm-dd HH:MM:SS"
   [ -f "$PROXY_LOG" ] || return 0
-  awk -v B="$BOOT_TS" '
+  awk -v B="$1" '
     /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] /{ on = (substr($0,1,19) >= B) }
     on' "$PROXY_LOG"
 }
+since_boot() { since_ts "$BOOT_TS"; }
 count_since_boot() { since_boot | grep -c "$1"; }
 
 set_boot_ts() {
@@ -283,8 +284,16 @@ AX 'to click menu bar item 1 of menu bar 2' >/dev/null
 sleep 1
 menu=$(AX 'to get name of every menu item of menu 1 of menu bar item 1 of menu bar 2')
 AX 'to click menu item "Show Headroom" of menu 1 of menu bar item 1 of menu bar 2' >/dev/null
-sleep 5
-geom=$(AX 'to get {position, size} of window 1' | tr -d ' ')
+# The main window is a tray popover: it hides 150ms after losing focus
+# (MAIN_WINDOW_BLUR_HIDE_DELAY_MS), so anyone clicking elsewhere during a fixed
+# sleep scores a healthy build as "no window" (0.9.11-rc.5 quick re-run). Read
+# the geometry and shoot the moment it is there (measured +0.3s), poll up to 5s.
+geom=""
+for _ in $(seq 1 20); do
+  geom=$(AX 'to get {position, size} of window 1' | tr -d ' ')
+  [[ "$geom" =~ ^([0-9-]+),([0-9-]+),([0-9]+),([0-9]+)$ ]] && break
+  sleep 0.25
+done
 if [[ "$menu" == *"Headroom"* ]] && [[ "$geom" =~ ^([0-9-]+),([0-9-]+),([0-9]+),([0-9]+)$ ]]; then
   x=${BASH_REMATCH[1]}; y=${BASH_REMATCH[2]}; w=${BASH_REMATCH[3]}; h=${BASH_REMATCH[4]}
   shot="$SHOTS/dashboard-$(date +%H%M%S).png"
@@ -293,34 +302,6 @@ if [[ "$menu" == *"Headroom"* ]] && [[ "$geom" =~ ^([0-9-]+),([0-9-]+),([0-9]+),
   row MANUAL "16 lifetime >= today" "in that screenshot: 'Total costs saved' >= chart's 'saved today'"
 else
   row FAIL "5 dashboard opens" "no window after Show Headroom (menu: $menu)"
-fi
-
-# --- 7. actively optimizing (needs a large Read between two runs) -----------
-snap=$(curl -s "http://127.0.0.1:6767/stats" | jq -c '{
-  frozen: (.summary.uncompressed_requests.prefix_frozen // 0),
-  compressed: (.summary.compression.requests_compressed // 0),
-  cache_usd: (.summary.cost.breakdown.cache_savings_usd // 0),
-  before: (.summary.compression.total_tokens_before // 0),
-  claude: (.requests.by_model // {} | with_entries(select(.key|startswith("claude-"))) | to_entries | map(.value) | add // 0)
-}' 2>/dev/null)
-if [ -z "$snap" ] || [ "$snap" = "null" ]; then
-  row FAIL "7 optimizing" "/stats unreadable"
-elif [ -f "$BASELINE" ]; then
-  o=$(cat "$BASELINE")
-  d() { echo "$1" | jq -r ".$2"; }
-  dc=$(( $(d "$snap" claude) - $(d "$o" claude) ))
-  db=$(( $(d "$snap" before) - $(d "$o" before) ))
-  dr=$(( ($(d "$snap" frozen) + $(d "$snap" compressed)) - ($(d "$o" frozen) + $(d "$o" compressed)) ))
-  du=$(echo "$(d "$snap" cache_usd) > $(d "$o" cache_usd)" | bc -l)
-  if [ "$dc" -gt 0 ] && [ "$db" -gt 0 ] && [ "$dr" -ge 1 ] && [ "$du" = "1" ]; then
-    row PASS "7 optimizing" "+$dc claude reqs, +$db tok_before, +$dr compressed/frozen, cache_savings up"
-  else
-    row FAIL "7 optimizing" "+$dc claude reqs, +$db tok_before, +$dr compressed/frozen, cache_usd_grew=$du"
-  fi
-  rm -f "$BASELINE"
-else
-  echo "$snap" > "$BASELINE"
-  row PENDING "7 optimizing" "baseline saved; do a ~1400-line Read (the tool, not cat), then re-run"
 fi
 
 # --- disruptive block -------------------------------------------------------
@@ -422,6 +403,48 @@ else
       row FAIL "12 sitecustomize imported" "proxy terminated - sitecustomize was never imported"
     fi
   fi
+fi
+
+# --- 7. actively optimizing (needs a large Read between two runs) -----------
+# Runs after the disruptive block on purpose: /stats is in-memory per backend
+# boot, so a baseline taken before checks 6/9 restart it scores the --quick
+# re-run against reset counters (0.9.11-rc.5 pass).
+snap=$(curl -s "http://127.0.0.1:6767/stats" | jq -c --arg ts "$(date +"%Y-%m-%d %H:%M:%S")" '{
+  ts: $ts,
+  frozen: (.summary.uncompressed_requests.prefix_frozen // 0),
+  compressed: (.summary.compression.requests_compressed // 0),
+  before: (.summary.compression.total_tokens_before // 0),
+  claude: (.requests.by_model // {} | with_entries(select(.key|startswith("claude-"))) | to_entries | map(.value) | add // 0)
+}' 2>/dev/null)
+if [ -z "$snap" ] || [ "$snap" = "null" ]; then
+  row FAIL "7 optimizing" "/stats unreadable"
+elif [ -f "$BASELINE" ]; then
+  o=$(cat "$BASELINE")
+  d() { echo "$1" | jq -r ".$2"; }
+  dc=$(( $(d "$snap" claude) - $(d "$o" claude) ))
+  db=$(( $(d "$snap" before) - $(d "$o" before) ))
+  dr=$(( ($(d "$snap" frozen) + $(d "$snap" compressed)) - ($(d "$o" frozen) + $(d "$o" compressed)) ))
+  # Cache side of the trade, per request from the proxy log since the baseline.
+  # cost.py's cache_savings_usd is net of the write premium over a window and
+  # moves both ways by design, so it cannot be a gate (doc, check 7).
+  read -r pn ptb pts pcr pcw <<<"$(since_ts "$(d "$o" ts)" | grep 'PERF model=claude-' \
+    | awk '{ for (i = 1; i <= NF; i++) { split($i, kv, "="); v[kv[1]] = kv[2] }
+             n++; tb += v["tok_before"]; sv += v["tok_saved"]; cr += v["cache_read"]; cw += v["cache_write"] }
+           END { printf "%d %d %d %d %d\n", n, tb, sv, cr, cw }')"
+  dropped=$(since_ts "$(d "$o" ts)" | grep -c 'event=cache_breakpoints.*dropped=true')
+  cache_ok=1; [ -f "$PROXY_LOG" ] && [ "${pcr:-0}" -eq 0 ] && cache_ok=0
+  if [ "$dc" -gt 0 ] && [ "$db" -gt 0 ] && [ "$dr" -ge 1 ] && [ "$cache_ok" = 1 ]; then
+    row PASS "7 optimizing" "+$dc claude reqs, +$db tok_before, +$dr compressed/frozen"
+  else
+    row FAIL "7 optimizing" "+$dc claude reqs, +$db tok_before, +$dr compressed/frozen, cache_read since baseline=${pcr:-0}"
+  fi
+  if [ "${pn:-0}" -gt 0 ]; then
+    row NOTE "7 cache side" "$pn claude reqs: cache_read/req=$(( pcr / pn )), cache_write/req=$(( pcw / pn )), tok_saved/tok_before=$(( pts * 100 / (ptb > 0 ? ptb : 1) ))%, tail breakpoint dropped on $dropped (held Read parks it: read_maturation, see doc)"
+  fi
+  rm -f "$BASELINE"
+else
+  echo "$snap" > "$BASELINE"
+  row PENDING "7 optimizing" "baseline saved; do a ~1400-line Read (the tool, not cat), then re-run with --quick"
 fi
 
 echo

@@ -49,6 +49,16 @@ fn scrub_all_in(projects_root: Option<&Path>, memory_db_path: &Path) {
             }
             Err(e) => log::warn!("memory_scrubber: failed to scrub {}: {e}", path.display()),
         }
+        // Heal start-only learn blocks left behind by pre-0.9.10 scrubs (which
+        // ate the end marker). Until now this only ran before a manual learn,
+        // so most users stayed stuck: the wheel's writer replaces start..end
+        // and silently writes nothing without the end marker.
+        if crate::tool_manager::repair_headroom_learn_block_file(path) {
+            log::info!(
+                "memory_scrubber: restored learn end marker in {}",
+                path.display()
+            );
+        }
     }
 
     match scrub_memory_db(memory_db_path) {
@@ -415,6 +425,26 @@ mod tests {
         // Should not panic.
         scrub_all_in(Some(&missing_projects), &missing_db);
         scrub_all_in(None, &missing_db);
+    }
+
+    /// A file scrubbed by a pre-0.9.10 build (start marker, no end marker)
+    /// must leave launch with the end marker restored.
+    #[test]
+    fn scrub_all_in_heals_start_only_learn_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let mem = projects.join("stuck").join("memory");
+        fs::create_dir_all(&mem).unwrap();
+        let path = mem.join("MEMORY.md");
+        fs::write(
+            &path,
+            "<!-- headroom:learn:start -->\n## Headroom Learned Patterns\n\n## Manual memory index\n- keep\n",
+        )
+        .unwrap();
+        scrub_all_in(Some(&projects), &tmp.path().join("missing.db"));
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("<!-- headroom:learn:end -->"), "{after}");
+        assert!(after.contains("## Manual memory index\n- keep"), "{after}");
     }
 
     #[test]
