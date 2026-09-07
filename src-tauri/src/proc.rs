@@ -48,6 +48,7 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 
 /// Why a spawned child did not produce an `Output`.
 #[derive(Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum OutputError {
     Spawn(std::io::Error),
     TimedOut,
@@ -60,6 +61,9 @@ pub enum OutputError {
 /// blocks on a profile). Stdin is closed so a child that reads it cannot wait
 /// on us either. On timeout the child is killed and reaped; whatever it
 /// wrote is discarded, because a partial answer is not an answer.
+///
+/// Only the Windows-only WSL probe calls this today, hence the allow.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn output_with_timeout(
     mut command: Command,
     timeout: std::time::Duration,

@@ -2480,7 +2480,7 @@ export default function App() {
                 : startupError
                 ? { text: `Headroom could not finish starting: ${startupError}`, tone: "error" }
                 : {
-                    text: "Finishing setup - first launch downloads models and can take a minute.",
+                    text: "Finishing setup - first launch downloads models and can take a minute. Wait for this message to clear before sending your test message, or the test will not register.",
                     tone: "info"
                   }
             );
