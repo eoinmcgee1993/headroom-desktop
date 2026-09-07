@@ -6192,6 +6192,21 @@ export default function App() {
     runtimeIssues.push("Kompress disabled");
   }
 
+  // A startup hint is prose: "what is wrong. What to do." The headline
+  // carries its first sentence and the rest renders underneath it. Short
+  // issue fragments ("proxy unreachable") have no sentence break and stay
+  // inline, joined as before.
+  const splitIssue = (issue: string): { lead: string; detail: string } => {
+    const cut = issue.search(/[.!?] (?=[A-Z])/);
+    return cut === -1
+      ? { lead: issue, detail: "" }
+      : { lead: issue.slice(0, cut + 1), detail: issue.slice(cut + 2) };
+  };
+  const endSentence = (text: string): string => (/[.!?]$/.test(text) ? text : `${text}.`);
+  const primaryIssue = runtimeIssues.length > 0 ? splitIssue(runtimeIssues[0]) : null;
+  const runtimeIssueDetail = primaryIssue?.detail ?? "";
+  const issueSummary = primaryIssue?.detail ? primaryIssue.lead : runtimeIssues.join(", ");
+
   const runtimeHealthy = Boolean(
     runtimeStatus &&
       runtimeStatus.running &&
@@ -6304,27 +6319,20 @@ export default function App() {
       tone: disconnected ? "disconnected" : "degraded",
       title: disconnected
         ? runtimeIssues.length > 0
-          ? `Headroom is not hooked up right now: ${runtimeIssues.join(", ")}.`
+          ? endSentence(`Headroom is not hooked up right now: ${issueSummary}`)
           : "Headroom is not hooked up right now."
         : runtimeIssues.length > 0
-          ? `Headroom needs attention: ${runtimeIssues.join(", ")}.`
+          ? endSentence(`Headroom needs attention: ${issueSummary}`)
           : "Headroom is running, but something needs attention."
     } as const;
   })();
 
   const calloutTitle =
-    calloutBanner.title.length <= 110
+    calloutBanner.title.length <= 110 || !primaryIssue
       ? calloutBanner.title
-      : (() => {
-          const primaryIssue = runtimeIssues[0];
-          if (!primaryIssue) {
-            return calloutBanner.title;
-          }
-          if (calloutBanner.tone === "disconnected") {
-            return `Headroom is not hooked up right now: ${primaryIssue}.`;
-          }
-          return `Headroom needs attention: ${primaryIssue}.`;
-        })();
+      : endSentence(
+          `${calloutBanner.tone === "disconnected" ? "Headroom is not hooked up right now" : "Headroom needs attention"}: ${primaryIssue.lead}`
+        );
   const tierMismatch = pricingStatus?.tierMismatch ?? null;
   // Products the clamp actually limits (per-product scope). Falls back to the
   // recommendation source for payloads cached by builds without the flags.
@@ -6795,6 +6803,9 @@ export default function App() {
               <span className={`callout-banner__dot callout-banner__dot--${calloutBanner.tone}`} aria-hidden="true" />
               <div className="callout-banner__body">
                 <h1>{calloutTitle}</h1>
+                {runtimeIssueDetail && (calloutBanner.tone === "disconnected" || calloutBanner.tone === "degraded") ? (
+                  <p className="callout-banner__subtitle">{runtimeIssueDetail}</p>
+                ) : null}
                 {platformPreviewNotice ? (
                   <p className="callout-banner__subtitle">
                     {platformPreviewNotice} Please report any issues to{" "}

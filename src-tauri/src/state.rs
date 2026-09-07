@@ -3231,19 +3231,38 @@ impl AppState {
         // coding and silently saves nothing. That is Sentry RUST-6J into
         // RUST-5C, and the largest Windows cluster we have.
         //
-        // Asking the backend directly closes it. The argv check is what keeps
-        // this safe: adopting a backend from an OLDER app build would silently
-        // run a mismatched wheel and, worse, quietly disable the exact-pin
-        // prefix-floor vendor. A mismatched argv fails this test and falls
-        // through to the existing teardown-and-respawn path unchanged.
-        let backend_serving =
-            crate::tool_manager::probe_backend_readyz_ok(crate::backend_port::get());
+        // Asking the backend directly closes it. The argv check is the gate
+        // against adopting a backend from an OLDER app build, which would
+        // silently run a mismatched wheel and quietly disable the exact-pin
+        // prefix-floor vendor: a mismatched argv falls through to the
+        // teardown-and-respawn path unchanged. Know its limit: argv is read
+        // through `ps`, so on Windows it is unreadable and the check fails
+        // OPEN (see `running_proxy_matches_expected_args`), leaving the
+        // /readyz probe as the only gate there. What bounds that: an orphan
+        // is this machine's own venv, and `stop_headroom`'s sweep reaps it at
+        // the next quit or upgrade (verified on Windows 2026-09-06).
+        let intercept_reachable = is_headroom_proxy_reachable();
+        // Each probe below only runs when it can change the answer: the
+        // backend probe is a request, the argv check shells out.
+        let backend_serving = !intercept_reachable
+            && crate::tool_manager::probe_backend_readyz_ok(crate::backend_port::get());
+        let backend_argv_is_current =
+            backend_serving && crate::tool_manager::running_proxy_matches_expected_args();
         if runtime_already_serving(
-            is_headroom_proxy_reachable(),
+            intercept_reachable,
             backend_serving,
-            // Only consult argv when it can change the answer: it shells out.
-            backend_serving && crate::tool_manager::running_proxy_matches_expected_args(),
+            backend_argv_is_current,
+            *self.runtime_upgrade_in_progress.lock(),
         ) {
+            if !intercept_reachable {
+                // The one line that says this path fired. Verified on Windows
+                // 2026-09-06 by backend pid identity; the field signal is
+                // RUST-6J / RUST-5C going quiet.
+                log::info!(
+                    "ensure_headroom_running: adopting healthy backend on port {} behind an unreachable intercept; not spawning",
+                    crate::backend_port::get()
+                );
+            }
             *self.last_startup_error.lock() = None;
             return Ok(());
         }
@@ -4317,6 +4336,37 @@ struct LaunchProfile {
     unrouted_usage_notified: bool,
 }
 
+/// Parse a launch profile, resetting every top-level field that does not
+/// deserialize and keeping the rest. Returns the profile and, for each field
+/// reset, `name (cause)`. RUST-D7: a hand-edited `upstream_override.mode:
+/// "custom"` threw away the whole profile, launch count and lifetime savings
+/// included, where resetting that one field would have done. Field by field
+/// because `#[serde(default)]` only covers a MISSING field; one that is present
+/// and unreadable fails the container. Not JSON at all is still an error: the
+/// caller backs the file up and starts fresh.
+/// ponytail: top-level fields only, so a bad nested value resets its whole
+/// parent object; split the parent if that ever loses something worth keeping.
+fn parse_launch_profile_salvaging(bytes: &[u8]) -> Result<(LaunchProfile, Vec<String>)> {
+    if let Ok(profile) = serde_json::from_slice::<LaunchProfile>(bytes) {
+        return Ok((profile, Vec::new()));
+    }
+    let mut map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)?;
+    let dropped: Vec<String> = map
+        .iter()
+        .filter_map(|(key, value)| {
+            let one = serde_json::Map::from_iter([(key.clone(), value.clone())]);
+            serde_json::from_value::<LaunchProfile>(serde_json::Value::Object(one))
+                .err()
+                .map(|err| format!("{key} ({err})"))
+        })
+        .collect();
+    for entry in &dropped {
+        map.remove(entry.split(' ').next().unwrap_or_default());
+    }
+    let profile = serde_json::from_value::<LaunchProfile>(serde_json::Value::Object(map))?;
+    Ok((profile, dropped))
+}
+
 fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
     if let Ok(bytes) = serde_json::to_vec_pretty(profile) {
         let _ = crate::client_adapters::atomic_write(path, &bytes);
@@ -4354,12 +4404,23 @@ impl LaunchProfile {
         // A corrupt or truncated profile (0-byte file from a crash mid-write,
         // RUST-1P) must not crash startup — that's an unrecoverable launch
         // loop until the user manually deletes the file. Degrade to a fresh
-        // profile; the warn still reaches Sentry for visibility.
+        // profile; the warn still reaches Sentry for visibility. A profile
+        // that is valid JSON with one unreadable field keeps every other
+        // field (RUST-D7).
         let previous = if path.exists() {
             std::fs::read(&path)
                 .map_err(anyhow::Error::from)
-                .and_then(|bytes| {
-                    serde_json::from_slice::<LaunchProfile>(&bytes).map_err(anyhow::Error::from)
+                .and_then(|bytes| parse_launch_profile_salvaging(&bytes))
+                .map(|(profile, dropped)| {
+                    if !dropped.is_empty() {
+                        log::warn!(
+                            "launch profile at {} had unreadable field(s) {}; reset those to default and kept the rest (backup: .json.salvaged)",
+                            path.display(),
+                            dropped.join(", ")
+                        );
+                        let _ = std::fs::copy(&path, path.with_extension("json.salvaged"));
+                    }
+                    profile
                 })
                 .unwrap_or_else(|err| {
                     log::warn!(
@@ -7770,20 +7831,46 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
 /// `net stop winnat`, which fails on any machine where winnat is not even
 /// running -- confidently wrong advice is worse than none. Name the port, hand
 /// over the command that identifies the holder, and let the user look.
+/// The banner's explanation for a failed 6767 bind. `raw` is whatever the
+/// intercept's bind loop wrote into `AppState::intercept_bind_error`: the OS
+/// error while it is still working out who holds the port, or one of its own
+/// verdict phrases once it knows (`is held by NAME (pid N)`, `still being
+/// released`, `stuck in use`). Two sentences: the fact, then what to do. The
+/// dashboard prefixes the first sentence with "Headroom is not hooked up right
+/// now:" as the headline and shows the rest underneath, so the first sentence
+/// states only the fact and stays short.
 pub(crate) fn intercept_bind_hint(raw: &str) -> String {
     let port = crate::proxy_intercept::INTERCEPT_PORT;
+    if let Some((_, holder)) = raw.split_once(" is held by ") {
+        let holder = holder.trim_end_matches('.').replace("(pid ", "(PID ");
+        return format!(
+            "Port {port} is in use by {holder}. \
+             Quit that program, or end it in Task Manager, and Headroom reconnects on its own."
+        );
+    }
+    if raw.contains("still being released") {
+        return format!(
+            "Port {port} is still being released by the previous Headroom session. \
+             Nothing to do: Headroom reconnects on its own within a few minutes."
+        );
+    }
+    if raw.contains("stuck in use") {
+        return format!(
+            "Port {port} is in use, but no program is listening on it. \
+             Reboot to clear it; if it comes back, check for a reserved port range with: \
+             netsh int ipv4 show excludedportrange protocol=tcp"
+        );
+    }
     if raw.contains("os error 10048") {
         return format!(
-            "Port {port} is already held by another process, so Headroom cannot open it and \
-             clients get \"connection refused\". In PowerShell, \
-             `Get-NetTCPConnection -LocalPort {port}` names the owning process: if it is a \
-             leftover Headroom, quit it and relaunch. If nothing owns the port, check for a \
-             reserved range with `netsh int ipv4 show excludedportrange protocol=tcp`."
+            "Port {port} is in use by another program. \
+             Headroom retries every few seconds; if this doesn't clear, \
+             Get-NetTCPConnection -LocalPort {port} in PowerShell shows what holds the port."
         );
     }
     format!(
-        "Headroom cannot open port {port}, so no client traffic can reach it ({raw}). \
-         Another app is holding the port -- quit it, or reboot to clear stuck listeners."
+        "Headroom can't open port {port} ({raw}). \
+         Quit whatever holds the port, or reboot to clear stuck listeners."
     )
 }
 
@@ -7797,13 +7884,18 @@ fn is_headroom_proxy_reachable() -> bool {
 ///
 /// A reachable intercept is sufficient (the pre-existing rule). A healthy
 /// backend alone is NOT: it must also be running this build's argv, or we would
-/// adopt an older build's proxy and silently run a mismatched wheel.
+/// adopt an older build's proxy and silently run a mismatched wheel. And never
+/// during an upgrade's boot validation: the backend on the port then is the
+/// OLD wheel that `stop_headroom` was meant to remove, and validating against
+/// it would report the upgrade as working while nothing changed; the spawn
+/// path force-reclaims it instead.
 fn runtime_already_serving(
     intercept_reachable: bool,
     backend_serving: bool,
     backend_argv_is_current: bool,
+    upgrade_in_progress: bool,
 ) -> bool {
-    intercept_reachable || (backend_serving && backend_argv_is_current)
+    intercept_reachable || (!upgrade_in_progress && backend_serving && backend_argv_is_current)
 }
 
 fn probe_proxy_readyz(timeout: Duration) -> bool {
@@ -9481,6 +9573,29 @@ mod tests {
         assert!(!hint.contains("net stop winnat"), "{hint}");
     }
 
+    /// The bind loop's own verdicts each get a hint that says what is wrong
+    /// and what to do, never "quit whatever holds the port" for a port that
+    /// nothing is holding.
+    #[test]
+    fn intercept_bind_hint_reads_the_bind_loops_verdicts() {
+        let foreign = intercept_bind_hint("port 6767 is held by python.exe (pid 11236)");
+        assert!(foreign.contains("python.exe (PID 11236)"), "{foreign}");
+        assert!(foreign.contains("Task Manager"), "{foreign}");
+        let draining =
+            intercept_bind_hint("port 6767 is still being released after a restart; reconnecting");
+        assert!(draining.contains("Nothing to do"), "{draining}");
+        assert!(!draining.contains("Quit"), "{draining}");
+        let stuck = intercept_bind_hint("port 6767 stuck in use with nothing listening (301s)");
+        assert!(stuck.contains("excludedportrange"), "{stuck}");
+        assert!(stuck.contains("Reboot"), "{stuck}");
+        // Every variant leads with a sentence that stands alone as the headline.
+        for hint in [&foreign, &draining, &stuck] {
+            let first = hint.split(". ").next().unwrap();
+            assert!(first.starts_with("Port 6767"), "{first}");
+            assert!(first.len() < 110, "headline too long: {first}");
+        }
+    }
+
     #[test]
     fn intercept_bind_hint_falls_back_to_the_raw_cause() {
         let hint = intercept_bind_hint("Address already in use (os error 48)");
@@ -9759,20 +9874,26 @@ mod tests {
         use super::runtime_already_serving as serving;
 
         // The pre-existing rule is untouched: a reachable intercept is enough.
-        assert!(serving(true, false, false));
-        assert!(serving(true, true, true));
+        assert!(serving(true, false, false, false));
+        assert!(serving(true, true, true, false));
 
         // The fix: intercept down, backend healthy and running this build.
-        assert!(serving(false, true, true));
+        assert!(serving(false, true, true, false));
 
         // A healthy backend from an OLDER build must NOT be adopted. Doing so
         // would silently run a mismatched wheel and disable the exact-pin
         // prefix-floor vendor, so this has to fall through to respawn.
-        assert!(!serving(false, true, false));
+        assert!(!serving(false, true, false, false));
 
         // Nothing serving at all still spawns.
-        assert!(!serving(false, false, false));
-        assert!(!serving(false, false, true));
+        assert!(!serving(false, false, false, false));
+        assert!(!serving(false, false, true, false));
+
+        // During an upgrade's boot validation the healthy backend is the OLD
+        // wheel: never adopt it, fall through to the force-reclaim spawn. The
+        // intercept rule is not affected by the flag.
+        assert!(!serving(false, true, true, true));
+        assert!(serving(true, false, false, true));
     }
 
     #[test]
@@ -13209,6 +13330,63 @@ mod tests {
         let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("reload");
         assert_eq!(profile.launch_count, 2);
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// RUST-D7: one hand-edited enum value must reset that field, not the
+    /// profile. The counters next to it survive and the file is backed up.
+    #[test]
+    fn launch_profile_load_or_create_keeps_the_fields_next_to_an_unreadable_one() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "headroom-launch-profile-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        ensure_data_dirs(&base_dir).expect("create temp dirs");
+        let path = crate::storage::config_file(&base_dir, "launch-profile.json");
+        std::fs::write(
+            &path,
+            r#"{"launch_count": 7, "lifetime_requests": 3, "accepted_terms_version": 2,
+                "upstream_override": {"mode": "custom", "base_url": "https://api.example.com"}}"#,
+        )
+        .expect("write profile");
+
+        let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("salvaged");
+        assert_eq!(profile.launch_count, 8);
+        assert_eq!(profile.lifetime_requests, 3);
+        assert_eq!(profile.accepted_terms_version, 2);
+        assert_eq!(
+            profile.upstream_override,
+            super::UpstreamOverride::default()
+        );
+        assert!(path.with_extension("json.salvaged").exists());
+        // The rewritten file parses cleanly on the next launch.
+        let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("reload");
+        assert_eq!(profile.launch_count, 9);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn parse_launch_profile_salvaging_names_only_the_bad_fields() {
+        let (profile, dropped) = super::parse_launch_profile_salvaging(
+            br#"{"launch_count": 4, "upstream_override": {"mode": "custom"}, "setup_wizard_complete": "yes"}"#,
+        )
+        .expect("salvaged");
+        assert_eq!(profile.launch_count, 4);
+        assert!(!profile.setup_wizard_complete);
+        let mut names: Vec<&str> = dropped
+            .iter()
+            .map(|entry| entry.split(' ').next().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["setup_wizard_complete", "upstream_override"]);
+        assert!(
+            dropped
+                .iter()
+                .any(|entry| entry.contains("unknown variant `custom`")),
+            "{dropped:?}"
+        );
+        // Not JSON at all is still an error: the caller backs up and starts fresh.
+        assert!(super::parse_launch_profile_salvaging(b"").is_err());
+        assert!(super::parse_launch_profile_salvaging(b"{").is_err());
     }
 
     #[test]

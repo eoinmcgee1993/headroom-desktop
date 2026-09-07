@@ -3260,6 +3260,14 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     // OpenMP DLL. The probe only runs after a 0xffffffff exit, and "killed"
     // only comes from the timeout (Windows has no signals), so the phrase is
     // specific. An `(exit N)` verdict is a broken venv, not this.
+    // STATUS_DLL_INIT_FAILED from a python.exe whose next attempt printed the
+    // banner (RUST-DA, Win11 26200, fresh install): not a missing DLL
+    // (0xc0000135) or a bad image (0xc000007b), a DLL's init refused, which on
+    // a venv that runs a moment later is an injected security-product DLL.
+    // The code survives every locale.
+    if lower.contains("0xc0000142") {
+        return true;
+    }
     if lower.contains("import onnxruntime failed (killed)") {
         return true;
     }
@@ -4996,16 +5004,53 @@ async fn detect_unrouted_clients(
             if !client_adapters::client_ran_unrouted(activity, requests, app_started_at, now) {
                 continue;
             }
+            // One report per activity timestamp: the condition holds for the
+            // whole 24h window, so the hourly rescan re-filed the same stale
+            // session every hour (nine events per host per day on RUST-2K).
+            static LAST_REPORTED: OnceLock<
+                Mutex<std::collections::HashMap<&'static str, SystemTime>>,
+            > = OnceLock::new();
+            if activity.is_some_and(|at| {
+                LAST_REPORTED
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap()
+                    .insert(client_id, at)
+                    == Some(at)
+            }) {
+                continue;
+            }
             let enabled = match client_id {
                 "codex" => client_adapters::is_codex_enabled(),
                 _ => client_adapters::is_claude_code_enabled(),
             };
             let reapplied = enabled && client_adapters::apply_client_setup(client_id).is_ok();
             let active_at: chrono::DateTime<chrono::Utc> = activity.unwrap_or(now).into();
-            // warn: the log bridge forwards it to Sentry, the only fleet-wide
-            // trace of an agent silently running outside Headroom.
-            log::warn!(
+            log::info!(
                 "unrouted client {client_id}: active locally at {active_at}, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
+            );
+            // The only fleet-wide trace of an agent silently running outside
+            // Headroom. Captured explicitly under a fixed fingerprint: as a
+            // warn through the log bridge it grouped on the caller stack,
+            // which release builds cannot symbolicate, so every build opened
+            // a fresh issue for the one condition (RUST-2K, RUST-D5, RUST-D6).
+            sentry::with_scope(
+                |scope| {
+                    scope.set_tag("flow", "unrouted_client");
+                    scope.set_tag("client", client_id);
+                    scope.set_tag("enabled", enabled);
+                    scope.set_tag("reapplied", reapplied);
+                    scope.set_extra("active_at", active_at.to_rfc3339().into());
+                    scope.set_fingerprint(Some(&["unrouted_client", client_id]));
+                },
+                || {
+                    sentry::capture_message(
+                        &format!(
+                            "unrouted client {client_id}: active locally, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
+                        ),
+                        sentry::Level::Warning,
+                    );
+                },
             );
             analytics::track_event(
                 &app,
@@ -12108,6 +12153,20 @@ Some unrelated content.
             "Could not resolve host: pypi.org"
         ));
         assert!(!is_endpoint_protection_signal("ENOSPC: no space left"));
+        // Neighbouring NTSTATUS: a DLL that is missing, not one that refused.
+        assert!(!is_endpoint_protection_signal(
+            "exited with status exit code: 0xc0000135 before opening port 6768"
+        ));
+    }
+
+    #[test]
+    fn is_endpoint_protection_signal_matches_dll_init_failed_exit() {
+        let raw = "python.exe: exited with status exit code: 0xc0000142 before opening port 6768";
+        assert!(is_endpoint_protection_signal(raw));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(raw)),
+            Some("startup_endpoint_protection")
+        );
     }
 
     #[test]

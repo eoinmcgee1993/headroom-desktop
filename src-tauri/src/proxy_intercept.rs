@@ -813,7 +813,14 @@ pub fn spawn(
                                         // be configured for, so "it will
                                         // clear itself" has stopped being
                                         // true. Nothing to name, but worth
-                                        // knowing about.
+                                        // knowing about. The phrase is what
+                                        // `state::intercept_bind_hint` keys
+                                        // on to say "reboot" instead of "quit
+                                        // whatever holds the port".
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} stuck in use with nothing listening ({}s)",
+                                            launched_at.elapsed().as_secs()
+                                        ));
                                         log::warn!(
                                             "[proxy_intercept] port {INTERCEPT_PORT} still in use with nothing listening after {}s; retrying in 15s ({e})",
                                             launched_at.elapsed().as_secs()
