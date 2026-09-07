@@ -2493,6 +2493,8 @@ impl AppState {
                 ci_low_percent: e.ci_low_percent,
                 ci_high_percent: e.ci_high_percent,
                 requests: e.requests,
+                coverage_percent: Some(e.coverage_percent),
+                publishable: e.covers_enough(),
             })
             .or_else(|| {
                 if !backend_output_fallback_allowed {
@@ -2507,6 +2509,8 @@ impl AppState {
                         ci_low_percent: o.ci_low_percent,
                         ci_high_percent: o.ci_high_percent,
                         requests: o.requests,
+                        coverage_percent: None,
+                        publishable: true,
                     })
             });
 
@@ -3231,19 +3235,38 @@ impl AppState {
         // coding and silently saves nothing. That is Sentry RUST-6J into
         // RUST-5C, and the largest Windows cluster we have.
         //
-        // Asking the backend directly closes it. The argv check is what keeps
-        // this safe: adopting a backend from an OLDER app build would silently
-        // run a mismatched wheel and, worse, quietly disable the exact-pin
-        // prefix-floor vendor. A mismatched argv fails this test and falls
-        // through to the existing teardown-and-respawn path unchanged.
-        let backend_serving =
-            crate::tool_manager::probe_backend_readyz_ok(crate::backend_port::get());
+        // Asking the backend directly closes it. The argv check is the gate
+        // against adopting a backend from an OLDER app build, which would
+        // silently run a mismatched wheel and quietly disable the exact-pin
+        // prefix-floor vendor: a mismatched argv falls through to the
+        // teardown-and-respawn path unchanged. Know its limit: argv is read
+        // through `ps`, so on Windows it is unreadable and the check fails
+        // OPEN (see `running_proxy_matches_expected_args`), leaving the
+        // /readyz probe as the only gate there. What bounds that: an orphan
+        // is this machine's own venv, and `stop_headroom`'s sweep reaps it at
+        // the next quit or upgrade (verified on Windows 2026-09-06).
+        let intercept_reachable = is_headroom_proxy_reachable();
+        // Each probe below only runs when it can change the answer: the
+        // backend probe is a request, the argv check shells out.
+        let backend_serving = !intercept_reachable
+            && crate::tool_manager::probe_backend_readyz_ok(crate::backend_port::get());
+        let backend_argv_is_current =
+            backend_serving && crate::tool_manager::running_proxy_matches_expected_args();
         if runtime_already_serving(
-            is_headroom_proxy_reachable(),
+            intercept_reachable,
             backend_serving,
-            // Only consult argv when it can change the answer: it shells out.
-            backend_serving && crate::tool_manager::running_proxy_matches_expected_args(),
+            backend_argv_is_current,
+            *self.runtime_upgrade_in_progress.lock(),
         ) {
+            if !intercept_reachable {
+                // The one line that says this path fired. Verified on Windows
+                // 2026-09-06 by backend pid identity; the field signal is
+                // RUST-6J / RUST-5C going quiet.
+                log::info!(
+                    "ensure_headroom_running: adopting healthy backend on port {} behind an unreachable intercept; not spawning",
+                    crate::backend_port::get()
+                );
+            }
             *self.last_startup_error.lock() = None;
             return Ok(());
         }
@@ -4317,6 +4340,37 @@ struct LaunchProfile {
     unrouted_usage_notified: bool,
 }
 
+/// Parse a launch profile, resetting every top-level field that does not
+/// deserialize and keeping the rest. Returns the profile and, for each field
+/// reset, `name (cause)`. RUST-D7: a hand-edited `upstream_override.mode:
+/// "custom"` threw away the whole profile, launch count and lifetime savings
+/// included, where resetting that one field would have done. Field by field
+/// because `#[serde(default)]` only covers a MISSING field; one that is present
+/// and unreadable fails the container. Not JSON at all is still an error: the
+/// caller backs the file up and starts fresh.
+/// ponytail: top-level fields only, so a bad nested value resets its whole
+/// parent object; split the parent if that ever loses something worth keeping.
+fn parse_launch_profile_salvaging(bytes: &[u8]) -> Result<(LaunchProfile, Vec<String>)> {
+    if let Ok(profile) = serde_json::from_slice::<LaunchProfile>(bytes) {
+        return Ok((profile, Vec::new()));
+    }
+    let mut map: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)?;
+    let dropped: Vec<String> = map
+        .iter()
+        .filter_map(|(key, value)| {
+            let one = serde_json::Map::from_iter([(key.clone(), value.clone())]);
+            serde_json::from_value::<LaunchProfile>(serde_json::Value::Object(one))
+                .err()
+                .map(|err| format!("{key} ({err})"))
+        })
+        .collect();
+    for entry in &dropped {
+        map.remove(entry.split(' ').next().unwrap_or_default());
+    }
+    let profile = serde_json::from_value::<LaunchProfile>(serde_json::Value::Object(map))?;
+    Ok((profile, dropped))
+}
+
 fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
     if let Ok(bytes) = serde_json::to_vec_pretty(profile) {
         let _ = crate::client_adapters::atomic_write(path, &bytes);
@@ -4354,12 +4408,23 @@ impl LaunchProfile {
         // A corrupt or truncated profile (0-byte file from a crash mid-write,
         // RUST-1P) must not crash startup — that's an unrecoverable launch
         // loop until the user manually deletes the file. Degrade to a fresh
-        // profile; the warn still reaches Sentry for visibility.
+        // profile; the warn still reaches Sentry for visibility. A profile
+        // that is valid JSON with one unreadable field keeps every other
+        // field (RUST-D7).
         let previous = if path.exists() {
             std::fs::read(&path)
                 .map_err(anyhow::Error::from)
-                .and_then(|bytes| {
-                    serde_json::from_slice::<LaunchProfile>(&bytes).map_err(anyhow::Error::from)
+                .and_then(|bytes| parse_launch_profile_salvaging(&bytes))
+                .map(|(profile, dropped)| {
+                    if !dropped.is_empty() {
+                        log::warn!(
+                            "launch profile at {} had unreadable field(s) {}; reset those to default and kept the rest (backup: .json.salvaged)",
+                            path.display(),
+                            dropped.join(", ")
+                        );
+                        let _ = std::fs::copy(&path, path.with_extension("json.salvaged"));
+                    }
+                    profile
                 })
                 .unwrap_or_else(|err| {
                     log::warn!(
@@ -6287,6 +6352,111 @@ fn note_stats_fetch_success() {
     }
 }
 
+// A structural failure signal from the proxy, not a savings-rate canary.
+// Deserialize an allowlist so request text or arbitrary extras can never enter
+// Sentry through this endpoint. Empty/old-wheel payloads are simply absent.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CacheIntegrityKind {
+    TrackerReset,
+    PrefixRewrite,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CacheIntegrityReport {
+    boot_id: String,
+    count: u64,
+    kind: CacheIntegrityKind,
+    stable_messages: u64,
+    first_changed_message: u64,
+    previously_cached_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+impl CacheIntegrityReport {
+    fn from_stats(body: &str) -> Option<Self> {
+        let stats: Value = serde_json::from_str(body).ok()?;
+        let report: Self =
+            serde_json::from_value(stats.get("prefix_cache")?.get("desktop_integrity")?.clone())
+                .ok()?;
+        (report.boot_id.len() == 32
+            && report.boot_id.bytes().all(|c| c.is_ascii_hexdigit())
+            && report.count > 0
+            && report.first_changed_message < report.stable_messages
+            && report.cache_read_tokens < report.previously_cached_tokens
+            && report.cache_write_tokens > 0)
+            .then_some(report)
+    }
+}
+
+#[derive(Default)]
+struct CacheIntegrityReporter {
+    seen: Option<(String, u64)>,
+    last_reported: Option<Instant>,
+}
+
+impl CacheIntegrityReporter {
+    fn should_report(&mut self, report: &CacheIntegrityReport, now: Instant) -> bool {
+        if self
+            .seen
+            .as_ref()
+            .is_some_and(|(boot, count)| boot == &report.boot_id && *count >= report.count)
+        {
+            return false;
+        }
+        self.seen = Some((report.boot_id.clone(), report.count));
+        // A broken loop should create one grouped issue, not an event per turn.
+        // Proxy restarts do not bypass the desktop's one-hour throttle.
+        if self
+            .last_reported
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(3600))
+        {
+            return false;
+        }
+        self.last_reported = Some(now);
+        true
+    }
+}
+
+fn report_cache_integrity(body: &str) {
+    static REPORTER: Mutex<CacheIntegrityReporter> = Mutex::new(CacheIntegrityReporter {
+        seen: None,
+        last_reported: None,
+    });
+    let Some(report) = CacheIntegrityReport::from_stats(body) else {
+        return;
+    };
+    if !REPORTER.lock().should_report(&report, Instant::now()) {
+        return;
+    }
+    let kind = match report.kind {
+        CacheIntegrityKind::TrackerReset => "tracker_reset",
+        CacheIntegrityKind::PrefixRewrite => "prefix_rewrite",
+    };
+    sentry::with_scope(
+        |scope| {
+            scope.set_fingerprint(Some(&["cache-prefix-integrity", kind]));
+            scope.set_tag("cache_integrity_kind", kind);
+            scope.set_tag("provider", "anthropic");
+            scope.set_extra(
+                "cache_integrity",
+                serde_json::to_value(&report).unwrap_or_default(),
+            );
+        },
+        || {
+            sentry::capture_message(
+                "Headroom rewrote an unchanged cached prefix",
+                sentry::Level::Warning,
+            );
+        },
+    );
+    log::info!(
+        "cache-prefix-integrity: {kind}, observation {}",
+        report.count
+    );
+}
+
 fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     if !is_headroom_proxy_reachable() {
         return None;
@@ -6340,6 +6510,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
         };
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
+            report_cache_integrity(&body);
             // Only a SUSTAINED recovery resets the backoff; a lone success
             // between two timeouts must not (see STATS_FETCH_RECOVERY_WINDOW).
             note_stats_fetch_success();
@@ -7770,20 +7941,46 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
 /// `net stop winnat`, which fails on any machine where winnat is not even
 /// running -- confidently wrong advice is worse than none. Name the port, hand
 /// over the command that identifies the holder, and let the user look.
+/// The banner's explanation for a failed 6767 bind. `raw` is whatever the
+/// intercept's bind loop wrote into `AppState::intercept_bind_error`: the OS
+/// error while it is still working out who holds the port, or one of its own
+/// verdict phrases once it knows (`is held by NAME (pid N)`, `still being
+/// released`, `stuck in use`). Two sentences: the fact, then what to do. The
+/// dashboard prefixes the first sentence with "Headroom is not hooked up right
+/// now:" as the headline and shows the rest underneath, so the first sentence
+/// states only the fact and stays short.
 pub(crate) fn intercept_bind_hint(raw: &str) -> String {
     let port = crate::proxy_intercept::INTERCEPT_PORT;
+    if let Some((_, holder)) = raw.split_once(" is held by ") {
+        let holder = holder.trim_end_matches('.').replace("(pid ", "(PID ");
+        return format!(
+            "Port {port} is in use by {holder}. \
+             Quit that program, or end it in Task Manager, and Headroom reconnects on its own."
+        );
+    }
+    if raw.contains("still being released") {
+        return format!(
+            "Port {port} is still being released by the previous Headroom session. \
+             Nothing to do: Headroom reconnects on its own within a few minutes."
+        );
+    }
+    if raw.contains("stuck in use") {
+        return format!(
+            "Port {port} is in use, but no program is listening on it. \
+             Reboot to clear it; if it comes back, check for a reserved port range with: \
+             netsh int ipv4 show excludedportrange protocol=tcp"
+        );
+    }
     if raw.contains("os error 10048") {
         return format!(
-            "Port {port} is already held by another process, so Headroom cannot open it and \
-             clients get \"connection refused\". In PowerShell, \
-             `Get-NetTCPConnection -LocalPort {port}` names the owning process: if it is a \
-             leftover Headroom, quit it and relaunch. If nothing owns the port, check for a \
-             reserved range with `netsh int ipv4 show excludedportrange protocol=tcp`."
+            "Port {port} is in use by another program. \
+             Headroom retries every few seconds; if this doesn't clear, \
+             Get-NetTCPConnection -LocalPort {port} in PowerShell shows what holds the port."
         );
     }
     format!(
-        "Headroom cannot open port {port}, so no client traffic can reach it ({raw}). \
-         Another app is holding the port -- quit it, or reboot to clear stuck listeners."
+        "Headroom can't open port {port} ({raw}). \
+         Quit whatever holds the port, or reboot to clear stuck listeners."
     )
 }
 
@@ -7797,13 +7994,18 @@ fn is_headroom_proxy_reachable() -> bool {
 ///
 /// A reachable intercept is sufficient (the pre-existing rule). A healthy
 /// backend alone is NOT: it must also be running this build's argv, or we would
-/// adopt an older build's proxy and silently run a mismatched wheel.
+/// adopt an older build's proxy and silently run a mismatched wheel. And never
+/// during an upgrade's boot validation: the backend on the port then is the
+/// OLD wheel that `stop_headroom` was meant to remove, and validating against
+/// it would report the upgrade as working while nothing changed; the spawn
+/// path force-reclaims it instead.
 fn runtime_already_serving(
     intercept_reachable: bool,
     backend_serving: bool,
     backend_argv_is_current: bool,
+    upgrade_in_progress: bool,
 ) -> bool {
-    intercept_reachable || (backend_serving && backend_argv_is_current)
+    intercept_reachable || (!upgrade_in_progress && backend_serving && backend_argv_is_current)
 }
 
 fn probe_proxy_readyz(timeout: Duration) -> bool {
@@ -8406,14 +8608,39 @@ fn warn_once_if_savings_rate_implausible(
         // legit expensive-model mix, a foreign backend on 6767, and real
         // contamination are indistinguishable from the rate alone (RUST-89,
         // 2026-09-01: $93.70/M on a 0.35.0-pinned install, undecidable).
+        //
+        // The lifetime rate alone still could not separate the two shapes this
+        // canary has churned through four resolve/regress cycles on: one
+        // contaminated day dragging an otherwise-sane series up, versus every
+        // day sitting above the ceiling. The worst bucket says which, and the
+        // configured upstream says whether Anthropic rates were applied to a
+        // third-party endpoint's traffic -- both read off state already in hand.
         let saved_usd: f64 = daily_savings.iter().map(|p| p.estimated_savings_usd).sum();
         let saved_tokens: u64 = daily_savings.iter().map(|p| p.estimated_tokens_saved).sum();
         let wheel = installed_wheel().unwrap_or_else(|| "unknown".into());
+        let bucket_rate =
+            |p: &DailySavingsPoint| p.estimated_savings_usd / p.estimated_tokens_saved as f64 * 1e6;
+        let worst = daily_savings
+            .iter()
+            .filter(|p| p.estimated_tokens_saved > 0)
+            .max_by(|a, b| bucket_rate(a).total_cmp(&bucket_rate(b)))
+            .map(|p| {
+                format!(
+                    "{} at ${:.2}/M (${:.2} / {} tok)",
+                    p.date,
+                    bucket_rate(p),
+                    p.estimated_savings_usd,
+                    p.estimated_tokens_saved
+                )
+            })
+            .unwrap_or_else(|| "none".into());
+        let upstream = crate::upstream_override::get().mode;
         log::warn!(
             "savings rate implausible: buckets imply ${savings_per_m:.2}/M saved (${saved_usd:.2} \
              across {saved_tokens} tokens, wheel {wheel}), above the \
              ${MAX_PLAUSIBLE_INPUT_USD_PER_M:.2}/M ceiling for an input token; upstream savings \
-             semantics likely changed under the pinned wheel"
+             semantics likely changed under the pinned wheel; worst bucket {worst}, upstream \
+             {upstream:?}"
         );
     }
 }
@@ -8661,6 +8888,97 @@ fn bootstrap_failed_state(current: &BootstrapProgress, message: String) -> Boots
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn cache_integrity_report_is_allowlisted_and_throttled() {
+        use super::{CacheIntegrityReport, CacheIntegrityReporter, Duration, Instant};
+        let mut payload = serde_json::json!({"prefix_cache": {"desktop_integrity": {
+            "boot_id": "0123456789abcdef0123456789abcdef", "count": 1,
+            "kind": "tracker_reset", "stable_messages": 861, "first_changed_message": 3,
+            "previously_cached_tokens": 503505, "cache_read_tokens": 7259,
+            "cache_write_tokens": 491260, "unexpected_prompt": "private content"
+        }}});
+        let mut report = CacheIntegrityReport::from_stats(&payload.to_string()).unwrap();
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("private content"));
+        let mut reporter = CacheIntegrityReporter::default();
+        let start = Instant::now();
+        assert!(reporter.should_report(&report, start));
+        assert!(!reporter.should_report(&report, start + Duration::from_secs(3601)));
+        report.count = 2;
+        assert!(!reporter.should_report(&report, start + Duration::from_secs(12)));
+        report.boot_id = "fedcba9876543210fedcba9876543210".into();
+        report.count = 1;
+        assert!(!reporter.should_report(&report, start + Duration::from_secs(24)));
+        report.count = 2;
+        assert!(reporter.should_report(&report, start + Duration::from_secs(3601)));
+
+        assert!(CacheIntegrityReport::from_stats("{}").is_none());
+        assert!(CacheIntegrityReport::from_stats("not json").is_none());
+        for (key, value) in [
+            ("boot_id", serde_json::json!("user-supplied-content")),
+            ("count", serde_json::json!(0)),
+            ("kind", serde_json::json!("arbitrary-message")),
+            ("first_changed_message", serde_json::json!(861)),
+            ("cache_read_tokens", serde_json::json!(503505)),
+            ("cache_write_tokens", serde_json::json!(0)),
+        ] {
+            let previous = payload["prefix_cache"]["desktop_integrity"][key].clone();
+            payload["prefix_cache"]["desktop_integrity"][key] = value;
+            assert!(
+                CacheIntegrityReport::from_stats(&payload.to_string()).is_none(),
+                "{key}"
+            );
+            payload["prefix_cache"]["desktop_integrity"][key] = previous;
+        }
+    }
+
+    #[test]
+    fn cache_integrity_sentry_event_is_grouped_and_contains_no_prompt() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<sentry::protocol::Event<'static>>>);
+        impl sentry::Transport for Recorder {
+            fn send_envelope(&self, envelope: sentry::Envelope) {
+                if let Some(event) = envelope.event() {
+                    self.0.lock().unwrap().push(event.clone());
+                }
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let client = sentry::Client::from(sentry::ClientOptions {
+            dsn: Some("https://public@sentry.invalid/1".parse().unwrap()),
+            transport: Some(Arc::new(recorder.clone())),
+            ..Default::default()
+        });
+        let hub = Arc::new(sentry::Hub::new(
+            Some(Arc::new(client)),
+            Arc::new(Default::default()),
+        ));
+        let payload = serde_json::json!({"prefix_cache": {"desktop_integrity": {
+            "boot_id": "0123456789abcdef0123456789abcdef", "count": 1,
+            "kind": "tracker_reset", "stable_messages": 861, "first_changed_message": 3,
+            "previously_cached_tokens": 503505, "cache_read_tokens": 7259,
+            "cache_write_tokens": 491260, "unexpected_prompt": "private content"
+        }}})
+        .to_string();
+        sentry::Hub::run(hub, || {
+            super::report_cache_integrity(&payload);
+            super::report_cache_integrity(&payload);
+        });
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].fingerprint.as_ref(),
+            ["cache-prefix-integrity", "tracker_reset"]
+        );
+        assert_eq!(events[0].level, sentry::Level::Warning);
+        assert_eq!(events[0].tags["provider"], "anthropic");
+        assert!(!serde_json::to_string(&events[0])
+            .unwrap()
+            .contains("private content"));
+    }
 
     #[test]
     fn strip_extended_length_prefix_handles_windows_and_unix_forms() {
@@ -9481,6 +9799,29 @@ mod tests {
         assert!(!hint.contains("net stop winnat"), "{hint}");
     }
 
+    /// The bind loop's own verdicts each get a hint that says what is wrong
+    /// and what to do, never "quit whatever holds the port" for a port that
+    /// nothing is holding.
+    #[test]
+    fn intercept_bind_hint_reads_the_bind_loops_verdicts() {
+        let foreign = intercept_bind_hint("port 6767 is held by python.exe (pid 11236)");
+        assert!(foreign.contains("python.exe (PID 11236)"), "{foreign}");
+        assert!(foreign.contains("Task Manager"), "{foreign}");
+        let draining =
+            intercept_bind_hint("port 6767 is still being released after a restart; reconnecting");
+        assert!(draining.contains("Nothing to do"), "{draining}");
+        assert!(!draining.contains("Quit"), "{draining}");
+        let stuck = intercept_bind_hint("port 6767 stuck in use with nothing listening (301s)");
+        assert!(stuck.contains("excludedportrange"), "{stuck}");
+        assert!(stuck.contains("Reboot"), "{stuck}");
+        // Every variant leads with a sentence that stands alone as the headline.
+        for hint in [&foreign, &draining, &stuck] {
+            let first = hint.split(". ").next().unwrap();
+            assert!(first.starts_with("Port 6767"), "{first}");
+            assert!(first.len() < 110, "headline too long: {first}");
+        }
+    }
+
     #[test]
     fn intercept_bind_hint_falls_back_to_the_raw_cause() {
         let hint = intercept_bind_hint("Address already in use (os error 48)");
@@ -9759,20 +10100,26 @@ mod tests {
         use super::runtime_already_serving as serving;
 
         // The pre-existing rule is untouched: a reachable intercept is enough.
-        assert!(serving(true, false, false));
-        assert!(serving(true, true, true));
+        assert!(serving(true, false, false, false));
+        assert!(serving(true, true, true, false));
 
         // The fix: intercept down, backend healthy and running this build.
-        assert!(serving(false, true, true));
+        assert!(serving(false, true, true, false));
 
         // A healthy backend from an OLDER build must NOT be adopted. Doing so
         // would silently run a mismatched wheel and disable the exact-pin
         // prefix-floor vendor, so this has to fall through to respawn.
-        assert!(!serving(false, true, false));
+        assert!(!serving(false, true, false, false));
 
         // Nothing serving at all still spawns.
-        assert!(!serving(false, false, false));
-        assert!(!serving(false, false, true));
+        assert!(!serving(false, false, false, false));
+        assert!(!serving(false, false, true, false));
+
+        // During an upgrade's boot validation the healthy backend is the OLD
+        // wheel: never adopt it, fall through to the force-reclaim spawn. The
+        // intercept rule is not affected by the flag.
+        assert!(!serving(false, true, true, true));
+        assert!(serving(true, false, false, true));
     }
 
     #[test]
@@ -13209,6 +13556,63 @@ mod tests {
         let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("reload");
         assert_eq!(profile.launch_count, 2);
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// RUST-D7: one hand-edited enum value must reset that field, not the
+    /// profile. The counters next to it survive and the file is backed up.
+    #[test]
+    fn launch_profile_load_or_create_keeps_the_fields_next_to_an_unreadable_one() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "headroom-launch-profile-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        ensure_data_dirs(&base_dir).expect("create temp dirs");
+        let path = crate::storage::config_file(&base_dir, "launch-profile.json");
+        std::fs::write(
+            &path,
+            r#"{"launch_count": 7, "lifetime_requests": 3, "accepted_terms_version": 2,
+                "upstream_override": {"mode": "custom", "base_url": "https://api.example.com"}}"#,
+        )
+        .expect("write profile");
+
+        let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("salvaged");
+        assert_eq!(profile.launch_count, 8);
+        assert_eq!(profile.lifetime_requests, 3);
+        assert_eq!(profile.accepted_terms_version, 2);
+        assert_eq!(
+            profile.upstream_override,
+            super::UpstreamOverride::default()
+        );
+        assert!(path.with_extension("json.salvaged").exists());
+        // The rewritten file parses cleanly on the next launch.
+        let (profile, _) = super::LaunchProfile::load_or_create(&base_dir).expect("reload");
+        assert_eq!(profile.launch_count, 9);
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn parse_launch_profile_salvaging_names_only_the_bad_fields() {
+        let (profile, dropped) = super::parse_launch_profile_salvaging(
+            br#"{"launch_count": 4, "upstream_override": {"mode": "custom"}, "setup_wizard_complete": "yes"}"#,
+        )
+        .expect("salvaged");
+        assert_eq!(profile.launch_count, 4);
+        assert!(!profile.setup_wizard_complete);
+        let mut names: Vec<&str> = dropped
+            .iter()
+            .map(|entry| entry.split(' ').next().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["setup_wizard_complete", "upstream_override"]);
+        assert!(
+            dropped
+                .iter()
+                .any(|entry| entry.contains("unknown variant `custom`")),
+            "{dropped:?}"
+        );
+        // Not JSON at all is still an error: the caller backs up and starts fresh.
+        assert!(super::parse_launch_profile_salvaging(b"").is_err());
+        assert!(super::parse_launch_profile_salvaging(b"{").is_err());
     }
 
     #[test]

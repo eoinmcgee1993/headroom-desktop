@@ -124,9 +124,7 @@ static FIRST_PROMPT_REQUEST_REPORTED: AtomicBool = AtomicBool::new(false);
 /// line (with how long it was down) and collapses the per-request spam.
 static BACKEND_REACHABILITY_STATE: AtomicU8 = AtomicU8::new(0);
 static BACKEND_DOWN_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-static BACKEND_DOWN_CODEX_RETRY_503S: AtomicU64 = AtomicU64::new(0);
 static CODEX_INFLIGHT_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
-static CODEX_GLOBAL_BYPASS_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 static CODEX_STREAM_NO_TERMINAL_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 const CODEX_RECONNECT_REPORT_MIN_INTERVAL_SECS: u64 = 60;
 /// Last-reported epoch-seconds per (client, status) for `report_upstream_error`:
@@ -250,16 +248,6 @@ fn note_backend_reachability(reachable: bool, backend_addr: SocketAddr) {
                     "backend {backend_addr} reachable (after {:.0}s unreachable)",
                     downtime.as_secs_f64()
                 );
-                let affected = BACKEND_DOWN_CODEX_RETRY_503S.swap(0, Ordering::AcqRel);
-                // Sub-10s outages are routine restart blips (updates, gate
-                // transitions); only report episodes long enough to be felt.
-                if affected > 0 && downtime.as_secs() >= 10 {
-                    report_codex_reconnect_incident(
-                        "backend_unreachable",
-                        affected,
-                        Some(downtime),
-                    );
-                }
             }
             None => log::info!("backend {backend_addr} reachable"),
         }
@@ -532,6 +520,36 @@ pub type FreshBearerNotifier = mpsc::Sender<()>;
 
 pub const ANTHROPIC_DIRECT_BASE: &str = "https://api.anthropic.com";
 pub const OPENAI_DIRECT_BASE: &str = "https://api.openai.com";
+/// Where a ChatGPT-subscription Codex request really goes. Its OAuth token is
+/// scoped to this backend and rejected by api.openai.com with a misleading
+/// "missing api.responses.write" 401, which is why those requests used to be
+/// answered 503 whenever the Python backend was down instead of forwarded.
+/// Same formula as the backend's `providers/codex/endpoints.py`.
+pub const CHATGPT_CODEX_DIRECT_BASE: &str = "https://chatgpt.com/backend-api/codex";
+
+/// Test seam. Shipped builds have no override and always use the const above;
+/// it exists so the direct-forward path can be exercised against a local mock
+/// instead of the real chatgpt.com, which a test must never call.
+#[cfg(test)]
+static CHATGPT_CODEX_BASE_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+
+fn chatgpt_codex_direct_base() -> String {
+    #[cfg(test)]
+    if let Some(base) = CHATGPT_CODEX_BASE_OVERRIDE.lock().clone() {
+        return base;
+    }
+    CHATGPT_CODEX_DIRECT_BASE.to_string()
+}
+
+/// Path on `CHATGPT_CODEX_DIRECT_BASE` for a request Codex sent to our `/v1`
+/// provider base: `/v1/responses` -> `/responses`, query intact. A path with
+/// no `/v1` prefix is passed through unchanged rather than guessed at.
+fn chatgpt_codex_direct_path(path: &str) -> &str {
+    match path.strip_prefix("/v1") {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') => rest,
+        _ => path,
+    }
+}
 
 /// What a held intercept port means, given who (if anyone) is listening on it
 /// and how long we have been trying.
@@ -795,7 +813,14 @@ pub fn spawn(
                                         // be configured for, so "it will
                                         // clear itself" has stopped being
                                         // true. Nothing to name, but worth
-                                        // knowing about.
+                                        // knowing about. The phrase is what
+                                        // `state::intercept_bind_hint` keys
+                                        // on to say "reboot" instead of "quit
+                                        // whatever holds the port".
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} stuck in use with nothing listening ({}s)",
+                                            launched_at.elapsed().as_secs()
+                                        ));
                                         log::warn!(
                                             "[proxy_intercept] port {INTERCEPT_PORT} still in use with nothing listening after {}s; retrying in 15s ({e})",
                                             launched_at.elapsed().as_secs()
@@ -1053,7 +1078,6 @@ async fn handle(
     // Codex plan capture, Codex-only bypass, counters, and response handling.
     let parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
     let is_codex = parsed_head.as_ref().is_some_and(is_codex_request_head);
-    let is_chatgpt_codex = is_codex && request_uses_chatgpt_auth(&buf);
     let is_local_backend_path = parsed_head
         .as_ref()
         .is_some_and(|head| is_local_proxy_path(&head.path));
@@ -1180,12 +1204,11 @@ async fn handle(
     }
 
     // When the pricing gate has bypassed Headroom, the Python proxy on
-    // `backend_addr` is intentionally stopped. Forward direct to Anthropic so
-    // already-running CC sessions stay alive while optimization is off.
-    // ChatGPT-authenticated Codex cannot be sent to api.openai.com: its OAuth
-    // token is scoped for chatgpt.com/backend-api/codex and the Platform API
-    // rejects it with a misleading missing `api.responses.write` 401. Return a
-    // retryable response instead of misrouting the credential.
+    // `backend_addr` is intentionally stopped. Forward direct to the provider
+    // so already-running sessions stay alive while optimization is off. The
+    // forwarder picks the upstream from the credential: Claude Code to
+    // Anthropic, API-key Codex to api.openai.com, ChatGPT-subscription Codex
+    // to chatgpt.com's Codex backend (the only place its OAuth token is valid).
     // OpenCode's transport plugin routes third-party providers (Google, custom
     // gateways) here with the real upstream in `x-headroom-base-url`. The
     // direct forwarder only knows the Anthropic/OpenAI bases, so forwarding
@@ -1195,10 +1218,11 @@ async fn handle(
     let is_plugin_routed = request_has_header(&buf, "x-headroom-base-url");
 
     if bypass.load(Ordering::Acquire) {
-        if is_chatgpt_codex || is_plugin_routed {
-            if is_chatgpt_codex && should_report_throttled(&CODEX_GLOBAL_BYPASS_503_LAST_REPORTED) {
-                report_codex_reconnect_incident("global_bypass", 1, None);
-            }
+        // ChatGPT-authenticated Codex goes through the direct forwarder too
+        // now: it knows chatgpt.com's Codex backend, so the OAuth token lands
+        // where it is valid instead of being answered 503. Only plugin-routed
+        // third-party providers still have no correct direct upstream.
+        if is_plugin_routed {
             write_retryable_service_unavailable(&mut client).await;
         } else {
             forward_direct_to_anthropic(client, buf, &upstream_base).await;
@@ -1263,17 +1287,18 @@ async fn handle(
     let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
         // Backend down or mid-restart (crash, gate transition, post-update
         // cold boot — which deliberately holds the bypass flags off for up to
-        // 10 minutes): fall back per-request to the native provider for Claude
-        // and API-key Codex. ChatGPT-authenticated Codex must retry until the
-        // backend returns because its OAuth token is not valid at the Platform
-        // API used by the direct forwarder.
+        // 10 minutes): fall back per-request to the native provider. That now
+        // includes ChatGPT-authenticated Codex, which the forwarder sends to
+        // chatgpt.com's Codex backend where its OAuth token is valid. It used
+        // to get a 503 here and retry until the backend returned, which on a
+        // first launch (model download, a minute or more) meant the setup
+        // wizard's "send a test message" produced an error in Codex while
+        // Claude Code passed through unnoticed: Codex users reached savings
+        // at 55-66% against ~90% for Claude Code on both platforms.
         // info, not warn: warn would ship to Sentry per request; the watchdog's
         // capture_watchdog_give_up already reports genuine down episodes.
         note_backend_reachability(false, backend_addr);
-        if is_chatgpt_codex {
-            BACKEND_DOWN_CODEX_RETRY_503S.fetch_add(1, Ordering::AcqRel);
-            write_retryable_service_unavailable(&mut client).await;
-        } else if is_plugin_routed {
+        if is_plugin_routed {
             // See the bypass branch above: no correct direct upstream exists
             // for plugin-routed third-party providers.
             write_retryable_service_unavailable(&mut client).await;
@@ -2383,10 +2408,21 @@ async fn forward_direct_to_anthropic(
     // OpenAI's, separate from Headroom's Claude account gate, so don't break
     // Codex when the gate trips — forward Codex requests to OpenAI directly
     // rather than (wrongly) to api.anthropic.com.
-    let effective_base: &str = if is_codex_request_head(&parsed) {
-        OPENAI_DIRECT_BASE
+    // Three upstreams, keyed on what the request carries: a ChatGPT OAuth
+    // token is only valid at chatgpt.com's Codex backend, an API key at
+    // api.openai.com, anything else is Claude Code on `upstream_base`.
+    let chatgpt_codex = is_codex_request_head(&parsed) && request_uses_chatgpt_auth(&header_buf);
+    let effective_base: String = if chatgpt_codex {
+        chatgpt_codex_direct_base()
+    } else if is_codex_request_head(&parsed) {
+        OPENAI_DIRECT_BASE.to_string()
     } else {
-        upstream_base
+        upstream_base.to_string()
+    };
+    let effective_path: &str = if chatgpt_codex {
+        chatgpt_codex_direct_path(&parsed.path)
+    } else {
+        &parsed.path
     };
 
     let header_value = |name: &str| {
@@ -2403,7 +2439,7 @@ async fn forward_direct_to_anthropic(
     // bypass modes meant to keep it alive. Tunnel the upgrade via hyper's
     // connection takeover instead.
     if header_value("upgrade").is_some() {
-        let url = format!("{}{}", effective_base, parsed.path);
+        let url = format!("{}{}", effective_base, effective_path);
         tunnel_upgrade_direct(client, &parsed, leftover_body, &url).await;
         return;
     }
@@ -2477,7 +2513,7 @@ async fn forward_direct_to_anthropic(
         sanitize_stale_tool_references(body, &parsed.path)
     };
 
-    let url = format!("{}{}", effective_base, parsed.path);
+    let url = format!("{}{}", effective_base, effective_path);
     let method = match reqwest::Method::from_bytes(parsed.method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -2489,6 +2525,16 @@ async fn forward_direct_to_anthropic(
     };
 
     let mut req = upstream_client().request(method, &url);
+    // Same fallback the backend's `resolve_codex_routing` applies: a Codex
+    // build that omits the account header on some request still carries the
+    // account id in its JWT, and chatgpt.com wants it as a header.
+    if chatgpt_codex && header_value("chatgpt-account-id").is_none() {
+        if let Some(account) = extract_bearer(&header_buf)
+            .and_then(|token| decode_codex_auth_claim(&token, "chatgpt_account_id"))
+        {
+            req = req.header("ChatGPT-Account-ID", account);
+        }
+    }
     for (name, value) in &parsed.headers {
         if is_hop_by_hop_request_header(name) {
             continue;
@@ -3400,6 +3446,33 @@ mod tests {
         assert_eq!(extract_bearer(request).as_deref(), Some("test-token"));
     }
 
+    /// The direct forwarder now sends ChatGPT-subscription Codex to
+    /// chatgpt.com's Codex backend instead of answering 503. The path Codex
+    /// sends is relative to our `/v1` provider base; chatgpt.com's is not.
+    #[test]
+    fn chatgpt_codex_direct_path_drops_our_v1_prefix_and_keeps_the_query() {
+        use super::chatgpt_codex_direct_path as map;
+        assert_eq!(map("/v1/responses"), "/responses");
+        assert_eq!(map("/v1/responses?stream=true"), "/responses?stream=true");
+        assert_eq!(map("/v1/responses/abc/compact"), "/responses/abc/compact");
+        assert_eq!(
+            map("/v1/models?client_version=1"),
+            "/models?client_version=1"
+        );
+        assert_eq!(map("/v1"), "");
+        // Not our prefix: never invent a mapping.
+        assert_eq!(map("/v10/responses"), "/v10/responses");
+        assert_eq!(map("/responses"), "/responses");
+        assert_eq!(
+            format!(
+                "{}{}",
+                super::CHATGPT_CODEX_DIRECT_BASE,
+                map("/v1/responses")
+            ),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
     #[test]
     fn detects_chatgpt_codex_auth_from_header_or_jwt() {
         assert!(request_uses_chatgpt_auth(
@@ -3835,8 +3908,14 @@ mod tests {
             "codex counter should not move for an Anthropic-path request"
         );
 
-        // ChatGPT-authenticated Codex cannot use the Platform API direct
-        // fallback. It must retry until the auth-aware Python backend returns.
+        // ChatGPT-authenticated Codex forwards to chatgpt.com's Codex backend,
+        // where its OAuth token is valid. It used to be answered 503 and left
+        // to retry until the Python backend returned, which on a first launch
+        // is a minute or more of the setup wizard's test message failing in
+        // Codex while Claude Code passed through direct and looked fine.
+        // Pointed at the local mock: a test must never call the real host.
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() =
+            Some(format!("http://127.0.0.1:{}", upstream_addr.port()));
         let mut codex_client = TcpStream::connect(intercept_addr)
             .await
             .expect("codex connect");
@@ -3847,14 +3926,11 @@ mod tests {
             .await
             .expect("write codex request");
         let response = read_response(codex_client).await;
+        *super::CHATGPT_CODEX_BASE_OVERRIDE.lock() = None;
         let response_str = std::str::from_utf8(&response).unwrap_or("");
         assert!(
-            response_str.starts_with("HTTP/1.1 503"),
-            "expected retryable 503 for ChatGPT Codex, got: {response_str:?}"
-        );
-        assert!(
-            response_str.contains("\r\nRetry-After: 1\r\n"),
-            "ChatGPT Codex 503 should ask the client to retry: {response_str:?}"
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected ChatGPT Codex to forward direct, got: {response_str:?}"
         );
         let counts_after_codex = intercept_request_counts();
         assert_eq!(

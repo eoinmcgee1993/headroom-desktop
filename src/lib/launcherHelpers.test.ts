@@ -36,6 +36,7 @@ describe("install-wizard funnel steps", () => {
       "bootstrap_failed",
       "post_install_shown",
       "unrouted_usage_detected",
+      "unrouted_codex_usage_detected",
       "first_optimized_request",
       "first_prompt_request",
       "first_savings_recorded"
@@ -282,7 +283,10 @@ describe("launcher helpers", () => {
       // ChatGPT Pro Lite is ~$100/mo, the Claude Max x5 price point.
       expect(recommendedHeadroomTier(null, "prolite")).toBe("max5x");
       expect(recommendedHeadroomTier(null, "self_serve_business_usage_based")).toBe("max5x");
+      expect(recommendedHeadroomTier(null, "self_serve_business_prolite")).toBe("max5x");
       expect(recommendedHeadroomTier(null, "edu")).toBe("max5x");
+      // OpenAI mints both spellings of the ChatGPT Edu claim.
+      expect(recommendedHeadroomTier(null, "education")).toBe("max5x");
       expect(recommendedHeadroomTier(null, "pro")).toBe("max20x");
       expect(recommendedHeadroomTier(null, "enterprise")).toBe("max20x");
       expect(recommendedHeadroomTier(null, "enterprise_cbp_usage_based")).toBe("max20x");

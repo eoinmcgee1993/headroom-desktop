@@ -121,6 +121,10 @@ struct IdentityPayload {
     /// captures acceptance. `None` (omitted) when nothing accepted yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     accepted_terms_version: Option<u32>,
+    /// Windows only: what the WSL probe found (`wsl_probe`). Omitted until the
+    /// probe finishes and on every other platform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wsl_agents: Option<String>,
 }
 
 /// Reqwest errors caused by the user's environment (offline, captive portal,
@@ -304,6 +308,7 @@ impl IdentityPayload {
             codex_usage_windows: None,
             tier_mismatch_since: None,
             accepted_terms_version: None,
+            wsl_agents: crate::wsl_probe::result(),
         }
     }
 
@@ -1614,6 +1619,11 @@ pub struct SavingsReport {
     pub cache_savings_usd: f64,
     pub output_reduction_percent: Option<f64>,
     pub output_reduction_method: Option<String>,
+    /// How much of the machine's shaped traffic that percentage actually
+    /// covers. Without it the server cannot tell a solid 43% from a 97% drawn
+    /// from 3% of requests, and both render identically in the admin.
+    pub output_reduction_requests: Option<u64>,
+    pub output_reduction_coverage_percent: Option<f64>,
     /// Retrieval-churn gauges (see `DashboardState`): how much compressed-away
     /// content came back. The over-compression tripwire behind "context filled
     /// up faster with Headroom" reports.
@@ -2498,9 +2508,11 @@ fn codex_billing_type(plan: &CodexPlanTier, has_org: bool) -> Option<String> {
         CodexPlanTier::Team
         | CodexPlanTier::Business
         | CodexPlanTier::SelfServeBusinessUsageBased
+        | CodexPlanTier::SelfServeBusinessProlite
         | CodexPlanTier::Enterprise
         | CodexPlanTier::EnterpriseCbpUsageBased
-        | CodexPlanTier::Edu => Some(plan.as_header_str().to_string()),
+        | CodexPlanTier::Edu
+        | CodexPlanTier::Education => Some(plan.as_header_str().to_string()),
         CodexPlanTier::Go | CodexPlanTier::Plus | CodexPlanTier::ProLite | CodexPlanTier::Pro => {
             Some(if has_org {
                 plan.as_header_str().to_string()
@@ -4132,6 +4144,11 @@ mod tests {
         assert_eq!(CodexPlanTier::Business.as_header_str(), "business");
         assert_eq!(CodexPlanTier::Enterprise.as_header_str(), "enterprise");
         assert_eq!(CodexPlanTier::Edu.as_header_str(), "edu");
+        assert_eq!(CodexPlanTier::Education.as_header_str(), "education");
+        assert_eq!(
+            CodexPlanTier::SelfServeBusinessProlite.as_header_str(),
+            "self_serve_business_prolite"
+        );
         assert_eq!(CodexPlanTier::Unknown.as_header_str(), "unknown");
     }
 

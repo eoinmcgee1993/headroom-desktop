@@ -111,6 +111,12 @@ export interface OutputReduction {
   ciLowPercent: number;
   ciHighPercent: number;
   requests: number;
+  // `requests` as a share of every shaped request, and whether that share is
+  // thick enough for the percentage to describe the machine rather than a
+  // corner of it. Rust owns the threshold (output_savings.rs); the UI only
+  // obeys the verdict. Optional: older payloads predate both.
+  coveragePercent?: number | null;
+  publishable?: boolean;
 }
 
 // Lifetime savings decomposition behind the headline card. cacheSavingsUsd is
@@ -558,9 +564,11 @@ export type CodexPlanTier =
   | "team"
   | "business"
   | "self_serve_business_usage_based"
+  | "self_serve_business_prolite"
   | "enterprise"
   | "enterprise_cbp_usage_based"
   | "edu"
+  | "education"
   | "unknown";
 
 // Mirrors `LaunchFlags` in lib.rs; served cached-or-default, never blocking.

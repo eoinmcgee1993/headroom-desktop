@@ -21,6 +21,7 @@ mod storage;
 mod tool_manager;
 mod upstream_override;
 mod usage_counters;
+mod wsl_probe;
 
 /// Cross-module lock for tests that repoint $HOME / $CODEX_HOME. Env vars are
 /// process-global, so home-mutating tests in different modules (client_adapters
@@ -532,28 +533,86 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         return;
     }
     // Cached (~90s warmer cadence), so polling this every 5s costs nothing.
-    let Ok(projects) = state.list_claude_code_projects() else {
-        return;
-    };
-    if !claude_sessions_touched_since(&projects, since) {
+    let claude = state
+        .list_claude_code_projects()
+        .map(|projects| claude_sessions_touched_since(&projects, since))
+        .unwrap_or(false);
+    // Shared with the hourly self-heal in `detect_unrouted_clients`: the one
+    // helper that knows Codex's session dir AND its GUI thread store, and how
+    // to ignore Headroom's own writes to it. It walks, so it is re-asked at
+    // most once a minute, not on every 5s poll.
+    let codex = codex_ran_locally_since(since);
+    if !claude && !codex {
         return;
     }
-    static UNROUTED_BEACON_SENT: AtomicBool = AtomicBool::new(false);
-    if !UNROUTED_BEACON_SENT.swap(true, Ordering::AcqRel) {
+    // One beacon per agent: Codex users save at 55-66% against ~90% for
+    // Claude Code on both platforms, with 25-35% never producing traffic, and
+    // server-side data cannot tell "routing failed" from "logged in once,
+    // codes with Cursor". Sessions growing while nothing reaches the proxy is
+    // the only honest instrument for that, so it must be attributable by agent.
+    static CLAUDE_BEACON_SENT: AtomicBool = AtomicBool::new(false);
+    static CODEX_BEACON_SENT: AtomicBool = AtomicBool::new(false);
+    if claude && !CLAUDE_BEACON_SENT.swap(true, Ordering::AcqRel) {
         pricing::report_funnel_step(state, "unrouted_usage_detected");
+    }
+    if codex && !CODEX_BEACON_SENT.swap(true, Ordering::AcqRel) {
+        pricing::report_funnel_step(state, "unrouted_codex_usage_detected");
     }
     if !state.try_mark_unrouted_usage_notified() {
         return;
     }
-    let _ = show_notification_impl(
+    let (title, body) = unrouted_usage_copy(claude, codex);
+    let _ = show_notification_impl(app, title, body, None);
+    analytics::track_event(
         app,
-        "Claude Code isn't going through Headroom",
-        "You've used Claude Code since Headroom started, but none of that traffic came \
-         through, so nothing was optimized. Restart your terminal or editor so it picks \
-         up the new settings.",
-        None,
+        "unrouted_usage_nudge_shown",
+        Some(json!({ "claude": claude, "codex": codex })),
     );
-    analytics::track_event(app, "unrouted_usage_nudge_shown", None);
+}
+
+/// Names the agent whose sessions grew: telling a Codex user to restart
+/// "Claude Code" reads as a notification meant for someone else.
+fn unrouted_usage_copy(claude: bool, codex: bool) -> (&'static str, &'static str) {
+    match (claude, codex) {
+        (true, true) => (
+            "Your coding agents aren't going through Headroom",
+            "You've used Claude Code and Codex since Headroom started, but none of that \
+             traffic came through, so nothing was optimized. Restart your terminal or \
+             editor so they pick up the new settings.",
+        ),
+        (false, true) => (
+            "Codex isn't going through Headroom",
+            "You've used Codex since Headroom started, but none of that traffic came \
+             through, so nothing was optimized. Restart Codex, or the terminal it runs \
+             in, so it picks up the new settings.",
+        ),
+        _ => (
+            "Claude Code isn't going through Headroom",
+            "You've used Claude Code since Headroom started, but none of that traffic came \
+             through, so nothing was optimized. Restart your terminal or editor so it picks \
+             up the new settings.",
+        ),
+    }
+}
+
+/// `client_local_activity_at("codex")` against `since`, memoized for a
+/// minute: the helper walks the sessions tree and the thread store (capped),
+/// which is too much for the 5s dashboard poll that drives the nudge. A
+/// cached `false` delays detection by at most that minute; the beacon and the
+/// notification are one-shot anyway.
+fn codex_ran_locally_since(since: chrono::DateTime<Utc>) -> bool {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((asked_at, answer)) = *last {
+        if asked_at.elapsed() < std::time::Duration::from_secs(60) {
+            return answer;
+        }
+    }
+    let answer = client_adapters::client_local_activity_at("codex")
+        .map(|at| chrono::DateTime::<Utc>::from(at) > since)
+        .unwrap_or(false);
+    *last = Some((std::time::Instant::now(), answer));
+    answer
 }
 
 /// True when any Claude Code project's last session activity is newer than
@@ -3201,6 +3260,14 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     // OpenMP DLL. The probe only runs after a 0xffffffff exit, and "killed"
     // only comes from the timeout (Windows has no signals), so the phrase is
     // specific. An `(exit N)` verdict is a broken venv, not this.
+    // STATUS_DLL_INIT_FAILED from a python.exe whose next attempt printed the
+    // banner (RUST-DA, Win11 26200, fresh install): not a missing DLL
+    // (0xc0000135) or a bad image (0xc000007b), a DLL's init refused, which on
+    // a venv that runs a moment later is an injected security-product DLL.
+    // The code survives every locale.
+    if lower.contains("0xc0000142") {
+        return true;
+    }
     if lower.contains("import onnxruntime failed (killed)") {
         return true;
     }
@@ -4110,9 +4177,16 @@ const ACTIVITY_OBSERVER_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// Rescan cadence for the Claude projects cache. This keeps Optimize mostly
 /// warm without doing filesystem-heavy project scans every minute forever.
 const CLAUDE_PROJECTS_WARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(75);
-/// Matches the frontend's `ACTIVITY_FEED_WINDOW` in App.tsx so the observer
-/// sees the same transformations the UI will display.
-const ACTIVITY_OBSERVER_LIMIT: u32 = 150;
+/// The backend hard-caps `/transformations/feed?limit=` at 100, so asking for
+/// more only made the constant lie (it used to claim it matched a frontend
+/// `ACTIVITY_FEED_WINDOW` that no longer exists). 100 is also above the busiest
+/// 20s window measured on a heavy machine (p50 3 requests, p90 8, p99 35, max
+/// 66), so a tick still sees every request that landed since the last one.
+const ACTIVITY_OBSERVER_LIMIT: u32 = 100;
+/// Pull the feed at least this often even when the intercept counters have not
+/// moved, so a producer the intercept cannot see (anything reaching the backend
+/// on 6768 directly) is still observed within a few minutes.
+const ACTIVITY_OBSERVER_MAX_FEED_GAP: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn spawn_activity_observer(app: AppHandle) {
     std::thread::spawn(move || {
@@ -4144,16 +4218,107 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
     });
 }
 
+/// Whether this tick should pull the transformations feed, given the intercept's
+/// forwarded-request total the last pull saw and how long ago that pull was.
+///
+/// One pull costs far more than what is read off it: measured 2026-09-07,
+/// `limit=100` returns ~44 MB because every event carries `request_messages`
+/// plus a byte-identical `compressed_messages` (~160 KB per event, and the
+/// backend has no parameter to omit them) while the observer and the canary
+/// between them read ~403 bytes of each. The backend serializes all of it on
+/// its event loop, and `/stats` -- which the dashboard polls on its own cadence
+/// -- queues behind it: 45 ms idle against 1.3 s with three pulls in flight, on
+/// an otherwise idle machine. That is the shape behind RUST-86's 15s `/stats`
+/// timeouts (122 hosts), so the observer stops paying it for nothing.
+///
+/// Unchanged counters mean every event in the window has already been observed.
+/// The elapsed arm still forces a pull, so a producer the intercept cannot see
+/// (anything reaching the backend on 6768 directly) is not missed forever.
+fn feed_pull_due(last: Option<(u64, std::time::Duration)>, forwarded: u64) -> bool {
+    match last {
+        Some((seen, since)) => seen != forwarded || since >= ACTIVITY_OBSERVER_MAX_FEED_GAP,
+        // First tick of the process: the window holds requests from before
+        // launch that nothing here has observed yet.
+        None => true,
+    }
+}
+
+fn should_pull_transformations_feed() -> bool {
+    static LAST_PULL: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
+    let forwarded: u64 = crate::proxy_intercept::intercept_request_counts()
+        .values()
+        .sum();
+    let mut last = LAST_PULL.lock();
+    let due = feed_pull_due(
+        last.map(|(seen, at): (u64, std::time::Instant)| (seen, at.elapsed())),
+        forwarded,
+    );
+    if due {
+        *last = Some((forwarded, std::time::Instant::now()));
+    }
+    due
+}
+
 fn run_activity_observation(app: &AppHandle) {
     let state: tauri::State<'_, AppState> = app.state();
 
     let _ = state.maybe_emit_weekly_recap();
 
-    if let Ok(feed) = fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
-        let _ = state.observe_activity_from_transformations(&feed.transformations);
-        // Same batch, second reader: flags a client whose requests all stopped
-        // compressing (see savings_canary for why the server cannot see this).
-        savings_canary::observe(&feed.transformations);
+    if should_pull_transformations_feed() {
+        match fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
+            Ok(feed) => {
+                let _ = state.observe_activity_from_transformations(&feed.transformations);
+                // Same batch, second reader: flags a client whose requests all
+                // stopped compressing (see savings_canary for why the server
+                // cannot see this).
+                savings_canary::observe(&feed.transformations);
+            }
+            // This used to be an `if let Ok`, which is how a permanently
+            // failing fetch stayed invisible: both readers above simply never
+            // ran, on exactly the heaviest machines. Once per process is the
+            // whole signal -- the failure repeats every tick, and a warn per
+            // tick would drown Sentry for one machine's one condition.
+            Err(err) => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    // Fingerprint on the cause class, with the detail in an
+                    // extra. Baking `err` into the message text is what split
+                    // one canary into RUST-A5 + RUST-A4; a timeout (payload too
+                    // big for the window) and an HTTP status (backend answering
+                    // wrong) are different bugs and need separate lifecycles.
+                    let category = if err.contains("timed out") {
+                        "timeout"
+                    } else if err.starts_with("proxy returned HTTP ") {
+                        "http"
+                    } else {
+                        "other"
+                    };
+                    sentry::with_scope(
+                        |scope| {
+                            scope.set_tag("flow", "transformations_feed_fetch");
+                            scope.set_extra("error", err.clone().into());
+                            scope.set_extra("limit", u64::from(ACTIVITY_OBSERVER_LIMIT).into());
+                            scope.set_fingerprint(Some(&["transformations-feed-fetch", category]));
+                        },
+                        || {
+                            sentry::capture_message(
+                                &format!(
+                                    "transformations feed fetch failed ({category}); activity \
+                                     observation and the zero-savings canary see nothing on this \
+                                     machine"
+                                ),
+                                sentry::Level::Warning,
+                            );
+                        },
+                    );
+                    log::warn!(
+                        "transformations feed fetch failed ({err}); activity observation and the \
+                         zero-savings canary see nothing on this machine"
+                    );
+                }
+            }
+        }
     }
 
     let projects = state.list_claude_code_projects().unwrap_or_default();
@@ -4937,16 +5102,53 @@ async fn detect_unrouted_clients(
             if !client_adapters::client_ran_unrouted(activity, requests, app_started_at, now) {
                 continue;
             }
+            // One report per activity timestamp: the condition holds for the
+            // whole 24h window, so the hourly rescan re-filed the same stale
+            // session every hour (nine events per host per day on RUST-2K).
+            static LAST_REPORTED: OnceLock<
+                Mutex<std::collections::HashMap<&'static str, SystemTime>>,
+            > = OnceLock::new();
+            if activity.is_some_and(|at| {
+                LAST_REPORTED
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap()
+                    .insert(client_id, at)
+                    == Some(at)
+            }) {
+                continue;
+            }
             let enabled = match client_id {
                 "codex" => client_adapters::is_codex_enabled(),
                 _ => client_adapters::is_claude_code_enabled(),
             };
             let reapplied = enabled && client_adapters::apply_client_setup(client_id).is_ok();
             let active_at: chrono::DateTime<chrono::Utc> = activity.unwrap_or(now).into();
-            // warn: the log bridge forwards it to Sentry, the only fleet-wide
-            // trace of an agent silently running outside Headroom.
-            log::warn!(
+            log::info!(
                 "unrouted client {client_id}: active locally at {active_at}, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
+            );
+            // The only fleet-wide trace of an agent silently running outside
+            // Headroom. Captured explicitly under a fixed fingerprint: as a
+            // warn through the log bridge it grouped on the caller stack,
+            // which release builds cannot symbolicate, so every build opened
+            // a fresh issue for the one condition (RUST-2K, RUST-D5, RUST-D6).
+            sentry::with_scope(
+                |scope| {
+                    scope.set_tag("flow", "unrouted_client");
+                    scope.set_tag("client", client_id);
+                    scope.set_tag("enabled", enabled);
+                    scope.set_tag("reapplied", reapplied);
+                    scope.set_extra("active_at", active_at.to_rfc3339().into());
+                    scope.set_fingerprint(Some(&["unrouted_client", client_id]));
+                },
+                || {
+                    sentry::capture_message(
+                        &format!(
+                            "unrouted client {client_id}: active locally, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
+                        ),
+                        sentry::Level::Warning,
+                    );
+                },
             );
             analytics::track_event(
                 &app,
@@ -5783,6 +5985,7 @@ pub fn run() {
             spawn_proxy_watchdog(app.handle().clone());
             spawn_activity_observer(app.handle().clone());
             spawn_claude_projects_warmer(app.handle().clone());
+            wsl_probe::spawn_probe();
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
             analytics::set_headroom_ai_version(
@@ -6166,13 +6369,18 @@ fn lifetime_token_milestone_kind(milestone_tokens_saved: u64) -> &'static str {
 /// How many recent days of savings travel with the milestone/heartbeat post.
 const SAVINGS_REPORT_DAYS: usize = 30;
 
-/// The output-reduction fields the savings report should carry. The desktop
-/// requests the shaper, but the wheel's rollout gate can block it by channel
-/// (all stable installs on the 0.37.0 wheel). A blocked shaper produces no
-/// live reduction, so the ledger-recomputed figure would report an "estimated"
-/// percentage for a feature that never ran; label it inactive and withhold the
-/// percent instead. Unknown state (older wheels without the rollout block)
-/// reports as before.
+/// The output-reduction percent + method the savings report should carry. Two
+/// states withhold the percent and say why in the method label instead:
+///
+/// - `inactive`: the desktop requests the shaper, but the wheel's rollout gate
+///   can block it by channel (all stable installs on the 0.37.0 wheel). A
+///   blocked shaper produces no live reduction, so the ledger-recomputed figure
+///   would report an "estimated" percentage for a feature that never ran.
+/// - `low_coverage`: the estimate covers too thin a slice of this machine's
+///   shaped traffic to describe it. The counters that prove it travel
+///   separately (see `savings_report`), so the floor can be tuned on real data.
+///
+/// Unknown rollout state (older wheels without the block) reports as before.
 fn reported_output_reduction(
     reduction: Option<&crate::models::OutputReduction>,
     shaper_active: Option<bool>,
@@ -6180,9 +6388,15 @@ fn reported_output_reduction(
     if shaper_active == Some(false) {
         return (None, Some("inactive".to_string()));
     }
+    let Some(reduction) = reduction else {
+        return (None, None);
+    };
+    if !reduction.publishable {
+        return (None, Some("low_coverage".to_string()));
+    }
     (
-        reduction.map(|o| o.reduction_percent),
-        reduction.map(|o| o.method.clone()),
+        Some(reduction.reduction_percent),
+        Some(reduction.method.clone()),
     )
 }
 
@@ -6213,6 +6427,13 @@ fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> 
         cache_savings_usd: breakdown.cache_savings_usd,
         output_reduction_percent,
         output_reduction_method,
+        // Unconditional, unlike the percent: a withheld `low_coverage` figure
+        // is exactly the case the server needs the denominator for.
+        output_reduction_requests: dashboard.output_reduction.as_ref().map(|o| o.requests),
+        output_reduction_coverage_percent: dashboard
+            .output_reduction
+            .as_ref()
+            .and_then(|o| o.coverage_percent),
         reread_tokens: dashboard.reread_tokens,
         reread_compressed_tokens: dashboard.reread_compressed_tokens,
         ccr_retrievals: dashboard.ccr_retrievals,
@@ -6547,12 +6768,22 @@ struct RawTransformationsFeedResponse {
     transformations: Vec<crate::models::TransformationFeedEvent>,
 }
 
+/// 2s was silently fatal on exactly the users whose data matters most. The feed
+/// ships every event's full message bodies (~160 KB each, no way to ask the
+/// backend for less), so `limit=100` measured 44 MB / 0.38s on a heavy machine
+/// here -- and a machine with conversations a few times larger crosses 2s, at
+/// which point the activity observer AND the zero-savings canary get nothing,
+/// every tick, forever. Raising this costs the backend nothing: it serializes
+/// the whole response either way, we were only throwing the result away. Half
+/// the observer's 20s tick, so a slow fetch still cannot let ticks pile up.
+const TRANSFORMATIONS_FEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn fetch_transformations_feed_from(
     base_url: &str,
     limit: u32,
 ) -> Result<TransformationFeedResponse, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_millis(2000))
+        .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
         .build()
         .map_err(|err| err.to_string())?;
     let url = format!("{base_url}/transformations/feed?limit={limit}");
@@ -8846,9 +9077,9 @@ mod tests {
         compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
-        fake_override, fetch_transformations_feed_from, first_savings_body, format_token_count,
-        install_pending_update, is_blocked_runtime_dll_signal, is_disk_full_signal,
-        is_endpoint_protection_signal, is_environmental_startup_key,
+        fake_override, feed_pull_due, fetch_transformations_feed_from, first_savings_body,
+        format_token_count, install_pending_update, is_blocked_runtime_dll_signal,
+        is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
         is_loopback_socket_denied_signal, is_network_download_signal, is_port_conflict_failure,
         is_prerelease_version, learn_agent_auth_hint, learn_agent_limit_hint,
         learn_failure_agent_limit_line, learn_failure_is_agent_auth,
@@ -10136,6 +10367,26 @@ mod tests {
             err.contains("Sign in to the Codex CLI"),
             "expected codex sign-in hint, got: {err}"
         );
+    }
+
+    /// The feed pull is ~44 MB and the observer reads ~0.25% of it, so an idle
+    /// tick must not pay for it -- but an unseen producer must not be able to
+    /// hide behind unchanged counters forever either (RUST-86).
+    #[test]
+    fn feed_pull_skips_idle_ticks_but_never_stalls_past_the_gap() {
+        use std::time::Duration;
+        // First tick of the process: the window predates us, always pull.
+        assert!(feed_pull_due(None, 0));
+        // Nothing forwarded since the last pull, and well inside the gap.
+        assert!(!feed_pull_due(Some((42, Duration::from_secs(20))), 42));
+        // New traffic; pull immediately rather than waiting out the gap.
+        assert!(feed_pull_due(Some((42, Duration::from_secs(20))), 43));
+        // Counters idle but the gap elapsed: pull anyway, in case something
+        // reached the backend without passing the intercept.
+        assert!(feed_pull_due(
+            Some((42, crate::ACTIVITY_OBSERVER_MAX_FEED_GAP)),
+            42
+        ));
     }
 
     #[test]
@@ -12048,6 +12299,20 @@ Some unrelated content.
             "Could not resolve host: pypi.org"
         ));
         assert!(!is_endpoint_protection_signal("ENOSPC: no space left"));
+        // Neighbouring NTSTATUS: a DLL that is missing, not one that refused.
+        assert!(!is_endpoint_protection_signal(
+            "exited with status exit code: 0xc0000135 before opening port 6768"
+        ));
+    }
+
+    #[test]
+    fn is_endpoint_protection_signal_matches_dll_init_failed_exit() {
+        let raw = "python.exe: exited with status exit code: 0xc0000142 before opening port 6768";
+        assert!(is_endpoint_protection_signal(raw));
+        assert_eq!(
+            startup_error_fingerprint_key(Some(raw)),
+            Some("startup_endpoint_protection")
+        );
     }
 
     #[test]
@@ -12219,6 +12484,15 @@ Some unrelated content.
         assert!(!claude_sessions_touched_since(&[], since));
     }
 
+    #[test]
+    fn unrouted_usage_copy_names_the_agent() {
+        use super::unrouted_usage_copy as copy;
+        assert!(copy(true, false).0.contains("Claude Code"));
+        assert!(copy(false, true).0.contains("Codex"));
+        assert!(!copy(false, true).1.contains("Claude"));
+        assert!(copy(true, true).1.contains("Claude Code and Codex"));
+    }
+
     /// An app that exited on its own must be relaunched without any kill at all.
     #[cfg(target_os = "macos")]
     #[test]
@@ -12360,6 +12634,8 @@ mod output_reduction_report_tests {
             ci_low_percent: 20.0,
             ci_high_percent: 36.0,
             requests: 19_644,
+            coverage_percent: Some(63.5),
+            publishable: true,
         }
     }
 
@@ -12375,6 +12651,18 @@ mod output_reduction_report_tests {
         let (pct, method) = reported_output_reduction(Some(&reduction()), Some(true));
         assert_eq!(pct, Some(28.0));
         assert_eq!(method.as_deref(), Some("estimated"));
+    }
+
+    #[test]
+    fn a_thinly_covered_estimate_withholds_the_percent_and_says_why() {
+        let thin = OutputReduction {
+            coverage_percent: Some(3.8),
+            publishable: false,
+            ..reduction()
+        };
+        let (pct, method) = reported_output_reduction(Some(&thin), Some(true));
+        assert_eq!(pct, None);
+        assert_eq!(method.as_deref(), Some("low_coverage"));
     }
 
     #[test]

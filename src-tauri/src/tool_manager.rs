@@ -1297,6 +1297,276 @@ def finalize_turn(
                 _hd_v_se.finalize_turn = _hd_v_finalize
     except Exception:
         pass
+    # Claude Code can replace a trailing system reminder on every turn. Keep
+    # its unchanged history attached to the cached tracker. This fallback only
+    # affects lineage selection, never wire messages or the #3380 replay body.
+    # Remove when the pinned wheel handles transient system tails itself.
+    try:
+        from importlib import metadata as _hd_ts_meta
+        if (_hd_ts_meta.version("headroom-ai") == "0.37.0" and
+            _hd_os.environ.get("HEADROOM_TRANSIENT_SYSTEM_LINEAGE", "1").strip().lower()
+                not in ("0", "false", "no", "off")):
+            import headroom.cache.prefix_tracker as _hd_ts_pt
+            _hd_ts_resolve = _hd_ts_pt.SessionTrackerStore.resolve_tracker
+            def _hd_ts_resolve_tracker(self, session_id, provider, messages=None,
+                                       cache_affinity=None):
+                if provider != "anthropic" or not messages or not self._default_config.enabled:
+                    return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
+                self._maybe_cleanup()
+                snap = _hd_ts_pt._lineage_snapshot(
+                    _hd_ts_pt._canonicalize_for_prefix_compare(messages))
+                family = self._lineages.get(session_id, {})
+                candidates = []
+                for key, chain in family.items():
+                    if self._lineage_affinities.get(key) != cache_affinity:
+                        continue
+                    # Every existing match takes precedence, including ambiguous
+                    # block rewrites: let the wheel apply its own tie policy.
+                    if _hd_ts_pt._classify_history_canonical(snap, chain).kind != "diverged":
+                        return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
+                    if (len(chain) > 1 and chain[-1].get("role") == "system"
+                        and any(m.get("role") in ("user", "assistant") for m in chain[:-1])
+                        and len(snap) >= len(chain) and snap[:len(chain) - 1] == chain[:-1]):
+                        candidates.append((len(chain), key))
+                candidates.sort(reverse=True)
+                if candidates and (len(candidates) == 1 or candidates[0][0] > candidates[1][0]):
+                    key = candidates[0][1]
+                    previous = family[key]
+                    trimmed = previous[:-1]
+                    # Synchronous resolver: expose only the proven prefix for
+                    # selection, then let the wheel store the FULL current snap.
+                    family[key] = trimmed
+                    try:
+                        return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
+                    finally:
+                        if family.get(key) is trimmed:
+                            family[key] = previous
+                return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
+            _hd_ts_pt.SessionTrackerStore.resolve_tracker = _hd_ts_resolve_tracker
+    except Exception:
+        pass
+
+    # Observe confirmed prefix rewrites independently of the replay/lineage
+    # fixes. Only numeric diagnostics cross /stats to the desktop's Sentry SDK.
+    # No provider calls, disk writes, or request mutations in this observer.
+    try:
+        from importlib import metadata as _hd_ci_meta
+        if (_hd_ci_meta.version("headroom-ai") == "0.37.0" and
+            _hd_os.environ.get("HEADROOM_CACHE_INTEGRITY", "1").strip().lower()
+                not in ("0", "false", "no", "off")):
+            import contextvars as _hd_ci_cv
+            import time as _hd_ci_time
+            import uuid as _hd_ci_uuid
+            import sys as _hd_ci_sys
+            from headroom.cache import prefix_tracker as _hd_ci_pt
+            from headroom.proxy import cost as _hd_ci_cost
+            _hd_ci_pending = _hd_ci_cv.ContextVar("desktop_cache_integrity", default=None)
+            _hd_ci_stats = {"boot_id": _hd_ci_uuid.uuid4().hex, "count": 0}
+            _hd_ci_resolve = _hd_ci_pt.SessionTrackerStore.resolve_tracker
+            _hd_ci_update = _hd_ci_pt.PrefixCacheTracker.update_from_response
+            _hd_ci_build_stats = _hd_ci_cost.build_prefix_cache_stats
+
+            def _hd_ci_resolve_tracker(self, session_id, provider, messages=None, cache_affinity=None):
+                _hd_ci_pending.set(None)
+                tracker = _hd_ci_resolve(self, session_id, provider, messages, cache_affinity)
+                try:
+                    if provider != "anthropic" or not messages or not self._default_config.enabled:
+                        return tracker
+                    prior = tracker
+                    if not prior.get_frozen_message_count():
+                        # A lost tracker has no history to check. Recover evidence
+                        # ONLY for the proven disappearing-system-tail shape;
+                        # arbitrary sibling branches must not raise an alarm.
+                        snap = _hd_ci_pt._lineage_snapshot(
+                            _hd_ci_pt._canonicalize_for_prefix_compare(messages))
+                        candidates = []
+                        for key, chain in self._lineages.get(session_id, {}).items():
+                            candidate = self.peek(key)
+                            if (candidate is None or candidate is tracker
+                                or self._lineage_affinities.get(key) != cache_affinity
+                                or not candidate.get_frozen_message_count()):
+                                continue
+                            if (len(chain) > 1 and chain[-1].get("role") == "system"
+                                and any(m.get("role") in ("user", "assistant") for m in chain[:-1])
+                                and len(snap) >= len(chain) and snap[:len(chain)-1] == chain[:-1]):
+                                candidates.append((len(chain), key, candidate))
+                        candidates.sort(key=lambda x: x[0], reverse=True)
+                        if not candidates or (len(candidates) > 1 and candidates[0][0] == candidates[1][0]):
+                            return tracker
+                        prior = candidates[0][2]
+                    idle = (prior._idle_seconds_at_fetch if prior is tracker
+                            else prior.seconds_since_activity())
+                    ttl = prior.resolved_cache_ttl_seconds()
+                    if idle >= ttl or not prior.get_frozen_message_count():
+                        return tracker
+                    original = prior._last_original_messages
+                    frozen = prior.get_frozen_message_count()
+                    # The handler appends the assistant RESPONSE to tracker
+                    # history. Those bytes were never in the previous request;
+                    # an estimated floor can overshoot into this fresh message.
+                    if original and original[-1].get("role") == "assistant":
+                        frozen = min(frozen, len(original) - 1)
+                    # Tracker updates replace these lists instead of mutating
+                    # them. Hold references for this request, not another copy
+                    # of a potentially million-token conversation.
+                    _hd_ci_pending.set((tracker, original,
+                        prior._last_forwarded_messages, frozen,
+                        prior._cached_token_count, _hd_ci_time.monotonic() + ttl - idle,
+                        prior is not tracker))
+                except Exception:
+                    pass
+                return tracker
+
+            def _hd_ci_update_tracker(self, cache_read_tokens, cache_write_tokens, messages,
+                                      message_token_counts=None, original_messages=None):
+                evidence = _hd_ci_pending.get()
+                _hd_ci_pending.set(None)
+                try:
+                    if (evidence is not None and evidence[0] is self
+                        and original_messages and cache_write_tokens > 0
+                        and cache_read_tokens < evidence[4]
+                        and _hd_ci_time.monotonic() < evidence[5]):
+                        _, old_original, old_forwarded, frozen, expected, _, reset = evidence
+                        stable = 0
+                        first_changed = None
+                        canon = _hd_ci_pt._canonicalize_for_prefix_compare
+                        for i in range(min(frozen, len(old_original), len(old_forwarded),
+                                           len(original_messages), len(messages))):
+                            if canon([old_original[i]]) != canon([original_messages[i]]):
+                                break
+                            stable += 1
+                            if first_changed is None and canon([old_forwarded[i]]) != canon([messages[i]]):
+                                first_changed = i
+                        if first_changed is not None:
+                            _hd_ci_stats.update(count=_hd_ci_stats["count"] + 1,
+                                kind="tracker_reset" if reset else "prefix_rewrite",
+                                stable_messages=stable, first_changed_message=first_changed,
+                                previously_cached_tokens=expected,
+                                cache_read_tokens=cache_read_tokens,
+                                cache_write_tokens=cache_write_tokens)
+                except Exception:
+                    pass
+                return _hd_ci_update(self, cache_read_tokens, cache_write_tokens, messages,
+                                     message_token_counts, original_messages)
+
+            def _hd_ci_prefix_stats(*args, **kwargs):
+                result = _hd_ci_build_stats(*args, **kwargs)
+                result["desktop_integrity"] = dict(_hd_ci_stats)
+                return result
+
+            _hd_ci_pt.SessionTrackerStore.resolve_tracker = _hd_ci_resolve_tracker
+            _hd_ci_pt.PrefixCacheTracker.update_from_response = _hd_ci_update_tracker
+            _hd_ci_cost.build_prefix_cache_stats = _hd_ci_prefix_stats
+            # Usually server imports cost after sitecustomize; cover an already
+            # loaded server too without importing it just for instrumentation.
+            _hd_ci_server = _hd_ci_sys.modules.get("headroom.proxy.server")
+            if _hd_ci_server is not None:
+                _hd_ci_server.build_prefix_cache_stats = _hd_ci_prefix_stats
+                _hd_ci_server._build_prefix_cache_stats = _hd_ci_prefix_stats
+    except Exception:
+        pass
+
+    # Responses compression fans one request out across many router/Kompress
+    # calls. The wheel resets its 20s budget per call, so a timed-out request
+    # keeps doing inference for minutes and quarantines unrelated requests.
+    # Share one cooperative budget across both executor hops. Finished work
+    # survives; unstarted content passes through byte-for-byte. No inference
+    # thread is killed, and the existing cache/replay policy is unchanged.
+    try:
+        from importlib import metadata as _hd_cb_meta
+        if (_hd_cb_meta.version("headroom-ai") == "0.37.0" and
+            _hd_os.environ.get("HEADROOM_RESPONSES_SHARED_BUDGET", "1").strip().lower()
+                not in ("0", "false", "no", "off")):
+            import contextvars as _hd_cb_context
+            import threading as _hd_cb_threading
+            import time as _hd_cb_time
+            from headroom.proxy import server as _hd_cb_server
+            from headroom.proxy.handlers import openai as _hd_cb_oa
+            from headroom.transforms import content_router as _hd_cb_router
+            from headroom.transforms import kompress_compressor as _hd_cb_kc
+            _hd_cb_budget = _hd_cb_context.ContextVar("desktop_responses_budget", default=None)
+            _hd_cb_responses = _hd_cb_oa.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor
+            _hd_cb_executor = _hd_cb_server.HeadroomProxy._run_compression_in_executor
+            _hd_cb_units = _hd_cb_oa._openai_responses_unit_executor
+            _hd_cb_compress = _hd_cb_router.ContentRouter.compress
+            _hd_cb_units_lock = _hd_cb_threading.Lock()
+
+            async def _hd_cb_responses_bounded(self, payload, **kwargs):
+                seconds = _hd_cb_router._compression_deadline_seconds()
+                if seconds <= 0:
+                    return await _hd_cb_responses(self, payload, **kwargs)
+                # Leave time to finish the current non-preemptible inference,
+                # merge results and serialize before the outer timeout fires.
+                timeout = kwargs.get("timeout", _hd_cb_oa.COMPRESSION_TIMEOUT_SECONDS)
+                seconds = min(seconds, max(0.0, timeout * 0.75))
+                cancelled = _hd_cb_threading.Event()
+                token = _hd_cb_budget.set((_hd_cb_time.perf_counter() + seconds, cancelled))
+                try:
+                    return await _hd_cb_responses(self, payload, **kwargs)
+                finally:
+                    cancelled.set()
+                    _hd_cb_budget.reset(token)
+
+            async def _hd_cb_run_executor(self, fn, *, timeout):
+                if _hd_cb_budget.get() is None:
+                    return await _hd_cb_executor(self, fn, timeout=timeout)
+                context = _hd_cb_context.copy_context()
+                return await _hd_cb_executor(self, lambda: context.run(fn), timeout=timeout)
+
+            def _hd_cb_unit_executor():
+                executor = _hd_cb_units()
+                with _hd_cb_units_lock:
+                    if not getattr(executor, "_desktop_budget_context", False):
+                        submit = executor.submit
+                        def submit_with_context(fn, *args, **kwargs):
+                            context = _hd_cb_context.copy_context()
+                            return submit(context.run, fn, *args, **kwargs)
+                        executor.submit = submit_with_context
+                        executor._desktop_budget_context = True
+                return executor
+
+            def _hd_cb_expired(budget):
+                return budget and (budget[1].is_set() or _hd_cb_time.perf_counter() >= budget[0])
+
+            def _hd_cb_router_compress(self, content, *args, **kwargs):
+                if _hd_cb_expired(_hd_cb_budget.get()):
+                    return _hd_cb_router.RouterCompressionResult(
+                        compressed=content, original=content,
+                        strategy_used=_hd_cb_router.CompressionStrategy.PASSTHROUGH,
+                        routing_log=[])
+                return _hd_cb_compress(self, content, *args, **kwargs)
+
+            def _hd_cb_kompress_wrapper(original, batch=False):
+                def bounded(self, *args, **kwargs):
+                    content = args[0] if args else kwargs["contents" if batch else "content"]
+                    budget = _hd_cb_budget.get()
+                    if _hd_cb_expired(budget):
+                        if batch:
+                            return [self._passthrough(text, len(text.split())) for text in content]
+                        return self._passthrough(content, len(content.split()))
+                    if budget is not None:
+                        seconds = getattr(self, "_deadline_s", None)
+                        if seconds is None:
+                            seconds = _hd_cb_kc._request_deadline_seconds()
+                        if seconds > 0:
+                            # Feed the native chunk/acquire deadline, including
+                            # nested compress_batch -> compress calls. Never
+                            # extend an earlier deadline supplied by the caller.
+                            started = budget[0] - seconds
+                            previous = kwargs.get("_deadline_started_at")
+                            kwargs["_deadline_started_at"] = min(started, previous) if previous is not None else started
+                    return original(self, *args, **kwargs)
+                return bounded
+
+            _hd_cb_oa.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = _hd_cb_responses_bounded
+            _hd_cb_server.HeadroomProxy._run_compression_in_executor = _hd_cb_run_executor
+            _hd_cb_oa._openai_responses_unit_executor = _hd_cb_unit_executor
+            _hd_cb_router.ContentRouter.compress = _hd_cb_router_compress
+            _hd_cb_kc.KompressCompressor.compress = _hd_cb_kompress_wrapper(_hd_cb_kc.KompressCompressor.compress)
+            _hd_cb_kc.KompressCompressor.compress_batch = _hd_cb_kompress_wrapper(_hd_cb_kc.KompressCompressor.compress_batch, batch=True)
+    except Exception:
+        pass
+
     # Prefix-replay guard (upstream issue #3379 / PR #3380; remove once a
     # wheel ships the fix -- see the module docstring for the cache-bust loop
     # this prevents). Restores v0.35.0's policy: that release has no size
@@ -1518,6 +1788,25 @@ def finalize_turn(
 # first-appearance counting coherently. Newly-matured and fresh-tail savings
 # are untouched; matured content books exactly once, on the turn it matures.
 #
+# TWO paths re-remove an already-booked Read, and the second is the one that
+# actually runs in production (verified 2026-09-07 by driving a 5-turn session
+# through the real Anthropic handler and reading x-headroom-tokens-saved:
+# [0, 0, 11863, 11863, 11863], turns 3 and 4 re-booking with
+# transforms=router:noop):
+#   * _handle_read swaps the raw content out itself - only when the cached
+#     prefix did not already cover the Read;
+#   * the marker is ALREADY in _handle_read's input, put there by the
+#     cached-prefix replay before maturation ran. _handle_read returns None
+#     and the ORIGINAL vendor accrued nothing here, which is why watching its
+#     replay branch alone left this whole section inert from the turn after
+#     maturation onward.
+# The second path is detected on the apply() seam instead of _handle_read's,
+# because a matured Read eventually falls inside frozen_message_count and
+# apply() skips those messages without ever calling _handle_read for them -
+# the scan below reads the request's full message list, frozen region
+# included. A marker in that input is always Headroom's own re-removal: the
+# client's transcript holds what IT sent (raw), never what we forwarded.
+#
 # Bridge: a lock-guarded module-global pending counter, drained (clamped at
 # the request's own tokens_saved) by the next record_request. Deliberately
 # NOT task/context-scoped: the transform may run on a different task or
@@ -1574,30 +1863,87 @@ if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                     return max(1, len(text) // 4)
 
             _hd_fa_orig_handle = _hd_fa_rm.ReadMaturationManager._handle_read
+            _hd_fa_orig_apply = _hd_fa_rm.ReadMaturationManager.apply
             _hd_fa_orig_record = _hd_fa_pm.PrometheusMetrics.record_request
+
+            def _hd_fa_delta(tc_id, content, marker):
+                delta = _hd_fa_deltas.get(tc_id)
+                if delta is None:
+                    if len(_hd_fa_deltas) >= 4096:
+                        _hd_fa_deltas.clear()
+                    delta = max(0, _hd_fa_count(content) - _hd_fa_count(marker))
+                    _hd_fa_deltas[tc_id] = delta
+                return delta
+
+            def _hd_fa_tool_results(messages):
+                # (tool_call_id, content) for every string tool result, in both
+                # the Anthropic block and OpenAI role="tool" shapes.
+                for msg in messages or ():
+                    if not isinstance(msg, dict):
+                        continue
+                    content = msg.get("content")
+                    if msg.get("role") == "tool":
+                        if isinstance(content, str):
+                            yield str(msg.get("tool_call_id", "")), content
+                        continue
+                    if isinstance(content, list):
+                        for block in content:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_result"
+                                and isinstance(block.get("content"), str)
+                            ):
+                                yield str(block.get("tool_use_id", "")), block["content"]
+
+            def _hd_fa_accrue(delta):
+                if delta > 0:
+                    with _hd_fa_lock:
+                        _hd_fa_pending[0] += delta
 
             def _hd_fa_handle(self, tc_id, content, activity, result):
                 matured_before = self._matured.get(tc_id)
                 out = _hd_fa_orig_handle(self, tc_id, content, activity, result)
                 try:
-                    # Replay branch only: matured on an EARLIER request and
-                    # replaced again now. Newly-matured stays fully booked.
-                    if matured_before is not None and out[0] is not None:
-                        delta = _hd_fa_deltas.get(tc_id)
-                        if delta is None:
-                            if len(_hd_fa_deltas) >= 4096:
-                                _hd_fa_deltas.clear()
-                            delta = max(
-                                0,
-                                _hd_fa_count(content)
-                                - _hd_fa_count(matured_before.marker),
-                            )
-                            _hd_fa_deltas[tc_id] = delta
-                        if delta > 0:
-                            with _hd_fa_lock:
-                                _hd_fa_pending[0] += delta
+                    if matured_before is None:
+                        # This request matured the Read, so it books the
+                        # removal in full. Learn the token delta here: it is
+                        # the last time the raw content is in hand, and the
+                        # apply() scan below only ever sees the marker.
+                        matured = self._matured.get(tc_id)
+                        if matured is not None and out[0] is not None:
+                            _hd_fa_delta(tc_id, content, matured.marker)
+                    elif out[0] is not None:
+                        # Matured earlier and swapped out by THIS pass (the
+                        # cached prefix did not cover it): already booked.
+                        _hd_fa_accrue(
+                            _hd_fa_delta(tc_id, content, matured_before.marker)
+                        )
                 except Exception:
                     # Accounting-only: never let bookkeeping break a request.
+                    pass
+                return out
+
+            def _hd_fa_apply(self, messages, *args, **kwargs):
+                # Markers already present on the way IN were put there by the
+                # cached-prefix replay, so their removal was booked on an
+                # earlier request. Snapshot _matured first: a Read maturing on
+                # THIS request must not be charged for its own first
+                # appearance. Reads the full list, frozen region included.
+                known = dict(self._matured) if self._matured else None
+                out = _hd_fa_orig_apply(self, messages, *args, **kwargs)
+                try:
+                    if known:
+                        debt = 0
+                        for tc_id, content in _hd_fa_tool_results(messages):
+                            matured = known.get(tc_id)
+                            if matured is not None and content == matured.marker:
+                                # 0 when the delta was never learned in this
+                                # process (proxy restart, cache cleared): the
+                                # books then stay as upstream writes them
+                                # rather than guessing a share.
+                                debt += _hd_fa_deltas.get(tc_id, 0)
+                        _hd_fa_accrue(debt)
+                except Exception:
                     pass
                 return out
 
@@ -1620,6 +1966,7 @@ if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 return await _hd_fa_orig_record(self, *args, **kwargs)
 
             _hd_fa_rm.ReadMaturationManager._handle_read = _hd_fa_handle
+            _hd_fa_rm.ReadMaturationManager.apply = _hd_fa_apply
             _hd_fa_pm.PrometheusMetrics.record_request = _hd_fa_record
     except Exception:
         # Accounting-only vendor: any binding failure leaves the books
@@ -9433,7 +9780,48 @@ fn argv_contains_flag(argv: &str, flag: &str) -> bool {
     argv.split_whitespace().any(|tok| tok == flag)
 }
 
+/// argv of `pid`, for the argv gate and the listener diagnostics.
+///
+/// This used to shell `/bin/ps` unconditionally, so on Windows it was always
+/// `None` and `running_proxy_matches_expected_args` failed open: the one
+/// platform where the healthy-backend adoption in `ensure_headroom_running`
+/// matters had no argv gate at all, and every occupant string Sentry saw from
+/// Windows was a bare image name. `Win32_Process.CommandLine` is the argv
+/// there, same shape as `ps -o command=` (quoted exe, then the flags).
+///
+/// One-entry cache keyed on pid: the gate runs on every ensure pass while the
+/// backend is up, and the Windows lookup is a PowerShell spawn. A live process
+/// never changes its argv, so a repeat pid answers from cache. Pid reuse after
+/// the backend exits can only fail in the safe direction: a stale argv reads
+/// as "not this build", which respawns.
 fn ps_command(pid: u32) -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<(u32, String)>> = std::sync::Mutex::new(None);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((cached_pid, argv)) = guard.as_ref() {
+            if *cached_pid == pid {
+                return Some(argv.clone());
+            }
+        }
+    }
+    let argv = ps_command_uncached(pid)?;
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((pid, argv.clone()));
+    }
+    Some(argv)
+}
+
+fn ps_command_uncached(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    let output = crate::proc::command("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"),
+        ])
+        .output()
+        .ok()?;
+    #[cfg(not(windows))]
     let output = crate::proc::command("/bin/ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
@@ -11590,6 +11978,40 @@ const PIP_OUTPUT_SILENCE_TIMEOUT: Duration = Duration::from_secs(600);
 /// the default window above.
 const PIP_UNPACK_SILENCE_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Retry schedule for a failed pip run, indexed by the attempt that just
+/// failed: `Some(backoff)` means try again after it, `None` means that was the
+/// last attempt.
+///
+/// Two tables. The default is the long-standing 3 attempts. A Windows sharing
+/// violation gets more room: on a fresh install it is almost always antivirus
+/// scanning the wheel pip just wrote (torch alone is ~200MB), it clears on its
+/// own in seconds to tens of seconds, and 2s+5s was not enough for it
+/// (RUST-6Z, 3 attempts burned inside 7 seconds). Windows is where bootstrap
+/// dies: 11% of Windows installs never complete it against 4% on macOS, and
+/// pip failures run 7 Windows users to 2.
+const PIP_RETRY_BACKOFFS_SECS: &[u64] = &[2, 5];
+const PIP_SHARING_VIOLATION_BACKOFFS_SECS: &[u64] = &[2, 5, 10, 20, 30];
+
+fn pip_retry_backoff(failed_attempt: u32, failure_text: &str) -> Option<Duration> {
+    let table = if pip_failure_is_sharing_violation(failure_text) {
+        PIP_SHARING_VIOLATION_BACKOFFS_SECS
+    } else {
+        PIP_RETRY_BACKOFFS_SECS
+    };
+    table
+        .get(failed_attempt.checked_sub(1)? as usize)
+        .map(|secs| Duration::from_secs(*secs))
+}
+
+/// ERROR_SHARING_VIOLATION, "the process cannot access the file because it is
+/// being used by another process". Matched on the numeric code only: the
+/// sentence is localized (RUST-6Z arrived in Portuguese) and the code is not.
+/// The bracket after 32 keeps 320-329 out.
+fn pip_failure_is_sharing_violation(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("winerror 32]") || lower.contains("os error 32)")
+}
+
 /// Widen `limit` for the rest of the run once `line` marks the start of pip's
 /// silent unpack phase. `None` (wait forever) stays `None`.
 fn widen_silence_for_unpack(limit: Option<Duration>, line: &str) -> Option<Duration> {
@@ -11612,11 +12034,10 @@ fn run_pip_install_with_retries_streaming<F>(
 where
     F: FnMut(&str),
 {
-    const MAX_ATTEMPTS: u32 = 3;
-    const BACKOFFS_SECS: &[u64] = &[2, 5];
-    let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match run_command_streaming(
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let err = match run_command_streaming(
             python,
             args,
             cwd,
@@ -11624,68 +12045,49 @@ where
             &mut on_line,
         ) {
             Ok(()) => return Ok(()),
-            Err(err) => {
-                if attempt < MAX_ATTEMPTS {
-                    log::info!(
-                        "pip install attempt {}/{} failed (will retry): {}",
-                        attempt,
-                        MAX_ATTEMPTS,
-                        err
-                    );
-                } else {
-                    let compact = compact_pip_failure(&err);
-                    if crate::is_disk_full_signal(&compact)
-                        || crate::is_disk_full_signal(&format!("{err:#}"))
-                    {
-                        // ENOSPC is environmental and already surfaced + Sentry-
-                        // suppressed by the caller's runtime_upgrade_failed /
-                        // bootstrap_failed guard. Drop this per-attempt warn to
-                        // info so the log->Sentry bridge doesn't recapture it
-                        // (RUST-4C).
-                        log::info!(
-                            "pip install attempt {}/{} failed (final): disk full (ENOSPC)",
-                            attempt,
-                            MAX_ATTEMPTS
-                        );
-                    } else {
-                        // Explicit per-category fingerprint; the bridged warn is
-                        // local-only (skip_sentry rule) so this doesn't double-
-                        // report. See `pip_failure_category`.
-                        let category = pip_failure_category_with_evidence(
-                            &compact,
-                            &pip_failure_evidence(&err, &compact),
-                        );
-                        sentry::with_scope(
-                            |scope| {
-                                scope.set_fingerprint(Some(&["pip-install-failed", category]));
-                            },
-                            || {
-                                sentry::capture_message(
-                                    &format!(
-                                        "pip install failed after {MAX_ATTEMPTS} attempts \
-                                         [{category}]: {compact}"
-                                    ),
-                                    sentry::Level::Warning,
-                                );
-                            },
-                        );
-                        log::warn!(
-                            "pip install attempt {}/{} failed (final): {}",
-                            attempt,
-                            MAX_ATTEMPTS,
-                            compact
-                        );
-                    }
-                }
-                last_err = Some(err);
-                if attempt < MAX_ATTEMPTS {
-                    let idx = (attempt as usize - 1).min(BACKOFFS_SECS.len() - 1);
-                    std::thread::sleep(std::time::Duration::from_secs(BACKOFFS_SECS[idx]));
-                }
-            }
+            Err(err) => err,
+        };
+        let compact = compact_pip_failure(&err);
+        let evidence = pip_failure_evidence(&err, &compact);
+        // The schedule depends on WHAT failed, so classify before deciding
+        // whether this attempt was the last one (see `pip_retry_backoff`).
+        if let Some(backoff) = pip_retry_backoff(attempt, &evidence) {
+            log::info!(
+                "pip install attempt {attempt} failed (will retry in {}s): {err}",
+                backoff.as_secs()
+            );
+            std::thread::sleep(backoff);
+            continue;
         }
+        if crate::is_disk_full_signal(&compact) || crate::is_disk_full_signal(&format!("{err:#}")) {
+            // ENOSPC is environmental and already surfaced + Sentry-
+            // suppressed by the caller's runtime_upgrade_failed /
+            // bootstrap_failed guard. Drop this per-attempt warn to
+            // info so the log->Sentry bridge doesn't recapture it
+            // (RUST-4C).
+            log::info!("pip install attempt {attempt} failed (final): disk full (ENOSPC)");
+        } else {
+            // Explicit per-category fingerprint; the bridged warn is
+            // local-only (skip_sentry rule) so this doesn't double-
+            // report. See `pip_failure_category`.
+            let category = pip_failure_category_with_evidence(&compact, &evidence);
+            sentry::with_scope(
+                |scope| {
+                    scope.set_fingerprint(Some(&["pip-install-failed", category]));
+                },
+                || {
+                    sentry::capture_message(
+                        &format!(
+                            "pip install failed after {attempt} attempts [{category}]: {compact}"
+                        ),
+                        sentry::Level::Warning,
+                    );
+                },
+            );
+            log::warn!("pip install attempt {attempt} failed (final): {compact}");
+        }
+        return Err(err);
     }
-    Err(last_err.expect("at least one attempt was made"))
 }
 
 /// Like `run_command` but streams stdout + stderr line-by-line through
@@ -12624,6 +13026,108 @@ mod tests {
         assert!(py.contains("_rewrite_delta"));
         // ...and the kill switch is honored.
         assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
+    }
+
+    #[test]
+    fn transient_system_lineage_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-transient-lineage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let out = crate::proc::command(&python)
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../scripts/reproduce-transient-system-cache.py"),
+            )
+            .arg("--sitecustomize")
+            .arg(dir.join("sitecustomize.py"))
+            .arg("--expect-fixed")
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            .output()
+            .expect("run transient-system lineage probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "transient-system lineage regression\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn cache_integrity_observer_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-cache-integrity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        for broken in [false, true] {
+            let mut command = crate::proc::command(&python);
+            command
+                .arg(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../scripts/verify-cache-integrity.py"),
+                )
+                .arg("--sitecustomize")
+                .arg(dir.join("sitecustomize.py"));
+            if broken {
+                command.arg("--broken-lineage");
+            }
+            let out = command.output().expect("run cache-integrity probe");
+            assert!(
+                out.status.success(),
+                "cache-integrity regression (broken={broken})\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn responses_shared_budget_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-responses-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        for disabled in [false, true] {
+            let mut command = crate::proc::command(&python);
+            command
+                .arg(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../scripts/verify-responses-budget.py"),
+                )
+                .arg("--sitecustomize")
+                .arg(dir.join("sitecustomize.py"));
+            if disabled {
+                command.arg("--disabled");
+            }
+            let out = command.output().expect("run Responses budget probe");
+            assert!(
+                out.status.success(),
+                "Responses budget regression (disabled={disabled})\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Behavioural check of the vendored #3380 prefix floor, against the REAL
@@ -17739,6 +18243,37 @@ exit 0
         let compact = compact_pip_failure(&pip_failure(&stderr));
         assert!(compact.starts_with("exit=1; stderr tail: "));
         assert!(compact.contains("エラー"));
+    }
+
+    /// A sharing violation is antivirus holding a freshly written wheel; the
+    /// old 2s+5s schedule burned all its attempts before the scan finished
+    /// (RUST-6Z). Everything else keeps the original three attempts.
+    #[test]
+    fn pip_retry_backoff_gives_sharing_violations_more_room() {
+        use super::pip_retry_backoff as backoff;
+        let plain = "exit=1; stderr tail: ERROR: No matching distribution found";
+        assert_eq!(backoff(1, plain), Some(Duration::from_secs(2)));
+        assert_eq!(backoff(2, plain), Some(Duration::from_secs(5)));
+        assert_eq!(backoff(3, plain), None, "third failure is final");
+
+        // Localized stderr: only the code identifies it.
+        let locked = "ERROR: Could not install packages due to an OSError: [WinError 32] \
+                      O arquivo já está sendo usado por outro processo: 'C:\\x\\torch.dll'";
+        assert_eq!(backoff(3, locked), Some(Duration::from_secs(10)));
+        assert_eq!(backoff(5, locked), Some(Duration::from_secs(30)));
+        assert_eq!(backoff(6, locked), None);
+        // Rust-side io error shape.
+        assert!(super::pip_failure_is_sharing_violation(
+            "renaming x: (os error 32)"
+        ));
+        // 320-329 are different errors.
+        assert!(!super::pip_failure_is_sharing_violation(
+            "[WinError 3] path not found"
+        ));
+        assert!(!super::pip_failure_is_sharing_violation(
+            "[WinError 320] whatever"
+        ));
+        assert_eq!(backoff(0, locked), None, "attempt numbering starts at 1");
     }
 
     #[test]

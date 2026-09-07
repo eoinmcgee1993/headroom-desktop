@@ -1,5 +1,7 @@
 # Beta smoke test
 
+Most of this is automated. `./scripts/smoke-test.sh` runs every non-Codex check a shell can drive and prints a PASS/FAIL table; `--quick` skips the three that restart the app. Run that first - this doc is the reference for what each check means and how to read a failure, and the script deliberately reuses the commands below so the two cannot drift. Checks 4, 7 and the visual half of 5 and 16 still need a client session or an eyeball; the script reports those as MANUAL/PENDING with the exact follow-up.
+
 After installing a new beta (`-rc.N`) build, paste this file into Claude Code and ask it to run the checks. Each check has a single expected signal — if any fail, stop and investigate before promoting to stable.
 
 ## Setup
@@ -43,9 +45,27 @@ Have Claude call `mcp__headroom__headroom_retrieve` with any small query and exp
 ### 5. Tray → Dashboard renders
 Click the tray icon, open the dashboard. Expect savings chart and per-client stats render without a blank/error state.
 
-### 6. Pause / resume cleanly strips and restores interception
-In Settings, toggle Pause then Resume (restore runs on a background thread, so give it a second), checking after each:
+This does not need a human. The tray menu and the whole dashboard are exposed to the accessibility API, so checks 5, 6 and 16's visual step can all be driven headlessly (verified on the 0.9.11-rc.4 pass). Note the process name is `headroom-desktop`, the tray lives on menu bar 2, and the webview's own controls resolve as real AX elements (`button Home of group Tray navigation of ...`), so `click at` hits them:
 ```bash
+AX() { osascript -e "tell application \"System Events\" to tell process \"Headroom\" $1"; }
+AX 'to click menu bar item 1 of menu bar 2'                                    # open tray menu
+AX 'to get name of every menu item of menu 1 of menu bar item 1 of menu bar 2' # Show/Pause|Resume/Quit
+AX 'to click menu item "Show Headroom" of menu 1 of menu bar item 1 of menu bar 2'
+AX 'to get {name, size, position} of every window'                             # empty list = no window open
+```
+Then screenshot just the window rather than the whole screen - `screencapture -x -o -R<x>,<y>,<w>,<h> shot.png` using the position/size from the last line above.
+
+### 6. Pause / resume cleanly strips and restores interception
+In Settings (or via the tray menu, see check 5), toggle Pause then Resume, checking after each:
+```bash
+grep -c 'headroom:claude_code' ~/.zprofile ~/.zshrc
+```
+Restore is **not** quick, and the reason matters. Resume is `start_headroom` (lib.rs), which calls `resume_runtime` -> `ensure_headroom_running` *first* and only then spawns the `restore_client_setups` thread, so the wait you are measuring is the backend's cold Python boot, not the file writes. That ordering is deliberate: the shell blocks point at 6767, so writing them before something listens there would hand the user connection-refused instead of a merely unoptimized session. Measured 15-20s on the 0.9.11-rc.4 pass (Resume clicked 13:56:0x, files rewritten 13:56:21). Treat 15-20s as normal and a minute-plus as a backend that failed to come up - check `/livez`, not the config. A fixed `sleep` of a few seconds reads `0` and scores a healthy build as a FAIL, so poll for the restore instead of sleeping through it:
+```bash
+for _ in $(seq 1 40); do
+  [ "$(cat ~/.zprofile ~/.zshrc | grep -c 'headroom:claude_code')" = "4" ] && break
+  sleep 1
+done
 grep -c 'headroom:claude_code' ~/.zprofile ~/.zshrc
 ```
 Expect: after Pause both files print `0`; after Resume both print `2` (the `# >>> headroom:claude_code >>>` and `# <<< headroom:claude_code <<<` marker lines). Do *not* grep `~/.claude/settings.json` for `headroom-rtk-rewrite` — that hook only exists when the RTK addon is installed, so on an install with RTK off (check 3) it reads `0` in both states and the check looks like a FAIL on a healthy build. The managed shell block is the RTK-independent marker. If RTK *is* installed, `grep -c headroom-rtk-rewrite ~/.claude/settings.json` is a valid extra signal: `0` after Pause, `1` after Resume.
@@ -72,7 +92,12 @@ Generate the payload with a real `Read` tool call. Dumping the file through Bash
 2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1300-1500 lines is plenty).
 3. On the *next* turn, re-run the same `jq` command.
 
-Expect: `primary_model` is a `claude-*` model, `cache_savings_usd` is strictly greater (the cached prefix was preserved, not busted), `total_tokens_before` jumped by at least the size of the Read, and `prefix_frozen` + `requests_compressed` together increased by at least 1. The large Read all but guarantees live-zone savings, so in practice the increment lands in `requests_compressed`; `prefix_frozen` only counts requests returned fully unchanged, so it can legitimately stay flat for a whole session (observed on a healthy 0.6.9-rc.1: `prefix_frozen` flat at 17 while cache savings climbed). A bumped mtime on `activity-facts.json` is not enough — interception alone would still touch that file without delivering savings.
+`primary_model` is the single most-served model of the session, so on a box with a Codex session running alongside it can legitimately read `gpt-*` while Claude traffic is healthy (observed on the 0.9.11-rc.4 pass: `gpt-6-astra` with 17 gpt requests against 26 `claude-*` ones). Do not FAIL on it. Confirm Claude traffic directly instead - this key is present regardless of which model won the tiebreak, and its count must increase across the Read:
+```bash
+curl -s http://127.0.0.1:6767/stats | jq '.requests.by_model | with_entries(select(.key|startswith("claude-")))'
+```
+
+Expect: at least one `claude-*` entry whose count increased, `cache_savings_usd` is strictly greater (the cached prefix was preserved, not busted), `total_tokens_before` jumped by at least the size of the Read, and `prefix_frozen` + `requests_compressed` together increased by at least 1. The large Read all but guarantees live-zone savings, so in practice the increment lands in `requests_compressed`; `prefix_frozen` only counts requests returned fully unchanged, so it can legitimately stay flat for a whole session (observed on a healthy 0.6.9-rc.1: `prefix_frozen` flat at 17 while cache savings climbed). A bumped mtime on `activity-facts.json` is not enough — interception alone would still touch that file without delivering savings.
 
 **Pay-per-token API-key traffic** (classified `PAYG`/`OAUTH` — this is also the branch Codex hits; the Codex pass below adds a Codex-attributed version):
 1. Capture the baseline:
@@ -154,20 +179,27 @@ Checks 2 and 7 confirm the proxy *reports* savings. They cannot tell you the opt
 
 The proxy log settles it on a single line. `source=` is the bytes actually forwarded and `mutation_reasons=` is what the pipeline changed, so `body_mutated=true ... source=passthrough` is a literal contradiction: work was done and the original bytes went out anyway.
 
-**11a. The empty-200 class must be gone (hard FAIL).** Scope to the *current* log - rotated logs still hold pre-fix history and will report non-zero forever.
+Every count in checks 11 and 13 has to be scoped to the current backend boot. `proxy.log` persists across backend restarts, so a whole-file grep keeps reporting pre-fix history forever (observed on the 0.9.4-rc.1 pass: 148 `output_shaper` discards from the same morning's 0.35.0 run, 0 since the rc boot). Define the filter once and pipe every count through it - the `on` state carries across untimestamped continuation lines, so a traceback under a matching line is not silently dropped:
 ```bash
-grep -c 'ccr_streaming_retrieve_buffered[^ ]* source=passthrough' \
-  ~/.headroom/logs/proxy.log
+BOOT=$(date -j -f "%a %b %e %T %Y" \
+  "$(ps -o lstart= -p "$(lsof -ti TCP:6768 -sTCP:LISTEN | head -1)")" +"%Y-%m-%d %H:%M:%S")
+since_boot() { awk -v B="$BOOT" '/^[0-9-]{10} /{on=(substr($0,1,19)>=B)} on' ~/.headroom/logs/proxy.log; }
+```
+Use the live backend port from check 9 if it fell back off `6768`.
+
+**11a. The empty-200 class must be gone (hard FAIL).**
+```bash
+since_boot | grep -c 'ccr_streaming_retrieve_buffered[^ ]* source=passthrough'
 ```
 Expect: `0`. Anything above zero means a streaming CCR request forwarded `stream:true` bytes on a buffered path, and the client is about to receive an unparseable, unretryable 200. Verified discriminating: `0` on the current log, `6` across the pre-fix rotated logs.
 
 **11b. General discard rate (hard FAIL since the headroom-ai 0.37.0 wheel).**
 ```bash
-grep -c 'body_mutated=true.*source=passthrough' ~/.headroom/logs/proxy.log
-grep 'body_mutated=true.*source=passthrough' ~/.headroom/logs/proxy.log \
+since_boot | grep -c 'body_mutated=true.*source=passthrough'
+since_boot | grep 'body_mutated=true.*source=passthrough' \
   | sed -n 's/.*mutation_reasons=\([^ ]*\).*/\1/p' | tr ',' '\n' | sort | uniq -c
 ```
-Expect: `0` on the current wheel - the signed-thinking discard fix (upstream #3015, merged upstream in v0.36.0) ships here since the headroom-ai 0.37.0 bump in 0.9.4-rc.1. Scope the count to lines timestamped after the current backend booted: `proxy.log` persists across backend restarts, so pre-bump history keeps the whole-file grep non-zero forever (observed on the 0.9.4-rc.1 pass: 148 `output_shaper` discards from the same morning's 0.35.0 run, 0 since the rc boot). Boot time via `ps -o lstart= -p $(lsof -ti TCP:6768 -sTCP:LISTEN | head -1)`, then filter on the log timestamp before counting.
+Expect: `0` on the current wheel - the signed-thinking discard fix (upstream #3015, merged upstream in v0.36.0) ships here since the headroom-ai 0.37.0 bump in 0.9.4-rc.1.
 
 `structural_diff_vs_original` is the one to read first, not last. The core compression pipeline never calls `mark_mutated` - grep the package and the reason vocabulary has no entry for it - so compression is only ever noticed by the structural safety net at the end of `handle_anthropic_messages`, which fires when no transform reported a mutation but the final body differs from the parsed original bytes. That makes this reason the label core compression lands under by omission, and a discard under it is the pipeline's own work being thrown away, which costs more than losing a shaping pass. It also means the share is not fixed: measured 7.6%-60% of mutated requests across six logs on 0.8.5-rc.1, tracking how much real compression happened. Do not read a ~3% reading as the `HEADROOM_OUTPUT_HOLDOUT=0.03` control arm - the arm gate and this one are unrelated, and the resemblance is a coincidence of whichever subset you counted.
 
@@ -197,8 +229,8 @@ The definitive probe of whether `sitecustomize.py` was actually *imported* (rath
 The response-side half of check 11. A request can be optimized, accounted, and still hand the client something unusable - the proxy records a 200 and moves on. Two signatures, both one-liners, both scoped to the current log:
 
 ```bash
-grep -c 'PERF model=claude-[^ ]* .*tok_out=0 ' ~/.headroom/logs/proxy.log
-grep -c 'response_cache_store_refused' ~/.headroom/logs/proxy.log
+since_boot | grep -c 'PERF model=claude-[^ ]* .*tok_out=0 '
+since_boot | grep -c 'response_cache_store_refused'
 ```
 Expect: `0` and `0`.
 
@@ -210,7 +242,7 @@ Line 2 is the desktop's own `SemanticCache.set` guard in `SITECUSTOMIZE_PY` refu
 
 If the cache ever does replay a poisoned body, the signature is a `/v1/messages` 200 in under 20ms with `tok_out=0`:
 ```bash
-grep 'PERF model=claude-' ~/.headroom/logs/proxy.log | awk '{for(i=1;i<=NF;i++){if($i~/^total_ms=/)t=substr($i,10)+0; if($i~/^tok_out=/)o=substr($i,9)+0} if(t<20&&o==0)n++} END{print n+0}'
+since_boot | grep 'PERF model=claude-' | awk '{for(i=1;i<=NF;i++){if($i~/^total_ms=/)t=substr($i,10)+0; if($i~/^tok_out=/)o=substr($i,9)+0} if(t<20&&o==0)n++} END{print n+0}'
 ```
 Expect: `0`. Only a proxy restart clears a poisoned entry, so this stays non-zero until the backend is bounced.
 
@@ -218,34 +250,23 @@ Expect: `0`. Only a proxy restart clears a poisoned entry, so this stays non-zer
 
 Checks 1-13 all describe a working install. None of them notice that the upgrade silently reset it, because a wiped state file looks exactly like a healthy fresh one. Every persisted file here is read back through `serde`, so one field added or renamed in the new build is enough to fail a parse and hand the user a default: a restarted grace clock, an empty savings history, or a client-setup record that no longer knows which shell files we wrote (which is also what uninstall reads to clean up).
 
-From 0.9.3 on, the app takes this snapshot itself: on the first launch of a new version, `snapshot_state_on_version_change` (storage.rs) copies the three state files raw into `config/pre-update/` - before anything parses them - with a `meta.json` naming the from/to versions. When the build being replaced is >= 0.9.3, verify `meta.json`'s `from_version` is that build and diff against `config/pre-update/` instead of a manual snapshot. The manual block below remains for upgrades from older builds and as a cross-check. One expected asymmetry: the auto-snapshot's `client-setup.json` is captured in the post-quit state, where `clear_client_setups()` has already emptied `configuredClients`/`managedShellFiles` - the surviving client set lives under `rememberedClients` there. Compare that key, not the configured sets (observed and verified on the rc.5 -> rc.7 pass).
+From 0.9.3 on, the app takes this snapshot itself: on the first launch of a new version, `snapshot_state_on_version_change` (storage.rs) copies the three state files raw into `config/pre-update/` - before anything parses them - with a `meta.json` naming the from/to versions. Verify `meta.json`'s `from_version` is the build you replaced, then diff against `config/pre-update/`. One expected asymmetry: the auto-snapshot's `client-setup.json` is captured in the post-quit state, where `clear_client_setups()` has already emptied `configuredClients`/`managedShellFiles` - the surviving client set lives under `rememberedClients` there. Compare that key, not the configured sets (observed and verified on the rc.5 -> rc.7 pass).
 
-**Run this block BEFORE installing the rc**, on the build you are upgrading from:
+**After installing and launching the rc**, diff the live files against the snapshot the app took for you:
 ```bash
 S=~/Library/Application\ Support/Headroom
-mkdir -p /tmp/hr-preupgrade
-jq '{first_seen_at,paywall_first}' "$S/config/headroom-pricing-state.json" > /tmp/hr-preupgrade/pricing.json
-jq '{configured:(.configuredClients|keys),shell:(.managedShellFiles|keys)}' "$S/config/client-setup.json" > /tmp/hr-preupgrade/setup.json
-jq '{tokens:.allTimeRecordTokens,recap:.lastWeeklyRecapWeekKey,schema:.schemaVersion}' "$S/config/activity-facts.json" > /tmp/hr-preupgrade/facts.json
-# For check 15: the user's own CLAUDE.md content, excluding our managed blocks.
-awk '/headroom:(learn:start|markitdown_office >>>)/{skip=1} !skip{n+=length($0)+1} /headroom:(learn:end|markitdown_office <<<)/{skip=0} END{print FILENAME, n+0}' \
-  ~/.claude/CLAUDE.md > /tmp/hr-preupgrade/claude-md.txt
-cat /tmp/hr-preupgrade/*.json /tmp/hr-preupgrade/claude-md.txt
-```
-
-**After installing and launching the rc**, re-run the same three `jq` expressions and diff:
-```bash
-S=~/Library/Application\ Support/Headroom
-stat -f '%Sm %N' /tmp/hr-preupgrade/*   # must predate THIS install, not an older one
-[ /tmp/hr-preupgrade -nt /Applications/Headroom.app ] && echo 'NOT RUN - snapshot is NEWER than the installed app; it was taken after this install'
-diff <(jq '{first_seen_at,paywall_first}' "$S/config/headroom-pricing-state.json") /tmp/hr-preupgrade/pricing.json
-diff <(jq '{configured:(.configuredClients|keys),shell:(.managedShellFiles|keys)}' "$S/config/client-setup.json") /tmp/hr-preupgrade/setup.json
-jq '{tokens:.allTimeRecordTokens,recap:.lastWeeklyRecapWeekKey,schema:.schemaVersion}' "$S/config/activity-facts.json"
+P="$S/config/pre-update"
+jq -r '.from_version + " -> " + .to_version' "$P/meta.json"   # must name the build you just replaced
+diff <(jq '.first_seen_at' "$S/config/headroom-pricing-state.json") <(jq '.first_seen_at' "$P/headroom-pricing-state.json")
+diff <(jq '.rememberedClients|keys' "$S/config/client-setup.json") <(jq '.rememberedClients|keys' "$P/client-setup.json")
+diff <(jq '{t:.allTimeRecordTokens,r:.lastWeeklyRecapWeekKey}' "$S/config/activity-facts.json") <(jq '{t:.allTimeRecordTokens,r:.lastWeeklyRecapWeekKey}' "$P/activity-facts.json")
 ls "$S/config/" | grep -c '\.corrupt$'
 ```
-Expect: `first_seen_at` byte-identical (`paywall_first` may legitimately change - the server owns it), the configured-client and shell-file key sets unchanged, and `0` quarantine files. (Use `grep -c`, not `ls *.corrupt`: zsh aborts the whole line with `no matches found` when the glob is empty, which is the healthy case.)
+Expect: `meta.json` reads `<the build you replaced> -> <the build now installed>`, all three diffs empty, and `0` quarantine files. (Use `grep -c`, not `ls *.corrupt`: zsh aborts the whole line with `no matches found` when the glob is empty, which is the healthy case.) `paywall_first` is deliberately not compared - the server owns it and may legitimately change it.
 
-Check the snapshot's mtime before trusting a clean diff. `/tmp/hr-preupgrade` survives across rcs, so a run that forgot the pre-install step silently diffs against a snapshot from two builds ago - which passes, but tests the wrong upgrade. If the mtime predates the build you just replaced, say so in the report rather than claiming this rc preserved state.
+Check `meta.json`'s `to_version` against the running build before trusting a clean diff. The snapshot is only rewritten on a version *change*, so re-running against the same rc diffs that rc against itself: it passes while testing nothing.
+
+A manual `/tmp/hr-preupgrade` block used to live here, to be run before installing. It is gone. `snapshot_state_on_version_change` has covered every upgrade since 0.9.3, and the manual step failed open - on the 0.9.11-rc.4 pass `/tmp/hr-preupgrade` existed from an earlier rc but was empty, so a run that skipped the pre-install step would have diffed nothing and reported a pass. A step that fails silently is worse than no step.
 
 `activity-facts.json` is the deliberate exception: a `schemaVersion` bump intentionally drops the tile slots, so it needs its own comparison rather than a `diff`. What must survive a bump is `allTimeRecordTokens` and `lastWeeklyRecapWeekKey` - wiping those re-fires the weekly recap and resets all-time records for every user, which has happened on four bumps so far.
 
@@ -263,7 +284,7 @@ for f in ~/.claude/CLAUDE.md ~/Code/headroom-desktop/CLAUDE.md; do
   awk '/headroom:(learn:start|markitdown_office >>>)/{skip=1} !skip{n+=length($0)+1} /headroom:(learn:end|markitdown_office <<<)/{skip=0} END{print "  user bytes outside managed blocks: " n+0}' "$f"
 done
 ```
-Expect: every pair is `0/0` or `1/1` - never `2/2` (duplicated block) and never `1/0` (truncated mid-write). The user-bytes figure has no fixed value; capture it in the check 14 pre-install snapshot and confirm it does not shrink across the upgrade. On this machine it is 81 for the global file (which is nearly all managed blocks) and ~3,000 for the desktop project file.
+Expect: every pair is `0/0` or `1/1` - never `2/2` (duplicated block) and never `1/0` (truncated mid-write). The user-bytes figure has no fixed value and nothing captures it across an upgrade (the auto-snapshot in check 14 covers the three state files, not CLAUDE.md), so treat it as a tripwire you read rather than diff: a figure far below the one recorded here means content was eaten, and the marker pairs above are what actually prove the writers behaved. On this machine it is 81 for the global file (which is nearly all managed blocks) and ~10,100 for the desktop project file (that one grows as CLAUDE.md is edited - it read ~3,000 when this check was written, so refresh the figure rather than reading growth as damage; only a *shrink* across an upgrade is the failure).
 
 A `2/2` is the duplicate-block bug: `strip_marker_block` loops for exactly this reason, and `upsert_managed_block` treats reordered `end`-before-`start` markers as absent and appends fresh rather than rebuilding around them. Both behaviours have unit tests (`managed_block_upsert_replaces_existing_block_without_duplication`, `managed_block_upsert_treats_reordered_markers_as_absent`, `updating_one_managed_block_does_not_touch_other_blocks_or_user_content`), so a failure here means a new writer, not a regression in those.
 
