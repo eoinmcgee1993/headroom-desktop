@@ -4243,6 +4243,25 @@ fn feed_pull_due(last: Option<(u64, std::time::Duration)>, forwarded: u64) -> bo
     }
 }
 
+/// How long the feed fetch must keep failing before the canary reports it.
+///
+/// The backend is legitimately down for seconds at a time -- every app launch
+/// starts with it not up yet, and an update, a gate transition or a port
+/// fallback each restart it -- and the intercept answers a local path with 503
+/// for that whole window. Reporting the FIRST failing pull filed a Sentry issue
+/// for exactly that race (RUST-DD: 503 at 15:40:07, backend reachable again at
+/// 15:40:18, on a machine where nothing was wrong). Only a fetch still failing
+/// long past any restart is the permanent condition this canary exists to
+/// catch. A pull happens at least every `ACTIVITY_OBSERVER_MAX_FEED_GAP`, so
+/// ten minutes is at least two failing pulls with no success in between.
+const FEED_FETCH_FAILURE_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Whether a feed fetch that has been failing for `elapsed` has outlived any
+/// plausible backend restart (see [`FEED_FETCH_FAILURE_GRACE`]).
+fn feed_failure_is_persistent(elapsed: std::time::Duration) -> bool {
+    elapsed >= FEED_FETCH_FAILURE_GRACE
+}
+
 fn should_pull_transformations_feed() -> bool {
     static LAST_PULL: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
     let forwarded: u64 = crate::proxy_intercept::intercept_request_counts()
@@ -4264,9 +4283,15 @@ fn run_activity_observation(app: &AppHandle) {
 
     let _ = state.maybe_emit_weekly_recap();
 
+    // Instant of the first failing pull in the current failing streak, cleared
+    // by every success: what turns "the backend is restarting" into "this
+    // machine's feed is dead". See `FEED_FETCH_FAILURE_GRACE`.
+    static FEED_FAILING_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
     if should_pull_transformations_feed() {
         match fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
             Ok(feed) => {
+                *FEED_FAILING_SINCE.lock() = None;
                 let _ = state.observe_activity_from_transformations(&feed.transformations);
                 // Same batch, second reader: flags a client whose requests all
                 // stopped compressing (see savings_canary for why the server
@@ -4281,7 +4306,20 @@ fn run_activity_observation(app: &AppHandle) {
             Err(err) => {
                 static WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
-                if !WARNED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                // The intercept answers a local path with 503 for as long as
+                // the backend is down, and the first tick lands about a second
+                // after spawn -- so the first failing pull is normally a launch
+                // or a restart, not a dead feed (RUST-DD). Skipping 503
+                // outright would work for that, but it also throws away the
+                // case this canary exists for: a backend that comes up and
+                // keeps answering 503. Wait it out instead.
+                let failing_for = {
+                    let mut since = FEED_FAILING_SINCE.lock();
+                    since.get_or_insert_with(std::time::Instant::now).elapsed()
+                };
+                if feed_failure_is_persistent(failing_for)
+                    && !WARNED.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
                     // Fingerprint on the cause class, with the detail in an
                     // extra. Baking `err` into the message text is what split
                     // one canary into RUST-A5 + RUST-A4; a timeout (payload too
