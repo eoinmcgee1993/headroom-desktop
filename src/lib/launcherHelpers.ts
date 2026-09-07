@@ -98,7 +98,9 @@ export function recommendedHeadroomTier(
       ? "pro"
     : codexTier === "prolite" ||
         codexTier === "self_serve_business_usage_based" ||
-        codexTier === "edu"
+        codexTier === "self_serve_business_prolite" ||
+        codexTier === "edu" ||
+        codexTier === "education"
       ? "max5x"
     : codexTier === "pro" ||
         codexTier === "enterprise" ||

@@ -2503,9 +2503,11 @@ fn codex_billing_type(plan: &CodexPlanTier, has_org: bool) -> Option<String> {
         CodexPlanTier::Team
         | CodexPlanTier::Business
         | CodexPlanTier::SelfServeBusinessUsageBased
+        | CodexPlanTier::SelfServeBusinessProlite
         | CodexPlanTier::Enterprise
         | CodexPlanTier::EnterpriseCbpUsageBased
-        | CodexPlanTier::Edu => Some(plan.as_header_str().to_string()),
+        | CodexPlanTier::Edu
+        | CodexPlanTier::Education => Some(plan.as_header_str().to_string()),
         CodexPlanTier::Go | CodexPlanTier::Plus | CodexPlanTier::ProLite | CodexPlanTier::Pro => {
             Some(if has_org {
                 plan.as_header_str().to_string()
@@ -4137,6 +4139,11 @@ mod tests {
         assert_eq!(CodexPlanTier::Business.as_header_str(), "business");
         assert_eq!(CodexPlanTier::Enterprise.as_header_str(), "enterprise");
         assert_eq!(CodexPlanTier::Edu.as_header_str(), "edu");
+        assert_eq!(CodexPlanTier::Education.as_header_str(), "education");
+        assert_eq!(
+            CodexPlanTier::SelfServeBusinessProlite.as_header_str(),
+            "self_serve_business_prolite"
+        );
         assert_eq!(CodexPlanTier::Unknown.as_header_str(), "unknown");
     }
 

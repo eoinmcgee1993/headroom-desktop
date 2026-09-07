@@ -918,9 +918,16 @@ pub enum CodexPlanTier {
     Team,
     Business,
     SelfServeBusinessUsageBased,
+    /// A self-serve Business workspace whose seats sit on the Pro Lite level.
+    /// Seen in the fleet from 2026-06, classified 2026-09-07 after the raw
+    /// claim showed up unmapped.
+    SelfServeBusinessProlite,
     Enterprise,
     EnterpriseCbpUsageBased,
     Edu,
+    /// Second spelling of the ChatGPT Edu claim, minted alongside `edu` and
+    /// first seen 2026-09-06. Same plan, same price parity.
+    Education,
     Unknown,
 }
 
@@ -936,9 +943,11 @@ impl CodexPlanTier {
             "team" => CodexPlanTier::Team,
             "business" => CodexPlanTier::Business,
             "self_serve_business_usage_based" => CodexPlanTier::SelfServeBusinessUsageBased,
+            "self_serve_business_prolite" => CodexPlanTier::SelfServeBusinessProlite,
             "enterprise" => CodexPlanTier::Enterprise,
             "enterprise_cbp_usage_based" => CodexPlanTier::EnterpriseCbpUsageBased,
             "edu" => CodexPlanTier::Edu,
+            "education" => CodexPlanTier::Education,
             _ => CodexPlanTier::Unknown,
         }
     }
@@ -956,9 +965,11 @@ impl CodexPlanTier {
             CodexPlanTier::Team => "team",
             CodexPlanTier::Business => "business",
             CodexPlanTier::SelfServeBusinessUsageBased => "self_serve_business_usage_based",
+            CodexPlanTier::SelfServeBusinessProlite => "self_serve_business_prolite",
             CodexPlanTier::Enterprise => "enterprise",
             CodexPlanTier::EnterpriseCbpUsageBased => "enterprise_cbp_usage_based",
             CodexPlanTier::Edu => "edu",
+            CodexPlanTier::Education => "education",
             CodexPlanTier::Unknown => "unknown",
         }
     }
@@ -980,7 +991,10 @@ impl CodexPlanTier {
 /// - Pro ($100/$200) -> Max x20: individual already paying top dollar.
 /// - Enterprise / enterprise CBP usage-based -> Max x20: $60+/seat at a 150-seat
 ///   minimum, the genuine high-budget tier.
-/// - Edu -> Max x5: institutional but discounted.
+/// - Edu / Education -> Max x5: institutional but discounted. OpenAI mints
+///   both spellings for the same plan.
+/// - Self-serve Business Pro Lite -> Max x5: a Business workspace on Pro Lite
+///   seats, and both halves of that name already price at Max x5.
 /// - Unknown -> Max x20: plan claim couldn't be decoded, so pitch the top plan
 ///   rather than under-recommend.
 /// Free carries no recommendation (already on the no-cost tier).
@@ -991,7 +1005,9 @@ pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubs
         }
         CodexPlanTier::ProLite
         | CodexPlanTier::SelfServeBusinessUsageBased
-        | CodexPlanTier::Edu => Some(HeadroomSubscriptionTier::Max5x),
+        | CodexPlanTier::SelfServeBusinessProlite
+        | CodexPlanTier::Edu
+        | CodexPlanTier::Education => Some(HeadroomSubscriptionTier::Max5x),
         CodexPlanTier::Pro
         | CodexPlanTier::Enterprise
         | CodexPlanTier::EnterpriseCbpUsageBased
@@ -1340,6 +1356,11 @@ mod tests {
             (CodexPlanTier::Free, "free"),
             (CodexPlanTier::Plus, "plus"),
             (CodexPlanTier::Enterprise, "enterprise"),
+            (CodexPlanTier::Education, "education"),
+            (
+                CodexPlanTier::SelfServeBusinessProlite,
+                "self_serve_business_prolite",
+            ),
             (CodexPlanTier::Unknown, "unknown"),
         ] {
             assert_eq!(serde_json::to_value(tier).unwrap(), json!(wire));
@@ -1355,6 +1376,20 @@ mod tests {
         // ChatGPT Pro Lite: the claim OpenAI mints for the ~$100/mo mid-tier.
         assert_eq!(CodexPlanTier::from_claim("prolite"), CodexPlanTier::ProLite);
         assert_eq!(CodexPlanTier::ProLite.as_header_str(), "prolite");
+        // Both spellings of ChatGPT Edu, and the Business/Pro Lite composite.
+        assert_eq!(
+            CodexPlanTier::from_claim("education"),
+            CodexPlanTier::Education
+        );
+        assert_eq!(CodexPlanTier::Education.as_header_str(), "education");
+        assert_eq!(
+            CodexPlanTier::from_claim("self_serve_business_prolite"),
+            CodexPlanTier::SelfServeBusinessProlite
+        );
+        assert_eq!(
+            CodexPlanTier::SelfServeBusinessProlite.as_header_str(),
+            "self_serve_business_prolite"
+        );
         assert_eq!(
             CodexPlanTier::from_claim("chatgptpaidplan"),
             CodexPlanTier::Unknown
@@ -1385,7 +1420,9 @@ mod tests {
         for plan in [
             CodexPlanTier::ProLite,
             CodexPlanTier::SelfServeBusinessUsageBased,
+            CodexPlanTier::SelfServeBusinessProlite,
             CodexPlanTier::Edu,
+            CodexPlanTier::Education,
         ] {
             assert_eq!(headroom_tier_for_codex_plan(&plan), Some(Max5x));
         }

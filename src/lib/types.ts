@@ -558,9 +558,11 @@ export type CodexPlanTier =
   | "team"
   | "business"
   | "self_serve_business_usage_based"
+  | "self_serve_business_prolite"
   | "enterprise"
   | "enterprise_cbp_usage_based"
   | "edu"
+  | "education"
   | "unknown";
 
 // Mirrors `LaunchFlags` in lib.rs; served cached-or-default, never blocking.
