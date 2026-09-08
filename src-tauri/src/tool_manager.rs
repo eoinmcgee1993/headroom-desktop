@@ -316,6 +316,29 @@ conversation and feeds the novel figure to the two cumulative
 consumers; per-request surfaces keep the wire truth, matching #3480 so
 the wheel bump is a no-op. Self-neutralizes once a wheel ships #3480's
 RequestOutcome fields. Kill switch: HEADROOM_CONVERSATION_SAVINGS=0.
+Thinking signatures are not input (upstream PR #3482): the shared block walker priced Anthropic `thinking` blocks
+through its JSON catch-all, so the ~1 KB opaque `signature` per block
+counted as text. Measured 2026-09-08 on a 369-message Claude Code
+session: 99 signatures were 256K of 414K counted tokens against ~313K
+provider-billed, inflating every tokens_before-derived figure (feed
+percent, size stratum, cold-start deferral). The vendor counts only the
+thinking text. Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
+Fresh cache_control compression (upstream PR #3483): the router never touched a block carrying cache_control, but
+Claude Code stamps its newest tool_result every turn, so the freshest
+tool output was protected on the one turn it was fresh and only retried
+inside the unfrozen window (1,229 cache_control_protected visits across
+650 requests in a day, ~2 per request). The request's final user/tool
+message has never been forwarded, so no provider key exists for it; the
+vendor peels the marker off that message's blocks, lets the router run
+unchanged, and puts the marker back on the same slot. Any shape drift
+returns the untouched message. Kill switch: HEADROOM_FRESH_CC_COMPRESS=0.
+Kompress marker gate (upstream PR #3484): Kompress only
+appended its CCR retrieval marker below ratio 0.8, while the router
+accepts any shrink and (#1307) discards a lossy result with no marker,
+so every 1-20 percent shrink ran the model and saved nothing (218
+lossy_unrecoverable_skipped in a day). The vendor appends the marker
+whenever the saving pays for it. Kill switch:
+HEADROOM_KOMPRESS_MARKER_GATE=0.
 Chained-read protection (upstream PR #2668): _is_read_command
 inspects only the FIRST program and applies its write/redirect check
 to the whole string, so a read batched behind other work
@@ -2320,6 +2343,180 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # Response-shaping only: on any binding failure the client sees the
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
+
+# --- Thinking signatures are not input tokens (upstream PR #3482) -----------
+# The shared block walker (BaseTokenizer._count_content_parts, borrowed by every
+# provider counter via count_content_blocks) had no `thinking` branch, so the
+# JSON catch-all priced the ~1 KB opaque `signature` per block as text: 99
+# signatures were 256K of 414K counted tokens on one 369-message Claude Code
+# session, against ~313K provider-billed. Only the thinking text is input.
+# Wraps the walker to swap each signed thinking block for a text block of its
+# thinking text; every other block goes through the walker untouched.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
+_hd_sig_flag = _hd_os.environ.get("HEADROOM_THINKING_SIG_TOKENS", "1")
+if _hd_sig_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_sig_meta
+
+        if _hd_sig_meta.version("headroom-ai") == "0.37.0":
+            from headroom.tokenizers import base as _hd_sig_base
+
+            _hd_sig_orig = _hd_sig_base.BaseTokenizer._count_content_parts
+
+            def _hd_sig_is_thinking(part):
+                return isinstance(part, dict) and part.get("type") == "thinking"
+
+            def _hd_sig_count(self, parts):
+                # Every thinking block, signed or not, counts as its text so
+                # the two shapes price identically (the catch-all also added
+                # JSON overhead to the unsigned form).
+                if isinstance(parts, list) and any(_hd_sig_is_thinking(p) for p in parts):
+                    parts = [
+                        {"type": "text", "text": p.get("thinking", "") or ""}
+                        if _hd_sig_is_thinking(p)
+                        else p
+                        for p in parts
+                    ]
+                return _hd_sig_orig(self, parts)
+
+            _hd_sig_base.BaseTokenizer._count_content_parts = _hd_sig_count
+    except Exception:
+        # Counting only: on any binding failure the walker keeps the wheel's
+        # own (overcounting) behavior, never a new failure.
+        pass
+
+
+# --- Fresh cache_control blocks are compressible (upstream PR #3483) ---------
+# ContentRouter._process_content_blocks hard-skips any block carrying
+# cache_control so a cached key is never busted. Claude Code stamps the marker
+# on its newest tool_use AND newest tool_result every turn, so the freshest
+# tool output -- the one block Headroom gets a clean shot at before the prefix
+# floor freezes it -- was skipped by rule (1,229 cache_control_protected visits
+# across 650 requests on 2026-09-08). The request's FINAL user/tool message has
+# never been forwarded, so no provider key exists for it: the marker there is
+# the client staking out next turn's breakpoint, and whatever we forward is
+# what gets cached. The wrapper peels the marker off that message's blocks,
+# runs the wheel's router unchanged, and re-attaches the marker to the same
+# slot (every router branch appends exactly one block per input block, and
+# every rewrite spreads the source block, so the slot mapping is 1:1). If the
+# output shape ever differs, the untouched message is returned: no compression
+# that turn, marker intact, which is the pre-vendor behavior.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_FRESH_CC_COMPRESS=0.
+_hd_fcc_flag = _hd_os.environ.get("HEADROOM_FRESH_CC_COMPRESS", "1")
+if _hd_fcc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_fcc_meta
+
+        if _hd_fcc_meta.version("headroom-ai") == "0.37.0":
+            from headroom.transforms import content_router as _hd_fcc_cr
+
+            _hd_fcc_orig = _hd_fcc_cr.ContentRouter._process_content_blocks
+
+            def _hd_fcc_process(self, message, content_blocks, *args, **kwargs):
+                if (
+                    kwargs.get("messages_from_end") != 1
+                    or not isinstance(message, dict)
+                    or message.get("role") not in ("user", "tool")
+                    or not isinstance(content_blocks, list)
+                ):
+                    return _hd_fcc_orig(self, message, content_blocks, *args, **kwargs)
+                peeled = []
+                markers = {}
+                for idx, block in enumerate(content_blocks):
+                    if isinstance(block, dict) and "cache_control" in block:
+                        bare = dict(block)
+                        markers[idx] = bare.pop("cache_control")
+                        peeled.append(bare)
+                    else:
+                        peeled.append(block)
+                if not markers:
+                    return _hd_fcc_orig(self, message, content_blocks, *args, **kwargs)
+                shadow = dict(message)
+                shadow["content"] = peeled
+                result = _hd_fcc_orig(self, shadow, peeled, *args, **kwargs)
+                out = result.get("content") if isinstance(result, dict) else None
+                if not isinstance(out, list) or len(out) != len(peeled):
+                    return message
+                for idx, marker in markers.items():
+                    block = out[idx]
+                    if not isinstance(block, dict):
+                        return message
+                    # `peeled[idx]` and every router rewrite are our own dicts;
+                    # the client's original block is never mutated.
+                    out[idx] = {**block, "cache_control": marker}
+                return result
+
+            _hd_fcc_cr.ContentRouter._process_content_blocks = _hd_fcc_process
+    except Exception:
+        pass
+
+
+# --- Kompress marker follows the saving (upstream PR #3484) -----------------
+# KompressCompressor appended its CCR retrieval marker only below ratio 0.8.
+# The router accepts any shrink (min_ratio 1.0) and, per #1307, discards a
+# lossy result that carries no marker, so every 1-20 percent shrink ran the
+# model and was thrown away (218 lossy_unrecoverable_skipped on 2026-09-08).
+# Post-processes both compress paths: a shrunk, unmarked result whose saving
+# exceeds the marker's own cost gets stored in the CCR store and marked with
+# the wheel's own marker function. Already-marked, passthrough and sub-marker
+# results are returned as-is. Composes with the shared-budget wrapper above
+# (outer wrapper; that one only substitutes passthroughs).
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_KOMPRESS_MARKER_GATE=0.
+_hd_kmg_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_MARKER_GATE", "1")
+if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_kmg_meta
+
+        if _hd_kmg_meta.version("headroom-ai") == "0.37.0":
+            from headroom.transforms import kompress_compressor as _hd_kmg_kc
+
+            _HD_KMG_MARKER_WORDS = 13
+            _hd_kmg_orig = _hd_kmg_kc.KompressCompressor.compress
+            _hd_kmg_orig_batch = _hd_kmg_kc.KompressCompressor.compress_batch
+
+            def _hd_kmg_mark(self, result, ccr_source):
+                try:
+                    if (
+                        getattr(result, "cache_key", None) is not None
+                        or not getattr(self.config, "enable_ccr", False)
+                        or result.compressed == result.original
+                        or result.original_tokens - result.compressed_tokens
+                        <= _HD_KMG_MARKER_WORDS
+                    ):
+                        return result
+                    source = ccr_source if ccr_source is not None else result.original
+                    key = self._store_in_ccr(source, result.compressed, len(source.split()))
+                    if key:
+                        result.cache_key = key
+                        result.compressed += _hd_kmg_kc.ccr_retrieval_marker(
+                            result.original_tokens, result.compressed_tokens, source, key
+                        )
+                except Exception:
+                    pass
+                return result
+
+            def _hd_kmg_compress(self, *args, **kwargs):
+                result = _hd_kmg_orig(self, *args, **kwargs)
+                return _hd_kmg_mark(self, result, kwargs.get("ccr_original"))
+
+            def _hd_kmg_batch(self, *args, **kwargs):
+                results = _hd_kmg_orig_batch(self, *args, **kwargs)
+                originals = kwargs.get("ccr_originals")
+                if isinstance(results, list):
+                    for i, r in enumerate(results):
+                        src = (
+                            originals[i]
+                            if isinstance(originals, list) and i < len(originals)
+                            else None
+                        )
+                        results[i] = _hd_kmg_mark(self, r, src)
+                return results
+
+            _hd_kmg_kc.KompressCompressor.compress = _hd_kmg_compress
+            _hd_kmg_kc.KompressCompressor.compress_batch = _hd_kmg_batch
+    except Exception:
+        pass
+
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
@@ -13587,6 +13784,90 @@ mod tests {
             "per-conversation savings accounting misbehaved against the installed wheel.\n\
              Shipping this wrong moves every Codex savings number the product is\n\
              trusted for.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn sitecustomize_vendors_compression_fixes() {
+        // Three upstream PRs (#3482, #3483, #3484) vendored while 0.37.0 is the pin: thinking
+        // signatures out of the token count, fresh cache_control blocks
+        // compressible, Kompress marker following the saving. Behaviour is
+        // proven by compression_vendors_behave_against_the_installed_wheel;
+        // this pins the shape and the exact-pin gates.
+        let py = super::SITECUSTOMIZE_PY;
+        for (flag, gate, bind) in [
+            (
+                "HEADROOM_THINKING_SIG_TOKENS",
+                r#"_hd_sig_meta.version("headroom-ai") == "0.37.0""#,
+                "_hd_sig_base.BaseTokenizer._count_content_parts = _hd_sig_count",
+            ),
+            (
+                "HEADROOM_FRESH_CC_COMPRESS",
+                r#"_hd_fcc_meta.version("headroom-ai") == "0.37.0""#,
+                "_hd_fcc_cr.ContentRouter._process_content_blocks = _hd_fcc_process",
+            ),
+            (
+                "HEADROOM_KOMPRESS_MARKER_GATE",
+                r#"_hd_kmg_meta.version("headroom-ai") == "0.37.0""#,
+                "_hd_kmg_kc.KompressCompressor.compress_batch = _hd_kmg_batch",
+            ),
+        ] {
+            assert!(py.contains(flag), "{flag} kill switch missing");
+            assert!(py.contains(gate), "{flag} exact-pin gate missing");
+            assert!(py.contains(bind), "{flag} seam binding missing");
+        }
+        // The fresh-turn wrapper must fail to the untouched message, never to
+        // a marker-less block (that would move the client's breakpoint).
+        assert!(py.contains("if not isinstance(out, list) or len(out) != len(peeled):\n                    return message"));
+    }
+
+    #[test]
+    fn compression_vendors_behave_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel and
+        // asserts each vendor's contract end to end: a signed thinking block
+        // counts the same as an unsigned one on both walkers; a final-message
+        // tool_result with cache_control is compressed and keeps its marker
+        // while an earlier one stays protected; a Kompress result that shrinks
+        // 20 percent gets a retrieval marker and one that saves less than the
+        // marker does not; and the three kill switches unbind.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-compression-vendors.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hd-comp-vendors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run compression-vendors probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that ships the fixes leaves the vendors inert by design; the
+        // probe's binding checks are the signal.
+        if stdout.contains("FAIL sig bound")
+            || stdout.contains("FAIL fcc bound")
+            || stdout.contains("FAIL kmg bound")
+        {
+            eprintln!("skipping: a compression vendor did not bind (wheel ships the fix?)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK compression-vendors"),
+            "compression vendors misbehaved against the installed wheel.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
