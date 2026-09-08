@@ -7,8 +7,9 @@ headroom-ai, so this fails if a wheel moves a seam out from under a vendor.
 
 Checks, in order:
   1. each vendor bound (the skippable signal when a wheel ships the fix);
-  2. thinking signatures: a signed thinking block counts the same as an
-     unsigned one, on the base walker and on the Anthropic provider counter;
+  2. thinking signatures: a signature prices at decoded bytes / 4 (above
+     zero for an omitted-display block, below the JSON catch-all), on the
+     base walker and on the Anthropic provider counter;
   3. fresh cache_control: a final-message tool_result carrying cache_control
      is compressed and keeps its marker, the client's original block is not
      mutated, an earlier message's block stays protected and counted, and an
@@ -104,13 +105,25 @@ def main() -> int:
     ]
     unsigned = [{"role": "assistant", "content": [{"type": "thinking", "thinking": text}]}]
     empty = [{"role": "assistant", "content": [{"type": "thinking", "thinking": ""}]}]
+    omitted = [
+        {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "", "signature": "A" * 4000}],
+        }
+    ]
     est = EstimatingTokenCounter()
     a, b, c = est.count_messages(signed), est.count_messages(unsigned), est.count_messages(empty)
-    check(a == b, f"base walker: signed == unsigned ({a} == {b})")
+    catch_all = est._count_serialized(signed[0]["content"][0])
+    check(a - b == 750, f"base walker: signature prices at decoded bytes / 4 ({a} - {b} == 750)")
+    check(a - b < catch_all, f"base walker: below the JSON catch-all ({a - b} < {catch_all})")
     check(a > c, f"base walker: thinking text still priced ({a} > {c})")
+    check(
+        est.count_messages(omitted) > c,
+        "base walker: omitted-display block is not free",
+    )
     ant = AnthropicProvider().get_token_counter("claude-opus-5")
     a2, b2 = ant.count_messages(signed), ant.count_messages(unsigned)
-    check(a2 == b2, f"anthropic counter: signed == unsigned ({a2} == {b2})")
+    check(a2 - b2 == 750, f"anthropic counter: signature at decoded bytes / 4 ({a2} - {b2} == 750)")
 
     # 3. fresh cache_control ---------------------------------------------------
     router = cr.ContentRouter(cr.ContentRouterConfig())

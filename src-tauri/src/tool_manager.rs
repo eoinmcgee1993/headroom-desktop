@@ -316,13 +316,18 @@ conversation and feeds the novel figure to the two cumulative
 consumers; per-request surfaces keep the wire truth, matching #3480 so
 the wheel bump is a no-op. Self-neutralizes once a wheel ships #3480's
 RequestOutcome fields. Kill switch: HEADROOM_CONVERSATION_SAVINGS=0.
-Thinking signatures are not input (upstream PR #3482): the shared block walker priced Anthropic `thinking` blocks
-through its JSON catch-all, so the ~1 KB opaque `signature` per block
-counted as text. Measured 2026-09-08 on a 369-message Claude Code
-session: 99 signatures were 256K of 414K counted tokens against ~313K
-provider-billed, inflating every tokens_before-derived figure (feed
-percent, size stratum, cold-start deferral). The vendor counts only the
-thinking text. Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
+Thinking signatures priced as decoded bytes (upstream PR #3482): the shared block walker priced Anthropic `thinking` blocks
+through its JSON catch-all, so the `signature` per block counted as
+prose at ~3 chars/token. Measured 2026-09-08 on a 369-message Claude
+Code session: 99 signatures were 256K of 414K counted tokens against
+~313K provider-billed, inflating every tokens_before-derived figure
+(feed percent, size stratum, cold-start deferral). The signature is
+not free either: it is the encrypted full reasoning, replayed as billed
+input on the keep-all-turns models (the 5.x line), and under the 5.x
+default `display: "omitted"` the thinking text is empty, so text-only
+priced every block at zero (first cut of #3482, changes requested).
+The vendor prices thinking text plus decoded signature bytes / 4.
+Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
 Fresh cache_control compression (upstream PR #3483): the router never touched a block carrying cache_control, but
 Claude Code stamps its newest tool_result every turn, so the freshest
 tool output was protected on the one turn it was fresh and only retried
@@ -2344,14 +2349,19 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
 
-# --- Thinking signatures are not input tokens (upstream PR #3482) -----------
+# --- Thinking signatures priced as decoded bytes (upstream PR #3482) --------
 # The shared block walker (BaseTokenizer._count_content_parts, borrowed by every
 # provider counter via count_content_blocks) had no `thinking` branch, so the
-# JSON catch-all priced the ~1 KB opaque `signature` per block as text: 99
-# signatures were 256K of 414K counted tokens on one 369-message Claude Code
-# session, against ~313K provider-billed. Only the thinking text is input.
-# Wraps the walker to swap each signed thinking block for a text block of its
-# thinking text; every other block goes through the walker untouched.
+# JSON catch-all priced the base64 `signature` per block as prose at ~3
+# chars/token: 99 signatures were 256K of 414K counted tokens on one
+# 369-message Claude Code session, against ~313K provider-billed. Zero is wrong
+# too: the signature is the encrypted full reasoning, decrypted server-side
+# into the prompt and billed as input on the keep-all-turns models (Opus 4.5+,
+# Sonnet 4.6+, the 5.x line), and under the 5.x default display "omitted" the
+# thinking text is empty, so every local Claude Code thinking block IS its
+# signature. Wraps the walker to swap each thinking block for a text block of
+# its thinking text and add the decoded signature bytes at ~4 bytes/token
+# (len * 3 // 16); every other block goes through the walker untouched.
 # Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
 _hd_sig_flag = _hd_os.environ.get("HEADROOM_THINKING_SIG_TOKENS", "1")
 if _hd_sig_flag.strip().lower() not in ("", "0", "false", "no", "off"):
@@ -2367,16 +2377,22 @@ if _hd_sig_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 return isinstance(part, dict) and part.get("type") == "thinking"
 
             def _hd_sig_count(self, parts):
-                # Every thinking block, signed or not, counts as its text so
-                # the two shapes price identically (the catch-all also added
-                # JSON overhead to the unsigned form).
+                # Thinking text prices as text; the signature at decoded
+                # bytes / 4, so an omitted-display block is never free and a
+                # signed block never pays the catch-all's base64-as-prose rate.
                 if isinstance(parts, list) and any(_hd_sig_is_thinking(p) for p in parts):
+                    sig_tokens = sum(
+                        len(p.get("signature") or "") * 3 // 16
+                        for p in parts
+                        if _hd_sig_is_thinking(p)
+                    )
                     parts = [
                         {"type": "text", "text": p.get("thinking", "") or ""}
                         if _hd_sig_is_thinking(p)
                         else p
                         for p in parts
                     ]
+                    return _hd_sig_orig(self, parts) + sig_tokens
                 return _hd_sig_orig(self, parts)
 
             _hd_sig_base.BaseTokenizer._count_content_parts = _hd_sig_count
@@ -2402,6 +2418,13 @@ if _hd_sig_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # every rewrite spreads the source block, so the slot mapping is 1:1). If the
 # output shape ever differs, the untouched message is returned: no compression
 # that turn, marker intact, which is the pre-vendor behavior.
+# Upstream (#3483, after review) gates this behind an apply() kwarg,
+# prefix_replay_guaranteed=True, passed only by handlers that run
+# finalize_turn: next turn the block is no longer final, the router hard-skips
+# it again and would forward the client's original bytes, so only a caller
+# that replays last turn's forwarded prefix may take the exception. This
+# process is that caller: the desktop proxy's messages and chat paths replay
+# through the #3380 vendor above (full-replay fallback when floorless).
 # Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_FRESH_CC_COMPRESS=0.
 _hd_fcc_flag = _hd_os.environ.get("HEADROOM_FRESH_CC_COMPRESS", "1")
 if _hd_fcc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
@@ -13831,8 +13854,9 @@ mod tests {
     #[test]
     fn compression_vendors_behave_against_the_installed_wheel() {
         // Runs the shipped sitecustomize against the installed wheel and
-        // asserts each vendor's contract end to end: a signed thinking block
-        // counts the same as an unsigned one on both walkers; a final-message
+        // asserts each vendor's contract end to end: a thinking signature prices
+        // at decoded bytes / 4 on both walkers (above zero, below the JSON
+        // catch-all); a final-message
         // tool_result with cache_control is compressed and keeps its marker
         // while an earlier one stays protected; a Kompress result that shrinks
         // 20 percent gets a retrieval marker and one that saves less than the
