@@ -503,6 +503,9 @@ pub struct AppState {
     /// task can update it without going through AppState; read by
     /// `pricing::fetch_codex_usage` to drive the Codex usage gauge.
     pub codex_rate_limits: Arc<Mutex<Option<CodexRateLimitSnapshot>>>,
+    /// Latest Claude usage windows in the identity-touch wire shape
+    /// ("five_hour=NN@300;seven_day=NN@10080"), set by the pricing refresh.
+    pub claude_usage_windows: Arc<Mutex<Option<String>>>,
     /// OpenAI/ChatGPT plan decoded from the latest Codex OAuth bearer JWT seen by
     /// the proxy intercept (`proxy_intercept::decode_codex_plan_tier`). Read by
     /// `pricing::fetch_codex_usage` to pick the recommended upgrade tier.
@@ -695,6 +698,7 @@ impl AppState {
             bootstrap_failure_report: Mutex::new(None),
             claude_bearer_token: Arc::new(Mutex::new(None)),
             codex_rate_limits: Arc::new(Mutex::new(None)),
+            claude_usage_windows: Arc::new(Mutex::new(None)),
             codex_plan_tier: Arc::new(Mutex::new(None)),
             intercept_bind_error: Arc::new(Mutex::new(None)),
             proxy_bypass: Arc::new(AtomicBool::new(false)),
@@ -6511,6 +6515,9 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
             report_cache_integrity(&body);
+            // Same body, same pass: whether the savings this parse just turned
+            // into a percentage can have come out of the input it divides by.
+            crate::savings_canary::observe_basis(&body);
             // Only a SUSTAINED recovery resets the backoff; a lone success
             // between two timeouts must not (see STATS_FETCH_RECOVERY_WINDOW).
             note_stats_fetch_success();
@@ -7969,6 +7976,24 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
             "Port {port} is in use, but no program is listening on it. \
              Reboot to clear it; if it comes back, check for a reserved port range with: \
              netsh int ipv4 show excludedportrange protocol=tcp"
+        );
+    }
+    // WSAEACCES. Nothing is holding the port -- Windows refused us the socket
+    // outright -- so both the fallback below ("quit whatever holds the port")
+    // and the 10048 arm's "in use by another program" are confidently wrong
+    // here, which this file's own docstring bans. Same two causes and the same
+    // discriminating command as `crate::loopback_socket_denied_hint`, which
+    // covers the Python runtime hitting 10013 at startup; this is the
+    // intercept's own front door, so the remedy is phrased around the port and
+    // around the fact that the bind loop keeps retrying on its own.
+    if crate::is_loopback_socket_denied_signal(raw) {
+        return format!(
+            "Port {port} was refused by Windows itself, not taken by another program \
+             (WinError 10013). This is usually security software filtering loopback \
+             connections, or a reserved port range (Hyper-V, WSL2, Docker) covering it: run \
+             netsh int ipv4 show excludedportrange protocol=tcp in PowerShell to check, and \
+             allow Headroom in your antivirus or firewall's network protection. \
+             Headroom keeps retrying and reconnects on its own once it clears."
         );
     }
     if raw.contains("os error 10048") {
@@ -9820,6 +9845,26 @@ mod tests {
             assert!(first.starts_with("Port 6767"), "{first}");
             assert!(first.len() < 110, "headline too long: {first}");
         }
+    }
+
+    /// RUST-DR: a Windows 11 host whose 6767 bind returns WSAEACCES on every
+    /// retry got the generic fallback, which tells the user to quit whatever
+    /// holds the port. Nothing holds it; Windows refused the socket. The hint
+    /// must name the two real causes and the command that tells them apart.
+    #[test]
+    fn intercept_bind_hint_explains_a_windows_refused_socket() {
+        // Localized prose, as the affected hosts report it (RUST-DR was Korean).
+        let hint = intercept_bind_hint(
+            "액세스 권한에 의해 숨겨진 소켓에 액세스를              시도했습니다. (os error 10013)",
+        );
+        assert!(hint.contains("10013"), "{hint}");
+        assert!(hint.contains("excludedportrange"), "{hint}");
+        // Never the wrong remedy: nothing is holding this port.
+        assert!(!hint.contains("Quit"), "{hint}");
+        assert!(!hint.contains("in use by another program"), "{hint}");
+        let first = hint.split(". ").next().unwrap();
+        assert!(first.starts_with("Port 6767"), "{first}");
+        assert!(first.len() < 110, "headline too long: {first}");
     }
 
     #[test]

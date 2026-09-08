@@ -41,7 +41,10 @@ function usageNudgeTitle(
 }
 
 export async function maybeFireUrgentPricingNotifications(
-  status: HeadroomPricingStatus
+  status: HeadroomPricingStatus,
+  // "about N tokens went through unoptimized" (appHelpers.unsavedWhileBlockedLabel);
+  // appended to the blocked notice so the wall is felt, not just announced.
+  unsavedLabel: string | null = null
 ): Promise<void> {
   if (await isWindowVisible()) return;
 
@@ -57,11 +60,13 @@ export async function maybeFireUrgentPricingNotifications(
   }
 
   if (!status.optimizationAllowed) {
+    const base =
+      status.gateMessage ||
+      "Your current plan has optimization disabled. Open Headroom to review.";
     await fireOncePerDay(
       OPTIMIZATION_BLOCKED_KEY,
       "Headroom optimization is off",
-      status.gateMessage ||
-        "Your current plan has optimization disabled. Open Headroom to review.",
+      unsavedLabel ? `${base} ${unsavedLabel}` : base,
       "billing"
     );
     return;

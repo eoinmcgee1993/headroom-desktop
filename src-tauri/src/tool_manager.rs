@@ -9408,9 +9408,10 @@ pub(crate) fn redact_sensitive(line: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let rest = &line[i..];
-        if let Some(consumed) = match_redactable(rest) {
+        if let Some((keep, redact)) = match_redactable(rest) {
+            out.push_str(&rest[..keep]);
             out.push_str("[REDACTED]");
-            i += consumed;
+            i += keep + redact;
         } else {
             let ch = rest.chars().next().unwrap();
             out.push(ch);
@@ -9420,14 +9421,36 @@ pub(crate) fn redact_sensitive(line: &str) -> String {
     out
 }
 
-/// If `rest` starts with a redactable token, return the byte length to skip.
-fn match_redactable(rest: &str) -> Option<usize> {
+/// Names that make whatever follows `=` or `:` a secret, regardless of shape.
+///
+/// The two token prefixes below only ever caught OUR OWN credentials. A user's
+/// are arbitrary strings and are recognisable only by what they are called --
+/// RUST-B7 carried `PGPASSWORD=0000` and a second live database password out of
+/// a user's generated CLAUDE.md and into a Sentry event in the clear, because
+/// the learn tail echoes memory files and Sentry's server-side scrubber did not
+/// match these keys either. Matched case-insensitively as a SUBSTRING of the
+/// name, so `PGPASSWORD`, `MYSQL_ROOT_PASSWORD` and `password` all hit.
+const SECRET_NAME_MARKERS: [&str; 7] = [
+    "PASSWORD",
+    "PASSWD",
+    "SECRET",
+    "APIKEY",
+    "API_KEY",
+    "TOKEN",
+    "CREDENTIAL",
+];
+
+/// If `rest` starts with something redactable, return `(keep, redact)`: the
+/// byte length to copy through verbatim, then the byte length to replace with
+/// `[REDACTED]`. `keep` is non-zero only for a named assignment, where the name
+/// is what makes the event diagnosable at all and the value is the secret.
+fn match_redactable(rest: &str) -> Option<(usize, usize)> {
     if let Some(after) = rest.strip_prefix("sk-ant-") {
         let token_len = after
             .bytes()
             .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
             .count();
-        return Some("sk-ant-".len() + token_len);
+        return Some((0, "sk-ant-".len() + token_len));
     }
     for prefix in ["Bearer ", "bearer "] {
         if let Some(after) = rest.strip_prefix(prefix) {
@@ -9439,11 +9462,71 @@ fn match_redactable(rest: &str) -> Option<usize> {
                 })
                 .count();
             if token_len >= 8 {
-                return Some(prefix.len() + token_len);
+                return Some((0, prefix.len() + token_len));
             }
         }
     }
-    None
+    match_secret_assignment(rest)
+}
+
+/// `NAME=value` or `NAME: value` where NAME names a secret. Keeps the name and
+/// separator, redacts the value up to the next whitespace or quote.
+///
+/// Called at every byte offset by `redact_sensitive`, so it only ever sees a
+/// name that starts here; a mid-word offset is unreachable because the first
+/// match consumes the whole assignment.
+fn match_secret_assignment(rest: &str) -> Option<(usize, usize)> {
+    let name_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'-'))
+        .count();
+    // Bounded so a long alphanumeric blob that happens to contain "token"
+    // cannot turn into a name.
+    if name_len == 0 || name_len > 64 {
+        return None;
+    }
+    let upper = rest[..name_len].to_ascii_uppercase();
+    // `max_tokens=`, `input_tokens:`, `tokens_saved:` are counts, and every
+    // learn tail and proxy log line carries them; redacting those would gut
+    // the diagnostic value the tail exists for.
+    if upper.contains("TOKENS") {
+        return None;
+    }
+    if !SECRET_NAME_MARKERS.iter().any(|m| upper.contains(m)) {
+        return None;
+    }
+    let after = &rest[name_len..];
+    let sep_len = if let Some(v) = after.strip_prefix('=') {
+        // `NAME=` with nothing after it is a shape we should not eat.
+        if v.is_empty() {
+            return None;
+        }
+        1
+    } else if after.starts_with(": ") {
+        2
+    } else if after.starts_with(':') {
+        1
+    } else {
+        return None;
+    };
+    // A quoted value is read to its closing quote; an unquoted one stops at the
+    // first whitespace. Either way the quotes themselves are kept, so the line
+    // still reads as the shell/YAML it came from and the surrounding prose --
+    // which is the whole diagnostic value of the tail -- survives intact.
+    let value_area = &after[sep_len..];
+    let quote = value_area
+        .bytes()
+        .next()
+        .filter(|b| matches!(*b, b'"' | b'\'' | b'`'));
+    let open_len = usize::from(quote.is_some());
+    let value_len = value_area[open_len..]
+        .bytes()
+        .take_while(|b| match quote {
+            Some(q) => *b != q && *b != b'\n',
+            None => !b.is_ascii_whitespace() && !matches!(*b, b'"' | b'\'' | b'`'),
+        })
+        .count();
+    (value_len > 0).then_some((name_len + sep_len + open_len, value_len))
 }
 
 /// Newest `headroom-proxy*.log` in the logs directory, if any.
@@ -13821,6 +13904,49 @@ mod tests {
         assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"), "leak: {out}");
         assert!(out.contains("[REDACTED]"));
         assert!(out.contains("trailing"));
+    }
+
+    /// RUST-B7: a user's learn tail reached Sentry carrying two live database
+    /// passwords in the clear. The name survives (it is what makes the event
+    /// readable); the value does not.
+    #[test]
+    fn redact_sensitive_strips_named_secret_values() {
+        let line = "- Local DB: `PGPASSWORD=0000 psql -h localhost -U postgresql -d ontrace`; \
+                    test DB: `PGPASSWORD=ontrace_test psql`";
+        let out = redact_sensitive(line);
+        assert!(!out.contains("0000"), "{out}");
+        assert!(!out.contains("ontrace_test psql"), "{out}");
+        // The name stays so the event still says WHAT leaked.
+        assert!(out.contains("PGPASSWORD=[REDACTED]"), "{out}");
+        // Surrounding prose is intact: the value stops at whitespace.
+        assert!(out.contains("psql -h localhost"), "{out}");
+        assert!(out.contains("-d ontrace`"), "{out}");
+
+        // Case-insensitive, and the `: ` separator.
+        let yaml = redact_sensitive("api_key: sk_live_abc123\ndb_password: hunter2");
+        assert!(!yaml.contains("sk_live_abc123"), "{yaml}");
+        assert!(!yaml.contains("hunter2"), "{yaml}");
+        assert!(yaml.contains("api_key: [REDACTED]"), "{yaml}");
+
+        // A quoted value keeps its closing quote.
+        let quoted = redact_sensitive("SECRET_TOKEN=\"abc123\"");
+        assert!(!quoted.contains("abc123"), "{quoted}");
+        assert!(quoted.ends_with('"'), "{quoted}");
+    }
+
+    /// The matcher must not eat prose that merely mentions a secret-ish word,
+    /// or the tail stops being diagnosable (the RUST-BC lesson).
+    #[test]
+    fn redact_sensitive_leaves_secret_words_without_values_alone() {
+        for line in [
+            "the password was rejected by the server",
+            "Error: invalid token",
+            "PASSWORD=",
+            "refresh_token expired at 12:04",
+            "max_tokens=4000 input_tokens: 1234 tokens_saved: 9",
+        ] {
+            assert_eq!(redact_sensitive(line), line, "{line}");
+        }
     }
 
     #[test]

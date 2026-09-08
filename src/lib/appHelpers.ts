@@ -10,7 +10,7 @@ import type {
   PlanPrices,
   TierRecommendationSource,
 } from "./types";
-import { currencyExact } from "./dashboardHelpers";
+import { compactNumber, currencyExact } from "./dashboardHelpers";
 // Type-only, so this stays free of setupHealthAlert's Tauri imports at runtime.
 import type { SetupStallKind } from "./setupHealthAlert";
 
@@ -155,6 +155,27 @@ export function recentDailySavingsUsd(daily: DailySavingsPoint[], days = 7): num
   const window = daily.slice(-days);
   const total = window.reduce((sum, p) => sum + p.estimatedSavingsUsd, 0);
   return total / window.length;
+}
+
+/// "Unsaved while Headroom was paused" counter for the gate card. `bypassBytes`
+/// is request bytes the intercept forwarded unoptimized (Content-Length while
+/// gated); tokens ~ bytes/4, scaled by the user's own historical compression
+/// rate, and priced at their own dollars per saved token. Null until there is
+/// history to scale by and enough bypassed traffic for the number to mean
+/// anything, so a weak claim never deters an upgrade.
+export function unsavedWhileBlockedLabel(
+  bypassBytes: number,
+  daily: DailySavingsPoint[]
+): string | null {
+  const saved = daily.reduce((sum, p) => sum + p.estimatedTokensSaved, 0);
+  const sent = daily.reduce((sum, p) => sum + p.totalTokensSent, 0);
+  const usd = daily.reduce((sum, p) => sum + p.estimatedSavingsUsd, 0);
+  if (saved <= 0 || sent + saved <= 0) return null;
+  const unsavedTokens = (bypassBytes / 4) * (saved / (sent + saved));
+  if (unsavedTokens < 10_000) return null;
+  const unsavedUsd = unsavedTokens * (usd / saved);
+  const usdPart = unsavedUsd >= 1 ? ` (about ${currencyExact(unsavedUsd)})` : "";
+  return `Since your trial ended, about ${compactNumber(unsavedTokens)} tokens${usdPart} went through unoptimized.`;
 }
 
 /// Item 1 - "pays for itself" anchor. Compares the user's recent monthly

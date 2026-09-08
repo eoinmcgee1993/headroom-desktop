@@ -17,6 +17,7 @@ import {
   scheduledPlanChange,
   recentDailySavingsUsd,
   setServerPlanPrices,
+  unsavedWhileBlockedLabel,
   upgradePlanIntentLabel,
 } from "./appHelpers";
 import type { ClientConnectorStatus, HeadroomAccountProfile, RuntimeStatus } from "./types";
@@ -44,6 +45,19 @@ describe("app helpers", () => {
     // 9 days present, default window 7 -> mean of the last 7 ($2 each).
     const points = [daily(100), daily(100), ...Array(7).fill(daily(2))];
     expect(recentDailySavingsUsd(points)).toBe(2);
+  });
+
+  it("prices unsaved traffic at the user's own rate, or stays quiet", () => {
+    // No history to scale by -> nothing to claim.
+    expect(unsavedWhileBlockedLabel(4_000_000, [])).toBeNull();
+    // 50% compression, $0.01 per 1k saved tokens.
+    const history = [{ ...daily(10), estimatedTokensSaved: 1_000_000, totalTokensSent: 1_000_000 }];
+    // 4 MB ~ 1M tokens -> 500k unsaved -> $5.
+    const label = unsavedWhileBlockedLabel(4_000_000, history);
+    expect(label).toContain("500K tokens");
+    expect(label).toContain("$5.00");
+    // Below the floor (10k tokens) -> null, so a trickle never nags.
+    expect(unsavedWhileBlockedLabel(40_000, history)).toBeNull();
   });
 
   it("shows the payback anchor only at a genuine value-add (>= 2x)", () => {
