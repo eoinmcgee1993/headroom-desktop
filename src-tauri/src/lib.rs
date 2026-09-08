@@ -5939,7 +5939,7 @@ pub fn run() {
     let mut builder =
         tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Second launch: focus the existing window and exit the new process.
-            let _ = show_launcher_window(app);
+            let _ = show_primary_window(app);
             // On Windows/Linux the OS answers a `headroom://` link by spawning
             // a NEW process with the URL in argv; the running instance is never
             // notified, and the new one dies here. Replay argv into the primary
@@ -6202,7 +6202,7 @@ pub fn run() {
                 std::sync::Arc::clone(&state.intercept_bind_error),
             );
             if state.should_present_on_launch() && !launched_from_autostart {
-                let _ = show_launcher_window(app.handle());
+                let _ = show_primary_window(app.handle());
             }
             if state.tool_manager.python_runtime_installed() {
                 state.set_runtime_starting(true);
@@ -7794,13 +7794,9 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
-                if onboarding_complete(app) {
-                    let _ = hide_launcher_window(app);
-                    let _ = show_main_window(app, None);
+                if show_primary_window(app).unwrap_or(false) {
                     let app_bg = app.clone();
                     std::thread::spawn(move || ensure_runtime_ready_for_tray(&app_bg));
-                } else {
-                    let _ = show_launcher_window(app);
                 }
             }
             "pause" => {
@@ -8955,6 +8951,25 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
     let _ = window.unminimize();
     window.set_focus()?;
     Ok(())
+}
+
+/// Which window a "bring Headroom up" request means: the dashboard once
+/// onboarding is done, the setup launcher before. Returns true when the
+/// dashboard was shown. Used by manual (re)launch, the second-instance
+/// hand-off and the tray "Show" item. Manual relaunch used to raise the
+/// launcher's "Get started" screen unconditionally, whose only button hides
+/// the window; on Windows, where the tray icon sits behind the overflow
+/// chevron, that left returning users with no visible way to the dashboard
+/// (and its Upgrade button).
+fn show_primary_window(app: &AppHandle) -> tauri::Result<bool> {
+    if onboarding_complete(app) {
+        hide_launcher_window(app)?;
+        show_main_window(app, None)?;
+        Ok(true)
+    } else {
+        show_launcher_window(app)?;
+        Ok(false)
+    }
 }
 
 fn show_launcher_window(app: &AppHandle) -> tauri::Result<()> {

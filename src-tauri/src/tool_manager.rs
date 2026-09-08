@@ -2486,11 +2486,24 @@ if _hd_fcc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # The router accepts any shrink (min_ratio 1.0) and, per #1307, discards a
 # lossy result that carries no marker, so every 1-20 percent shrink ran the
 # model and was thrown away (218 lossy_unrecoverable_skipped on 2026-09-08).
-# Post-processes both compress paths: a shrunk, unmarked result whose saving
-# exceeds the marker's own cost gets stored in the CCR store and marked with
-# the wheel's own marker function. Already-marked, passthrough and sub-marker
-# results are returned as-is. Composes with the shared-budget wrapper above
-# (outer wrapper; that one only substitutes passthroughs).
+# The marker must also pay for itself in TOKENS: it is 12 words but 36-45
+# cl100k tokens (the 24-hex hash alone is ~16, digits add more), while the
+# words Kompress drops are the cheap ones, at least 1 token each. A 13-word
+# gate (first cut of #3484) admitted marked payloads larger than the original
+# (drop 16 of 100 words: cl100k 196 -> 200); a fixed 40-word allowance (second
+# cut) still let a 43-token marker ship on 100 single-token words (100 -> 102).
+# Even a measured marker cost against saved words is not enough (third cut):
+# the word left at the head of the candidate can tokenize differently from
+# its space-prefixed form in the source (100 -> 103 on a "bureaucratic" head).
+# Post-processes both compress paths with upstream's whole-payload policy:
+# the whole original and the whole marked candidate are measured in one unit
+# (cl100k_base from the venv, an estimate for Anthropic; one token per
+# character without it); a candidate that is not smaller, marked by the
+# wheel's ratio gate or not, is passed through untouched; a smaller one is
+# stored and marked with the wheel's own marker function and its accounting
+# reports that measurement; passthroughs and no-CCR results are returned
+# as-is. Composes with the shared-budget wrapper above (outer wrapper; that
+# one only substitutes passthroughs).
 # Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_KOMPRESS_MARKER_GATE=0.
 _hd_kmg_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_MARKER_GATE", "1")
 if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
@@ -2500,27 +2513,58 @@ if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         if _hd_kmg_meta.version("headroom-ai") == "0.37.0":
             from headroom.transforms import kompress_compressor as _hd_kmg_kc
 
-            _HD_KMG_MARKER_WORDS = 13
             _hd_kmg_orig = _hd_kmg_kc.KompressCompressor.compress
             _hd_kmg_orig_batch = _hd_kmg_kc.KompressCompressor.compress_batch
+            _hd_kmg_enc = None
+            try:
+                import tiktoken as _hd_kmg_tiktoken
+
+                _hd_kmg_enc = _hd_kmg_tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                _hd_kmg_enc = None
+
+            def _hd_kmg_tokens(text):
+                # Same unit as upstream payload_tokens: cl100k_base, or one
+                # token per character without an encoder.
+                if _hd_kmg_enc is not None:
+                    try:
+                        return len(_hd_kmg_enc.encode(text, disallowed_special=()))
+                    except Exception:
+                        pass
+                return len(text)
 
             def _hd_kmg_mark(self, result, ccr_source):
                 try:
                     if (
-                        getattr(result, "cache_key", None) is not None
-                        or not getattr(self.config, "enable_ccr", False)
+                        not getattr(self.config, "enable_ccr", False)
                         or result.compressed == result.original
-                        or result.original_tokens - result.compressed_tokens
-                        <= _HD_KMG_MARKER_WORDS
                     ):
                         return result
+                    # The wheel's counts are pre-marker word counts on both
+                    # its marked (ratio < 0.8) and unmarked results; its
+                    # marked results already carry the marker text.
                     source = ccr_source if ccr_source is not None else result.original
-                    key = self._store_in_ccr(source, result.compressed, len(source.split()))
-                    if key:
-                        result.cache_key = key
-                        result.compressed += _hd_kmg_kc.ccr_retrieval_marker(
+                    key = getattr(result, "cache_key", None)
+                    if key is None:
+                        key = self._store_in_ccr(source, result.compressed, len(source.split()))
+                        if not key:
+                            return result
+                        marked = result.compressed + _hd_kmg_kc.ccr_retrieval_marker(
                             result.original_tokens, result.compressed_tokens, source, key
                         )
+                    else:
+                        marked = result.compressed
+                    original_tokens = _hd_kmg_tokens(result.original)
+                    compressed_tokens = _hd_kmg_tokens(marked)
+                    if compressed_tokens >= original_tokens:
+                        return self._passthrough(result.original, len(result.original.split()))
+                    result.cache_key = key
+                    result.compressed = marked
+                    result.original_tokens = original_tokens
+                    result.compressed_tokens = compressed_tokens
+                    result.compression_ratio = (
+                        compressed_tokens / original_tokens if original_tokens else 1.0
+                    )
                 except Exception:
                     pass
                 return result

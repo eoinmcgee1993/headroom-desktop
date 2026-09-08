@@ -6171,7 +6171,7 @@ export default function App() {
           >
             Get started
           </button>
-          <p>Headroom stays active in your menu bar while you work.</p>
+          <p>Headroom stays active in your {navigator.userAgent.includes("Mac") ? "menu bar" : "system tray"} while you work.</p>
         </div>
       </LauncherShell>
     );

@@ -14,10 +14,12 @@ Checks, in order:
      is compressed and keeps its marker, the client's original block is not
      mutated, an earlier message's block stays protected and counted, and an
      assistant block in the final position keeps the hard skip;
-  4. Kompress marker gate: a 20 percent shrink (ratio 0.80, unmarked by the
-     wheel's `< 0.8` gate) gets stored and marked on both compress paths, a
-     shrink smaller than the marker stays unmarked, and a passthrough is
-     untouched;
+  4. Kompress marker gate: a 20 percent shrink of 300 words (ratio 0.80,
+     unmarked by the wheel's `< 0.8` gate) gets stored and marked on both
+     compress paths and reports the whole-payload cl100k measurement, the two
+     boundary sources (41 single-token words saved against a 43-token marker;
+     a head word that retokenizes, 100 -> 103), both marked by the wheel's
+     own ratio gate, pass through, and a passthrough is untouched;
   5. the three kill switches unbind (re-runs this file in a subprocess).
 
 Prints OK/FAIL lines; exit code 0 only when every check passed.
@@ -201,22 +203,47 @@ def main() -> int:
             comp = kc.KompressCompressor(kc.KompressConfig(min_input_words=10))
             comp._should_batch_single_content = lambda *a, **k: False
             comp._should_use_sequential_fallback = lambda: False
-            comp._store_in_ccr = lambda *a, **k: "abc123"
+            # A real-length key: the marker's cost depends on its hash, and a
+            # short stub hash makes the marker cheap enough to pay for.
+            comp._store_in_ccr = lambda source, *a, **k: _key(source)
             return comp
 
-        r = compressor(20).compress(_prose(100))
-        check(r.compressed_tokens == 80, f"kompress fake shrank 100 -> {r.compressed_tokens}")
+        def _key(source: str) -> str:
+            import hashlib
+
+            return hashlib.sha256(source.encode()).hexdigest()[:24]
+
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        big = _prose(300)
+        marked = " ".join(big.split()[60:]) + kc.ccr_retrieval_marker(300, 240, big, _key(big))
+        tok = lambda t: len(enc.encode(t))  # noqa: E731
+        r = compressor(60).compress(big)
         check(
-            r.cache_key == "abc123" and "Retrieve more: hash=abc123" in r.compressed,
-            "20 percent shrink gets a retrieval marker",
+            r.cache_key == _key(big) and r.compressed == marked,
+            "20 percent shrink of 300 words gets a retrieval marker",
         )
-        [rb] = compressor(20).compress_batch([_prose(100)], batch_size=8)
-        check("Retrieve more: hash=abc123" in rb.compressed, "batch path marks too")
-        r5 = compressor(5).compress(_prose(100))
         check(
-            r5.cache_key is None and "Retrieve more" not in r5.compressed,
-            "saving smaller than the marker stays unmarked",
+            (r.original_tokens, r.compressed_tokens) == (tok(big), tok(marked)),
+            f"marked result reports the whole-payload measurement ({r.original_tokens} -> {r.compressed_tokens})",
         )
+        [rb] = compressor(60).compress_batch([big], batch_size=8)
+        check(
+            rb.compressed == marked and rb.compressed_tokens == tok(marked),
+            "batch path marks and accounts too",
+        )
+        for label, source, drop in (
+            ("41 single-token words saved against a 43-token marker", " ".join(["alpha"] * 99 + ["nfs"]), 41),
+            ("a head word that retokenizes (100 -> 103)", " ".join(["alpha"] * 36 + ["bureaucratic"] + ["alpha"] * 63), 36),
+        ):
+            rs = compressor(drop).compress(source)
+            check(
+                rs.compressed == source and rs.cache_key is None and rs.compression_ratio == 1.0,
+                f"{label}: passthrough",
+            )
+            [rbs] = compressor(drop).compress_batch([source], batch_size=8)
+            check(rbs.compressed == source, f"{label}: batch passthrough")
         r0 = compressor(0).compress(_prose(100))
         check(r0.compressed.split() == _prose(100).split(), "passthrough untouched")
     finally:
