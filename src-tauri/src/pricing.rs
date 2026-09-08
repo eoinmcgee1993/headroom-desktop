@@ -111,6 +111,10 @@ struct IdentityPayload {
     /// allowance (the upsell cohort the plan claim can't reveal).
     #[serde(skip_serializing_if = "Option::is_none")]
     codex_usage_windows: Option<String>,
+    /// Same shape for Claude ("five_hour=NN@300;seven_day=NN@10080"), so the
+    /// server can test whether rate-limit pressure predicts conversion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_usage_windows: Option<String>,
     /// When the local tier-mismatch clock started, if a mismatch is currently
     /// open. The clamp fires `TIER_MISMATCH_GRACE_DAYS` after this, so the
     /// server can derive both the mismatch cohort and who is actually clamped.
@@ -274,6 +278,7 @@ impl IdentityPayload {
             .lock()
             .as_ref()
             .map(codex_usage_windows_summary);
+        payload.claude_usage_windows = state.claude_usage_windows.lock().clone();
         payload.tier_mismatch_since = load_or_initialize_local_state()
             .ok()
             .and_then(|local| local.mismatch_since)
@@ -306,6 +311,7 @@ impl IdentityPayload {
             codex_rate_limit_tier: codex.and_then(|p| p.rate_limit_tier.clone()),
             codex_billing_type: codex.and_then(|p| p.billing_type.clone()),
             codex_usage_windows: None,
+            claude_usage_windows: None,
             tier_mismatch_since: None,
             accepted_terms_version: None,
             wsl_agents: crate::wsl_probe::result(),
@@ -372,6 +378,9 @@ impl IdentityPayload {
         }
         if let Some(value) = self.codex_usage_windows.as_deref() {
             builder = builder.header("X-Headroom-Codex-Usage-Windows", value);
+        }
+        if let Some(value) = self.claude_usage_windows.as_deref() {
+            builder = builder.header("X-Headroom-Claude-Usage-Windows", value);
         }
         if let Some(value) = self.tier_mismatch_since.as_deref() {
             builder = builder.header("X-Headroom-Tier-Mismatch-Since", value);
@@ -671,6 +680,8 @@ struct RemoteAccountResponse {
     email: String,
     trial_started_at: Option<DateTime<Utc>>,
     trial_ends_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    trial_usage_days_left: Option<u32>,
     trial_active: bool,
     subscription_active: bool,
     subscription_tier: Option<HeadroomSubscriptionTier>,
@@ -828,7 +839,19 @@ enum RemoteAccountSyncError {
     Other(#[allow(dead_code)] String),
 }
 
+/// When any caller last ran `get_pricing_status`; the background pricing
+/// loop in lib.rs only fetches when this is stale.
+static LAST_STATUS_FETCH: parking_lot::Mutex<Option<std::time::Instant>> =
+    parking_lot::Mutex::new(None);
+
+pub fn status_fetched_within(window: std::time::Duration) -> bool {
+    LAST_STATUS_FETCH
+        .lock()
+        .is_some_and(|at| at.elapsed() < window)
+}
+
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
+    *LAST_STATUS_FETCH.lock() = Some(std::time::Instant::now());
     let mut local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let local_grace_active = Utc::now() < local_grace_ends_at;
@@ -1019,7 +1042,6 @@ fn fetch_codex_usage(
     if !crate::client_adapters::is_codex_enabled() {
         return None;
     }
-    let snapshot = state.codex_rate_limits.lock().clone()?;
     let plan_tier = state.codex_plan_tier();
     // Identical activation ladder to the Claude branch: subscription (metered
     // only when clamped) > active trial > grandfathered (metered) > hard block.
@@ -1036,6 +1058,16 @@ fn fetch_codex_usage(
         Some(a) if a.grandfathered => (CodexActivation::Metered, a.invite_bonus_percent),
         Some(a) => (CodexActivation::HardBlock, a.invite_bonus_percent),
         None => (CodexActivation::Ungated, 0.0),
+    };
+    // The snapshot comes from Codex response headers seen in-process, so it
+    // is empty after every relaunch until the first response. Metering needs
+    // real windows; the hard block does not, and waiting for a snapshot ran
+    // Codex fully optimized past the wall until then (and forever on hosts
+    // whose responses never carry the headers).
+    let snapshot = match (state.codex_rate_limits.lock().clone(), &activation) {
+        (Some(snapshot), _) => snapshot,
+        (None, CodexActivation::HardBlock) => CodexRateLimitSnapshot::default(),
+        (None, _) => return None,
     };
     Some(codex_usage_from_snapshot(
         snapshot,
@@ -1076,6 +1108,20 @@ fn metered_window(snapshot: &CodexRateLimitSnapshot) -> Option<&crate::models::C
                 .is_none_or(|m| m >= MIN_METERED_WINDOW_MINUTES)
         })
         .max_by_key(|w| w.window_minutes.unwrap_or(0))
+}
+
+/// Claude counterpart of `codex_usage_windows_summary`, same wire shape so the
+/// server parses both with one regex. Window minutes are Anthropic's fixed
+/// 5h / 7d.
+fn claude_usage_windows_summary(usage: &crate::models::ClaudeUsage) -> String {
+    let mut parts = Vec::new();
+    if let Some(w) = usage.five_hour.as_ref() {
+        parts.push(format!("five_hour={:.0}@300", w.utilization));
+    }
+    if let Some(w) = usage.seven_day.as_ref() {
+        parts.push(format!("seven_day={:.0}@10080", w.utilization));
+    }
+    parts.join(";")
 }
 
 /// Compact wire summary of the Codex usage windows and credits, as
@@ -1206,8 +1252,7 @@ fn codex_plan_gate(
             nudge_level: u8::MAX,
             gate_reason: Some(PricingGateReason::TrialEnded),
             gate_message:
-                "Your 7-day Headroom trial has ended. Upgrade to keep Headroom optimizing Codex."
-                    .into(),
+                "Your Headroom trial has ended. Upgrade to keep Headroom optimizing Codex.".into(),
             nudge_thresholds_percent: nudges_display,
             disable_threshold_percent: disable_display,
         },
@@ -1636,6 +1681,8 @@ pub struct SavingsReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct SavingsDay {
     pub date: String,
+    /// UTC end boundary of this local calendar day, used for trial-day accounting.
+    pub day_ends_at: Option<DateTime<Utc>>,
     /// Input compression only. The app's chart headline sums this WITH
     /// `output_savings_usd` (both Headroom layers), so the server has to carry
     /// them separately to show the same total and still rate the input layer.
@@ -2148,7 +2195,7 @@ fn evaluate_pricing_status_with_mismatch(
             gate_reason = Some(PricingGateReason::TrialEnded);
             recommended_subscription_tier = headroom_tier_for_claude_plan(&claude.plan_tier);
             gate_message =
-                "Your 7-day Headroom trial has ended. Upgrade to keep Headroom optimizing your prompts."
+                "Your Headroom trial has ended. Upgrade to keep Headroom optimizing your prompts."
                     .into();
         }
     } else if authenticated {
@@ -2674,6 +2721,11 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
         Err(err) => (None, Some(err.message), err.transient),
     };
     let usage = fetch_claude_usage(state).ok();
+    // Keep the latest window shape for the identity touch (same idea as
+    // `codex_rate_limits`); a failed fetch keeps the last known value.
+    if let Some(u) = usage.as_ref() {
+        *state.claude_usage_windows.lock() = Some(claude_usage_windows_summary(u));
+    }
 
     let (plan_tier, plan_detection_source) = if let Some(ref p) = profile {
         detect_plan_tier_from_profile(p)
@@ -3137,6 +3189,7 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         email: value.email,
         trial_started_at: value.trial_started_at,
         trial_ends_at: value.trial_ends_at,
+        trial_usage_days_left: value.trial_usage_days_left,
         trial_active: value.trial_active,
         subscription_active: value.subscription_active,
         subscription_tier: value.subscription_tier,
@@ -3929,6 +3982,7 @@ mod tests {
             email: "user@example.com".into(),
             trial_started_at: Some(Utc::now()),
             trial_ends_at: Some(Utc::now()),
+            trial_usage_days_left: None,
             trial_active: true,
             subscription_active: true,
             subscription_tier: Some(HeadroomSubscriptionTier::Pro),
@@ -4474,6 +4528,7 @@ mod tests {
             email: "user@example.com".into(),
             trial_started_at: Some(Utc::now()),
             trial_ends_at: Some(Utc::now()),
+            trial_usage_days_left: None,
             trial_active: true,
             subscription_active: false,
             subscription_tier: None,
@@ -4504,6 +4559,7 @@ mod tests {
             email: "user@example.com".into(),
             trial_started_at: None,
             trial_ends_at: None,
+            trial_usage_days_left: None,
             trial_active: false,
             subscription_active: false,
             subscription_tier: None,
@@ -5197,6 +5253,7 @@ mod tests {
             email: "a@b".into(),
             trial_started_at: None,
             trial_ends_at: None,
+            trial_usage_days_left: None,
             trial_active: false,
             subscription_active: false,
             subscription_tier: None,
@@ -5229,6 +5286,7 @@ mod tests {
             email: "a@b".into(),
             trial_started_at: None,
             trial_ends_at: None,
+            trial_usage_days_left: None,
             trial_active: false,
             subscription_active: false,
             subscription_tier: None,
@@ -5630,6 +5688,47 @@ mod tests {
             )
             .optimization_allowed,
             "secondary without a declared length still meters"
+        );
+    }
+
+    #[test]
+    fn codex_hard_block_needs_no_rate_limit_snapshot() {
+        let usage = super::codex_usage_from_snapshot(
+            crate::models::CodexRateLimitSnapshot::default(),
+            CodexPlanTier::Plus,
+            super::CodexActivation::HardBlock,
+            0.0,
+        );
+        assert!(!usage.optimization_allowed);
+        assert!(matches!(
+            usage.gate_reason,
+            Some(PricingGateReason::TrialEnded)
+        ));
+    }
+
+    #[test]
+    fn claude_usage_windows_summary_matches_codex_wire_shape() {
+        let window = |utilization: f64| crate::models::ClaudeUsageWindow {
+            utilization,
+            resets_at: Utc::now(),
+        };
+        let usage = crate::models::ClaudeUsage {
+            five_hour: Some(window(12.4)),
+            seven_day: Some(window(63.6)),
+            extra_usage: None,
+        };
+        assert_eq!(
+            super::claude_usage_windows_summary(&usage),
+            "five_hour=12@300;seven_day=64@10080"
+        );
+        let seven_only = crate::models::ClaudeUsage {
+            five_hour: None,
+            seven_day: Some(window(5.0)),
+            extra_usage: None,
+        };
+        assert_eq!(
+            super::claude_usage_windows_summary(&seven_only),
+            "seven_day=5@10080"
         );
     }
 

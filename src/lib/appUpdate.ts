@@ -42,7 +42,7 @@ export function displayAppUpdateNotes(notes: string | null | undefined): string 
 export interface AppUpdateStatePatch {
   config?: AppUpdateConfiguration;
   availableUpdate?: AvailableAppUpdate | null;
-  readyToRestart?: boolean;
+  stagedVersion?: string;
   showDialog?: boolean;
   statusCopy?: string | null;
 }
@@ -81,14 +81,27 @@ export function getBlockedAppUpdateCheckPatch(
 export async function runAppUpdateCheck({
   background = false,
   knownUpdateVersion = null,
+  stagedVersion = null,
   invokeFn = invoke,
 }: {
   background?: boolean;
   knownUpdateVersion?: string | null;
+  stagedVersion?: string | null;
   invokeFn?: AppUpdateInvoker;
 } = {}): Promise<AppUpdateStatePatch> {
   try {
     const update = await invokeFn<AvailableAppUpdate | null>("check_for_app_update");
+
+    // A staged update leaves the running process reporting its *old* version,
+    // so the backend keeps offering the build we already installed. Swallow
+    // that echo (installing it again would re-download every hour) and hold
+    // the "restart to finish" state if the manifest stops offering anything.
+    // A genuinely newer version still falls through, so a loud hotfix reaches
+    // users who have not restarted yet instead of waiting behind the staged
+    // one.
+    if (stagedVersion && (!update || update.version === stagedVersion)) {
+      return {};
+    }
 
     if (update) {
       // Background-found updates only interrupt when the release is marked
@@ -98,7 +111,6 @@ export async function runAppUpdateCheck({
         !background || (isLoudAppUpdate(update) && update.version !== knownUpdateVersion);
       return {
         availableUpdate: update,
-        readyToRestart: false,
         ...(shouldShowDialog ? { showDialog: true } : {}),
         statusCopy: `Update available: ${update.version}.`,
       };
@@ -106,7 +118,6 @@ export async function runAppUpdateCheck({
 
     return {
       availableUpdate: null,
-      readyToRestart: false,
       ...(background ? {} : { statusCopy: "Up to date." }),
     };
   } catch (error) {
@@ -244,7 +255,7 @@ export async function runAppUpdateInstall({
   try {
     await invokeFn("install_app_update");
     return {
-      readyToRestart: true,
+      stagedVersion: availableUpdate.version,
       ...(quiet ? {} : { showDialog: true }),
       statusCopy: `Headroom ${availableUpdate.version} is installed and ready to restart.`,
     };

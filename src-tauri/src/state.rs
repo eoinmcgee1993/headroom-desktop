@@ -503,6 +503,9 @@ pub struct AppState {
     /// task can update it without going through AppState; read by
     /// `pricing::fetch_codex_usage` to drive the Codex usage gauge.
     pub codex_rate_limits: Arc<Mutex<Option<CodexRateLimitSnapshot>>>,
+    /// Latest Claude usage windows in the identity-touch wire shape
+    /// ("five_hour=NN@300;seven_day=NN@10080"), set by the pricing refresh.
+    pub claude_usage_windows: Arc<Mutex<Option<String>>>,
     /// OpenAI/ChatGPT plan decoded from the latest Codex OAuth bearer JWT seen by
     /// the proxy intercept (`proxy_intercept::decode_codex_plan_tier`). Read by
     /// `pricing::fetch_codex_usage` to pick the recommended upgrade tier.
@@ -695,6 +698,7 @@ impl AppState {
             bootstrap_failure_report: Mutex::new(None),
             claude_bearer_token: Arc::new(Mutex::new(None)),
             codex_rate_limits: Arc::new(Mutex::new(None)),
+            claude_usage_windows: Arc::new(Mutex::new(None)),
             codex_plan_tier: Arc::new(Mutex::new(None)),
             intercept_bind_error: Arc::new(Mutex::new(None)),
             proxy_bypass: Arc::new(AtomicBool::new(false)),
@@ -3819,6 +3823,34 @@ impl AppState {
     /// only Claude traffic forwards direct) instead of the full `proxy_bypass`
     /// (Python torn down, everything direct). Computed at the call site via
     /// `client_adapters::is_codex_enabled()` so this method stays pure for tests.
+    /// True for a poll that carries no verdict: signed in, but the account
+    /// sync failed and there is no account to evaluate. The evaluator keeps
+    /// optimization enabled on that reading so a blip never pauses a paying
+    /// user, which also meant every blip LIFTED an active gate (exit ->
+    /// Python restart -> up to two poll intervals optimized before the
+    /// re-gate debounce). Measured 2026-09-08: 25 of 163 lapsed trials with
+    /// the app alive kept saving after the wall. An error reading must leave
+    /// the flags exactly where they are.
+    pub fn is_error_reading(status: &crate::models::HeadroomPricingStatus) -> bool {
+        status.authenticated && status.account.is_none() && status.account_sync_error.is_some()
+    }
+
+    /// Reconcile both gates with one evaluated status. The single entry
+    /// point for every trigger (frontend poll, deep link, sign-in, the
+    /// background pricing loop), so the error-reading guard cannot be
+    /// skipped by a caller.
+    pub fn apply_pricing_gates(&self, status: &crate::models::HeadroomPricingStatus) {
+        if Self::is_error_reading(status) {
+            log::info!("pricing_gate: account sync failed; leaving gate flags untouched");
+            return;
+        }
+        self.apply_pricing_gate_status(
+            status,
+            crate::client_adapters::any_gate_exempt_client_enabled(),
+        );
+        self.apply_codex_pricing_gate_status(status.codex.as_ref());
+    }
+
     pub fn apply_pricing_gate_status(
         &self,
         status: &crate::models::HeadroomPricingStatus,
@@ -3827,6 +3859,16 @@ impl AppState {
         use std::sync::atomic::Ordering::{Acquire, Release};
         let was_bypassed = self.proxy_bypass.load(Acquire) || self.claude_only_bypass.load(Acquire);
         let should_bypass = !status.optimization_allowed;
+        // Account wall (trial ended / sign-in required) vs plan-usage metering:
+        // only the wall is shared with OpenCode and Grok.
+        let account_wall = should_bypass
+            && matches!(
+                status.gate_reason,
+                Some(
+                    crate::models::PricingGateReason::TrialEnded
+                        | crate::models::PricingGateReason::SignInRequired
+                )
+            );
 
         if should_bypass {
             if !was_bypassed {
@@ -3849,10 +3891,12 @@ impl AppState {
             // also flips us between full and Claude-only bypass if Codex's
             // enable state changed while already gated.
             self.enter_claude_gate(codex_keep_alive);
+            crate::proxy_intercept::set_account_gate(account_wall);
         } else {
             // Any ungated reading clears the violation streak so a later
             // gated reading starts the debounce window over.
             self.pricing_gate_violation_streak.store(0, Release);
+            crate::proxy_intercept::set_account_gate(false);
             if was_bypassed {
                 self.exit_claude_gate();
             }
@@ -6511,6 +6555,9 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
 
         if let Some(parsed) = parse_headroom_stats_from_json(&body) {
             report_cache_integrity(&body);
+            // Same body, same pass: whether the savings this parse just turned
+            // into a percentage can have come out of the input it divides by.
+            crate::savings_canary::observe_basis(&body);
             // Only a SUSTAINED recovery resets the backoff; a lone success
             // between two timeouts must not (see STATS_FETCH_RECOVERY_WINDOW).
             note_stats_fetch_success();
@@ -7969,6 +8016,24 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
             "Port {port} is in use, but no program is listening on it. \
              Reboot to clear it; if it comes back, check for a reserved port range with: \
              netsh int ipv4 show excludedportrange protocol=tcp"
+        );
+    }
+    // WSAEACCES. Nothing is holding the port -- Windows refused us the socket
+    // outright -- so both the fallback below ("quit whatever holds the port")
+    // and the 10048 arm's "in use by another program" are confidently wrong
+    // here, which this file's own docstring bans. Same two causes and the same
+    // discriminating command as `crate::loopback_socket_denied_hint`, which
+    // covers the Python runtime hitting 10013 at startup; this is the
+    // intercept's own front door, so the remedy is phrased around the port and
+    // around the fact that the bind loop keeps retrying on its own.
+    if crate::is_loopback_socket_denied_signal(raw) {
+        return format!(
+            "Port {port} was refused by Windows itself, not taken by another program \
+             (WinError 10013). This is usually security software filtering loopback \
+             connections, or a reserved port range (Hyper-V, WSL2, Docker) covering it: run \
+             netsh int ipv4 show excludedportrange protocol=tcp in PowerShell to check, and \
+             allow Headroom in your antivirus or firewall's network protection. \
+             Headroom keeps retrying and reconnects on its own once it clears."
         );
     }
     if raw.contains("os error 10048") {
@@ -9822,6 +9887,26 @@ mod tests {
         }
     }
 
+    /// RUST-DR: a Windows 11 host whose 6767 bind returns WSAEACCES on every
+    /// retry got the generic fallback, which tells the user to quit whatever
+    /// holds the port. Nothing holds it; Windows refused the socket. The hint
+    /// must name the two real causes and the command that tells them apart.
+    #[test]
+    fn intercept_bind_hint_explains_a_windows_refused_socket() {
+        // Localized prose, as the affected hosts report it (RUST-DR was Korean).
+        let hint = intercept_bind_hint(
+            "액세스 권한에 의해 숨겨진 소켓에 액세스를              시도했습니다. (os error 10013)",
+        );
+        assert!(hint.contains("10013"), "{hint}");
+        assert!(hint.contains("excludedportrange"), "{hint}");
+        // Never the wrong remedy: nothing is holding this port.
+        assert!(!hint.contains("Quit"), "{hint}");
+        assert!(!hint.contains("in use by another program"), "{hint}");
+        let first = hint.split(". ").next().unwrap();
+        assert!(first.starts_with("Port 6767"), "{first}");
+        assert!(first.len() < 110, "headline too long: {first}");
+    }
+
     #[test]
     fn intercept_bind_hint_falls_back_to_the_raw_cause() {
         let hint = intercept_bind_hint("Address already in use (os error 48)");
@@ -11155,6 +11240,66 @@ mod tests {
             intro_offer: None,
             plan_prices: None,
         }
+    }
+
+    #[test]
+    fn apply_pricing_gates_leaves_flags_untouched_on_an_error_reading() {
+        let base_dir = temp_test_dir("headroom-gate-error-reading");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        // Gated after the debounce.
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
+        assert!(state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // A sync failure evaluates as "allowed" but carries no verdict.
+        let mut blip = pricing_status_with_optimization(true);
+        blip.account = None;
+        blip.account_sync_error = Some("send: timed out".into());
+        assert!(AppState::is_error_reading(&blip));
+        state.apply_pricing_gates(&blip);
+        assert!(
+            state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a failed account sync must not lift the gate"
+        );
+
+        // A real ungated verdict still lifts it.
+        let mut ok = pricing_status_with_optimization(true);
+        ok.account_sync_error = None;
+        assert!(!AppState::is_error_reading(&ok));
+        state.apply_pricing_gate_status(&ok, false);
+        assert!(!state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn account_wall_flag_follows_the_gate_reason() {
+        use crate::models::PricingGateReason;
+        let base_dir = temp_test_dir("headroom-account-wall-flag");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let mut wall = pricing_status_with_optimization(false);
+        wall.gate_reason = Some(PricingGateReason::TrialEnded);
+        state.apply_pricing_gate_status(&wall, true);
+        state.apply_pricing_gate_status(&wall, true);
+        assert!(
+            crate::proxy_intercept::account_gate(),
+            "trial wall is shared with OpenCode/Grok"
+        );
+
+        // Plan-usage metering gates Claude only.
+        let mut metered = pricing_status_with_optimization(false);
+        metered.gate_reason = Some(PricingGateReason::WeeklyUsageLimitReached);
+        state.apply_pricing_gate_status(&metered, true);
+        assert!(!crate::proxy_intercept::account_gate());
+
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(true), true);
+        assert!(!crate::proxy_intercept::account_gate());
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]

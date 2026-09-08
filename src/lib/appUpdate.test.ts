@@ -106,7 +106,6 @@ describe("app update helpers", () => {
     expect(invokeFn).toHaveBeenCalledWith("check_for_app_update");
     expect(result).toEqual({
       availableUpdate,
-      readyToRestart: false,
       showDialog: true,
       statusCopy: "Update available: 0.3.0.",
     });
@@ -123,7 +122,6 @@ describe("app update helpers", () => {
 
     expect(result).toEqual({
       availableUpdate,
-      readyToRestart: false,
       statusCopy: "Update available: 0.3.0.",
     });
   });
@@ -139,7 +137,6 @@ describe("app update helpers", () => {
 
     expect(result).toEqual({
       availableUpdate: loudUpdate,
-      readyToRestart: false,
       showDialog: true,
       statusCopy: "Update available: 0.3.0.",
     });
@@ -156,7 +153,6 @@ describe("app update helpers", () => {
 
     expect(result).toEqual({
       availableUpdate: loudUpdate,
-      readyToRestart: false,
       statusCopy: "Update available: 0.3.0.",
     });
   });
@@ -172,8 +168,51 @@ describe("app update helpers", () => {
 
     expect(result).toEqual({
       availableUpdate,
-      readyToRestart: false,
       statusCopy: "Update available: 0.3.0.",
+    });
+  });
+
+  it("ignores the staged version echoing back while an update waits for restart", async () => {
+    const invokeFn = vi.fn().mockResolvedValueOnce(availableUpdate);
+
+    const result = await runAppUpdateCheck({
+      background: true,
+      knownUpdateVersion: "0.3.0",
+      stagedVersion: "0.3.0",
+      invokeFn,
+    });
+
+    expect(result).toEqual({});
+  });
+
+  it("holds the staged restart state when the manifest stops offering an update", async () => {
+    const invokeFn = vi.fn().mockResolvedValueOnce(null);
+
+    const result = await runAppUpdateCheck({
+      background: true,
+      knownUpdateVersion: "0.3.0",
+      stagedVersion: "0.3.0",
+      invokeFn,
+    });
+
+    expect(result).toEqual({});
+  });
+
+  it("lets a newer release through while an older update is staged", async () => {
+    const newerLoudUpdate: AvailableAppUpdate = { ...loudUpdate, version: "0.3.1" };
+    const invokeFn = vi.fn().mockResolvedValueOnce(newerLoudUpdate);
+
+    const result = await runAppUpdateCheck({
+      background: true,
+      knownUpdateVersion: "0.3.0",
+      stagedVersion: "0.3.0",
+      invokeFn,
+    });
+
+    expect(result).toEqual({
+      availableUpdate: newerLoudUpdate,
+      showDialog: true,
+      statusCopy: "Update available: 0.3.1.",
     });
   });
 
@@ -184,9 +223,40 @@ describe("app update helpers", () => {
 
     expect(result).toEqual({
       availableUpdate: null,
-      readyToRestart: false,
       statusCopy: "Up to date.",
     });
+  });
+
+  it("keeps the installed version restartable when its replacement fails, then retries it", async () => {
+    const newer = { ...availableUpdate, version: "0.3.1" };
+    let state: { availableUpdate: AvailableAppUpdate | null; stagedVersion: string } = { availableUpdate, stagedVersion: "0.3.0" };
+    state = { ...state, ...await runAppUpdateCheck({
+      background: true,
+      stagedVersion: state.stagedVersion,
+      knownUpdateVersion: state.availableUpdate!.version,
+      invokeFn: vi.fn().mockResolvedValue(newer),
+    }) };
+    expect(state.availableUpdate!.version).toBe("0.3.1");
+    expect(state.stagedVersion).toBe("0.3.0");
+
+    state = { ...state, ...await runAppUpdateInstall({
+      availableUpdate: state.availableUpdate,
+      invokeFn: vi.fn().mockRejectedValue("download failed"),
+    }) };
+    expect(state.stagedVersion).toBe("0.3.0");
+
+    const retry = await runAppUpdateCheck({
+      background: true,
+      knownUpdateVersion: state.availableUpdate!.version,
+      stagedVersion: state.stagedVersion,
+      invokeFn: vi.fn().mockResolvedValue(newer),
+    });
+    expect(retry.availableUpdate).toEqual(newer);
+    state = { ...state, ...await runAppUpdateInstall({
+      availableUpdate: retry.availableUpdate!,
+      invokeFn: vi.fn().mockResolvedValue(undefined),
+    }) };
+    expect(state.stagedVersion).toBe("0.3.1");
   });
 
   it("suppresses background check errors instead of overwriting status copy", async () => {
@@ -266,7 +336,7 @@ describe("app update helpers", () => {
 
     expect(invokeFn).toHaveBeenCalledWith("install_app_update");
     expect(result).toEqual({
-      readyToRestart: true,
+      stagedVersion: "0.3.0",
       showDialog: true,
       statusCopy: "Headroom 0.3.0 is installed and ready to restart.",
     });
@@ -282,7 +352,7 @@ describe("app update helpers", () => {
     });
 
     expect(result).toEqual({
-      readyToRestart: true,
+      stagedVersion: "0.3.0",
       statusCopy: "Headroom 0.3.0 is installed and ready to restart.",
     });
   });

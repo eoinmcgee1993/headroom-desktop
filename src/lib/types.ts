@@ -634,6 +634,9 @@ export interface HeadroomAccountProfile {
   email: string;
   trialStartedAt?: string | null;
   trialEndsAt?: string | null;
+  /** Usage-day trials: saving days left before the wall. Null/absent on
+   * calendar trials and older servers, where trialEndsAt is the date. */
+  trialUsageDaysLeft?: number | null;
   trialActive: boolean;
   subscriptionActive: boolean;
   subscriptionTier?: HeadroomSubscriptionTier | null;

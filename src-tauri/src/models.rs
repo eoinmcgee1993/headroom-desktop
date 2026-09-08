@@ -1177,6 +1177,10 @@ pub struct HeadroomAccountProfile {
     pub email: String,
     pub trial_started_at: Option<DateTime<Utc>>,
     pub trial_ends_at: Option<DateTime<Utc>>,
+    /// Usage-day trials (web TrialPolicy::USAGE_SWITCH_AT onward): saving
+    /// days left before the wall. None on calendar trials and old servers.
+    #[serde(default)]
+    pub trial_usage_days_left: Option<u32>,
     pub trial_active: bool,
     pub subscription_active: bool,
     pub subscription_tier: Option<HeadroomSubscriptionTier>,

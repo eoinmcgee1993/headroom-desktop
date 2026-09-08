@@ -301,6 +301,44 @@ persisted dollar field; tool-schema TOKENS are untouched and the
 desktop keeps pricing those itself at the cache-read rate.
 Self-neutralizes once a wheel ships #3170's disjoint fields. Kill
 switch: HEADROOM_SAVINGS_FOLD_GUARD=0.
+Per-conversation savings accounting (upstream PR #3480): OpenAI
+/v1/responses re-sends the whole transcript every turn and the router
+recompresses all of it, so a turn's tokens_saved is the CONVERSATION's
+running total, not that turn's. Everything cumulative summed it again
+on every remaining turn -- lifetime totals, by_model.savings_percent,
+the dollar figure, and any rate dividing savings by new input, which
+then has no 100 percent ceiling. Anthropic's frozen cached prefix makes
+its tokens_saved novel-only, so the two providers never meant the same
+thing: measured 2026-09-08, gpt/codex booked 8.10M saved against 3.90M
+new input (2.1x, impossible as a share) where claude booked 4.18M
+against 43.3M. The vendor differences the running total per
+conversation and feeds the novel figure to the two cumulative
+consumers; per-request surfaces keep the wire truth, matching #3480 so
+the wheel bump is a no-op. Self-neutralizes once a wheel ships #3480's
+RequestOutcome fields. Kill switch: HEADROOM_CONVERSATION_SAVINGS=0.
+Thinking signatures are not input (upstream PR #3482): the shared block walker priced Anthropic `thinking` blocks
+through its JSON catch-all, so the ~1 KB opaque `signature` per block
+counted as text. Measured 2026-09-08 on a 369-message Claude Code
+session: 99 signatures were 256K of 414K counted tokens against ~313K
+provider-billed, inflating every tokens_before-derived figure (feed
+percent, size stratum, cold-start deferral). The vendor counts only the
+thinking text. Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
+Fresh cache_control compression (upstream PR #3483): the router never touched a block carrying cache_control, but
+Claude Code stamps its newest tool_result every turn, so the freshest
+tool output was protected on the one turn it was fresh and only retried
+inside the unfrozen window (1,229 cache_control_protected visits across
+650 requests in a day, ~2 per request). The request's final user/tool
+message has never been forwarded, so no provider key exists for it; the
+vendor peels the marker off that message's tool_result blocks, lets the router run
+unchanged, and puts the marker back on the same slot. Any shape drift
+returns the untouched message. Kill switch: HEADROOM_FRESH_CC_COMPRESS=0.
+Kompress marker gate (upstream PR #3484): Kompress only
+appended its CCR retrieval marker below ratio 0.8, while the router
+accepts any shrink and (#1307) discards a lossy result with no marker,
+so every 1-20 percent shrink ran the model and saved nothing (218
+lossy_unrecoverable_skipped in a day). The vendor appends the marker
+whenever the saving pays for it. Kill switch:
+HEADROOM_KOMPRESS_MARKER_GATE=0.
 Chained-read protection (upstream PR #2668): _is_read_command
 inspects only the FIRST program and applies its write/redirect check
 to the whole string, so a read batched behind other work
@@ -1974,6 +2012,155 @@ if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # from this section, so there is nothing to fail closed FOR.
         pass
 
+    # Per-conversation savings accounting (upstream PR #3480, still open;
+    # remove once a wheel ships it -- see the module docstring for the
+    # inflation this ends). Three wraps, no logic reimplemented: the
+    # compressor stashes (conversation key, running total) per request_id,
+    # the outcome funnel differences it into this turn's NOVEL saving and
+    # parks that on a ContextVar, and the two CUMULATIVE consumers read the
+    # var. A ContextVar and not a global because concurrent requests are
+    # separate asyncio tasks with separate contexts, and the funnel awaits
+    # both consumers inside its own task. The per-request surfaces the funnel
+    # also writes (request log, transformations feed, PERF tok_saved) keep
+    # outcome.tokens_saved untouched: those tokens really did leave this
+    # request's payload, and matching #3480 exactly here is what makes the
+    # wheel bump a no-op. Self-neutralizes on the first wheel carrying
+    # #3480's RequestOutcome fields. Kill switch:
+    # HEADROOM_CONVERSATION_SAVINGS=0.
+    #
+    # BINDING ORDER IS LOAD-BEARING: this block must stay AFTER the
+    # first-appearance vendor above, which rewrites tokens_saved on the same
+    # PrometheusMetrics seam. Later binding means outer wrapper, so this one
+    # substitutes the novel figure FIRST and first-appearance then subtracts
+    # its pending amount from it. Bound the other way round (this block
+    # earlier in the file) the substitution lands last and silently discards
+    # every first-appearance subtraction on Codex traffic.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_CONVERSATION_SAVINGS", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import collections as _hd_cs_collections
+            import contextvars as _hd_cs_contextvars
+            import threading as _hd_cs_threading
+
+            import headroom.proxy.cost as _hd_cs_cost
+            import headroom.proxy.handlers.openai as _hd_cs_openai
+            import headroom.proxy.outcome as _hd_cs_outcome
+            import headroom.proxy.prometheus_metrics as _hd_cs_prom
+            import headroom.proxy.server as _hd_cs_server
+            from headroom.proxy.output_savings import (
+                conversation_key_from_body as _hd_cs_conv_key,
+            )
+
+            if "conversation_key" not in getattr(
+                _hd_cs_outcome.RequestOutcome, "__dataclass_fields__", {}
+            ):
+                # request_id -> (conversation key, the conversation's running
+                # removed-token total). WS sessions reuse ONE request_id across
+                # every turn, so entries are overwritten per frame and never
+                # popped -- the funnel wants the latest turn's total, and
+                # popping would starve every turn after the first.
+                _hd_cs_pending = _hd_cs_collections.OrderedDict()
+                # conversation key -> total already counted. A conversation
+                # evicted while still live re-counts its transcript once, which
+                # is a bounded one-off overcount, not a leak.
+                _hd_cs_seen = _hd_cs_collections.OrderedDict()
+                _HD_CS_MAX = 512
+                _hd_cs_lock = _hd_cs_threading.Lock()
+                _hd_cs_novel = _hd_cs_contextvars.ContextVar(
+                    "headroom_novel_tokens_saved", default=None
+                )
+
+                def _hd_cs_bounded(store, key, value):
+                    with _hd_cs_lock:
+                        previous = store.get(key)
+                        store[key] = value
+                        store.move_to_end(key)
+                        while len(store) > _HD_CS_MAX:
+                            store.popitem(last=False)
+                    return previous
+
+                _hd_cs_orig_compress = (
+                    _hd_cs_openai.OpenAIHandlerMixin
+                    ._compress_openai_responses_payload_in_executor
+                )
+
+                async def _hd_cs_compress(self, payload, **kwargs):
+                    # Keyed BEFORE the pass so a rewritten first user message
+                    # cannot move the key mid-conversation.
+                    key = None
+                    try:
+                        if isinstance(payload, dict):
+                            key = _hd_cs_conv_key(payload)
+                    except Exception:
+                        key = None
+                    result = await _hd_cs_orig_compress(self, payload, **kwargs)
+                    try:
+                        rid = kwargs.get("request_id")
+                        # result is (body, modified, tokens_saved, ...). A pass
+                        # that changed nothing saves nothing and must not reset
+                        # the running total, so only modified passes register.
+                        if rid and key and result[1]:
+                            _hd_cs_bounded(_hd_cs_pending, rid, (key, int(result[2])))
+                    except Exception:
+                        pass
+                    return result
+
+                _hd_cs_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
+                    _hd_cs_compress
+                )
+
+                _hd_cs_orig_record = _hd_cs_server.HeadroomProxy._record_request_outcome
+
+                async def _hd_cs_record(self, outcome):
+                    token = None
+                    try:
+                        rid = getattr(outcome, "request_id", None)
+                        entry = None
+                        if rid:
+                            with _hd_cs_lock:
+                                entry = _hd_cs_pending.get(rid)
+                        if entry is not None:
+                            key, total = entry
+                            total = max(0, int(total))
+                            previous = _hd_cs_bounded(_hd_cs_seen, key, total)
+                            # A total that went DOWN means the transcript shrank
+                            # under it (a compaction, or a client dropping
+                            # history): nothing was removed for the first time,
+                            # and the next turn counts from the lower base.
+                            token = _hd_cs_novel.set(max(0, total - (previous or 0)))
+                    except Exception:
+                        token = None
+                    try:
+                        return await _hd_cs_orig_record(self, outcome)
+                    finally:
+                        if token is not None:
+                            _hd_cs_novel.reset(token)
+
+                _hd_cs_server.HeadroomProxy._record_request_outcome = _hd_cs_record
+
+                _hd_cs_orig_metrics = _hd_cs_prom.PrometheusMetrics.record_request
+
+                async def _hd_cs_metrics(self, **kwargs):
+                    novel = _hd_cs_novel.get()
+                    if novel is not None and "tokens_saved" in kwargs:
+                        kwargs["tokens_saved"] = novel
+                    return await _hd_cs_orig_metrics(self, **kwargs)
+
+                _hd_cs_prom.PrometheusMetrics.record_request = _hd_cs_metrics
+
+                _hd_cs_orig_cost = _hd_cs_cost.CostTracker.record_tokens
+
+                def _hd_cs_cost_record(self, model, tokens_saved, tokens_sent, **kwargs):
+                    novel = _hd_cs_novel.get()
+                    if novel is not None:
+                        tokens_saved = novel
+                    return _hd_cs_orig_cost(self, model, tokens_saved, tokens_sent, **kwargs)
+
+                _hd_cs_cost.CostTracker.record_tokens = _hd_cs_cost_record
+    except Exception:
+        pass
+
 
 # --- Tool-search history repair: both block shapes, keyed on absence (vendor) --
 # With ENABLE_TOOL_SEARCH=true the Claude Code client runs its OWN tool search and
@@ -2156,6 +2343,187 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # Response-shaping only: on any binding failure the client sees the
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
+
+# --- Thinking signatures are not input tokens (upstream PR #3482) -----------
+# The shared block walker (BaseTokenizer._count_content_parts, borrowed by every
+# provider counter via count_content_blocks) had no `thinking` branch, so the
+# JSON catch-all priced the ~1 KB opaque `signature` per block as text: 99
+# signatures were 256K of 414K counted tokens on one 369-message Claude Code
+# session, against ~313K provider-billed. Only the thinking text is input.
+# Wraps the walker to swap each signed thinking block for a text block of its
+# thinking text; every other block goes through the walker untouched.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
+_hd_sig_flag = _hd_os.environ.get("HEADROOM_THINKING_SIG_TOKENS", "1")
+if _hd_sig_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_sig_meta
+
+        if _hd_sig_meta.version("headroom-ai") == "0.37.0":
+            from headroom.tokenizers import base as _hd_sig_base
+
+            _hd_sig_orig = _hd_sig_base.BaseTokenizer._count_content_parts
+
+            def _hd_sig_is_thinking(part):
+                return isinstance(part, dict) and part.get("type") == "thinking"
+
+            def _hd_sig_count(self, parts):
+                # Every thinking block, signed or not, counts as its text so
+                # the two shapes price identically (the catch-all also added
+                # JSON overhead to the unsigned form).
+                if isinstance(parts, list) and any(_hd_sig_is_thinking(p) for p in parts):
+                    parts = [
+                        {"type": "text", "text": p.get("thinking", "") or ""}
+                        if _hd_sig_is_thinking(p)
+                        else p
+                        for p in parts
+                    ]
+                return _hd_sig_orig(self, parts)
+
+            _hd_sig_base.BaseTokenizer._count_content_parts = _hd_sig_count
+    except Exception:
+        # Counting only: on any binding failure the walker keeps the wheel's
+        # own (overcounting) behavior, never a new failure.
+        pass
+
+
+# --- Fresh cache_control blocks are compressible (upstream PR #3483) ---------
+# ContentRouter._process_content_blocks hard-skips any block carrying
+# cache_control so a cached key is never busted. Claude Code stamps the marker
+# on its newest tool_use AND newest tool_result every turn, so the freshest
+# tool output -- the one block Headroom gets a clean shot at before the prefix
+# floor freezes it -- was skipped by rule (1,229 cache_control_protected visits
+# across 650 requests on 2026-09-08). The request's FINAL user/tool message has
+# never been forwarded, so no provider key exists for it: the marker there is
+# the client staking out next turn's breakpoint, and whatever we forward is
+# what gets cached. The wrapper peels the marker off that message's tool_result
+# blocks (text blocks are the user's prompt and keep the hard skip),
+# runs the wheel's router unchanged, and re-attaches the marker to the same
+# slot (every router branch appends exactly one block per input block, and
+# every rewrite spreads the source block, so the slot mapping is 1:1). If the
+# output shape ever differs, the untouched message is returned: no compression
+# that turn, marker intact, which is the pre-vendor behavior.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_FRESH_CC_COMPRESS=0.
+_hd_fcc_flag = _hd_os.environ.get("HEADROOM_FRESH_CC_COMPRESS", "1")
+if _hd_fcc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_fcc_meta
+
+        if _hd_fcc_meta.version("headroom-ai") == "0.37.0":
+            from headroom.transforms import content_router as _hd_fcc_cr
+
+            _hd_fcc_orig = _hd_fcc_cr.ContentRouter._process_content_blocks
+
+            def _hd_fcc_process(self, message, content_blocks, *args, **kwargs):
+                if (
+                    kwargs.get("messages_from_end") != 1
+                    or not isinstance(message, dict)
+                    or message.get("role") not in ("user", "tool")
+                    or not isinstance(content_blocks, list)
+                ):
+                    return _hd_fcc_orig(self, message, content_blocks, *args, **kwargs)
+                peeled = []
+                markers = {}
+                for idx, block in enumerate(content_blocks):
+                    # Only tool output is released; a marked text block is the
+                    # user's prompt and keeps the wheel's hard skip.
+                    if (
+                        isinstance(block, dict)
+                        and "cache_control" in block
+                        and block.get("type") == "tool_result"
+                    ):
+                        bare = dict(block)
+                        markers[idx] = bare.pop("cache_control")
+                        peeled.append(bare)
+                    else:
+                        peeled.append(block)
+                if not markers:
+                    return _hd_fcc_orig(self, message, content_blocks, *args, **kwargs)
+                shadow = dict(message)
+                shadow["content"] = peeled
+                result = _hd_fcc_orig(self, shadow, peeled, *args, **kwargs)
+                out = result.get("content") if isinstance(result, dict) else None
+                if not isinstance(out, list) or len(out) != len(peeled):
+                    return message
+                for idx, marker in markers.items():
+                    block = out[idx]
+                    if not isinstance(block, dict):
+                        return message
+                    # `peeled[idx]` and every router rewrite are our own dicts;
+                    # the client's original block is never mutated.
+                    out[idx] = {**block, "cache_control": marker}
+                return result
+
+            _hd_fcc_cr.ContentRouter._process_content_blocks = _hd_fcc_process
+    except Exception:
+        pass
+
+
+# --- Kompress marker follows the saving (upstream PR #3484) -----------------
+# KompressCompressor appended its CCR retrieval marker only below ratio 0.8.
+# The router accepts any shrink (min_ratio 1.0) and, per #1307, discards a
+# lossy result that carries no marker, so every 1-20 percent shrink ran the
+# model and was thrown away (218 lossy_unrecoverable_skipped on 2026-09-08).
+# Post-processes both compress paths: a shrunk, unmarked result whose saving
+# exceeds the marker's own cost gets stored in the CCR store and marked with
+# the wheel's own marker function. Already-marked, passthrough and sub-marker
+# results are returned as-is. Composes with the shared-budget wrapper above
+# (outer wrapper; that one only substitutes passthroughs).
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_KOMPRESS_MARKER_GATE=0.
+_hd_kmg_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_MARKER_GATE", "1")
+if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_kmg_meta
+
+        if _hd_kmg_meta.version("headroom-ai") == "0.37.0":
+            from headroom.transforms import kompress_compressor as _hd_kmg_kc
+
+            _HD_KMG_MARKER_WORDS = 13
+            _hd_kmg_orig = _hd_kmg_kc.KompressCompressor.compress
+            _hd_kmg_orig_batch = _hd_kmg_kc.KompressCompressor.compress_batch
+
+            def _hd_kmg_mark(self, result, ccr_source):
+                try:
+                    if (
+                        getattr(result, "cache_key", None) is not None
+                        or not getattr(self.config, "enable_ccr", False)
+                        or result.compressed == result.original
+                        or result.original_tokens - result.compressed_tokens
+                        <= _HD_KMG_MARKER_WORDS
+                    ):
+                        return result
+                    source = ccr_source if ccr_source is not None else result.original
+                    key = self._store_in_ccr(source, result.compressed, len(source.split()))
+                    if key:
+                        result.cache_key = key
+                        result.compressed += _hd_kmg_kc.ccr_retrieval_marker(
+                            result.original_tokens, result.compressed_tokens, source, key
+                        )
+                except Exception:
+                    pass
+                return result
+
+            def _hd_kmg_compress(self, *args, **kwargs):
+                result = _hd_kmg_orig(self, *args, **kwargs)
+                return _hd_kmg_mark(self, result, kwargs.get("ccr_original"))
+
+            def _hd_kmg_batch(self, *args, **kwargs):
+                results = _hd_kmg_orig_batch(self, *args, **kwargs)
+                originals = kwargs.get("ccr_originals")
+                if isinstance(results, list):
+                    for i, r in enumerate(results):
+                        src = (
+                            originals[i]
+                            if isinstance(originals, list) and i < len(originals)
+                            else None
+                        )
+                        results[i] = _hd_kmg_mark(self, r, src)
+                return results
+
+            _hd_kmg_kc.KompressCompressor.compress = _hd_kmg_compress
+            _hd_kmg_kc.KompressCompressor.compress_batch = _hd_kmg_batch
+    except Exception:
+        pass
+
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
@@ -9408,9 +9776,10 @@ pub(crate) fn redact_sensitive(line: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let rest = &line[i..];
-        if let Some(consumed) = match_redactable(rest) {
+        if let Some((keep, redact)) = match_redactable(rest) {
+            out.push_str(&rest[..keep]);
             out.push_str("[REDACTED]");
-            i += consumed;
+            i += keep + redact;
         } else {
             let ch = rest.chars().next().unwrap();
             out.push(ch);
@@ -9420,14 +9789,36 @@ pub(crate) fn redact_sensitive(line: &str) -> String {
     out
 }
 
-/// If `rest` starts with a redactable token, return the byte length to skip.
-fn match_redactable(rest: &str) -> Option<usize> {
+/// Names that make whatever follows `=` or `:` a secret, regardless of shape.
+///
+/// The two token prefixes below only ever caught OUR OWN credentials. A user's
+/// are arbitrary strings and are recognisable only by what they are called --
+/// RUST-B7 carried `PGPASSWORD=0000` and a second live database password out of
+/// a user's generated CLAUDE.md and into a Sentry event in the clear, because
+/// the learn tail echoes memory files and Sentry's server-side scrubber did not
+/// match these keys either. Matched case-insensitively as a SUBSTRING of the
+/// name, so `PGPASSWORD`, `MYSQL_ROOT_PASSWORD` and `password` all hit.
+const SECRET_NAME_MARKERS: [&str; 7] = [
+    "PASSWORD",
+    "PASSWD",
+    "SECRET",
+    "APIKEY",
+    "API_KEY",
+    "TOKEN",
+    "CREDENTIAL",
+];
+
+/// If `rest` starts with something redactable, return `(keep, redact)`: the
+/// byte length to copy through verbatim, then the byte length to replace with
+/// `[REDACTED]`. `keep` is non-zero only for a named assignment, where the name
+/// is what makes the event diagnosable at all and the value is the secret.
+fn match_redactable(rest: &str) -> Option<(usize, usize)> {
     if let Some(after) = rest.strip_prefix("sk-ant-") {
         let token_len = after
             .bytes()
             .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
             .count();
-        return Some("sk-ant-".len() + token_len);
+        return Some((0, "sk-ant-".len() + token_len));
     }
     for prefix in ["Bearer ", "bearer "] {
         if let Some(after) = rest.strip_prefix(prefix) {
@@ -9439,11 +9830,71 @@ fn match_redactable(rest: &str) -> Option<usize> {
                 })
                 .count();
             if token_len >= 8 {
-                return Some(prefix.len() + token_len);
+                return Some((0, prefix.len() + token_len));
             }
         }
     }
-    None
+    match_secret_assignment(rest)
+}
+
+/// `NAME=value` or `NAME: value` where NAME names a secret. Keeps the name and
+/// separator, redacts the value up to the next whitespace or quote.
+///
+/// Called at every byte offset by `redact_sensitive`, so it only ever sees a
+/// name that starts here; a mid-word offset is unreachable because the first
+/// match consumes the whole assignment.
+fn match_secret_assignment(rest: &str) -> Option<(usize, usize)> {
+    let name_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(*b, b'_' | b'-'))
+        .count();
+    // Bounded so a long alphanumeric blob that happens to contain "token"
+    // cannot turn into a name.
+    if name_len == 0 || name_len > 64 {
+        return None;
+    }
+    let upper = rest[..name_len].to_ascii_uppercase();
+    // `max_tokens=`, `input_tokens:`, `tokens_saved:` are counts, and every
+    // learn tail and proxy log line carries them; redacting those would gut
+    // the diagnostic value the tail exists for.
+    if upper.contains("TOKENS") {
+        return None;
+    }
+    if !SECRET_NAME_MARKERS.iter().any(|m| upper.contains(m)) {
+        return None;
+    }
+    let after = &rest[name_len..];
+    let sep_len = if let Some(v) = after.strip_prefix('=') {
+        // `NAME=` with nothing after it is a shape we should not eat.
+        if v.is_empty() {
+            return None;
+        }
+        1
+    } else if after.starts_with(": ") {
+        2
+    } else if after.starts_with(':') {
+        1
+    } else {
+        return None;
+    };
+    // A quoted value is read to its closing quote; an unquoted one stops at the
+    // first whitespace. Either way the quotes themselves are kept, so the line
+    // still reads as the shell/YAML it came from and the surrounding prose --
+    // which is the whole diagnostic value of the tail -- survives intact.
+    let value_area = &after[sep_len..];
+    let quote = value_area
+        .bytes()
+        .next()
+        .filter(|b| matches!(*b, b'"' | b'\'' | b'`'));
+    let open_len = usize::from(quote.is_some());
+    let value_len = value_area[open_len..]
+        .bytes()
+        .take_while(|b| match quote {
+            Some(q) => *b != q && *b != b'\n',
+            None => !b.is_ascii_whitespace() && !matches!(*b, b'"' | b'\'' | b'`'),
+        })
+        .count();
+    (value_len > 0).then_some((name_len + sep_len + open_len, value_len))
 }
 
 /// Newest `headroom-proxy*.log` in the logs directory, if any.
@@ -13293,6 +13744,141 @@ mod tests {
     }
 
     #[test]
+    fn conversation_savings_behaves_against_the_installed_wheel() {
+        // The per-conversation vendor rewrites the value INSIDE
+        // PrometheusMetrics.record_request / CostTracker.record_tokens, so a
+        // string assertion on the blob proves nothing. This runs the shipped
+        // sitecustomize against the installed wheel and asserts the whole
+        // contract: turn one counts in full, turn two counts only the growth,
+        // a compaction counts zero, the per-request log keeps the wire figure,
+        // paths with no conversation identity are untouched, and the kill
+        // switch unbinds. The probe also proves this vendor coexists with the
+        // others that wrap the same two seams.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-conversation-savings.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hd-conv-savings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run conversation-savings probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that ships #3480 leaves this vendor inert by design, and the
+        // probe's first check is the binding signal.
+        if stdout.contains("FAIL cs bound") {
+            eprintln!("skipping: conversation-savings vendor did not bind (wheel ships #3480?)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK conversation-savings"),
+            "per-conversation savings accounting misbehaved against the installed wheel.\n\
+             Shipping this wrong moves every Codex savings number the product is\n\
+             trusted for.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn sitecustomize_vendors_compression_fixes() {
+        // Three upstream PRs (#3482, #3483, #3484) vendored while 0.37.0 is the pin: thinking
+        // signatures out of the token count, fresh cache_control blocks
+        // compressible, Kompress marker following the saving. Behaviour is
+        // proven by compression_vendors_behave_against_the_installed_wheel;
+        // this pins the shape and the exact-pin gates.
+        let py = super::SITECUSTOMIZE_PY;
+        for (flag, gate, bind) in [
+            (
+                "HEADROOM_THINKING_SIG_TOKENS",
+                r#"_hd_sig_meta.version("headroom-ai") == "0.37.0""#,
+                "_hd_sig_base.BaseTokenizer._count_content_parts = _hd_sig_count",
+            ),
+            (
+                "HEADROOM_FRESH_CC_COMPRESS",
+                r#"_hd_fcc_meta.version("headroom-ai") == "0.37.0""#,
+                "_hd_fcc_cr.ContentRouter._process_content_blocks = _hd_fcc_process",
+            ),
+            (
+                "HEADROOM_KOMPRESS_MARKER_GATE",
+                r#"_hd_kmg_meta.version("headroom-ai") == "0.37.0""#,
+                "_hd_kmg_kc.KompressCompressor.compress_batch = _hd_kmg_batch",
+            ),
+        ] {
+            assert!(py.contains(flag), "{flag} kill switch missing");
+            assert!(py.contains(gate), "{flag} exact-pin gate missing");
+            assert!(py.contains(bind), "{flag} seam binding missing");
+        }
+        // The fresh-turn wrapper must fail to the untouched message, never to
+        // a marker-less block (that would move the client's breakpoint).
+        assert!(py.contains("if not isinstance(out, list) or len(out) != len(peeled):\n                    return message"));
+    }
+
+    #[test]
+    fn compression_vendors_behave_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel and
+        // asserts each vendor's contract end to end: a signed thinking block
+        // counts the same as an unsigned one on both walkers; a final-message
+        // tool_result with cache_control is compressed and keeps its marker
+        // while an earlier one stays protected; a Kompress result that shrinks
+        // 20 percent gets a retrieval marker and one that saves less than the
+        // marker does not; and the three kill switches unbind.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-compression-vendors.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hd-comp-vendors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run compression-vendors probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that ships the fixes leaves the vendors inert by design; the
+        // probe's binding checks are the signal.
+        if stdout.contains("FAIL sig bound")
+            || stdout.contains("FAIL fcc bound")
+            || stdout.contains("FAIL kmg bound")
+        {
+            eprintln!("skipping: a compression vendor did not bind (wheel ships the fix?)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK compression-vendors"),
+            "compression vendors misbehaved against the installed wheel.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
     fn tool_search_history_repair_behaves_against_the_installed_wheel() {
         // The tool_reference 400 ("... not found in available tools") lived in
         // the WHEEL's history repair, not the string blob. This runs the shipped
@@ -13821,6 +14407,49 @@ mod tests {
         assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"), "leak: {out}");
         assert!(out.contains("[REDACTED]"));
         assert!(out.contains("trailing"));
+    }
+
+    /// RUST-B7: a user's learn tail reached Sentry carrying two live database
+    /// passwords in the clear. The name survives (it is what makes the event
+    /// readable); the value does not.
+    #[test]
+    fn redact_sensitive_strips_named_secret_values() {
+        let line = "- Local DB: `PGPASSWORD=0000 psql -h localhost -U postgresql -d ontrace`; \
+                    test DB: `PGPASSWORD=ontrace_test psql`";
+        let out = redact_sensitive(line);
+        assert!(!out.contains("0000"), "{out}");
+        assert!(!out.contains("ontrace_test psql"), "{out}");
+        // The name stays so the event still says WHAT leaked.
+        assert!(out.contains("PGPASSWORD=[REDACTED]"), "{out}");
+        // Surrounding prose is intact: the value stops at whitespace.
+        assert!(out.contains("psql -h localhost"), "{out}");
+        assert!(out.contains("-d ontrace`"), "{out}");
+
+        // Case-insensitive, and the `: ` separator.
+        let yaml = redact_sensitive("api_key: sk_live_abc123\ndb_password: hunter2");
+        assert!(!yaml.contains("sk_live_abc123"), "{yaml}");
+        assert!(!yaml.contains("hunter2"), "{yaml}");
+        assert!(yaml.contains("api_key: [REDACTED]"), "{yaml}");
+
+        // A quoted value keeps its closing quote.
+        let quoted = redact_sensitive("SECRET_TOKEN=\"abc123\"");
+        assert!(!quoted.contains("abc123"), "{quoted}");
+        assert!(quoted.ends_with('"'), "{quoted}");
+    }
+
+    /// The matcher must not eat prose that merely mentions a secret-ish word,
+    /// or the tail stops being diagnosable (the RUST-BC lesson).
+    #[test]
+    fn redact_sensitive_leaves_secret_words_without_values_alone() {
+        for line in [
+            "the password was rejected by the server",
+            "Error: invalid token",
+            "PASSWORD=",
+            "refresh_token expired at 12:04",
+            "max_tokens=4000 input_tokens: 1234 tokens_saved: 9",
+        ] {
+            assert_eq!(redact_sensitive(line), line, "{line}");
+        }
     }
 
     #[test]

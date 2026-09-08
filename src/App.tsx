@@ -97,6 +97,7 @@ import {
   forgoneSavingsLabel,
   paybackLabel,
   recentDailySavingsUsd,
+  unsavedWhileBlockedLabel,
   setServerPlanPrices,
   tierRecommendationSourceLabel,
   scheduledPlanChange,
@@ -1688,7 +1689,9 @@ export default function App() {
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
   const [appUpdateInstallBusy, setAppUpdateInstallBusy] = useState(false);
   const [appUpdateRestartBusy, setAppUpdateRestartBusy] = useState(false);
-  const [appUpdateReadyToRestart, setAppUpdateReadyToRestart] = useState(false);
+  const [appUpdateStagedVersion, setAppUpdateStagedVersion] = useState<string | null>(null);
+  const appUpdateReadyToRestart = appUpdateStagedVersion != null;
+  const displayedUpdateInstalled = appUpdateAvailable?.version === appUpdateStagedVersion;
   const [showAppUpdateDialog, setShowAppUpdateDialog] = useState(false);
   const [appUpdateStatusCopy, setAppUpdateStatusCopy] = useState<string | null>(null);
   const [showHeadroomDetails, setShowHeadroomDetails] = useState(false);
@@ -1738,6 +1741,8 @@ export default function App() {
   const activityTabTrackedRef = useRef(false);
   const [activityFeedError, setActivityFeedError] = useState<string | null>(null);
   const [pricingStatus, setPricingStatus] = useState<HeadroomPricingStatus | null>(null);
+  // Request bytes forwarded unoptimized while gated; see unsavedWhileBlockedLabel.
+  const [gatedBypassBytes, setGatedBypassBytes] = useState(0);
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
   const [pricingError, setPricingError] = useState<string | null>(null);
@@ -1869,7 +1874,7 @@ export default function App() {
   // showing per app run instead of resurrecting itself on every poll.
   const forcedSetupStallFiredRef = useRef(false);
   const appUpdateKnownVersionRef = useRef<string | null>(null);
-  const appUpdateReadyToRestartRef = useRef(false);
+  const appUpdateStagedVersionRef = useRef<string | null>(null);
   const appUpdateBusyRef = useRef(false);
   const appUpdateInstallBusyRef = useRef(false);
   const launcherHideAnimationMs = 320;
@@ -2868,7 +2873,6 @@ export default function App() {
 
     const runBackgroundCheck = () => {
       if (
-        appUpdateReadyToRestartRef.current ||
         appUpdateBusyRef.current ||
         appUpdateInstallBusyRef.current ||
         // Don't fire an "update available" notification while first-install
@@ -2905,8 +2909,8 @@ export default function App() {
   }, [appUpdateAvailable?.version]);
 
   useEffect(() => {
-    appUpdateReadyToRestartRef.current = appUpdateReadyToRestart;
-  }, [appUpdateReadyToRestart]);
+    appUpdateStagedVersionRef.current = appUpdateStagedVersion;
+  }, [appUpdateStagedVersion]);
 
   useEffect(() => {
     appUpdateBusyRef.current = appUpdateBusy;
@@ -3747,8 +3751,8 @@ export default function App() {
     if (Object.prototype.hasOwnProperty.call(patch, "availableUpdate")) {
       setAppUpdateAvailable(patch.availableUpdate ?? null);
     }
-    if (Object.prototype.hasOwnProperty.call(patch, "readyToRestart")) {
-      setAppUpdateReadyToRestart(patch.readyToRestart ?? false);
+    if (patch.stagedVersion) {
+      setAppUpdateStagedVersion(patch.stagedVersion);
     }
     if (Object.prototype.hasOwnProperty.call(patch, "showDialog")) {
       setShowAppUpdateDialog(patch.showDialog ?? false);
@@ -3793,7 +3797,14 @@ export default function App() {
     }
 
     try {
-      const patch = await runAppUpdateCheck({ background, knownUpdateVersion });
+      const patch = await runAppUpdateCheck({
+        background,
+        knownUpdateVersion,
+        // Keeps checking while an update sits staged: the echo of the staged
+        // version comes back as an empty patch (so it can't clear the
+        // "restart to finish" state), a newer one re-stages on top.
+        stagedVersion: appUpdateStagedVersionRef.current,
+      });
       applyAppUpdatePatch(patch);
 
       if (background && patch.availableUpdate) {
@@ -3974,8 +3985,15 @@ export default function App() {
         setAuthCode("");
         setAuthCodeRequestedFor(null);
       }
+      // While gated, make the wall felt: how much went through unoptimized.
+      let unsavedLabel: string | null = null;
+      if (!status.optimizationAllowed || status.codex?.optimizationAllowed === false) {
+        const bytes = await invoke<number>("get_gated_bypass_bytes").catch(() => 0);
+        setGatedBypassBytes(bytes);
+        unsavedLabel = unsavedWhileBlockedLabel(bytes, dashboard.dailySavings);
+      }
       void maybeFireTrialNotifications(status);
-      void maybeFireUrgentPricingNotifications(status);
+      void maybeFireUrgentPricingNotifications(status, unsavedLabel);
       setPricingError(null);
     } catch (error) {
       setPricingError(
@@ -5985,7 +6003,7 @@ export default function App() {
             </p>
           ) : null}
           <p className="paywall__detection">
-            Pick the tier that matches your Claude or ChatGPT plan • <strong>7-day free trial</strong>.
+            Pick the tier that matches your Claude or ChatGPT plan • <strong>free trial: 7 days of use</strong>.
           </p>
           {!signedIn ? (
             <AuthCodeForm
@@ -6520,10 +6538,14 @@ export default function App() {
       return subscriptionTierLabel(pricingStatus.account.subscriptionTier);
     }
     if (pricingStatus.account.trialActive) {
+      const usageDaysLeft = pricingStatus.account.trialUsageDaysLeft;
+      if (usageDaysLeft != null) {
+        return `${usageDaysLeft} day${usageDaysLeft === 1 ? "" : "s"} of use left in trial`;
+      }
       if (trialDaysRemaining != null) {
         return `${trialDaysRemaining} day${trialDaysRemaining === 1 ? "" : "s"} left in trial`;
       }
-      return "7-day trial";
+      return "Free trial";
     }
     return "Trial expired";
   })();
@@ -6575,21 +6597,27 @@ export default function App() {
       };
     }
     if (pricingStatus.account?.trialActive) {
+      // Usage-day trials count saving days, so "3 more days of use" is the
+      // honest label; calendar trials keep the countdown.
+      const usageDaysLeft = pricingStatus.account.trialUsageDaysLeft;
       const daysLabel =
         trialDaysRemaining != null
           ? `${trialDaysRemaining} day${trialDaysRemaining === 1 ? "" : "s"}`
           : "7 days";
       return {
         tone: "warning" as const,
-        message: `${daysLabel} of trial to go. Upgrade to continue using Headroom without limits.`,
+        message:
+          usageDaysLeft != null
+            ? `${usageDaysLeft} more day${usageDaysLeft === 1 ? "" : "s"} of use left in your trial. Upgrade to continue using Headroom without limits.`
+            : `${daysLabel} of trial to go. Upgrade to continue using Headroom without limits.`,
         actionLabel: "Upgrade",
         onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
       };
     }
+    const unsaved = unsavedWhileBlockedLabel(gatedBypassBytes, dashboard.dailySavings);
     return {
       tone: "expired" as const,
-      message:
-        "Your 7-day trial has ended. Upgrade to keep Headroom optimizing your prompts.",
+      message: `Your trial has ended.${unsaved ? ` ${unsaved}` : ""} Upgrade to keep Headroom optimizing your prompts.`,
       actionLabel: "Upgrade",
       onAction: () => void handleUpgradeAction(upgradeDefaultPlanId)
     };
@@ -8703,12 +8731,12 @@ export default function App() {
             <div className="modal-backdrop" role="dialog" aria-modal="true">
               <div className="modal-card">
                 <h3>
-                  {appUpdateReadyToRestart
+                  {displayedUpdateInstalled
                     ? `Restart to finish updating to ${appUpdateAvailable.version}`
                     : `Headroom ${appUpdateAvailable.version} is available`}
                 </h3>
                 <p>
-                  {appUpdateReadyToRestart
+                  {displayedUpdateInstalled
                     ? "The new version has been installed. Restart Headroom when you're ready to switch over."
                     : "Headroom found a new release in the background. Nothing will install until you confirm it here."}
                 </p>
@@ -8729,6 +8757,16 @@ export default function App() {
                   <p className="app-update-card__summary">{appUpdateStatusCopy}</p>
                 ) : null}
                 <div className="modal-actions">
+                  {appUpdateStagedVersion && !displayedUpdateInstalled ? (
+                    <button
+                      className="secondary-button"
+                      disabled={appUpdateInstallBusy || appUpdateRestartBusy}
+                      onClick={() => restartIntoInstalledUpdate()}
+                      type="button"
+                    >
+                      Restart into {appUpdateStagedVersion}
+                    </button>
+                  ) : null}
                   <button
                     className="secondary-button"
                     disabled={appUpdateInstallBusy || appUpdateRestartBusy}
@@ -8741,7 +8779,7 @@ export default function App() {
                     className="primary-button"
                     disabled={appUpdateInstallBusy || appUpdateRestartBusy}
                     onClick={() =>
-                      appUpdateReadyToRestart
+                      displayedUpdateInstalled
                         ? restartIntoInstalledUpdate()
                         : void installAvailableUpdate()
                     }
@@ -8751,7 +8789,7 @@ export default function App() {
                       ? "Restarting…"
                       : appUpdateInstallBusy
                         ? "Installing…"
-                        : appUpdateReadyToRestart
+                        : displayedUpdateInstalled
                           ? "Restart now"
                           : `Install ${appUpdateAvailable.version}`}
                   </button>

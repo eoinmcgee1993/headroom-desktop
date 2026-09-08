@@ -82,10 +82,13 @@ const SENTRY_DSN: Option<&str> = option_env!("HEADROOM_SENTRY_DSN");
 const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk3QkUyNEU0MjVBMkRDM0MKUldRODNLSWw1Q1MrbC93MitlYTVoUXViSXJQNGVQWDdBRXA0Qkl4WGtpSEttNm5YTDB3QWtncEoK";
 const DEFAULT_UPDATER_ENDPOINT: &str =
     "https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json";
-/// Cadence of the background liveness ping. Long enough to be negligible
-/// backend load (4 calls/day/user), short enough that admin can tell a
-/// running-but-idle app from a quit one within half a day.
-const LIVENESS_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+/// Cadence of the background pricing loop. It only fetches when nothing
+/// else (the webview poll, a deep link) has in the last interval, so a
+/// healthy app adds no backend load; a stalled webview still gets a
+/// pricing verdict applied within this window. Doubles as the liveness
+/// ping (was 6h read-only; a hidden window's poll can stall under App
+/// Nap, and nothing else applied the trial wall to a running app).
+const PRICING_LOOP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const BETA_CHANNEL_ENV: &str = "HEADROOM_BETA_CHANNEL";
 const BETA_CHANNEL_SENTINEL: &str = "beta_channel";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
@@ -3588,6 +3591,14 @@ fn get_intercept_request_counts_by_agent() -> std::collections::HashMap<String, 
     proxy_intercept::intercept_request_counts()
 }
 
+/// Request bytes forwarded unoptimized while the pricing gate was on (this
+/// process). The gate card turns it into "about N tokens went through
+/// unoptimized" using the user's own savings rate.
+#[tauri::command]
+fn get_gated_bypass_bytes() -> u64 {
+    proxy_intercept::gated_bypass_bytes()
+}
+
 /// Running agent processes keyed by connector id, for the verify screen's
 /// "these sessions still hold old settings" callout. Undercounts are fine
 /// (the callout just stays quiet); false positives are not, so matching is
@@ -3880,11 +3891,7 @@ async fn get_headroom_pricing_status(
     // "Headroom optimization actually resumes" — without this, the pricing
     // gate's bypass flag would stay set and Python would stay down until
     // the next app launch.
-    state.apply_pricing_gate_status(
-        &status,
-        crate::client_adapters::any_gate_exempt_client_enabled(),
-    );
-    state.apply_codex_pricing_gate_status(status.codex.as_ref());
+    state.apply_pricing_gates(&status);
     state.report_weekly_limit_transitions(&status);
     Ok(status)
 }
@@ -3925,11 +3932,7 @@ fn handle_headroom_deep_link(app: &AppHandle, url: &tauri::Url) {
         let state: tauri::State<'_, AppState> = app_handle.state();
         match pricing::get_pricing_status(&state) {
             Ok(status) => {
-                state.apply_pricing_gate_status(
-                    &status,
-                    crate::client_adapters::any_gate_exempt_client_enabled(),
-                );
-                state.apply_codex_pricing_gate_status(status.codex.as_ref());
+                state.apply_pricing_gates(&status);
                 // Payload-less on purpose: this status was fetched before any
                 // magic link in the same URL was redeemed, so it is stale by
                 // the time it lands. The frontend refetches instead.
@@ -4033,11 +4036,7 @@ async fn verify_headroom_auth_code(
         let status = status.clone();
         std::thread::spawn(move || {
             let state: tauri::State<'_, AppState> = app_handle.state();
-            state.apply_pricing_gate_status(
-                &status,
-                crate::client_adapters::any_gate_exempt_client_enabled(),
-            );
-            state.apply_codex_pricing_gate_status(status.codex.as_ref());
+            state.apply_pricing_gates(&status);
         });
     }
     analytics::track_event(
@@ -4288,7 +4287,16 @@ fn run_activity_observation(app: &AppHandle) {
     // machine's feed is dead". See `FEED_FETCH_FAILURE_GRACE`.
     static FEED_FAILING_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-    if should_pull_transformations_feed() {
+    // The intercept answers every local path 503 while the backend is
+    // unreachable, so a backend the app itself is holding down (paused, auto-
+    // paused after a crash, or still starting -- update maintenance alone has
+    // run 10+ minutes) outlives the grace and files a dead-feed report for a
+    // machine where nothing is wrong (RUST-DD regressed on 0.9.12 with the
+    // grace in place). The canary is for a backend that is UP and still
+    // failing; only count the streak while the app expects it to be up.
+    if state.runtime_is_paused() || state.runtime_is_auto_paused() || state.runtime_is_starting() {
+        *FEED_FAILING_SINCE.lock() = None;
+    } else if should_pull_transformations_feed() {
         match fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
             Ok(feed) => {
                 *FEED_FAILING_SINCE.lock() = None;
@@ -5140,21 +5148,32 @@ async fn detect_unrouted_clients(
             if !client_adapters::client_ran_unrouted(activity, requests, app_started_at, now) {
                 continue;
             }
-            // One report per activity timestamp: the condition holds for the
-            // whole 24h window, so the hourly rescan re-filed the same stale
-            // session every hour (nine events per host per day on RUST-2K).
+            // One report per client per DAY. The condition is defined over a
+            // 24h window (`requests_since_yesterday`), so once it holds it
+            // holds for that whole window and every rescan inside it can only
+            // re-file the same fact.
+            //
+            // Keying on the ACTIVITY timestamp instead was the RUST-2K fix, and
+            // it only covered half the shape: it silences a host whose agent is
+            // IDLE, because the transcript mtime is then frozen and compares
+            // equal. A host actively working outside Headroom -- which is the
+            // case worth alerting on -- advances that mtime every few seconds,
+            // so every hourly scan saw a "new" timestamp and reported again.
+            // That is RUST-DN: 11 events from one host in a day, 23 across ten,
+            // the exact churn RUST-2K was meant to end. Throttling on our own
+            // report time covers both shapes with one rule.
             static LAST_REPORTED: OnceLock<
-                Mutex<std::collections::HashMap<&'static str, SystemTime>>,
+                Mutex<std::collections::HashMap<&'static str, Instant>>,
             > = OnceLock::new();
-            if activity.is_some_and(|at| {
-                LAST_REPORTED
-                    .get_or_init(Default::default)
-                    .lock()
-                    .unwrap()
-                    .insert(client_id, at)
-                    == Some(at)
-            }) {
-                continue;
+            {
+                let mut reported = LAST_REPORTED.get_or_init(Default::default).lock().unwrap();
+                if reported
+                    .get(client_id)
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(24 * 3600))
+                {
+                    continue;
+                }
+                reported.insert(client_id, Instant::now());
             }
             let enabled = match client_id {
                 "codex" => client_adapters::is_codex_enabled(),
@@ -6141,30 +6160,35 @@ pub fn run() {
                 })
                 .expect("spawn identity pusher");
 
-            // Liveness ping: an idle app (no agent traffic) otherwise makes
-            // zero backend calls after launch, so the server cannot tell
-            // "running but idle" from "quit" — last_active_at freezes and
-            // check-in emails misfire. get_pricing_status posts grace/start
-            // and, when signed in, GETs desktop/account (which refreshes
-            // last_active_at); it also re-evaluates the server-silent /
-            // auth-silent Sentry alarms on processes that run for days.
-            // Status is read, not applied: gate changes keep flowing through
-            // the existing lifecycle triggers only.
+            // Background pricing loop. Two jobs: (1) liveness - an idle app
+            // (no agent traffic) otherwise makes zero backend calls after
+            // launch, so the server cannot tell "running but idle" from "quit";
+            // get_pricing_status GETs desktop/account, which refreshes
+            // last_active_at, and re-evaluates the server-silent / auth-silent
+            // alarms. (2) The gate: the webview poll was the ONLY trigger that
+            // applied a trial wall to a running app, and it stalls when the
+            // hidden window naps. Skipped whenever something else fetched
+            // status inside the interval, so the fleet call rate is unchanged.
             let app_handle_for_ping = app.handle().clone();
             std::thread::Builder::new()
-                .name("liveness-ping".into())
+                .name("pricing-loop".into())
                 .spawn(move || loop {
-                    std::thread::sleep(LIVENESS_PING_INTERVAL);
+                    std::thread::sleep(PRICING_LOOP_INTERVAL);
+                    if pricing::status_fetched_within(PRICING_LOOP_INTERVAL) {
+                        continue;
+                    }
                     let app_handle = app_handle_for_ping.clone();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let state: tauri::State<'_, AppState> = app_handle.state();
-                        let _ = pricing::get_pricing_status(&state);
+                        if let Ok(status) = pricing::get_pricing_status(&state) {
+                            state.apply_pricing_gates(&status);
+                        }
                     }));
                     if result.is_err() {
-                        log::error!("liveness ping panicked");
+                        log::error!("pricing loop panicked");
                     }
                 })
-                .expect("spawn liveness ping");
+                .expect("spawn pricing loop");
 
             // Start the intercept layer before anything else touches port 6767.
             proxy_intercept::spawn(
@@ -6281,6 +6305,7 @@ pub fn run() {
             get_headroom_request_counts_by_agent,
             get_intercept_request_counts_by_agent,
             get_running_agent_process_counts,
+            get_gated_bypass_bytes,
             install_claude_code_cli,
             get_launch_flags,
             get_rtk_activity,
@@ -6482,6 +6507,23 @@ fn savings_report(dashboard: &DashboardState) -> Option<pricing::SavingsReport> 
 /// The most recent `SAVINGS_REPORT_DAYS` days that saw any traffic, oldest
 /// first. Empty days are skipped so a user who was away for a week still
 /// reports a full window of real activity.
+fn savings_day_end<Tz: chrono::TimeZone>(
+    date: &str,
+    timezone: &Tz,
+) -> Option<chrono::DateTime<Utc>> {
+    let next_day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()?
+        .succ_opt()?;
+    // A DST transition can skip midnight. In that case the local day ends
+    // at the first valid hour of the following date.
+    (0..=3).find_map(|hour| {
+        timezone
+            .from_local_datetime(&next_day.and_hms_opt(hour, 0, 0)?)
+            .earliest()
+            .map(|at| at.with_timezone(&Utc))
+    })
+}
+
 fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay> {
     // The counters use local day keys, exact for the merged series' recent
     // (local-tracker) buckets and approximate for its older UTC rollup days —
@@ -6495,6 +6537,12 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
         .map(|point| {
             let day_counters = counters.get(&point.date);
             pricing::SavingsDay {
+                // Only local-tracker buckets have a local boundary. Backend
+                // rollups are UTC-keyed and carry no new-input dimension; stamping
+                // a local end on them would relabel a UTC day as a local one.
+                day_ends_at: (point.new_input_tokens > 0)
+                    .then(|| savings_day_end(&point.date, &chrono::Local))
+                    .flatten(),
                 date: point.date.clone(),
                 savings_usd: point.estimated_savings_usd,
                 output_savings_usd: point.output_savings_usd,
@@ -7569,7 +7617,21 @@ fn execute_headroom_learn_run(
                 let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
                 let agent_limit_line = learn_failure_agent_limit_line(&stderr).map(str::to_string);
                 let agent_model_rejected = learn_failure_is_agent_model_rejected(&stderr);
-                let user_env_condition = signature.contains("is not readable")
+                // RUST-3F: this used to read `signature.contains(...)`, which is
+                // exactly the mistake the paragraph above warns about. Click
+                // prints its usage banner FIRST and the diagnosis LAST:
+                //
+                //   Usage: headroom learn [OPTIONS]
+                //   Try 'headroom learn --help' for help.
+                //
+                //   Error: Invalid value for '--project': Path '...' is not readable.
+                //
+                // so the signature is always "Usage: headroom learn [OPTIONS]"
+                // and never the verdict. The suppression never fired and every
+                // ejected external volume filed an event. Match the whole
+                // stderr, like the three siblings below.
+                let path_unreadable = stderr.contains("is not readable");
+                let user_env_condition = path_unreadable
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
                     || agent_model_rejected;
@@ -9218,6 +9280,25 @@ mod tests {
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
         }
+    }
+
+    #[test]
+    fn savings_day_end_preserves_local_boundaries_on_both_sides_of_utc() {
+        let west = chrono::FixedOffset::west_opt(7 * 3600).unwrap();
+        let east = chrono::FixedOffset::east_opt(14 * 3600).unwrap();
+        assert_eq!(
+            crate::savings_day_end("2026-09-08", &west)
+                .unwrap()
+                .to_rfc3339(),
+            "2026-09-09T07:00:00+00:00"
+        );
+        assert_eq!(
+            crate::savings_day_end("2026-09-10", &east)
+                .unwrap()
+                .to_rfc3339(),
+            "2026-09-10T10:00:00+00:00"
+        );
+        assert!(crate::savings_day_end("invalid", &west).is_none());
     }
 
     #[test]
@@ -11948,6 +12029,33 @@ Some unrelated content.
             learn_failure_signature_source(preamble).starts_with("onnxruntime 1.20"),
             "preamble-only stderr should fall back to line one"
         );
+    }
+
+    /// RUST-3F: the "project path is not readable" suppression matched the
+    /// SIGNATURE, and Click puts its usage banner first and the verdict last,
+    /// so the signature never contains the verdict and the suppression never
+    /// fired. Every ejected external volume filed an event. Locks in the shape
+    /// that makes signature-matching wrong, so the guard cannot drift back.
+    #[test]
+    fn learn_failure_click_unreadable_project_is_invisible_to_the_signature() {
+        let stderr = "Usage: headroom learn [OPTIONS]\n\
+                      Try 'headroom learn --help' for help.\n\
+                      \n\
+                      Error: Invalid value for '--project': Path \
+                      '/Volumes/zodlightning/sites/nutribaba' is not readable.\n";
+        let signature = normalize_learn_failure_signature(
+            learn_failure_signature_source(stderr)
+                .chars()
+                .take(160)
+                .collect::<String>()
+                .as_str(),
+        );
+        assert!(
+            !signature.contains("is not readable"),
+            "signature must not be what the guard tests: {signature}"
+        );
+        // ...but the raw stderr always is, which is what the guard now reads.
+        assert!(stderr.contains("is not readable"), "{stderr}");
     }
 
     #[test]

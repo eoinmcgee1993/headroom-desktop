@@ -104,6 +104,42 @@ static INTERCEPT_CODEX_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_OPENCODE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static INTERCEPT_GROK_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
+/// Request bytes forwarded unoptimized while the pricing gate was on, this
+/// process. Feeds the "unsaved since Headroom paused" counter in the gate
+/// card: the wall is otherwise invisible from the terminal (measured
+/// 2026-09-07: 191 of 368 lapsed trials kept the app running, blocked).
+/// ponytail: in-memory, resets on relaunch; persist via usage_counters if
+/// the counter proves to move purchases.
+static GATED_BYPASS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn gated_bypass_bytes() -> u64 {
+    GATED_BYPASS_BYTES.load(Ordering::Relaxed)
+}
+
+/// Account-level gate (trial ended / sign-in required), set by
+/// `AppState::apply_pricing_gate_status`. Unlike the Claude flags it is
+/// honored by EVERY client: OpenCode and Grok keep Python alive (their
+/// third-party upstreams cannot be forwarded direct) and used to sail
+/// through it fully optimized after the wall. Plan-usage metering stays
+/// per product; only the account wall is shared.
+static ACCOUNT_GATE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_account_gate(on: bool) {
+    ACCOUNT_GATE.store(on, Ordering::Release);
+}
+
+pub fn account_gate() -> bool {
+    ACCOUNT_GATE.load(Ordering::Acquire)
+}
+
+fn record_gated_bypass(head: &[u8]) {
+    if let Some(len) =
+        extract_header_value(head, "content-length").and_then(|v| v.parse::<u64>().ok())
+    {
+        GATED_BYPASS_BYTES.fetch_add(len, Ordering::Relaxed);
+    }
+}
+
 /// One-shot guard: has the `first_optimized_request` funnel beacon been sent
 /// this process yet? Fires when a request is actually forwarded to the backend
 /// (optimized), not on bypass/passthrough. See the fire site in `handle`.
@@ -1225,6 +1261,7 @@ async fn handle(
         if is_plugin_routed {
             write_retryable_service_unavailable(&mut client).await;
         } else {
+            record_gated_bypass(&buf);
             forward_direct_to_anthropic(client, buf, &upstream_base).await;
         }
         return;
@@ -1249,6 +1286,7 @@ async fn handle(
         && !is_local_backend_path
         && claude_only_bypass.load(Ordering::Acquire)
     {
+        record_gated_bypass(&buf);
         forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     }
@@ -1257,6 +1295,15 @@ async fn handle(
     // preserve the correct upstream for either ChatGPT OAuth or an API key,
     // but tell it to skip optimization for this request.
     if is_codex && !is_opencode && !is_grok && codex_bypass.load(Ordering::Acquire) {
+        record_gated_bypass(&buf);
+        stamp_headroom_bypass_header(&mut buf);
+    }
+
+    // OpenCode / Grok honor the account wall the same way: Python stays up
+    // (it owns their upstream routing) but is told to pass the request
+    // through untouched.
+    if (is_opencode || is_grok) && account_gate() {
+        record_gated_bypass(&buf);
         stamp_headroom_bypass_header(&mut buf);
     }
 

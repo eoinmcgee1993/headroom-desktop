@@ -27,7 +27,10 @@ export async function maybeFireTrialNotifications(
 
   const account = status.account;
   if (account?.trialActive && !account.subscriptionActive) {
-    await maybeFireTrialExpiryNotification(account.trialEndsAt ?? null);
+    await maybeFireTrialExpiryNotification(
+      account.trialEndsAt ?? null,
+      account.trialUsageDaysLeft ?? null
+    );
   }
 }
 
@@ -59,21 +62,27 @@ async function maybeFireGraceNotification(
 }
 
 async function maybeFireTrialExpiryNotification(
-  trialEndsAt: string | null
+  trialEndsAt: string | null,
+  usageDaysLeft: number | null
 ): Promise<void> {
-  if (!trialEndsAt) return;
-  const daysLeft = Math.ceil(
-    (new Date(trialEndsAt).getTime() - Date.now()) / (24 * 60 * 60 * 1000)
-  );
-  if (daysLeft > 3 || daysLeft <= 0) return;
+  // Usage-day trial: the server counts saving days, not the calendar.
+  const daysLeft =
+    usageDaysLeft ??
+    (trialEndsAt
+      ? Math.ceil((new Date(trialEndsAt).getTime() - Date.now()) / (24 * 60 * 60 * 1000))
+      : null);
+  if (daysLeft == null) return;
+  if (daysLeft > (usageDaysLeft != null ? 2 : 3) || daysLeft <= 0) return;
 
   const today = new Date().toISOString().slice(0, 10);
   if (localStorage.getItem(TRIAL_EXPIRY_DATE_KEY) === today) return;
 
   const body =
-    daysLeft === 1
-      ? "Your Headroom trial ends tomorrow. Upgrade today to keep optimization enabled."
-      : `Your Headroom trial ends in ${daysLeft} days. Upgrade to keep optimization enabled.`;
+    usageDaysLeft != null
+      ? `Your Headroom trial ends after ${daysLeft} more day${daysLeft === 1 ? "" : "s"} of use. Upgrade to keep optimization enabled.`
+      : daysLeft === 1
+        ? "Your Headroom trial ends tomorrow. Upgrade today to keep optimization enabled."
+        : `Your Headroom trial ends in ${daysLeft} days. Upgrade to keep optimization enabled.`;
 
   await sendNotification("Headroom Trial Ending Soon", body, "billing");
   localStorage.setItem(TRIAL_EXPIRY_DATE_KEY, today);

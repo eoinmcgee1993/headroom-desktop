@@ -187,9 +187,20 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // has an explicit capture at the emit site, so they all belong here.
     // `skips_foreign_port_bind_retry_warns` is the guard; keep its fixtures
     // copies of the real messages.
+    //
+    // The generic `[proxy_intercept] error: <e>; retrying` arm is in here for
+    // the same reason, and used not to be (RUST-DR: 1068 events from ONE host
+    // in four hours, a Windows box whose 6767 bind returns WSAEACCES forever).
+    // That branch already reports every DISTINCT error once via the
+    // `reported_errors` set at the emit site -- RUST-DS is that capture, 3
+    // events for the same 1068 failures -- so the bridged warn was pure
+    // duplicate volume on an infinite retry loop. Matched on the retry marker
+    // instead of `starts_with("[proxy_intercept] port")` because the generic
+    // arm backs off 1s/3s/15s and never says "in 15s"; every bind-retry warn
+    // in the loop ends in "retrying" and every one has its own capture.
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
-        && msg.starts_with("[proxy_intercept] port")
-        && msg.contains("retrying in 15s")
+        && msg.starts_with("[proxy_intercept]")
+        && msg.contains("retrying")
     {
         return true;
     }
@@ -424,7 +435,7 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // and backend-port lines above. Keep the local log -- it is what a support
     // thread reads -- and drop the Sentry twin.
     if target.starts_with("headroom_desktop_lib::savings_canary")
-        && msg.starts_with("zero-savings canary:")
+        && (msg.starts_with("zero-savings canary:") || msg.starts_with("savings-basis canary:"))
     {
         return true;
     }
@@ -796,10 +807,24 @@ mod tests {
             "headroom_desktop_lib::proxy_intercept",
             "[proxy_intercept] port 6767 still in use with nothing listening after 420s; retrying in 15s (Only one usage of each socket address (protocol/network address/port) is normally permitted. (os error 10048))"
         ));
-        // Other bind/loop errors from proxy_intercept stay in Sentry.
+        // The generic bind error, verbatim from the emit site (note: no
+        // "in 15s" -- that arm backs off 1s/3s/15s). It has its own
+        // once-per-distinct-error capture, so the warn is a duplicate. This
+        // assertion used to be negated, which is what let RUST-DR reach 1068
+        // events from a single host that can never bind.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::proxy_intercept",
+            "[proxy_intercept] error: An attempt was made to access a socket in a way \
+             forbidden by its access permissions. (os error 10013); retrying"
+        ));
+        // The rule is scoped to the retry marker, not blanket-by-target: a
+        // proxy_intercept warning that fires once and has no emit-site capture
+        // still reaches Sentry. (The real non-retry lines this file knows about
+        // -- the accept loop and the tool_search sanitizer -- have skip rules of
+        // their own above, so this fixture is deliberately synthetic.)
         assert!(!skip_sentry(
             "headroom_desktop_lib::proxy_intercept",
-            "[proxy_intercept] error: some other failure; retrying in 15s"
+            "[proxy_intercept] bind loop exited unexpectedly"
         ));
     }
 
