@@ -169,6 +169,14 @@ def main() -> int:
         amsg, amsg["content"], "", [], set(), set(), messages_from_end=1, compress_assistant_text_blocks=True
     )
     check(out_a["content"][0]["text"] == long_text, "assistant final block keeps the hard skip")
+    umsg = {
+        "role": "user",
+        "content": [{"type": "text", "text": long_text, "cache_control": {"type": "ephemeral"}}],
+    }
+    out_u = router._process_content_blocks(
+        umsg, umsg["content"], "", [], set(), set(), messages_from_end=1, skip_user=False
+    )
+    check(out_u["content"][0]["text"] == long_text, "marked user text in final position keeps the hard skip")
 
     # 4. Kompress marker gate --------------------------------------------------
     saved_load, saved_dev = kc._load_kompress, kc._model_device_type

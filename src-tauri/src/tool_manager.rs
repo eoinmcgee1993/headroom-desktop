@@ -329,7 +329,7 @@ tool output was protected on the one turn it was fresh and only retried
 inside the unfrozen window (1,229 cache_control_protected visits across
 650 requests in a day, ~2 per request). The request's final user/tool
 message has never been forwarded, so no provider key exists for it; the
-vendor peels the marker off that message's blocks, lets the router run
+vendor peels the marker off that message's tool_result blocks, lets the router run
 unchanged, and puts the marker back on the same slot. Any shape drift
 returns the untouched message. Kill switch: HEADROOM_FRESH_CC_COMPRESS=0.
 Kompress marker gate (upstream PR #3484): Kompress only
@@ -2395,7 +2395,8 @@ if _hd_sig_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # across 650 requests on 2026-09-08). The request's FINAL user/tool message has
 # never been forwarded, so no provider key exists for it: the marker there is
 # the client staking out next turn's breakpoint, and whatever we forward is
-# what gets cached. The wrapper peels the marker off that message's blocks,
+# what gets cached. The wrapper peels the marker off that message's tool_result
+# blocks (text blocks are the user's prompt and keep the hard skip),
 # runs the wheel's router unchanged, and re-attaches the marker to the same
 # slot (every router branch appends exactly one block per input block, and
 # every rewrite spreads the source block, so the slot mapping is 1:1). If the
@@ -2423,7 +2424,13 @@ if _hd_fcc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 peeled = []
                 markers = {}
                 for idx, block in enumerate(content_blocks):
-                    if isinstance(block, dict) and "cache_control" in block:
+                    # Only tool output is released; a marked text block is the
+                    # user's prompt and keeps the wheel's hard skip.
+                    if (
+                        isinstance(block, dict)
+                        and "cache_control" in block
+                        and block.get("type") == "tool_result"
+                    ):
                         bare = dict(block)
                         markers[idx] = bare.pop("cache_control")
                         peeled.append(bare)
