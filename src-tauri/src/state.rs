@@ -3823,6 +3823,34 @@ impl AppState {
     /// only Claude traffic forwards direct) instead of the full `proxy_bypass`
     /// (Python torn down, everything direct). Computed at the call site via
     /// `client_adapters::is_codex_enabled()` so this method stays pure for tests.
+    /// True for a poll that carries no verdict: signed in, but the account
+    /// sync failed and there is no account to evaluate. The evaluator keeps
+    /// optimization enabled on that reading so a blip never pauses a paying
+    /// user, which also meant every blip LIFTED an active gate (exit ->
+    /// Python restart -> up to two poll intervals optimized before the
+    /// re-gate debounce). Measured 2026-09-08: 25 of 163 lapsed trials with
+    /// the app alive kept saving after the wall. An error reading must leave
+    /// the flags exactly where they are.
+    pub fn is_error_reading(status: &crate::models::HeadroomPricingStatus) -> bool {
+        status.authenticated && status.account.is_none() && status.account_sync_error.is_some()
+    }
+
+    /// Reconcile both gates with one evaluated status. The single entry
+    /// point for every trigger (frontend poll, deep link, sign-in, the
+    /// background pricing loop), so the error-reading guard cannot be
+    /// skipped by a caller.
+    pub fn apply_pricing_gates(&self, status: &crate::models::HeadroomPricingStatus) {
+        if Self::is_error_reading(status) {
+            log::info!("pricing_gate: account sync failed; leaving gate flags untouched");
+            return;
+        }
+        self.apply_pricing_gate_status(
+            status,
+            crate::client_adapters::any_gate_exempt_client_enabled(),
+        );
+        self.apply_codex_pricing_gate_status(status.codex.as_ref());
+    }
+
     pub fn apply_pricing_gate_status(
         &self,
         status: &crate::models::HeadroomPricingStatus,
@@ -3831,6 +3859,16 @@ impl AppState {
         use std::sync::atomic::Ordering::{Acquire, Release};
         let was_bypassed = self.proxy_bypass.load(Acquire) || self.claude_only_bypass.load(Acquire);
         let should_bypass = !status.optimization_allowed;
+        // Account wall (trial ended / sign-in required) vs plan-usage metering:
+        // only the wall is shared with OpenCode and Grok.
+        let account_wall = should_bypass
+            && matches!(
+                status.gate_reason,
+                Some(
+                    crate::models::PricingGateReason::TrialEnded
+                        | crate::models::PricingGateReason::SignInRequired
+                )
+            );
 
         if should_bypass {
             if !was_bypassed {
@@ -3853,10 +3891,12 @@ impl AppState {
             // also flips us between full and Claude-only bypass if Codex's
             // enable state changed while already gated.
             self.enter_claude_gate(codex_keep_alive);
+            crate::proxy_intercept::set_account_gate(account_wall);
         } else {
             // Any ungated reading clears the violation streak so a later
             // gated reading starts the debounce window over.
             self.pricing_gate_violation_streak.store(0, Release);
+            crate::proxy_intercept::set_account_gate(false);
             if was_bypassed {
                 self.exit_claude_gate();
             }
@@ -11200,6 +11240,66 @@ mod tests {
             intro_offer: None,
             plan_prices: None,
         }
+    }
+
+    #[test]
+    fn apply_pricing_gates_leaves_flags_untouched_on_an_error_reading() {
+        let base_dir = temp_test_dir("headroom-gate-error-reading");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        // Gated after the debounce.
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
+        assert!(state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+
+        // A sync failure evaluates as "allowed" but carries no verdict.
+        let mut blip = pricing_status_with_optimization(true);
+        blip.account = None;
+        blip.account_sync_error = Some("send: timed out".into());
+        assert!(AppState::is_error_reading(&blip));
+        state.apply_pricing_gates(&blip);
+        assert!(
+            state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a failed account sync must not lift the gate"
+        );
+
+        // A real ungated verdict still lifts it.
+        let mut ok = pricing_status_with_optimization(true);
+        ok.account_sync_error = None;
+        assert!(!AppState::is_error_reading(&ok));
+        state.apply_pricing_gate_status(&ok, false);
+        assert!(!state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn account_wall_flag_follows_the_gate_reason() {
+        use crate::models::PricingGateReason;
+        let base_dir = temp_test_dir("headroom-account-wall-flag");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let mut wall = pricing_status_with_optimization(false);
+        wall.gate_reason = Some(PricingGateReason::TrialEnded);
+        state.apply_pricing_gate_status(&wall, true);
+        state.apply_pricing_gate_status(&wall, true);
+        assert!(
+            crate::proxy_intercept::account_gate(),
+            "trial wall is shared with OpenCode/Grok"
+        );
+
+        // Plan-usage metering gates Claude only.
+        let mut metered = pricing_status_with_optimization(false);
+        metered.gate_reason = Some(PricingGateReason::WeeklyUsageLimitReached);
+        state.apply_pricing_gate_status(&metered, true);
+        assert!(!crate::proxy_intercept::account_gate());
+
+        state.apply_pricing_gate_status(&pricing_status_with_optimization(true), true);
+        assert!(!crate::proxy_intercept::account_gate());
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]

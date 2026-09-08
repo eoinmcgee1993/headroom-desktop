@@ -839,7 +839,19 @@ enum RemoteAccountSyncError {
     Other(#[allow(dead_code)] String),
 }
 
+/// When any caller last ran `get_pricing_status`; the background pricing
+/// loop in lib.rs only fetches when this is stale.
+static LAST_STATUS_FETCH: parking_lot::Mutex<Option<std::time::Instant>> =
+    parking_lot::Mutex::new(None);
+
+pub fn status_fetched_within(window: std::time::Duration) -> bool {
+    LAST_STATUS_FETCH
+        .lock()
+        .is_some_and(|at| at.elapsed() < window)
+}
+
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
+    *LAST_STATUS_FETCH.lock() = Some(std::time::Instant::now());
     let mut local_state = reconcile_local_state_with_server(state)?;
     let local_grace_ends_at = local_state.first_seen_at + Duration::hours(LOCAL_GRACE_PERIOD_HOURS);
     let local_grace_active = Utc::now() < local_grace_ends_at;
@@ -1030,7 +1042,6 @@ fn fetch_codex_usage(
     if !crate::client_adapters::is_codex_enabled() {
         return None;
     }
-    let snapshot = state.codex_rate_limits.lock().clone()?;
     let plan_tier = state.codex_plan_tier();
     // Identical activation ladder to the Claude branch: subscription (metered
     // only when clamped) > active trial > grandfathered (metered) > hard block.
@@ -1047,6 +1058,16 @@ fn fetch_codex_usage(
         Some(a) if a.grandfathered => (CodexActivation::Metered, a.invite_bonus_percent),
         Some(a) => (CodexActivation::HardBlock, a.invite_bonus_percent),
         None => (CodexActivation::Ungated, 0.0),
+    };
+    // The snapshot comes from Codex response headers seen in-process, so it
+    // is empty after every relaunch until the first response. Metering needs
+    // real windows; the hard block does not, and waiting for a snapshot ran
+    // Codex fully optimized past the wall until then (and forever on hosts
+    // whose responses never carry the headers).
+    let snapshot = match (state.codex_rate_limits.lock().clone(), &activation) {
+        (Some(snapshot), _) => snapshot,
+        (None, CodexActivation::HardBlock) => CodexRateLimitSnapshot::default(),
+        (None, _) => return None,
     };
     Some(codex_usage_from_snapshot(
         snapshot,
@@ -5668,6 +5689,21 @@ mod tests {
             .optimization_allowed,
             "secondary without a declared length still meters"
         );
+    }
+
+    #[test]
+    fn codex_hard_block_needs_no_rate_limit_snapshot() {
+        let usage = super::codex_usage_from_snapshot(
+            crate::models::CodexRateLimitSnapshot::default(),
+            CodexPlanTier::Plus,
+            super::CodexActivation::HardBlock,
+            0.0,
+        );
+        assert!(!usage.optimization_allowed);
+        assert!(matches!(
+            usage.gate_reason,
+            Some(PricingGateReason::TrialEnded)
+        ));
     }
 
     #[test]

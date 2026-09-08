@@ -301,6 +301,21 @@ persisted dollar field; tool-schema TOKENS are untouched and the
 desktop keeps pricing those itself at the cache-read rate.
 Self-neutralizes once a wheel ships #3170's disjoint fields. Kill
 switch: HEADROOM_SAVINGS_FOLD_GUARD=0.
+Per-conversation savings accounting (upstream PR #3480): OpenAI
+/v1/responses re-sends the whole transcript every turn and the router
+recompresses all of it, so a turn's tokens_saved is the CONVERSATION's
+running total, not that turn's. Everything cumulative summed it again
+on every remaining turn -- lifetime totals, by_model.savings_percent,
+the dollar figure, and any rate dividing savings by new input, which
+then has no 100 percent ceiling. Anthropic's frozen cached prefix makes
+its tokens_saved novel-only, so the two providers never meant the same
+thing: measured 2026-09-08, gpt/codex booked 8.10M saved against 3.90M
+new input (2.1x, impossible as a share) where claude booked 4.18M
+against 43.3M. The vendor differences the running total per
+conversation and feeds the novel figure to the two cumulative
+consumers; per-request surfaces keep the wire truth, matching #3480 so
+the wheel bump is a no-op. Self-neutralizes once a wheel ships #3480's
+RequestOutcome fields. Kill switch: HEADROOM_CONVERSATION_SAVINGS=0.
 Chained-read protection (upstream PR #2668): _is_read_command
 inspects only the FIRST program and applies its write/redirect check
 to the whole string, so a read batched behind other work
@@ -1972,6 +1987,155 @@ if _hd_fa_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # Accounting-only vendor: any binding failure leaves the books
         # exactly as upstream writes them. The request path is never touched
         # from this section, so there is nothing to fail closed FOR.
+        pass
+
+    # Per-conversation savings accounting (upstream PR #3480, still open;
+    # remove once a wheel ships it -- see the module docstring for the
+    # inflation this ends). Three wraps, no logic reimplemented: the
+    # compressor stashes (conversation key, running total) per request_id,
+    # the outcome funnel differences it into this turn's NOVEL saving and
+    # parks that on a ContextVar, and the two CUMULATIVE consumers read the
+    # var. A ContextVar and not a global because concurrent requests are
+    # separate asyncio tasks with separate contexts, and the funnel awaits
+    # both consumers inside its own task. The per-request surfaces the funnel
+    # also writes (request log, transformations feed, PERF tok_saved) keep
+    # outcome.tokens_saved untouched: those tokens really did leave this
+    # request's payload, and matching #3480 exactly here is what makes the
+    # wheel bump a no-op. Self-neutralizes on the first wheel carrying
+    # #3480's RequestOutcome fields. Kill switch:
+    # HEADROOM_CONVERSATION_SAVINGS=0.
+    #
+    # BINDING ORDER IS LOAD-BEARING: this block must stay AFTER the
+    # first-appearance vendor above, which rewrites tokens_saved on the same
+    # PrometheusMetrics seam. Later binding means outer wrapper, so this one
+    # substitutes the novel figure FIRST and first-appearance then subtracts
+    # its pending amount from it. Bound the other way round (this block
+    # earlier in the file) the substitution lands last and silently discards
+    # every first-appearance subtraction on Codex traffic.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_CONVERSATION_SAVINGS", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import collections as _hd_cs_collections
+            import contextvars as _hd_cs_contextvars
+            import threading as _hd_cs_threading
+
+            import headroom.proxy.cost as _hd_cs_cost
+            import headroom.proxy.handlers.openai as _hd_cs_openai
+            import headroom.proxy.outcome as _hd_cs_outcome
+            import headroom.proxy.prometheus_metrics as _hd_cs_prom
+            import headroom.proxy.server as _hd_cs_server
+            from headroom.proxy.output_savings import (
+                conversation_key_from_body as _hd_cs_conv_key,
+            )
+
+            if "conversation_key" not in getattr(
+                _hd_cs_outcome.RequestOutcome, "__dataclass_fields__", {}
+            ):
+                # request_id -> (conversation key, the conversation's running
+                # removed-token total). WS sessions reuse ONE request_id across
+                # every turn, so entries are overwritten per frame and never
+                # popped -- the funnel wants the latest turn's total, and
+                # popping would starve every turn after the first.
+                _hd_cs_pending = _hd_cs_collections.OrderedDict()
+                # conversation key -> total already counted. A conversation
+                # evicted while still live re-counts its transcript once, which
+                # is a bounded one-off overcount, not a leak.
+                _hd_cs_seen = _hd_cs_collections.OrderedDict()
+                _HD_CS_MAX = 512
+                _hd_cs_lock = _hd_cs_threading.Lock()
+                _hd_cs_novel = _hd_cs_contextvars.ContextVar(
+                    "headroom_novel_tokens_saved", default=None
+                )
+
+                def _hd_cs_bounded(store, key, value):
+                    with _hd_cs_lock:
+                        previous = store.get(key)
+                        store[key] = value
+                        store.move_to_end(key)
+                        while len(store) > _HD_CS_MAX:
+                            store.popitem(last=False)
+                    return previous
+
+                _hd_cs_orig_compress = (
+                    _hd_cs_openai.OpenAIHandlerMixin
+                    ._compress_openai_responses_payload_in_executor
+                )
+
+                async def _hd_cs_compress(self, payload, **kwargs):
+                    # Keyed BEFORE the pass so a rewritten first user message
+                    # cannot move the key mid-conversation.
+                    key = None
+                    try:
+                        if isinstance(payload, dict):
+                            key = _hd_cs_conv_key(payload)
+                    except Exception:
+                        key = None
+                    result = await _hd_cs_orig_compress(self, payload, **kwargs)
+                    try:
+                        rid = kwargs.get("request_id")
+                        # result is (body, modified, tokens_saved, ...). A pass
+                        # that changed nothing saves nothing and must not reset
+                        # the running total, so only modified passes register.
+                        if rid and key and result[1]:
+                            _hd_cs_bounded(_hd_cs_pending, rid, (key, int(result[2])))
+                    except Exception:
+                        pass
+                    return result
+
+                _hd_cs_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
+                    _hd_cs_compress
+                )
+
+                _hd_cs_orig_record = _hd_cs_server.HeadroomProxy._record_request_outcome
+
+                async def _hd_cs_record(self, outcome):
+                    token = None
+                    try:
+                        rid = getattr(outcome, "request_id", None)
+                        entry = None
+                        if rid:
+                            with _hd_cs_lock:
+                                entry = _hd_cs_pending.get(rid)
+                        if entry is not None:
+                            key, total = entry
+                            total = max(0, int(total))
+                            previous = _hd_cs_bounded(_hd_cs_seen, key, total)
+                            # A total that went DOWN means the transcript shrank
+                            # under it (a compaction, or a client dropping
+                            # history): nothing was removed for the first time,
+                            # and the next turn counts from the lower base.
+                            token = _hd_cs_novel.set(max(0, total - (previous or 0)))
+                    except Exception:
+                        token = None
+                    try:
+                        return await _hd_cs_orig_record(self, outcome)
+                    finally:
+                        if token is not None:
+                            _hd_cs_novel.reset(token)
+
+                _hd_cs_server.HeadroomProxy._record_request_outcome = _hd_cs_record
+
+                _hd_cs_orig_metrics = _hd_cs_prom.PrometheusMetrics.record_request
+
+                async def _hd_cs_metrics(self, **kwargs):
+                    novel = _hd_cs_novel.get()
+                    if novel is not None and "tokens_saved" in kwargs:
+                        kwargs["tokens_saved"] = novel
+                    return await _hd_cs_orig_metrics(self, **kwargs)
+
+                _hd_cs_prom.PrometheusMetrics.record_request = _hd_cs_metrics
+
+                _hd_cs_orig_cost = _hd_cs_cost.CostTracker.record_tokens
+
+                def _hd_cs_cost_record(self, model, tokens_saved, tokens_sent, **kwargs):
+                    novel = _hd_cs_novel.get()
+                    if novel is not None:
+                        tokens_saved = novel
+                    return _hd_cs_orig_cost(self, model, tokens_saved, tokens_sent, **kwargs)
+
+                _hd_cs_cost.CostTracker.record_tokens = _hd_cs_cost_record
+    except Exception:
         pass
 
 
@@ -13372,6 +13536,57 @@ mod tests {
             "first-appearance accounting misbehaved against the installed wheel.\n\
              If traffic neutrality failed, do NOT ship: that is the 0.9.4 class\n\
              of mistake.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn conversation_savings_behaves_against_the_installed_wheel() {
+        // The per-conversation vendor rewrites the value INSIDE
+        // PrometheusMetrics.record_request / CostTracker.record_tokens, so a
+        // string assertion on the blob proves nothing. This runs the shipped
+        // sitecustomize against the installed wheel and asserts the whole
+        // contract: turn one counts in full, turn two counts only the growth,
+        // a compaction counts zero, the per-request log keeps the wire figure,
+        // paths with no conversation identity are untouched, and the kill
+        // switch unbinds. The probe also proves this vendor coexists with the
+        // others that wrap the same two seams.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-conversation-savings.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("hd-conv-savings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run conversation-savings probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A wheel that ships #3480 leaves this vendor inert by design, and the
+        // probe's first check is the binding signal.
+        if stdout.contains("FAIL cs bound") {
+            eprintln!("skipping: conversation-savings vendor did not bind (wheel ships #3480?)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK conversation-savings"),
+            "per-conversation savings accounting misbehaved against the installed wheel.\n\
+             Shipping this wrong moves every Codex savings number the product is\n\
+             trusted for.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
