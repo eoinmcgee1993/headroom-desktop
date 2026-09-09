@@ -816,7 +816,21 @@ pub fn spawn(
                                 // earlier "held by foreign process" wording
                                 // asserted the holder was not ours and sent a
                                 // whole investigation down the wrong path.
-                                *bind_error.lock() = Some(e.to_string());
+                                //
+                                // Deliberately NOT the raw OS string. Everything
+                                // between here and the verdict below shells out
+                                // (reclaim, then netstat + tasklist on Windows),
+                                // which is seconds, and for those seconds the
+                                // banner rendered `os error 10048` as "in use by
+                                // another program, here is the PowerShell command
+                                // to find it" -- an instruction the user cannot
+                                // act on yet, over a port we are still retrying
+                                // and have not finished diagnosing. Say we are
+                                // still looking; the verdict arms below replace
+                                // this within the same iteration.
+                                *bind_error.lock() = Some(format!(
+                                    "port {INTERCEPT_PORT} is in use; identifying what holds it"
+                                ));
                                 // Identity-gated: only ever kills a process
                                 // running this exact executable, so a foreign
                                 // holder or reserved range is untouched and

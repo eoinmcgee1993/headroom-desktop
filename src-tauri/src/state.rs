@@ -8022,6 +8022,15 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
              Nothing to do: Headroom reconnects on its own within a few minutes."
         );
     }
+    // The bind loop is mid-diagnosis: it knows the port is held but not by
+    // whom, and it is still retrying. Naming a remedy here would be guessing.
+    if raw.contains("identifying what holds it") {
+        return format!(
+            "Port {port} is in use and Headroom is checking what holds it. \
+             Nothing to do yet: Headroom keeps retrying, and names the program \
+             holding the port if this doesn't clear on its own."
+        );
+    }
     if raw.contains("stuck in use") {
         return format!(
             "Port {port} is in use, but no program is listening on it. \
@@ -9963,8 +9972,14 @@ mod tests {
         let stuck = intercept_bind_hint("port 6767 stuck in use with nothing listening (301s)");
         assert!(stuck.contains("excludedportrange"), "{stuck}");
         assert!(stuck.contains("Reboot"), "{stuck}");
+        // Mid-diagnosis: held, holder unknown, still retrying. No instruction
+        // to follow yet, and never the 10048 arm's PowerShell command.
+        let looking = intercept_bind_hint("port 6767 is in use; identifying what holds it");
+        assert!(looking.contains("Nothing to do yet"), "{looking}");
+        assert!(!looking.contains("Get-NetTCPConnection"), "{looking}");
+        assert!(!looking.contains("Quit"), "{looking}");
         // Every variant leads with a sentence that stands alone as the headline.
-        for hint in [&foreign, &draining, &stuck] {
+        for hint in [&foreign, &draining, &stuck, &looking] {
             let first = hint.split(". ").next().unwrap();
             assert!(first.starts_with("Port 6767"), "{first}");
             assert!(first.len() < 110, "headline too long: {first}");
