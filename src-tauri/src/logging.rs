@@ -574,6 +574,24 @@ fn scrub_json(value: &mut serde_json::Value) {
     }
 }
 
+/// Group a Windows `HRESULT(0x...)` log line by its CODE, not by the OS's
+/// prose after it. That prose is LOCALIZED, so one failure files one issue per
+/// language: `failed to create webview ... HRESULT(0x80070057)` is RUST-E6
+/// (Danish), RUST-DY (English) and, for its own code, RUST-8T (Portuguese) --
+/// the same bug, un-triageable three times over. Returns the text before the
+/// code plus the code itself; the localized message still rides along in the
+/// title. `None` for every other line, which keeps Sentry's own grouping (and
+/// the archived state of every issue already grouped that way) untouched.
+fn hresult_fingerprint(msg: &str) -> Option<[String; 2]> {
+    const MARKER: &str = "HRESULT(0x";
+    let at = msg.find(MARKER)?;
+    let code: String = msg[at + MARKER.len()..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    (!code.is_empty()).then(|| [msg[..at].trim().to_string(), format!("0x{code}")])
+}
+
 impl Log for FileLogger {
     fn enabled(&self, _meta: &Metadata) -> bool {
         true
@@ -615,7 +633,13 @@ impl Log for FileLogger {
             // never leaves the machine.
             let scrubbed = scrub_home(&msg);
             let truncated: String = scrubbed.chars().take(SENTRY_MESSAGE_CHAR_CAP).collect();
-            sentry::capture_message(&truncated, level);
+            match hresult_fingerprint(&truncated) {
+                Some(fp) => sentry::with_scope(
+                    |scope| scope.set_fingerprint(Some(&[fp[0].as_str(), fp[1].as_str()])),
+                    || sentry::capture_message(&truncated, level),
+                ),
+                None => sentry::capture_message(&truncated, level),
+            };
         }
     }
 
@@ -666,6 +690,22 @@ pub(crate) fn log_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hresult_fingerprint_groups_localized_webview_failures_together() {
+        let f = super::hresult_fingerprint;
+        // RUST-E6 (Danish) and RUST-DY (English): same code, same bug.
+        let da = f(r#"failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070057), message: "Klassen er ikke registreret" })"#).unwrap();
+        let en = f(r#"failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070057), message: "The parameter is incorrect." })"#).unwrap();
+        assert_eq!(da, en);
+        assert_eq!(da[1], "0x80070057");
+        // A different code stays a different issue (RUST-8T).
+        let other = f(r#"failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070578), message: "O identificador da janela e invalido" })"#).unwrap();
+        assert_ne!(other, da);
+        // Everything else keeps Sentry's own grouping.
+        assert!(f("repair_client_setups: repaired codex_cli").is_none());
+        assert!(f("WebView2 error: HRESULT(0xZZ) truncated").is_none());
+    }
+
     use super::skip_sentry;
 
     #[test]

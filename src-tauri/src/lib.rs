@@ -7028,6 +7028,12 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         "session limit reached",
         "hit your usage limit",
         "usage limit reached",
+        // RUST-EB: `You've hit your individual spend limit \u{b7} run
+        // /usage-credits to raise it` -- a credit ceiling, not a session
+        // window, and the organization variant words it differently again, so
+        // match the two words the whole family shares. Still specific enough
+        // not to hit a project's own source line echoed back.
+        "spend limit",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
@@ -11933,6 +11939,12 @@ Some unrelated content.
 
         assert!(learn_failure_agent_limit_line("usage limit reached for this session").is_some());
         assert!(learn_failure_agent_limit_line("You've hit your usage limit.").is_some());
+
+        // RUST-EB verbatim: a credit ceiling, worded so that none of the
+        // session/usage needles above touch it. It reached Sentry as an Error
+        // and handed the user the raw exit status instead of the reset time.
+        let spend = "You've hit your individual spend limit \u{b7} run /usage-credits to raise it, or visit claude.ai/admin-settings/usage \u{b7} your session limit resets 9:30pm (America/Sao_Paulo)";
+        assert_eq!(learn_failure_agent_limit_line(spend), Some(spend));
     }
 
     #[test]

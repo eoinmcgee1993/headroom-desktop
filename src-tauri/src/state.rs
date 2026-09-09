@@ -6406,6 +6406,11 @@ enum CacheIntegrityKind {
     PrefixRewrite,
 }
 
+// The three `*_tokens` fields deserialize the wheel's names and serialize
+// scrub-proof ones: Sentry's data scrubber nulls any extra whose KEY contains
+// "token", and it recurses into nested objects, so the only three numbers that
+// SIZE a rewrite (how much cache was thrown away) arrived null on every
+// RUST-DP event while the message indices next to them came through.
 #[derive(Debug, Deserialize, Serialize)]
 struct CacheIntegrityReport {
     boot_id: String,
@@ -6413,8 +6418,11 @@ struct CacheIntegrityReport {
     kind: CacheIntegrityKind,
     stable_messages: u64,
     first_changed_message: u64,
+    #[serde(rename(serialize = "previously_cached_toks"))]
     previously_cached_tokens: u64,
+    #[serde(rename(serialize = "cache_read_toks"))]
     cache_read_tokens: u64,
+    #[serde(rename(serialize = "cache_write_toks"))]
     cache_write_tokens: u64,
 }
 
@@ -9043,6 +9051,17 @@ mod tests {
         assert!(!serde_json::to_string(&events[0])
             .unwrap()
             .contains("private content"));
+        // Sentry nulls any extra key containing "token" -- and did, on every
+        // RUST-DP event -- so the sizes must reach it under other names.
+        let integrity = events[0].extra["cache_integrity"].as_object().unwrap();
+        assert!(
+            integrity.keys().all(|k| !k.contains("token")),
+            "{:?}",
+            integrity.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(integrity["previously_cached_toks"], 503505);
+        assert_eq!(integrity["cache_read_toks"], 7259);
+        assert_eq!(integrity["cache_write_toks"], 491260);
     }
 
     #[test]
