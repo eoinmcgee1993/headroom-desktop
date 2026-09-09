@@ -869,6 +869,11 @@ pub fn spawn(
                                                     scope.set_extra(
                                                         "held_secs",
                                                         launched_at.elapsed().as_secs().into());
+                                                    scope.set_fingerprint(Some(&[
+                                                        "proxy_intercept_bind_failed",
+                                                        "stuck",
+                                                        key.as_str(),
+                                                    ]));
                                                 },
                                                 || {
                                                     sentry::capture_message(
@@ -896,9 +901,24 @@ pub fn spawn(
                                                 |scope| {
                                                     scope.set_extra(
                                                         "os_error", e.to_string().into());
-                                                    scope.set_extra(
-                                                        "occupant", name.clone().into());
                                                     scope.set_extra("occupant_pid", pid.into());
+                                                    // The occupant's name is in
+                                                    // the message, so one
+                                                    // condition opened an issue
+                                                    // per squatter: RUST-EC
+                                                    // (`python3.1` on macOS) and
+                                                    // RUST-B0/B1 (the Windows
+                                                    // 10048 wordings) are all
+                                                    // "something else holds
+                                                    // 6767". Group on the OS
+                                                    // code; keep the name as a
+                                                    // tag so it aggregates.
+                                                    scope.set_tag("occupant", name.as_str());
+                                                    scope.set_fingerprint(Some(&[
+                                                        "proxy_intercept_bind_failed",
+                                                        "foreign",
+                                                        key.as_str(),
+                                                    ]));
                                                 },
                                                 || {
                                                     sentry::capture_message(
@@ -928,6 +948,11 @@ pub fn spawn(
                                     sentry::with_scope(
                                         |scope| {
                                             scope.set_extra("os_error", e.to_string().into());
+                                            scope.set_fingerprint(Some(&[
+                                                "proxy_intercept_bind_failed",
+                                                "error",
+                                                key.as_str(),
+                                            ]));
                                         },
                                         || {
                                             sentry::capture_message(

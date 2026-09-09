@@ -3,6 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   buildInitialProxyVerificationRows,
   formatConnectorNameList,
+  markIdleProxyVerificationRows,
+  proxyVerificationRowMessage,
+  testableProxyVerificationRows,
+  PROXY_VERIFY_IDLE_AFTER_SECONDS,
   getClaudeConnector,
   getContactRequestValidationError,
   getInitialLauncherStage,
@@ -317,5 +321,73 @@ describe("formatConnectorNameList", () => {
     expect(formatConnectorNameList(["Claude Code", "Codex", "OpenCode"])).toBe(
       "Claude Code, Codex and OpenCode"
     );
+  });
+});
+
+describe("proxy verification rows the screen should not be testing", () => {
+  const row = (clientId: string, state: "processing" | "verified" | "idle" = "processing") => ({
+    clientId,
+    name: clientId === "codex" ? "ChatGPT" : "Claude Code",
+    state,
+    message: ""
+  });
+
+  // The 2026-09-08 support case in miniature: an installed-but-dormant agent
+  // beside a live one kept the whole screen red, so the user concluded the
+  // product was broken when it was not.
+  it("marks a connector with no local activity as idle and stops testing it", () => {
+    const rows = markIdleProxyVerificationRows([row("codex"), row("claude_code")], {
+      codex: 60
+    });
+
+    expect(rows.map((entry) => entry.state)).toEqual(["processing", "idle"]);
+    expect(testableProxyVerificationRows(rows).map((entry) => entry.clientId)).toEqual(["codex"]);
+  });
+
+  it("treats activity older than the window as idle", () => {
+    const rows = markIdleProxyVerificationRows([row("codex")], {
+      codex: PROXY_VERIFY_IDLE_AFTER_SECONDS + 1
+    });
+
+    expect(rows[0].state).toBe("idle");
+  });
+
+  // Idle is a display state, not a lockout: a row that has already proven
+  // itself must never be demoted by a stale artifact walk.
+  it("never downgrades a verified row", () => {
+    const rows = markIdleProxyVerificationRows([row("codex", "verified")], {});
+
+    expect(rows[0].state).toBe("verified");
+  });
+});
+
+describe("what the verify row says while it waits", () => {
+  const row = {
+    clientId: "claude_code",
+    name: "Claude Code",
+    state: "processing" as const,
+    message: ""
+  };
+
+  it("names the stale sessions when the tool is already running", () => {
+    expect(proxyVerificationRowMessage(row, 2)).toContain("2 sessions are running");
+    expect(proxyVerificationRowMessage(row, 2)).toContain("Quit and reopen Claude Code");
+    expect(proxyVerificationRowMessage(row, 1)).toContain("1 session is running");
+  });
+
+  it("asks the user to start the tool when nothing is running", () => {
+    expect(proxyVerificationRowMessage(row, 0)).toBe(
+      "Not running yet. Open Claude Code and send it any message."
+    );
+  });
+
+  it("says an idle tool is still set up rather than failing", () => {
+    const message = proxyVerificationRowMessage({ ...row, state: "idle" }, 0);
+    expect(message).toContain("nothing to test");
+    expect(message).toContain("still set up");
+  });
+
+  it("confirms a verified row", () => {
+    expect(proxyVerificationRowMessage({ ...row, state: "verified" }, 0)).toBe("Request received");
   });
 });

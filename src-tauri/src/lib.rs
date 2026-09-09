@@ -3599,6 +3599,32 @@ fn get_gated_bypass_bytes() -> u64 {
     proxy_intercept::gated_bypass_bytes()
 }
 
+/// Seconds since each connector last wrote its own session artifacts on this
+/// machine. A client with no entry has never been seen at all.
+///
+/// The verify screen uses this to stop testing an agent the user does not
+/// actually use. A row is built for every *installed* connector, so a Claude
+/// Code that has sat dormant since March gets a "Waiting for a prompt..."
+/// spinner that can never resolve -- and because the success button needs
+/// every row green, the screen reads as "your setup failed" forever.
+#[tauri::command]
+fn get_client_local_activity_ages(
+    client_ids: Vec<String>,
+) -> std::collections::HashMap<String, u64> {
+    let now = std::time::SystemTime::now();
+    client_ids
+        .into_iter()
+        .filter_map(|client_id| {
+            let at = client_adapters::client_local_activity_at(&client_id)?;
+            // A clock that moved backwards yields no reading rather than a
+            // wrapped one: "never used" is the safe answer, since it only ever
+            // removes a row from the test, never fails one.
+            let age = now.duration_since(at).ok()?.as_secs();
+            Some((client_id, age))
+        })
+        .collect()
+}
+
 /// Running agent processes keyed by connector id, for the verify screen's
 /// "these sessions still hold old settings" callout. Undercounts are fine
 /// (the callout just stays quiet); false positives are not, so matching is
@@ -6305,6 +6331,7 @@ pub fn run() {
             get_headroom_request_counts_by_agent,
             get_intercept_request_counts_by_agent,
             get_running_agent_process_counts,
+            get_client_local_activity_ages,
             get_gated_bypass_bytes,
             install_claude_code_cli,
             get_launch_flags,

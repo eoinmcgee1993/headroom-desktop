@@ -64,7 +64,10 @@ export type AutoConfigureStep =
 export interface ProxyVerificationRowState {
   clientId: string;
   name: string;
-  state: "processing" | "waiting" | "verified";
+  /// "idle" is a display state, not a lockout: the row still flips to
+  /// "verified" if traffic does arrive. It only takes the row out of the
+  /// "everything must be green" test.
+  state: "processing" | "waiting" | "verified" | "idle";
   message: string;
 }
 
@@ -242,6 +245,60 @@ export function nextAutoConfigureStepAfterApply(
     return { kind: "begin_proxy_verification" };
   }
   return { kind: "show_client_setup" };
+}
+
+/// How long an agent can go untouched before the verify screen stops asking
+/// the user to prove it works. Long enough to cover a weekend, short enough
+/// that a tool the user has genuinely moved on from drops out.
+export const PROXY_VERIFY_IDLE_AFTER_SECONDS = 7 * 24 * 60 * 60;
+
+/// Rows are built from every *installed* connector, which is not the same as
+/// every connector the user actually uses. A dormant one can never turn green,
+/// so it would hold the screen in a failed-looking state forever and tell a
+/// perfectly healthy install that its setup is broken. Ages come from
+/// `get_client_local_activity_ages`; a missing entry means "never seen".
+export function markIdleProxyVerificationRows(
+  rows: ProxyVerificationRowState[],
+  activityAgesSeconds: Record<string, number>
+): ProxyVerificationRowState[] {
+  return rows.map((row) => {
+    if (row.state === "verified") {
+      return row;
+    }
+    const age = activityAgesSeconds[row.clientId];
+    const idle = age === undefined || age > PROXY_VERIFY_IDLE_AFTER_SECONDS;
+    return idle === (row.state === "idle") ? row : { ...row, state: idle ? "idle" : "processing" };
+  });
+}
+
+/// The rows the screen is actually testing. An idle connector is shown but not
+/// counted, so one dormant tool cannot withhold the success button.
+export function testableProxyVerificationRows(
+  rows: ProxyVerificationRowState[]
+): ProxyVerificationRowState[] {
+  return rows.filter((row) => row.state !== "idle");
+}
+
+/// What the row says while it waits. The old copy was a single frozen
+/// "Waiting for a X prompt..." that looked identical at second 0 and at hour
+/// 2, so a user with a stale terminal had no way to tell "normal" from
+/// "broken" -- and a support case (2026-09-08) sat on it for 2h42m before
+/// asking whether the product worked. It did; he needed to restart his tool.
+export function proxyVerificationRowMessage(
+  row: ProxyVerificationRowState,
+  runningSessions: number
+): string {
+  if (row.state === "verified") {
+    return "Request received";
+  }
+  if (row.state === "idle") {
+    return `Not used on this machine recently, so there is nothing to test. ${row.name} is still set up.`;
+  }
+  if (runningSessions > 0) {
+    const sessions = runningSessions === 1 ? "session is" : `sessions are`;
+    return `${runningSessions} ${sessions} running, but started before setup and still hold the old settings. Quit and reopen ${row.name}, then send it any message.`;
+  }
+  return `Not running yet. Open ${row.name} and send it any message.`;
 }
 
 export function buildInitialProxyVerificationRows(

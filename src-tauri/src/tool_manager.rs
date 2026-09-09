@@ -2706,22 +2706,22 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
         None => true,
     }
 }
-const RTK_VERSION: &str = "0.45.0";
+const RTK_VERSION: &str = "0.48.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str = "1.7.0";
-const CONTEXT7_PINNED_VERSION: &str = "4.0.2";
+const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
 /// First run downloads the package into the npx cache; slow networks need
 /// headroom over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const CODEBASE_MEMORY_VERSION: &str = "0.10.3";
+const CODEBASE_MEMORY_VERSION: &str = "0.10.8";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
-    "0ebf02328207d4c3d862c837b5e973de5bac808df92b0941737721d467287f7f";
+    "9bd840dfb3ec7eaef4f310382057adaa5b0e904df883104d03ffcf39836afd07";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
-    "1107fea28285823e1436e4f38a4e00a0b472d8a43c379da7dfd200c914a4b9dd";
+    "2b193085410af3801634a522f4b17dcd6699695e015a068393c87817c1d260d4";
 const CODEBASE_MEMORY_SHA256_LINUX_AARCH64: &str =
-    "967b9eababfdbd2ef1987c571d55bc7c028cd1db7f99279830634c58db311e32";
+    "e2804a20f5a6fc392af361525a232703e351b7d1aacb81b88eef806eec5959fa";
 const CODEBASE_MEMORY_SHA256_LINUX_X86_64: &str =
-    "74997fb0934e70a22f20c2e112fb4d883867dc1f01a7bcdc94cf86d13b5cbd31";
+    "e5cba4cad6ca8254a85f45041fc8a831908d7d5cb64f98fc3f8eb70a58671793";
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -2975,15 +2975,15 @@ fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Opti
     }
 }
 const RTK_SHA256_MACOS_AARCH64: &str =
-    "064151cfc2d50b24d810b06a0af2e41b9c945e83534e4c438c3d3eae607fc3f4";
+    "4fa025cc93a744b6963f4e53a008e5ba3f74b6a38061f4a47c639e1c3023e0db";
 const RTK_SHA256_MACOS_X86_64: &str =
-    "9ea02f889d5a2779e4fb700df4587824303c5a57cda22e903e30058079fca0ef";
+    "a95f2c23e08572dcc84ddff5fbe432e41e7f94369622eb086cca49ae0b6f61e8";
 const RTK_SHA256_LINUX_AARCH64: &str =
-    "80a746dd305ef944ff50ef011ae4ce3878dd5ba88dfe35d859d05498191637c3";
+    "5ed65486a96077bd6bba7c87fdc9d0e4a1918d19619be3c87380888389a30c7c";
 const RTK_SHA256_LINUX_X86_64: &str =
-    "c4c036fbf181fc55ef329786c8c17e0d427972b053b825944d968a6aafef1ba4";
+    "e4e650fa1677c0de2f6839a6040d7b17f312d32f163c402b75af70e9e5af1a91";
 const RTK_SHA256_WINDOWS_X86_64: &str =
-    "34cea9009a8099acdaf85147b971d95f65efabfa63fb3aea7d3e2b73e6f517c3";
+    "8c9ae56bacde865112777a9fe9791b449186d8b2a081c32c0772ef773f284f93";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
