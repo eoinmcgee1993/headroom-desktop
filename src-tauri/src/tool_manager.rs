@@ -4040,6 +4040,14 @@ impl ToolManager {
                                     if let Some(p) = original_pid {
                                         scope.set_extra("occupant_pid", p.into());
                                     }
+                                    // Fixed fingerprint: the occupant name,
+                                    // its pid and the chosen port are all in
+                                    // the message, so one condition opened an
+                                    // issue per fallback (RUST-81, RUST-7F)
+                                    // and none of them could be resolved.
+                                    // Same fix as `orphan_proxy_reclaimed`;
+                                    // the occupant is on a tag for filtering.
+                                    scope.set_fingerprint(Some(&["backend_port_fallback"]));
                                 },
                                 || {
                                     sentry::capture_message(

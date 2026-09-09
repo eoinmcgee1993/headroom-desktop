@@ -7601,7 +7601,10 @@ fn execute_headroom_learn_run(
                 let stderr_head = crate::tool_manager::redact_sensitive(
                     &stderr.chars().take(2000).collect::<String>(),
                 );
-                let stdout_head: String = stdout.chars().take(2000).collect();
+                // Never the bytes, only the shape: enough to tell "the CLI
+                // printed nothing" from "it printed and still failed".
+                let stdout_line_count = stdout.lines().count() as u64;
+                let stderr_tail = crate::state::tail_lines(&stderr, 32).join("\n");
                 let cli_path_str = cli_path
                     .as_ref()
                     .map(|p| p.display().to_string())
@@ -7654,12 +7657,20 @@ fn execute_headroom_learn_run(
                                     .map(|s| s.to_string().into())
                                     .unwrap_or(serde_json::Value::Null),
                             );
+                            // STDERR ONLY. `fail_tail` is the tail of stdout
+                            // MERGED with stderr, and stdout echoes the user's
+                            // memory files back verbatim -- RUST-B7 shipped a
+                            // user's CLAUDE.md, and on another host their
+                            // database passwords, into Sentry through these
+                            // two extras. The reason for a failure is always on
+                            // stderr; stdout only ever carried the banner and
+                            // the user's own project content.
                             scope.set_extra(
-                                "output_tail_redacted",
-                                crate::tool_manager::redact_sensitive(&fail_tail).into(),
+                                "stderr_tail_redacted",
+                                crate::tool_manager::redact_sensitive(&stderr_tail).into(),
                             );
                             scope.set_extra("stderr_head_redacted", stderr_head.into());
-                            scope.set_extra("stdout_head", stdout_head.into());
+                            scope.set_extra("stdout_lines", stdout_line_count.into());
                             scope.set_extra("cli_path", cli_path_str.into());
                             scope.set_extra("project_name", project_name.to_string().into());
                             scope.set_fingerprint(Some(fingerprint.as_slice()));
@@ -8449,8 +8460,19 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     match state.ensure_headroom_running() {
                         Ok(()) => port_conflict::note_proxy_started(&app),
                         Err(err) => {
-                            log::warn!("watchdog: hung-kill restart failed: {err:#}");
-                            port_conflict::note_proxy_failed(&app, &err, false);
+                            // Through the classifier, not the log bridge: the
+                            // bridged warn carried the whole error chain (argv,
+                            // ports, prior attempts) in its text, so one
+                            // condition opened an issue per machine and none
+                            // could be resolved (RUST-E2). This is the same
+                            // "unable to keep headroom running" the launch path
+                            // already classifies -- endpoint protection, a
+                            // denied loopback socket and a port conflict each
+                            // get their own remedy and their own issue.
+                            log::info!("watchdog: hung-kill restart failed: {err:#}");
+                            if !port_conflict::note_proxy_failed(&app, &err, false) {
+                                capture_headroom_start_failure("watchdog hung-kill restart", &err);
+                            }
                         }
                     }
                     continue;
