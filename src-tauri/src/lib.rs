@@ -6398,6 +6398,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .unwrap_or_else(|err| fatal_build_error(err))
         .run(|app, event| {
+            // macOS never spawns a second process when the user opens an
+            // already-running app from Finder or a pinned Dock icon, so the
+            // single-instance hand-off above never fires there; AppKit sends
+            // applicationShouldHandleReopen instead. Without this arm a
+            // relaunch did nothing visible while the app sat in the menu bar.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Err(err) = show_primary_window(app) {
+                    log::warn!("reopen: could not show window: {err}");
+                }
+                return;
+            }
             // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
             // or our explicit quit/restart commands). Without this, the proxy
             // outlives the desktop and the next launch reuses an orphan.

@@ -9955,6 +9955,11 @@ mod tests {
             intercept_bind_hint("port 6767 is still being released after a restart; reconnecting");
         assert!(draining.contains("Nothing to do"), "{draining}");
         assert!(!draining.contains("Quit"), "{draining}");
+        // The bind loop publishes the same phrase during the relaunch grace,
+        // before it knows which verdict applies, so both must land here rather
+        // than on the 10048 "another program has it" arm.
+        let relaunching = intercept_bind_hint("port 6767 is still being released; reconnecting");
+        assert_eq!(relaunching, draining);
         let stuck = intercept_bind_hint("port 6767 stuck in use with nothing listening (301s)");
         assert!(stuck.contains("excludedportrange"), "{stuck}");
         assert!(stuck.contains("Reboot"), "{stuck}");

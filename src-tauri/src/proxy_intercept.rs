@@ -753,9 +753,27 @@ pub fn spawn(
                             // it held) — benign, just wait for it to go away.
                             // Otherwise the port is foreign; escalate once.
                             if probe_existing_intercept().await {
-                                log::info!(
-                                    "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
-                                );
+                                // Clients still reach A Headroom, so this is
+                                // benign for traffic -- but nothing in this
+                                // loop ever clears it, and a second instance
+                                // really does happen (`restart_app`'s `open -n`
+                                // relauncher bypasses single-instance). Past
+                                // the relaunch window it has stopped being an
+                                // overlapping restart and this window is a
+                                // spectator whose toggles reach no proxy, so
+                                // say so once at a level that leaves a trace.
+                                if launched_at.elapsed() >= RELAUNCH_GRACE
+                                    && reported_errors.insert("existing_proxy".to_string())
+                                {
+                                    log::warn!(
+                                        "[proxy_intercept] port {INTERCEPT_PORT} still served by another Headroom proxy {}s after launch; this instance is not the one clients reach",
+                                        launched_at.elapsed().as_secs()
+                                    );
+                                } else {
+                                    log::info!(
+                                        "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
+                                    );
+                                }
                             } else if launched_at.elapsed() < RELAUNCH_GRACE {
                                 // Sentry stays quiet for the whole grace: a
                                 // bind that heals itself is not an error worth
@@ -764,7 +782,25 @@ pub fn spawn(
                                 // -- which blames the Python runtime for a port
                                 // that never opened -- for the full 90s.
                                 if launched_at.elapsed() >= HINT_GRACE {
-                                    *bind_error.lock() = Some(e.to_string());
+                                    // Deliberately NOT the raw OS string.
+                                    // `state::intercept_bind_hint` renders
+                                    // 10048 as "in use by another program,
+                                    // here is how to find it", which inside
+                                    // the relaunch window names the wrong
+                                    // culprit (it is our own outgoing
+                                    // instance) and is loud: a startup error
+                                    // hint bypasses the notification layer's
+                                    // cold-start grace, so an update fired
+                                    // "Headroom stopped running" over a window
+                                    // that healed itself. Same phrase as the
+                                    // Draining verdict below, so the banner
+                                    // reads identically whether the port
+                                    // clears before or after the grace, and a
+                                    // real foreign holder still corrects it at
+                                    // RELAUNCH_GRACE.
+                                    *bind_error.lock() = Some(format!(
+                                        "port {INTERCEPT_PORT} is still being released; reconnecting"
+                                    ));
                                 }
                                 log::info!(
                                     "[proxy_intercept] port {INTERCEPT_PORT} still held {}s after launch (a restart overlapping the previous instance looks exactly like this); retrying ({e})",
