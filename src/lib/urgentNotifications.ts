@@ -186,6 +186,14 @@ export async function maybeFireUrgentRuntimeNotification(
     runtime.installed && !runtime.running && !runtime.starting && !runtime.paused;
   if (!runtimeDown) return;
 
+  // A restart handing the port over to itself is not a crash. The intercept
+  // publishes this hint within 15s of an update relaunch and clears it as soon
+  // as the old instance's sockets drain, so notifying over it fires "Headroom
+  // stopped running" whose own body says there is nothing to do -- which is
+  // how the channel gets muted (0.9.10 -> 0.9.14 Windows update). The in-app
+  // banner still shows it.
+  if (runtime.startupErrorHint?.includes("still being released")) return;
+
   const hasHardError = !!(runtime.startupError || runtime.startupErrorHint);
   if (!everReachable && !hasHardError) {
     const now = Date.now();

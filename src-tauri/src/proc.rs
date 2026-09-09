@@ -119,26 +119,43 @@ pub fn output_with_timeout(
     })
 }
 
-/// `powershell` by its canonical absolute path when `system_root` has one.
+/// The Windows tools we shell out to that live directly in `System32`.
+/// `powershell` is handled separately: it sits one level deeper.
+const SYSTEM32_TOOLS: [&str; 5] = ["netstat", "tasklist", "taskkill", "reg", "hostname"];
+
+/// A Windows system tool by its canonical absolute path when `system_root` has
+/// one.
 ///
 /// A bare name resolves through PATH, and a user-edited PATH that lost
 /// `System32\WindowsPowerShell\v1.0` turned every sweep, kill, and port-owner
 /// lookup into "program not found" (RUST-CH/CJ/CK: one 0.9.7 host, three
-/// issues, all this one spawn). Every other program passes through untouched;
-/// a missing canonical file falls back to the bare name so the error stays the
-/// one it is today.
+/// issues, all this one spawn). A PATH that lost `System32` itself does the
+/// same to the rest of the list, and the port paths fail SILENTLY when it
+/// does: no `netstat` means no occupant to name, so a held 6767 reports as
+/// "nothing is listening" and `reclaim_stranded_intercept_holder` bails before
+/// its identity gate. Every other program passes through untouched; a missing
+/// canonical file falls back to the bare name so the error stays the one it is
+/// today.
 fn resolve_system_tool(program: &OsStr, system_root: Option<&OsStr>) -> OsString {
-    if program.eq_ignore_ascii_case("powershell") {
-        if let Some(root) = system_root {
-            let full = Path::new(root)
-                .join("System32")
-                .join("WindowsPowerShell")
-                .join("v1.0")
-                .join("powershell.exe");
-            if full.is_file() {
-                return full.into_os_string();
-            }
-        }
+    let Some(root) = system_root else {
+        return program.to_os_string();
+    };
+    let full = if program.eq_ignore_ascii_case("powershell") {
+        Path::new(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+    } else if let Some(tool) = SYSTEM32_TOOLS
+        .iter()
+        .find(|tool| program.eq_ignore_ascii_case(tool))
+    {
+        Path::new(root).join("System32").join(format!("{tool}.exe"))
+    } else {
+        return program.to_os_string();
+    };
+    if full.is_file() {
+        return full.into_os_string();
     }
     program.to_os_string()
 }
@@ -197,6 +214,18 @@ mod tests {
             super::resolve_system_tool(OsStr::new("PowerShell"), root_os),
             exe.as_os_str()
         );
+        // The System32 tools the port paths depend on resolve the same way --
+        // without netstat a held 6767 has no occupant to name at all.
+        let system32 = root.path().join("System32");
+        std::fs::create_dir_all(&system32).expect("mkdir");
+        for tool in ["netstat", "tasklist", "taskkill", "reg", "hostname"] {
+            let tool_exe = system32.join(format!("{tool}.exe"));
+            std::fs::write(&tool_exe, b"x").expect("write");
+            assert_eq!(
+                super::resolve_system_tool(OsStr::new(tool), root_os),
+                tool_exe.as_os_str()
+            );
+        }
         // Other programs, no SystemRoot, and a SystemRoot without the file all
         // pass the bare name through.
         assert_eq!(
@@ -211,6 +240,10 @@ mod tests {
         assert_eq!(
             super::resolve_system_tool(OsStr::new("powershell"), Some(empty.path().as_os_str())),
             OsStr::new("powershell")
+        );
+        assert_eq!(
+            super::resolve_system_tool(OsStr::new("netstat"), Some(empty.path().as_os_str())),
+            OsStr::new("netstat")
         );
     }
 

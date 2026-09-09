@@ -9413,16 +9413,35 @@ fn windows_listener(port: u16) -> Option<(String, u32)> {
     }
     let pid = parse_netstat_listener(&String::from_utf8_lossy(&output.stdout), port)?;
 
-    // The image name is cosmetic (it goes into the occupant string); a pid we
-    // could not name is still a pid worth reporting and gating a kill on.
-    let image = crate::proc::command("tasklist")
+    let listed = crate::proc::command("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
         .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| parse_tasklist_image(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_else(|| "unnamed process".to_string());
+        .ok();
+    let image = occupant_image(
+        listed
+            .as_ref()
+            .map(|out| String::from_utf8_lossy(&out.stdout))
+            .as_deref(),
+    )?;
     Some((image, pid))
+}
+
+/// The occupant name for `pid`, from `tasklist` stdout (`None` argument when
+/// tasklist itself could not be run).
+///
+/// A pid we could not name is still worth reporting and gating a kill on, so a
+/// tasklist we could not run keeps the pid under a placeholder. A tasklist that
+/// RAN and matched nothing is the opposite: proof that netstat's row named a
+/// holder which has since exited, so there is no listener to report. That case
+/// used to arrive as `Foreign { name: "unnamed process" }`, which told the user
+/// to end a pid their Task Manager no longer had (RUST-EE, an update relaunch)
+/// and blocked the `SO_REUSEADDR` rebind that clears a draining port.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn occupant_image(tasklist_stdout: Option<&str>) -> Option<String> {
+    match tasklist_stdout {
+        Some(text) => parse_tasklist_image(text),
+        None => Some("unnamed process".to_string()),
+    }
 }
 
 /// The pid LISTENING on `port` in `netstat -ano` output.
@@ -9638,7 +9657,14 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     }
 
     log::warn!("[backend_port] reclaiming orphaned headroom proxy pid {pid} on port {port}");
-    kill_pid(pid, false);
+    // Windows: `taskkill /T` without `/F` only closes a process that owns a
+    // window, and this target is always a windowless managed-runtime python
+    // (`pid_is_headroom_backend` above). Measured on win-test 2026-09-09: the
+    // graceful stage is a silent no-op 3/3 times and burns the whole 3s wait
+    // below, while the forced kill frees the port in 0-2 ms. Go straight to it.
+    // NOT done for the intercept reclaim, whose target can be a desktop twin
+    // that does own a window and needs the clean shutdown to flush state.
+    kill_pid(pid, cfg!(windows));
     if !wait_for_port_free(port, Duration::from_secs(3)) {
         kill_pid(pid, true);
         if !wait_for_port_free(port, Duration::from_secs(2)) {
@@ -9682,12 +9708,17 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
     if pid == std::process::id() {
         return false;
     }
-    if !pid_is_headroom_desktop_twin(pid) {
+    // Two shapes of "ours", both of which hold the front door and neither of
+    // which ever lets go: an updater-stranded desktop instance (same exe as
+    // us), and our own managed runtime on the wrong port -- a Python out of
+    // our runtime dir listening on 6767 instead of its own backend port, which
+    // `reclaim_orphan_proxy` never sees because it only ever looks at the
+    // backend port (RUST-D3, RUST-EC: "held by python.exe" / "python3.1").
+    // Anything else stays untouched.
+    if !pid_is_headroom_desktop_twin(pid) && !pid_is_headroom_backend(pid) {
         return false;
     }
-    log::warn!(
-        "[proxy_intercept] reclaiming stranded Headroom desktop instance pid {pid} on port {port}"
-    );
+    log::warn!("[proxy_intercept] reclaiming stranded Headroom process pid {pid} on port {port}");
     kill_pid(pid, false);
     if !wait_for_port_free(port, Duration::from_secs(3)) {
         kill_pid(pid, true);
@@ -13086,16 +13117,17 @@ mod tests {
         format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
-        looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
-        parse_netstat_listener, parse_pid_from_lsof_detail, parse_ss_listener,
-        parse_tasklist_image, path_with_binary_dir, pending_addon_update, pinned_headroom_release,
-        pip_failure_category, pip_line_to_progress, plugin_install_failure_category,
-        pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
-        purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
-        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
-        requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_unowned_port,
-        sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
+        looks_like_corrupt_venv_error, occupant_image, parse_lsof_listener,
+        parse_major_minor_patch, parse_netstat_listener, parse_pid_from_lsof_detail,
+        parse_ss_listener, parse_tasklist_image, path_with_binary_dir, pending_addon_update,
+        pinned_headroom_release, pip_failure_category, pip_line_to_progress,
+        plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
+        proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
+        reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
+        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
+        savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
+        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
         wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
         CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
         UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
@@ -15870,6 +15902,26 @@ mod tests {
             parse_tasklist_image("INFO: No tasks are running which match the specified criteria."),
             None
         );
+    }
+
+    #[test]
+    fn occupant_image_reports_no_holder_once_the_pid_is_gone() {
+        // tasklist ran and matched nothing: netstat's row was the exiting
+        // instance, so the port has no listener to name at the user.
+        assert_eq!(
+            occupant_image(Some(
+                "INFO: No tasks are running which match the specified criteria."
+            )),
+            None
+        );
+        assert_eq!(
+            occupant_image(Some(
+                "\"python.exe\",\"9876\",\"Console\",\"1\",\"45,678 K\"\r\n"
+            )),
+            Some("python.exe".to_string())
+        );
+        // tasklist itself could not run: the pid stands, the name does not.
+        assert_eq!(occupant_image(None), Some("unnamed process".to_string()));
     }
 
     #[test]
