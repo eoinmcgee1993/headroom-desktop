@@ -795,7 +795,24 @@ pub fn repair_client_setups() -> Vec<String> {
                 // a successful self-repair is the only fleet-visible trace of a
                 // config that was silently broken (e.g. the stale flagless
                 // Codex block, which 401'd every request until repaired).
-                log::warn!("repair_client_setups: repaired {client_id}");
+                // Info, not warn: the bridged warn carried no fingerprint,
+                // and Sentry grouped it on the SDK's stacktrace instead of the
+                // text -- so byte-identical "repaired codex_cli" lines opened
+                // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
+                // of them meant nothing. One issue per client, from here.
+                log::info!("repair_client_setups: repaired {client_id}");
+                sentry::with_scope(
+                    |scope| {
+                        scope.set_tag("flow", "repair_client_setups");
+                        scope.set_fingerprint(Some(&["repair_client_setups", client_id.as_str()]));
+                    },
+                    || {
+                        sentry::capture_message(
+                            &format!("repair_client_setups: repaired {client_id}"),
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
                 repaired.push(client_id);
             }
             Ok(verification) => log::warn!(

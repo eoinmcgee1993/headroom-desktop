@@ -3293,10 +3293,11 @@ impl AppState {
         } // release lock before the blocking start
 
         self.set_runtime_starting(true);
-        // During upgrade boot validation, reclaim 6768 even from a still-healthy
-        // old proxy — we're replacing it, so leaving it alone would strand the
-        // new venv unable to bind and roll the upgrade back as `not_started`.
-        let reclaim_healthy_orphan = *self.runtime_upgrade_in_progress.lock();
+        let reclaim_healthy_orphan = should_reclaim_healthy_backend(
+            *self.runtime_upgrade_in_progress.lock(),
+            backend_serving,
+            backend_argv_is_current,
+        );
         let started = self
             .tool_manager
             .start_headroom_background(reclaim_healthy_orphan);
@@ -3939,6 +3940,7 @@ impl AppState {
             if self.proxy_bypass.swap(false, AcqRel) {
                 if let Err(err) = self.ensure_headroom_running() {
                     log::warn!("enter_claude_gate: ensure_headroom_running failed: {err:#}");
+                    crate::capture_headroom_start_failure("enter_claude_gate", &err);
                 }
             }
         } else {
@@ -3961,6 +3963,7 @@ impl AppState {
         if self.proxy_bypass.swap(false, AcqRel) {
             if let Err(err) = self.ensure_headroom_running() {
                 log::warn!("exit_claude_gate: ensure_headroom_running failed: {err:#}");
+                crate::capture_headroom_start_failure("exit_claude_gate", &err);
             }
         }
     }
@@ -6406,6 +6409,11 @@ enum CacheIntegrityKind {
     PrefixRewrite,
 }
 
+// The three `*_tokens` fields deserialize the wheel's names and serialize
+// scrub-proof ones: Sentry's data scrubber nulls any extra whose KEY contains
+// "token", and it recurses into nested objects, so the only three numbers that
+// SIZE a rewrite (how much cache was thrown away) arrived null on every
+// RUST-DP event while the message indices next to them came through.
 #[derive(Debug, Deserialize, Serialize)]
 struct CacheIntegrityReport {
     boot_id: String,
@@ -6413,8 +6421,11 @@ struct CacheIntegrityReport {
     kind: CacheIntegrityKind,
     stable_messages: u64,
     first_changed_message: u64,
+    #[serde(rename(serialize = "previously_cached_toks"))]
     previously_cached_tokens: u64,
+    #[serde(rename(serialize = "cache_read_toks"))]
     cache_read_tokens: u64,
+    #[serde(rename(serialize = "cache_write_toks"))]
     cache_write_tokens: u64,
 }
 
@@ -8011,6 +8022,15 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
              Nothing to do: Headroom reconnects on its own within a few minutes."
         );
     }
+    // The bind loop is mid-diagnosis: it knows the port is held but not by
+    // whom, and it is still retrying. Naming a remedy here would be guessing.
+    if raw.contains("identifying what holds it") {
+        return format!(
+            "Port {port} is in use and Headroom is checking what holds it. \
+             Nothing to do yet: Headroom keeps retrying, and names the program \
+             holding the port if this doesn't clear on its own."
+        );
+    }
     if raw.contains("stuck in use") {
         return format!(
             "Port {port} is in use, but no program is listening on it. \
@@ -8064,6 +8084,31 @@ fn is_headroom_proxy_reachable() -> bool {
 /// OLD wheel that `stop_headroom` was meant to remove, and validating against
 /// it would report the upgrade as working while nothing changed; the spawn
 /// path force-reclaims it instead.
+/// Whether the spawn pre-flight may take 6768 back from a backend that is
+/// still answering `/readyz`.
+///
+/// Two reasons, and the second one is a deadlock fix. During upgrade boot
+/// validation we are replacing the occupant, so leaving it alone strands the
+/// new venv unable to bind and rolls the upgrade back as `not_started`. The
+/// other is a backend whose argv is NOT this build's: `runtime_already_serving`
+/// has just refused to adopt it for exactly that reason, and
+/// `reclaim_orphan_proxy` refuses to kill a healthy occupant unless forced --
+/// so without this every pass bails "headroom proxy already running on port
+/// 6768", three of those auto-pause the runtime, and the user silently saves
+/// nothing until reboot. That is RUST-6J into RUST-5C, the largest Windows
+/// cluster we have. `first_backend_start` only forced the FIRST pass of an app
+/// process; a watchdog restart or a tray open got nothing.
+///
+/// Safe direction on hosts we cannot introspect: `running_proxy_matches_expected_args`
+/// fails OPEN, so an unreadable argv reads as current and nothing is killed.
+fn should_reclaim_healthy_backend(
+    upgrade_in_progress: bool,
+    backend_serving: bool,
+    backend_argv_is_current: bool,
+) -> bool {
+    upgrade_in_progress || (backend_serving && !backend_argv_is_current)
+}
+
 fn runtime_already_serving(
     intercept_reachable: bool,
     backend_serving: bool,
@@ -8627,7 +8672,13 @@ const CACHE_READ_PRICE_RATIO: f64 = 0.10;
 /// the ~$33/M signature the 0.36.0 tool-schema contamination produced -- the
 /// event this canary exists to catch. RUST-89's lone post-b86b91b event was an
 /// o3-pro-class mix reading $20.11/M on the pinned, uncontaminated wheel.
-const MAX_PLAUSIBLE_INPUT_USD_PER_M: f64 = 25.0;
+///
+/// Raised 25 -> 30 on 2026-09-09: RUST-DX fired at $25.08/M lifetime, worst
+/// bucket $25.20/M, on the pinned 0.37.0 wheel -- 0.3% over the line, which is
+/// a legit expensive mix and not a semantics change. $30 keeps a ~10% margin
+/// under the contamination signature this exists to catch, and the canary was
+/// churning resolve/regress cycles on a threshold that sat inside the noise.
+const MAX_PLAUSIBLE_INPUT_USD_PER_M: f64 = 30.0;
 
 /// True when the buckets imply a savings $/token that no provider charges for
 /// an input token. A saved input token is worth exactly the rate it would have
@@ -8700,6 +8751,32 @@ fn warn_once_if_savings_rate_implausible(
             })
             .unwrap_or_else(|| "none".into());
         let upstream = crate::upstream_override::get().mode;
+        // Fixed fingerprint, numbers as extras: every dollar figure in the
+        // message text is different on every host, so the bridged warn opened
+        // one issue per machine per day (RUST-DX, RUST-89, RUST-8C are the same
+        // canary) and no resolve could ever stick. Same split the zero-savings
+        // and basis canaries already use; logging.rs drops the bridged twin.
+        sentry::with_scope(
+            |scope| {
+                scope.set_tag("flow", "savings_rate_implausible");
+                scope.set_tag("wheel", wheel.as_str());
+                scope.set_extra("usd_per_m", savings_per_m.into());
+                scope.set_extra("ceiling_usd_per_m", MAX_PLAUSIBLE_INPUT_USD_PER_M.into());
+                scope.set_extra("saved_usd", saved_usd.into());
+                // NOT "*_tokens": Sentry's scrubber nulls those keys.
+                scope.set_extra("saved_toks", saved_tokens.into());
+                scope.set_extra("worst_bucket", worst.clone().into());
+                scope.set_extra("upstream", format!("{upstream:?}").into());
+                scope.set_fingerprint(Some(&["savings_rate_implausible"]));
+            },
+            || {
+                sentry::capture_message(
+                    "savings rate implausible: buckets imply more per saved token than any \
+                     provider bills for an input token",
+                    sentry::Level::Warning,
+                );
+            },
+        );
         log::warn!(
             "savings rate implausible: buckets imply ${savings_per_m:.2}/M saved (${saved_usd:.2} \
              across {saved_tokens} tokens, wheel {wheel}), above the \
@@ -9043,6 +9120,17 @@ mod tests {
         assert!(!serde_json::to_string(&events[0])
             .unwrap()
             .contains("private content"));
+        // Sentry nulls any extra key containing "token" -- and did, on every
+        // RUST-DP event -- so the sizes must reach it under other names.
+        let integrity = events[0].extra["cache_integrity"].as_object().unwrap();
+        assert!(
+            integrity.keys().all(|k| !k.contains("token")),
+            "{:?}",
+            integrity.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(integrity["previously_cached_toks"], 503505);
+        assert_eq!(integrity["cache_read_toks"], 7259);
+        assert_eq!(integrity["cache_write_toks"], 491260);
     }
 
     #[test]
@@ -9876,11 +9964,22 @@ mod tests {
             intercept_bind_hint("port 6767 is still being released after a restart; reconnecting");
         assert!(draining.contains("Nothing to do"), "{draining}");
         assert!(!draining.contains("Quit"), "{draining}");
+        // The bind loop publishes the same phrase during the relaunch grace,
+        // before it knows which verdict applies, so both must land here rather
+        // than on the 10048 "another program has it" arm.
+        let relaunching = intercept_bind_hint("port 6767 is still being released; reconnecting");
+        assert_eq!(relaunching, draining);
         let stuck = intercept_bind_hint("port 6767 stuck in use with nothing listening (301s)");
         assert!(stuck.contains("excludedportrange"), "{stuck}");
         assert!(stuck.contains("Reboot"), "{stuck}");
+        // Mid-diagnosis: held, holder unknown, still retrying. No instruction
+        // to follow yet, and never the 10048 arm's PowerShell command.
+        let looking = intercept_bind_hint("port 6767 is in use; identifying what holds it");
+        assert!(looking.contains("Nothing to do yet"), "{looking}");
+        assert!(!looking.contains("Get-NetTCPConnection"), "{looking}");
+        assert!(!looking.contains("Quit"), "{looking}");
         // Every variant leads with a sentence that stands alone as the headline.
-        for hint in [&foreign, &draining, &stuck] {
+        for hint in [&foreign, &draining, &stuck, &looking] {
             let first = hint.split(". ").next().unwrap();
             assert!(first.starts_with("Port 6767"), "{first}");
             assert!(first.len() < 110, "headline too long: {first}");
@@ -10180,6 +10279,26 @@ mod tests {
     /// refuses to kill a healthy occupant and bails, every launch, until three
     /// failures auto-paused (and therefore BYPASSED) the runtime. Sentry
     /// RUST-6J -> RUST-5C, the largest Windows cluster.
+    #[test]
+    fn healthy_backend_is_reclaimed_only_when_this_build_cannot_adopt_it() {
+        use super::should_reclaim_healthy_backend as reclaim;
+
+        // Upgrade validation replaces the occupant either way.
+        assert!(reclaim(true, false, false));
+        // RUST-6J: healthy, but not this build's argv -- the adoption above
+        // refused it, so the reclaim must be allowed to kill it. Without this
+        // both gates say no and the start bails every pass until auto-pause.
+        assert!(reclaim(false, true, false));
+        // Healthy AND current: adopted upstream, never reached here, and must
+        // not be killed if it is.
+        assert!(!reclaim(false, true, true));
+        // Nothing serving: ordinary spawn, no force.
+        assert!(!reclaim(false, false, true));
+        // Unreadable argv fails OPEN to `true`, so an introspectable-less host
+        // lands on the no-force branch above, not on a kill.
+        assert!(!reclaim(false, false, false));
+    }
+
     #[test]
     fn runtime_already_serving_accepts_a_healthy_backend_behind_a_wedged_intercept() {
         use super::runtime_already_serving as serving;

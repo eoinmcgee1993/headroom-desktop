@@ -145,7 +145,10 @@ pub fn observe(events: &[TransformationFeedEvent]) {
             scope.set_tag("flow", "zero_savings_canary");
             scope.set_extra("sample", (anomaly.sample as u64).into());
             scope.set_extra("zero_saved", (anomaly.zero as u64).into());
-            scope.set_extra("min_input_tokens", MIN_INPUT_TOKENS.into());
+            // NOT "min_input_tokens": Sentry's data scrubber nulls any extra
+            // whose KEY contains "token", so the threshold this canary is
+            // measured against arrived empty on every event (RUST-A5).
+            scope.set_extra("min_input_toks", MIN_INPUT_TOKENS.into());
             scope.set_extra("strata", strata.clone().into());
             scope.set_extra("models", models.clone().into());
             scope.set_extra("transforms", transforms.clone().into());

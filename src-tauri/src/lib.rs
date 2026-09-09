@@ -3599,6 +3599,32 @@ fn get_gated_bypass_bytes() -> u64 {
     proxy_intercept::gated_bypass_bytes()
 }
 
+/// Seconds since each connector last wrote its own session artifacts on this
+/// machine. A client with no entry has never been seen at all.
+///
+/// The verify screen uses this to stop testing an agent the user does not
+/// actually use. A row is built for every *installed* connector, so a Claude
+/// Code that has sat dormant since March gets a "Waiting for a prompt..."
+/// spinner that can never resolve -- and because the success button needs
+/// every row green, the screen reads as "your setup failed" forever.
+#[tauri::command]
+fn get_client_local_activity_ages(
+    client_ids: Vec<String>,
+) -> std::collections::HashMap<String, u64> {
+    let now = std::time::SystemTime::now();
+    client_ids
+        .into_iter()
+        .filter_map(|client_id| {
+            let at = client_adapters::client_local_activity_at(&client_id)?;
+            // A clock that moved backwards yields no reading rather than a
+            // wrapped one: "never used" is the safe answer, since it only ever
+            // removes a row from the test, never fails one.
+            let age = now.duration_since(at).ok()?.as_secs();
+            Some((client_id, age))
+        })
+        .collect()
+}
+
 /// Running agent processes keyed by connector id, for the verify screen's
 /// "these sessions still hold old settings" callout. Undercounts are fine
 /// (the callout just stays quiet); false positives are not, so matching is
@@ -5939,7 +5965,7 @@ pub fn run() {
     let mut builder =
         tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Second launch: focus the existing window and exit the new process.
-            let _ = show_launcher_window(app);
+            let _ = show_primary_window(app);
             // On Windows/Linux the OS answers a `headroom://` link by spawning
             // a NEW process with the URL in argv; the running instance is never
             // notified, and the new one dies here. Replay argv into the primary
@@ -6202,7 +6228,7 @@ pub fn run() {
                 std::sync::Arc::clone(&state.intercept_bind_error),
             );
             if state.should_present_on_launch() && !launched_from_autostart {
-                let _ = show_launcher_window(app.handle());
+                let _ = show_primary_window(app.handle());
             }
             if state.tool_manager.python_runtime_installed() {
                 state.set_runtime_starting(true);
@@ -6305,6 +6331,7 @@ pub fn run() {
             get_headroom_request_counts_by_agent,
             get_intercept_request_counts_by_agent,
             get_running_agent_process_counts,
+            get_client_local_activity_ages,
             get_gated_bypass_bytes,
             install_claude_code_cli,
             get_launch_flags,
@@ -6371,6 +6398,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .unwrap_or_else(|err| fatal_build_error(err))
         .run(|app, event| {
+            // macOS never spawns a second process when the user opens an
+            // already-running app from Finder or a pinned Dock icon, so the
+            // single-instance hand-off above never fires there; AppKit sends
+            // applicationShouldHandleReopen instead. Without this arm a
+            // relaunch did nothing visible while the app sat in the menu bar.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Err(err) = show_primary_window(app) {
+                    log::warn!("reopen: could not show window: {err}");
+                }
+                return;
+            }
             // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
             // or our explicit quit/restart commands). Without this, the proxy
             // outlives the desktop and the next launch reuses an orphan.
@@ -7028,6 +7067,12 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         "session limit reached",
         "hit your usage limit",
         "usage limit reached",
+        // RUST-EB: `You've hit your individual spend limit \u{b7} run
+        // /usage-credits to raise it` -- a credit ceiling, not a session
+        // window, and the organization variant words it differently again, so
+        // match the two words the whole family shares. Still specific enough
+        // not to hit a project's own source line echoed back.
+        "spend limit",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
@@ -7595,7 +7640,10 @@ fn execute_headroom_learn_run(
                 let stderr_head = crate::tool_manager::redact_sensitive(
                     &stderr.chars().take(2000).collect::<String>(),
                 );
-                let stdout_head: String = stdout.chars().take(2000).collect();
+                // Never the bytes, only the shape: enough to tell "the CLI
+                // printed nothing" from "it printed and still failed".
+                let stdout_line_count = stdout.lines().count() as u64;
+                let stderr_tail = crate::state::tail_lines(&stderr, 32).join("\n");
                 let cli_path_str = cli_path
                     .as_ref()
                     .map(|p| p.display().to_string())
@@ -7648,12 +7696,20 @@ fn execute_headroom_learn_run(
                                     .map(|s| s.to_string().into())
                                     .unwrap_or(serde_json::Value::Null),
                             );
+                            // STDERR ONLY. `fail_tail` is the tail of stdout
+                            // MERGED with stderr, and stdout echoes the user's
+                            // memory files back verbatim -- RUST-B7 shipped a
+                            // user's CLAUDE.md, and on another host their
+                            // database passwords, into Sentry through these
+                            // two extras. The reason for a failure is always on
+                            // stderr; stdout only ever carried the banner and
+                            // the user's own project content.
                             scope.set_extra(
-                                "output_tail_redacted",
-                                crate::tool_manager::redact_sensitive(&fail_tail).into(),
+                                "stderr_tail_redacted",
+                                crate::tool_manager::redact_sensitive(&stderr_tail).into(),
                             );
                             scope.set_extra("stderr_head_redacted", stderr_head.into());
-                            scope.set_extra("stdout_head", stdout_head.into());
+                            scope.set_extra("stdout_lines", stdout_line_count.into());
                             scope.set_extra("cli_path", cli_path_str.into());
                             scope.set_extra("project_name", project_name.to_string().into());
                             scope.set_fingerprint(Some(fingerprint.as_slice()));
@@ -7794,13 +7850,9 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
-                if onboarding_complete(app) {
-                    let _ = hide_launcher_window(app);
-                    let _ = show_main_window(app, None);
+                if show_primary_window(app).unwrap_or(false) {
                     let app_bg = app.clone();
                     std::thread::spawn(move || ensure_runtime_ready_for_tray(&app_bg));
-                } else {
-                    let _ = show_launcher_window(app);
                 }
             }
             "pause" => {
@@ -8447,8 +8499,19 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     match state.ensure_headroom_running() {
                         Ok(()) => port_conflict::note_proxy_started(&app),
                         Err(err) => {
-                            log::warn!("watchdog: hung-kill restart failed: {err:#}");
-                            port_conflict::note_proxy_failed(&app, &err, false);
+                            // Through the classifier, not the log bridge: the
+                            // bridged warn carried the whole error chain (argv,
+                            // ports, prior attempts) in its text, so one
+                            // condition opened an issue per machine and none
+                            // could be resolved (RUST-E2). This is the same
+                            // "unable to keep headroom running" the launch path
+                            // already classifies -- endpoint protection, a
+                            // denied loopback socket and a port conflict each
+                            // get their own remedy and their own issue.
+                            log::info!("watchdog: hung-kill restart failed: {err:#}");
+                            if !port_conflict::note_proxy_failed(&app, &err, false) {
+                                capture_headroom_start_failure("watchdog hung-kill restart", &err);
+                            }
                         }
                     }
                     continue;
@@ -8955,6 +9018,25 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
     let _ = window.unminimize();
     window.set_focus()?;
     Ok(())
+}
+
+/// Which window a "bring Headroom up" request means: the dashboard once
+/// onboarding is done, the setup launcher before. Returns true when the
+/// dashboard was shown. Used by manual (re)launch, the second-instance
+/// hand-off and the tray "Show" item. Manual relaunch used to raise the
+/// launcher's "Get started" screen unconditionally, whose only button hides
+/// the window; on Windows, where the tray icon sits behind the overflow
+/// chevron, that left returning users with no visible way to the dashboard
+/// (and its Upgrade button).
+fn show_primary_window(app: &AppHandle) -> tauri::Result<bool> {
+    if onboarding_complete(app) {
+        hide_launcher_window(app)?;
+        show_main_window(app, None)?;
+        Ok(true)
+    } else {
+        show_launcher_window(app)?;
+        Ok(false)
+    }
 }
 
 fn show_launcher_window(app: &AppHandle) -> tauri::Result<()> {
@@ -11918,6 +12000,12 @@ Some unrelated content.
 
         assert!(learn_failure_agent_limit_line("usage limit reached for this session").is_some());
         assert!(learn_failure_agent_limit_line("You've hit your usage limit.").is_some());
+
+        // RUST-EB verbatim: a credit ceiling, worded so that none of the
+        // session/usage needles above touch it. It reached Sentry as an Error
+        // and handed the user the raw exit status instead of the reset time.
+        let spend = "You've hit your individual spend limit \u{b7} run /usage-credits to raise it, or visit claude.ai/admin-settings/usage \u{b7} your session limit resets 9:30pm (America/Sao_Paulo)";
+        assert_eq!(learn_failure_agent_limit_line(spend), Some(spend));
     }
 
     #[test]

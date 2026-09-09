@@ -646,6 +646,25 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     });
   });
 
+  it("stays quiet while a restart is still handing the port over", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    // Reachable once, so the cold-start grace is not what is suppressing it.
+    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: true }));
+    await maybeFireUrgentRuntimeNotification(
+      makeRuntime({
+        running: false,
+        startupError: "os error 10048",
+        startupErrorHint:
+          "Port 6767 is still being released by the previous Headroom session. " +
+          "Nothing to do: Headroom reconnects on its own within a few minutes.",
+      })
+    );
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
   it("does not fire while the runtime is starting", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();

@@ -316,13 +316,18 @@ conversation and feeds the novel figure to the two cumulative
 consumers; per-request surfaces keep the wire truth, matching #3480 so
 the wheel bump is a no-op. Self-neutralizes once a wheel ships #3480's
 RequestOutcome fields. Kill switch: HEADROOM_CONVERSATION_SAVINGS=0.
-Thinking signatures are not input (upstream PR #3482): the shared block walker priced Anthropic `thinking` blocks
-through its JSON catch-all, so the ~1 KB opaque `signature` per block
-counted as text. Measured 2026-09-08 on a 369-message Claude Code
-session: 99 signatures were 256K of 414K counted tokens against ~313K
-provider-billed, inflating every tokens_before-derived figure (feed
-percent, size stratum, cold-start deferral). The vendor counts only the
-thinking text. Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
+Thinking signatures priced as decoded bytes (upstream PR #3482): the shared block walker priced Anthropic `thinking` blocks
+through its JSON catch-all, so the `signature` per block counted as
+prose at ~3 chars/token. Measured 2026-09-08 on a 369-message Claude
+Code session: 99 signatures were 256K of 414K counted tokens against
+~313K provider-billed, inflating every tokens_before-derived figure
+(feed percent, size stratum, cold-start deferral). The signature is
+not free either: it is the encrypted full reasoning, replayed as billed
+input on the keep-all-turns models (the 5.x line), and under the 5.x
+default `display: "omitted"` the thinking text is empty, so text-only
+priced every block at zero (first cut of #3482, changes requested).
+The vendor prices thinking text plus decoded signature bytes / 4.
+Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
 Fresh cache_control compression (upstream PR #3483): the router never touched a block carrying cache_control, but
 Claude Code stamps its newest tool_result every turn, so the freshest
 tool output was protected on the one turn it was fresh and only retried
@@ -2344,14 +2349,19 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
 
-# --- Thinking signatures are not input tokens (upstream PR #3482) -----------
+# --- Thinking signatures priced as decoded bytes (upstream PR #3482) --------
 # The shared block walker (BaseTokenizer._count_content_parts, borrowed by every
 # provider counter via count_content_blocks) had no `thinking` branch, so the
-# JSON catch-all priced the ~1 KB opaque `signature` per block as text: 99
-# signatures were 256K of 414K counted tokens on one 369-message Claude Code
-# session, against ~313K provider-billed. Only the thinking text is input.
-# Wraps the walker to swap each signed thinking block for a text block of its
-# thinking text; every other block goes through the walker untouched.
+# JSON catch-all priced the base64 `signature` per block as prose at ~3
+# chars/token: 99 signatures were 256K of 414K counted tokens on one
+# 369-message Claude Code session, against ~313K provider-billed. Zero is wrong
+# too: the signature is the encrypted full reasoning, decrypted server-side
+# into the prompt and billed as input on the keep-all-turns models (Opus 4.5+,
+# Sonnet 4.6+, the 5.x line), and under the 5.x default display "omitted" the
+# thinking text is empty, so every local Claude Code thinking block IS its
+# signature. Wraps the walker to swap each thinking block for a text block of
+# its thinking text and add the decoded signature bytes at ~4 bytes/token
+# (len * 3 // 16); every other block goes through the walker untouched.
 # Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_THINKING_SIG_TOKENS=0.
 _hd_sig_flag = _hd_os.environ.get("HEADROOM_THINKING_SIG_TOKENS", "1")
 if _hd_sig_flag.strip().lower() not in ("", "0", "false", "no", "off"):
@@ -2367,16 +2377,22 @@ if _hd_sig_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 return isinstance(part, dict) and part.get("type") == "thinking"
 
             def _hd_sig_count(self, parts):
-                # Every thinking block, signed or not, counts as its text so
-                # the two shapes price identically (the catch-all also added
-                # JSON overhead to the unsigned form).
+                # Thinking text prices as text; the signature at decoded
+                # bytes / 4, so an omitted-display block is never free and a
+                # signed block never pays the catch-all's base64-as-prose rate.
                 if isinstance(parts, list) and any(_hd_sig_is_thinking(p) for p in parts):
+                    sig_tokens = sum(
+                        len(p.get("signature") or "") * 3 // 16
+                        for p in parts
+                        if _hd_sig_is_thinking(p)
+                    )
                     parts = [
                         {"type": "text", "text": p.get("thinking", "") or ""}
                         if _hd_sig_is_thinking(p)
                         else p
                         for p in parts
                     ]
+                    return _hd_sig_orig(self, parts) + sig_tokens
                 return _hd_sig_orig(self, parts)
 
             _hd_sig_base.BaseTokenizer._count_content_parts = _hd_sig_count
@@ -2402,6 +2418,13 @@ if _hd_sig_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # every rewrite spreads the source block, so the slot mapping is 1:1). If the
 # output shape ever differs, the untouched message is returned: no compression
 # that turn, marker intact, which is the pre-vendor behavior.
+# Upstream (#3483, after review) gates this behind an apply() kwarg,
+# prefix_replay_guaranteed=True, passed only by handlers that run
+# finalize_turn: next turn the block is no longer final, the router hard-skips
+# it again and would forward the client's original bytes, so only a caller
+# that replays last turn's forwarded prefix may take the exception. This
+# process is that caller: the desktop proxy's messages and chat paths replay
+# through the #3380 vendor above (full-replay fallback when floorless).
 # Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_FRESH_CC_COMPRESS=0.
 _hd_fcc_flag = _hd_os.environ.get("HEADROOM_FRESH_CC_COMPRESS", "1")
 if _hd_fcc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
@@ -2463,11 +2486,24 @@ if _hd_fcc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # The router accepts any shrink (min_ratio 1.0) and, per #1307, discards a
 # lossy result that carries no marker, so every 1-20 percent shrink ran the
 # model and was thrown away (218 lossy_unrecoverable_skipped on 2026-09-08).
-# Post-processes both compress paths: a shrunk, unmarked result whose saving
-# exceeds the marker's own cost gets stored in the CCR store and marked with
-# the wheel's own marker function. Already-marked, passthrough and sub-marker
-# results are returned as-is. Composes with the shared-budget wrapper above
-# (outer wrapper; that one only substitutes passthroughs).
+# The marker must also pay for itself in TOKENS: it is 12 words but 36-45
+# cl100k tokens (the 24-hex hash alone is ~16, digits add more), while the
+# words Kompress drops are the cheap ones, at least 1 token each. A 13-word
+# gate (first cut of #3484) admitted marked payloads larger than the original
+# (drop 16 of 100 words: cl100k 196 -> 200); a fixed 40-word allowance (second
+# cut) still let a 43-token marker ship on 100 single-token words (100 -> 102).
+# Even a measured marker cost against saved words is not enough (third cut):
+# the word left at the head of the candidate can tokenize differently from
+# its space-prefixed form in the source (100 -> 103 on a "bureaucratic" head).
+# Post-processes both compress paths with upstream's whole-payload policy:
+# the whole original and the whole marked candidate are measured in one unit
+# (cl100k_base from the venv, an estimate for Anthropic; one token per
+# character without it); a candidate that is not smaller, marked by the
+# wheel's ratio gate or not, is passed through untouched; a smaller one is
+# stored and marked with the wheel's own marker function and its accounting
+# reports that measurement; passthroughs and no-CCR results are returned
+# as-is. Composes with the shared-budget wrapper above (outer wrapper; that
+# one only substitutes passthroughs).
 # Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_KOMPRESS_MARKER_GATE=0.
 _hd_kmg_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_MARKER_GATE", "1")
 if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
@@ -2477,27 +2513,58 @@ if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         if _hd_kmg_meta.version("headroom-ai") == "0.37.0":
             from headroom.transforms import kompress_compressor as _hd_kmg_kc
 
-            _HD_KMG_MARKER_WORDS = 13
             _hd_kmg_orig = _hd_kmg_kc.KompressCompressor.compress
             _hd_kmg_orig_batch = _hd_kmg_kc.KompressCompressor.compress_batch
+            _hd_kmg_enc = None
+            try:
+                import tiktoken as _hd_kmg_tiktoken
+
+                _hd_kmg_enc = _hd_kmg_tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                _hd_kmg_enc = None
+
+            def _hd_kmg_tokens(text):
+                # Same unit as upstream payload_tokens: cl100k_base, or one
+                # token per character without an encoder.
+                if _hd_kmg_enc is not None:
+                    try:
+                        return len(_hd_kmg_enc.encode(text, disallowed_special=()))
+                    except Exception:
+                        pass
+                return len(text)
 
             def _hd_kmg_mark(self, result, ccr_source):
                 try:
                     if (
-                        getattr(result, "cache_key", None) is not None
-                        or not getattr(self.config, "enable_ccr", False)
+                        not getattr(self.config, "enable_ccr", False)
                         or result.compressed == result.original
-                        or result.original_tokens - result.compressed_tokens
-                        <= _HD_KMG_MARKER_WORDS
                     ):
                         return result
+                    # The wheel's counts are pre-marker word counts on both
+                    # its marked (ratio < 0.8) and unmarked results; its
+                    # marked results already carry the marker text.
                     source = ccr_source if ccr_source is not None else result.original
-                    key = self._store_in_ccr(source, result.compressed, len(source.split()))
-                    if key:
-                        result.cache_key = key
-                        result.compressed += _hd_kmg_kc.ccr_retrieval_marker(
+                    key = getattr(result, "cache_key", None)
+                    if key is None:
+                        key = self._store_in_ccr(source, result.compressed, len(source.split()))
+                        if not key:
+                            return result
+                        marked = result.compressed + _hd_kmg_kc.ccr_retrieval_marker(
                             result.original_tokens, result.compressed_tokens, source, key
                         )
+                    else:
+                        marked = result.compressed
+                    original_tokens = _hd_kmg_tokens(result.original)
+                    compressed_tokens = _hd_kmg_tokens(marked)
+                    if compressed_tokens >= original_tokens:
+                        return self._passthrough(result.original, len(result.original.split()))
+                    result.cache_key = key
+                    result.compressed = marked
+                    result.original_tokens = original_tokens
+                    result.compressed_tokens = compressed_tokens
+                    result.compression_ratio = (
+                        compressed_tokens / original_tokens if original_tokens else 1.0
+                    )
                 except Exception:
                     pass
                 return result
@@ -2639,22 +2706,22 @@ fn receipt_requires_atomic_rebuild(previous_version: &str) -> bool {
         None => true,
     }
 }
-const RTK_VERSION: &str = "0.45.0";
+const RTK_VERSION: &str = "0.48.0";
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str = "1.7.0";
-const CONTEXT7_PINNED_VERSION: &str = "4.0.2";
+const CONTEXT7_PINNED_VERSION: &str = "4.0.6";
 /// First run downloads the package into the npx cache; slow networks need
 /// headroom over the usual smoke-test budget.
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const CODEBASE_MEMORY_VERSION: &str = "0.10.3";
+const CODEBASE_MEMORY_VERSION: &str = "0.10.8";
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
-    "0ebf02328207d4c3d862c837b5e973de5bac808df92b0941737721d467287f7f";
+    "9bd840dfb3ec7eaef4f310382057adaa5b0e904df883104d03ffcf39836afd07";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
-    "1107fea28285823e1436e4f38a4e00a0b472d8a43c379da7dfd200c914a4b9dd";
+    "2b193085410af3801634a522f4b17dcd6699695e015a068393c87817c1d260d4";
 const CODEBASE_MEMORY_SHA256_LINUX_AARCH64: &str =
-    "967b9eababfdbd2ef1987c571d55bc7c028cd1db7f99279830634c58db311e32";
+    "e2804a20f5a6fc392af361525a232703e351b7d1aacb81b88eef806eec5959fa";
 const CODEBASE_MEMORY_SHA256_LINUX_X86_64: &str =
-    "74997fb0934e70a22f20c2e112fb4d883867dc1f01a7bcdc94cf86d13b5cbd31";
+    "e5cba4cad6ca8254a85f45041fc8a831908d7d5cb64f98fc3f8eb70a58671793";
 /// Serena's CLI cold-imports its full LSP stack; first run on a slow disk can
 /// take tens of seconds.
 const SERENA_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -2908,15 +2975,15 @@ fn pending_addon_update(id: &str, installed: Option<&str>, pinned: &str) -> Opti
     }
 }
 const RTK_SHA256_MACOS_AARCH64: &str =
-    "064151cfc2d50b24d810b06a0af2e41b9c945e83534e4c438c3d3eae607fc3f4";
+    "4fa025cc93a744b6963f4e53a008e5ba3f74b6a38061f4a47c639e1c3023e0db";
 const RTK_SHA256_MACOS_X86_64: &str =
-    "9ea02f889d5a2779e4fb700df4587824303c5a57cda22e903e30058079fca0ef";
+    "a95f2c23e08572dcc84ddff5fbe432e41e7f94369622eb086cca49ae0b6f61e8";
 const RTK_SHA256_LINUX_AARCH64: &str =
-    "80a746dd305ef944ff50ef011ae4ce3878dd5ba88dfe35d859d05498191637c3";
+    "5ed65486a96077bd6bba7c87fdc9d0e4a1918d19619be3c87380888389a30c7c";
 const RTK_SHA256_LINUX_X86_64: &str =
-    "c4c036fbf181fc55ef329786c8c17e0d427972b053b825944d968a6aafef1ba4";
+    "e4e650fa1677c0de2f6839a6040d7b17f312d32f163c402b75af70e9e5af1a91";
 const RTK_SHA256_WINDOWS_X86_64: &str =
-    "34cea9009a8099acdaf85147b971d95f65efabfa63fb3aea7d3e2b73e6f517c3";
+    "8c9ae56bacde865112777a9fe9791b449186d8b2a081c32c0772ef773f284f93";
 const PYTHON_STANDALONE_RELEASE: &str = "20251014";
 const PYTHON_SHA256_MACOS_AARCH64: &str =
     "84cb7acbf75264982c8bdd818bfa1ff0f1eb76007b48a5f3e01d28633b46afdf";
@@ -3973,6 +4040,14 @@ impl ToolManager {
                                     if let Some(p) = original_pid {
                                         scope.set_extra("occupant_pid", p.into());
                                     }
+                                    // Fixed fingerprint: the occupant name,
+                                    // its pid and the chosen port are all in
+                                    // the message, so one condition opened an
+                                    // issue per fallback (RUST-81, RUST-7F)
+                                    // and none of them could be resolved.
+                                    // Same fix as `orphan_proxy_reclaimed`;
+                                    // the occupant is on a tag for filtering.
+                                    scope.set_fingerprint(Some(&["backend_port_fallback"]));
                                 },
                                 || {
                                     sentry::capture_message(
@@ -9338,16 +9413,35 @@ fn windows_listener(port: u16) -> Option<(String, u32)> {
     }
     let pid = parse_netstat_listener(&String::from_utf8_lossy(&output.stdout), port)?;
 
-    // The image name is cosmetic (it goes into the occupant string); a pid we
-    // could not name is still a pid worth reporting and gating a kill on.
-    let image = crate::proc::command("tasklist")
+    let listed = crate::proc::command("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
         .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| parse_tasklist_image(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_else(|| "unnamed process".to_string());
+        .ok();
+    let image = occupant_image(
+        listed
+            .as_ref()
+            .map(|out| String::from_utf8_lossy(&out.stdout))
+            .as_deref(),
+    )?;
     Some((image, pid))
+}
+
+/// The occupant name for `pid`, from `tasklist` stdout (`None` argument when
+/// tasklist itself could not be run).
+///
+/// A pid we could not name is still worth reporting and gating a kill on, so a
+/// tasklist we could not run keeps the pid under a placeholder. A tasklist that
+/// RAN and matched nothing is the opposite: proof that netstat's row named a
+/// holder which has since exited, so there is no listener to report. That case
+/// used to arrive as `Foreign { name: "unnamed process" }`, which told the user
+/// to end a pid their Task Manager no longer had (RUST-EE, an update relaunch)
+/// and blocked the `SO_REUSEADDR` rebind that clears a draining port.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn occupant_image(tasklist_stdout: Option<&str>) -> Option<String> {
+    match tasklist_stdout {
+        Some(text) => parse_tasklist_image(text),
+        None => Some("unnamed process".to_string()),
+    }
 }
 
 /// The pid LISTENING on `port` in `netstat -ano` output.
@@ -9563,7 +9657,14 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     }
 
     log::warn!("[backend_port] reclaiming orphaned headroom proxy pid {pid} on port {port}");
-    kill_pid(pid, false);
+    // Windows: `taskkill /T` without `/F` only closes a process that owns a
+    // window, and this target is always a windowless managed-runtime python
+    // (`pid_is_headroom_backend` above). Measured on win-test 2026-09-09: the
+    // graceful stage is a silent no-op 3/3 times and burns the whole 3s wait
+    // below, while the forced kill frees the port in 0-2 ms. Go straight to it.
+    // NOT done for the intercept reclaim, whose target can be a desktop twin
+    // that does own a window and needs the clean shutdown to flush state.
+    kill_pid(pid, cfg!(windows));
     if !wait_for_port_free(port, Duration::from_secs(3)) {
         kill_pid(pid, true);
         if !wait_for_port_free(port, Duration::from_secs(2)) {
@@ -9607,12 +9708,22 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
     if pid == std::process::id() {
         return false;
     }
-    if !pid_is_headroom_desktop_twin(pid) {
+    // Two shapes of "ours", both of which hold the front door and neither of
+    // which ever lets go: an updater-stranded desktop instance (same exe as
+    // us), and our own managed runtime on the wrong port -- a Python out of
+    // our runtime dir listening on 6767 instead of its own backend port, which
+    // `reclaim_orphan_proxy` never sees because it only ever looks at the
+    // backend port (RUST-D3, RUST-EC: "held by python.exe" / "python3.1").
+    // Anything else stays untouched.
+    if !pid_is_headroom_desktop_twin(pid) && !pid_is_headroom_backend(pid) {
         return false;
     }
-    log::warn!(
-        "[proxy_intercept] reclaiming stranded Headroom desktop instance pid {pid} on port {port}"
-    );
+    // Info, not warn: the pid and the port are in the text, and this target
+    // does not match the `[proxy_intercept] ... retrying` skip rule, so the
+    // bridged warn opened one issue per reclaim (RUST-EG, and RUST-E7 for the
+    // desktop-twin wording before it). The fingerprinted capture below is the
+    // Sentry path -- same split `reclaim_orphan_proxy` already uses.
+    log::info!("[proxy_intercept] reclaiming stranded Headroom process pid {pid} on port {port}");
     kill_pid(pid, false);
     if !wait_for_port_free(port, Duration::from_secs(3)) {
         kill_pid(pid, true);
@@ -9625,6 +9736,10 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
             scope.set_tag("flow", "intercept_stranded_instance_reclaimed");
             scope.set_extra("port", port.into());
             scope.set_extra("occupant_pid", pid.into());
+            // Fixed fingerprint, for the reason spelled out on
+            // `orphan_proxy_reclaimed`: the pid in the message opened one
+            // issue per reclaim (RUST-E8) for a single condition.
+            scope.set_fingerprint(Some(&["intercept_stranded_instance_reclaimed"]));
         },
         || {
             sentry::capture_message(
@@ -13011,16 +13126,17 @@ mod tests {
         format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
-        looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
-        parse_netstat_listener, parse_pid_from_lsof_detail, parse_ss_listener,
-        parse_tasklist_image, path_with_binary_dir, pending_addon_update, pinned_headroom_release,
-        pip_failure_category, pip_line_to_progress, plugin_install_failure_category,
-        pre_upstream_concurrency, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
-        purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
-        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
-        requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_unowned_port,
-        sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
+        looks_like_corrupt_venv_error, occupant_image, parse_lsof_listener,
+        parse_major_minor_patch, parse_netstat_listener, parse_pid_from_lsof_detail,
+        parse_ss_listener, parse_tasklist_image, path_with_binary_dir, pending_addon_update,
+        pinned_headroom_release, pip_failure_category, pip_line_to_progress,
+        plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
+        proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
+        reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
+        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
+        savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
+        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
         wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
         CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
         UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
@@ -13831,8 +13947,9 @@ mod tests {
     #[test]
     fn compression_vendors_behave_against_the_installed_wheel() {
         // Runs the shipped sitecustomize against the installed wheel and
-        // asserts each vendor's contract end to end: a signed thinking block
-        // counts the same as an unsigned one on both walkers; a final-message
+        // asserts each vendor's contract end to end: a thinking signature prices
+        // at decoded bytes / 4 on both walkers (above zero, below the JSON
+        // catch-all); a final-message
         // tool_result with cache_control is compressed and keeps its marker
         // while an earlier one stays protected; a Kompress result that shrinks
         // 20 percent gets a retrieval marker and one that saves less than the
@@ -15794,6 +15911,26 @@ mod tests {
             parse_tasklist_image("INFO: No tasks are running which match the specified criteria."),
             None
         );
+    }
+
+    #[test]
+    fn occupant_image_reports_no_holder_once_the_pid_is_gone() {
+        // tasklist ran and matched nothing: netstat's row was the exiting
+        // instance, so the port has no listener to name at the user.
+        assert_eq!(
+            occupant_image(Some(
+                "INFO: No tasks are running which match the specified criteria."
+            )),
+            None
+        );
+        assert_eq!(
+            occupant_image(Some(
+                "\"python.exe\",\"9876\",\"Console\",\"1\",\"45,678 K\"\r\n"
+            )),
+            Some("python.exe".to_string())
+        );
+        // tasklist itself could not run: the pid stands, the name does not.
+        assert_eq!(occupant_image(None), Some("unnamed process".to_string()));
     }
 
     #[test]

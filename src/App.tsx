@@ -154,6 +154,11 @@ import {
 import {
   buildInitialProxyVerificationRows,
   formatConnectorNameList,
+  markIdleProxyVerificationRows,
+  proxyVerificationRowMessage,
+  setupCheckSuccessMessage,
+  testableProxyVerificationRows,
+  type ProxyVerificationRowState,
   getClaudeConnector,
   getContactRequestValidationError,
   getInitialLauncherStage,
@@ -204,6 +209,7 @@ import type {
   ClientConnectorStatus,
   UnroutedClient,
   ClientSetupResult,
+  ClientSetupVerification,
   DailySavingsPoint,
   DashboardState,
   DebugOverrides,
@@ -1586,12 +1592,6 @@ function buildUpgradeIssueMailto(failure: RuntimeUpgradeFailure): string {
   return `mailto:support@extraheadroom.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 }
 
-interface ProxyVerificationRow {
-  clientId: string;
-  name: string;
-  state: "processing" | "waiting" | "verified";
-  message: string;
-}
 
 
 export default function App() {
@@ -1657,8 +1657,14 @@ export default function App() {
   );
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
   const [connectorsNotice, setConnectorsNotice] = useState<string | null>(null);
-  const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
+  const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRowState[]>(
+    []
+  );
   const [runningAgentCounts, setRunningAgentCounts] = useState<Record<string, number>>({});
+  // Result of the on-demand config check, or null when it has not been run.
+  const [setupCheck, setSetupCheck] = useState<
+    { busy: true } | { busy: false; ok: boolean; lines: string[] } | null
+  >(null);
   const [proxyVerificationHint, setProxyVerificationHint] = useState<
     { text: string; tone: "info" | "error" } | null
   >(null);
@@ -2557,6 +2563,32 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
+  }, [windowLabel, launcherStage]);
+
+  // Which enabled connectors the user actually uses. Rows are built from every
+  // installed connector, so without this a dormant tool sits at "Waiting for a
+  // prompt..." forever and holds the whole screen in a failed-looking state.
+  // One walk per stage entry: `client_local_activity_at` stats up to 20k
+  // entries, and an agent that starts being used mid-screen announces itself by
+  // producing traffic, which flips the row regardless of its idle mark.
+  useEffect(() => {
+    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+      return;
+    }
+    let active = true;
+    void invoke<Record<string, number>>("get_client_local_activity_ages", {
+      clientIds: proxyVerificationRows.map((row) => row.clientId)
+    })
+      .then((ages) => {
+        if (!active) return;
+        setProxyVerificationRows((current) => markIdleProxyVerificationRows(current, ages));
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // Deliberately not keyed on the rows themselves: this marks them, so
+    // re-running on every change would loop.
   }, [windowLabel, launcherStage]);
 
   // Warm the bootstrap download cache while the user is still signing up.
@@ -5781,15 +5813,60 @@ export default function App() {
     windowLabel === "launcher" && launcherStage === "proxy_verify"
   ) {
     const hasEnabledApps = proxyVerificationRows.length > 0;
-    const allVerified =
-      hasEnabledApps &&
-      proxyVerificationRows.every((row) => row.state === "verified");
+    // A dormant tool is displayed but not tested: it can never turn green, and
+    // counting it withholds the success button from a healthy install forever.
+    const testableRows = testableProxyVerificationRows(proxyVerificationRows);
+    const allIdle = hasEnabledApps && testableRows.length === 0;
+    const allVerified = testableRows.length > 0 && testableRows.every((row) => row.state === "verified");
     const anyVerified = proxyVerificationRows.some((row) => row.state === "verified");
-    const unverified = proxyVerificationRows.filter((row) => row.state !== "verified");
-    const unverifiedNames = formatConnectorNameList(unverified.map((row) => row.name));
-    const unverifiedRunning = unverified
-      .map((row) => ({ name: row.name, count: runningAgentCounts[row.clientId] ?? 0 }))
-      .filter((item) => item.count > 0);
+    // Answers "is it broken, or am I just waiting?" without the user having to
+    // guess. Reads config off disk plus proxy reachability -- the same check
+    // `repair_client_setups` already trusts hourly -- so a pass is real
+    // evidence that the only thing left to do is restart the tool.
+    const runSetupCheck = async () => {
+      setSetupCheck({ busy: true });
+      const targets = testableRows.length > 0 ? testableRows : proxyVerificationRows;
+      const results = await Promise.all(
+        targets.map((row) =>
+          invoke<ClientSetupVerification>("verify_client_setup", { clientId: row.clientId })
+            .then((verification) => ({ row, verification }))
+            .catch(() => ({ row, verification: null }))
+        )
+      );
+      const unreadable = results.filter((result) => result.verification === null);
+      const failures = results.flatMap(({ row, verification }) =>
+        verification && !verification.verified
+          ? verification.failures.map((failure) => `${row.name}: ${failure}`)
+          : []
+      );
+      if (unreadable.length > 0) {
+        setSetupCheck({
+          busy: false,
+          ok: false,
+          lines: [
+            `Could not read the setup for ${formatConnectorNameList(
+              unreadable.map(({ row }) => row.name)
+            )}.`
+          ]
+        });
+      } else if (failures.length > 0) {
+        setSetupCheck({ busy: false, ok: false, lines: failures });
+      } else if (!results.some(({ verification }) => verification?.proxyReachable)) {
+        setSetupCheck({
+          busy: false,
+          ok: false,
+          lines: [
+            "Your tools are pointed at Headroom, but the proxy is not answering on 127.0.0.1:6767 yet. Give it a few seconds and check again."
+          ]
+        });
+      } else {
+        setSetupCheck({
+          busy: false,
+          ok: true,
+          lines: [setupCheckSuccessMessage(proxyVerificationRows)]
+        });
+      }
+    };
     const finishSetup = () => {
       void invoke("complete_setup_wizard");
       setLauncherStage("post_install");
@@ -5818,19 +5895,6 @@ export default function App() {
             </button>{" "}
             for help.
           </p>
-          {unverifiedRunning.length > 0 ? (
-            <p className="launcher-restart-hint">
-              {unverifiedRunning
-                .map(({ name, count }) =>
-                  count === 1
-                    ? `${name} has 1 session running`
-                    : `${name} has ${count} sessions running`
-                )
-                .join("; ")}{" "}
-              right now. Sessions started before this setup keep their old
-              settings until you restart them.
-            </p>
-          ) : null}
           {hasEnabledApps ? (
             <div className="connector-list">
               {proxyVerificationRows.map((row) => (
@@ -5843,7 +5907,9 @@ export default function App() {
                       {row.name}
                     </h3>
                     <div className="proxy-verify-item__message">
-                      <span>{row.message}</span>
+                      <span>
+                        {proxyVerificationRowMessage(row, runningAgentCounts[row.clientId] ?? 0)}
+                      </span>
                       {row.state === "verified" ? (
                         <span className="proxy-verified-pill">verified</span>
                       ) : null}
@@ -5857,6 +5923,23 @@ export default function App() {
               No tools are enabled yet. Go back to the previous step to enable one.
             </p>
           )}
+          {hasEnabledApps ? (
+            <p className="launcher-restart-hint">
+              <button
+                className="secondary-button"
+                disabled={setupCheck?.busy === true}
+                onClick={() => void runSetupCheck()}
+                type="button"
+              >
+                {setupCheck?.busy ? "Checking..." : "Check my setup"}
+              </button>
+            </p>
+          ) : null}
+          {setupCheck && !setupCheck.busy ? (
+            <p className={setupCheck.ok ? "launcher-restart-hint" : "install-progress__error"}>
+              {setupCheck.lines.join(" ")}
+            </p>
+          ) : null}
           {proxyVerificationHint ? (
             <p
               className={
@@ -5870,9 +5953,14 @@ export default function App() {
           ) : null}
           {!allVerified && proxyVerifySkipArmed ? (
             <p className="install-progress__notice">
-              {hasEnabledApps
-                ? `We have not detected any ${unverifiedNames} activity flowing through our savings pipeline yet. You can skip and continue for now, but Headroom can only compress requests it sees, so your savings are likely to stay at zero. Restart ${unverifiedNames} to fix this.`
-                : "Headroom has nothing to optimize until a coding agent is connected and its requests flow through our savings pipeline. Your savings will stay at zero. You can connect one later from within the app if you prefer."}
+              {allIdle
+                ? "None of your connected tools have been used on this machine recently, so there is nothing to test right now. Headroom is set up and starts saving the moment you use one."
+                : hasEnabledApps
+                  ? // The row for each tool and the setup-check result both
+                    // already say what is pending and what to do about it, so
+                    // this one only has to answer "is skipping safe?".
+                    "You can continue either way: Headroom starts saving as soon as it sees traffic."
+                  : "Headroom has nothing to optimize until a coding agent is connected. Install Claude Code or Codex, then connect it here or later from within the app."}
               <br />
               <br />
               <strong>Note:</strong> Headroom does not work with the Claude Desktop app due to
@@ -6171,7 +6259,7 @@ export default function App() {
           >
             Get started
           </button>
-          <p>Headroom stays active in your menu bar while you work.</p>
+          <p>Headroom stays active in your {navigator.userAgent.includes("Mac") ? "menu bar" : "system tray"} while you work.</p>
         </div>
       </LauncherShell>
     );

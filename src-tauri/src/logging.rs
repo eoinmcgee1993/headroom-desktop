@@ -439,6 +439,16 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Third canary, same split: the emit site captures it under the fixed
+    // `savings_rate_implausible` fingerprint with the dollar figures as extras.
+    // The bridged twin bakes them into the text, which is what opened RUST-DX,
+    // RUST-89 and RUST-8C for one condition. Keep the local line -- it is the
+    // self-diagnosing one a support thread reads.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with("savings rate implausible:")
+    {
+        return true;
+    }
     // Same split, same reason: the observer captures this one at the emit site
     // with the cause class as the fingerprint and the raw error as an extra.
     // The local line keeps the full error text -- which is exactly what would
@@ -574,6 +584,43 @@ fn scrub_json(value: &mut serde_json::Value) {
     }
 }
 
+/// Group a log line carrying an OS error by its CODE, not by the OS's prose
+/// around it. That prose is LOCALIZED, so one failure files one issue per
+/// language: `failed to create webview ... HRESULT(0x80070057)` is RUST-E6
+/// (Danish), RUST-DY (English) and, for its own code, RUST-8T (Portuguese) --
+/// the same bug, un-triageable three times over; RUST-DV is the same shape with
+/// a Rust `io::Error` (`... : 指定されたパスは無効です。 (os error 161)`).
+///
+/// Returns the stable text plus the code; the localized message still rides
+/// along in the title. For `(os error N)` the prose sits between the last
+/// `": "` and the code, so cut there. `None` for every other line, which keeps
+/// Sentry's own grouping (and the archived state of every issue already grouped
+/// that way) untouched.
+fn os_failure_fingerprint(msg: &str) -> Option<[String; 2]> {
+    const HRESULT: &str = "HRESULT(0x";
+    if let Some(at) = msg.find(HRESULT) {
+        let code: String = msg[at + HRESULT.len()..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect();
+        if !code.is_empty() {
+            return Some([msg[..at].trim().to_string(), format!("0x{code}")]);
+        }
+    }
+    const OS_ERROR: &str = "(os error ";
+    let at = msg.find(OS_ERROR)?;
+    let code: String = msg[at + OS_ERROR.len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if code.is_empty() {
+        return None;
+    }
+    let before = msg[..at].trim_end();
+    let head = before.rfind(": ").map_or(before, |cut| &before[..cut]);
+    Some([head.trim().to_string(), format!("os error {code}")])
+}
+
 impl Log for FileLogger {
     fn enabled(&self, _meta: &Metadata) -> bool {
         true
@@ -615,7 +662,13 @@ impl Log for FileLogger {
             // never leaves the machine.
             let scrubbed = scrub_home(&msg);
             let truncated: String = scrubbed.chars().take(SENTRY_MESSAGE_CHAR_CAP).collect();
-            sentry::capture_message(&truncated, level);
+            match os_failure_fingerprint(&truncated) {
+                Some(fp) => sentry::with_scope(
+                    |scope| scope.set_fingerprint(Some(&[fp[0].as_str(), fp[1].as_str()])),
+                    || sentry::capture_message(&truncated, level),
+                ),
+                None => sentry::capture_message(&truncated, level),
+            };
         }
     }
 
@@ -666,6 +719,32 @@ pub(crate) fn log_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn os_failure_fingerprint_groups_localized_failures_together() {
+        let f = super::os_failure_fingerprint;
+        // RUST-E6 (Danish) and RUST-DY (English): same code, same bug.
+        let da = f(r#"failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070057), message: "Klassen er ikke registreret" })"#).unwrap();
+        let en = f(r#"failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070057), message: "The parameter is incorrect." })"#).unwrap();
+        assert_eq!(da, en);
+        assert_eq!(da[1], "0x80070057");
+        // A different code stays a different issue (RUST-8T).
+        let other = f(r#"failed to create webview: WebView2 error: WindowsError(Error { code: HRESULT(0x80070578), message: "O identificador da janela e invalido" })"#).unwrap();
+        assert_ne!(other, da);
+        // Everything else keeps Sentry's own grouping.
+        assert!(f("repair_client_setups: repaired codex_cli").is_none());
+        assert!(f("WebView2 error: HRESULT(0xZZ) truncated").is_none());
+
+        // RUST-DV: same shape from a Rust io::Error, prose before the code.
+        let ja = f("pre-update snapshot: cannot create ~/config/pre-update: \u{6307}\u{5b9a} (os error 161)").unwrap();
+        let en = f("pre-update snapshot: cannot create ~/config/pre-update: The specified path is invalid. (os error 161)").unwrap();
+        assert_eq!(ja, en);
+        assert_eq!(
+            ja[0],
+            "pre-update snapshot: cannot create ~/config/pre-update"
+        );
+        assert_eq!(ja[1], "os error 161");
+    }
+
     use super::skip_sentry;
 
     #[test]
