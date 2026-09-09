@@ -9718,7 +9718,12 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
     if !pid_is_headroom_desktop_twin(pid) && !pid_is_headroom_backend(pid) {
         return false;
     }
-    log::warn!("[proxy_intercept] reclaiming stranded Headroom process pid {pid} on port {port}");
+    // Info, not warn: the pid and the port are in the text, and this target
+    // does not match the `[proxy_intercept] ... retrying` skip rule, so the
+    // bridged warn opened one issue per reclaim (RUST-EG, and RUST-E7 for the
+    // desktop-twin wording before it). The fingerprinted capture below is the
+    // Sentry path -- same split `reclaim_orphan_proxy` already uses.
+    log::info!("[proxy_intercept] reclaiming stranded Headroom process pid {pid} on port {port}");
     kill_pid(pid, false);
     if !wait_for_port_free(port, Duration::from_secs(3)) {
         kill_pid(pid, true);
@@ -9731,6 +9736,10 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
             scope.set_tag("flow", "intercept_stranded_instance_reclaimed");
             scope.set_extra("port", port.into());
             scope.set_extra("occupant_pid", pid.into());
+            // Fixed fingerprint, for the reason spelled out on
+            // `orphan_proxy_reclaimed`: the pid in the message opened one
+            // issue per reclaim (RUST-E8) for a single condition.
+            scope.set_fingerprint(Some(&["intercept_stranded_instance_reclaimed"]));
         },
         || {
             sentry::capture_message(
