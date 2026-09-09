@@ -292,7 +292,7 @@ export function setupCheckSuccessMessage(rows: ProxyVerificationRowState[]): str
   }
   const waiting = testable.filter((row) => row.state !== "verified");
   if (waiting.length === 0) {
-    return `${prefix} Every tool below has already reached it, so there is nothing left to do.`;
+    return `${prefix} Every tool above has already reached it, so there is nothing left to do.`;
   }
   // Deliberately does NOT repeat "quit and reopen X": the row above each tool
   // already says that, and the screen was printing the same instruction three
