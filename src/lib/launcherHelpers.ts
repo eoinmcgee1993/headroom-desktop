@@ -279,6 +279,29 @@ export function testableProxyVerificationRows(
   return rows.filter((row) => row.state !== "idle");
 }
 
+/// The "Check my setup" result when nothing is misconfigured. Which of the
+/// three cases it is decides what the user should do next, and the single
+/// frozen line it replaces told a user whose only tool was already verified to
+/// quit and reopen it - which reads as "so it still is not working" on a screen
+/// showing a green VERIFIED pill (2026-09-09).
+export function setupCheckSuccessMessage(rows: ProxyVerificationRowState[]): string {
+  const prefix = "Your configuration is correct and Headroom is running.";
+  const testable = testableProxyVerificationRows(rows);
+  if (testable.length === 0) {
+    return `${prefix} None of your tools have been used on this machine recently, so there is nothing to test. Headroom starts saving the moment you use one.`;
+  }
+  const waiting = testable.filter((row) => row.state !== "verified");
+  if (waiting.length === 0) {
+    return `${prefix} Every tool below has already reached it, so there is nothing left to do.`;
+  }
+  // Deliberately does NOT repeat "quit and reopen X": the row above each tool
+  // already says that, and the screen was printing the same instruction three
+  // times (row, this line, and the skip notice).
+  return `${prefix} Nothing is broken: no prompt from ${formatConnectorNameList(
+    waiting.map((row) => row.name)
+  )} has reached it yet.`;
+}
+
 /// What the row says while it waits. The old copy was a single frozen
 /// "Waiting for a X prompt..." that looked identical at second 0 and at hour
 /// 2, so a user with a stale terminal had no way to tell "normal" from

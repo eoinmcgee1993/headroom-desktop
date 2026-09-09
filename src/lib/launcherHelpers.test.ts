@@ -5,6 +5,7 @@ import {
   formatConnectorNameList,
   markIdleProxyVerificationRows,
   proxyVerificationRowMessage,
+  setupCheckSuccessMessage,
   testableProxyVerificationRows,
   PROXY_VERIFY_IDLE_AFTER_SECONDS,
   getClaudeConnector,
@@ -389,5 +390,40 @@ describe("what the verify row says while it waits", () => {
 
   it("confirms a verified row", () => {
     expect(proxyVerificationRowMessage({ ...row, state: "verified" }, 0)).toBe("Request received");
+  });
+});
+
+describe("setupCheckSuccessMessage", () => {
+  const row = (name: string, state: "processing" | "verified" | "idle") => ({
+    clientId: name.toLowerCase(),
+    name,
+    state,
+    message: ""
+  });
+
+  it("does not ask for a restart once every testable tool is verified", () => {
+    const message = setupCheckSuccessMessage([
+      row("Claude Code", "verified"),
+      row("ChatGPT", "idle")
+    ]);
+    expect(message).not.toContain("quit and reopen");
+    expect(message).toContain("nothing left to do");
+  });
+
+  it("names only the tools still waiting", () => {
+    const message = setupCheckSuccessMessage([
+      row("Claude Code", "verified"),
+      row("Cursor", "processing")
+    ]);
+    expect(message).toContain("no prompt from Cursor");
+    expect(message).not.toContain("Claude Code");
+    // The row for Cursor already carries the instruction.
+    expect(message).not.toContain("quit and reopen");
+  });
+
+  it("says there is nothing to test when every tool is dormant", () => {
+    const message = setupCheckSuccessMessage([row("ChatGPT", "idle")]);
+    expect(message).toContain("nothing to test");
+    expect(message).not.toContain("quit and reopen");
   });
 });

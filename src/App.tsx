@@ -156,6 +156,7 @@ import {
   formatConnectorNameList,
   markIdleProxyVerificationRows,
   proxyVerificationRowMessage,
+  setupCheckSuccessMessage,
   testableProxyVerificationRows,
   type ProxyVerificationRowState,
   getClaudeConnector,
@@ -5818,8 +5819,6 @@ export default function App() {
     const allIdle = hasEnabledApps && testableRows.length === 0;
     const allVerified = testableRows.length > 0 && testableRows.every((row) => row.state === "verified");
     const anyVerified = proxyVerificationRows.some((row) => row.state === "verified");
-    const unverified = testableRows.filter((row) => row.state !== "verified");
-    const unverifiedNames = formatConnectorNameList(unverified.map((row) => row.name));
     // Answers "is it broken, or am I just waiting?" without the user having to
     // guess. Reads config off disk plus proxy reachability -- the same check
     // `repair_client_setups` already trusts hourly -- so a pass is real
@@ -5864,9 +5863,7 @@ export default function App() {
         setSetupCheck({
           busy: false,
           ok: true,
-          lines: [
-            "Your configuration is correct and Headroom is running. Nothing is broken: quit and reopen your tool, then send it any message."
-          ]
+          lines: [setupCheckSuccessMessage(proxyVerificationRows)]
         });
       }
     };
@@ -5959,7 +5956,10 @@ export default function App() {
               {allIdle
                 ? "None of your connected tools have been used on this machine recently, so there is nothing to test right now. Headroom is set up and starts saving the moment you use one."
                 : hasEnabledApps
-                  ? `Headroom is installed and running. We have not seen a prompt from ${unverifiedNames} yet, which is normal until you quit and reopen it. You can continue either way: Headroom starts saving as soon as it sees traffic.`
+                  ? // The row for each tool and the setup-check result both
+                    // already say what is pending and what to do about it, so
+                    // this one only has to answer "is skipping safe?".
+                    "You can continue either way: Headroom starts saving as soon as it sees traffic."
                   : "Headroom has nothing to optimize until a coding agent is connected. Install Claude Code or Codex, then connect it here or later from within the app."}
               <br />
               <br />
