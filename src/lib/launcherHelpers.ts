@@ -2,6 +2,7 @@ import { aggregateClientConnectors } from "./dashboardHelpers";
 import type {
   ClaudePlanTier,
   ClientConnectorStatus,
+  ClientSetupVerification,
   CodexPlanTier,
   HeadroomSubscriptionTier,
   LaunchExperience,
@@ -279,34 +280,48 @@ export function testableProxyVerificationRows(
   return rows.filter((row) => row.state !== "idle");
 }
 
-/// The "Check my setup" result when nothing is misconfigured. Which of the
-/// three cases it is decides what the user should do next, and the single
-/// frozen line it replaces told a user whose only tool was already verified to
-/// quit and reopen it - which reads as "so it still is not working" on a screen
-/// showing a green VERIFIED pill (2026-09-09).
-export function setupCheckSuccessMessage(rows: ProxyVerificationRowState[]): string {
-  const prefix = "Your configuration is correct and Headroom is running.";
-  const testable = testableProxyVerificationRows(rows);
-  if (testable.length === 0) {
-    return `${prefix} None of your tools have been used on this machine recently, so there is nothing to test. Headroom starts saving the moment you use one.`;
+/// The verify screen's background config check, folded into one line. It
+/// replaces a "Check my setup" button whose pass message sat next to a "Skip
+/// for now" button and read as failure anyway: two support cases in three days
+/// (2026-09-08, 2026-09-10) were healthy installs whose users could not tell.
+export function summarizeSetupCheck(
+  results: { name: string; verification: ClientSetupVerification | null }[]
+): { ok: boolean; lines: string[] } {
+  const unreadable = results.filter((result) => result.verification === null);
+  if (unreadable.length > 0) {
+    return {
+      ok: false,
+      lines: [
+        `Could not read the setup for ${formatConnectorNameList(
+          unreadable.map((result) => result.name)
+        )}.`
+      ]
+    };
   }
-  const waiting = testable.filter((row) => row.state !== "verified");
-  if (waiting.length === 0) {
-    return `${prefix} Every tool above has already reached it, so there is nothing left to do.`;
+  const failures = results.flatMap(({ name, verification }) =>
+    verification && !verification.verified
+      ? verification.failures.map((failure) => `${name}: ${failure}`)
+      : []
+  );
+  if (failures.length > 0) {
+    return { ok: false, lines: failures };
   }
-  // Deliberately does NOT repeat "quit and reopen X": the row above each tool
-  // already says that, and the screen was printing the same instruction three
-  // times (row, this line, and the skip notice).
-  return `${prefix} Nothing is broken: no prompt from ${formatConnectorNameList(
-    waiting.map((row) => row.name)
-  )} has reached it yet.`;
+  if (!results.some(({ verification }) => verification?.proxyReachable)) {
+    return {
+      ok: false,
+      lines: [
+        "Your tools are pointed at Headroom, but it is not answering on 127.0.0.1:6767 yet. This usually clears within a minute."
+      ]
+    };
+  }
+  return { ok: true, lines: [] };
 }
 
-/// What the row says while it waits. The old copy was a single frozen
-/// "Waiting for a X prompt..." that looked identical at second 0 and at hour
-/// 2, so a user with a stale terminal had no way to tell "normal" from
-/// "broken" -- and a support case (2026-09-08) sat on it for 2h42m before
-/// asking whether the product worked. It did; he needed to restart his tool.
+/// What the row says while it waits. It has to distinguish "your tool is
+/// still holding the old settings" from "you have not opened it" -- a support
+/// case (2026-09-08) sat 2h42m on a copy that could not. It does NOT count
+/// sessions: "10 sessions are running" is our vocabulary for VS Code terminal
+/// panes and only alarmed people (2026-09-10 support screenshot).
 export function proxyVerificationRowMessage(
   row: ProxyVerificationRowState,
   runningSessions: number
@@ -318,10 +333,9 @@ export function proxyVerificationRowMessage(
     return `Not used on this machine recently, so there is nothing to test. ${row.name} is still set up.`;
   }
   if (runningSessions > 0) {
-    const sessions = runningSessions === 1 ? "session is" : `sessions are`;
-    return `${runningSessions} ${sessions} running, but started before setup and still hold the old settings. Quit and reopen ${row.name}, then send it any message.`;
+    return `Still open with the old settings. Quit and reopen ${row.name}, then send it any message.`;
   }
-  return `Not running yet. Open ${row.name} and send it any message.`;
+  return `Open ${row.name} and send it any message.`;
 }
 
 export function buildInitialProxyVerificationRows(

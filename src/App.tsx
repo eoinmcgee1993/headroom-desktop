@@ -153,10 +153,9 @@ import {
 } from "./lib/dashboardHelpers";
 import {
   buildInitialProxyVerificationRows,
-  formatConnectorNameList,
   markIdleProxyVerificationRows,
   proxyVerificationRowMessage,
-  setupCheckSuccessMessage,
+  summarizeSetupCheck,
   testableProxyVerificationRows,
   type ProxyVerificationRowState,
   getClaudeConnector,
@@ -1661,20 +1660,12 @@ export default function App() {
     []
   );
   const [runningAgentCounts, setRunningAgentCounts] = useState<Record<string, number>>({});
-  // Result of the on-demand config check, or null when it has not been run.
-  const [setupCheck, setSetupCheck] = useState<
-    { busy: true } | { busy: false; ok: boolean; lines: string[] } | null
-  >(null);
+  // Result of the verify screen's background config check, null until the
+  // first one completes.
+  const [setupCheck, setSetupCheck] = useState<{ ok: boolean; lines: string[] } | null>(null);
   const [proxyVerificationHint, setProxyVerificationHint] = useState<
     { text: string; tone: "info" | "error" } | null
   >(null);
-  // Leaving the verify step unverified takes two clicks: the first arms the
-  // warning, the second leaves. 86% of installs used to click straight past
-  // this screen (median 26s, 45% under 15s) and the ones that did went on to
-  // send a first prompt 59% of the time vs 76% for the ones that waited -- the
-  // single biggest activation leak in onboarding, and invisible in support
-  // reports because nothing errors.
-  const [proxyVerifySkipArmed, setProxyVerifySkipArmed] = useState(false);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   // Fresh install (no runtime on disk yet). Drives the onboarding email-harvest
@@ -2541,6 +2532,44 @@ export default function App() {
     };
   }, [windowLabel, launcherStage, interceptOnlyVerify]);
 
+  // The verify screen's config check runs by itself: reads config off disk
+  // plus proxy reachability, the same check `repair_client_setups` trusts
+  // hourly. A pass turns Finish into the primary action; the user never had
+  // to click "Check my setup" to learn that nothing is broken.
+  const proxyVerificationClientIds = proxyVerificationRows
+    .map((row) => row.clientId)
+    .join(",");
+  useEffect(() => {
+    if (
+      windowLabel !== "launcher" ||
+      launcherStage !== "proxy_verify" ||
+      proxyVerificationClientIds === ""
+    ) {
+      return;
+    }
+    let active = true;
+    const check = () => {
+      // Dormant tools are shown but not tested, same as the rows themselves.
+      const testable = testableProxyVerificationRows(proxyVerificationRows);
+      const targets = testable.length > 0 ? testable : proxyVerificationRows;
+      void Promise.all(
+        targets.map((row) =>
+          invoke<ClientSetupVerification>("verify_client_setup", { clientId: row.clientId })
+            .then((verification) => ({ name: row.name, verification }))
+            .catch(() => ({ name: row.name, verification: null }))
+        )
+      ).then((results) => {
+        if (active) setSetupCheck(summarizeSetupCheck(results));
+      });
+    };
+    check();
+    const interval = window.setInterval(check, 3000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [windowLabel, launcherStage, proxyVerificationClientIds]);
+
   // Live agent processes for the verify screen's restart callout: sessions
   // started before setup keep their pre-Headroom environment, and naming them
   // turns "restart each tool" from generic advice into a concrete instruction.
@@ -2636,16 +2665,6 @@ export default function App() {
       reportFunnelStep("proxy_verified");
     }
   }, [windowLabel, launcherStage, proxyVerificationRows]);
-
-  // A connector checking in invalidates the armed skip warning: it was written
-  // against the old unverified set and reads as "we still see nothing" even
-  // after the user did exactly what it asked. Re-arm on the next Skip click.
-  const proxyVerifiedCount = proxyVerificationRows.filter(
-    (row) => row.state === "verified"
-  ).length;
-  useEffect(() => {
-    if (proxyVerifiedCount > 0) setProxyVerifySkipArmed(false);
-  }, [proxyVerifiedCount]);
 
   useEffect(() => {
     if (!showInstallProgress) {
@@ -4792,7 +4811,7 @@ export default function App() {
 
     setLauncherStage("proxy_verify");
     setProxyVerificationHint(null);
-    setProxyVerifySkipArmed(false);
+    setSetupCheck(null);
     setProxyVerificationRows(buildInitialProxyVerificationRows(fresh));
     // Reset to null so the polling effect re-anchors on its first reachable
     // /stats reading. Setting it here would risk anchoring on a stale value
@@ -5816,57 +5835,12 @@ export default function App() {
     // A dormant tool is displayed but not tested: it can never turn green, and
     // counting it withholds the success button from a healthy install forever.
     const testableRows = testableProxyVerificationRows(proxyVerificationRows);
-    const allIdle = hasEnabledApps && testableRows.length === 0;
     const allVerified = testableRows.length > 0 && testableRows.every((row) => row.state === "verified");
     const anyVerified = proxyVerificationRows.some((row) => row.state === "verified");
-    // Answers "is it broken, or am I just waiting?" without the user having to
-    // guess. Reads config off disk plus proxy reachability -- the same check
-    // `repair_client_setups` already trusts hourly -- so a pass is real
-    // evidence that the only thing left to do is restart the tool.
-    const runSetupCheck = async () => {
-      setSetupCheck({ busy: true });
-      const targets = testableRows.length > 0 ? testableRows : proxyVerificationRows;
-      const results = await Promise.all(
-        targets.map((row) =>
-          invoke<ClientSetupVerification>("verify_client_setup", { clientId: row.clientId })
-            .then((verification) => ({ row, verification }))
-            .catch(() => ({ row, verification: null }))
-        )
-      );
-      const unreadable = results.filter((result) => result.verification === null);
-      const failures = results.flatMap(({ row, verification }) =>
-        verification && !verification.verified
-          ? verification.failures.map((failure) => `${row.name}: ${failure}`)
-          : []
-      );
-      if (unreadable.length > 0) {
-        setSetupCheck({
-          busy: false,
-          ok: false,
-          lines: [
-            `Could not read the setup for ${formatConnectorNameList(
-              unreadable.map(({ row }) => row.name)
-            )}.`
-          ]
-        });
-      } else if (failures.length > 0) {
-        setSetupCheck({ busy: false, ok: false, lines: failures });
-      } else if (!results.some(({ verification }) => verification?.proxyReachable)) {
-        setSetupCheck({
-          busy: false,
-          ok: false,
-          lines: [
-            "Your tools are pointed at Headroom, but the proxy is not answering on 127.0.0.1:6767 yet. Give it a few seconds and check again."
-          ]
-        });
-      } else {
-        setSetupCheck({
-          busy: false,
-          ok: true,
-          lines: [setupCheckSuccessMessage(proxyVerificationRows)]
-        });
-      }
-    };
+    // Finish is the happy path once the config check has passed or a tool has
+    // already come through. Until then leaving is allowed but must not look
+    // like the happy path: it is the road to "Headroom didn't work" emails.
+    const canFinish = anyVerified || setupCheck?.ok === true;
     const finishSetup = () => {
       void invoke("complete_setup_wizard");
       setLauncherStage("post_install");
@@ -5881,19 +5855,10 @@ export default function App() {
         version={appSemver}
       >
         <div className="post-install__lead">
-          <h1>Test your setup</h1>
+          <h1>Restart your tools</h1>
           <p>
-            Restart each tool below, then send it any message to test its connection with Headroom. 
-            "Say hi" is enough. If restarting doesn't work, contact{" "}
-            <button
-              className="install-progress__notice-link"
-              onClick={() =>
-                void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
-              type="button"
-            >
-              support@extraheadroom.com
-            </button>{" "}
-            for help.
+            Tools that were already open still use their old settings, so each one needs a
+            restart. Any message afterwards, even "hi", confirms the connection.
           </p>
           {hasEnabledApps ? (
             <div className="connector-list">
@@ -5923,21 +5888,22 @@ export default function App() {
               No tools are enabled yet. Go back to the previous step to enable one.
             </p>
           )}
-          {hasEnabledApps ? (
-            <p className="launcher-restart-hint">
+          {setupCheck?.ok ? (
+            <p className="launcher-restart-hint">Headroom is set up and running.</p>
+          ) : setupCheck && !proxyVerificationHint ? (
+            // The startup hint below already explains an unreachable proxy on
+            // first launch, so the check only speaks when the hint does not.
+            <p className="install-progress__error">
+              {setupCheck.lines.join(" ")} If this does not clear, contact{" "}
               <button
-                className="secondary-button"
-                disabled={setupCheck?.busy === true}
-                onClick={() => void runSetupCheck()}
+                className="install-progress__notice-link"
+                onClick={() =>
+                  void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
                 type="button"
               >
-                {setupCheck?.busy ? "Checking..." : "Check my setup"}
+                support@extraheadroom.com
               </button>
-            </p>
-          ) : null}
-          {setupCheck && !setupCheck.busy ? (
-            <p className={setupCheck.ok ? "launcher-restart-hint" : "install-progress__error"}>
-              {setupCheck.lines.join(" ")}
+              .
             </p>
           ) : null}
           {proxyVerificationHint ? (
@@ -5951,43 +5917,6 @@ export default function App() {
               {proxyVerificationHint.text}
             </p>
           ) : null}
-          {!allVerified && proxyVerifySkipArmed ? (
-            <p className="install-progress__notice">
-              {allIdle
-                ? "None of your connected tools have been used on this machine recently, so there is nothing to test right now. Headroom is set up and starts saving the moment you use one."
-                : hasEnabledApps
-                  ? // The row for each tool and the setup-check result both
-                    // already say what is pending and what to do about it, so
-                    // this one only has to answer "is skipping safe?".
-                    "You can continue either way: Headroom starts saving as soon as it sees traffic."
-                  : "Headroom has nothing to optimize until a coding agent is connected. Install Claude Code or Codex, then connect it here or later from within the app."}
-              <br />
-              <br />
-              <strong>Note:</strong> Headroom does not work with the Claude Desktop app due to
-              design decisions by Anthropic. You need to use Claude Code{" "}
-              <button
-                className="install-progress__notice-link"
-                onClick={() =>
-                  void invoke("open_external_link", {
-                    url: "https://code.claude.com/docs/en/quickstart#step-1-install-claude-code"
-                  })}
-                type="button"
-              >
-                in the CLI
-              </button>{" "}
-              or{" "}
-              <button
-                className="install-progress__notice-link"
-                onClick={() =>
-                  void invoke("open_external_link", {
-                    url: "https://code.claude.com/docs/en/overview#vs-code"
-                  })}
-                type="button"
-              >
-                in VS Code
-              </button>
-            </p>
-          ) : null}
         </div>
         <div className="post-install__actions">
           <button
@@ -5999,40 +5928,19 @@ export default function App() {
           >
             Back
           </button>
-          {allVerified ? (
+          {canFinish ? (
             <button
-              className="primary-button primary-button--large primary-button--success"
+              className={`primary-button primary-button--large${
+                allVerified ? " primary-button--success" : ""
+              }`}
               onClick={finishSetup}
               type="button"
             >
-              Continue
-            </button>
-          ) : anyVerified ? (
-            // At least one connector is proven working, so continuing is a
-            // legitimate path - no skip-arming friction needed.
-            <button
-              className="primary-button primary-button--large"
-              onClick={finishSetup}
-              type="button"
-            >
-              Continue
+              Finish
             </button>
           ) : (
-            // Deliberately not a primary button: leaving without a single
-            // verified connector is the path that ends in "Headroom didn't
-            // work", so it should not look like the happy path.
-            <button
-              className="secondary-button"
-              onClick={() => {
-                if (proxyVerifySkipArmed) {
-                  finishSetup();
-                  return;
-                }
-                setProxyVerifySkipArmed(true);
-              }}
-              type="button"
-            >
-              {proxyVerifySkipArmed ? "Skip anyway" : "Skip for now"}
+            <button className="secondary-button" onClick={finishSetup} type="button">
+              Skip for now
             </button>
           )}
         </div>

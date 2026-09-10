@@ -5,7 +5,7 @@ import {
   formatConnectorNameList,
   markIdleProxyVerificationRows,
   proxyVerificationRowMessage,
-  setupCheckSuccessMessage,
+  summarizeSetupCheck,
   testableProxyVerificationRows,
   PROXY_VERIFY_IDLE_AFTER_SECONDS,
   getClaudeConnector,
@@ -370,15 +370,15 @@ describe("what the verify row says while it waits", () => {
     message: ""
   };
 
-  it("names the stale sessions when the tool is already running", () => {
-    expect(proxyVerificationRowMessage(row, 2)).toContain("2 sessions are running");
-    expect(proxyVerificationRowMessage(row, 2)).toContain("Quit and reopen Claude Code");
-    expect(proxyVerificationRowMessage(row, 1)).toContain("1 session is running");
+  it("says the tool is holding old settings without counting sessions", () => {
+    const message = proxyVerificationRowMessage(row, 10);
+    expect(message).toContain("Quit and reopen Claude Code");
+    expect(message).not.toMatch(/\d/);
   });
 
   it("asks the user to start the tool when nothing is running", () => {
     expect(proxyVerificationRowMessage(row, 0)).toBe(
-      "Not running yet. Open Claude Code and send it any message."
+      "Open Claude Code and send it any message."
     );
   });
 
@@ -393,37 +393,41 @@ describe("what the verify row says while it waits", () => {
   });
 });
 
-describe("setupCheckSuccessMessage", () => {
-  const row = (name: string, state: "processing" | "verified" | "idle") => ({
-    clientId: name.toLowerCase(),
+describe("summarizeSetupCheck", () => {
+  const ok = (name: string, proxyReachable = true) => ({
     name,
-    state,
-    message: ""
+    verification: { clientId: name, verified: true, proxyReachable, checks: [], failures: [] }
   });
 
-  it("does not ask for a restart once every testable tool is verified", () => {
-    const message = setupCheckSuccessMessage([
-      row("Claude Code", "verified"),
-      row("ChatGPT", "idle")
+  it("passes when every tool is configured and the proxy answers", () => {
+    expect(summarizeSetupCheck([ok("Claude Code"), ok("ChatGPT")])).toEqual({ ok: true, lines: [] });
+  });
+
+  it("names the tools it could not read", () => {
+    const result = summarizeSetupCheck([ok("Claude Code"), { name: "ChatGPT", verification: null }]);
+    expect(result.ok).toBe(false);
+    expect(result.lines).toEqual(["Could not read the setup for ChatGPT."]);
+  });
+
+  it("prefixes each failure with the tool name", () => {
+    const result = summarizeSetupCheck([
+      {
+        name: "ChatGPT",
+        verification: {
+          clientId: "codex",
+          verified: false,
+          proxyReachable: true,
+          checks: [],
+          failures: ["base URL is not Headroom"]
+        }
+      }
     ]);
-    expect(message).not.toContain("quit and reopen");
-    expect(message).toContain("nothing left to do");
+    expect(result).toEqual({ ok: false, lines: ["ChatGPT: base URL is not Headroom"] });
   });
 
-  it("names only the tools still waiting", () => {
-    const message = setupCheckSuccessMessage([
-      row("Claude Code", "verified"),
-      row("Cursor", "processing")
-    ]);
-    expect(message).toContain("no prompt from Cursor");
-    expect(message).not.toContain("Claude Code");
-    // The row for Cursor already carries the instruction.
-    expect(message).not.toContain("quit and reopen");
-  });
-
-  it("says there is nothing to test when every tool is dormant", () => {
-    const message = setupCheckSuccessMessage([row("ChatGPT", "idle")]);
-    expect(message).toContain("nothing to test");
-    expect(message).not.toContain("quit and reopen");
+  it("waits calmly when the config is right but the proxy is not up yet", () => {
+    const result = summarizeSetupCheck([ok("Claude Code", false)]);
+    expect(result.ok).toBe(false);
+    expect(result.lines[0]).toContain("not answering on 127.0.0.1:6767 yet");
   });
 });
