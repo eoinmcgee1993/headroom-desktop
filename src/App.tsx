@@ -515,23 +515,9 @@ const STARTER_PROMPT =
 // broken indicator. What earned its place is the starter prompt: sending one
 // real prompt is the actual gap here (10% of mature signups send exactly one
 // prompt ever), so hand over something paste-able that works in any repo.
-function FirstSavingsChecklist({ onReopenSetup }: { onReopenSetup: () => void }) {
+function StarterPrompt() {
   const [copied, setCopied] = useState(false);
-  // No traffic yet usually means it isn't reaching Headroom, not that the user
-  // hasn't acted. Offer a setup re-check, but only after a grace window:
-  // proxyReachable is false for ~1min on a healthy install while the backend
-  // binds, so an immediate prompt would nag on good installs.
-  const [showTroubleshoot, setShowTroubleshoot] = useState(false);
-  useEffect(() => {
-    const timer = window.setTimeout(() => setShowTroubleshoot(true), 20000);
-    return () => window.clearTimeout(timer);
-  }, []);
   return (
-    <div className="post-install__checklist">
-      <p>
-        In order to start using Headroom you first need to restart your AI Agents.
-        Then ask them to "Say hi" or paste the prompt below to see savings appear.
-      </p>
       <div className="post-install__starter">
         <code>{STARTER_PROMPT}</code>
         <button
@@ -547,16 +533,6 @@ function FirstSavingsChecklist({ onReopenSetup }: { onReopenSetup: () => void })
           {copied ? "Copied" : "Copy prompt"}
         </button>
       </div>
-      {showTroubleshoot && (
-        <button
-          type="button"
-          className="post-install__troubleshoot"
-          onClick={onReopenSetup}
-        >
-          Nothing showing up? Re-check setup.
-        </button>
-      )}
-    </div>
   );
 }
 
@@ -5923,6 +5899,38 @@ export default function App() {
   if (
     windowLabel === "launcher" && launcherStage === "post_install"
   ) {
+    // Rows exist only when the user just came through client setup (fresh
+    // entries from an upgrade start empty). Shown whether or not savings
+    // already exist: a re-run after a first prompt still has tools holding
+    // pre-setup settings.
+    const restartRows =
+      proxyVerificationRows.length > 0 ? (
+        <div className="connector-list">
+          {proxyVerificationRows.map((row) => (
+            <article className="connector-item" key={row.clientId}>
+              <div>
+                <h3>
+                  <span className="client-logo" aria-hidden="true">
+                    {renderConnectorLogo(row.clientId)}
+                  </span>
+                  {row.name}
+                </h3>
+                <div className="proxy-verify-item__message">
+                  <span>
+                    {proxyVerificationRowMessage(
+                      row,
+                      runningAgentCounts[row.clientId] ?? 0
+                    )}
+                  </span>
+                  {row.state === "verified" ? (
+                    <span className="proxy-verified-pill">verified</span>
+                  ) : null}
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : null;
     // The tray's 5s dashboard poll keeps running under the launcher window,
     // so a first-run user who sends a prompt sees this screen flip from
     // "waiting" to their first real savings without any interaction — the
@@ -5938,47 +5946,15 @@ export default function App() {
         version={appSemver}
       >
         <div className="post-install__lead">
-          <h1>
-            Headroom is now running
-            <br />
-            in the background
-          </h1>
-          {/* Rows exist only when the user just came through client setup
-              (fresh entries from an upgrade start empty). Shown whether or
-              not savings already exist: a re-run after a first prompt still
-              has tools holding pre-setup settings. */}
-          {proxyVerificationRows.length > 0 ? (
-            <div className="connector-list">
-              {proxyVerificationRows.map((row) => (
-                <article className="connector-item" key={row.clientId}>
-                  <div>
-                    <h3>
-                      <span className="client-logo" aria-hidden="true">
-                        {renderConnectorLogo(row.clientId)}
-                      </span>
-                      {row.name}
-                    </h3>
-                    <div className="proxy-verify-item__message">
-                      <span>
-                        {proxyVerificationRowMessage(
-                          row,
-                          runningAgentCounts[row.clientId] ?? 0
-                        )}
-                      </span>
-                      {row.state === "verified" ? (
-                        <span className="proxy-verified-pill">verified</span>
-                      ) : null}
-                      </div>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            ) : null}
+          <h1>Headroom is now running</h1>
           {awaitingFirstSavings ? (
-            <>
-              <FirstSavingsChecklist
-                onReopenSetup={() => setLauncherStage("client_setup")}
-              />
+            <div className="post-install__checklist">
+              <p>
+                In order to start using Headroom you first need to restart your AI Agents.
+                Then ask them to "Say hi" or paste the prompt below to see savings appear.
+              </p>
+              {restartRows}
+              <StarterPrompt />
               {proxyVerificationHint ? (
                 <p
                   className={
@@ -5990,9 +5966,10 @@ export default function App() {
                   {proxyVerificationHint.text}
                 </p>
               ) : null}
-            </>
+            </div>
           ) : (
             <>
+              {restartRows}
               <p>
                 {dashboard.launchExperience === "first_run"
                   ? "That prompt went through Headroom — your first savings are in."

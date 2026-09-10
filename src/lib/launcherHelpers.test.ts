@@ -385,14 +385,14 @@ describe("what the verify row says while it waits", () => {
 
   it("asks the user to start the tool when nothing is running", () => {
     expect(proxyVerificationRowMessage(row, 0)).toBe(
-      "Open Claude Code and send it any message."
+      "Open Claude Code and send it a message."
     );
   });
 
-  it("says an idle tool is still set up rather than failing", () => {
+  it("asks the user to launch an idle tool rather than failing it", () => {
     const message = proxyVerificationRowMessage({ ...row, state: "idle" }, 0);
-    expect(message).toContain("nothing to test");
-    expect(message).toContain("still set up");
+    expect(message).toContain("haven't used Claude Code recently");
+    expect(message).toContain("Launch it");
   });
 
   it("confirms a verified row", () => {

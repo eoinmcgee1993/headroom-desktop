@@ -295,12 +295,12 @@ export function proxyVerificationRowMessage(
     return "Request received";
   }
   if (row.state === "idle") {
-    return `Not used on this machine recently, so there is nothing to test. ${row.name} is still set up.`;
+    return `Looks like you haven't used ${row.name} recently. Launch it and send it a message.`;
   }
   if (runningSessions > 0) {
-    return `Still open with the old settings. Quit and reopen ${row.name}, then send it any message.`;
+    return `Quit and reopen ${row.name}, then send it a message.`;
   }
-  return `Open ${row.name} and send it any message.`;
+  return `Open ${row.name} and send it a message.`;
 }
 
 export function buildInitialProxyVerificationRows(
