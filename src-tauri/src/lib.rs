@@ -535,6 +535,12 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     if dashboard.lifetime_requests > 0 || !state.setup_wizard_complete() {
         return;
     }
+    // Sessions growing while nothing reaches the proxy proves a leak, not its
+    // cause. With 6767 unbound the cause is ours, and "restart your terminal"
+    // is advice that cannot work -- same reasoning as the hourly detector.
+    if state.intercept_bind_failed() {
+        return;
+    }
     // Cached (~90s warmer cadence), so polling this every 5s costs nothing.
     let claude = state
         .list_claude_code_projects()
@@ -2642,6 +2648,7 @@ pub(crate) fn build_watchdog_give_up_report(
 fn probe_backend_readyz_with_body(timeout: std::time::Duration) -> (String, Option<String>) {
     let port = crate::backend_port::get();
     let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(timeout)
         .build()
     {
@@ -3547,6 +3554,7 @@ fn stats_client() -> Option<&'static reqwest::blocking::Client> {
     CLIENT
         .get_or_init(|| {
             reqwest::blocking::Client::builder()
+                .no_proxy()
                 .timeout(std::time::Duration::from_millis(500))
                 .build()
                 .ok()
@@ -3629,6 +3637,11 @@ fn get_client_local_activity_ages(
 /// "these sessions still hold old settings" callout. Undercounts are fine
 /// (the callout just stays quiet); false positives are not, so matching is
 /// strict on the executable/script basename.
+#[tauri::command]
+fn claude_desktop_installed() -> bool {
+    client_adapters::claude_desktop_installed()
+}
+
 #[tauri::command]
 fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize> {
     #[cfg(windows)]
@@ -4320,7 +4333,17 @@ fn run_activity_observation(app: &AppHandle) {
     // machine where nothing is wrong (RUST-DD regressed on 0.9.12 with the
     // grace in place). The canary is for a backend that is UP and still
     // failing; only count the streak while the app expects it to be up.
-    if state.runtime_is_paused() || state.runtime_is_auto_paused() || state.runtime_is_starting() {
+    // Same reasoning for a front door that never opened: when the intercept
+    // cannot bind 6767 (RUST-EQ, Windows refusing the socket outright), every
+    // fetch is refused for as long as that lasts -- and the bind loop already
+    // reports it, with the OS code and the occupant. The canary would only add
+    // a second, blinder issue for the same machine (RUST-DT).
+    let intercept_bind_failed = state.intercept_bind_failed();
+    if state.runtime_is_paused()
+        || state.runtime_is_auto_paused()
+        || state.runtime_is_starting()
+        || intercept_bind_failed
+    {
         *FEED_FAILING_SINCE.lock() = None;
     } else if should_pull_transformations_feed() {
         match fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
@@ -4899,6 +4922,7 @@ async fn submit_contact_request(
     let target = validate_contact_request_url(&url)
         .ok_or_else(|| "Could not reach the contact form.".to_string())?;
 
+    // proxy-ok: contact form posts to extraheadroom.com, not loopback
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -5081,11 +5105,6 @@ async fn apply_client_setup(
     }
 }
 
-#[tauri::command]
-async fn verify_client_setup(client_id: String) -> Result<ClientSetupVerification, String> {
-    client_adapters::verify_client_setup(&client_id).map_err(|err| err.to_string())
-}
-
 /// Watchdog-driven silent self-heal (see `client_adapters::repair_client_setups`).
 /// Skipped while the runtime is paused or bypassed: the pricing gate and the
 /// watchdog give-up path tear client configs down on purpose, and repairing
@@ -5145,7 +5164,15 @@ async fn detect_unrouted_clients(
         use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
         let state: State<'_, AppState> = app.state();
         // Paused or bypassed: the agent going direct is the intended state.
+        // A failed intercept bind is the same fact from the other end: when
+        // 6767 never opened (RUST-EQ, Windows refusing the socket outright),
+        // no client CAN reach us, so "active locally, no proxied request" is
+        // OUR outage, not a clobbered client config. Reporting it here blames
+        // the client, re-applies a setup that was never wrong, and shows the
+        // user a "ran without Headroom" affordance pointing at their terminal.
+        // The bind loop already reports the real cause, with the OS code.
         if state.runtime_is_paused()
+            || state.intercept_bind_failed()
             || state
                 .proxy_bypass
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -6332,6 +6359,7 @@ pub fn run() {
             get_intercept_request_counts_by_agent,
             get_running_agent_process_counts,
             get_client_local_activity_ages,
+            claude_desktop_installed,
             get_gated_bypass_bytes,
             install_claude_code_cli,
             get_launch_flags,
@@ -6364,7 +6392,6 @@ pub fn run() {
             get_transformations_feed,
             start_headroom_learn,
             apply_client_setup,
-            verify_client_setup,
             repair_client_setups,
             detect_unrouted_clients,
             detect_oss_remnants,
@@ -6908,6 +6935,7 @@ fn fetch_transformations_feed_from(
     limit: u32,
 ) -> Result<TransformationFeedResponse, String> {
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
         .build()
         .map_err(|err| err.to_string())?;
@@ -7073,10 +7101,18 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         // match the two words the whole family shares. Still specific enough
         // not to hit a project's own source line echoed back.
         "spend limit",
+        // RUST-EP: `You've hit your weekly limit \u{b7} resets 2am
+        // (Europe/Berlin)` -- a fourth wording in three months.
+        "weekly limit",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
         NEEDLES.iter().any(|needle| lower.contains(needle))
+            // Every wording so far is second-person ("You've hit your <window>
+            // limit"), so match that shape too rather than waiting for the
+            // fifth variant to file another Error. Still anchored: a project's
+            // own source line echoed back says "limit", never "hit your".
+            || (lower.contains("hit your") && lower.contains("limit"))
     })
 }
 
@@ -7113,6 +7149,52 @@ fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
 fn learn_failure_is_agent_model_rejected(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     lowered.contains("unrecognized_model") || lowered.contains("does not support this model")
+}
+
+/// True when a `headroom learn` failure was the agent CLI exhausting its own
+/// API retries: `{"type":"system","subtype":"api_retry","attempt":8,
+/// "max_retries":10,"retry_delay_ms":38510,"error_status":null,"error":
+/// "unknown",...}` repeated until it gave up (RUST-EW). The CLI never reached
+/// its backend, so the outcome is the user's network or an upstream outage --
+/// the same user-environment class as the auth and limit lines above.
+///
+/// `error_status` must be null, and that is load-bearing: a retry storm around
+/// a REAL status -- a 400 for a prompt we built too long (RUST-BK) -- is ours
+/// and has to keep reporting. Suppressing this class also un-fragments it: the
+/// retry event carries `retry_delay_ms`, `attempt` and a session UUID, and the
+/// failure signature is built from that line, so every storm opened a brand
+/// new issue.
+///
+/// Every retry line has to be statusless, not just one of them: a run that
+/// blipped statuslessly and THEN failed on a real 400 carries both shapes, and
+/// an `any()` over the null one would suppress the report we most need. One
+/// retry around a real status anywhere disqualifies the whole run.
+fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
+    let mut statusless = false;
+    for line in text
+        .lines()
+        .filter(|line| line.contains("\"subtype\":\"api_retry\""))
+    {
+        if !line.contains("\"error_status\":null") {
+            return false;
+        }
+        statusless = true;
+    }
+    statusless
+}
+
+/// The user-facing remedy for [`learn_failure_is_agent_api_unreachable`].
+fn learn_agent_api_unreachable_hint(agent: LearnAgent) -> String {
+    let cli = match agent {
+        LearnAgent::Claude => "Claude Code",
+        LearnAgent::Codex => "Codex",
+        LearnAgent::Opencode => "opencode",
+        LearnAgent::Grok => "Grok",
+    };
+    format!(
+        "{cli} could not reach its API -- it retried and gave up -- so headroom learn could not \
+         run its analysis. Check this machine's connection, then start the scan again."
+    )
 }
 
 /// The text a learn failure is fingerprinted on.
@@ -7478,7 +7560,11 @@ fn execute_headroom_learn_run(
                     let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
                     let agent_limit_line =
                         learn_failure_agent_limit_line(&stderr).map(str::to_string);
-                    if !agent_not_signed_in && agent_limit_line.is_none() {
+                    // RUST-EW, third cause in the same class: the CLI never
+                    // reached its own API.
+                    let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
+                    if !agent_not_signed_in && agent_limit_line.is_none() && !agent_api_unreachable
+                    {
                         sentry::with_scope(
                             |scope| {
                                 scope.set_tag("flow", "headroom_learn");
@@ -7665,6 +7751,7 @@ fn execute_headroom_learn_run(
                 let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
                 let agent_limit_line = learn_failure_agent_limit_line(&stderr).map(str::to_string);
                 let agent_model_rejected = learn_failure_is_agent_model_rejected(&stderr);
+                let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
                 // RUST-3F: this used to read `signature.contains(...)`, which is
                 // exactly the mistake the paragraph above warns about. Click
                 // prints its usage banner FIRST and the diagnosis LAST:
@@ -7682,7 +7769,8 @@ fn execute_headroom_learn_run(
                 let user_env_condition = path_unreadable
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
-                    || agent_model_rejected;
+                    || agent_model_rejected
+                    || agent_api_unreachable;
                 if !user_env_condition {
                     sentry::with_scope(
                         |scope| {
@@ -7725,6 +7813,8 @@ fn execute_headroom_learn_run(
                     learn_agent_auth_hint(agent)
                 } else if let Some(line) = &agent_limit_line {
                     learn_agent_limit_hint(agent, line)
+                } else if agent_api_unreachable {
+                    learn_agent_api_unreachable_hint(agent)
                 } else {
                     format!(
                         "headroom learn exited with {}.\n{}",
@@ -9272,7 +9362,8 @@ mod tests {
         is_blocked_runtime_dll_signal, is_disk_full_signal, is_endpoint_protection_signal,
         is_environmental_startup_key, is_loopback_socket_denied_signal, is_network_download_signal,
         is_port_conflict_failure, is_prerelease_version, learn_agent_auth_hint,
-        learn_agent_limit_hint, learn_failure_agent_limit_line, learn_failure_is_agent_auth,
+        learn_agent_limit_hint, learn_failure_agent_limit_line,
+        learn_failure_is_agent_api_unreachable, learn_failure_is_agent_auth,
         learn_failure_is_agent_model_rejected, learn_failure_signature_source, learn_step_label,
         lifetime_token_milestone_kind, noop_app_update_progress_emitter,
         normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
@@ -11419,6 +11510,80 @@ Some unrelated content.
         assert_eq!(auto_resume_backoff(50), Duration::from_secs(300));
     }
 
+    /// Every reqwest client must decide, explicitly, whether it honors the
+    /// user's system proxy. reqwest 0.12 delegates proxy discovery to
+    /// hyper-util, which has no loopback exemption anywhere:
+    ///
+    /// - Windows reads HKCU `Internet Settings\ProxyServer` and applies it to
+    ///   http AND https, taking its bypass list only from `ProxyOverride`.
+    ///   WinINET's `<local>` token is copied through as a literal string that
+    ///   can never match `127.0.0.1`, so even a correctly configured corporate
+    ///   proxy fails to exempt loopback.
+    /// - macOS reads `HTTPProxy`/`HTTPSProxy` and ignores `ExceptionsList` and
+    ///   `ExcludeSimpleHostnames` entirely, so the user's own bypass list is
+    ///   not consulted at all.
+    ///
+    /// A user with any system proxy enabled therefore has our /readyz, /livez,
+    /// /stats and feed polls sent to that proxy, and a healthy backend reads as
+    /// unreachable. That is the same class as the v2rayN `socks4://` crashes
+    /// (RUST-9F/9T/AT/AS/AY/B3/B5), which only ever got fixed for the backend
+    /// child's env, not for our own HTTP calls.
+    ///
+    /// So: a client that talks to loopback calls `.no_proxy()`. A client that
+    /// talks to the internet must keep honoring the proxy (corporate networks
+    /// need it) and says so with a `// proxy-ok:` comment above the builder.
+    /// Adding a client without either is the regression this guards.
+    #[test]
+    fn every_reqwest_client_decides_about_the_system_proxy() {
+        // Split so this needle does not match its own source line.
+        let needle = concat!("Client::", "builder()");
+        let sources = [
+            ("analytics.rs", include_str!("analytics.rs")),
+            ("client_adapters.rs", include_str!("client_adapters.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+            ("pricing.rs", include_str!("pricing.rs")),
+            ("proxy_intercept.rs", include_str!("proxy_intercept.rs")),
+            ("state.rs", include_str!("state.rs")),
+            ("tool_manager.rs", include_str!("tool_manager.rs")),
+        ];
+
+        let mut undecided = Vec::new();
+        let mut decided = 0usize;
+        for (name, source) in sources {
+            let lines: Vec<&str> = source.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                // The builder chain runs to its `.build()`; 40 lines is well
+                // clear of the longest one (the asset downloader, at 5).
+                let end = (i..lines.len().min(i + 40))
+                    .find(|&j| lines[j].contains(".build()"))
+                    .unwrap_or(i);
+                let chain = lines[i..=end].join("\n");
+                let marked = i > 0 && lines[i - 1].contains("proxy-ok:");
+                if chain.contains(".no_proxy()") || marked {
+                    decided += 1;
+                } else {
+                    undecided.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+
+        assert!(
+            undecided.is_empty(),
+            "reqwest client(s) with no system-proxy decision: {undecided:?}. \
+             Add .no_proxy() if it talks to 127.0.0.1, or a `// proxy-ok: <why>` \
+             comment above the builder if it must honor the user's proxy."
+        );
+        // Tripwire against the scan silently matching nothing (a rename of the
+        // builder API, or the include_str! paths drifting).
+        assert!(
+            decided >= 15,
+            "expected to find the known reqwest clients, found only {decided}"
+        );
+    }
+
     /// Ordering guard for the give-up path. `capture_watchdog_give_up`
     /// re-probes the backend and sleeps ~4s to sample a CPU rate, so running it
     /// before the bypass flip holds every in-flight request on the unreachable
@@ -12022,6 +12187,42 @@ Some unrelated content.
         ] {
             assert!(
                 learn_failure_agent_limit_line(stderr).is_none(),
+                "for: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn learn_failure_agent_limit_line_matches_the_weekly_window() {
+        // RUST-EP verbatim: a fourth wording, matched by none of the needles.
+        let weekly = "You've hit your weekly limit \u{b7} resets 2am (Europe/Berlin)";
+        assert_eq!(learn_failure_agent_limit_line(weekly), Some(weekly));
+        // The shape rule, not the needle: any future window wording.
+        assert!(learn_failure_agent_limit_line("You've hit your Opus limit for today").is_some());
+    }
+
+    #[test]
+    fn learn_failure_is_agent_api_unreachable_only_on_a_statusless_retry_storm() {
+        // RUST-EW verbatim: claude-cli retried its API ten times, never got a
+        // status back, and gave up. Nothing on our side changes that.
+        let storm = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\n{\"type\":\"system\",\"subtype\":\"api_retry\",\"attempt\":8,\"max_retries\":10,\"retry_delay_ms\":38510,\"error_status\":null,\"error\":\"unknown\",\"session_id\":\"083b154e\"}\n";
+        assert!(learn_failure_is_agent_api_unreachable(storm));
+        // A retry storm around a REAL status is OURS (RUST-BK: a prompt we
+        // built too long) and must keep reporting.
+        let ours = "{\"type\":\"system\",\"subtype\":\"api_retry\",\"attempt\":1,\"max_retries\":10,\"error_status\":400,\"error\":\"prompt is too long\"}";
+        assert!(!learn_failure_is_agent_api_unreachable(ours));
+        // Mixed: a statusless blip, then the real 400. The run is still OURS,
+        // so the null line must not buy it a suppression.
+        assert!(!learn_failure_is_agent_api_unreachable(&format!(
+            "{storm}{ours}\n"
+        )));
+        for stderr in [
+            "LLM analysis failed: `claude -p` did not respond within 120s.",
+            "API Error: 400 status code (no body)",
+            "",
+        ] {
+            assert!(
+                !learn_failure_is_agent_api_unreachable(stderr),
                 "for: {stderr}"
             );
         }

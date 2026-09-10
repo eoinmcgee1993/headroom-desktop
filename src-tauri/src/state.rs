@@ -1626,6 +1626,7 @@ impl AppState {
         // large Claude request (tokenization, ONNX inference, etc). The
         // previous 1.5s timeout false-fired during those bursts.
         let client = match reqwest::blocking::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()
         {
@@ -3444,6 +3445,16 @@ impl AppState {
         *self.runtime_paused.lock()
     }
 
+    /// True while the intercept's bind loop is still failing, i.e. 6767 is not
+    /// ours right now. Every client is hard-configured to that port, so this
+    /// means nothing CAN route through Headroom whatever the clients' configs
+    /// say -- which is why the unrouted-client detector and the transformations
+    /// feed canary both stand down on it instead of filing a second, blinder
+    /// issue for the same machine (RUST-EQ, RUST-DT).
+    pub fn intercept_bind_failed(&self) -> bool {
+        self.intercept_bind_error.lock().is_some()
+    }
+
     pub fn set_runtime_auto_paused(&self, auto_paused: bool) {
         self.runtime_auto_paused
             .store(auto_paused, std::sync::atomic::Ordering::Release);
@@ -4049,7 +4060,7 @@ pub(crate) fn current_platform_support_tier() -> &'static str {
 
 pub(crate) fn support_tier_for_platform(os: &str) -> &'static str {
     match os {
-        "linux" | "windows" => "experimental",
+        "linux" => "experimental",
         _ => "stable",
     }
 }
@@ -6528,6 +6539,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     // fetch that still times out means the backend is genuinely starved.
     const STATS_FETCH_TIMEOUT_SECS: u64 = 15;
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
         .build()
         .ok()?;
@@ -6587,6 +6599,7 @@ fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
     }
 
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_millis(500))
         .build()
         .ok()?;
@@ -8016,6 +8029,17 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
              Quit that program, or end it in Task Manager, and Headroom reconnects on its own."
         );
     }
+    // Two app instances (`restart_app`'s `open -n` relauncher bypasses
+    // single-instance). Traffic is fine -- the OTHER window is optimizing it --
+    // so this must not read as an outage, and the remedy is about the window,
+    // not the port.
+    if raw.contains("served by another Headroom instance") {
+        return format!(
+            "Another Headroom window already has port {port}, so this one is a spectator. \
+             Your traffic is still being optimized by that window. \
+             Quit this window; if you can't tell them apart, quit Headroom entirely and reopen it once."
+        );
+    }
     if raw.contains("still being released") {
         return format!(
             "Port {port} is still being released by the previous Headroom session. \
@@ -8120,6 +8144,7 @@ fn runtime_already_serving(
 
 fn probe_proxy_readyz(timeout: Duration) -> bool {
     let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(timeout)
         .build()
     {
@@ -9939,6 +9964,18 @@ mod tests {
     /// rather than blaming the Python runtime -- which in that state is running
     /// fine on a port of its own. The hint must hand over the command that
     /// identifies the holder instead of asserting which one it is.
+    #[test]
+    fn intercept_bind_hint_for_a_second_instance_does_not_read_as_an_outage() {
+        // The string the existing-proxy arm writes, verbatim.
+        let hint = intercept_bind_hint("port 6767 is served by another Headroom instance");
+        assert!(hint.contains("6767"), "{hint}");
+        assert!(hint.contains("still being optimized"), "{hint}");
+        // Must not inherit the mid-diagnosis or foreign-holder remedies: no
+        // program is squatting the port and nothing is being identified.
+        assert!(!hint.contains("checking what holds it"), "{hint}");
+        assert!(!hint.contains("Task Manager"), "{hint}");
+    }
+
     #[test]
     fn intercept_bind_hint_names_the_port_and_how_to_find_the_holder() {
         let hint = intercept_bind_hint(
@@ -14559,9 +14596,9 @@ mod tests {
     }
 
     #[test]
-    fn support_tier_for_platform_marks_windows_experimental() {
+    fn support_tier_for_platform_marks_linux_experimental() {
         assert_eq!(support_tier_for_platform("linux"), "experimental");
-        assert_eq!(support_tier_for_platform("windows"), "experimental");
+        assert_eq!(support_tier_for_platform("windows"), "stable");
         assert_eq!(support_tier_for_platform("macos"), "stable");
     }
 }

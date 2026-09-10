@@ -140,17 +140,25 @@ export function cacheHitPair(
 /** The all-time cache-hit pair, from the lifetime breakdown rather than a
  * window of buckets. Null when the client has never cached anything: there is
  * no hit rate to report, and `cacheHitPair` would be dividing into an empty
- * window. */
+ * window.
+ *
+ * `compressionSavingsUsd` is INPUT COMPRESSION ALONE, and must be: the
+ * denominator here is an input-cost one, so pairing it with
+ * `lifetimeEstimatedSavingsUsd` (which also carries output shaping and tool-
+ * schema deferral, neither of which removes input) made the all-time row read
+ * above the windowed rows beside it -- 17.0% against 11.6% on the same machine,
+ * measured 2026-09-10. Named for the field, not for "lifetime savings", so the
+ * broader figure cannot be passed back in by accident. */
 export function allTimeCacheHitPair(
   breakdown: SavingsBreakdown | null | undefined,
-  lifetimeEstimatedSavingsUsd: number
+  compressionSavingsUsd: number
 ) {
   if (!breakdown || breakdown.cacheReadTokens <= 0) return null;
   return cacheHitPair([
     {
       cacheSavingsUsd: breakdown.cacheSavingsUsd,
       actualCostUsd: breakdown.totalInputCostUsd,
-      estimatedSavingsUsd: lifetimeEstimatedSavingsUsd
+      estimatedSavingsUsd: compressionSavingsUsd
     }
   ]);
 }

@@ -753,6 +753,24 @@ pub fn spawn(
                             // it held) — benign, just wait for it to go away.
                             // Otherwise the port is foreign; escalate once.
                             if probe_existing_intercept().await {
+                                // Name the real cause. `bind_error` is only
+                                // ever cleared by a successful bind and this
+                                // arm never binds, so whatever an earlier
+                                // iteration wrote sticks for the process
+                                // lifetime -- and that was "in use;
+                                // identifying what holds it", which renders as
+                                // "Headroom is checking what holds it" and
+                                // then never resolves, because the diagnosis
+                                // it promises only runs in the arm below.
+                                //
+                                // Deliberately overwritten, NOT cleared: this
+                                // instance is a spectator, so its view of
+                                // traffic is not authoritative and the
+                                // detectors keyed on `intercept_bind_failed`
+                                // must stay stood down.
+                                *bind_error.lock() = Some(format!(
+                                    "port {INTERCEPT_PORT} is served by another Headroom instance"
+                                ));
                                 // Clients still reach A Headroom, so this is
                                 // benign for traffic -- but nothing in this
                                 // loop ever clears it, and a second instance
@@ -765,9 +783,33 @@ pub fn spawn(
                                 if launched_at.elapsed() >= RELAUNCH_GRACE
                                     && reported_errors.insert("existing_proxy".to_string())
                                 {
-                                    log::warn!(
-                                        "[proxy_intercept] port {INTERCEPT_PORT} still served by another Headroom proxy {}s after launch; this instance is not the one clients reach",
-                                        launched_at.elapsed().as_secs()
+                                    let held_secs = launched_at.elapsed().as_secs();
+                                    log::info!(
+                                        "[proxy_intercept] port {INTERCEPT_PORT} still served by another Headroom proxy {held_secs}s after launch; this instance is not the one clients reach"
+                                    );
+                                    // The elapsed seconds are an EXTRA, and the
+                                    // fingerprint is fixed: interpolated into
+                                    // the message they open one issue per
+                                    // second-count (RUST-EH arrived as "93s"),
+                                    // and this target does not match the
+                                    // `[proxy_intercept] ... retrying` skip
+                                    // rule either. Same split the two sibling
+                                    // reclaim reports use.
+                                    sentry::with_scope(
+                                        |scope| {
+                                            scope.set_tag("flow", "intercept_second_instance");
+                                            scope.set_extra("held_secs", held_secs.into());
+                                            scope.set_extra("port", INTERCEPT_PORT.into());
+                                            scope.set_fingerprint(Some(&[
+                                                "intercept_second_instance",
+                                            ]));
+                                        },
+                                        || {
+                                            sentry::capture_message(
+                                                "[proxy_intercept] port still served by another Headroom proxy past the relaunch grace; this instance is not the one clients reach",
+                                                sentry::Level::Warning,
+                                            );
+                                        },
                                     );
                                 } else {
                                     log::info!(
@@ -2355,6 +2397,7 @@ fn fetch_codex_usage_snapshot(
     account_id: &str,
     user_agent: &str,
 ) -> Option<CodexRateLimitSnapshot> {
+    // proxy-ok: api.openai.com auth probe, not loopback
     let client = reqwest::blocking::Client::builder()
         .timeout(CODEX_USAGE_POLL_TIMEOUT)
         .build()

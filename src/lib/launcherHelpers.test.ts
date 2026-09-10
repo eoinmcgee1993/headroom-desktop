@@ -2,11 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildInitialProxyVerificationRows,
-  formatConnectorNameList,
   markIdleProxyVerificationRows,
   proxyVerificationRowMessage,
-  setupCheckSuccessMessage,
-  testableProxyVerificationRows,
   PROXY_VERIFY_IDLE_AFTER_SECONDS,
   getClaudeConnector,
   getContactRequestValidationError,
@@ -117,7 +114,7 @@ describe("launcher helpers", () => {
           verified: false
         }
       ])
-    ).toBe("begin_proxy_verification");
+    ).toBe("begin_post_install");
     // Codex-only: a non-Claude tool drives the same auto-configure decision.
     expect(
       getLauncherAutoConfigureDecision([
@@ -248,17 +245,17 @@ describe("launcher helpers", () => {
       });
     });
 
-    it("routes begin_proxy_verification straight to proxy verification", () => {
-      expect(nextAutoConfigureStep("begin_proxy_verification", [])).toEqual({
-        kind: "begin_proxy_verification"
+    it("routes begin_post_install straight to the post-install screen", () => {
+      expect(nextAutoConfigureStep("begin_post_install", [])).toEqual({
+        kind: "begin_post_install"
       });
     });
   });
 
   describe("nextAutoConfigureStepAfterApply", () => {
     it("advances to proxy verification when apply produced a verified setup", () => {
-      expect(nextAutoConfigureStepAfterApply("begin_proxy_verification")).toEqual({
-        kind: "begin_proxy_verification"
+      expect(nextAutoConfigureStepAfterApply("begin_post_install")).toEqual({
+        kind: "begin_post_install"
       });
     });
 
@@ -312,20 +309,7 @@ describe("launcher helpers", () => {
   });
 });
 
-describe("formatConnectorNameList", () => {
-  // Feeds the proxy-verify skip warning, which names the connectors that never
-  // checked in. Four can be enabled at once, so the 3+ case is real.
-  it("reads naturally at every connector count", () => {
-    expect(formatConnectorNameList([])).toBe("");
-    expect(formatConnectorNameList(["Claude Code"])).toBe("Claude Code");
-    expect(formatConnectorNameList(["Claude Code", "Codex"])).toBe("Claude Code and Codex");
-    expect(formatConnectorNameList(["Claude Code", "Codex", "OpenCode"])).toBe(
-      "Claude Code, Codex and OpenCode"
-    );
-  });
-});
-
-describe("proxy verification rows the screen should not be testing", () => {
+describe("idle marking and row order", () => {
   const row = (clientId: string, state: "processing" | "verified" | "idle" = "processing") => ({
     clientId,
     name: clientId === "codex" ? "ChatGPT" : "Claude Code",
@@ -342,7 +326,14 @@ describe("proxy verification rows the screen should not be testing", () => {
     });
 
     expect(rows.map((entry) => entry.state)).toEqual(["processing", "idle"]);
-    expect(testableProxyVerificationRows(rows).map((entry) => entry.clientId)).toEqual(["codex"]);
+  });
+
+  it("sinks idle rows below the ones the user still has to restart", () => {
+    const rows = markIdleProxyVerificationRows([row("codex"), row("claude_code")], {
+      claude_code: 60
+    });
+
+    expect(rows.map((entry) => entry.clientId)).toEqual(["claude_code", "codex"]);
   });
 
   it("treats activity older than the window as idle", () => {
@@ -370,22 +361,22 @@ describe("what the verify row says while it waits", () => {
     message: ""
   };
 
-  it("names the stale sessions when the tool is already running", () => {
-    expect(proxyVerificationRowMessage(row, 2)).toContain("2 sessions are running");
-    expect(proxyVerificationRowMessage(row, 2)).toContain("Quit and reopen Claude Code");
-    expect(proxyVerificationRowMessage(row, 1)).toContain("1 session is running");
+  it("says the tool is holding old settings without counting sessions", () => {
+    const message = proxyVerificationRowMessage(row, 10);
+    expect(message).toContain("Quit and reopen Claude Code");
+    expect(message).not.toMatch(/\d/);
   });
 
   it("asks the user to start the tool when nothing is running", () => {
     expect(proxyVerificationRowMessage(row, 0)).toBe(
-      "Not running yet. Open Claude Code and send it any message."
+      "Open Claude Code and send it a message."
     );
   });
 
-  it("says an idle tool is still set up rather than failing", () => {
+  it("asks the user to launch an idle tool rather than failing it", () => {
     const message = proxyVerificationRowMessage({ ...row, state: "idle" }, 0);
-    expect(message).toContain("nothing to test");
-    expect(message).toContain("still set up");
+    expect(message).toContain("haven't used Claude Code recently");
+    expect(message).toContain("Launch it");
   });
 
   it("confirms a verified row", () => {
@@ -393,37 +384,3 @@ describe("what the verify row says while it waits", () => {
   });
 });
 
-describe("setupCheckSuccessMessage", () => {
-  const row = (name: string, state: "processing" | "verified" | "idle") => ({
-    clientId: name.toLowerCase(),
-    name,
-    state,
-    message: ""
-  });
-
-  it("does not ask for a restart once every testable tool is verified", () => {
-    const message = setupCheckSuccessMessage([
-      row("Claude Code", "verified"),
-      row("ChatGPT", "idle")
-    ]);
-    expect(message).not.toContain("quit and reopen");
-    expect(message).toContain("nothing left to do");
-  });
-
-  it("names only the tools still waiting", () => {
-    const message = setupCheckSuccessMessage([
-      row("Claude Code", "verified"),
-      row("Cursor", "processing")
-    ]);
-    expect(message).toContain("no prompt from Cursor");
-    expect(message).not.toContain("Claude Code");
-    // The row for Cursor already carries the instruction.
-    expect(message).not.toContain("quit and reopen");
-  });
-
-  it("says there is nothing to test when every tool is dormant", () => {
-    const message = setupCheckSuccessMessage([row("ChatGPT", "idle")]);
-    expect(message).toContain("nothing to test");
-    expect(message).not.toContain("quit and reopen");
-  });
-});

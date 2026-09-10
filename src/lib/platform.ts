@@ -7,9 +7,8 @@ export function platformPreviewNoticeFor(
   if (supportTier !== "experimental") {
     return null;
   }
-  if (platform === "linux" || platform === "windows") {
-    const name = platform === "linux" ? "Linux" : "Windows";
-    return `${name} is currently in preview.`;
+  if (platform === "linux") {
+    return "Linux is currently in preview.";
   }
   return "This platform is currently in preview.";
 }

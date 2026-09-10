@@ -3434,6 +3434,7 @@ fn last_codex_retag_at() -> Option<SystemTime> {
 fn retag_codex_thread_providers(from: &str, to: &str) {
     let mut found_thread_store = false;
     let mut unreadable = 0usize;
+    let mut skip_reasons: Vec<String> = Vec::new();
     for path in discover_codex_state_dbs() {
         match retag_one_codex_db(&path, from, to) {
             // No `threads` table: unrelated sqlite store (logs/goals/memories).
@@ -3457,9 +3458,11 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
                     "codex retag {from}->{to} skipped for {}: {e}",
                     path.display()
                 );
+                skip_reasons.push(e.to_string());
             }
         }
     }
+    report_codex_retag_skips(&skip_reasons);
     *LAST_CODEX_RETAG.lock().unwrap() = Some(SystemTime::now());
     // A `state_*.sqlite`-shaped file with no `threads` table means Codex renamed
     // the table itself (discovery already survives a file rename). Only flag when
@@ -3486,6 +3489,82 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
             );
         }
     }
+}
+
+/// One Sentry event per retag PASS, not one per file.
+///
+/// The per-file warn names the DB, so the log bridge grouped it by filename: a
+/// running Codex holding three of its own sqlite files opened three issues in
+/// the same second for one condition (RUST-EK, RUST-EM, RUST-EN). The bridged
+/// twin is dropped in logging.rs and the reasons ride along as an extra.
+///
+/// The environmental causes stay dropped (a DB the user's disk corrupted is
+/// not ours to fix, RUST-95/96), but a real one anywhere in the pass still
+/// reports: a lock outliving `busy_timeout` is how we would learn that
+/// assumption went stale. Capped at one event per class per session by
+/// `claim_retag_skip_report_slot`.
+fn codex_retag_skip_class(reasons: &[String]) -> Option<&'static str> {
+    reasons.iter().find_map(|reason| {
+        let lower = reason.to_ascii_lowercase();
+        if lower.contains("malformed") || lower.contains("disk i/o error") {
+            None
+        } else if lower.contains("is locked") {
+            Some("locked")
+        } else {
+            Some("other")
+        }
+    })
+}
+
+/// Skip classes already reported this session, so the event stays a HOST
+/// count. A retag pass runs on every app launch and every quit, and
+/// `busy_timeout` is 750ms -- which a Codex actively writing its own store
+/// blows past routinely. Without this the one condition files a Warning per
+/// launch, forever, on every user who keeps Codex open. Same shape as
+/// `claim_transient_report_slot` in pricing.rs.
+static RETAG_SKIP_REPORTED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn claim_retag_skip_report_slot(class: &'static str) -> bool {
+    let mut seen = RETAG_SKIP_REPORTED.lock().unwrap_or_else(|e| {
+        // A poisoned lock must not silence reporting outright.
+        RETAG_SKIP_REPORTED.clear_poison();
+        e.into_inner()
+    });
+    seen.insert(class)
+}
+
+fn report_codex_retag_skips(reasons: &[String]) {
+    let Some(class) = codex_retag_skip_class(reasons) else {
+        return;
+    };
+    if !claim_retag_skip_report_slot(class) {
+        return;
+    }
+    let sample: Vec<String> = {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for reason in reasons {
+            seen.insert(reason.chars().take(160).collect());
+        }
+        seen.into_iter().take(5).collect()
+    };
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("flow", "codex_retag");
+            scope.set_extra("skipped_files", (reasons.len() as u64).into());
+            scope.set_extra("reasons", sample.join(" | ").into());
+            scope.set_fingerprint(Some(&["codex_retag_skipped", class]));
+        },
+        || {
+            sentry::capture_message(
+                &format!(
+                    "codex retag skipped {} database(s) ({class})",
+                    reasons.len()
+                ),
+                sentry::Level::Warning,
+            );
+        },
+    );
 }
 
 fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<Option<usize>> {
@@ -5940,6 +6019,7 @@ fn is_headroom_proxy_reachable() -> bool {
 
 fn probe_headroom_proxy() -> bool {
     let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_millis(500))
         .build()
     {
@@ -6792,6 +6872,28 @@ fn grok_home() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".grok"))
 }
 
+/// Claude Desktop is not a supported client: its bundled Claude Code pins
+/// provider routing to the host, so nothing Headroom configures reaches it.
+/// A machine that has only it installed still deserves to hear that in words
+/// rather than a generic "no coding tool found". Presence only, no version.
+pub(crate) fn claude_desktop_installed() -> bool {
+    let home = home_dir();
+    let mut candidates = vec![
+        PathBuf::from("/Applications/Claude.app"),
+        home.join("Applications").join("Claude.app"),
+    ];
+    // The Squirrel install root, which uninstall removes. Deliberately NOT the
+    // Electron userData dirs (`~/Library/Application Support/Claude`,
+    // `%APPDATA%\Claude`): those outlive an uninstall, so they would tell a
+    // former user we cannot work with an app they already deleted. Missing an
+    // install in a non-standard location is the safe direction -- the copy is
+    // an extra explanation and its absence leaves the correct generic text.
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(base).join("AnthropicClaude"));
+    }
+    candidates.iter().any(|path| path.exists())
+}
+
 fn detect_claude_code_client(configured: bool) -> ClientStatus {
     let executable = claude_code_candidate_paths()
         .into_iter()
@@ -7230,6 +7332,43 @@ fn windows_path_extensions() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_retag_skip_class_reports_only_what_a_release_can_fix() {
+        use super::codex_retag_skip_class;
+        // A disk the user's Codex corrupted is not ours (RUST-95/96).
+        assert_eq!(
+            codex_retag_skip_class(&["database disk image is malformed".into()]),
+            None
+        );
+        assert_eq!(codex_retag_skip_class(&["disk I/O error".into()]), None);
+        // A lock outliving busy_timeout is: one class for the whole pass,
+        // however many of Codex's own DBs it happened to hold (RUST-EK/EM/EN).
+        assert_eq!(
+            codex_retag_skip_class(&[
+                "database disk image is malformed".into(),
+                "database is locked".into(),
+                "database is locked".into(),
+            ]),
+            Some("locked")
+        );
+        assert_eq!(codex_retag_skip_class(&[]), None);
+    }
+
+    /// A retag pass runs on every launch AND every quit, and a Codex that is
+    /// open holds its own store past `busy_timeout` routinely -- so without a
+    /// per-session cap the one condition files a Warning per launch forever.
+    /// The event has to stay a HOST count.
+    #[test]
+    fn a_retag_skip_class_reports_once_per_session() {
+        use super::claim_retag_skip_report_slot;
+        // Slug is deliberately not one of the real classes: the static is
+        // process-global, so a real one would couple this to run order.
+        assert!(claim_retag_skip_report_slot("test-only-class"));
+        assert!(!claim_retag_skip_report_slot("test-only-class"));
+        // A different class is still worth one event of its own.
+        assert!(claim_retag_skip_report_slot("test-only-other"));
+    }
+
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};

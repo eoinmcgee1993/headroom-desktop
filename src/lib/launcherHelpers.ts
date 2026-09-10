@@ -10,15 +10,14 @@ import type {
 export const EMAIL_ADDRESS_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // Linear onboarding flow shown in the launcher window:
-// install → client_setup → proxy_verify → post_install. Back buttons can jump
-// backwards. The install step doubles as the pre-install landing.
-// Paywall-first experiment (server flag, fresh installs only) reorders to:
-// install(landing) → client_setup → proxy_verify(passthrough) → paywall →
-// install(bootstrap) → post_install.
+// install → client_setup → post_install. Back buttons can jump backwards. The
+// install step doubles as the pre-install landing. The post-install screen
+// carries the per-tool "restart, then send the starter prompt" rows that used
+// to be a separate proxy_verify stage (removed 2026-09-10: the gate produced
+// the "is it broken?" support emails it was meant to prevent).
 export type LauncherStage =
   | "install"
   | "client_setup"
-  | "proxy_verify"
   | "paywall"
   | "post_install";
 
@@ -51,7 +50,7 @@ export type InstallWizardStep = (typeof INSTALL_WIZARD_STEPS)[number];
 export type LauncherAutoConfigureDecision =
   | "show_client_setup"
   | "apply_client_setup"
-  | "begin_proxy_verification";
+  | "begin_post_install";
 
 /// Step the launcher's auto-configure flow should take next, given a fresh
 /// connector probe. The component is responsible for performing the IPC
@@ -59,7 +58,7 @@ export type LauncherAutoConfigureDecision =
 export type AutoConfigureStep =
   | { kind: "show_client_setup" }
   | { kind: "apply"; clientIds: string[] }
-  | { kind: "begin_proxy_verification" };
+  | { kind: "begin_post_install" };
 
 export interface ProxyVerificationRowState {
   clientId: string;
@@ -163,7 +162,7 @@ export function getLauncherAutoConfigureDecision(
   if (installed.some((connector) => !connector.enabled)) {
     return "apply_client_setup";
   }
-  return "begin_proxy_verification";
+  return "begin_post_install";
 }
 
 /// Copy for the launcher's magic-link screen (headroom://auth). Success has no
@@ -231,23 +230,23 @@ export function nextAutoConfigureStep(
     }
     return { kind: "apply", clientIds };
   }
-  return { kind: "begin_proxy_verification" };
+  return { kind: "begin_post_install" };
 }
 
 /// Second step of the launcher's auto-configure flow: after the apply IPC
-/// resolved, decide whether to advance to proxy verification or bail back to
+/// resolved, decide whether to advance to the post-install screen or bail back to
 /// the manual setup screen. Reuses `nextAutoConfigureStep`'s decision branch
 /// since the post-apply state is just a re-evaluation of the connector probe.
 export function nextAutoConfigureStepAfterApply(
   postApplyDecision: LauncherAutoConfigureDecision
 ): AutoConfigureStep {
-  if (postApplyDecision === "begin_proxy_verification") {
-    return { kind: "begin_proxy_verification" };
+  if (postApplyDecision === "begin_post_install") {
+    return { kind: "begin_post_install" };
   }
   return { kind: "show_client_setup" };
 }
 
-/// How long an agent can go untouched before the verify screen stops asking
+/// How long an agent can go untouched before the post-install rows stop asking
 /// the user to prove it works. Long enough to cover a weekend, short enough
 /// that a tool the user has genuinely moved on from drops out.
 export const PROXY_VERIFY_IDLE_AFTER_SECONDS = 7 * 24 * 60 * 60;
@@ -257,11 +256,14 @@ export const PROXY_VERIFY_IDLE_AFTER_SECONDS = 7 * 24 * 60 * 60;
 /// so it would hold the screen in a failed-looking state forever and tell a
 /// perfectly healthy install that its setup is broken. Ages come from
 /// `get_client_local_activity_ages`; a missing entry means "never seen".
+/// Idle rows sink to the bottom so the tool the user has to act on is first
+/// (stable sort: the name order from `buildInitialProxyVerificationRows` holds
+/// within each group).
 export function markIdleProxyVerificationRows(
   rows: ProxyVerificationRowState[],
   activityAgesSeconds: Record<string, number>
 ): ProxyVerificationRowState[] {
-  return rows.map((row) => {
+  const marked: ProxyVerificationRowState[] = rows.map((row) => {
     if (row.state === "verified") {
       return row;
     }
@@ -269,44 +271,14 @@ export function markIdleProxyVerificationRows(
     const idle = age === undefined || age > PROXY_VERIFY_IDLE_AFTER_SECONDS;
     return idle === (row.state === "idle") ? row : { ...row, state: idle ? "idle" : "processing" };
   });
+  return marked.sort((a, b) => Number(a.state === "idle") - Number(b.state === "idle"));
 }
 
-/// The rows the screen is actually testing. An idle connector is shown but not
-/// counted, so one dormant tool cannot withhold the success button.
-export function testableProxyVerificationRows(
-  rows: ProxyVerificationRowState[]
-): ProxyVerificationRowState[] {
-  return rows.filter((row) => row.state !== "idle");
-}
-
-/// The "Check my setup" result when nothing is misconfigured. Which of the
-/// three cases it is decides what the user should do next, and the single
-/// frozen line it replaces told a user whose only tool was already verified to
-/// quit and reopen it - which reads as "so it still is not working" on a screen
-/// showing a green VERIFIED pill (2026-09-09).
-export function setupCheckSuccessMessage(rows: ProxyVerificationRowState[]): string {
-  const prefix = "Your configuration is correct and Headroom is running.";
-  const testable = testableProxyVerificationRows(rows);
-  if (testable.length === 0) {
-    return `${prefix} None of your tools have been used on this machine recently, so there is nothing to test. Headroom starts saving the moment you use one.`;
-  }
-  const waiting = testable.filter((row) => row.state !== "verified");
-  if (waiting.length === 0) {
-    return `${prefix} Every tool above has already reached it, so there is nothing left to do.`;
-  }
-  // Deliberately does NOT repeat "quit and reopen X": the row above each tool
-  // already says that, and the screen was printing the same instruction three
-  // times (row, this line, and the skip notice).
-  return `${prefix} Nothing is broken: no prompt from ${formatConnectorNameList(
-    waiting.map((row) => row.name)
-  )} has reached it yet.`;
-}
-
-/// What the row says while it waits. The old copy was a single frozen
-/// "Waiting for a X prompt..." that looked identical at second 0 and at hour
-/// 2, so a user with a stale terminal had no way to tell "normal" from
-/// "broken" -- and a support case (2026-09-08) sat on it for 2h42m before
-/// asking whether the product worked. It did; he needed to restart his tool.
+/// What the row says while it waits. It has to distinguish "your tool is
+/// still holding the old settings" from "you have not opened it" -- a support
+/// case (2026-09-08) sat 2h42m on a copy that could not. It does NOT count
+/// sessions: "10 sessions are running" is our vocabulary for VS Code terminal
+/// panes and only alarmed people (2026-09-10 support screenshot).
 export function proxyVerificationRowMessage(
   row: ProxyVerificationRowState,
   runningSessions: number
@@ -315,13 +287,12 @@ export function proxyVerificationRowMessage(
     return "Request received";
   }
   if (row.state === "idle") {
-    return `Not used on this machine recently, so there is nothing to test. ${row.name} is still set up.`;
+    return `Looks like you haven't used ${row.name} recently. Launch it and send it a message.`;
   }
   if (runningSessions > 0) {
-    const sessions = runningSessions === 1 ? "session is" : `sessions are`;
-    return `${runningSessions} ${sessions} running, but started before setup and still hold the old settings. Quit and reopen ${row.name}, then send it any message.`;
+    return `Quit and reopen ${row.name}, then send it a message.`;
   }
-  return `Not running yet. Open ${row.name} and send it any message.`;
+  return `Open ${row.name} and send it a message.`;
 }
 
 export function buildInitialProxyVerificationRows(
@@ -336,15 +307,4 @@ export function buildInitialProxyVerificationRows(
       state: "processing",
       message: `Waiting for a ${connector.name} prompt...`
     }));
-}
-
-/// Join connector names for the skip warning on the proxy-verify step. Up to
-/// four connectors can be enabled at once, so a plain `join(" and ")` mangles
-/// the 3+ case. `Intl.ListFormat` does this properly but needs an ES2021 lib,
-/// and one warning line is not worth raising the whole project's target.
-export function formatConnectorNameList(names: string[]): string {
-  if (names.length <= 1) {
-    return names.join("");
-  }
-  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }

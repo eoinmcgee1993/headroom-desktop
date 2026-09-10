@@ -467,21 +467,6 @@ select {
   margin-top: 10px;
 }
 
-.post-install__troubleshoot {
-  margin-top: 14px;
-  border: 0;
-  background: transparent;
-  padding: 0;
-  font-size: var(--text-sm);
-  color: var(--text-muted);
-  text-decoration: underline;
-  cursor: pointer;
-}
-
-.post-install__troubleshoot:hover {
-  color: var(--accent);
-}
-
 .post-install__actions p {
   margin: 12px 0 0;
   font-size: var(--text-sm);
@@ -587,7 +572,12 @@ select {
 }
 
 .install-progress-shell {
-  min-height: 84px;
+  /* Reserves the progress block's height so the install button doesn't jump
+     when the bar appears. Sized to what it actually needs (35px + its 14px
+     margin-top): at the old 84px the extra 34px pushed the pre-install state
+     to 547px inside the fixed 540px launcher window, which tripped
+     .intro-shell's scroll fallback and drew a scrollbar on first run. */
+  min-height: 52px;
   padding-bottom: 4px;
   display: flex;
   align-items: flex-end;

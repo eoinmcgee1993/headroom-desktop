@@ -153,11 +153,8 @@ import {
 } from "./lib/dashboardHelpers";
 import {
   buildInitialProxyVerificationRows,
-  formatConnectorNameList,
   markIdleProxyVerificationRows,
   proxyVerificationRowMessage,
-  setupCheckSuccessMessage,
-  testableProxyVerificationRows,
   type ProxyVerificationRowState,
   getClaudeConnector,
   getContactRequestValidationError,
@@ -209,7 +206,6 @@ import type {
   ClientConnectorStatus,
   UnroutedClient,
   ClientSetupResult,
-  ClientSetupVerification,
   DailySavingsPoint,
   DashboardState,
   DebugOverrides,
@@ -498,7 +494,6 @@ function reportFunnelStep(step: InstallWizardStep): void {
 // screen is captured by `signup_gate_shown`, not a launcher stage.
 const LAUNCHER_STAGE_STEP: Partial<Record<LauncherStage, InstallWizardStep>> = {
   client_setup: "client_setup_shown",
-  proxy_verify: "proxy_verify_started",
   post_install: "post_install_shown"
 };
 
@@ -520,23 +515,9 @@ const STARTER_PROMPT =
 // broken indicator. What earned its place is the starter prompt: sending one
 // real prompt is the actual gap here (10% of mature signups send exactly one
 // prompt ever), so hand over something paste-able that works in any repo.
-function FirstSavingsChecklist({ onReopenSetup }: { onReopenSetup: () => void }) {
+function StarterPrompt() {
   const [copied, setCopied] = useState(false);
-  // No traffic yet usually means it isn't reaching Headroom, not that the user
-  // hasn't acted. Offer a setup re-check, but only after a grace window:
-  // proxyReachable is false for ~1min on a healthy install while the backend
-  // binds, so an immediate prompt would nag on good installs.
-  const [showTroubleshoot, setShowTroubleshoot] = useState(false);
-  useEffect(() => {
-    const timer = window.setTimeout(() => setShowTroubleshoot(true), 20000);
-    return () => window.clearTimeout(timer);
-  }, []);
   return (
-    <div className="post-install__checklist">
-      <p>
-        Use a connected coding agent as normal and your savings appear here. No
-        project in mind? Paste this into your agent to see it work.
-      </p>
       <div className="post-install__starter">
         <code>{STARTER_PROMPT}</code>
         <button
@@ -552,16 +533,6 @@ function FirstSavingsChecklist({ onReopenSetup }: { onReopenSetup: () => void })
           {copied ? "Copied" : "Copy prompt"}
         </button>
       </div>
-      {showTroubleshoot && (
-        <button
-          type="button"
-          className="post-install__troubleshoot"
-          onClick={onReopenSetup}
-        >
-          Nothing showing up? Re-check setup.
-        </button>
-      )}
-    </div>
   );
 }
 
@@ -1652,6 +1623,9 @@ export default function App() {
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
   const [connectorsBusy, setConnectorsBusy] = useState(false);
   const [claudeInstallBusy, setClaudeInstallBusy] = useState(false);
+  // Claude Desktop on disk. It is not a client we can route (host-managed
+  // provider env), so the no-clients and no-agent copy has to say so.
+  const [claudeDesktopInstalled, setClaudeDesktopInstalled] = useState(false);
   const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">(
     () => (isConnectorTrafficVerified() ? "healthy" : "verifying")
   );
@@ -1661,20 +1635,9 @@ export default function App() {
     []
   );
   const [runningAgentCounts, setRunningAgentCounts] = useState<Record<string, number>>({});
-  // Result of the on-demand config check, or null when it has not been run.
-  const [setupCheck, setSetupCheck] = useState<
-    { busy: true } | { busy: false; ok: boolean; lines: string[] } | null
-  >(null);
   const [proxyVerificationHint, setProxyVerificationHint] = useState<
     { text: string; tone: "info" | "error" } | null
   >(null);
-  // Leaving the verify step unverified takes two clicks: the first arms the
-  // warning, the second leaves. 86% of installs used to click straight past
-  // this screen (median 26s, 45% under 15s) and the ones that did went on to
-  // send a first prompt 59% of the time vs 76% for the ones that waited -- the
-  // single biggest activation leak in onboarding, and invisible in support
-  // reports because nothing errors.
-  const [proxyVerifySkipArmed, setProxyVerifySkipArmed] = useState(false);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   // Fresh install (no runtime on disk yet). Drives the onboarding email-harvest
@@ -1685,7 +1648,7 @@ export default function App() {
   // Verify against the always-up 6767 intercept (which counts passthrough
   // traffic) instead of the backend whenever the backend won't be optimizing:
   // pre-install, or when the pricing gate has bypassed it (e.g. ended trial).
-  // Otherwise proxy_verify waits forever on a backend that never comes up.
+  // Otherwise the post-install rows wait forever on a backend that never comes up.
   const interceptOnlyVerify =
     paywallFirstFlow || runtimeStatus?.bypassed === true;
   const [resuming, setResuming] = useState(false);
@@ -1940,6 +1903,16 @@ export default function App() {
     dashboard.launchExperience === "first_run" &&
     dashboard.lifetimeEstimatedTokensSaved <= 0 &&
     dashboard.lifetimeEstimatedSavingsUsd <= 0;
+  // Savings on record are not proof the user has done anything: an already
+  // open Claude Code session sends small non-prompt calls, and one of those
+  // put $0.01 on a clean VM before any prompt was typed, flipping this screen
+  // to "your first savings are in" under rows still saying "restart"
+  // (2026-09-10). While restart rows exist, a row turning verified is the
+  // signal that the user's own tool came through.
+  const awaitingFirstPrompt =
+    awaitingFirstSavings ||
+    (proxyVerificationRows.length > 0 &&
+      !proxyVerificationRows.some((row) => row.state === "verified"));
   // Independent of launchExperience: any savings on record at all, which is
   // what retires the setup-stall watchdog below.
   const forcedSetupStall = debugOverrides?.setupStall ?? null;
@@ -2455,7 +2428,7 @@ export default function App() {
   }, [windowLabel, launcherStage, pricingStatus?.account?.subscriptionActive]);
 
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+    if (windowLabel !== "launcher" || launcherStage !== "post_install") {
       return;
     }
 
@@ -2541,12 +2514,12 @@ export default function App() {
     };
   }, [windowLabel, launcherStage, interceptOnlyVerify]);
 
-  // Live agent processes for the verify screen's restart callout: sessions
+  // Live agent processes for the post-install restart rows: sessions
   // started before setup keep their pre-Headroom environment, and naming them
   // turns "restart each tool" from generic advice into a concrete instruction.
   // One ps/tasklist spawn per poll, so only while this stage is showing.
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+    if (windowLabel !== "launcher" || launcherStage !== "post_install") {
       return;
     }
     let active = true;
@@ -2572,7 +2545,7 @@ export default function App() {
   // entries, and an agent that starts being used mid-screen announces itself by
   // producing traffic, which flips the row regardless of its idle mark.
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+    if (windowLabel !== "launcher" || launcherStage !== "post_install") {
       return;
     }
     let active = true;
@@ -2598,6 +2571,9 @@ export default function App() {
   useEffect(() => {
     if (windowLabel !== "launcher") return;
     void invoke("prefetch_bootstrap_artifacts").catch(() => {});
+    void invoke<boolean>("claude_desktop_installed")
+      .then(setClaudeDesktopInstalled)
+      .catch(() => {});
   }, [windowLabel]);
 
   // One beacon per launcher stage the user reaches. Single source for the
@@ -2624,7 +2600,7 @@ export default function App() {
 
   // proxy_verified: every enabled client's test traffic reached the proxy.
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") return;
+    if (windowLabel !== "launcher" || launcherStage !== "post_install") return;
     if (
       proxyVerificationRows.length > 0 &&
       proxyVerificationRows.every((row) => row.state === "verified")
@@ -2636,16 +2612,6 @@ export default function App() {
       reportFunnelStep("proxy_verified");
     }
   }, [windowLabel, launcherStage, proxyVerificationRows]);
-
-  // A connector checking in invalidates the armed skip warning: it was written
-  // against the old unverified set and reads as "we still see nothing" even
-  // after the user did exactly what it asked. Re-arm on the next Skip click.
-  const proxyVerifiedCount = proxyVerificationRows.filter(
-    (row) => row.state === "verified"
-  ).length;
-  useEffect(() => {
-    if (proxyVerifiedCount > 0) setProxyVerifySkipArmed(false);
-  }, [proxyVerifiedCount]);
 
   useEffect(() => {
     if (!showInstallProgress) {
@@ -2680,7 +2646,7 @@ export default function App() {
   }, [isLastScreen]);
 
   useEffect(() => {
-    if (!isLastScreen || awaitingFirstSavings) return;
+    if (!isLastScreen || awaitingFirstPrompt) return;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
@@ -2690,7 +2656,7 @@ export default function App() {
         unlisten = fn;
       });
     return () => unlisten?.();
-  }, [isLastScreen, awaitingFirstSavings]);
+  }, [isLastScreen, awaitingFirstPrompt]);
 
   const optimizationBlocked = pricingStatus
     ? pricingStatus.needsAuthentication || !pricingStatus.optimizationAllowed
@@ -4151,13 +4117,13 @@ export default function App() {
         const postApplyStep = nextAutoConfigureStepAfterApply(
           getLauncherAutoConfigureDecision(latestConnectors)
         );
-        if (postApplyStep.kind !== "begin_proxy_verification") {
+        if (postApplyStep.kind !== "begin_post_install") {
           setLauncherStage("client_setup");
           return;
         }
       }
 
-      await beginProxyVerificationStep();
+      await beginPostInstallStep();
     } catch (error) {
       setConnectorsError(
         describeInvokeError(error, "Could not configure your coding tools automatically.")
@@ -4781,7 +4747,7 @@ export default function App() {
     }
   }
 
-  async function beginProxyVerificationStep() {
+  async function beginPostInstallStep() {
     let fresh = connectors;
     try {
       fresh = await fetchConnectors();
@@ -4790,9 +4756,8 @@ export default function App() {
       // fall back to cached state
     }
 
-    setLauncherStage("proxy_verify");
+    setLauncherStage("post_install");
     setProxyVerificationHint(null);
-    setProxyVerifySkipArmed(false);
     setProxyVerificationRows(buildInitialProxyVerificationRows(fresh));
     // Reset to null so the polling effect re-anchors on its first reachable
     // /stats reading. Setting it here would risk anchoring on a stale value
@@ -4868,18 +4833,6 @@ export default function App() {
 
   const headroomTool = dashboard.tools.find((tool) => tool.id === "headroom");
   const headroomVersion = headroomTool?.version ?? "Unknown";
-  const lifetimeTotalTokensSent = dashboard.dailySavings.reduce(
-    (sum, point) => sum + point.totalTokensSent,
-    0
-  );
-  const lifetimeTotalTokensBeforeOptimization =
-    lifetimeTotalTokensSent + dashboard.lifetimeEstimatedTokensSaved;
-  const headroomLifetimeSavingsPct =
-    lifetimeTotalTokensBeforeOptimization > 0
-      ? (dashboard.lifetimeEstimatedTokensSaved /
-          lifetimeTotalTokensBeforeOptimization) *
-        100
-      : null;
   // Paired context for the savings headline. The headline rate dilutes as the
   // client's prompt caching improves, because cache reads sit in its
   // denominator while compression deliberately never touches the cached
@@ -4892,11 +4845,18 @@ export default function App() {
   // feeds it the lifetime breakdown as a single synthetic bucket;
   // cacheReadTokens is used only as an existence signal for coverage, never
   // ratioed against our own token counts.
+  //
+  // The numerator is compression ALONE, not lifetimeEstimatedSavingsUsd. That
+  // three-layer total also carries output shaping and tool-schema deferral,
+  // neither of which removes input, so pairing it with an input-cost
+  // denominator made all-time read above the two rows beside it (measured
+  // 2026-09-10: 17.0% against 11.6% this month, 2.2pp of the gap being the
+  // extra layers rather than better compression). Same layer as the windowed
+  // rows now, so the three are comparable.
   const cachePairAllTime = allTimeCacheHitPair(
     dashboard.savingsBreakdown,
-    dashboard.lifetimeEstimatedSavingsUsd
+    dashboard.savingsBreakdown?.compressionSavingsUsd ?? 0
   );
-  const compressionOfRestPct = cachePairAllTime?.compressedPct ?? null;
   // Same pair for the shorter windows, from the buckets that carry cache
   // coverage (backend history checkpoints; local-tracker buckets and days
   // aged out of retention are excluded from both rates). The all-time row
@@ -5529,11 +5489,19 @@ export default function App() {
         >
           <div className="post-install__lead">
             <h1>Install a coding agent first</h1>
-            <p>
-              Headroom saves tokens by routing an AI coding tool you already use
-              through its local proxy, and no supported tool was found on this
-              machine. Install Claude Code, sign in, then check again.
-            </p>
+            {claudeDesktopInstalled ? (
+              <p className="install-progress__notice">
+                <strong>You have the Claude Desktop app, but Headroom cannot work with it.</strong>{" "}
+                Due to design decisions by Anthropic, we are unable to apply our compression logic.
+                Instead, please use Claude Code in your terminal or in VS Code.
+              </p>
+            ) : (
+              <p>
+                Headroom saves tokens by routing an AI coding tool you already use
+                through its local proxy, and no supported tool was found on this
+                machine. Install Claude Code or ChatGPT Codex, sign in and then check again.
+              </p>
+            )}
             <div className="install-prompt" role="status">
               <header className="install-prompt__head">
                 <span className="install-prompt__icon" aria-hidden="true">
@@ -5580,10 +5548,12 @@ export default function App() {
               Also works with ChatGPT Codex, OpenCode, and Grok. Install any of
               them, then check again.
             </p>
-            <p>
-              Note: unfortunately Headroom does not work with the Claude Desktop
-              app due to design decisions by Anthropic.
-            </p>
+            {claudeDesktopInstalled ? null : (
+              <p>
+                Note: unfortunately Headroom does not work with the Claude Desktop
+                app due to design decisions by Anthropic.
+              </p>
+            )}
             {connectorsError ? (
               <p className="install-progress__error">{connectorsError}</p>
             ) : null}
@@ -5605,7 +5575,7 @@ export default function App() {
               className="secondary-button"
               disabled={connectorsBusy}
               onClick={() => {
-                void beginProxyVerificationStep();
+                void beginPostInstallStep();
               }}
               type="button"
             >
@@ -5798,243 +5768,12 @@ export default function App() {
             className="primary-button primary-button--large primary-button--success"
             disabled={connectorsBusy || (requireSelection && enabledConnectorCount === 0)}
             onClick={() => {
-              void beginProxyVerificationStep();
+              void beginPostInstallStep();
             }}
             type="button"
           >
             Continue
           </button>
-        </div>
-      </LauncherShell>
-    );
-  }
-
-  if (
-    windowLabel === "launcher" && launcherStage === "proxy_verify"
-  ) {
-    const hasEnabledApps = proxyVerificationRows.length > 0;
-    // A dormant tool is displayed but not tested: it can never turn green, and
-    // counting it withholds the success button from a healthy install forever.
-    const testableRows = testableProxyVerificationRows(proxyVerificationRows);
-    const allIdle = hasEnabledApps && testableRows.length === 0;
-    const allVerified = testableRows.length > 0 && testableRows.every((row) => row.state === "verified");
-    const anyVerified = proxyVerificationRows.some((row) => row.state === "verified");
-    // Answers "is it broken, or am I just waiting?" without the user having to
-    // guess. Reads config off disk plus proxy reachability -- the same check
-    // `repair_client_setups` already trusts hourly -- so a pass is real
-    // evidence that the only thing left to do is restart the tool.
-    const runSetupCheck = async () => {
-      setSetupCheck({ busy: true });
-      const targets = testableRows.length > 0 ? testableRows : proxyVerificationRows;
-      const results = await Promise.all(
-        targets.map((row) =>
-          invoke<ClientSetupVerification>("verify_client_setup", { clientId: row.clientId })
-            .then((verification) => ({ row, verification }))
-            .catch(() => ({ row, verification: null }))
-        )
-      );
-      const unreadable = results.filter((result) => result.verification === null);
-      const failures = results.flatMap(({ row, verification }) =>
-        verification && !verification.verified
-          ? verification.failures.map((failure) => `${row.name}: ${failure}`)
-          : []
-      );
-      if (unreadable.length > 0) {
-        setSetupCheck({
-          busy: false,
-          ok: false,
-          lines: [
-            `Could not read the setup for ${formatConnectorNameList(
-              unreadable.map(({ row }) => row.name)
-            )}.`
-          ]
-        });
-      } else if (failures.length > 0) {
-        setSetupCheck({ busy: false, ok: false, lines: failures });
-      } else if (!results.some(({ verification }) => verification?.proxyReachable)) {
-        setSetupCheck({
-          busy: false,
-          ok: false,
-          lines: [
-            "Your tools are pointed at Headroom, but the proxy is not answering on 127.0.0.1:6767 yet. Give it a few seconds and check again."
-          ]
-        });
-      } else {
-        setSetupCheck({
-          busy: false,
-          ok: true,
-          lines: [setupCheckSuccessMessage(proxyVerificationRows)]
-        });
-      }
-    };
-    const finishSetup = () => {
-      void invoke("complete_setup_wizard");
-      setLauncherStage("post_install");
-    };
-
-    return (
-      <LauncherShell
-        shellClassName="intro-shell intro-shell--post-install"
-        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
-        copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
-        version={appSemver}
-      >
-        <div className="post-install__lead">
-          <h1>Test your setup</h1>
-          <p>
-            Restart each tool below, then send it any message to test its connection with Headroom. 
-            "Say hi" is enough. If restarting doesn't work, contact{" "}
-            <button
-              className="install-progress__notice-link"
-              onClick={() =>
-                void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
-              type="button"
-            >
-              support@extraheadroom.com
-            </button>{" "}
-            for help.
-          </p>
-          {hasEnabledApps ? (
-            <div className="connector-list">
-              {proxyVerificationRows.map((row) => (
-                <article className="connector-item" key={row.clientId}>
-                  <div>
-                    <h3>
-                      <span className="client-logo" aria-hidden="true">
-                        {renderConnectorLogo(row.clientId)}
-                      </span>
-                      {row.name}
-                    </h3>
-                    <div className="proxy-verify-item__message">
-                      <span>
-                        {proxyVerificationRowMessage(row, runningAgentCounts[row.clientId] ?? 0)}
-                      </span>
-                      {row.state === "verified" ? (
-                        <span className="proxy-verified-pill">verified</span>
-                      ) : null}
-                    </div>
-                  </div>
-                </article>
-              ))}
-            </div>
-          ) : (
-            <p className="launcher-restart-hint">
-              No tools are enabled yet. Go back to the previous step to enable one.
-            </p>
-          )}
-          {hasEnabledApps ? (
-            <p className="launcher-restart-hint">
-              <button
-                className="secondary-button"
-                disabled={setupCheck?.busy === true}
-                onClick={() => void runSetupCheck()}
-                type="button"
-              >
-                {setupCheck?.busy ? "Checking..." : "Check my setup"}
-              </button>
-            </p>
-          ) : null}
-          {setupCheck && !setupCheck.busy ? (
-            <p className={setupCheck.ok ? "launcher-restart-hint" : "install-progress__error"}>
-              {setupCheck.lines.join(" ")}
-            </p>
-          ) : null}
-          {proxyVerificationHint ? (
-            <p
-              className={
-                proxyVerificationHint.tone === "error"
-                  ? "install-progress__error"
-                  : "launcher-restart-hint"
-              }
-            >
-              {proxyVerificationHint.text}
-            </p>
-          ) : null}
-          {!allVerified && proxyVerifySkipArmed ? (
-            <p className="install-progress__notice">
-              {allIdle
-                ? "None of your connected tools have been used on this machine recently, so there is nothing to test right now. Headroom is set up and starts saving the moment you use one."
-                : hasEnabledApps
-                  ? // The row for each tool and the setup-check result both
-                    // already say what is pending and what to do about it, so
-                    // this one only has to answer "is skipping safe?".
-                    "You can continue either way: Headroom starts saving as soon as it sees traffic."
-                  : "Headroom has nothing to optimize until a coding agent is connected. Install Claude Code or Codex, then connect it here or later from within the app."}
-              <br />
-              <br />
-              <strong>Note:</strong> Headroom does not work with the Claude Desktop app due to
-              design decisions by Anthropic. You need to use Claude Code{" "}
-              <button
-                className="install-progress__notice-link"
-                onClick={() =>
-                  void invoke("open_external_link", {
-                    url: "https://code.claude.com/docs/en/quickstart#step-1-install-claude-code"
-                  })}
-                type="button"
-              >
-                in the CLI
-              </button>{" "}
-              or{" "}
-              <button
-                className="install-progress__notice-link"
-                onClick={() =>
-                  void invoke("open_external_link", {
-                    url: "https://code.claude.com/docs/en/overview#vs-code"
-                  })}
-                type="button"
-              >
-                in VS Code
-              </button>
-            </p>
-          ) : null}
-        </div>
-        <div className="post-install__actions">
-          <button
-            className="secondary-button post-install__reopen-setup"
-            onClick={() => {
-              setLauncherStage("client_setup");
-            }}
-            type="button"
-          >
-            Back
-          </button>
-          {allVerified ? (
-            <button
-              className="primary-button primary-button--large primary-button--success"
-              onClick={finishSetup}
-              type="button"
-            >
-              Continue
-            </button>
-          ) : anyVerified ? (
-            // At least one connector is proven working, so continuing is a
-            // legitimate path - no skip-arming friction needed.
-            <button
-              className="primary-button primary-button--large"
-              onClick={finishSetup}
-              type="button"
-            >
-              Continue
-            </button>
-          ) : (
-            // Deliberately not a primary button: leaving without a single
-            // verified connector is the path that ends in "Headroom didn't
-            // work", so it should not look like the happy path.
-            <button
-              className="secondary-button"
-              onClick={() => {
-                if (proxyVerifySkipArmed) {
-                  finishSetup();
-                  return;
-                }
-                setProxyVerifySkipArmed(true);
-              }}
-              type="button"
-            >
-              {proxyVerifySkipArmed ? "Skip anyway" : "Skip for now"}
-            </button>
-          )}
         </div>
       </LauncherShell>
     );
@@ -6186,12 +5925,55 @@ export default function App() {
   if (
     windowLabel === "launcher" && launcherStage === "post_install"
   ) {
+    // Rows exist only when the user just came through client setup (fresh
+    // entries from an upgrade start empty). Shown whether or not savings
+    // already exist: a re-run after a first prompt still has tools holding
+    // pre-setup settings.
+    // "Skip for now" on the no-clients screen lands here with nothing
+    // connected; the restart-and-paste instructions would be a lie.
+    // An EMPTY list means "not probed yet", not "no agent": `connectors` starts
+    // empty and `beginPostInstallStep` falls back to it when `fetchConnectors`
+    // throws, so one transient IPC error would otherwise tell a correctly
+    // configured machine it has no coding agent. Claiming that needs evidence.
+    const hasConnectedAgent =
+      connectors.length === 0 ||
+      aggregateClientConnectors(connectors).some(
+        (connector) => connector.enabled && connector.installed
+      );
+    const restartRows =
+      proxyVerificationRows.length > 0 ? (
+        <div className="connector-list">
+          {proxyVerificationRows.map((row) => (
+            <article className="connector-item" key={row.clientId}>
+              <div>
+                <h3>
+                  <span className="client-logo" aria-hidden="true">
+                    {renderConnectorLogo(row.clientId)}
+                  </span>
+                  {row.name}
+                </h3>
+                <div className="proxy-verify-item__message">
+                  <span>
+                    {proxyVerificationRowMessage(
+                      row,
+                      runningAgentCounts[row.clientId] ?? 0
+                    )}
+                  </span>
+                  {row.state === "verified" ? (
+                    <span className="proxy-verified-pill">verified</span>
+                  ) : null}
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : null;
     // The tray's 5s dashboard poll keeps running under the launcher window,
     // so a first-run user who sends a prompt sees this screen flip from
     // "waiting" to their first real savings without any interaction — the
     // payoff moment stays inside onboarding instead of being deferred to a
     // later session that a third of signups never have. While waiting,
-    // blur-autohide is disarmed (see awaitingFirstSavings above).
+    // blur-autohide is disarmed (see awaitingFirstPrompt above).
     return (
       <LauncherShell
         shellClassName="intro-shell intro-shell--post-install"
@@ -6201,20 +5983,44 @@ export default function App() {
         version={appSemver}
       >
         <div className="post-install__lead">
-          <h1>
-            Headroom is now running
-            <br />
-            in the background
-          </h1>
-          {awaitingFirstSavings ? (
-            <FirstSavingsChecklist
-              onReopenSetup={() => setLauncherStage("client_setup")}
-            />
+          <h1>Headroom is now running</h1>
+          {awaitingFirstPrompt && !hasConnectedAgent ? (
+            <div className="post-install__checklist">
+              <p>
+                No coding agent is connected yet, so Headroom has nothing to optimize.
+                Install Claude Code or Codex, then connect it from the Back button here or
+                later from the Headroom window.
+                {claudeDesktopInstalled
+                  ? " The Claude Desktop app does not count: Anthropic pins its built-in Claude Code to its own servers, so Headroom cannot route it."
+                  : ""}
+              </p>
+            </div>
+          ) : awaitingFirstPrompt ? (
+            <div className="post-install__checklist">
+              <p>
+                In order to start using Headroom you first need to restart your AI Agents.
+                Then ask them to "Say hi" or paste the prompt below to see savings appear.
+              </p>
+              {restartRows}
+              <StarterPrompt />
+              {proxyVerificationHint ? (
+                <p
+                  className={
+                    proxyVerificationHint.tone === "error"
+                      ? "install-progress__error"
+                      : "launcher-restart-hint"
+                  }
+                >
+                  {proxyVerificationHint.text}
+                </p>
+              ) : null}
+            </div>
           ) : (
             <>
+              {restartRows}
               <p>
                 {dashboard.launchExperience === "first_run"
-                  ? "That prompt went through Headroom — your first savings are in."
+                  ? "That prompt went through Headroom. Your first savings are in."
                   : "It will trim prompt bloat whenever you use a connected coding agent."}
               </p>
               <div className="post-install__metrics">
@@ -6244,7 +6050,7 @@ export default function App() {
           <button
             className="secondary-button post-install__reopen-setup"
             onClick={() => {
-              void beginProxyVerificationStep();
+              setLauncherStage("client_setup");
             }}
             type="button"
           >
@@ -8219,13 +8025,6 @@ export default function App() {
                   <div className="runtime-status__meta">
                     <span className="runtime-status__section-title">
                       Headroom CLI ({headroomVersion})
-                      {(compressionOfRestPct ?? headroomLifetimeSavingsPct) !== null ? (
-                        <span className="runtime-status__section-context">
-                          {" "}
-                          ({percent1((compressionOfRestPct ?? headroomLifetimeSavingsPct)!)}% of
-                          billable input removed all-time)
-                        </span>
-                      ) : null}
                     </span>
                   </div>
                   <div className="runtime-status__grid runtime-status__grid--4">
