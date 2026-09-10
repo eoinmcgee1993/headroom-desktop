@@ -3708,6 +3708,7 @@ fn fetch_remote_account(
 }
 
 fn http_client() -> Result<Client, String> {
+    // proxy-ok: extraheadroom.com account/pricing API, not loopback
     Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()

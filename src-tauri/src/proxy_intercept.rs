@@ -2379,6 +2379,7 @@ fn fetch_codex_usage_snapshot(
     account_id: &str,
     user_agent: &str,
 ) -> Option<CodexRateLimitSnapshot> {
+    // proxy-ok: api.openai.com auth probe, not loopback
     let client = reqwest::blocking::Client::builder()
         .timeout(CODEX_USAGE_POLL_TIMEOUT)
         .build()

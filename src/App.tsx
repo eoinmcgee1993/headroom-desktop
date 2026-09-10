@@ -5481,16 +5481,15 @@ export default function App() {
             <h1>Install a coding agent first</h1>
             {claudeDesktopInstalled ? (
               <p className="install-progress__notice">
-                <strong>The Claude Desktop app was found, but Headroom cannot work with it.</strong>{" "}
-                Anthropic pins the Claude Code built into the desktop app to its own servers,
-                so nothing Headroom configures reaches it. Claude Code in your terminal or in
-                VS Code runs on the same subscription and works fully. Install it below.
+                <strong>You have the Claude Desktop app, but Headroom cannot work with it.</strong>{" "}
+                Due to design decision by Anthropic, we are unable to inject our compression logic.
+                Instead, please use Claude Code in your terminal or in VS Code
               </p>
             ) : (
               <p>
                 Headroom saves tokens by routing an AI coding tool you already use
                 through its local proxy, and no supported tool was found on this
-                machine. Install Claude Code, sign in, then check again.
+                machine. Install Claude Code or ChatGPT Codex, sign in and then check again.
               </p>
             )}
             <div className="install-prompt" role="status">

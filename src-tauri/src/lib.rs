@@ -2648,6 +2648,7 @@ pub(crate) fn build_watchdog_give_up_report(
 fn probe_backend_readyz_with_body(timeout: std::time::Duration) -> (String, Option<String>) {
     let port = crate::backend_port::get();
     let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(timeout)
         .build()
     {
@@ -3553,6 +3554,7 @@ fn stats_client() -> Option<&'static reqwest::blocking::Client> {
     CLIENT
         .get_or_init(|| {
             reqwest::blocking::Client::builder()
+                .no_proxy()
                 .timeout(std::time::Duration::from_millis(500))
                 .build()
                 .ok()
@@ -4920,6 +4922,7 @@ async fn submit_contact_request(
     let target = validate_contact_request_url(&url)
         .ok_or_else(|| "Could not reach the contact form.".to_string())?;
 
+    // proxy-ok: contact form posts to extraheadroom.com, not loopback
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -6938,6 +6941,7 @@ fn fetch_transformations_feed_from(
     limit: u32,
 ) -> Result<TransformationFeedResponse, String> {
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
         .build()
         .map_err(|err| err.to_string())?;
@@ -11497,6 +11501,80 @@ Some unrelated content.
         assert_eq!(auto_resume_backoff(2), Duration::from_secs(120));
         assert_eq!(auto_resume_backoff(3), Duration::from_secs(300));
         assert_eq!(auto_resume_backoff(50), Duration::from_secs(300));
+    }
+
+    /// Every reqwest client must decide, explicitly, whether it honors the
+    /// user's system proxy. reqwest 0.12 delegates proxy discovery to
+    /// hyper-util, which has no loopback exemption anywhere:
+    ///
+    /// - Windows reads HKCU `Internet Settings\ProxyServer` and applies it to
+    ///   http AND https, taking its bypass list only from `ProxyOverride`.
+    ///   WinINET's `<local>` token is copied through as a literal string that
+    ///   can never match `127.0.0.1`, so even a correctly configured corporate
+    ///   proxy fails to exempt loopback.
+    /// - macOS reads `HTTPProxy`/`HTTPSProxy` and ignores `ExceptionsList` and
+    ///   `ExcludeSimpleHostnames` entirely, so the user's own bypass list is
+    ///   not consulted at all.
+    ///
+    /// A user with any system proxy enabled therefore has our /readyz, /livez,
+    /// /stats and feed polls sent to that proxy, and a healthy backend reads as
+    /// unreachable. That is the same class as the v2rayN `socks4://` crashes
+    /// (RUST-9F/9T/AT/AS/AY/B3/B5), which only ever got fixed for the backend
+    /// child's env, not for our own HTTP calls.
+    ///
+    /// So: a client that talks to loopback calls `.no_proxy()`. A client that
+    /// talks to the internet must keep honoring the proxy (corporate networks
+    /// need it) and says so with a `// proxy-ok:` comment above the builder.
+    /// Adding a client without either is the regression this guards.
+    #[test]
+    fn every_reqwest_client_decides_about_the_system_proxy() {
+        // Split so this needle does not match its own source line.
+        let needle = concat!("Client::", "builder()");
+        let sources = [
+            ("analytics.rs", include_str!("analytics.rs")),
+            ("client_adapters.rs", include_str!("client_adapters.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+            ("pricing.rs", include_str!("pricing.rs")),
+            ("proxy_intercept.rs", include_str!("proxy_intercept.rs")),
+            ("state.rs", include_str!("state.rs")),
+            ("tool_manager.rs", include_str!("tool_manager.rs")),
+        ];
+
+        let mut undecided = Vec::new();
+        let mut decided = 0usize;
+        for (name, source) in sources {
+            let lines: Vec<&str> = source.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                // The builder chain runs to its `.build()`; 40 lines is well
+                // clear of the longest one (the asset downloader, at 5).
+                let end = (i..lines.len().min(i + 40))
+                    .find(|&j| lines[j].contains(".build()"))
+                    .unwrap_or(i);
+                let chain = lines[i..=end].join("\n");
+                let marked = i > 0 && lines[i - 1].contains("proxy-ok:");
+                if chain.contains(".no_proxy()") || marked {
+                    decided += 1;
+                } else {
+                    undecided.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+
+        assert!(
+            undecided.is_empty(),
+            "reqwest client(s) with no system-proxy decision: {undecided:?}. \
+             Add .no_proxy() if it talks to 127.0.0.1, or a `// proxy-ok: <why>` \
+             comment above the builder if it must honor the user's proxy."
+        );
+        // Tripwire against the scan silently matching nothing (a rename of the
+        // builder API, or the include_str! paths drifting).
+        assert!(
+            decided >= 15,
+            "expected to find the known reqwest clients, found only {decided}"
+        );
     }
 
     /// Ordering guard for the give-up path. `capture_watchdog_give_up`

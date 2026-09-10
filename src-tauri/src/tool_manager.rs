@@ -8709,6 +8709,7 @@ const SERENA_DASHBOARD_PORT_SCAN: u16 = 4;
 /// output_tokens}}}`; empty stats yield Some(0), no/invalid responder None.
 fn fetch_serena_output_tokens(base_url: &str) -> Option<u64> {
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_millis(300))
         .build()
         .ok()?;
@@ -9599,6 +9600,7 @@ fn find_listener_command(port: u16) -> String {
 /// in time and a healthy one answers in milliseconds.
 pub(crate) fn probe_backend_readyz_ok(port: u16) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_millis(800))
         .build()
     else {
@@ -10925,6 +10927,7 @@ where
         }
     }
 
+    // proxy-ok: downloads wheels/assets from the public internet
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("headroom-desktop/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(30))

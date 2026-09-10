@@ -329,6 +329,7 @@ fn build_http_client(config: &AnalyticsConfig) -> Client {
     headers.insert("App-Key", app_key_header);
     headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
+    // proxy-ok: analytics ingest is a public endpoint; a corporate proxy must be honored
     Client::builder()
         .timeout(Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
         .default_headers(headers)

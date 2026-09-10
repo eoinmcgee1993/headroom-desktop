@@ -1626,6 +1626,7 @@ impl AppState {
         // large Claude request (tokenization, ONNX inference, etc). The
         // previous 1.5s timeout false-fired during those bursts.
         let client = match reqwest::blocking::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()
         {
@@ -6538,6 +6539,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     // fetch that still times out means the backend is genuinely starved.
     const STATS_FETCH_TIMEOUT_SECS: u64 = 15;
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
         .build()
         .ok()?;
@@ -6597,6 +6599,7 @@ fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
     }
 
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_millis(500))
         .build()
         .ok()?;
@@ -8130,6 +8133,7 @@ fn runtime_already_serving(
 
 fn probe_proxy_readyz(timeout: Duration) -> bool {
     let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(timeout)
         .build()
     {
