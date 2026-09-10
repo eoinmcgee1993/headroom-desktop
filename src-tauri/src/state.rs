@@ -4059,7 +4059,7 @@ pub(crate) fn current_platform_support_tier() -> &'static str {
 
 pub(crate) fn support_tier_for_platform(os: &str) -> &'static str {
     match os {
-        "linux" | "windows" => "experimental",
+        "linux" => "experimental",
         _ => "stable",
     }
 }
@@ -14569,9 +14569,9 @@ mod tests {
     }
 
     #[test]
-    fn support_tier_for_platform_marks_windows_experimental() {
+    fn support_tier_for_platform_marks_linux_experimental() {
         assert_eq!(support_tier_for_platform("linux"), "experimental");
-        assert_eq!(support_tier_for_platform("windows"), "experimental");
+        assert_eq!(support_tier_for_platform("windows"), "stable");
         assert_eq!(support_tier_for_platform("macos"), "stable");
     }
 }

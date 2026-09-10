@@ -13,8 +13,8 @@ describe("platformPreviewNoticeFor", () => {
     expect(platformPreviewNoticeFor("linux", "experimental")).toContain("Linux");
   });
 
-  it("returns the windows message for experimental windows", () => {
-    expect(platformPreviewNoticeFor("windows", "experimental")).toContain("Windows");
+  it("returns null for windows, which is no longer a preview platform", () => {
+    expect(platformPreviewNoticeFor("windows", "stable")).toBeNull();
   });
 
   it("returns the generic message for other experimental platforms", () => {
