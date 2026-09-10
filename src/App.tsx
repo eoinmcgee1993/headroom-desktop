@@ -1903,6 +1903,16 @@ export default function App() {
     dashboard.launchExperience === "first_run" &&
     dashboard.lifetimeEstimatedTokensSaved <= 0 &&
     dashboard.lifetimeEstimatedSavingsUsd <= 0;
+  // Savings on record are not proof the user has done anything: an already
+  // open Claude Code session sends small non-prompt calls, and one of those
+  // put $0.01 on a clean VM before any prompt was typed, flipping this screen
+  // to "your first savings are in" under rows still saying "restart"
+  // (2026-09-10). While restart rows exist, a row turning verified is the
+  // signal that the user's own tool came through.
+  const awaitingFirstPrompt =
+    awaitingFirstSavings ||
+    (proxyVerificationRows.length > 0 &&
+      !proxyVerificationRows.some((row) => row.state === "verified"));
   // Independent of launchExperience: any savings on record at all, which is
   // what retires the setup-stall watchdog below.
   const forcedSetupStall = debugOverrides?.setupStall ?? null;
@@ -2636,7 +2646,7 @@ export default function App() {
   }, [isLastScreen]);
 
   useEffect(() => {
-    if (!isLastScreen || awaitingFirstSavings) return;
+    if (!isLastScreen || awaitingFirstPrompt) return;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
@@ -2646,7 +2656,7 @@ export default function App() {
         unlisten = fn;
       });
     return () => unlisten?.();
-  }, [isLastScreen, awaitingFirstSavings]);
+  }, [isLastScreen, awaitingFirstPrompt]);
 
   const optimizationBlocked = pricingStatus
     ? pricingStatus.needsAuthentication || !pricingStatus.optimizationAllowed
@@ -5957,7 +5967,7 @@ export default function App() {
     // "waiting" to their first real savings without any interaction — the
     // payoff moment stays inside onboarding instead of being deferred to a
     // later session that a third of signups never have. While waiting,
-    // blur-autohide is disarmed (see awaitingFirstSavings above).
+    // blur-autohide is disarmed (see awaitingFirstPrompt above).
     return (
       <LauncherShell
         shellClassName="intro-shell intro-shell--post-install"
@@ -5968,7 +5978,7 @@ export default function App() {
       >
         <div className="post-install__lead">
           <h1>Headroom is now running</h1>
-          {awaitingFirstSavings && !hasConnectedAgent ? (
+          {awaitingFirstPrompt && !hasConnectedAgent ? (
             <div className="post-install__checklist">
               <p>
                 No coding agent is connected yet, so Headroom has nothing to optimize.
@@ -5979,7 +5989,7 @@ export default function App() {
                   : ""}
               </p>
             </div>
-          ) : awaitingFirstSavings ? (
+          ) : awaitingFirstPrompt ? (
             <div className="post-install__checklist">
               <p>
                 In order to start using Headroom you first need to restart your AI Agents.
@@ -6004,7 +6014,7 @@ export default function App() {
               {restartRows}
               <p>
                 {dashboard.launchExperience === "first_run"
-                  ? "That prompt went through Headroom — your first savings are in."
+                  ? "That prompt went through Headroom. Your first savings are in."
                   : "It will trim prompt bloat whenever you use a connected coding agent."}
               </p>
               <div className="post-install__metrics">
