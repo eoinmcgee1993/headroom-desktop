@@ -3434,6 +3434,7 @@ fn last_codex_retag_at() -> Option<SystemTime> {
 fn retag_codex_thread_providers(from: &str, to: &str) {
     let mut found_thread_store = false;
     let mut unreadable = 0usize;
+    let mut skip_reasons: Vec<String> = Vec::new();
     for path in discover_codex_state_dbs() {
         match retag_one_codex_db(&path, from, to) {
             // No `threads` table: unrelated sqlite store (logs/goals/memories).
@@ -3457,9 +3458,11 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
                     "codex retag {from}->{to} skipped for {}: {e}",
                     path.display()
                 );
+                skip_reasons.push(e.to_string());
             }
         }
     }
+    report_codex_retag_skips(&skip_reasons);
     *LAST_CODEX_RETAG.lock().unwrap() = Some(SystemTime::now());
     // A `state_*.sqlite`-shaped file with no `threads` table means Codex renamed
     // the table itself (discovery already survives a file rename). Only flag when
@@ -3486,6 +3489,60 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
             );
         }
     }
+}
+
+/// One Sentry event per retag PASS, not one per file.
+///
+/// The per-file warn names the DB, so the log bridge grouped it by filename: a
+/// running Codex holding three of its own sqlite files opened three issues in
+/// the same second for one condition (RUST-EK, RUST-EM, RUST-EN). The bridged
+/// twin is dropped in logging.rs and the reasons ride along as an extra.
+///
+/// The environmental causes stay dropped (a DB the user's disk corrupted is
+/// not ours to fix, RUST-95/96), but a real one anywhere in the pass still
+/// reports: a lock outliving `busy_timeout` is how we would learn that
+/// assumption went stale.
+fn codex_retag_skip_class(reasons: &[String]) -> Option<&'static str> {
+    reasons.iter().find_map(|reason| {
+        let lower = reason.to_ascii_lowercase();
+        if lower.contains("malformed") || lower.contains("disk i/o error") {
+            None
+        } else if lower.contains("is locked") {
+            Some("locked")
+        } else {
+            Some("other")
+        }
+    })
+}
+
+fn report_codex_retag_skips(reasons: &[String]) {
+    let Some(class) = codex_retag_skip_class(reasons) else {
+        return;
+    };
+    let sample: Vec<String> = {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for reason in reasons {
+            seen.insert(reason.chars().take(160).collect());
+        }
+        seen.into_iter().take(5).collect()
+    };
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("flow", "codex_retag");
+            scope.set_extra("skipped_files", (reasons.len() as u64).into());
+            scope.set_extra("reasons", sample.join(" | ").into());
+            scope.set_fingerprint(Some(&["codex_retag_skipped", class]));
+        },
+        || {
+            sentry::capture_message(
+                &format!(
+                    "codex retag skipped {} database(s) ({class})",
+                    reasons.len()
+                ),
+                sentry::Level::Warning,
+            );
+        },
+    );
 }
 
 fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<Option<usize>> {
@@ -7230,6 +7287,28 @@ fn windows_path_extensions() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_retag_skip_class_reports_only_what_a_release_can_fix() {
+        use super::codex_retag_skip_class;
+        // A disk the user's Codex corrupted is not ours (RUST-95/96).
+        assert_eq!(
+            codex_retag_skip_class(&["database disk image is malformed".into()]),
+            None
+        );
+        assert_eq!(codex_retag_skip_class(&["disk I/O error".into()]), None);
+        // A lock outliving busy_timeout is: one class for the whole pass,
+        // however many of Codex's own DBs it happened to hold (RUST-EK/EM/EN).
+        assert_eq!(
+            codex_retag_skip_class(&[
+                "database disk image is malformed".into(),
+                "database is locked".into(),
+                "database is locked".into(),
+            ]),
+            Some("locked")
+        );
+        assert_eq!(codex_retag_skip_class(&[]), None);
+    }
+
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};

@@ -765,9 +765,33 @@ pub fn spawn(
                                 if launched_at.elapsed() >= RELAUNCH_GRACE
                                     && reported_errors.insert("existing_proxy".to_string())
                                 {
-                                    log::warn!(
-                                        "[proxy_intercept] port {INTERCEPT_PORT} still served by another Headroom proxy {}s after launch; this instance is not the one clients reach",
-                                        launched_at.elapsed().as_secs()
+                                    let held_secs = launched_at.elapsed().as_secs();
+                                    log::info!(
+                                        "[proxy_intercept] port {INTERCEPT_PORT} still served by another Headroom proxy {held_secs}s after launch; this instance is not the one clients reach"
+                                    );
+                                    // The elapsed seconds are an EXTRA, and the
+                                    // fingerprint is fixed: interpolated into
+                                    // the message they open one issue per
+                                    // second-count (RUST-EH arrived as "93s"),
+                                    // and this target does not match the
+                                    // `[proxy_intercept] ... retrying` skip
+                                    // rule either. Same split the two sibling
+                                    // reclaim reports use.
+                                    sentry::with_scope(
+                                        |scope| {
+                                            scope.set_tag("flow", "intercept_second_instance");
+                                            scope.set_extra("held_secs", held_secs.into());
+                                            scope.set_extra("port", INTERCEPT_PORT.into());
+                                            scope.set_fingerprint(Some(&[
+                                                "intercept_second_instance",
+                                            ]));
+                                        },
+                                        || {
+                                            sentry::capture_message(
+                                                "[proxy_intercept] port still served by another Headroom proxy past the relaunch grace; this instance is not the one clients reach",
+                                                sentry::Level::Warning,
+                                            );
+                                        },
                                     );
                                 } else {
                                     log::info!(

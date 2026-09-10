@@ -184,6 +184,30 @@ fn transport_kind_slug(err: &reqwest::Error) -> &'static str {
     }
 }
 
+/// Flatten a transport error's source chain into one line.
+///
+/// `transport_failure` deliberately reduces the cause to three stable phrases
+/// so the message groups, which means the actual reason - DNS, refused, or a
+/// corporate MITM proxy presenting an untrusted root - never leaves the
+/// machine. `is_connect()` covers all three, so RUST-BE could not be told
+/// apart from a captive portal. Carried as an extra, never a tag or
+/// fingerprint component, so grouping is unaffected. Bounded because a chain
+/// is attacker-agnostic but not length-bounded.
+fn transport_cause_chain(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if parts.len() >= 6 {
+            break;
+        }
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    let mut chain = parts.join(" <- ");
+    chain.truncate(400);
+    chain
+}
+
 /// (action, kind) pairs that have already reported a TRANSIENT transport
 /// failure this session, so the repeats can be dropped.
 static TRANSIENT_TRANSPORT_REPORTED: std::sync::Mutex<
@@ -235,6 +259,7 @@ fn capture_transport_failure(action_slug: &'static str, msg: &str, err: &reqwest
         |scope| {
             scope.set_fingerprint(Some(&["transport-failure", action_slug, kind]));
             scope.set_tag("transport.kind", kind);
+            scope.set_extra("cause_chain", transport_cause_chain(err).into());
         },
         || sentry::capture_message(msg, transport_level(err)),
     );
@@ -6376,6 +6401,12 @@ mod tests {
             .send()
             .expect_err("port 1 refuses");
         assert_eq!(super::transport_kind_slug(&connect), "connect");
+        // RUST-BE: the user-facing message is the same phrase for a refused
+        // port, a DNS failure and a TLS-intercepting proxy, so the chain is
+        // the only thing that tells them apart in Sentry.
+        let chain = super::transport_cause_chain(&connect);
+        assert!(chain.len() > connect.to_string().len(), "chain: {chain}");
+        assert!(chain.len() <= 400, "chain must stay bounded: {chain}");
     }
 
     #[test]

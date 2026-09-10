@@ -8357,11 +8357,21 @@ impl ToolManager {
     /// first or the "update" reinstalls the same commit. Plain `install`/`add`
     /// on an installed plugin is a no-op, which is why Update cannot just be
     /// the install path replayed.
-    fn install_plugin_into(&self, plugin: &'static PluginAddon, host: PluginHost) -> Result<()> {
-        let cli = host.cli().context("CLI not found on PATH")?;
+    ///
+    /// `cli` is resolved by the CALLER and passed in. Re-resolving it here ran
+    /// a second `detect_*_cli` probe milliseconds after the caller's, and that
+    /// one shells out (PATH lookup, then a login shell with a 2s cap): when it
+    /// came back empty the install reported "CLI not found on PATH" for a CLI
+    /// we had just found and filed it as a partial-install failure (RUST-EV).
+    fn install_plugin_into(
+        &self,
+        plugin: &'static PluginAddon,
+        host: PluginHost,
+        cli: &Path,
+    ) -> Result<()> {
         if host.plugin_present(plugin) {
-            let _ = self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_update_args(plugin));
-            self.run_plugin_cmd(plugin, &cli, host, &host.update_args(plugin))?;
+            let _ = self.run_plugin_cmd(plugin, cli, host, &host.marketplace_update_args(plugin));
+            self.run_plugin_cmd(plugin, cli, host, &host.update_args(plugin))?;
         } else {
             // Re-adding an already-known marketplace is a benign error, so its
             // failure is not fatal on its own -- but it must not be discarded
@@ -8371,7 +8381,7 @@ impl ToolManager {
             // names a consequence and hides every cause (Sentry RUST-6K). Carry
             // the add error and attach it if the install then fails.
             let mut marketplace_err = self
-                .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
+                .run_plugin_cmd(plugin, cli, host, &host.marketplace_add_args(plugin))
                 .err();
             // "marketplace 'x' is already added from a different source": the
             // host has our marketplace recorded under another spelling of the
@@ -8388,12 +8398,12 @@ impl ToolManager {
                     host.label()
                 );
                 let _ =
-                    self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_remove_args(plugin));
+                    self.run_plugin_cmd(plugin, cli, host, &host.marketplace_remove_args(plugin));
                 marketplace_err = self
-                    .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
+                    .run_plugin_cmd(plugin, cli, host, &host.marketplace_add_args(plugin))
                     .err();
             }
-            self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))
+            self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin))
                 .map_err(|err| match marketplace_err {
                     Some(add_err) => {
                         err.context(format!("marketplace add failed first: {add_err:#}"))
@@ -8414,9 +8424,9 @@ impl ToolManager {
     /// is a version skew the user can only fix by updating Codex.
     pub fn install_plugin(&self, id: &str) -> Result<bool> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        let hosts: Vec<PluginHost> = PluginHost::ALL
+        let hosts: Vec<(PluginHost, PathBuf)> = PluginHost::ALL
             .into_iter()
-            .filter(|host| host.cli().is_some())
+            .filter_map(|host| host.cli().map(|cli| (host, cli)))
             .collect();
         if hosts.is_empty() {
             bail!(
@@ -8426,8 +8436,8 @@ impl ToolManager {
         let mut errors: Vec<String> = Vec::new();
         let mut installed_any = false;
         let mut codex_outdated = false;
-        for host in hosts {
-            match self.install_plugin_into(plugin, host) {
+        for (host, cli) in hosts {
+            match self.install_plugin_into(plugin, host, &cli) {
                 Ok(()) => installed_any = true,
                 Err(err) if matches!(host, PluginHost::Codex) && is_outdated_codex(&err) => {
                     codex_outdated = true;
@@ -8485,7 +8495,7 @@ impl ToolManager {
             // Codex has no enable/disable verb, so enabling re-installs and
             // disabling removes. Skip disabling a host that isn't present.
             let result = if enabled {
-                self.install_plugin_into(plugin, host)
+                self.install_plugin_into(plugin, host, &cli)
             } else if host.plugin_present(plugin) {
                 self.run_plugin_cmd(plugin, &cli, host, &host.disable_args(plugin))
             } else {
@@ -11138,6 +11148,31 @@ pub fn repair_headroom_learn_block_file(path: &Path) -> bool {
         .unwrap_or_default();
     match crate::client_adapters::atomic_write(path, repaired.as_bytes()) {
         Ok(()) => {
+            // The path, the mtime and the size are EXTRAS. Interpolated into
+            // the message they grouped per project -- RUST-ER, RUST-ES and
+            // RUST-ET are one host's three repos in the same second -- which
+            // destroys the one thing this warn exists for: a fleet count that
+            // tells a code bug (many hosts) from a hand edit (one host). The
+            // bridged twin is dropped in logging.rs; the local line keeps the
+            // path, which is what a support thread needs.
+            sentry::with_scope(
+                |scope| {
+                    scope.set_tag("flow", "learn_block_repair");
+                    scope.set_extra(
+                        "path",
+                        crate::logging::scrub_home(&path.display().to_string()).into(),
+                    );
+                    scope.set_extra("file_mtime", modified.clone().into());
+                    scope.set_extra("bytes", (content.len() as u64).into());
+                    scope.set_fingerprint(Some(&["learn_block_end_marker_restored"]));
+                },
+                || {
+                    sentry::capture_message(
+                        "learn block had no end marker; end marker restored",
+                        sentry::Level::Warning,
+                    );
+                },
+            );
             log::warn!(
                 "learn block in {} had no end marker (file mtime {modified}, {} bytes); end marker restored",
                 path.display(),

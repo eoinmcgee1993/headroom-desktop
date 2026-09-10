@@ -342,7 +342,7 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // assumption went stale.
     if target.starts_with("headroom_desktop_lib::client_adapters")
         && msg.starts_with("codex retag")
-        && (msg.contains("database disk image is malformed") || msg.contains("disk I/O error"))
+        && msg.contains(" skipped for ")
     {
         return true;
     }
@@ -356,6 +356,18 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("headroom_desktop_lib::proxy_intercept")
         && msg.starts_with("[proxy_intercept] dropped ")
         && msg.contains("stale tool_search reference")
+    {
+        return true;
+    }
+    // The learn-block repair reaches Sentry via the fingerprinted capture at
+    // the emit site, which carries the path, the file mtime and the size as
+    // extras. This line bakes all three into the text, so one host's three
+    // repos landed as RUST-ER + RUST-ES + RUST-ET in the same second -- and a
+    // per-project group cannot answer the only question the warn exists for,
+    // which is how many HOSTS see it. Same split as the sibling lines here.
+    if target.starts_with("headroom_desktop_lib::tool_manager")
+        && msg.starts_with("learn block in ")
+        && msg.contains("end marker restored")
     {
         return true;
     }
@@ -921,15 +933,24 @@ mod tests {
     }
 
     #[test]
-    fn skips_codex_retag_malformed_db() {
+    fn skips_codex_retag_per_file_skip_lines() {
         assert!(skip_sentry(
             "headroom_desktop_lib::client_adapters",
             "codex retag openai->headroom skipped for ~/.codex/logs_2.sqlite: database disk image is malformed"
         ));
-        // Other retag skip causes (locked DB, schema drift) stay in Sentry.
-        assert!(!skip_sentry(
+        // A locked DB is still REPORTED -- by the per-pass capture in
+        // client_adapters, which groups every file in one pass under one
+        // fingerprint. This line names the file, so leaving it bridged filed
+        // one issue per sqlite file a running Codex happened to hold
+        // (RUST-EK/EM/EN, three in one second on one host).
+        assert!(skip_sentry(
             "headroom_desktop_lib::client_adapters",
             "codex retag openai->headroom skipped for ~/.codex/state_5.sqlite: database is locked"
+        ));
+        // The schema-drift signal is not a per-file skip line and stays.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::client_adapters",
+            "codex retag openai->headroom: a state_*.sqlite is present but has no `threads` table"
         ));
     }
 

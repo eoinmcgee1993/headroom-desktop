@@ -4320,7 +4320,17 @@ fn run_activity_observation(app: &AppHandle) {
     // machine where nothing is wrong (RUST-DD regressed on 0.9.12 with the
     // grace in place). The canary is for a backend that is UP and still
     // failing; only count the streak while the app expects it to be up.
-    if state.runtime_is_paused() || state.runtime_is_auto_paused() || state.runtime_is_starting() {
+    // Same reasoning for a front door that never opened: when the intercept
+    // cannot bind 6767 (RUST-EQ, Windows refusing the socket outright), every
+    // fetch is refused for as long as that lasts -- and the bind loop already
+    // reports it, with the OS code and the occupant. The canary would only add
+    // a second, blinder issue for the same machine (RUST-DT).
+    let intercept_bind_failed = state.intercept_bind_error.lock().is_some();
+    if state.runtime_is_paused()
+        || state.runtime_is_auto_paused()
+        || state.runtime_is_starting()
+        || intercept_bind_failed
+    {
         *FEED_FAILING_SINCE.lock() = None;
     } else if should_pull_transformations_feed() {
         match fetch_transformations_feed(ACTIVITY_OBSERVER_LIMIT) {
@@ -7073,10 +7083,18 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         // match the two words the whole family shares. Still specific enough
         // not to hit a project's own source line echoed back.
         "spend limit",
+        // RUST-EP: `You've hit your weekly limit \u{b7} resets 2am
+        // (Europe/Berlin)` -- a fourth wording in three months.
+        "weekly limit",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
         NEEDLES.iter().any(|needle| lower.contains(needle))
+            // Every wording so far is second-person ("You've hit your <window>
+            // limit"), so match that shape too rather than waiting for the
+            // fifth variant to file another Error. Still anchored: a project's
+            // own source line echoed back says "limit", never "hit your".
+            || (lower.contains("hit your") && lower.contains("limit"))
     })
 }
 
@@ -7113,6 +7131,39 @@ fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
 fn learn_failure_is_agent_model_rejected(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
     lowered.contains("unrecognized_model") || lowered.contains("does not support this model")
+}
+
+/// True when a `headroom learn` failure was the agent CLI exhausting its own
+/// API retries: `{"type":"system","subtype":"api_retry","attempt":8,
+/// "max_retries":10,"retry_delay_ms":38510,"error_status":null,"error":
+/// "unknown",...}` repeated until it gave up (RUST-EW). The CLI never reached
+/// its backend, so the outcome is the user's network or an upstream outage --
+/// the same user-environment class as the auth and limit lines above.
+///
+/// `error_status` must be null, and that is load-bearing: a retry storm around
+/// a REAL status -- a 400 for a prompt we built too long (RUST-BK) -- is ours
+/// and has to keep reporting. Suppressing this class also un-fragments it: the
+/// retry event carries `retry_delay_ms`, `attempt` and a session UUID, and the
+/// failure signature is built from that line, so every storm opened a brand
+/// new issue.
+fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.contains("\"subtype\":\"api_retry\"") && line.contains("\"error_status\":null")
+    })
+}
+
+/// The user-facing remedy for [`learn_failure_is_agent_api_unreachable`].
+fn learn_agent_api_unreachable_hint(agent: LearnAgent) -> String {
+    let cli = match agent {
+        LearnAgent::Claude => "Claude Code",
+        LearnAgent::Codex => "Codex",
+        LearnAgent::Opencode => "opencode",
+        LearnAgent::Grok => "Grok",
+    };
+    format!(
+        "{cli} could not reach its API -- it retried and gave up -- so headroom learn could not \
+         run its analysis. Check this machine's connection, then start the scan again."
+    )
 }
 
 /// The text a learn failure is fingerprinted on.
@@ -7478,7 +7529,11 @@ fn execute_headroom_learn_run(
                     let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
                     let agent_limit_line =
                         learn_failure_agent_limit_line(&stderr).map(str::to_string);
-                    if !agent_not_signed_in && agent_limit_line.is_none() {
+                    // RUST-EW, third cause in the same class: the CLI never
+                    // reached its own API.
+                    let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
+                    if !agent_not_signed_in && agent_limit_line.is_none() && !agent_api_unreachable
+                    {
                         sentry::with_scope(
                             |scope| {
                                 scope.set_tag("flow", "headroom_learn");
@@ -7665,6 +7720,7 @@ fn execute_headroom_learn_run(
                 let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
                 let agent_limit_line = learn_failure_agent_limit_line(&stderr).map(str::to_string);
                 let agent_model_rejected = learn_failure_is_agent_model_rejected(&stderr);
+                let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
                 // RUST-3F: this used to read `signature.contains(...)`, which is
                 // exactly the mistake the paragraph above warns about. Click
                 // prints its usage banner FIRST and the diagnosis LAST:
@@ -7682,7 +7738,8 @@ fn execute_headroom_learn_run(
                 let user_env_condition = path_unreadable
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
-                    || agent_model_rejected;
+                    || agent_model_rejected
+                    || agent_api_unreachable;
                 if !user_env_condition {
                     sentry::with_scope(
                         |scope| {
@@ -7725,6 +7782,8 @@ fn execute_headroom_learn_run(
                     learn_agent_auth_hint(agent)
                 } else if let Some(line) = &agent_limit_line {
                     learn_agent_limit_hint(agent, line)
+                } else if agent_api_unreachable {
+                    learn_agent_api_unreachable_hint(agent)
                 } else {
                     format!(
                         "headroom learn exited with {}.\n{}",
@@ -9272,7 +9331,8 @@ mod tests {
         is_blocked_runtime_dll_signal, is_disk_full_signal, is_endpoint_protection_signal,
         is_environmental_startup_key, is_loopback_socket_denied_signal, is_network_download_signal,
         is_port_conflict_failure, is_prerelease_version, learn_agent_auth_hint,
-        learn_agent_limit_hint, learn_failure_agent_limit_line, learn_failure_is_agent_auth,
+        learn_agent_limit_hint, learn_failure_agent_limit_line,
+        learn_failure_is_agent_api_unreachable, learn_failure_is_agent_auth,
         learn_failure_is_agent_model_rejected, learn_failure_signature_source, learn_step_label,
         lifetime_token_milestone_kind, noop_app_update_progress_emitter,
         normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
@@ -12022,6 +12082,37 @@ Some unrelated content.
         ] {
             assert!(
                 learn_failure_agent_limit_line(stderr).is_none(),
+                "for: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn learn_failure_agent_limit_line_matches_the_weekly_window() {
+        // RUST-EP verbatim: a fourth wording, matched by none of the needles.
+        let weekly = "You've hit your weekly limit \u{b7} resets 2am (Europe/Berlin)";
+        assert_eq!(learn_failure_agent_limit_line(weekly), Some(weekly));
+        // The shape rule, not the needle: any future window wording.
+        assert!(learn_failure_agent_limit_line("You've hit your Opus limit for today").is_some());
+    }
+
+    #[test]
+    fn learn_failure_is_agent_api_unreachable_only_on_a_statusless_retry_storm() {
+        // RUST-EW verbatim: claude-cli retried its API ten times, never got a
+        // status back, and gave up. Nothing on our side changes that.
+        let storm = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\n{\"type\":\"system\",\"subtype\":\"api_retry\",\"attempt\":8,\"max_retries\":10,\"retry_delay_ms\":38510,\"error_status\":null,\"error\":\"unknown\",\"session_id\":\"083b154e\"}\n";
+        assert!(learn_failure_is_agent_api_unreachable(storm));
+        // A retry storm around a REAL status is OURS (RUST-BK: a prompt we
+        // built too long) and must keep reporting.
+        let ours = "{\"type\":\"system\",\"subtype\":\"api_retry\",\"attempt\":1,\"max_retries\":10,\"error_status\":400,\"error\":\"prompt is too long\"}";
+        assert!(!learn_failure_is_agent_api_unreachable(ours));
+        for stderr in [
+            "LLM analysis failed: `claude -p` did not respond within 120s.",
+            "API Error: 400 status code (no body)",
+            "",
+        ] {
+            assert!(
+                !learn_failure_is_agent_api_unreachable(stderr),
                 "for: {stderr}"
             );
         }
