@@ -9181,10 +9181,32 @@ enum PortState {
 /// rather than three loose copies of the same literal.
 const UNKNOWN_OCCUPANT: &str = "unknown process";
 
+/// Occupant string for a port Windows refuses outright (WSAEACCES). Not
+/// `UNKNOWN_OCCUPANT`: no process holds the port, so `settle_unowned_port`
+/// must not wait 3s for a socket that is not draining, and the report must not
+/// claim a holder the user could go and quit.
+const DENIED_OCCUPANT: &str = "Windows itself (WinError 10013)";
+
+/// A bind refused for lack of permission rather than because something is
+/// there: a reserved/excluded port range (Hyper-V, WSL2, Docker) or security
+/// software filtering loopback. Windows-only in practice -- the signal keys on
+/// the 10013 code, so a Unix EACCES (os error 13) does not match.
+fn bind_denied_by_os(err: &std::io::Error) -> bool {
+    crate::is_loopback_socket_denied_signal(&err.to_string())
+}
+
 fn diagnose_proxy_port(port: u16) -> PortState {
     // If we can bind the port, nothing is there.
-    if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-        return PortState::Free;
+    match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_) => return PortState::Free,
+        // Held and denied are different failures with the same errno slot:
+        // this one has no occupant to probe, name, or wait out, and calling it
+        // "held by unknown process" sent RUST-ED's reporter after a squatter
+        // that does not exist. Fall back to another port either way.
+        Err(err) if bind_denied_by_os(&err) => {
+            return PortState::ForeignOccupant(DENIED_OCCUPANT.into());
+        }
+        Err(_) => {}
     }
 
     // Port is held. Probe it: headroom's proxy speaks HTTP and, for an
@@ -14457,6 +14479,25 @@ mod tests {
         );
         assert!(matches!(state, PortState::Free));
         assert_eq!(calls.get(), 3);
+    }
+
+    /// RUST-ED: 6768 refused with WSAEACCES was reported as "held by unknown
+    /// process", which names a squatter the user cannot find and makes
+    /// `settle_unowned_port` wait out a socket that is not draining.
+    #[test]
+    fn a_denied_bind_is_not_reported_as_an_unknown_holder() {
+        use super::{bind_denied_by_os, DENIED_OCCUPANT, UNKNOWN_OCCUPANT};
+        use std::io::Error;
+
+        assert!(bind_denied_by_os(&Error::from_raw_os_error(10013)));
+        // In use (Windows and Unix) is a real holder, not a denial.
+        assert!(!bind_denied_by_os(&Error::from_raw_os_error(10048)));
+        assert!(!bind_denied_by_os(&Error::from_raw_os_error(48)));
+        // Unix EACCES is a privileged port, nothing to do with WSAEACCES.
+        assert!(!bind_denied_by_os(&Error::from_raw_os_error(13)));
+        // The settle loop keys on this exact shape.
+        assert_ne!(DENIED_OCCUPANT, UNKNOWN_OCCUPANT);
+        assert!(DENIED_OCCUPANT.contains("10013"));
     }
 
     /// The boot-validation failure path reports the occupant, not just a

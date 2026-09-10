@@ -3444,6 +3444,16 @@ impl AppState {
         *self.runtime_paused.lock()
     }
 
+    /// True while the intercept's bind loop is still failing, i.e. 6767 is not
+    /// ours right now. Every client is hard-configured to that port, so this
+    /// means nothing CAN route through Headroom whatever the clients' configs
+    /// say -- which is why the unrouted-client detector and the transformations
+    /// feed canary both stand down on it instead of filing a second, blinder
+    /// issue for the same machine (RUST-EQ, RUST-DT).
+    pub fn intercept_bind_failed(&self) -> bool {
+        self.intercept_bind_error.lock().is_some()
+    }
+
     pub fn set_runtime_auto_paused(&self, auto_paused: bool) {
         self.runtime_auto_paused
             .store(auto_paused, std::sync::atomic::Ordering::Release);

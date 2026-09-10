@@ -535,6 +535,12 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     if dashboard.lifetime_requests > 0 || !state.setup_wizard_complete() {
         return;
     }
+    // Sessions growing while nothing reaches the proxy proves a leak, not its
+    // cause. With 6767 unbound the cause is ours, and "restart your terminal"
+    // is advice that cannot work -- same reasoning as the hourly detector.
+    if state.intercept_bind_failed() {
+        return;
+    }
     // Cached (~90s warmer cadence), so polling this every 5s costs nothing.
     let claude = state
         .list_claude_code_projects()
@@ -4325,7 +4331,7 @@ fn run_activity_observation(app: &AppHandle) {
     // fetch is refused for as long as that lasts -- and the bind loop already
     // reports it, with the OS code and the occupant. The canary would only add
     // a second, blinder issue for the same machine (RUST-DT).
-    let intercept_bind_failed = state.intercept_bind_error.lock().is_some();
+    let intercept_bind_failed = state.intercept_bind_failed();
     if state.runtime_is_paused()
         || state.runtime_is_auto_paused()
         || state.runtime_is_starting()
@@ -5155,7 +5161,15 @@ async fn detect_unrouted_clients(
         use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
         let state: State<'_, AppState> = app.state();
         // Paused or bypassed: the agent going direct is the intended state.
+        // A failed intercept bind is the same fact from the other end: when
+        // 6767 never opened (RUST-EQ, Windows refusing the socket outright),
+        // no client CAN reach us, so "active locally, no proxied request" is
+        // OUR outage, not a clobbered client config. Reporting it here blames
+        // the client, re-applies a setup that was never wrong, and shows the
+        // user a "ran without Headroom" affordance pointing at their terminal.
+        // The bind loop already reports the real cause, with the OS code.
         if state.runtime_is_paused()
+            || state.intercept_bind_failed()
             || state
                 .proxy_bypass
                 .load(std::sync::atomic::Ordering::Acquire)
