@@ -529,8 +529,8 @@ function FirstSavingsChecklist({ onReopenSetup }: { onReopenSetup: () => void })
   return (
     <div className="post-install__checklist">
       <p>
-        Tools that were already open still use their old settings, so restart them.
-        Then paste this into one and your first savings appear here.
+        In order to start using Headroom you first need to restart your AI Agents.
+        Then ask them to "Say hi" or paste the prompt below to see savings appear.
       </p>
       <div className="post-install__starter">
         <code>{STARTER_PROMPT}</code>
