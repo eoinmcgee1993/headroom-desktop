@@ -8029,6 +8029,17 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
              Quit that program, or end it in Task Manager, and Headroom reconnects on its own."
         );
     }
+    // Two app instances (`restart_app`'s `open -n` relauncher bypasses
+    // single-instance). Traffic is fine -- the OTHER window is optimizing it --
+    // so this must not read as an outage, and the remedy is about the window,
+    // not the port.
+    if raw.contains("served by another Headroom instance") {
+        return format!(
+            "Another Headroom window already has port {port}, so this one is a spectator. \
+             Your traffic is still being optimized by that window. \
+             Quit this window; if you can't tell them apart, quit Headroom entirely and reopen it once."
+        );
+    }
     if raw.contains("still being released") {
         return format!(
             "Port {port} is still being released by the previous Headroom session. \
@@ -9953,6 +9964,18 @@ mod tests {
     /// rather than blaming the Python runtime -- which in that state is running
     /// fine on a port of its own. The hint must hand over the command that
     /// identifies the holder instead of asserting which one it is.
+    #[test]
+    fn intercept_bind_hint_for_a_second_instance_does_not_read_as_an_outage() {
+        // The string the existing-proxy arm writes, verbatim.
+        let hint = intercept_bind_hint("port 6767 is served by another Headroom instance");
+        assert!(hint.contains("6767"), "{hint}");
+        assert!(hint.contains("still being optimized"), "{hint}");
+        // Must not inherit the mid-diagnosis or foreign-holder remedies: no
+        // program is squatting the port and nothing is being identified.
+        assert!(!hint.contains("checking what holds it"), "{hint}");
+        assert!(!hint.contains("Task Manager"), "{hint}");
+    }
+
     #[test]
     fn intercept_bind_hint_names_the_port_and_how_to_find_the_holder() {
         let hint = intercept_bind_hint(
