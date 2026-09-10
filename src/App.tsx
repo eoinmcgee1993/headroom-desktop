@@ -5943,35 +5943,39 @@ export default function App() {
             <br />
             in the background
           </h1>
+          {/* Rows exist only when the user just came through client setup
+              (fresh entries from an upgrade start empty). Shown whether or
+              not savings already exist: a re-run after a first prompt still
+              has tools holding pre-setup settings. */}
+          {proxyVerificationRows.length > 0 ? (
+            <div className="connector-list">
+              {proxyVerificationRows.map((row) => (
+                <article className="connector-item" key={row.clientId}>
+                  <div>
+                    <h3>
+                      <span className="client-logo" aria-hidden="true">
+                        {renderConnectorLogo(row.clientId)}
+                      </span>
+                      {row.name}
+                    </h3>
+                    <div className="proxy-verify-item__message">
+                      <span>
+                        {proxyVerificationRowMessage(
+                          row,
+                          runningAgentCounts[row.clientId] ?? 0
+                        )}
+                      </span>
+                      {row.state === "verified" ? (
+                        <span className="proxy-verified-pill">verified</span>
+                      ) : null}
+                      </div>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : null}
           {awaitingFirstSavings ? (
             <>
-              {proxyVerificationRows.length > 0 ? (
-                <div className="connector-list">
-                  {proxyVerificationRows.map((row) => (
-                    <article className="connector-item" key={row.clientId}>
-                      <div>
-                        <h3>
-                          <span className="client-logo" aria-hidden="true">
-                            {renderConnectorLogo(row.clientId)}
-                          </span>
-                          {row.name}
-                        </h3>
-                        <div className="proxy-verify-item__message">
-                          <span>
-                            {proxyVerificationRowMessage(
-                              row,
-                              runningAgentCounts[row.clientId] ?? 0
-                            )}
-                          </span>
-                          {row.state === "verified" ? (
-                            <span className="proxy-verified-pill">verified</span>
-                          ) : null}
-                        </div>
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              ) : null}
               <FirstSavingsChecklist
                 onReopenSetup={() => setLauncherStage("client_setup")}
               />

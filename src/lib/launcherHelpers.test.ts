@@ -385,7 +385,7 @@ describe("what the verify row says while it waits", () => {
 
   it("asks the user to start the tool when nothing is running", () => {
     expect(proxyVerificationRowMessage(row, 0)).toBe(
-      "Open Claude Code and send it the prompt below."
+      "Open Claude Code and send it any message."
     );
   });
 

@@ -298,9 +298,9 @@ export function proxyVerificationRowMessage(
     return `Not used on this machine recently, so there is nothing to test. ${row.name} is still set up.`;
   }
   if (runningSessions > 0) {
-    return `Still open with the old settings. Quit and reopen ${row.name}, then send it the prompt below.`;
+    return `Still open with the old settings. Quit and reopen ${row.name}, then send it any message.`;
   }
-  return `Open ${row.name} and send it the prompt below.`;
+  return `Open ${row.name} and send it any message.`;
 }
 
 export function buildInitialProxyVerificationRows(
