@@ -256,11 +256,14 @@ export const PROXY_VERIFY_IDLE_AFTER_SECONDS = 7 * 24 * 60 * 60;
 /// so it would hold the screen in a failed-looking state forever and tell a
 /// perfectly healthy install that its setup is broken. Ages come from
 /// `get_client_local_activity_ages`; a missing entry means "never seen".
+/// Idle rows sink to the bottom so the tool the user has to act on is first
+/// (stable sort: the name order from `buildInitialProxyVerificationRows` holds
+/// within each group).
 export function markIdleProxyVerificationRows(
   rows: ProxyVerificationRowState[],
   activityAgesSeconds: Record<string, number>
 ): ProxyVerificationRowState[] {
-  return rows.map((row) => {
+  const marked: ProxyVerificationRowState[] = rows.map((row) => {
     if (row.state === "verified") {
       return row;
     }
@@ -268,6 +271,7 @@ export function markIdleProxyVerificationRows(
     const idle = age === undefined || age > PROXY_VERIFY_IDLE_AFTER_SECONDS;
     return idle === (row.state === "idle") ? row : { ...row, state: idle ? "idle" : "processing" };
   });
+  return marked.sort((a, b) => Number(a.state === "idle") - Number(b.state === "idle"));
 }
 
 /// The rows the screen is actually testing. An idle connector is shown but not

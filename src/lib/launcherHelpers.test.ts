@@ -344,6 +344,14 @@ describe("proxy verification rows the screen should not be testing", () => {
     expect(testableProxyVerificationRows(rows).map((entry) => entry.clientId)).toEqual(["codex"]);
   });
 
+  it("sinks idle rows below the ones the user still has to restart", () => {
+    const rows = markIdleProxyVerificationRows([row("codex"), row("claude_code")], {
+      claude_code: 60
+    });
+
+    expect(rows.map((entry) => entry.clientId)).toEqual(["claude_code", "codex"]);
+  });
+
   it("treats activity older than the window as idle", () => {
     const rows = markIdleProxyVerificationRows([row("codex")], {
       codex: PROXY_VERIFY_IDLE_AFTER_SECONDS + 1
