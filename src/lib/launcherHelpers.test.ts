@@ -5,7 +5,6 @@ import {
   formatConnectorNameList,
   markIdleProxyVerificationRows,
   proxyVerificationRowMessage,
-  summarizeSetupCheck,
   testableProxyVerificationRows,
   PROXY_VERIFY_IDLE_AFTER_SECONDS,
   getClaudeConnector,
@@ -117,7 +116,7 @@ describe("launcher helpers", () => {
           verified: false
         }
       ])
-    ).toBe("begin_proxy_verification");
+    ).toBe("begin_post_install");
     // Codex-only: a non-Claude tool drives the same auto-configure decision.
     expect(
       getLauncherAutoConfigureDecision([
@@ -248,17 +247,17 @@ describe("launcher helpers", () => {
       });
     });
 
-    it("routes begin_proxy_verification straight to proxy verification", () => {
-      expect(nextAutoConfigureStep("begin_proxy_verification", [])).toEqual({
-        kind: "begin_proxy_verification"
+    it("routes begin_post_install straight to the post-install screen", () => {
+      expect(nextAutoConfigureStep("begin_post_install", [])).toEqual({
+        kind: "begin_post_install"
       });
     });
   });
 
   describe("nextAutoConfigureStepAfterApply", () => {
     it("advances to proxy verification when apply produced a verified setup", () => {
-      expect(nextAutoConfigureStepAfterApply("begin_proxy_verification")).toEqual({
-        kind: "begin_proxy_verification"
+      expect(nextAutoConfigureStepAfterApply("begin_post_install")).toEqual({
+        kind: "begin_post_install"
       });
     });
 
@@ -378,7 +377,7 @@ describe("what the verify row says while it waits", () => {
 
   it("asks the user to start the tool when nothing is running", () => {
     expect(proxyVerificationRowMessage(row, 0)).toBe(
-      "Open Claude Code and send it any message."
+      "Open Claude Code and send it the prompt below."
     );
   });
 
@@ -393,41 +392,3 @@ describe("what the verify row says while it waits", () => {
   });
 });
 
-describe("summarizeSetupCheck", () => {
-  const ok = (name: string, proxyReachable = true) => ({
-    name,
-    verification: { clientId: name, verified: true, proxyReachable, checks: [], failures: [] }
-  });
-
-  it("passes when every tool is configured and the proxy answers", () => {
-    expect(summarizeSetupCheck([ok("Claude Code"), ok("ChatGPT")])).toEqual({ ok: true, lines: [] });
-  });
-
-  it("names the tools it could not read", () => {
-    const result = summarizeSetupCheck([ok("Claude Code"), { name: "ChatGPT", verification: null }]);
-    expect(result.ok).toBe(false);
-    expect(result.lines).toEqual(["Could not read the setup for ChatGPT."]);
-  });
-
-  it("prefixes each failure with the tool name", () => {
-    const result = summarizeSetupCheck([
-      {
-        name: "ChatGPT",
-        verification: {
-          clientId: "codex",
-          verified: false,
-          proxyReachable: true,
-          checks: [],
-          failures: ["base URL is not Headroom"]
-        }
-      }
-    ]);
-    expect(result).toEqual({ ok: false, lines: ["ChatGPT: base URL is not Headroom"] });
-  });
-
-  it("waits calmly when the config is right but the proxy is not up yet", () => {
-    const result = summarizeSetupCheck([ok("Claude Code", false)]);
-    expect(result.ok).toBe(false);
-    expect(result.lines[0]).toContain("not answering on 127.0.0.1:6767 yet");
-  });
-});

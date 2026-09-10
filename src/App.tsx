@@ -155,8 +155,6 @@ import {
   buildInitialProxyVerificationRows,
   markIdleProxyVerificationRows,
   proxyVerificationRowMessage,
-  summarizeSetupCheck,
-  testableProxyVerificationRows,
   type ProxyVerificationRowState,
   getClaudeConnector,
   getContactRequestValidationError,
@@ -208,7 +206,6 @@ import type {
   ClientConnectorStatus,
   UnroutedClient,
   ClientSetupResult,
-  ClientSetupVerification,
   DailySavingsPoint,
   DashboardState,
   DebugOverrides,
@@ -497,7 +494,6 @@ function reportFunnelStep(step: InstallWizardStep): void {
 // screen is captured by `signup_gate_shown`, not a launcher stage.
 const LAUNCHER_STAGE_STEP: Partial<Record<LauncherStage, InstallWizardStep>> = {
   client_setup: "client_setup_shown",
-  proxy_verify: "proxy_verify_started",
   post_install: "post_install_shown"
 };
 
@@ -533,8 +529,8 @@ function FirstSavingsChecklist({ onReopenSetup }: { onReopenSetup: () => void })
   return (
     <div className="post-install__checklist">
       <p>
-        Use a connected coding agent as normal and your savings appear here. No
-        project in mind? Paste this into your agent to see it work.
+        Tools that were already open still use their old settings, so restart them.
+        Then paste this into one and your first savings appear here.
       </p>
       <div className="post-install__starter">
         <code>{STARTER_PROMPT}</code>
@@ -1660,9 +1656,6 @@ export default function App() {
     []
   );
   const [runningAgentCounts, setRunningAgentCounts] = useState<Record<string, number>>({});
-  // Result of the verify screen's background config check, null until the
-  // first one completes.
-  const [setupCheck, setSetupCheck] = useState<{ ok: boolean; lines: string[] } | null>(null);
   const [proxyVerificationHint, setProxyVerificationHint] = useState<
     { text: string; tone: "info" | "error" } | null
   >(null);
@@ -1676,7 +1669,7 @@ export default function App() {
   // Verify against the always-up 6767 intercept (which counts passthrough
   // traffic) instead of the backend whenever the backend won't be optimizing:
   // pre-install, or when the pricing gate has bypassed it (e.g. ended trial).
-  // Otherwise proxy_verify waits forever on a backend that never comes up.
+  // Otherwise the post-install rows wait forever on a backend that never comes up.
   const interceptOnlyVerify =
     paywallFirstFlow || runtimeStatus?.bypassed === true;
   const [resuming, setResuming] = useState(false);
@@ -2446,7 +2439,7 @@ export default function App() {
   }, [windowLabel, launcherStage, pricingStatus?.account?.subscriptionActive]);
 
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+    if (windowLabel !== "launcher" || launcherStage !== "post_install") {
       return;
     }
 
@@ -2532,50 +2525,12 @@ export default function App() {
     };
   }, [windowLabel, launcherStage, interceptOnlyVerify]);
 
-  // The verify screen's config check runs by itself: reads config off disk
-  // plus proxy reachability, the same check `repair_client_setups` trusts
-  // hourly. A pass turns Finish into the primary action; the user never had
-  // to click "Check my setup" to learn that nothing is broken.
-  const proxyVerificationClientIds = proxyVerificationRows
-    .map((row) => row.clientId)
-    .join(",");
-  useEffect(() => {
-    if (
-      windowLabel !== "launcher" ||
-      launcherStage !== "proxy_verify" ||
-      proxyVerificationClientIds === ""
-    ) {
-      return;
-    }
-    let active = true;
-    const check = () => {
-      // Dormant tools are shown but not tested, same as the rows themselves.
-      const testable = testableProxyVerificationRows(proxyVerificationRows);
-      const targets = testable.length > 0 ? testable : proxyVerificationRows;
-      void Promise.all(
-        targets.map((row) =>
-          invoke<ClientSetupVerification>("verify_client_setup", { clientId: row.clientId })
-            .then((verification) => ({ name: row.name, verification }))
-            .catch(() => ({ name: row.name, verification: null }))
-        )
-      ).then((results) => {
-        if (active) setSetupCheck(summarizeSetupCheck(results));
-      });
-    };
-    check();
-    const interval = window.setInterval(check, 3000);
-    return () => {
-      active = false;
-      window.clearInterval(interval);
-    };
-  }, [windowLabel, launcherStage, proxyVerificationClientIds]);
-
-  // Live agent processes for the verify screen's restart callout: sessions
+  // Live agent processes for the post-install restart rows: sessions
   // started before setup keep their pre-Headroom environment, and naming them
   // turns "restart each tool" from generic advice into a concrete instruction.
   // One ps/tasklist spawn per poll, so only while this stage is showing.
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+    if (windowLabel !== "launcher" || launcherStage !== "post_install") {
       return;
     }
     let active = true;
@@ -2601,7 +2556,7 @@ export default function App() {
   // entries, and an agent that starts being used mid-screen announces itself by
   // producing traffic, which flips the row regardless of its idle mark.
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+    if (windowLabel !== "launcher" || launcherStage !== "post_install") {
       return;
     }
     let active = true;
@@ -2653,7 +2608,7 @@ export default function App() {
 
   // proxy_verified: every enabled client's test traffic reached the proxy.
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") return;
+    if (windowLabel !== "launcher" || launcherStage !== "post_install") return;
     if (
       proxyVerificationRows.length > 0 &&
       proxyVerificationRows.every((row) => row.state === "verified")
@@ -4170,13 +4125,13 @@ export default function App() {
         const postApplyStep = nextAutoConfigureStepAfterApply(
           getLauncherAutoConfigureDecision(latestConnectors)
         );
-        if (postApplyStep.kind !== "begin_proxy_verification") {
+        if (postApplyStep.kind !== "begin_post_install") {
           setLauncherStage("client_setup");
           return;
         }
       }
 
-      await beginProxyVerificationStep();
+      await beginPostInstallStep();
     } catch (error) {
       setConnectorsError(
         describeInvokeError(error, "Could not configure your coding tools automatically.")
@@ -4800,7 +4755,7 @@ export default function App() {
     }
   }
 
-  async function beginProxyVerificationStep() {
+  async function beginPostInstallStep() {
     let fresh = connectors;
     try {
       fresh = await fetchConnectors();
@@ -4809,9 +4764,8 @@ export default function App() {
       // fall back to cached state
     }
 
-    setLauncherStage("proxy_verify");
+    setLauncherStage("post_install");
     setProxyVerificationHint(null);
-    setSetupCheck(null);
     setProxyVerificationRows(buildInitialProxyVerificationRows(fresh));
     // Reset to null so the polling effect re-anchors on its first reachable
     // /stats reading. Setting it here would risk anchoring on a stale value
@@ -5619,7 +5573,7 @@ export default function App() {
               className="secondary-button"
               disabled={connectorsBusy}
               onClick={() => {
-                void beginProxyVerificationStep();
+                void beginPostInstallStep();
               }}
               type="button"
             >
@@ -5812,132 +5766,12 @@ export default function App() {
             className="primary-button primary-button--large primary-button--success"
             disabled={connectorsBusy || (requireSelection && enabledConnectorCount === 0)}
             onClick={() => {
-              void beginProxyVerificationStep();
+              void beginPostInstallStep();
             }}
             type="button"
           >
             Continue
           </button>
-        </div>
-      </LauncherShell>
-    );
-  }
-
-  if (
-    windowLabel === "launcher" && launcherStage === "proxy_verify"
-  ) {
-    const hasEnabledApps = proxyVerificationRows.length > 0;
-    // A dormant tool is displayed but not tested: it can never turn green, and
-    // counting it withholds the success button from a healthy install forever.
-    const testableRows = testableProxyVerificationRows(proxyVerificationRows);
-    const allVerified = testableRows.length > 0 && testableRows.every((row) => row.state === "verified");
-    const anyVerified = proxyVerificationRows.some((row) => row.state === "verified");
-    // Finish is the happy path once the config check has passed or a tool has
-    // already come through. Until then leaving is allowed but must not look
-    // like the happy path: it is the road to "Headroom didn't work" emails.
-    const canFinish = anyVerified || setupCheck?.ok === true;
-    const finishSetup = () => {
-      void invoke("complete_setup_wizard");
-      setLauncherStage("post_install");
-    };
-
-    return (
-      <LauncherShell
-        shellClassName="intro-shell intro-shell--post-install"
-        spinnerClassName="intro-shell__spinner intro-shell__spinner--post-install"
-        copyClassName="intro-shell__copy intro-shell__copy--post-install"
-        onMouseDown={handleLauncherSurfaceMouseDown}
-        version={appSemver}
-      >
-        <div className="post-install__lead">
-          <h1>Restart your tools</h1>
-          <p>
-            Tools that were already open still use their old settings, so each one needs a
-            restart. Any message afterwards, even "hi", confirms the connection.
-          </p>
-          {hasEnabledApps ? (
-            <div className="connector-list">
-              {proxyVerificationRows.map((row) => (
-                <article className="connector-item" key={row.clientId}>
-                  <div>
-                    <h3>
-                      <span className="client-logo" aria-hidden="true">
-                        {renderConnectorLogo(row.clientId)}
-                      </span>
-                      {row.name}
-                    </h3>
-                    <div className="proxy-verify-item__message">
-                      <span>
-                        {proxyVerificationRowMessage(row, runningAgentCounts[row.clientId] ?? 0)}
-                      </span>
-                      {row.state === "verified" ? (
-                        <span className="proxy-verified-pill">verified</span>
-                      ) : null}
-                    </div>
-                  </div>
-                </article>
-              ))}
-            </div>
-          ) : (
-            <p className="launcher-restart-hint">
-              No tools are enabled yet. Go back to the previous step to enable one.
-            </p>
-          )}
-          {setupCheck?.ok ? (
-            <p className="launcher-restart-hint">Headroom is set up and running.</p>
-          ) : setupCheck && !proxyVerificationHint ? (
-            // The startup hint below already explains an unreachable proxy on
-            // first launch, so the check only speaks when the hint does not.
-            <p className="install-progress__error">
-              {setupCheck.lines.join(" ")} If this does not clear, contact{" "}
-              <button
-                className="install-progress__notice-link"
-                onClick={() =>
-                  void invoke("open_external_link", { url: "mailto:support@extraheadroom.com" })}
-                type="button"
-              >
-                support@extraheadroom.com
-              </button>
-              .
-            </p>
-          ) : null}
-          {proxyVerificationHint ? (
-            <p
-              className={
-                proxyVerificationHint.tone === "error"
-                  ? "install-progress__error"
-                  : "launcher-restart-hint"
-              }
-            >
-              {proxyVerificationHint.text}
-            </p>
-          ) : null}
-        </div>
-        <div className="post-install__actions">
-          <button
-            className="secondary-button post-install__reopen-setup"
-            onClick={() => {
-              setLauncherStage("client_setup");
-            }}
-            type="button"
-          >
-            Back
-          </button>
-          {canFinish ? (
-            <button
-              className={`primary-button primary-button--large${
-                allVerified ? " primary-button--success" : ""
-              }`}
-              onClick={finishSetup}
-              type="button"
-            >
-              Finish
-            </button>
-          ) : (
-            <button className="secondary-button" onClick={finishSetup} type="button">
-              Skip for now
-            </button>
-          )}
         </div>
       </LauncherShell>
     );
@@ -6110,9 +5944,49 @@ export default function App() {
             in the background
           </h1>
           {awaitingFirstSavings ? (
-            <FirstSavingsChecklist
-              onReopenSetup={() => setLauncherStage("client_setup")}
-            />
+            <>
+              {proxyVerificationRows.length > 0 ? (
+                <div className="connector-list">
+                  {proxyVerificationRows.map((row) => (
+                    <article className="connector-item" key={row.clientId}>
+                      <div>
+                        <h3>
+                          <span className="client-logo" aria-hidden="true">
+                            {renderConnectorLogo(row.clientId)}
+                          </span>
+                          {row.name}
+                        </h3>
+                        <div className="proxy-verify-item__message">
+                          <span>
+                            {proxyVerificationRowMessage(
+                              row,
+                              runningAgentCounts[row.clientId] ?? 0
+                            )}
+                          </span>
+                          {row.state === "verified" ? (
+                            <span className="proxy-verified-pill">verified</span>
+                          ) : null}
+                        </div>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+              <FirstSavingsChecklist
+                onReopenSetup={() => setLauncherStage("client_setup")}
+              />
+              {proxyVerificationHint ? (
+                <p
+                  className={
+                    proxyVerificationHint.tone === "error"
+                      ? "install-progress__error"
+                      : "launcher-restart-hint"
+                  }
+                >
+                  {proxyVerificationHint.text}
+                </p>
+              ) : null}
+            </>
           ) : (
             <>
               <p>
@@ -6147,7 +6021,7 @@ export default function App() {
           <button
             className="secondary-button post-install__reopen-setup"
             onClick={() => {
-              void beginProxyVerificationStep();
+              setLauncherStage("client_setup");
             }}
             type="button"
           >

@@ -2,7 +2,6 @@ import { aggregateClientConnectors } from "./dashboardHelpers";
 import type {
   ClaudePlanTier,
   ClientConnectorStatus,
-  ClientSetupVerification,
   CodexPlanTier,
   HeadroomSubscriptionTier,
   LaunchExperience,
@@ -11,15 +10,14 @@ import type {
 export const EMAIL_ADDRESS_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // Linear onboarding flow shown in the launcher window:
-// install → client_setup → proxy_verify → post_install. Back buttons can jump
-// backwards. The install step doubles as the pre-install landing.
-// Paywall-first experiment (server flag, fresh installs only) reorders to:
-// install(landing) → client_setup → proxy_verify(passthrough) → paywall →
-// install(bootstrap) → post_install.
+// install → client_setup → post_install. Back buttons can jump backwards. The
+// install step doubles as the pre-install landing. The post-install screen
+// carries the per-tool "restart, then send the starter prompt" rows that used
+// to be a separate proxy_verify stage (removed 2026-09-10: the gate produced
+// the "is it broken?" support emails it was meant to prevent).
 export type LauncherStage =
   | "install"
   | "client_setup"
-  | "proxy_verify"
   | "paywall"
   | "post_install";
 
@@ -52,7 +50,7 @@ export type InstallWizardStep = (typeof INSTALL_WIZARD_STEPS)[number];
 export type LauncherAutoConfigureDecision =
   | "show_client_setup"
   | "apply_client_setup"
-  | "begin_proxy_verification";
+  | "begin_post_install";
 
 /// Step the launcher's auto-configure flow should take next, given a fresh
 /// connector probe. The component is responsible for performing the IPC
@@ -60,7 +58,7 @@ export type LauncherAutoConfigureDecision =
 export type AutoConfigureStep =
   | { kind: "show_client_setup" }
   | { kind: "apply"; clientIds: string[] }
-  | { kind: "begin_proxy_verification" };
+  | { kind: "begin_post_install" };
 
 export interface ProxyVerificationRowState {
   clientId: string;
@@ -164,7 +162,7 @@ export function getLauncherAutoConfigureDecision(
   if (installed.some((connector) => !connector.enabled)) {
     return "apply_client_setup";
   }
-  return "begin_proxy_verification";
+  return "begin_post_install";
 }
 
 /// Copy for the launcher's magic-link screen (headroom://auth). Success has no
@@ -232,23 +230,23 @@ export function nextAutoConfigureStep(
     }
     return { kind: "apply", clientIds };
   }
-  return { kind: "begin_proxy_verification" };
+  return { kind: "begin_post_install" };
 }
 
 /// Second step of the launcher's auto-configure flow: after the apply IPC
-/// resolved, decide whether to advance to proxy verification or bail back to
+/// resolved, decide whether to advance to the post-install screen or bail back to
 /// the manual setup screen. Reuses `nextAutoConfigureStep`'s decision branch
 /// since the post-apply state is just a re-evaluation of the connector probe.
 export function nextAutoConfigureStepAfterApply(
   postApplyDecision: LauncherAutoConfigureDecision
 ): AutoConfigureStep {
-  if (postApplyDecision === "begin_proxy_verification") {
-    return { kind: "begin_proxy_verification" };
+  if (postApplyDecision === "begin_post_install") {
+    return { kind: "begin_post_install" };
   }
   return { kind: "show_client_setup" };
 }
 
-/// How long an agent can go untouched before the verify screen stops asking
+/// How long an agent can go untouched before the post-install rows stop asking
 /// the user to prove it works. Long enough to cover a weekend, short enough
 /// that a tool the user has genuinely moved on from drops out.
 export const PROXY_VERIFY_IDLE_AFTER_SECONDS = 7 * 24 * 60 * 60;
@@ -280,43 +278,6 @@ export function testableProxyVerificationRows(
   return rows.filter((row) => row.state !== "idle");
 }
 
-/// The verify screen's background config check, folded into one line. It
-/// replaces a "Check my setup" button whose pass message sat next to a "Skip
-/// for now" button and read as failure anyway: two support cases in three days
-/// (2026-09-08, 2026-09-10) were healthy installs whose users could not tell.
-export function summarizeSetupCheck(
-  results: { name: string; verification: ClientSetupVerification | null }[]
-): { ok: boolean; lines: string[] } {
-  const unreadable = results.filter((result) => result.verification === null);
-  if (unreadable.length > 0) {
-    return {
-      ok: false,
-      lines: [
-        `Could not read the setup for ${formatConnectorNameList(
-          unreadable.map((result) => result.name)
-        )}.`
-      ]
-    };
-  }
-  const failures = results.flatMap(({ name, verification }) =>
-    verification && !verification.verified
-      ? verification.failures.map((failure) => `${name}: ${failure}`)
-      : []
-  );
-  if (failures.length > 0) {
-    return { ok: false, lines: failures };
-  }
-  if (!results.some(({ verification }) => verification?.proxyReachable)) {
-    return {
-      ok: false,
-      lines: [
-        "Your tools are pointed at Headroom, but it is not answering on 127.0.0.1:6767 yet. This usually clears within a minute."
-      ]
-    };
-  }
-  return { ok: true, lines: [] };
-}
-
 /// What the row says while it waits. It has to distinguish "your tool is
 /// still holding the old settings" from "you have not opened it" -- a support
 /// case (2026-09-08) sat 2h42m on a copy that could not. It does NOT count
@@ -333,9 +294,9 @@ export function proxyVerificationRowMessage(
     return `Not used on this machine recently, so there is nothing to test. ${row.name} is still set up.`;
   }
   if (runningSessions > 0) {
-    return `Still open with the old settings. Quit and reopen ${row.name}, then send it any message.`;
+    return `Still open with the old settings. Quit and reopen ${row.name}, then send it the prompt below.`;
   }
-  return `Open ${row.name} and send it any message.`;
+  return `Open ${row.name} and send it the prompt below.`;
 }
 
 export function buildInitialProxyVerificationRows(
