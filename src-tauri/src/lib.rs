@@ -5105,11 +5105,6 @@ async fn apply_client_setup(
     }
 }
 
-#[tauri::command]
-async fn verify_client_setup(client_id: String) -> Result<ClientSetupVerification, String> {
-    client_adapters::verify_client_setup(&client_id).map_err(|err| err.to_string())
-}
-
 /// Watchdog-driven silent self-heal (see `client_adapters::repair_client_setups`).
 /// Skipped while the runtime is paused or bypassed: the pricing gate and the
 /// watchdog give-up path tear client configs down on purpose, and repairing
@@ -6397,7 +6392,6 @@ pub fn run() {
             get_transformations_feed,
             start_headroom_learn,
             apply_client_setup,
-            verify_client_setup,
             repair_client_setups,
             detect_unrouted_clients,
             detect_oss_remnants,
@@ -7170,10 +7164,23 @@ fn learn_failure_is_agent_model_rejected(text: &str) -> bool {
 /// retry event carries `retry_delay_ms`, `attempt` and a session UUID, and the
 /// failure signature is built from that line, so every storm opened a brand
 /// new issue.
+///
+/// Every retry line has to be statusless, not just one of them: a run that
+/// blipped statuslessly and THEN failed on a real 400 carries both shapes, and
+/// an `any()` over the null one would suppress the report we most need. One
+/// retry around a real status anywhere disqualifies the whole run.
 fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
-    text.lines().any(|line| {
-        line.contains("\"subtype\":\"api_retry\"") && line.contains("\"error_status\":null")
-    })
+    let mut statusless = false;
+    for line in text
+        .lines()
+        .filter(|line| line.contains("\"subtype\":\"api_retry\""))
+    {
+        if !line.contains("\"error_status\":null") {
+            return false;
+        }
+        statusless = true;
+    }
+    statusless
 }
 
 /// The user-facing remedy for [`learn_failure_is_agent_api_unreachable`].
@@ -12204,6 +12211,11 @@ Some unrelated content.
         // built too long) and must keep reporting.
         let ours = "{\"type\":\"system\",\"subtype\":\"api_retry\",\"attempt\":1,\"max_retries\":10,\"error_status\":400,\"error\":\"prompt is too long\"}";
         assert!(!learn_failure_is_agent_api_unreachable(ours));
+        // Mixed: a statusless blip, then the real 400. The run is still OURS,
+        // so the null line must not buy it a suppression.
+        assert!(!learn_failure_is_agent_api_unreachable(&format!(
+            "{storm}{ours}\n"
+        )));
         for stderr in [
             "LLM analysis failed: `claude -p` did not respond within 120s.",
             "API Error: 400 status code (no body)",

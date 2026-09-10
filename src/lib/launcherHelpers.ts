@@ -274,14 +274,6 @@ export function markIdleProxyVerificationRows(
   return marked.sort((a, b) => Number(a.state === "idle") - Number(b.state === "idle"));
 }
 
-/// The rows the screen is actually testing. An idle connector is shown but not
-/// counted, so one dormant tool cannot withhold the success button.
-export function testableProxyVerificationRows(
-  rows: ProxyVerificationRowState[]
-): ProxyVerificationRowState[] {
-  return rows.filter((row) => row.state !== "idle");
-}
-
 /// What the row says while it waits. It has to distinguish "your tool is
 /// still holding the old settings" from "you have not opened it" -- a support
 /// case (2026-09-08) sat 2h42m on a copy that could not. It does NOT count
@@ -315,15 +307,4 @@ export function buildInitialProxyVerificationRows(
       state: "processing",
       message: `Waiting for a ${connector.name} prompt...`
     }));
-}
-
-/// Join connector names for the skip warning on the proxy-verify step. Up to
-/// four connectors can be enabled at once, so a plain `join(" and ")` mangles
-/// the 3+ case. `Intl.ListFormat` does this properly but needs an ES2021 lib,
-/// and one warning line is not worth raising the whole project's target.
-export function formatConnectorNameList(names: string[]): string {
-  if (names.length <= 1) {
-    return names.join("");
-  }
-  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }

@@ -203,9 +203,16 @@ fn transport_cause_chain(err: &reqwest::Error) -> String {
         parts.push(cause.to_string());
         source = cause.source();
     }
-    let mut chain = parts.join(" <- ");
-    chain.truncate(400);
-    chain
+    // A cause can be a filesystem one (a client cert, a CA bundle path), and
+    // this is the one place a raw OS string leaves the machine unbridged --
+    // the log bridge's scrub does not apply to an explicit extra.
+    // Bounded by CHARS, not bytes: `String::truncate` panics when the byte
+    // index is not a char boundary, and a localized Windows OS error message
+    // is exactly the multibyte text that would land one mid-character.
+    crate::logging::scrub_home(&parts.join(" <- "))
+        .chars()
+        .take(400)
+        .collect()
 }
 
 /// (action, kind) pairs that have already reported a TRANSIENT transport
@@ -6407,7 +6414,10 @@ mod tests {
         // the only thing that tells them apart in Sentry.
         let chain = super::transport_cause_chain(&connect);
         assert!(chain.len() > connect.to_string().len(), "chain: {chain}");
-        assert!(chain.len() <= 400, "chain must stay bounded: {chain}");
+        assert!(
+            chain.chars().count() <= 400,
+            "chain must stay bounded: {chain}"
+        );
     }
 
     #[test]

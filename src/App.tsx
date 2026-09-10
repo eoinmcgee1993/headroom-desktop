@@ -5492,8 +5492,8 @@ export default function App() {
             {claudeDesktopInstalled ? (
               <p className="install-progress__notice">
                 <strong>You have the Claude Desktop app, but Headroom cannot work with it.</strong>{" "}
-                Due to design decision by Anthropic, we are unable to inject our compression logic.
-                Instead, please use Claude Code in your terminal or in VS Code
+                Due to design decisions by Anthropic, we are unable to apply our compression logic.
+                Instead, please use Claude Code in your terminal or in VS Code.
               </p>
             ) : (
               <p>
@@ -5931,9 +5931,15 @@ export default function App() {
     // pre-setup settings.
     // "Skip for now" on the no-clients screen lands here with nothing
     // connected; the restart-and-paste instructions would be a lie.
-    const hasConnectedAgent = aggregateClientConnectors(connectors).some(
-      (connector) => connector.enabled && connector.installed
-    );
+    // An EMPTY list means "not probed yet", not "no agent": `connectors` starts
+    // empty and `beginPostInstallStep` falls back to it when `fetchConnectors`
+    // throws, so one transient IPC error would otherwise tell a correctly
+    // configured machine it has no coding agent. Claiming that needs evidence.
+    const hasConnectedAgent =
+      connectors.length === 0 ||
+      aggregateClientConnectors(connectors).some(
+        (connector) => connector.enabled && connector.installed
+      );
     const restartRows =
       proxyVerificationRows.length > 0 ? (
         <div className="connector-list">

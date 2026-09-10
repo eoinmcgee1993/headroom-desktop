@@ -3501,7 +3501,8 @@ fn retag_codex_thread_providers(from: &str, to: &str) {
 /// The environmental causes stay dropped (a DB the user's disk corrupted is
 /// not ours to fix, RUST-95/96), but a real one anywhere in the pass still
 /// reports: a lock outliving `busy_timeout` is how we would learn that
-/// assumption went stale.
+/// assumption went stale. Capped at one event per class per session by
+/// `claim_retag_skip_report_slot`.
 fn codex_retag_skip_class(reasons: &[String]) -> Option<&'static str> {
     reasons.iter().find_map(|reason| {
         let lower = reason.to_ascii_lowercase();
@@ -3515,10 +3516,31 @@ fn codex_retag_skip_class(reasons: &[String]) -> Option<&'static str> {
     })
 }
 
+/// Skip classes already reported this session, so the event stays a HOST
+/// count. A retag pass runs on every app launch and every quit, and
+/// `busy_timeout` is 750ms -- which a Codex actively writing its own store
+/// blows past routinely. Without this the one condition files a Warning per
+/// launch, forever, on every user who keeps Codex open. Same shape as
+/// `claim_transient_report_slot` in pricing.rs.
+static RETAG_SKIP_REPORTED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn claim_retag_skip_report_slot(class: &'static str) -> bool {
+    let mut seen = RETAG_SKIP_REPORTED.lock().unwrap_or_else(|e| {
+        // A poisoned lock must not silence reporting outright.
+        RETAG_SKIP_REPORTED.clear_poison();
+        e.into_inner()
+    });
+    seen.insert(class)
+}
+
 fn report_codex_retag_skips(reasons: &[String]) {
     let Some(class) = codex_retag_skip_class(reasons) else {
         return;
     };
+    if !claim_retag_skip_report_slot(class) {
+        return;
+    }
     let sample: Vec<String> = {
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for reason in reasons {
@@ -6859,14 +6881,15 @@ pub(crate) fn claude_desktop_installed() -> bool {
     let mut candidates = vec![
         PathBuf::from("/Applications/Claude.app"),
         home.join("Applications").join("Claude.app"),
-        home.join("Library")
-            .join("Application Support")
-            .join("Claude"),
     ];
-    for (var, sub) in [("LOCALAPPDATA", "AnthropicClaude"), ("APPDATA", "Claude")] {
-        if let Some(base) = std::env::var_os(var) {
-            candidates.push(PathBuf::from(base).join(sub));
-        }
+    // The Squirrel install root, which uninstall removes. Deliberately NOT the
+    // Electron userData dirs (`~/Library/Application Support/Claude`,
+    // `%APPDATA%\Claude`): those outlive an uninstall, so they would tell a
+    // former user we cannot work with an app they already deleted. Missing an
+    // install in a non-standard location is the safe direction -- the copy is
+    // an extra explanation and its absence leaves the correct generic text.
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(base).join("AnthropicClaude"));
     }
     candidates.iter().any(|path| path.exists())
 }
@@ -7329,6 +7352,21 @@ mod tests {
             Some("locked")
         );
         assert_eq!(codex_retag_skip_class(&[]), None);
+    }
+
+    /// A retag pass runs on every launch AND every quit, and a Codex that is
+    /// open holds its own store past `busy_timeout` routinely -- so without a
+    /// per-session cap the one condition files a Warning per launch forever.
+    /// The event has to stay a HOST count.
+    #[test]
+    fn a_retag_skip_class_reports_once_per_session() {
+        use super::claim_retag_skip_report_slot;
+        // Slug is deliberately not one of the real classes: the static is
+        // process-global, so a real one would couple this to run order.
+        assert!(claim_retag_skip_report_slot("test-only-class"));
+        assert!(!claim_retag_skip_report_slot("test-only-class"));
+        // A different class is still worth one event of its own.
+        assert!(claim_retag_skip_report_slot("test-only-other"));
     }
 
     use std::collections::{BTreeMap, BTreeSet};

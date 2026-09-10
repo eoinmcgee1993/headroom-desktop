@@ -753,6 +753,18 @@ pub fn spawn(
                             // it held) — benign, just wait for it to go away.
                             // Otherwise the port is foreign; escalate once.
                             if probe_existing_intercept().await {
+                                // A Headroom IS serving 6767, so the port is
+                                // not the problem: clear whatever an earlier
+                                // iteration recorded. `bind_error` is otherwise
+                                // only cleared by a successful bind, and this
+                                // arm never binds -- so a stale "port is in
+                                // use; identifying what holds it" would stick
+                                // for the process lifetime and, through
+                                // `AppState::intercept_bind_failed`, mute the
+                                // unrouted detector, the usage nudge and the
+                                // transformations-feed canary on a machine
+                                // whose traffic is flowing fine.
+                                *bind_error.lock() = None;
                                 // Clients still reach A Headroom, so this is
                                 // benign for traffic -- but nothing in this
                                 // loop ever clears it, and a second instance

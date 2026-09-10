@@ -2,10 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildInitialProxyVerificationRows,
-  formatConnectorNameList,
   markIdleProxyVerificationRows,
   proxyVerificationRowMessage,
-  testableProxyVerificationRows,
   PROXY_VERIFY_IDLE_AFTER_SECONDS,
   getClaudeConnector,
   getContactRequestValidationError,
@@ -311,20 +309,7 @@ describe("launcher helpers", () => {
   });
 });
 
-describe("formatConnectorNameList", () => {
-  // Feeds the proxy-verify skip warning, which names the connectors that never
-  // checked in. Four can be enabled at once, so the 3+ case is real.
-  it("reads naturally at every connector count", () => {
-    expect(formatConnectorNameList([])).toBe("");
-    expect(formatConnectorNameList(["Claude Code"])).toBe("Claude Code");
-    expect(formatConnectorNameList(["Claude Code", "Codex"])).toBe("Claude Code and Codex");
-    expect(formatConnectorNameList(["Claude Code", "Codex", "OpenCode"])).toBe(
-      "Claude Code, Codex and OpenCode"
-    );
-  });
-});
-
-describe("proxy verification rows the screen should not be testing", () => {
+describe("idle marking and row order", () => {
   const row = (clientId: string, state: "processing" | "verified" | "idle" = "processing") => ({
     clientId,
     name: clientId === "codex" ? "ChatGPT" : "Claude Code",
@@ -341,7 +326,6 @@ describe("proxy verification rows the screen should not be testing", () => {
     });
 
     expect(rows.map((entry) => entry.state)).toEqual(["processing", "idle"]);
-    expect(testableProxyVerificationRows(rows).map((entry) => entry.clientId)).toEqual(["codex"]);
   });
 
   it("sinks idle rows below the ones the user still has to restart", () => {
