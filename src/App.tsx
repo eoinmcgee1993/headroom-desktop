@@ -4887,18 +4887,6 @@ export default function App() {
 
   const headroomTool = dashboard.tools.find((tool) => tool.id === "headroom");
   const headroomVersion = headroomTool?.version ?? "Unknown";
-  const lifetimeTotalTokensSent = dashboard.dailySavings.reduce(
-    (sum, point) => sum + point.totalTokensSent,
-    0
-  );
-  const lifetimeTotalTokensBeforeOptimization =
-    lifetimeTotalTokensSent + dashboard.lifetimeEstimatedTokensSaved;
-  const headroomLifetimeSavingsPct =
-    lifetimeTotalTokensBeforeOptimization > 0
-      ? (dashboard.lifetimeEstimatedTokensSaved /
-          lifetimeTotalTokensBeforeOptimization) *
-        100
-      : null;
   // Paired context for the savings headline. The headline rate dilutes as the
   // client's prompt caching improves, because cache reads sit in its
   // denominator while compression deliberately never touches the cached
@@ -4911,11 +4899,18 @@ export default function App() {
   // feeds it the lifetime breakdown as a single synthetic bucket;
   // cacheReadTokens is used only as an existence signal for coverage, never
   // ratioed against our own token counts.
+  //
+  // The numerator is compression ALONE, not lifetimeEstimatedSavingsUsd. That
+  // three-layer total also carries output shaping and tool-schema deferral,
+  // neither of which removes input, so pairing it with an input-cost
+  // denominator made all-time read above the two rows beside it (measured
+  // 2026-09-10: 17.0% against 11.6% this month, 2.2pp of the gap being the
+  // extra layers rather than better compression). Same layer as the windowed
+  // rows now, so the three are comparable.
   const cachePairAllTime = allTimeCacheHitPair(
     dashboard.savingsBreakdown,
-    dashboard.lifetimeEstimatedSavingsUsd
+    dashboard.savingsBreakdown?.compressionSavingsUsd ?? 0
   );
-  const compressionOfRestPct = cachePairAllTime?.compressedPct ?? null;
   // Same pair for the shorter windows, from the buckets that carry cache
   // coverage (backend history checkpoints; local-tracker buckets and days
   // aged out of retention are excluded from both rates). The all-time row
@@ -8127,13 +8122,6 @@ export default function App() {
                   <div className="runtime-status__meta">
                     <span className="runtime-status__section-title">
                       Headroom CLI ({headroomVersion})
-                      {(compressionOfRestPct ?? headroomLifetimeSavingsPct) !== null ? (
-                        <span className="runtime-status__section-context">
-                          {" "}
-                          ({percent1((compressionOfRestPct ?? headroomLifetimeSavingsPct)!)}% of
-                          billable input removed all-time)
-                        </span>
-                      ) : null}
                     </span>
                   </div>
                   <div className="runtime-status__grid runtime-status__grid--4">
