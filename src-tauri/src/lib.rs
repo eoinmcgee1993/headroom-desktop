@@ -3636,6 +3636,11 @@ fn get_client_local_activity_ages(
 /// (the callout just stays quiet); false positives are not, so matching is
 /// strict on the executable/script basename.
 #[tauri::command]
+fn claude_desktop_installed() -> bool {
+    client_adapters::claude_desktop_installed()
+}
+
+#[tauri::command]
 fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize> {
     #[cfg(windows)]
     {
@@ -6356,6 +6361,7 @@ pub fn run() {
             get_intercept_request_counts_by_agent,
             get_running_agent_process_counts,
             get_client_local_activity_ages,
+            claude_desktop_installed,
             get_gated_bypass_bytes,
             install_claude_code_cli,
             get_launch_flags,

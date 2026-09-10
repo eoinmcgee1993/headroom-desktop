@@ -1623,6 +1623,9 @@ export default function App() {
   const [openConnectorWarningId, setOpenConnectorWarningId] = useState<string | null>(null);
   const [connectorsBusy, setConnectorsBusy] = useState(false);
   const [claudeInstallBusy, setClaudeInstallBusy] = useState(false);
+  // Claude Desktop on disk. It is not a client we can route (host-managed
+  // provider env), so the no-clients and no-agent copy has to say so.
+  const [claudeDesktopInstalled, setClaudeDesktopInstalled] = useState(false);
   const [connectorPhase, setConnectorPhase] = useState<"disabled" | "verifying" | "healthy">(
     () => (isConnectorTrafficVerified() ? "healthy" : "verifying")
   );
@@ -2558,6 +2561,9 @@ export default function App() {
   useEffect(() => {
     if (windowLabel !== "launcher") return;
     void invoke("prefetch_bootstrap_artifacts").catch(() => {});
+    void invoke<boolean>("claude_desktop_installed")
+      .then(setClaudeDesktopInstalled)
+      .catch(() => {});
   }, [windowLabel]);
 
   // One beacon per launcher stage the user reaches. Single source for the
@@ -5473,11 +5479,20 @@ export default function App() {
         >
           <div className="post-install__lead">
             <h1>Install a coding agent first</h1>
-            <p>
-              Headroom saves tokens by routing an AI coding tool you already use
-              through its local proxy, and no supported tool was found on this
-              machine. Install Claude Code, sign in, then check again.
-            </p>
+            {claudeDesktopInstalled ? (
+              <p className="install-progress__notice">
+                <strong>The Claude Desktop app was found, but Headroom cannot work with it.</strong>{" "}
+                Anthropic pins the Claude Code built into the desktop app to its own servers,
+                so nothing Headroom configures reaches it. Claude Code in your terminal or in
+                VS Code runs on the same subscription and works fully. Install it below.
+              </p>
+            ) : (
+              <p>
+                Headroom saves tokens by routing an AI coding tool you already use
+                through its local proxy, and no supported tool was found on this
+                machine. Install Claude Code, sign in, then check again.
+              </p>
+            )}
             <div className="install-prompt" role="status">
               <header className="install-prompt__head">
                 <span className="install-prompt__icon" aria-hidden="true">
@@ -5524,10 +5539,12 @@ export default function App() {
               Also works with ChatGPT Codex, OpenCode, and Grok. Install any of
               them, then check again.
             </p>
-            <p>
-              Note: unfortunately Headroom does not work with the Claude Desktop
-              app due to design decisions by Anthropic.
-            </p>
+            {claudeDesktopInstalled ? null : (
+              <p>
+                Note: unfortunately Headroom does not work with the Claude Desktop
+                app due to design decisions by Anthropic.
+              </p>
+            )}
             {connectorsError ? (
               <p className="install-progress__error">{connectorsError}</p>
             ) : null}
@@ -5903,6 +5920,11 @@ export default function App() {
     // entries from an upgrade start empty). Shown whether or not savings
     // already exist: a re-run after a first prompt still has tools holding
     // pre-setup settings.
+    // "Skip for now" on the no-clients screen lands here with nothing
+    // connected; the restart-and-paste instructions would be a lie.
+    const hasConnectedAgent = aggregateClientConnectors(connectors).some(
+      (connector) => connector.enabled && connector.installed
+    );
     const restartRows =
       proxyVerificationRows.length > 0 ? (
         <div className="connector-list">
@@ -5947,7 +5969,18 @@ export default function App() {
       >
         <div className="post-install__lead">
           <h1>Headroom is now running</h1>
-          {awaitingFirstSavings ? (
+          {awaitingFirstSavings && !hasConnectedAgent ? (
+            <div className="post-install__checklist">
+              <p>
+                No coding agent is connected yet, so Headroom has nothing to optimize.
+                Install Claude Code or Codex, then connect it from the Back button here or
+                later from the Headroom window.
+                {claudeDesktopInstalled
+                  ? " The Claude Desktop app does not count: Anthropic pins its built-in Claude Code to its own servers, so Headroom cannot route it."
+                  : ""}
+              </p>
+            </div>
+          ) : awaitingFirstSavings ? (
             <div className="post-install__checklist">
               <p>
                 In order to start using Headroom you first need to restart your AI Agents.

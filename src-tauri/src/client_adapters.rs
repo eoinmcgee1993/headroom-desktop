@@ -5997,6 +5997,7 @@ fn is_headroom_proxy_reachable() -> bool {
 
 fn probe_headroom_proxy() -> bool {
     let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_millis(500))
         .build()
     {
@@ -6847,6 +6848,27 @@ fn grok_home() -> PathBuf {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".grok"))
+}
+
+/// Claude Desktop is not a supported client: its bundled Claude Code pins
+/// provider routing to the host, so nothing Headroom configures reaches it.
+/// A machine that has only it installed still deserves to hear that in words
+/// rather than a generic "no coding tool found". Presence only, no version.
+pub(crate) fn claude_desktop_installed() -> bool {
+    let home = home_dir();
+    let mut candidates = vec![
+        PathBuf::from("/Applications/Claude.app"),
+        home.join("Applications").join("Claude.app"),
+        home.join("Library")
+            .join("Application Support")
+            .join("Claude"),
+    ];
+    for (var, sub) in [("LOCALAPPDATA", "AnthropicClaude"), ("APPDATA", "Claude")] {
+        if let Some(base) = std::env::var_os(var) {
+            candidates.push(PathBuf::from(base).join(sub));
+        }
+    }
+    candidates.iter().any(|path| path.exists())
 }
 
 fn detect_claude_code_client(configured: bool) -> ClientStatus {
