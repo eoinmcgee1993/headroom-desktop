@@ -5082,11 +5082,10 @@ fn build_codex_guard_script() -> String {
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 
 try:
     import tomllib
@@ -5096,7 +5095,7 @@ except ModuleNotFoundError:
 CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or (pathlib.Path.home() / ".codex"))
 CONFIG = CODEX_HOME / "config.toml"
 BASE_URL = "{base}"
-READYZ = "{readyz}"
+ADDR = ("127.0.0.1", 6767)
 # stderr fires every invocation; the macOS notification is rate-limited so an
 # app restart doesn't produce a storm of alerts.
 DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
@@ -5163,14 +5162,14 @@ def load_config():
 
 
 def probe():
-    # Any HTTP response means our server answered -- the app is up. A 503 during
-    # bypass mode is still "up", so only connection errors / timeouts count as down.
+    # A TCP accept on the intercept port means the desktop app is up. Not an
+    # HTTP round trip: /readyz is forwarded to the Python backend, which under
+    # heavy multi-agent load can miss a 2s window while perfectly healthy, and
+    # that false "down" surfaced as a SessionStart hook error in Claude Code.
     try:
-        urllib.request.urlopen(READYZ, timeout=2)
+        socket.create_connection(ADDR, timeout=2).close()
         return True
-    except urllib.error.HTTPError:
-        return True
-    except Exception:
+    except OSError:
         return False
 
 
@@ -5215,7 +5214,6 @@ if __name__ == "__main__":
     raise SystemExit(main())
 "##,
         base = HEADROOM_OPENAI_BASE_URL,
-        readyz = "http://127.0.0.1:6767/readyz",
     )
 }
 
@@ -5480,14 +5478,13 @@ fn build_claude_guard_script() -> String {
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 
 BASE_URL = "{base}"
-READYZ = "{readyz}"
+ADDR = ("127.0.0.1", 6767)
 # stderr fires every invocation; the macOS notification is rate-limited so an
 # app restart doesn't produce a storm of alerts.
 DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
@@ -5520,14 +5517,14 @@ def notify(message):
 
 
 def probe():
-    # Any HTTP response means our server answered -- the app is up. A 503 during
-    # bypass mode is still "up", so only connection errors / timeouts count as down.
+    # A TCP accept on the intercept port means the desktop app is up. Not an
+    # HTTP round trip: /readyz is forwarded to the Python backend, which under
+    # heavy multi-agent load can miss a 2s window while perfectly healthy, and
+    # that false "down" surfaced as a SessionStart hook error in Claude Code.
     try:
-        urllib.request.urlopen(READYZ, timeout=2)
+        socket.create_connection(ADDR, timeout=2).close()
         return True
-    except urllib.error.HTTPError:
-        return True
-    except Exception:
+    except OSError:
         return False
 
 
@@ -5596,7 +5593,6 @@ if __name__ == "__main__":
     raise SystemExit(main())
 "##,
         base = HEADROOM_ANTHROPIC_BASE_URL,
-        readyz = "http://127.0.0.1:6767/readyz",
     )
 }
 
@@ -12229,9 +12225,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     fn claude_guard_script_is_diagnostic_and_reachable_tolerates_any_response() {
         let script = build_claude_guard_script();
-        // reachable() no longer flags a 503-during-bypass as "app down".
+        // reachable() is a TCP accept on the intercept port: an HTTP probe is
+        // forwarded to the backend and reads "down" under load (false
+        // SessionStart hook errors), and a 503-during-bypass is still "up".
         assert!(!script.contains("return response.status < 500"));
-        assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
+        assert!(!script.contains("urllib"));
+        assert!(script.contains("socket.create_connection(ADDR, timeout=2).close()"));
         // main() explains WHY instead of the flat "is not" message.
         assert!(script.contains("def diagnose_route"));
         assert!(script.contains("overrides Headroom's route"));
@@ -12250,7 +12249,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn codex_guard_script_names_actual_values_and_tolerates_any_response() {
         let script = build_codex_guard_script();
         assert!(!script.contains("return response.status < 500"));
-        assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
+        assert!(!script.contains("urllib"));
+        assert!(script.contains("socket.create_connection(ADDR, timeout=2).close()"));
         // Messages include the actual found value, not just "is not headroom".
         assert!(script.contains("(expected \"headroom\")"));
         assert!(script.contains("(expected \" + BASE_URL + \")"));

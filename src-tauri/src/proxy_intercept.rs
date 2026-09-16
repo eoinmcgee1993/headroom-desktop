@@ -1295,19 +1295,15 @@ async fn handle(
     }
 
     // Route Grok through the backend's per-request upstream selection: the
-    // backend's OpenAI handler honours `x-headroom-base-url` (verified live
-    // against api.x.ai with bearer passthrough), so grok traffic gets the
-    // full compression pipeline and the correct upstream from the shared
-    // backend instance. Stamped BEFORE the bypass branches below so the
+    // backend's OpenAI handler honours `x-headroom-base-url`, so grok traffic
+    // gets the full compression pipeline and the correct upstream from the
+    // shared backend instance. Stamped BEFORE the bypass branches below so the
     // no-direct-upstream 503 guard covers grok too - the direct forwarder
     // only knows the Anthropic/OpenAI bases, and forwarding an xAI key to
     // api.openai.com is the exact misroute this connector was blocked on.
     if is_grok {
-        stamp_request_header(
-            &mut buf,
-            "x-headroom-base-url",
-            b"x-headroom-base-url: https://api.x.ai\r\n",
-        );
+        let upstream = grok_upstream_header(extract_bearer(&buf).as_deref());
+        stamp_request_header(&mut buf, "x-headroom-base-url", upstream);
         stamp_client_header(&mut buf, b"X-Client: grok_build\r\n");
     }
 
@@ -3190,6 +3186,21 @@ fn stamp_client_header(buf: &mut Vec<u8>, header_line: &'static [u8]) {
     stamp_request_header(buf, "x-client", header_line);
 }
 
+/// The upstream a Grok Build request belongs to, keyed on its credential.
+/// `grok login` stores an auth.x.ai OIDC session token (a JWT) and the CLI's
+/// own default base for that mode is `cli-chat-proxy.grok.com/v1`; api.x.ai
+/// only accepts `xai-` API keys and answers the session token 401, which the
+/// CLI surfaces as "not signed in" (user report 2026-09-16: Grok worked only
+/// with Headroom stopped). Anything that is not an API key takes the CLI's
+/// default, so a missing bearer (the /v1/settings startup probe) does too.
+fn grok_upstream_header(bearer: Option<&str>) -> &'static [u8] {
+    if bearer.is_some_and(|t| t.starts_with("xai-")) {
+        b"x-headroom-base-url: https://api.x.ai\r\n"
+    } else {
+        b"x-headroom-base-url: https://cli-chat-proxy.grok.com\r\n"
+    }
+}
+
 /// Append `header_line` as the last request header unless a header named
 /// `guard_name` is already present. No-op if the terminator is missing.
 fn stamp_request_header(buf: &mut Vec<u8>, guard_name: &str, header_line: &'static [u8]) {
@@ -3407,13 +3418,14 @@ mod tests {
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
         codex_error_summary, codex_snapshot_from_usage_payload, codex_window_label,
         decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
-        intercept_request_counts, is_client_probe_path, is_codex_request_head,
-        is_codex_sse_response, is_geo_blocked_codex_error, is_hop_by_hop_request_header,
-        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
-        is_prompt_request_head, is_reportable_upstream_error, os_error_key,
-        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
-        response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        grok_upstream_header, intercept_request_counts, is_client_probe_path,
+        is_codex_request_head, is_codex_sse_response, is_geo_blocked_codex_error,
+        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
+        is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        is_reportable_upstream_error, os_error_key, parse_codex_rate_limit_headers,
+        parse_request_head, parse_response_status, read_http_headers, request_has_header,
+        request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
+        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, should_report_upstream_error,
         stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
         stamp_request_header, strip_request_header, verdict_permits_reuse, BypassFlag,
@@ -4306,17 +4318,37 @@ mod tests {
     }
 
     #[test]
+    fn grok_upstream_follows_the_credential_kind() {
+        // `grok login` session token (auth.x.ai JWT): the CLI's own default.
+        assert_eq!(
+            grok_upstream_header(Some("eyJ0eXAiOiJhdCtqd3QifQ.x.y")),
+            b"x-headroom-base-url: https://cli-chat-proxy.grok.com\r\n"
+        );
+        // No bearer (startup /v1/settings probe): same default.
+        assert_eq!(
+            grok_upstream_header(None),
+            b"x-headroom-base-url: https://cli-chat-proxy.grok.com\r\n"
+        );
+        // xAI API key: the public API.
+        assert_eq!(
+            grok_upstream_header(Some("xai-abc123")),
+            b"x-headroom-base-url: https://api.x.ai\r\n"
+        );
+    }
+
+    #[test]
     fn stamp_request_header_grok_base_url_and_client() {
         let mut buf =
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: grok-shell/0.2.112 (macos; aarch64)\r\n\r\n{}"
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: grok-shell/0.2.112 (macos; aarch64)\r\nAuthorization: Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y\r\n\r\n{}"
                 .to_vec();
-        stamp_request_header(
-            &mut buf,
-            "x-headroom-base-url",
-            b"x-headroom-base-url: https://api.x.ai\r\n",
-        );
+        let upstream = grok_upstream_header(extract_bearer(&buf).as_deref());
+        stamp_request_header(&mut buf, "x-headroom-base-url", upstream);
         stamp_client_header(&mut buf, b"X-Client: grok_build\r\n");
         assert!(request_has_header(&buf, "x-headroom-base-url"));
+        assert_eq!(
+            extract_header_value(&buf, "x-headroom-base-url").as_deref(),
+            Some("https://cli-chat-proxy.grok.com")
+        );
         assert!(request_has_header(&buf, "x-client"));
         assert!(buf.ends_with(b"\r\n\r\n{}"), "body preserved");
         // Re-stamping must not duplicate either header.

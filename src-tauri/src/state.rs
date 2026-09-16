@@ -3338,7 +3338,11 @@ impl AppState {
         let installed = self.tool_manager.python_runtime_installed();
         let paused = self.runtime_is_paused();
         let auto_paused = self.runtime_is_auto_paused();
-        let proxy_reachable = is_headroom_proxy_reachable();
+        // Tolerant probe: this feeds the Runtime / Proxy dots and the
+        // "not hooked up" banner. The tight 1.5s probe flapped both red
+        // under heavy multi-agent load while /readyz was healthy (Windows
+        // report, 2026-09-16); the watchdog already re-probes with 5s.
+        let proxy_reachable = headroom_proxy_reachable();
         let mcp_configured = self.tool_manager.headroom_mcp_configured();
         let mcp_error = self.tool_manager.headroom_mcp_error();
         let ml_installed = self.tool_manager.headroom_ml_installed();
@@ -8139,13 +8143,17 @@ fn probe_proxy_readyz(timeout: Duration) -> bool {
         Err(_) => return false,
     };
 
-    ["127.0.0.1", "localhost"].iter().any(|host| {
-        client
-            .get(format!("http://{host}:6767/readyz"))
-            .send()
-            .map(proxy_readyz_response_is_reachable)
-            .unwrap_or(false)
-    })
+    for host in ["127.0.0.1", "localhost"] {
+        match client.get(format!("http://{host}:6767/readyz")).send() {
+            Ok(response) => return proxy_readyz_response_is_reachable(response),
+            // Accepted but slow: the same server sits behind both names, so a
+            // second leg only doubles the wait. Only a connect failure earns
+            // the localhost retry.
+            Err(err) if err.is_timeout() => return false,
+            Err(_) => continue,
+        }
+    }
+    false
 }
 
 /// Whether a `/readyz` response means the proxy is up and serving.

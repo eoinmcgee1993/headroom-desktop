@@ -8640,10 +8640,10 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 continue;
             }
 
-            // Tolerant confirmation before counting a strike. The standard
-            // reachability check (`is_headroom_proxy_reachable`) uses a tight
-            // 1.5s timeout via the 6767 intercept, and a busy backend on a
-            // contended machine can miss that window while perfectly healthy.
+            // Tolerant confirmation before counting a strike. The status
+            // probe (`headroom_proxy_reachable`, 5s via the 6767 intercept)
+            // can still miss on a busy backend on a contended machine while
+            // it is perfectly healthy; this leg goes straight to 6768.
             // (This once compounded with a `nice`-wrapped backend, dropped
             // 2026-08-17; the tolerance stays as defense in depth, since an
             // oversubscribed box starves a default-priority process too.)
