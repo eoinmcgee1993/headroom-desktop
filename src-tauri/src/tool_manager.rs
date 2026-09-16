@@ -4225,6 +4225,25 @@ impl ToolManager {
                     // The SIGABRT is uncatchable in Python; disabling xet falls
                     // back to the stable HTTPS download path.
                     .env("HF_HUB_DISABLE_XET", "1")
+                    // Copies instead of symlinks in the HF cache. Creating a
+                    // symlink on Windows needs SeCreateSymbolicLinkPrivilege
+                    // (Developer Mode or admin); without it huggingface_hub's
+                    // download dies with "[WinError 1314] a required privilege
+                    // is not held", fastembed then retries its sources with
+                    // 3s/9s/27s backoff, and because the embedder is pulled
+                    // from the lifespan startup the port is never bound --
+                    // RUST-F2, 300s auto-start timeout. hf_hub probes for
+                    // symlink support and falls back to copies on its own, but
+                    // the probe passed on that host and the real symlink still
+                    // failed, so take the probe out of the loop. Symlinks are
+                    // only a dedup optimisation; copies cost disk, not boot.
+                    .env("HF_HUB_DISABLE_SYMLINKS", "1")
+                    // Persistent embedding-model cache, same reason as
+                    // TIKTOKEN_CACHE_DIR below: fastembed defaults to
+                    // $TMPDIR/fastembed_cache, which Windows Storage Sense and
+                    // macOS both purge, so the ~130MB bge-small pull is redone
+                    // on the boot path after every cleanup.
+                    .env("FASTEMBED_CACHE_PATH", self.fastembed_cache_dir())
                     // Persistent vocab cache. tiktoken defaults to
                     // $TMPDIR/data-gym-cache, which macOS purges, so the backend
                     // re-downloads vocab files; the fetch (requests.get, no
@@ -5059,6 +5078,8 @@ impl ToolManager {
             // Same xet guard as the proxy spawn: the native hf_xet downloader
             // can SIGABRT mid-pull; the HTTPS fallback is stable.
             .env("HF_HUB_DISABLE_XET", "1")
+            // Same symlink guard as the proxy spawn (RUST-F2).
+            .env("HF_HUB_DISABLE_SYMLINKS", "1")
             // huggingface_hub 1.x downloads over httpx, which reads SSL_CERT_FILE
             // but NOT REQUESTS_CA_BUNDLE. Users behind corporate TLS inspection
             // who set REQUESTS_CA_BUNDLE (per our bootstrap remediation) got pip
@@ -5089,6 +5110,13 @@ impl ToolManager {
     /// location is not good enough).
     pub fn tiktoken_cache_dir(&self) -> PathBuf {
         self.runtime.root_dir.join("tiktoken-cache")
+    }
+
+    /// Where fastembed keeps the relevance embedding model. Under the runtime
+    /// root so it survives reboots and temp sweeps, unlike fastembed's
+    /// `$TMPDIR/fastembed_cache` default (see the proxy spawn, RUST-F2).
+    pub fn fastembed_cache_dir(&self) -> PathBuf {
+        self.runtime.root_dir.join("fastembed-cache")
     }
 
     /// Best-effort pre-download of the tiktoken vocabularies the backend
@@ -11288,31 +11316,14 @@ pub fn repair_headroom_learn_block_file(path: &Path) -> bool {
         .unwrap_or_default();
     match crate::client_adapters::atomic_write(path, repaired.as_bytes()) {
         Ok(()) => {
-            // The path, the mtime and the size are EXTRAS. Interpolated into
-            // the message they grouped per project -- RUST-ER, RUST-ES and
-            // RUST-ET are one host's three repos in the same second -- which
-            // destroys the one thing this warn exists for: a fleet count that
-            // tells a code bug (many hosts) from a hand edit (one host). The
-            // bridged twin is dropped in logging.rs; the local line keeps the
-            // path, which is what a support thread needs.
-            sentry::with_scope(
-                |scope| {
-                    scope.set_tag("flow", "learn_block_repair");
-                    scope.set_extra(
-                        "path",
-                        crate::logging::scrub_home(&path.display().to_string()).into(),
-                    );
-                    scope.set_extra("file_mtime", modified.clone().into());
-                    scope.set_extra("bytes", (content.len() as u64).into());
-                    scope.set_fingerprint(Some(&["learn_block_end_marker_restored"]));
-                },
-                || {
-                    sentry::capture_message(
-                        "learn block had no end marker; end marker restored",
-                        sentry::Level::Warning,
-                    );
-                },
-            );
+            // Local log only. The Sentry capture that sat here (fingerprint
+            // learn_block_end_marker_restored) answered its question: 64 events
+            // across nine hosts in one week (RUST-F1), every file's mtime from
+            // May to August 2026 and most of them 136 bytes -- the empty
+            // start-only block an older wheel wrote, not a live code bug. The
+            // heal is one-shot per file, so the count could only keep reopening
+            // the issue as more hosts upgraded. The bridged twin of this line
+            // is dropped in logging.rs; the path is what a support thread needs.
             log::warn!(
                 "learn block in {} had no end marker (file mtime {modified}, {} bytes); end marker restored",
                 path.display(),

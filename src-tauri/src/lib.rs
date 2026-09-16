@@ -5,7 +5,6 @@ mod bearer;
 mod claude_cli;
 mod client_adapters;
 mod device;
-mod insights;
 mod keychain;
 mod logging;
 mod memory_scrubber;
@@ -69,9 +68,9 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use crate::models::{
     ActivityFeedResponse, BillingPeriod, BootstrapFailureReport, BootstrapProgress,
     ClaudeAccountProfile, ClaudeCodeProject, ClaudeUsage, ClientConnectorStatus, ClientSetupResult,
-    ClientSetupVerification, DailySavingsPoint, DashboardState, HeadroomAuthCodeRequest,
-    HeadroomLearnPrereqStatus, HeadroomLearnStatus, HeadroomPricingStatus,
-    HeadroomSubscriptionTier, RuntimeStatus, RuntimeUpgradeProgress, TransformationFeedResponse,
+    DailySavingsPoint, DashboardState, HeadroomAuthCodeRequest, HeadroomLearnPrereqStatus,
+    HeadroomLearnStatus, HeadroomPricingStatus, HeadroomSubscriptionTier, RuntimeStatus,
+    RuntimeUpgradeProgress, TransformationFeedResponse,
 };
 use crate::state::AppState;
 
@@ -3294,6 +3293,16 @@ pub(crate) fn is_endpoint_protection_signal(text: &str) -> bool {
     // a venv that runs a moment later is an injected security-product DLL.
     // The code survives every locale.
     if lower.contains("0xc0000142") {
+        return true;
+    }
+    // CreateProcess on our own venv exe refused with ACCESS_DENIED after
+    // `retry_transient_denied` gave up on the transient-AV case: AppLocker,
+    // SRP and EDR execution blocks on %LOCALAPPDATA% all surface exactly this,
+    // and a fresh install's own ACL never does (RUST-G2/G3/G4: two corporate
+    // hosts, "Access is denied. (os error 5)"). Numeric code, so a localized
+    // "Zugriff verweigert" matches too. Scoped to the spawn context so a
+    // denied write elsewhere in a chain does not read as AV.
+    if lower.contains("starting headroom background process:") && lower.contains("(os error 5)") {
         return true;
     }
     if lower.contains("import onnxruntime failed (killed)") {
@@ -7163,6 +7172,10 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
         // RUST-EP: `You've hit your weekly limit \u{b7} resets 2am
         // (Europe/Berlin)` -- a fourth wording in three months.
         "weekly limit",
+        // RUST-FV: `You're out of usage credits. Switch to another model, or
+        // manage usage credits at claude.ai/settings/usage ...` -- a credit
+        // ceiling worded without "limit" at all.
+        "out of usage credits",
     ];
     text.lines().map(str::trim).find(|line| {
         let lower = line.to_ascii_lowercase();
@@ -7172,7 +7185,42 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
             // fifth variant to file another Error. Still anchored: a project's
             // own source line echoed back says "limit", never "hit your".
             || (lower.contains("hit your") && lower.contains("limit"))
+            // RUST-FM: `You've reached your Fable limit. Switch to another
+            // model, or manage usage credits ...` -- same family, new verb.
+            || (lower.contains("reached your") && lower.contains("limit"))
     })
+}
+
+/// The line on which the agent CLI relayed an error from its own API:
+/// `API Error: 400 status code (no body)`, `API Error: Rate limit reached`,
+/// `API Error: 502 Upstream service error ...`, `Credit balance is too low`.
+/// Whatever the status, the exchange was between the user's CLI and the
+/// user's account -- nothing we ship changes it -- and each new wording was
+/// filing its own Sentry Error (RUST-FQ, FS, FF, FN, FP, G9 in one week).
+/// Same user-environment class as [`learn_failure_is_agent_auth`]; the local
+/// learn log keeps the full stderr.
+fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| {
+        line.starts_with("API Error:")
+            || line
+                .to_ascii_lowercase()
+                .contains("credit balance is too low")
+    })
+}
+
+/// The user-facing remedy for [`learn_failure_agent_api_error_line`].
+fn learn_agent_api_error_hint(agent: LearnAgent, line: &str) -> String {
+    let (cli, command) = match agent {
+        LearnAgent::Claude => ("Claude Code", "claude"),
+        LearnAgent::Codex => ("Codex", "codex"),
+        LearnAgent::Opencode => ("opencode", "opencode"),
+        LearnAgent::Grok => ("Grok", "grok"),
+    };
+    format!(
+        "{cli}'s API refused the request (\"{line}\"), so headroom learn could not run its \
+         analysis. Start the scan again later; if it keeps failing, run `{command}` in a \
+         terminal to check the account."
+    )
 }
 
 /// The user-facing remedy for [`learn_failure_agent_limit_line`], echoing the
@@ -7229,6 +7277,11 @@ fn learn_failure_is_agent_model_rejected(text: &str) -> bool {
 /// an `any()` over the null one would suppress the report we most need. One
 /// retry around a real status anywhere disqualifies the whole run.
 fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
+    // RUST-F4: upstream's own idle watchdog (`produced no output for 180s.
+    // Check network connectivity, ...`) -- the CLI never answered at all.
+    if text.contains("produced no output for") {
+        return true;
+    }
     let mut statusless = false;
     for line in text
         .lines()
@@ -7656,10 +7709,15 @@ fn execute_headroom_learn_run(
                     // RUST-B7, fourth: the model's answer was not the JSON the
                     // analyzer asked for.
                     let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
+                    // Fifth: the CLI's own API said no (status, rate limit,
+                    // credit balance).
+                    let agent_api_error_line =
+                        learn_failure_agent_api_error_line(&stderr).map(str::to_string);
                     if !agent_not_signed_in
                         && agent_limit_line.is_none()
                         && !agent_api_unreachable
                         && !agent_unparseable
+                        && agent_api_error_line.is_none()
                     {
                         sentry::with_scope(
                             |scope| {
@@ -7725,6 +7783,11 @@ fn execute_headroom_learn_run(
                                 "headroom learn hit the agent's usage limit for {project_name}."
                             ),
                             learn_agent_limit_hint(agent, line),
+                        )
+                    } else if let Some(line) = &agent_api_error_line {
+                        (
+                            format!("headroom learn could not reach the agent's API for {project_name}."),
+                            learn_agent_api_error_hint(agent, line),
                         )
                     } else {
                         (
@@ -7848,6 +7911,8 @@ fn execute_headroom_learn_run(
                 let agent_limit_line = learn_failure_agent_limit_line(&stderr).map(str::to_string);
                 let agent_model_rejected = learn_failure_is_agent_model_rejected(&stderr);
                 let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
+                let agent_api_error_line =
+                    learn_failure_agent_api_error_line(&stderr).map(str::to_string);
                 // RUST-3F: this used to read `signature.contains(...)`, which is
                 // exactly the mistake the paragraph above warns about. Click
                 // prints its usage banner FIRST and the diagnosis LAST:
@@ -7866,6 +7931,7 @@ fn execute_headroom_learn_run(
                 let user_env_condition = path_unreadable
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
+                    || agent_api_error_line.is_some()
                     || agent_model_rejected
                     || agent_api_unreachable
                     || agent_unparseable;
@@ -7911,6 +7977,8 @@ fn execute_headroom_learn_run(
                     learn_agent_auth_hint(agent)
                 } else if let Some(line) = &agent_limit_line {
                     learn_agent_limit_hint(agent, line)
+                } else if let Some(line) = &agent_api_error_line {
+                    learn_agent_api_error_hint(agent, line)
                 } else if agent_api_unreachable {
                     learn_agent_api_unreachable_hint(agent)
                 } else if agent_unparseable {
@@ -7925,6 +7993,8 @@ fn execute_headroom_learn_run(
                     format!("headroom learn needs a signed-in agent for {project_name}.")
                 } else if agent_limit_line.is_some() {
                     format!("headroom learn hit the agent's usage limit for {project_name}.")
+                } else if agent_api_error_line.is_some() {
+                    format!("headroom learn could not reach the agent's API for {project_name}.")
                 } else if agent_unparseable {
                     format!("headroom learn could not read the analysis for {project_name}.")
                 } else {
@@ -9465,13 +9535,13 @@ mod tests {
         is_endpoint_protection_signal, is_environmental_startup_key,
         is_loopback_socket_denied_signal, is_missing_headroom_module_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
-        learn_agent_auth_hint, learn_agent_limit_hint, learn_failure_agent_limit_line,
-        learn_failure_is_agent_api_unreachable, learn_failure_is_agent_auth,
-        learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
-        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
-        noop_app_update_progress_emitter, normalize_learn_failure_signature,
-        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
-        parse_request_count_from_stats_body, parse_request_counts_by_agent,
+        learn_agent_auth_hint, learn_agent_limit_hint, learn_failure_agent_api_error_line,
+        learn_failure_agent_limit_line, learn_failure_is_agent_api_unreachable,
+        learn_failure_is_agent_auth, learn_failure_is_agent_model_rejected,
+        learn_failure_is_agent_unparseable_output, learn_failure_signature_source,
+        learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
+        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
+        parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
         physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
         readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
@@ -9630,7 +9700,6 @@ mod tests {
             tools: Vec::new(),
             clients: Vec::new(),
             recent_usage: Vec::new(),
-            insights: Vec::new(),
             required_terms_version: 1,
             accepted_terms_version: 1,
             terms_url: String::new(),
@@ -12317,7 +12386,9 @@ Some unrelated content.
 
     #[test]
     fn learn_failure_agent_limit_line_does_not_swallow_real_failures() {
-        // These must keep reporting: they are ours to fix (or transient).
+        // None of these is a usage window. The first two keep reporting; the
+        // login prompt is the auth class and the credit balance the API-error
+        // class (learn_failure_agent_api_error_line), each with its own hint.
         for stderr in [
             "LLM analysis failed: `claude -p` did not respond within 120s.",
             "Error: rate limit exceeded, try again later",
@@ -12341,6 +12412,59 @@ Some unrelated content.
         assert_eq!(learn_failure_agent_limit_line(weekly), Some(weekly));
         // The shape rule, not the needle: any future window wording.
         assert!(learn_failure_agent_limit_line("You've hit your Opus limit for today").is_some());
+    }
+
+    #[test]
+    fn learn_failure_agent_limit_line_matches_the_reached_wording() {
+        // RUST-FM verbatim.
+        let fable = "You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai/admin-settings/usage, to continue.";
+        assert_eq!(learn_failure_agent_limit_line(fable), Some(fable));
+        // RUST-FV verbatim: no "limit" in it at all.
+        let credits = "You're out of usage credits. Switch to another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.";
+        assert_eq!(learn_failure_agent_limit_line(credits), Some(credits));
+    }
+
+    #[test]
+    fn learn_failure_agent_api_error_line_matches_the_cli_api_relay() {
+        // One week of RUST-FQ/FS/FF/FN/FP/G9, verbatim: the child CLI's
+        // diagnosis on the line after upstream's marker.
+        let marker = "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\n";
+        for diagnosis in [
+            "API Error: 400 status code (no body)",
+            "API Error: Rate limit reached",
+            "API Error: 502 Upstream service error. The upstream provider is temporarily unavailable.",
+            "API Error: 404 {\"type\":\"error\",\"error\":{\"type\":\"not_found_error\"}}",
+            "Credit balance is too low",
+        ] {
+            let stderr = format!("{marker}{diagnosis}\n  Analysis failed: ...\n");
+            assert_eq!(
+                learn_failure_agent_api_error_line(&stderr),
+                Some(diagnosis),
+                "for: {diagnosis}"
+            );
+        }
+        // Not the class: our own analyzer verdicts, and a project's echoed
+        // source mentioning the words.
+        for stderr in [
+            "Usage: headroom learn [OPTIONS]",
+            "returned unparseable output. First 2000 chars:",
+            "const API_ERROR = 'API Error: fake';",
+            "Prompt is too long",
+            "",
+        ] {
+            assert!(
+                learn_failure_agent_api_error_line(stderr).is_none(),
+                "for: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn learn_failure_is_agent_api_unreachable_matches_the_idle_watchdog() {
+        // RUST-F4 verbatim: upstream's own idle timeout, no CLI output at all.
+        assert!(learn_failure_is_agent_api_unreachable(
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose` produced no output for 180s. Check network connectivity, raise HEADROOM_LEARN_CLI_IDLE_TIMEOUT_SECS, or try a different backend with --model <litellm-model-name>."
+        ));
     }
 
     #[test]
@@ -12943,6 +13067,23 @@ Some unrelated content.
         ));
         assert!(!is_endpoint_protection_signal(
             "(onnx probe: import onnxruntime failed (exit 1): ModuleNotFoundError: No module named 'onnxruntime')"
+        ));
+    }
+
+    #[test]
+    fn is_endpoint_protection_signal_matches_a_denied_backend_spawn() {
+        // RUST-G2/G3/G4 verbatim (path scrubbed): CreateProcess on our venv
+        // exe refused outright, after the transient-AV retry.
+        assert!(is_endpoint_protection_signal(
+            "starting headroom background process: ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe proxy --port 6768 --no-http2: Access is denied. (os error 5)"
+        ));
+        // Localized text, same code.
+        assert!(is_endpoint_protection_signal(
+            "starting headroom background process: ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\python.exe -m headroom.proxy.server: Zugriff verweigert (os error 5)"
+        ));
+        // A denied WRITE elsewhere in a chain is a permissions problem, not AV.
+        assert!(!is_endpoint_protection_signal(
+            "writing ~\\AppData\\Local\\Headroom\\state.json: Access is denied. (os error 5)"
         ));
     }
 

@@ -3815,12 +3815,12 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
     let end = format!("# <<< headroom:{block_id} <<<");
     let mut out = content.to_string();
     loop {
-        let (Some(start_idx), Some(end_idx)) = (out.find(&start), out.find(&end)) else {
+        let Some(start_idx) = out.find(&start) else {
             break;
         };
-        if end_idx < start_idx {
-            break; // malformed (stray end before start) — leave it alone
-        }
+        let Some(end_idx) = out[start_idx..].find(&end).map(|rel| start_idx + rel) else {
+            break;
+        };
         let tail = out[end_idx + end.len()..]
             .trim_start_matches('\n')
             .to_string();
@@ -3832,6 +3832,27 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
         }
         rebuilt.push_str(&tail);
         out = rebuilt;
+    }
+    // Stray markers. Codex's TOML writer keeps our start marker as the leading
+    // comment of `[model_providers.headroom]`, so when it drops that table the
+    // start goes with it and the trailing end marker (document trailer) stays.
+    // This used to `break` on "end before start" and leave the file alone,
+    // which made every render a no-op fixpoint and every verify a miss:
+    // hourly "still failing after re-apply" for as long as the file lived
+    // (RUST-BZ). Drop any marker line that is not part of a pair.
+    if out.contains(&start) || out.contains(&end) {
+        let had_newline = out.ends_with('\n');
+        out = out
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                line != start && line != end
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if had_newline && !out.is_empty() {
+            out.push('\n');
+        }
     }
     out
 }
@@ -4145,17 +4166,19 @@ fn find_grok_build_table(lines: &[&str]) -> Option<(usize, Option<usize>)> {
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             if trimmed == "[model.grok-build]" {
                 header_idx = Some(idx);
-            } else if header_idx.is_some() {
-                return Some((header_idx.unwrap(), None));
+            } else if let Some(header) = header_idx {
+                // Next table started: the grok-build table had no base_url.
+                return Some((header, None));
             }
             continue;
         }
-        if header_idx.is_some()
-            && trimmed
+        if let Some(header) = header_idx {
+            if trimmed
                 .split_once('=')
                 .is_some_and(|(key, _)| key.trim() == "base_url")
-        {
-            return Some((header_idx.unwrap(), Some(idx)));
+            {
+                return Some((header, Some(idx)));
+            }
         }
     }
     header_idx.map(|h| (h, None))
@@ -4903,11 +4926,17 @@ fn codex_provider_block_matches() -> Result<bool> {
 fn marker_block_contains(content: &str, block_id: &str, needle: &str) -> bool {
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
-    match (content.find(&start), content.find(&end)) {
-        (Some(start_idx), Some(end_idx)) if start_idx < end_idx => {
-            content[start_idx..end_idx].contains(needle)
-        }
-        _ => false,
+    // The end marker is searched AFTER the start. Searched from the top, a
+    // stray end marker earlier in the file read as "end before start" and the
+    // intact block behind it verified as missing on every hourly repair
+    // (RUST-BZ: 67 events, 8 hosts; see strip_marker_block for how the stray
+    // marker gets there).
+    let Some(start_idx) = content.find(&start) else {
+        return false;
+    };
+    match content[start_idx..].find(&end) {
+        Some(rel) => content[start_idx..start_idx + rel].contains(needle),
+        None => false,
     }
 }
 
@@ -11293,6 +11322,51 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(repaired, vec!["codex_cli".to_string()]);
         let healed = super::verify_client_setup("codex").expect("verify runs");
         assert!(healed.failures.is_empty(), "healed: {:?}", healed.failures);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_heals_a_stray_end_marker_left_by_a_codex_rewrite() {
+        // RUST-BZ: Codex's TOML writer carries our start marker as the
+        // leading comment of [model_providers.headroom]; dropping that table
+        // takes the start with it and leaves the trailing end marker behind.
+        // Render then saw "end before start", left the file untouched, and
+        // verify failed on every hourly repair.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "# >>> headroom:codex_cli >>>\nmodel_provider = \"headroom\"\nopenai_base_url = \"http://127.0.0.1:6767/v1\"\n# <<< headroom:codex_cli <<<\n\n[projects.\"/Users/x/app\"]\ntrust_level = \"trusted\"\n# <<< headroom:codex_cli_provider <<<\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+        let healed = super::verify_client_setup("codex").expect("verify runs");
+        assert!(healed.failures.is_empty(), "healed: {:?}", healed.failures);
+        let after = fs::read_to_string(&config_toml).unwrap();
+        assert_eq!(
+            after
+                .matches("# <<< headroom:codex_cli_provider <<<")
+                .count(),
+            1,
+            "{after}"
+        );
+        assert_eq!(
+            after.matches("[model_providers.headroom]").count(),
+            1,
+            "{after}"
+        );
+        assert!(after.contains("trust_level = \"trusted\""), "{after}");
+
+        super::apply_client_setup("codex").expect("second apply");
+        assert_eq!(
+            fs::read_to_string(&config_toml).unwrap(),
+            after,
+            "byte-stable"
+        );
     }
 
     #[test]

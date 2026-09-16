@@ -176,6 +176,41 @@ mod pre_update_snapshot_tests {
         );
     }
 
+    /// `user_day` buckets by the user's local midnight, not UTC's. The
+    /// regression this guards is a call site reverting to
+    /// `Utc::now().date_naive()`, which shifts every "today" counter by up to a
+    /// full day for anyone off UTC (build_claude_code_project's sessions_today
+    /// did exactly that).
+    ///
+    /// ponytail: inert on a UTC host (the two midnights coincide there), so CI
+    /// does not catch the revert -- only a developer or user off UTC does.
+    /// Making it deterministic everywhere needs an injectable clock timezone,
+    /// which is more machinery than the one-line call site is worth.
+    #[test]
+    fn user_day_buckets_on_local_midnight() {
+        use chrono::{Duration, Local, TimeZone, Timelike};
+
+        let local_now = Local::now();
+        let midnight = Local
+            .from_local_datetime(&local_now.date_naive().and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .expect("local midnight is unambiguous");
+        assert_eq!(midnight.hour(), 0);
+
+        // One second either side of local midnight lands on different local days.
+        let before = midnight - Duration::seconds(1);
+        let after = midnight + Duration::seconds(1);
+        assert_eq!(user_day(after), midnight.date_naive());
+        assert_eq!(user_day(before), midnight.date_naive() - Duration::days(1));
+        // And the key property: the bucket follows Local, not the instant's own
+        // timezone. `before.with_timezone(&Utc).date_naive()` is the buggy form.
+        assert_eq!(
+            user_day(before.with_timezone(&chrono::Utc)),
+            user_day(before)
+        );
+        assert_eq!(user_day_key(after), midnight.format("%Y-%m-%d").to_string());
+    }
+
     #[test]
     fn same_version_relaunch_leaves_snapshot_untouched() {
         let dir = tempfile::tempdir().unwrap();

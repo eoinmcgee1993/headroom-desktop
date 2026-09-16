@@ -1570,7 +1570,9 @@ async fn handle(
             let error_path = parsed_head
                 .as_ref()
                 .filter(|head| {
-                    !is_local_proxy_path(&head.path) && !is_client_probe_path(&head.path)
+                    is_provider_api_path(&head.path)
+                        && !is_local_proxy_path(&head.path)
+                        && !is_client_probe_path(&head.path)
                 })
                 .map(|head| head.path.clone());
             let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path);
@@ -1584,7 +1586,12 @@ async fn handle(
 /// Upper bound on a `/v1/models` response body we're willing to buffer for the
 /// lite-flag rewrite. Real model catalogs are a few KB.
 const MAX_MODELS_BODY: usize = 2 * 1024 * 1024;
-const MODELS_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle bound between body reads, not a total. The backend streams the
+/// catalog as the provider sends it, and a 10s idle gap cut a 396 KB catalog
+/// 27 times on one host (RUST-7S); a truncated read forwards the body
+/// unrewritten, which is the lite-transport breakage this rewrite exists to
+/// prevent, so waiting longer costs that user less than giving up.
+const MODELS_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Splice client <-> backend for a Codex `GET /v1/models` catalog fetch,
 /// rewriting `"use_responses_lite": true` to `false` in the JSON response so
@@ -1620,13 +1627,21 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
     if rewritable {
         let total = content_length.unwrap_or(0);
         let mut body = head.split_off(head_end);
-        while body.len() < total {
+        // WHY the read stopped short goes into the report: a backend that
+        // closed early is a backend bug, an idle timeout is the network, and
+        // "read 391424 of 396026" alone (RUST-7S) could not tell them apart.
+        let stopped_by = loop {
+            if body.len() >= total {
+                break None;
+            }
             let mut tmp = [0u8; 4096];
             match tokio::time::timeout(MODELS_BODY_READ_TIMEOUT, backend.read(&mut tmp)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(0)) => break Some("backend_eof"),
+                Ok(Err(_)) => break Some("read_error"),
+                Err(_) => break Some("idle_timeout"),
                 Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
             }
-        }
+        };
         // Bytes past `total` belong to the next keep-alive response.
         let extra = if body.len() > total {
             body.split_off(total)
@@ -1662,7 +1677,11 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
             report_models_rewrite(
                 "truncated_body",
                 sentry::Level::Warning,
-                &format!("read {} of {total} body bytes", body.len()),
+                &format!(
+                    "read {} of {total} body bytes ({})",
+                    body.len(),
+                    stopped_by.unwrap_or("short")
+                ),
             );
         }
         for part in [&head, &body, &extra] {
@@ -3219,7 +3238,21 @@ fn stamp_headroom_bypass_header(buf: &mut Vec<u8>) {
 /// is_local_proxy_path: bypass mode must keep forwarding these upstream (where
 /// /api/hello 200s), not answer 503.
 fn is_client_probe_path(path: &str) -> bool {
+    // Query stripped: the /mcp that keeps arriving (RUST-CV, two hosts)
+    // carries `?tools=web_search_exa`, so the exact match never fired.
+    let path = path.split('?').next().unwrap_or(path);
     matches!(path, "/" | "/api/hello" | "/v1/settings" | "/mcp")
+}
+
+/// Every provider a supported client reaches through us lives under `/v1/`
+/// (Anthropic /v1/messages, OpenAI /v1/responses and /v1/chat/completions,
+/// x.ai /v1/...). Anything else on our port is a client's non-provider
+/// traffic aimed at our base URL by mistake -- opencode fetching models.dev's
+/// /api.json and GitHub's /repos/.../releases/latest through us (RUST-FD,
+/// RUST-G5) -- and the "upstream error" it draws is our own backend's
+/// unrouted-path rejection, not a provider's. Not worth an issue each.
+fn is_provider_api_path(path: &str) -> bool {
+    path.starts_with("/v1/")
 }
 
 fn is_local_proxy_path(path: &str) -> bool {
@@ -3356,7 +3389,7 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("authorization:") {
-            if let Some(_) = rest.trim().strip_prefix("bearer ") {
+            if rest.trim().strip_prefix("bearer ").is_some() {
                 // Find "bearer " in the original line (case-insensitive) and
                 // return the token with its original casing intact.
                 let bearer_pos = lower.find("bearer ").unwrap_or(0) + 7;
@@ -4385,7 +4418,14 @@ mod tests {
 
     #[test]
     fn client_probe_paths_are_excluded_from_error_capture_but_not_local() {
-        for probe in ["/", "/api/hello", "/v1/settings", "/mcp"] {
+        for probe in [
+            "/",
+            "/api/hello",
+            "/v1/settings",
+            "/mcp",
+            // RUST-CV verbatim: the query is part of the request target.
+            "/mcp?tools=web_search_exa",
+        ] {
             assert!(is_client_probe_path(probe), "{probe}");
             assert!(
                 !is_local_proxy_path(probe),
@@ -4467,6 +4507,30 @@ mod tests {
         ));
         assert!(!is_missing_auth_error(b"<html>401</html>"));
         assert!(!is_missing_auth_error(b""));
+    }
+
+    #[test]
+    fn only_provider_api_paths_draw_upstream_error_reports() {
+        use super::is_provider_api_path;
+        for path in [
+            "/v1/messages",
+            "/v1/messages?beta=true",
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/v1/models",
+        ] {
+            assert!(is_provider_api_path(path), "{path}");
+        }
+        // RUST-FD (models.dev), RUST-G5 (GitHub), RUST-CV (an MCP client):
+        // never a provider, always our backend's own rejection.
+        for path in [
+            "/api.json",
+            "/repos/anomalyco/opencode/releases/latest",
+            "/mcp?tools=web_search_exa",
+            "/",
+        ] {
+            assert!(!is_provider_api_path(path), "{path}");
+        }
     }
 
     #[test]

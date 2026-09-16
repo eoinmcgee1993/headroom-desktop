@@ -44,7 +44,6 @@ export const mockDashboard: DashboardState = {
     }
   ],
   recentUsage: [],
-  insights: [],
   // Mock represents an already-accepted user so the terms gate never flashes
   // over the initial mock state before the real dashboard loads.
   requiredTermsVersion: 1,

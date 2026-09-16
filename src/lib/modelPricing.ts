@@ -17,13 +17,19 @@
 type PriceRule = { match: RegExp; usdPerMTokens: number };
 
 // Ordered most-specific → least-specific. First match wins.
+//
+// Anthropic rates verified 2026-09-10. The Opus rows matter most: Opus was
+// $15/M through 4.1, then dropped to $5/M from 4.6 onward. A single /opus/i
+// rule at 15 priced every Opus 4.6+/5 request 3x too high, and Opus is the
+// bulk of this fleet's traffic, so the feed's per-compression dollar figure
+// was inflated 3x for most users.
 const PRICE_RULES: PriceRule[] = [
-  { match: /opus-4/i, usdPerMTokens: 15 },
+  { match: /fable|mythos/i, usdPerMTokens: 10 },
+  { match: /opus-(5|4-[6-9])/i, usdPerMTokens: 5 },
   { match: /opus/i, usdPerMTokens: 15 },
-  { match: /sonnet-4/i, usdPerMTokens: 3 },
+  { match: /sonnet-5/i, usdPerMTokens: 2 },
   { match: /sonnet/i, usdPerMTokens: 3 },
-  { match: /haiku-4/i, usdPerMTokens: 1 },
-  { match: /haiku/i, usdPerMTokens: 0.8 },
+  { match: /haiku/i, usdPerMTokens: 1 },
   { match: /gpt-4o-mini/i, usdPerMTokens: 0.15 },
   { match: /gpt-4o/i, usdPerMTokens: 2.5 },
   { match: /gpt-4/i, usdPerMTokens: 2.5 },

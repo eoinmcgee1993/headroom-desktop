@@ -38,6 +38,7 @@ pub fn spawn_probe() {
 
 /// Sub-verdict from the check script's stdout: one line per agent home that
 /// exists in the distro.
+#[cfg(any(windows, test))]
 fn classify_check_output(stdout: &str) -> String {
     let mut found: Vec<&str> = Vec::new();
     for line in stdout.lines().map(str::trim) {
@@ -58,6 +59,7 @@ fn classify_check_output(stdout: &str) -> String {
 /// distros of its own that no human codes in; with only those present the
 /// machine has no WSL to speak of, and probing docker-desktop's busybox
 /// would report a confident `no_agent` for the wrong reason.
+#[cfg(any(windows, test))]
 fn user_distros(list_stdout: &str) -> Vec<String> {
     list_stdout
         .lines()
@@ -70,6 +72,7 @@ fn user_distros(list_stdout: &str) -> Vec<String> {
 /// `wsl.exe` itself prints UTF-16LE (with a BOM), while anything the distro's
 /// shell prints comes back UTF-8. Sniff the NUL pattern rather than trusting
 /// either: the two are mixed across the two calls this module makes.
+#[cfg(any(windows, test))]
 fn decode_wsl_output(bytes: &[u8]) -> String {
     let looks_utf16 =
         bytes.len() >= 2 && (bytes.starts_with(&[0xFF, 0xFE]) || (bytes[1] == 0 && bytes[0] != 0));

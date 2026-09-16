@@ -82,34 +82,6 @@ pub struct UsageEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InsightCategory {
-    Savings,
-    Workflow,
-    Health,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InsightSeverity {
-    Info,
-    Warning,
-    Critical,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DailyInsight {
-    pub id: String,
-    pub category: InsightCategory,
-    pub severity: InsightSeverity,
-    pub title: String,
-    pub recommendation: String,
-    pub evidence: String,
-    pub related_workspace: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ClientHealth {
     Healthy,
     Attention,
@@ -381,7 +353,6 @@ pub struct DashboardState {
     pub tools: Vec<ManagedTool>,
     pub clients: Vec<ClientStatus>,
     pub recent_usage: Vec<UsageEvent>,
-    pub insights: Vec<DailyInsight>,
     /// Terms-of-Service version the app currently requires the user to accept.
     pub required_terms_version: u32,
     /// Highest terms version this user has already accepted (0 = none).
