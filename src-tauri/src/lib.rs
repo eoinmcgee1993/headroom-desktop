@@ -7199,12 +7199,17 @@ fn learn_failure_agent_limit_line(text: &str) -> Option<&str> {
 /// filing its own Sentry Error (RUST-FQ, FS, FF, FN, FP, G9 in one week).
 /// Same user-environment class as [`learn_failure_is_agent_auth`]; the local
 /// learn log keeps the full stderr.
+///
+/// One 400 is excluded: `prompt is too long` is OURS (RUST-BK, the digest
+/// budget we build), and it must keep reporting until the wheel carries the
+/// shrinking-digest retry (upstream #3404).
 fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
     text.lines().map(str::trim).find(|line| {
-        line.starts_with("API Error:")
-            || line
-                .to_ascii_lowercase()
-                .contains("credit balance is too low")
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("too long") {
+            return false;
+        }
+        line.starts_with("API Error:") || lower.contains("credit balance is too low")
     })
 }
 
@@ -12450,6 +12455,10 @@ Some unrelated content.
             "returned unparseable output. First 2000 chars:",
             "const API_ERROR = 'API Error: fake';",
             "Prompt is too long",
+            // RUST-BK: a 400 that is ours (the digest we build), in both the
+            // CLI's raw shape and the API's JSON body.
+            "API Error: 400 prompt too long",
+            "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 213462 tokens > 200000 maximum\"}}",
             "",
         ] {
             assert!(

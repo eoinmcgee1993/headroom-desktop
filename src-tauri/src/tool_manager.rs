@@ -4629,11 +4629,12 @@ impl ToolManager {
                 // per retry would pile force-reinstalls on top of each other.
                 // A repair that did not take will not take on the next poll
                 // either; the next app launch gets a fresh attempt.
-                if !WHEEL_REPAIR_ATTEMPTED.swap(true, Ordering::AcqRel)
-                    && failures
+                if claim_once(
+                    &WHEEL_REPAIR_ATTEMPTED,
+                    failures
                         .iter()
-                        .any(|f| crate::is_missing_headroom_module_signal(&f.log_tail))
-                {
+                        .any(|f| crate::is_missing_headroom_module_signal(&f.log_tail)),
+                ) {
                     let version = self
                         .installed_headroom_version()
                         .unwrap_or_else(|| HEADROOM_PINNED_VERSION.to_string());
@@ -4661,9 +4662,10 @@ impl ToolManager {
                 // (RUST-C7). Not gated on `cfg!(windows)`: the crash is the
                 // library's, and macOS/Linux surface the same abort as a
                 // signal.
-                if !ONNX_CRASH_CHECKED.swap(true, Ordering::AcqRel)
-                    && failures.iter().any(|f| startup_exit_is_a_crash(&f.reason))
-                    && onnx_probe_crashed(&self.onnx_probe_verdict_once())
+                if claim_once(
+                    &ONNX_CRASH_CHECKED,
+                    failures.iter().any(|f| startup_exit_is_a_crash(&f.reason)),
+                ) && onnx_probe_crashed(&self.onnx_probe_verdict_once())
                 {
                     log::warn!(
                         "headroom proxy died importing onnxruntime; retrying with Kompress \
@@ -13250,6 +13252,15 @@ static ONNX_CRASH_CHECKED: AtomicBool = AtomicBool::new(false);
 /// carries `HEADROOM_DISABLE_KOMPRESS=1`.
 static KOMPRESS_DISABLED_FOR_ONNX_CRASH: AtomicBool = AtomicBool::new(false);
 
+/// Claims a once-per-process `flag` for a failure that `applies`. The shape
+/// check comes first on purpose: `!flag.swap(true) && applies` burns the flag
+/// on the first failure of ANY shape, so an exit-1 start followed later in
+/// the same process by the crash (or the torn wheel) the flag guards never
+/// gets its one repair.
+fn claim_once(flag: &AtomicBool, applies: bool) -> bool {
+    applies && !flag.swap(true, Ordering::AcqRel)
+}
+
 /// True for a startup exit that means the process was taken down mid-flight
 /// rather than exiting on its own terms: Windows reports a native abort as
 /// 0xffffffff (and the 0xc00000xx family), unix as a signal.
@@ -14609,6 +14620,22 @@ mod tests {
         assert!(
             !head.contains("--memory-db-path"),
             "args must not lead: {head}"
+        );
+    }
+
+    #[test]
+    fn claim_once_is_not_burned_by_a_failure_of_another_shape() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(false);
+        assert!(!super::claim_once(&flag, false));
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "a non-matching failure must not claim it"
+        );
+        assert!(super::claim_once(&flag, true));
+        assert!(
+            !super::claim_once(&flag, true),
+            "second matching failure: already claimed"
         );
     }
 
