@@ -3560,78 +3560,25 @@ async fn get_headroom_logs(
         .map_err(|err| err.to_string())
 }
 
-/// Authoritative "did the proxy receive a request" signal for the connector
-/// verification UI. Reads `/stats` on the live Rust front proxy and returns
-/// `requests.total`. The earlier verification path scanned the python proxy
-/// log for /v1/messages lines, but Claude Code traffic flows through the
-/// Rust proxy on 6767 — the python log only ever sees background/internal
-/// activity, so the regex match never fired even when the user's calls were
-/// being optimized normally.
+/// "Did the proxy receive a request" signal for the connector verification
+/// UI: the sum of the intercept's per-client counters.
 ///
-/// `None` means the proxy is unreachable or `/stats` failed; the frontend
-/// must distinguish that from `Some(0)` ("up but no traffic yet"), otherwise
-/// a transient unreachable → reachable transition would look like a counter
-/// jump from 0 → N and falsely flip the badge to healthy.
+/// This used to read `requests.total` off an UNCACHED `/stats` on a 500ms
+/// budget, once per second while a connector was verifying. `/stats` rebuilds
+/// its whole payload per call (tens of seconds on a full request log, on the
+/// backend's event loop) and a client that hangs up at 500ms does not cancel
+/// that work, so the poll queued unbounded rebuilds until the backend served
+/// nothing else (Vittorio, 0.9.16-rc.4: 4,769 `/stats` in 55 min, mean 517s,
+/// `/v1/messages` mean 135s, watchdog restart storm). The intercept counts the
+/// same client traffic without touching the backend at all.
 #[tauri::command]
-async fn get_headroom_request_count() -> Option<u64> {
-    // Blocking reqwest call — keep it off the async workers; the setup
-    // verification UI polls this while a connector is in 'verifying'.
-    tokio::task::spawn_blocking(fetch_proxy_request_count_stats)
-        .await
-        .ok()
-        .flatten()
-}
-
-fn fetch_proxy_request_count_stats() -> Option<u64> {
-    parse_request_count_from_stats_body(&fetch_proxy_stats_body()?)
-}
-
-fn stats_client() -> Option<&'static reqwest::blocking::Client> {
-    static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> =
-        std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::blocking::Client::builder()
-                .no_proxy()
-                .timeout(std::time::Duration::from_millis(500))
-                .build()
-                .ok()
-        })
-        .as_ref()
-}
-
-fn fetch_proxy_stats_body() -> Option<String> {
-    let client = stats_client()?;
-    for host in ["127.0.0.1", "localhost"] {
-        let url = format!("http://{host}:6767/stats");
-        let Ok(response) = client.get(&url).send() else {
-            continue;
-        };
-        if !response.status().is_success() {
-            continue;
-        }
-        if let Ok(body) = response.text() {
-            return Some(body);
-        }
-    }
-    None
-}
-
-/// Per-agent request counts from `/stats` `agent_usage.agents[]`, keyed by the
-/// proxy's agent id (`claude-code`, `codex`, ...). Used by setup verification
-/// so a prompt sent to one client only flips that client's row, not all rows.
-#[tauri::command]
-async fn get_headroom_request_counts_by_agent() -> Option<std::collections::HashMap<String, u64>> {
-    let body = tokio::task::spawn_blocking(fetch_proxy_stats_body)
-        .await
-        .ok()
-        .flatten()?;
-    parse_request_counts_by_agent(&body)
+fn get_headroom_request_count() -> Option<u64> {
+    Some(proxy_intercept::intercept_request_counts().values().sum())
 }
 
 /// In-process per-agent counters from the Rust intercept. Same key shape as
-/// `get_headroom_request_counts_by_agent`, but works with no Python backend —
-/// paywall-first setup verification polls this while in passthrough.
+/// `/stats` `agent_usage.agents[]`; works with no Python backend, so setup
+/// verification polls this whether or not the runtime is up.
 #[tauri::command]
 fn get_intercept_request_counts_by_agent() -> std::collections::HashMap<String, u64> {
     proxy_intercept::intercept_request_counts()
@@ -3844,73 +3791,6 @@ pub struct DebugOverrides {
 fn get_launch_flags() -> LaunchFlags {
     LaunchFlags {
         paywall_first: pricing::paywall_first_flag_or_refresh(),
-    }
-}
-
-pub(crate) fn parse_request_counts_by_agent(
-    body: &str,
-) -> Option<std::collections::HashMap<String, u64>> {
-    let root = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    let mut counts = std::collections::HashMap::new();
-    if let Some(agents) = root
-        .get("agent_usage")
-        .and_then(|v| v.get("agents"))
-        .and_then(|v| v.as_array())
-    {
-        for agent in agents {
-            if let (Some(key), Some(requests)) = (
-                agent.get("agent").and_then(|v| v.as_str()),
-                agent.get("requests").and_then(|v| v.as_u64()),
-            ) {
-                counts.insert(key.to_string(), requests);
-            }
-        }
-    }
-    Some(counts)
-}
-
-/// Pull `requests.total` (or any of the legacy spellings) out of a /stats
-/// JSON body. Mirrors the lookup in `state::parse_headroom_stats_from_json`
-/// but trimmed to just the counter we need for verification.
-pub(crate) fn parse_request_count_from_stats_body(body: &str) -> Option<u64> {
-    let root = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    if let Some(total) = root
-        .get("requests")
-        .and_then(|v| v.get("total"))
-        .and_then(|v| v.as_u64())
-    {
-        return Some(total);
-    }
-    for key in ["total_requests", "totalRequests", "requests_total"] {
-        if let Some(total) = find_u64_key_recursive_local(&root, key) {
-            return Some(total);
-        }
-    }
-    None
-}
-
-fn find_u64_key_recursive_local(value: &serde_json::Value, key: &str) -> Option<u64> {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(found) = map.get(key).and_then(|v| v.as_u64()) {
-                return Some(found);
-            }
-            for v in map.values() {
-                if let Some(found) = find_u64_key_recursive_local(v, key) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                if let Some(found) = find_u64_key_recursive_local(item, key) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        _ => None,
     }
 }
 
@@ -6423,7 +6303,6 @@ pub fn run() {
             get_runtime_status,
             get_headroom_logs,
             get_headroom_request_count,
-            get_headroom_request_counts_by_agent,
             get_intercept_request_counts_by_agent,
             get_running_agent_process_counts,
             get_client_local_activity_ages,
@@ -9546,18 +9425,17 @@ mod tests {
         learn_failure_is_agent_unparseable_output, learn_failure_signature_source,
         learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
         normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
-        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
-        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
-        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
-        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
-        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
-        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
-        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
-        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
-        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
-        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
-        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
+        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
+        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
+        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
+        resolve_release_updater_config, savings_report, select_updater_endpoints,
+        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
+        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
+        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
+        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
+        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
+        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
     use parking_lot::Mutex;
@@ -11874,61 +11752,6 @@ Some unrelated content.
             "wait-check-failed"
         );
         assert_eq!(cat("something upstream changed"), "other");
-    }
-
-    #[test]
-    fn parse_request_count_reads_nested_requests_total() {
-        let body = json!({
-            "requests": { "total": 42, "active": 1 },
-            "tokens": { "saved": 100 }
-        })
-        .to_string();
-        assert_eq!(parse_request_count_from_stats_body(&body), Some(42));
-    }
-
-    #[test]
-    fn parse_request_count_falls_back_to_legacy_keys() {
-        // Older /stats payloads exposed the count under flat keys. The
-        // verification poller has to keep working against any of them or it
-        // will get stuck on a runtime mid-upgrade between schema versions.
-        let body = json!({ "total_requests": 7 }).to_string();
-        assert_eq!(parse_request_count_from_stats_body(&body), Some(7));
-
-        let body = json!({ "totalRequests": 9 }).to_string();
-        assert_eq!(parse_request_count_from_stats_body(&body), Some(9));
-
-        let body = json!({ "nested": { "requests_total": 11 } }).to_string();
-        assert_eq!(parse_request_count_from_stats_body(&body), Some(11));
-    }
-
-    #[test]
-    fn parse_request_count_returns_none_when_absent() {
-        let body = json!({ "tokens": { "saved": 100 } }).to_string();
-        assert_eq!(parse_request_count_from_stats_body(&body), None);
-        assert_eq!(parse_request_count_from_stats_body("not json"), None);
-    }
-
-    #[test]
-    fn parse_request_counts_by_agent_keys_by_agent_id() {
-        let body = json!({
-            "agent_usage": {
-                "agents": [
-                    { "agent": "claude-code", "requests": 5 },
-                    { "agent": "codex", "requests": 2 }
-                ]
-            }
-        })
-        .to_string();
-        let counts = parse_request_counts_by_agent(&body).unwrap();
-        assert_eq!(counts.get("claude-code"), Some(&5));
-        assert_eq!(counts.get("codex"), Some(&2));
-
-        // Proxy up, no traffic yet: empty map, not None.
-        let empty = json!({ "agent_usage": { "agents": [] } }).to_string();
-        assert!(parse_request_counts_by_agent(&empty).unwrap().is_empty());
-
-        // Unparseable body is None so the poller treats it as unreachable.
-        assert!(parse_request_counts_by_agent("not json").is_none());
     }
 
     #[test]

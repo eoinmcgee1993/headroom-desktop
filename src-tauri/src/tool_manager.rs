@@ -345,6 +345,15 @@ so every 1-20 percent shrink ran the model and saved nothing (218
 lossy_unrecoverable_skipped in a day). The vendor appends the marker
 whenever the saving pays for it. Kill switch:
 HEADROOM_KOMPRESS_MARKER_GATE=0.
+Stats request-log rows (upstream PR #3613):
+RequestLogger.get_recent ran dataclasses.asdict on every entry BEFORE
+dropping request_messages / compressed_messages / response_content, so
+every /stats build (get_recent(10_000), synchronous on the event loop,
+on every cached-snapshot rebuild too) walked every stored transcript:
+3.4 ms per 400 KB entry, ~34 s per /stats on a full deque, starving
+/v1/messages and /readyz (Vittorio, 0.9.16-rc.4: /stats mean 517 s,
+/v1/messages mean 135 s). The vendor builds rows from fields() and
+never touches the heavy ones. Kill switch: HEADROOM_STATS_GET_RECENT=0.
 Chained-read protection (upstream PR #2668): _is_read_command
 inspects only the FIRST program and applies its write/redirect check
 to the whole string, so a read batched behind other work
@@ -2589,6 +2598,47 @@ if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 
             _hd_kmg_kc.KompressCompressor.compress = _hd_kmg_compress
             _hd_kmg_kc.KompressCompressor.compress_batch = _hd_kmg_batch
+    except Exception:
+        pass
+
+# Stats request-log rows (upstream PR #3613):
+# RequestLogger.get_recent built each row with dataclasses.asdict(entry) and
+# only then dropped request_messages / compressed_messages / response_content,
+# so it deep-copied every stored transcript for fields it was about to
+# discard. /stats calls get_recent(10_000) synchronously on the event loop on
+# every build, the ?cached=1 snapshot rebuild included: 3.4 ms per 400 KB
+# Claude Code entry, ~34 s per /stats on a full deque, during which the loop
+# serves nothing (Vittorio, 0.9.16-rc.4). Rows are built from fields() and
+# the heavy fields are never read; kept dict/list fields get the same shallow
+# copy asdict produced for them, so callers still hold copies, not aliases.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_STATS_GET_RECENT=0.
+_hd_grc_flag = _hd_os.environ.get("HEADROOM_STATS_GET_RECENT", "1")
+if _hd_grc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_grc_meta
+
+        if _hd_grc_meta.version("headroom-ai") == "0.37.0":
+            from dataclasses import fields as _hd_grc_fields
+
+            from headroom.proxy import request_logger as _hd_grc_rl
+
+            _hd_grc_heavy = frozenset(
+                {"request_messages", "compressed_messages", "response_content"}
+            )
+
+            def _hd_grc_get_recent(self, n=100):
+                rows = []
+                for entry in list(self._logs)[-n:]:
+                    row = {}
+                    for f in _hd_grc_fields(entry):
+                        if f.name in _hd_grc_heavy:
+                            continue
+                        v = getattr(entry, f.name)
+                        row[f.name] = v.copy() if isinstance(v, (dict, list)) else v
+                    rows.append(row)
+                return rows
+
+            _hd_grc_rl.RequestLogger.get_recent = _hd_grc_get_recent
     except Exception:
         pass
 
@@ -14243,6 +14293,104 @@ mod tests {
         assert!(
             out.status.success() && stdout.contains("OK compression-vendors"),
             "compression vendors misbehaved against the installed wheel.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn sitecustomize_vendors_stats_get_recent() {
+        // Shape and gates only; behaviour is proven by
+        // stats_get_recent_vendor_behaves_against_the_installed_wheel.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains("HEADROOM_STATS_GET_RECENT"),
+            "kill switch missing"
+        );
+        assert!(
+            py.contains(r#"_hd_grc_meta.version("headroom-ai") == "0.37.0""#),
+            "exact-pin gate missing"
+        );
+        assert!(
+            py.contains("_hd_grc_rl.RequestLogger.get_recent = _hd_grc_get_recent"),
+            "seam binding missing"
+        );
+        // The heavy fields must be skipped by name BEFORE any read of them.
+        assert!(py.contains("if f.name in _hd_grc_heavy:\n                            continue\n                        v = getattr(entry, f.name)"));
+    }
+
+    #[test]
+    fn stats_get_recent_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel: a leaf
+        // whose __deepcopy__ raises is planted in both message payloads (the
+        // wheel's asdict walk would trip it), get_recent must still return the
+        // row without those keys and with COPIES of the kept containers; the
+        // kill switch must leave the wheel's own method bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-grc-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+import inspect, sys
+from headroom.proxy.request_logger import RequestLogger
+from headroom.proxy.models import RequestLog
+if RequestLogger.get_recent.__name__ != "_hd_grc_get_recent":
+    print("SKIP grc not bound"); sys.exit(0)
+class NoCopy:
+    def __deepcopy__(self, memo):
+        raise AssertionError("get_recent walked a message payload")
+sig = inspect.signature(RequestLog)
+kw = {n: 0 for n, p in sig.parameters.items() if p.default is inspect._empty}
+e = RequestLog(**kw)
+e.request_messages = [{"role": "user", "content": NoCopy()}]
+e.compressed_messages = [{"role": "user", "content": NoCopy()}]
+e.response_content = "r"
+e.tags = {"agent": "codex"}
+e.transforms_applied = ["smart_crusher"]
+logger = RequestLogger(log_file=None)
+logger._logs.append(e)
+rows = logger.get_recent(10)
+assert len(rows) == 1, rows
+row = rows[0]
+for k in ("request_messages", "compressed_messages", "response_content"):
+    assert k not in row, k
+assert row["tags"] == {"agent": "codex"} and row["transforms_applied"] == ["smart_crusher"], row
+row["tags"]["agent"] = "x"; row["transforms_applied"].append("y")
+assert e.tags == {"agent": "codex"} and e.transforms_applied == ["smart_crusher"], "aliased"
+print("OK grc")
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_STATS_GET_RECENT", flag)
+                .output()
+                .expect("run get_recent probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        if on_out.contains("SKIP grc not bound") {
+            eprintln!("skipping: get_recent vendor did not bind (wheel ships the fix?)");
+            return;
+        }
+        assert!(
+            on.status.success() && on_out.contains("OK grc"),
+            "get_recent vendor misbehaved against the installed wheel.\nstdout:\n{on_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        // Kill switch: the wheel's method stays bound, so the probe self-skips.
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        assert!(
+            off.status.success() && off_out.contains("SKIP grc not bound"),
+            "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&off.stderr)
         );
     }
 
