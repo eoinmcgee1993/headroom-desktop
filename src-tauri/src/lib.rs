@@ -1207,9 +1207,13 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
     // copy under `.../AppTranslocation/...`. Trashing that copy does nothing
     // useful and leaves the real install in place, so skip it.
     if bundle.to_string_lossy().contains("/AppTranslocation/") {
+        // No path in the warn: it is per-user random, so each host made its
+        // own Sentry issue (RUST-44, RUST-GD).
         log::warn!(
-            "uninstall: skipping app-bundle removal; running from translocated path {bundle:?}"
+            "uninstall: skipping app-bundle removal; running from a translocated path \
+             (launched from the DMG without being moved to /Applications)"
         );
+        log::info!("uninstall: translocated bundle path {bundle:?}");
         return None;
     }
 
@@ -2623,6 +2627,22 @@ pub(crate) fn startup_error_fingerprint_key(
     }
 }
 
+/// `startup_error_fingerprint_key` for the watchdog give-up. When the child
+/// spawned fine and died on import, `last_startup_error` only says "exited
+/// with status exit code: 1" and the verdict lives in the log tail
+/// (RUST-G1: `DLL load failed while importing unicodedata: An Application
+/// Control policy has blocked this file`, filed as a generic give-up). Only
+/// the environmental verdicts are read off the tail: the other keys match
+/// noise in a multi-line log too easily.
+pub(crate) fn give_up_startup_key(
+    last_startup_error: Option<&str>,
+    log_tail: Option<&str>,
+) -> Option<&'static str> {
+    startup_error_fingerprint_key(last_startup_error).or_else(|| {
+        startup_error_fingerprint_key(log_tail).filter(|k| is_environmental_startup_key(Some(k)))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_watchdog_give_up_report(
     consecutive_failures: u32,
@@ -2898,7 +2918,10 @@ fn capture_watchdog_give_up(
     // the give-up that follows it as an Error just re-reports the same block
     // (RUST-5C's latest events were one Spanish Windows host whose `_sqlite3`
     // was blocked, escalated to Error three times over).
-    let startup_key = startup_error_fingerprint_key(report.last_startup_error.as_deref());
+    let startup_key = give_up_startup_key(
+        report.last_startup_error.as_deref(),
+        report.log_tail.as_deref(),
+    );
     let startup_is_environmental = is_environmental_startup_key(startup_key);
     let level = if (report.last_startup_error.is_some() && !startup_is_environmental)
         || cpu_deadlock_signal
@@ -2927,6 +2950,7 @@ fn capture_watchdog_give_up(
             let mut fp: Vec<&str> = vec!["proxy_unreachable_post_boot", readyz_key, child_key];
             if let Some(key) = startup_key {
                 fp.push(key);
+                scope.set_tag("startup_cause", key);
             }
             scope.set_fingerprint(Some(fp.as_slice()));
             scope.set_extra(
@@ -9415,8 +9439,8 @@ mod tests {
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
         fake_override, feed_failure_is_persistent, feed_pull_limit,
         fetch_transformations_feed_from, first_savings_body, format_token_count,
-        install_pending_update, is_blocked_runtime_dll_signal, is_disk_full_signal,
-        is_endpoint_protection_signal, is_environmental_startup_key,
+        give_up_startup_key, install_pending_update, is_blocked_runtime_dll_signal,
+        is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
         is_loopback_socket_denied_signal, is_missing_headroom_module_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
         learn_agent_auth_hint, learn_agent_limit_hint, learn_failure_agent_api_error_line,
@@ -12792,6 +12816,33 @@ Some unrelated content.
         ] {
             assert!(!is_loopback_socket_denied_signal(other), "for: {other}");
         }
+    }
+
+    #[test]
+    fn give_up_startup_key_reads_app_control_verdict_off_the_log_tail() {
+        // RUST-G1 verbatim: the spawn succeeded, the import died, and only the
+        // log tail carries the Application Control verdict.
+        let lse = "unable to keep headroom running in background (prior attempts: headroom.exe: \
+                   exited with status exit code: 1 before opening port 6768)";
+        let tail = "Error: Proxy dependencies not installed. Run: pip install headroom-ai[proxy]\n\
+                    Details: DLL load failed while importing unicodedata: An Application Control \
+                    policy has blocked this file.";
+        assert_eq!(startup_error_fingerprint_key(Some(lse)), None);
+        assert_eq!(
+            give_up_startup_key(Some(lse), Some(tail)),
+            Some("startup_endpoint_protection")
+        );
+        // A startup error that classifies on its own wins over the tail.
+        assert_eq!(
+            give_up_startup_key(Some("No module named 'encodings'"), Some(tail)),
+            Some("startup_runtime_missing_stdlib")
+        );
+        // Non-environmental keys are not read off the tail.
+        assert_eq!(
+            give_up_startup_key(Some(lse), Some("No module named 'encodings'")),
+            None
+        );
+        assert_eq!(give_up_startup_key(None, None), None);
     }
 
     #[test]
