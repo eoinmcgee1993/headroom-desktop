@@ -57,6 +57,14 @@ jobs:
           python -m pip install --quiet packaging
           python scripts/check-python-locks.py
 
+      - name: Injected sitecustomize.py is valid Python
+        # SITECUSTOMIZE_PY is ~2,300 lines of Python held in a Rust raw string,
+        # carrying every vendored upstream patch. The Rust tests that run it all
+        # self-skip without a managed runtime, which is every CI runner, so a
+        # syntax error there is invisible to the entire suite and lands as
+        # eleven silently inert vendors on user machines.
+        run: python scripts/check-sitecustomize-syntax.py
+
       - name: Linux runtime lock resolves to wheels only
         # Mirrors the Windows job's check: a pin with no manylinux wheel makes
         # bootstrap compile from source on the user's machine. No --platform,
@@ -94,6 +102,12 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: React hook rules
+        # rules-of-hooks only (exhaustive-deps is a warning and does not fail):
+        # a conditionally-called hook corrupts hook order for every hook after
+        # it, and App.tsx has 78 useEffect calls with nothing else checking them.
+        run: npm run lint
 
       - name: Run app test suite
         run: ./scripts/verify-release.sh

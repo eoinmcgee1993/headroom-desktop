@@ -20,10 +20,9 @@ use crate::bearer::{BearerToken, BEARER_TOKEN_TTL};
 use crate::client_adapters::{
     detect_clients, ensure_rtk_integrations, is_rtk_disabled, rtk_integration_status,
 };
-use crate::insights::generate_daily_insights;
 use crate::models::{
     ActivityEvent, BootstrapFailureReport, BootstrapProgress, ClaudeAccountProfile,
-    ClaudeCodeProject, ClientStatus, CodexAccountProfile, CodexRateLimitSnapshot, DailyInsight,
+    ClaudeCodeProject, ClientStatus, CodexAccountProfile, CodexRateLimitSnapshot,
     DailySavingsPoint, DashboardState, HeadroomLearnPrereqStatus, HeadroomLearnStatus,
     HourlySavingsPoint, LaunchExperience, RtkRuntimeStatus, RuntimeStatus, RuntimeUpgradeFailure,
     RuntimeUpgradeProgress, TransformationFeedEvent, UpgradeFailurePhase, UsageEvent,
@@ -2425,11 +2424,6 @@ impl AppState {
         let tools = self.tool_manager.list_tools();
         let clients = self.cached_clients();
         let recent_usage = self.recent_usage.lock().clone();
-        let insights = build_insights(
-            &recent_usage,
-            &clients,
-            self.tool_manager.python_runtime_installed(),
-        );
         let (mut snapshot, mut daily_savings, mut hourly_savings) = {
             let tracker = self.savings_tracker.lock();
             (
@@ -2774,7 +2768,6 @@ impl AppState {
                 tools,
                 clients,
                 recent_usage,
-                insights,
                 required_terms_version: REQUIRED_TERMS_VERSION,
                 accepted_terms_version,
                 terms_url: TERMS_URL.to_string(),
@@ -3345,7 +3338,11 @@ impl AppState {
         let installed = self.tool_manager.python_runtime_installed();
         let paused = self.runtime_is_paused();
         let auto_paused = self.runtime_is_auto_paused();
-        let proxy_reachable = is_headroom_proxy_reachable();
+        // Tolerant probe: this feeds the Runtime / Proxy dots and the
+        // "not hooked up" banner. The tight 1.5s probe flapped both red
+        // under heavy multi-agent load while /readyz was healthy (Windows
+        // report, 2026-09-16); the watchdog already re-probes with 5s.
+        let proxy_reachable = headroom_proxy_reachable();
         let mcp_configured = self.tool_manager.headroom_mcp_configured();
         let mcp_error = self.tool_manager.headroom_mcp_error();
         let ml_installed = self.tool_manager.headroom_ml_installed();
@@ -3625,7 +3622,33 @@ impl AppState {
             if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern, lock_held) {
                 // `:#` prints the whole context chain: a spawn failure's io
                 // error (RUST-6H's 0.9.5 wave) is invisible without it.
-                log::warn!("failed to clean detached headroom proxy processes: {err:#}");
+                let detail = format!("{err:#}");
+                log::warn!("failed to clean detached headroom proxy processes: {detail}");
+                // The CIM query is the same for every pattern, so once it
+                // throws the remaining patterns only file the same verdict
+                // again. One capture per stop under a fixed fingerprint: the
+                // bridged warn carried each pattern's exe and args, so one
+                // host's one broken WMI opened RUST-9A, FH, FJ and FK at once
+                // (the bridge now drops that twin).
+                // ponytail: no Get-Process fallback -- Windows PowerShell 5.1
+                // exposes no parent pid outside CIM/WMI, and a sweep that
+                // cannot check the parent would kill a relaunching instance's
+                // proxy (RUST-CA/CB). The next launch's reclaim_orphan_proxy
+                // reaps by port instead.
+                if detail.contains("could not enumerate processes") {
+                    sentry::with_scope(
+                        |scope| {
+                            scope.set_fingerprint(Some(&["proxy_sweep_enumeration_failed"]));
+                        },
+                        || {
+                            sentry::capture_message(
+                                "stop_headroom: powershell could not enumerate processes (Win32_Process query failed); sweep skipped",
+                                sentry::Level::Warning,
+                            );
+                        },
+                    );
+                    break;
+                }
             }
         }
         log::info!("stop_headroom: done");
@@ -4137,7 +4160,11 @@ fn build_claude_code_project(
         .as_ref()
         .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
         .map(|ts| ts.with_timezone(&Utc));
-    let today = Utc::now().date_naive();
+    // Local days, not UTC: both counters are user-facing ("sessions today" ranks
+    // the Home screen's most-active project, "active days" drives the Train
+    // nudge), and a UTC bucket resets them mid-afternoon for US users. See the
+    // Persistence Rules in CLAUDE.md.
+    let today = crate::storage::user_day(Utc::now());
     let mut days_since_learn: HashSet<chrono::NaiveDate> = HashSet::new();
     let mut sessions_today: usize = 0;
     for file in &scan.session_files {
@@ -4148,12 +4175,12 @@ fn build_claude_code_project(
             continue;
         };
         let t: chrono::DateTime<Utc> = m.into();
-        if t.date_naive() == today {
+        if crate::storage::user_day(t) == today {
             sessions_today += 1;
         }
         if let Some(learn_time) = learn_time {
             if t > learn_time {
-                days_since_learn.insert(t.date_naive());
+                days_since_learn.insert(crate::storage::user_day(t));
             }
         }
     }
@@ -6029,45 +6056,6 @@ fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsSt
     }
 }
 
-fn build_insights(
-    recent_usage: &[UsageEvent],
-    clients: &[ClientStatus],
-    python_runtime_installed: bool,
-) -> Vec<DailyInsight> {
-    let mut insights = generate_daily_insights(recent_usage);
-
-    if !python_runtime_installed {
-        insights.push(DailyInsight {
-            id: "runtime-missing".into(),
-            category: crate::models::InsightCategory::Health,
-            severity: crate::models::InsightSeverity::Warning,
-            title: "Managed Python runtime not installed".into(),
-            recommendation:
-                "Complete bootstrap so Headroom can be installed into Headroom-managed storage."
-                    .into(),
-            evidence:
-                "Headroom keeps the initial app download small and installs tools after first launch."
-                    .into(),
-            related_workspace: None,
-        });
-    }
-
-    if clients.iter().all(|client| !client.installed) {
-        insights.push(DailyInsight {
-            id: "clients-missing".into(),
-            category: crate::models::InsightCategory::Workflow,
-            severity: crate::models::InsightSeverity::Info,
-            title: "No supported clients detected yet".into(),
-            recommendation:
-                "Install a supported client to start routing requests through Headroom.".into(),
-            evidence: "Client adapters look for known local executables during startup.".into(),
-            related_workspace: None,
-        });
-    }
-
-    insights
-}
-
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 struct HeadroomSavingsHistoryPoint {
     timestamp: chrono::DateTime<Utc>,
@@ -6125,8 +6113,12 @@ struct OutputReduction {
     /// including the period before the rollups carried the layer at all.
     tokens_saved: u64,
     /// The estimator's durable cumulative baseline (what the model would have
-    /// emitted unshaped). Sampled poll-over-poll by the tracker to build the
-    /// per-bucket output series; never surfaced to the frontend directly.
+    /// emitted unshaped). Nothing reads it at runtime -- the per-bucket series
+    /// is built from `SavingsTracker`'s own baseline field, not this one. It is
+    /// parsed solely so `stats_contract_pins_every_consumed_path` asserts it,
+    /// which is what catches upstream silently redefining the field on a wheel
+    /// bump (see the Wheel Bump Rules in CLAUDE.md). Do not delete.
+    #[allow(dead_code)]
     baseline_tokens: u64,
 }
 
@@ -7982,8 +7974,7 @@ pub(crate) fn classify_startup_error(raw: &str) -> Option<String> {
     // the base runtime's `Lib` tree being gone while `python.exe` survived
     // (RUST-C8). Same remedy as a missing headroom.* module, and the
     // installed gate now routes the next launch to bootstrap's reinstall.
-    if raw.contains("ModuleNotFoundError: No module named 'headroom")
-        || raw.contains("No module named 'encodings'")
+    if crate::is_missing_headroom_module_signal(raw) || raw.contains("No module named 'encodings'")
     {
         return Some(
             "Headroom's runtime is missing some of its own files, so it can't start \
@@ -8152,13 +8143,17 @@ fn probe_proxy_readyz(timeout: Duration) -> bool {
         Err(_) => return false,
     };
 
-    ["127.0.0.1", "localhost"].iter().any(|host| {
-        client
-            .get(format!("http://{host}:6767/readyz"))
-            .send()
-            .map(proxy_readyz_response_is_reachable)
-            .unwrap_or(false)
-    })
+    for host in ["127.0.0.1", "localhost"] {
+        match client.get(format!("http://{host}:6767/readyz")).send() {
+            Ok(response) => return proxy_readyz_response_is_reachable(response),
+            // Accepted but slow: the same server sits behind both names, so a
+            // second leg only doubles the wait. Only a connect failure earns
+            // the localhost retry.
+            Err(err) if err.is_timeout() => return false,
+            Err(_) => continue,
+        }
+    }
+    false
 }
 
 /// Whether a `/readyz` response means the proxy is up and serving.
@@ -11259,10 +11254,6 @@ mod tests {
 
         assert!(dashboard.tools.iter().any(|tool| tool.id == "headroom"));
         assert!(dashboard.tools.iter().any(|tool| tool.id == "rtk"));
-        assert!(dashboard
-            .insights
-            .iter()
-            .any(|insight| !insight.title.is_empty()));
 
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }

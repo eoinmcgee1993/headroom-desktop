@@ -16,11 +16,15 @@ if (!navigator.userAgent.includes("Mac")) {
 // listener throws on it -- RUST-8A/8B are 16 events of that, reported against no
 // release from a dev machine. Sentry calls are no-ops until init, so the rest of
 // the app's capture sites stay silent in dev rather than needing their own guard.
+// Delivery depends on connect-src in tauri.conf.json listing the DSN's ingest
+// host. It did not, so every frontend event -- including reportBootstrapFailure,
+// the only signal we have for installs that die during bootstrap -- was dropped
+// by the webview's CSP before it reached the network. No integrations: browser
+// tracing measures webview page loads, which tell us nothing about a desktop app.
 if (import.meta.env.PROD) {
   Sentry.init({
     dsn: import.meta.env.VITE_SENTRY_DSN,
-    integrations: [Sentry.browserTracingIntegration()],
-    tracesSampleRate: 0.1,
+    integrations: [],
   });
 }
 
@@ -41,9 +45,24 @@ window.addEventListener("headroom:boot-complete", () => {
   });
 });
 
+// The window is frameless, undecorated and non-resizable, so a bare message
+// leaves the user with no way out but force-quitting from the tray. Reload is
+// the one recovery that works from inside the webview. `showDialog` is gone: it
+// pulls Sentry's report dialog from their CDN, which script-src 'self' blocks.
+function CrashFallback() {
+  return (
+    <div className="crash-fallback">
+      <p>Headroom hit an unexpected error.</p>
+      <button type="button" onClick={() => window.location.reload()}>
+        Reload
+      </button>
+    </div>
+  );
+}
+
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <Sentry.ErrorBoundary fallback={<p>Something went wrong.</p>} showDialog>
+    <Sentry.ErrorBoundary fallback={<CrashFallback />}>
       <App />
     </Sentry.ErrorBoundary>
   </React.StrictMode>

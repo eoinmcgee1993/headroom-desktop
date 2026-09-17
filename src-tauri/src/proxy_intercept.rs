@@ -1047,9 +1047,26 @@ pub fn spawn(
                                             ]));
                                         },
                                         || {
+                                            // WSAEACCES is the machine's socket
+                                            // policy, not a fault of ours: no
+                                            // release changes it, the bind loop
+                                            // keeps retrying, and
+                                            // `intercept_bind_hint` already
+                                            // hands the user both causes and the
+                                            // command that tells them apart
+                                            // (RUST-EQ). Same Warning the
+                                            // runtime's own 10013 gets in
+                                            // `capture_headroom_start_failure`.
+                                            let level = if crate::is_loopback_socket_denied_signal(
+                                                &e.to_string(),
+                                            ) {
+                                                sentry::Level::Warning
+                                            } else {
+                                                sentry::Level::Error
+                                            };
                                             sentry::capture_message(
                                                 &format!("proxy_intercept error: {key} (retrying)"),
-                                                sentry::Level::Error,
+                                                level,
                                             );
                                         },
                                     );
@@ -1278,19 +1295,15 @@ async fn handle(
     }
 
     // Route Grok through the backend's per-request upstream selection: the
-    // backend's OpenAI handler honours `x-headroom-base-url` (verified live
-    // against api.x.ai with bearer passthrough), so grok traffic gets the
-    // full compression pipeline and the correct upstream from the shared
-    // backend instance. Stamped BEFORE the bypass branches below so the
+    // backend's OpenAI handler honours `x-headroom-base-url`, so grok traffic
+    // gets the full compression pipeline and the correct upstream from the
+    // shared backend instance. Stamped BEFORE the bypass branches below so the
     // no-direct-upstream 503 guard covers grok too - the direct forwarder
     // only knows the Anthropic/OpenAI bases, and forwarding an xAI key to
     // api.openai.com is the exact misroute this connector was blocked on.
     if is_grok {
-        stamp_request_header(
-            &mut buf,
-            "x-headroom-base-url",
-            b"x-headroom-base-url: https://api.x.ai\r\n",
-        );
+        let upstream = grok_upstream_header(extract_bearer(&buf).as_deref());
+        stamp_request_header(&mut buf, "x-headroom-base-url", upstream);
         stamp_client_header(&mut buf, b"X-Client: grok_build\r\n");
     }
 
@@ -1553,7 +1566,9 @@ async fn handle(
             let error_path = parsed_head
                 .as_ref()
                 .filter(|head| {
-                    !is_local_proxy_path(&head.path) && !is_client_probe_path(&head.path)
+                    is_provider_api_path(&head.path)
+                        && !is_local_proxy_path(&head.path)
+                        && !is_client_probe_path(&head.path)
                 })
                 .map(|head| head.path.clone());
             let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path);
@@ -1567,7 +1582,12 @@ async fn handle(
 /// Upper bound on a `/v1/models` response body we're willing to buffer for the
 /// lite-flag rewrite. Real model catalogs are a few KB.
 const MAX_MODELS_BODY: usize = 2 * 1024 * 1024;
-const MODELS_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle bound between body reads, not a total. The backend streams the
+/// catalog as the provider sends it, and a 10s idle gap cut a 396 KB catalog
+/// 27 times on one host (RUST-7S); a truncated read forwards the body
+/// unrewritten, which is the lite-transport breakage this rewrite exists to
+/// prevent, so waiting longer costs that user less than giving up.
+const MODELS_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Splice client <-> backend for a Codex `GET /v1/models` catalog fetch,
 /// rewriting `"use_responses_lite": true` to `false` in the JSON response so
@@ -1603,13 +1623,21 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
     if rewritable {
         let total = content_length.unwrap_or(0);
         let mut body = head.split_off(head_end);
-        while body.len() < total {
+        // WHY the read stopped short goes into the report: a backend that
+        // closed early is a backend bug, an idle timeout is the network, and
+        // "read 391424 of 396026" alone (RUST-7S) could not tell them apart.
+        let stopped_by = loop {
+            if body.len() >= total {
+                break None;
+            }
             let mut tmp = [0u8; 4096];
             match tokio::time::timeout(MODELS_BODY_READ_TIMEOUT, backend.read(&mut tmp)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(0)) => break Some("backend_eof"),
+                Ok(Err(_)) => break Some("read_error"),
+                Err(_) => break Some("idle_timeout"),
                 Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
             }
-        }
+        };
         // Bytes past `total` belong to the next keep-alive response.
         let extra = if body.len() > total {
             body.split_off(total)
@@ -1645,7 +1673,11 @@ async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: Tcp
             report_models_rewrite(
                 "truncated_body",
                 sentry::Level::Warning,
-                &format!("read {} of {total} body bytes", body.len()),
+                &format!(
+                    "read {} of {total} body bytes ({})",
+                    body.len(),
+                    stopped_by.unwrap_or("short")
+                ),
             );
         }
         for part in [&head, &body, &extra] {
@@ -3154,6 +3186,21 @@ fn stamp_client_header(buf: &mut Vec<u8>, header_line: &'static [u8]) {
     stamp_request_header(buf, "x-client", header_line);
 }
 
+/// The upstream a Grok Build request belongs to, keyed on its credential.
+/// `grok login` stores an auth.x.ai OIDC session token (a JWT) and the CLI's
+/// own default base for that mode is `cli-chat-proxy.grok.com/v1`; api.x.ai
+/// only accepts `xai-` API keys and answers the session token 401, which the
+/// CLI surfaces as "not signed in" (user report 2026-09-16: Grok worked only
+/// with Headroom stopped). Anything that is not an API key takes the CLI's
+/// default, so a missing bearer (the /v1/settings startup probe) does too.
+fn grok_upstream_header(bearer: Option<&str>) -> &'static [u8] {
+    if bearer.is_some_and(|t| t.starts_with("xai-")) {
+        b"x-headroom-base-url: https://api.x.ai\r\n"
+    } else {
+        b"x-headroom-base-url: https://cli-chat-proxy.grok.com\r\n"
+    }
+}
+
 /// Append `header_line` as the last request header unless a header named
 /// `guard_name` is already present. No-op if the terminator is missing.
 fn stamp_request_header(buf: &mut Vec<u8>, guard_name: &str, header_line: &'static [u8]) {
@@ -3202,7 +3249,21 @@ fn stamp_headroom_bypass_header(buf: &mut Vec<u8>) {
 /// is_local_proxy_path: bypass mode must keep forwarding these upstream (where
 /// /api/hello 200s), not answer 503.
 fn is_client_probe_path(path: &str) -> bool {
+    // Query stripped: the /mcp that keeps arriving (RUST-CV, two hosts)
+    // carries `?tools=web_search_exa`, so the exact match never fired.
+    let path = path.split('?').next().unwrap_or(path);
     matches!(path, "/" | "/api/hello" | "/v1/settings" | "/mcp")
+}
+
+/// Every provider a supported client reaches through us lives under `/v1/`
+/// (Anthropic /v1/messages, OpenAI /v1/responses and /v1/chat/completions,
+/// x.ai /v1/...). Anything else on our port is a client's non-provider
+/// traffic aimed at our base URL by mistake -- opencode fetching models.dev's
+/// /api.json and GitHub's /repos/.../releases/latest through us (RUST-FD,
+/// RUST-G5) -- and the "upstream error" it draws is our own backend's
+/// unrouted-path rejection, not a provider's. Not worth an issue each.
+fn is_provider_api_path(path: &str) -> bool {
+    path.starts_with("/v1/")
 }
 
 fn is_local_proxy_path(path: &str) -> bool {
@@ -3339,7 +3400,7 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("authorization:") {
-            if let Some(_) = rest.trim().strip_prefix("bearer ") {
+            if rest.trim().strip_prefix("bearer ").is_some() {
                 // Find "bearer " in the original line (case-insensitive) and
                 // return the token with its original casing intact.
                 let bearer_pos = lower.find("bearer ").unwrap_or(0) + 7;
@@ -3357,13 +3418,14 @@ mod tests {
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
         codex_error_summary, codex_snapshot_from_usage_payload, codex_window_label,
         decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
-        intercept_request_counts, is_client_probe_path, is_codex_request_head,
-        is_codex_sse_response, is_geo_blocked_codex_error, is_hop_by_hop_request_header,
-        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
-        is_prompt_request_head, is_reportable_upstream_error, os_error_key,
-        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
-        response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        grok_upstream_header, intercept_request_counts, is_client_probe_path,
+        is_codex_request_head, is_codex_sse_response, is_geo_blocked_codex_error,
+        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
+        is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        is_reportable_upstream_error, os_error_key, parse_codex_rate_limit_headers,
+        parse_request_head, parse_response_status, read_http_headers, request_has_header,
+        request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
+        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, should_report_upstream_error,
         stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
         stamp_request_header, strip_request_header, verdict_permits_reuse, BypassFlag,
@@ -4256,17 +4318,37 @@ mod tests {
     }
 
     #[test]
+    fn grok_upstream_follows_the_credential_kind() {
+        // `grok login` session token (auth.x.ai JWT): the CLI's own default.
+        assert_eq!(
+            grok_upstream_header(Some("eyJ0eXAiOiJhdCtqd3QifQ.x.y")),
+            b"x-headroom-base-url: https://cli-chat-proxy.grok.com\r\n"
+        );
+        // No bearer (startup /v1/settings probe): same default.
+        assert_eq!(
+            grok_upstream_header(None),
+            b"x-headroom-base-url: https://cli-chat-proxy.grok.com\r\n"
+        );
+        // xAI API key: the public API.
+        assert_eq!(
+            grok_upstream_header(Some("xai-abc123")),
+            b"x-headroom-base-url: https://api.x.ai\r\n"
+        );
+    }
+
+    #[test]
     fn stamp_request_header_grok_base_url_and_client() {
         let mut buf =
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: grok-shell/0.2.112 (macos; aarch64)\r\n\r\n{}"
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nUser-Agent: grok-shell/0.2.112 (macos; aarch64)\r\nAuthorization: Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y\r\n\r\n{}"
                 .to_vec();
-        stamp_request_header(
-            &mut buf,
-            "x-headroom-base-url",
-            b"x-headroom-base-url: https://api.x.ai\r\n",
-        );
+        let upstream = grok_upstream_header(extract_bearer(&buf).as_deref());
+        stamp_request_header(&mut buf, "x-headroom-base-url", upstream);
         stamp_client_header(&mut buf, b"X-Client: grok_build\r\n");
         assert!(request_has_header(&buf, "x-headroom-base-url"));
+        assert_eq!(
+            extract_header_value(&buf, "x-headroom-base-url").as_deref(),
+            Some("https://cli-chat-proxy.grok.com")
+        );
         assert!(request_has_header(&buf, "x-client"));
         assert!(buf.ends_with(b"\r\n\r\n{}"), "body preserved");
         // Re-stamping must not duplicate either header.
@@ -4368,7 +4450,14 @@ mod tests {
 
     #[test]
     fn client_probe_paths_are_excluded_from_error_capture_but_not_local() {
-        for probe in ["/", "/api/hello", "/v1/settings", "/mcp"] {
+        for probe in [
+            "/",
+            "/api/hello",
+            "/v1/settings",
+            "/mcp",
+            // RUST-CV verbatim: the query is part of the request target.
+            "/mcp?tools=web_search_exa",
+        ] {
             assert!(is_client_probe_path(probe), "{probe}");
             assert!(
                 !is_local_proxy_path(probe),
@@ -4450,6 +4539,30 @@ mod tests {
         ));
         assert!(!is_missing_auth_error(b"<html>401</html>"));
         assert!(!is_missing_auth_error(b""));
+    }
+
+    #[test]
+    fn only_provider_api_paths_draw_upstream_error_reports() {
+        use super::is_provider_api_path;
+        for path in [
+            "/v1/messages",
+            "/v1/messages?beta=true",
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/v1/models",
+        ] {
+            assert!(is_provider_api_path(path), "{path}");
+        }
+        // RUST-FD (models.dev), RUST-G5 (GitHub), RUST-CV (an MCP client):
+        // never a provider, always our backend's own rejection.
+        for path in [
+            "/api.json",
+            "/repos/anomalyco/opencode/releases/latest",
+            "/mcp?tools=web_search_exa",
+            "/",
+        ] {
+            assert!(!is_provider_api_path(path), "{path}");
+        }
     }
 
     #[test]

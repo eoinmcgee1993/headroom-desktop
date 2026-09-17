@@ -6447,3 +6447,32 @@ html.window-hiding {
   line-height: 1.45;
   color: var(--text-secondary);
 }
+
+/* Rendered by Sentry.ErrorBoundary when App itself throws. The window has no
+   titlebar and cannot be resized, so this is the only recovery affordance. */
+.crash-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  height: 100vh;
+  padding: 24px;
+  text-align: center;
+  font-size: var(--text-base);
+  color: var(--text-primary);
+}
+
+.crash-fallback button {
+  padding: 8px 20px;
+  font-size: var(--text-sm);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.crash-fallback button:hover {
+  background: var(--surface-overlay);
+}

@@ -157,6 +157,16 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("tauri_plugin_updater") {
         return is_transient_transport_error(msg) || is_updater_endpoint_error(msg);
     }
+    // rustls-platform-verifier logs every CA file it cannot read and every
+    // handshake it rejects, at warn/error, with no request context. The
+    // failing request is reported by its own call site (updater, sign-in,
+    // wheel download) with the context that makes it actionable; the crate's
+    // line alone describes the machine: an unreadable /etc/ssl/certs entry
+    // (RUST-FT, 28 events from one host) or a school web filter's MITM
+    // certificate (RUST-G7, lightspeedsystems.com). Local log keeps them.
+    if target.starts_with("rustls_platform_verifier") {
+        return true;
+    }
     // proxy_intercept bypass forwarders (plain + websocket-upgrade variant):
     // when CC is bypassing the local Python proxy and we re-issue directly to
     // the upstream API, transient network failures aren't actionable — client
@@ -495,6 +505,17 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     if target.starts_with("headroom_desktop_lib::state")
         && msg.starts_with(
             "failed to clean detached headroom proxy processes: powershell exited with status",
+        )
+    {
+        return true;
+    }
+    // The enumeration-failure verdict is captured explicitly by stop_headroom,
+    // once per stop under a fixed fingerprint. Bridged, this line carried the
+    // exe and args of each of the three command patterns, so one host's one
+    // broken WMI opened RUST-9A, FH, FJ and FK at once.
+    if target.starts_with("headroom_desktop_lib::state")
+        && msg.starts_with(
+            "failed to clean detached headroom proxy processes: powershell could not enumerate processes",
         )
     {
         return true;
@@ -1081,11 +1102,26 @@ mod tests {
             "headroom_desktop_lib::state",
             "failed to clean detached headroom proxy processes: refusing to pkill with an unresolved executable path \"\""
         ));
-        // A failed Win32_Process enumeration is the one sweep outcome worth a
-        // report; the script's own verdict separates it from a clean run.
-        assert!(!skip_sentry(
+        // A failed Win32_Process enumeration is reported by stop_headroom's
+        // own once-per-stop capture (fingerprint proxy_sweep_enumeration_failed);
+        // the bridged twin, one per command pattern, is dropped (RUST-9A/FH/FJ/FK).
+        assert!(skip_sentry(
             "headroom_desktop_lib::state",
             "failed to clean detached headroom proxy processes: powershell could not enumerate processes (Win32_Process query failed) for exe '~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Scripts\\headroom.exe' args 'proxy --port'"
+        ));
+    }
+
+    #[test]
+    fn skips_platform_verifier_certificate_noise() {
+        // RUST-FT and RUST-G7: the TLS crate's own per-file / per-handshake
+        // lines; the request they belong to reports itself with context.
+        assert!(skip_sentry(
+            "rustls_platform_verifier::verification::others",
+            "Error loading CA root certificate: failed to read PEM from file: Permission denied (os error 13) at '/etc/ssl/certs/2f6ced59.0'"
+        ));
+        assert!(skip_sentry(
+            "rustls_platform_verifier::verification::apple",
+            "failed to verify TLS certificate: invalid peer certificate: Other(OtherError(\"\u{201c}lightspeedsystems.com\u{201d} certificate is not trusted: -67843\"))"
         ));
     }
 

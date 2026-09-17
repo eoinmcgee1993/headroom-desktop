@@ -44,16 +44,6 @@ export interface UsageEvent {
   outcome: "success" | "bypassed" | "error";
 }
 
-export interface DailyInsight {
-  id: string;
-  category: "savings" | "workflow" | "health";
-  severity: "info" | "warning" | "critical";
-  title: string;
-  recommendation: string;
-  evidence: string;
-  relatedWorkspace?: string | null;
-}
-
 export interface ClientStatus {
   id: string;
   name: string;
@@ -204,7 +194,6 @@ export interface DashboardState {
   tools: ManagedTool[];
   clients: ClientStatus[];
   recentUsage: UsageEvent[];
-  insights: DailyInsight[];
   requiredTermsVersion: number;
   acceptedTermsVersion: number;
   termsUrl: string;

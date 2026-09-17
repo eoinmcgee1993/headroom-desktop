@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -344,6 +345,15 @@ so every 1-20 percent shrink ran the model and saved nothing (218
 lossy_unrecoverable_skipped in a day). The vendor appends the marker
 whenever the saving pays for it. Kill switch:
 HEADROOM_KOMPRESS_MARKER_GATE=0.
+Stats request-log rows (upstream PR #3613):
+RequestLogger.get_recent ran dataclasses.asdict on every entry BEFORE
+dropping request_messages / compressed_messages / response_content, so
+every /stats build (get_recent(10_000), synchronous on the event loop,
+on every cached-snapshot rebuild too) walked every stored transcript:
+3.4 ms per 400 KB entry, ~34 s per /stats on a full deque, starving
+/v1/messages and /readyz (Vittorio, 0.9.16-rc.4: /stats mean 517 s,
+/v1/messages mean 135 s). The vendor builds rows from fields() and
+never touches the heavy ones. Kill switch: HEADROOM_STATS_GET_RECENT=0.
 Chained-read protection (upstream PR #2668): _is_read_command
 inspects only the FIRST program and applies its write/redirect check
 to the whole string, so a read batched behind other work
@@ -2591,6 +2601,47 @@ if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# Stats request-log rows (upstream PR #3613):
+# RequestLogger.get_recent built each row with dataclasses.asdict(entry) and
+# only then dropped request_messages / compressed_messages / response_content,
+# so it deep-copied every stored transcript for fields it was about to
+# discard. /stats calls get_recent(10_000) synchronously on the event loop on
+# every build, the ?cached=1 snapshot rebuild included: 3.4 ms per 400 KB
+# Claude Code entry, ~34 s per /stats on a full deque, during which the loop
+# serves nothing (Vittorio, 0.9.16-rc.4). Rows are built from fields() and
+# the heavy fields are never read; kept dict/list fields get the same shallow
+# copy asdict produced for them, so callers still hold copies, not aliases.
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_STATS_GET_RECENT=0.
+_hd_grc_flag = _hd_os.environ.get("HEADROOM_STATS_GET_RECENT", "1")
+if _hd_grc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_grc_meta
+
+        if _hd_grc_meta.version("headroom-ai") == "0.37.0":
+            from dataclasses import fields as _hd_grc_fields
+
+            from headroom.proxy import request_logger as _hd_grc_rl
+
+            _hd_grc_heavy = frozenset(
+                {"request_messages", "compressed_messages", "response_content"}
+            )
+
+            def _hd_grc_get_recent(self, n=100):
+                rows = []
+                for entry in list(self._logs)[-n:]:
+                    row = {}
+                    for f in _hd_grc_fields(entry):
+                        if f.name in _hd_grc_heavy:
+                            continue
+                        v = getattr(entry, f.name)
+                        row[f.name] = v.copy() if isinstance(v, (dict, list)) else v
+                    rows.append(row)
+                return rows
+
+            _hd_grc_rl.RequestLogger.get_recent = _hd_grc_get_recent
+    except Exception:
+        pass
+
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
@@ -4224,6 +4275,25 @@ impl ToolManager {
                     // The SIGABRT is uncatchable in Python; disabling xet falls
                     // back to the stable HTTPS download path.
                     .env("HF_HUB_DISABLE_XET", "1")
+                    // Copies instead of symlinks in the HF cache. Creating a
+                    // symlink on Windows needs SeCreateSymbolicLinkPrivilege
+                    // (Developer Mode or admin); without it huggingface_hub's
+                    // download dies with "[WinError 1314] a required privilege
+                    // is not held", fastembed then retries its sources with
+                    // 3s/9s/27s backoff, and because the embedder is pulled
+                    // from the lifespan startup the port is never bound --
+                    // RUST-F2, 300s auto-start timeout. hf_hub probes for
+                    // symlink support and falls back to copies on its own, but
+                    // the probe passed on that host and the real symlink still
+                    // failed, so take the probe out of the loop. Symlinks are
+                    // only a dedup optimisation; copies cost disk, not boot.
+                    .env("HF_HUB_DISABLE_SYMLINKS", "1")
+                    // Persistent embedding-model cache, same reason as
+                    // TIKTOKEN_CACHE_DIR below: fastembed defaults to
+                    // $TMPDIR/fastembed_cache, which Windows Storage Sense and
+                    // macOS both purge, so the ~130MB bge-small pull is redone
+                    // on the boot path after every cleanup.
+                    .env("FASTEMBED_CACHE_PATH", self.fastembed_cache_dir())
                     // Persistent vocab cache. tiktoken defaults to
                     // $TMPDIR/data-gym-cache, which macOS purges, so the backend
                     // re-downloads vocab files; the fetch (requests.get, no
@@ -4485,6 +4555,17 @@ impl ToolManager {
                             .with_context(|| format!("cloning {}", log_path.display()))?,
                     ))
                     .stderr(Stdio::from(log_file));
+                // This machine's onnxruntime aborts the interpreter when it
+                // loads, and the startup path imports it to decide whether
+                // Kompress is available -- so the proxy dies before binding and
+                // nothing can start (RUST-C7). Kompress off skips that import;
+                // the host loses ML text compression and keeps a working proxy.
+                // ponytail: startup only. An image request can still reach
+                // `image/onnx_router`, which imports it too; wire the same flag
+                // there if a crash ever shows up past the port opening.
+                if KOMPRESS_DISABLED_FOR_ONNX_CRASH.load(Ordering::Acquire) {
+                    command.env("HEADROOM_DISABLE_KOMPRESS", "1");
+                }
                 // Windows: AV/Defender briefly holds the just-installed (or
                 // just-scanned) exe open and CreateProcess fails ACCESS_DENIED
                 // (os error 5) even though nothing is wrong -- the spawn twin
@@ -4587,6 +4668,63 @@ impl ToolManager {
                         }
                     }
                 }
+
+                // Same shape, our own wheel: an interrupted install leaves
+                // site-packages with `headroom` but not all of its submodules,
+                // and every later launch dies on the same import (RUST-CY).
+                // Force-reinstall the version the receipt says should be there
+                // -- not the pinned one, which would silently undo a rollback.
+                // Once per process: the tray retries a failed start every ~20s
+                // (three attempts in 65s in the RUST-C8 report), and a pip run
+                // per retry would pile force-reinstalls on top of each other.
+                // A repair that did not take will not take on the next poll
+                // either; the next app launch gets a fresh attempt.
+                if claim_once(
+                    &WHEEL_REPAIR_ATTEMPTED,
+                    failures
+                        .iter()
+                        .any(|f| crate::is_missing_headroom_module_signal(&f.log_tail)),
+                ) {
+                    let version = self
+                        .installed_headroom_version()
+                        .unwrap_or_else(|| HEADROOM_PINNED_VERSION.to_string());
+                    log::warn!(
+                        "headroom proxy failed on a missing headroom module; \
+                         reinstalling headroom-ai=={version} and retrying"
+                    );
+                    match self.pip_force_reinstall_headroom_version(&version) {
+                        Ok(()) => {
+                            log::warn!("headroom wheel repair succeeded; retrying startup");
+                            allow_repair = false;
+                            continue 'attempt;
+                        }
+                        Err(repair_err) => {
+                            log::error!("headroom wheel repair failed: {repair_err:#}");
+                        }
+                    }
+                }
+
+                // A native onnxruntime abort leaves no traceback at all, so the
+                // only evidence is the exit code -- 0xffffffff on Windows, a
+                // signal on the others -- and the probe. Ask it once, and if
+                // the import really is fatal here, retry with Kompress off
+                // instead of reporting a start that can never succeed
+                // (RUST-C7). Not gated on `cfg!(windows)`: the crash is the
+                // library's, and macOS/Linux surface the same abort as a
+                // signal.
+                if claim_once(
+                    &ONNX_CRASH_CHECKED,
+                    failures.iter().any(|f| startup_exit_is_a_crash(&f.reason)),
+                ) && onnx_probe_crashed(&self.onnx_probe_verdict_once())
+                {
+                    log::warn!(
+                        "headroom proxy died importing onnxruntime; retrying with Kompress \
+                         disabled"
+                    );
+                    KOMPRESS_DISABLED_FOR_ONNX_CRASH.store(true, Ordering::Release);
+                    allow_repair = false;
+                    continue 'attempt;
+                }
             }
 
             // Report the variant that actually captured a log tail (a traceback)
@@ -4607,11 +4745,17 @@ impl ToolManager {
             // on 2026-08-27, so probe the prime suspect (onnxruntime's native
             // init, pulled in by the ml extras) in a bare interpreter and carry
             // the verdict in the error chain Sentry already captures.
-            let onnx_note = if cfg!(windows)
-                && (last.reason.contains("0xffffffff")
-                    || failures.iter().any(|f| f.reason.contains("0xffffffff")))
+            // Every platform, not just Windows: the retry above fires on any
+            // crash-shaped exit, and `startup_error_fingerprint_key` reads the
+            // verdict back out of this chain -- so a macOS abort that got the
+            // Kompress retry has to carry it too, or that key can never match
+            // there. Memoised, so this costs nothing once the retry has asked.
+            let onnx_note = if failures
+                .iter()
+                .chain(std::iter::once(&last))
+                .any(|f| startup_exit_is_a_crash(&f.reason))
             {
-                format!(" (onnx probe: {})", self.probe_onnx_import())
+                format!(" (onnx probe: {})", self.onnx_probe_verdict_once())
             } else {
                 String::new()
             };
@@ -4632,6 +4776,14 @@ impl ToolManager {
     /// crash or a missing module, IS the diagnosis. Only called on the
     /// already-failed startup path, so the extra subprocess costs nothing in
     /// the happy path.
+    /// [`Self::probe_onnx_import`], memoised for the process. The probe spawns
+    /// an interpreter and waits up to 15s for it, and both the retry decision
+    /// and the reported error chain want the same verdict.
+    fn onnx_probe_verdict_once(&self) -> String {
+        static VERDICT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        VERDICT.get_or_init(|| self.probe_onnx_import()).clone()
+    }
+
     fn probe_onnx_import(&self) -> String {
         let python = self.managed_python();
         if !python.exists() {
@@ -4978,6 +5130,8 @@ impl ToolManager {
             // Same xet guard as the proxy spawn: the native hf_xet downloader
             // can SIGABRT mid-pull; the HTTPS fallback is stable.
             .env("HF_HUB_DISABLE_XET", "1")
+            // Same symlink guard as the proxy spawn (RUST-F2).
+            .env("HF_HUB_DISABLE_SYMLINKS", "1")
             // huggingface_hub 1.x downloads over httpx, which reads SSL_CERT_FILE
             // but NOT REQUESTS_CA_BUNDLE. Users behind corporate TLS inspection
             // who set REQUESTS_CA_BUNDLE (per our bootstrap remediation) got pip
@@ -5008,6 +5162,13 @@ impl ToolManager {
     /// location is not good enough).
     pub fn tiktoken_cache_dir(&self) -> PathBuf {
         self.runtime.root_dir.join("tiktoken-cache")
+    }
+
+    /// Where fastembed keeps the relevance embedding model. Under the runtime
+    /// root so it survives reboots and temp sweeps, unlike fastembed's
+    /// `$TMPDIR/fastembed_cache` default (see the proxy spawn, RUST-F2).
+    pub fn fastembed_cache_dir(&self) -> PathBuf {
+        self.runtime.root_dir.join("fastembed-cache")
     }
 
     /// Best-effort pre-download of the tiktoken vocabularies the backend
@@ -8403,15 +8564,38 @@ impl ToolManager {
                     .run_plugin_cmd(plugin, cli, host, &host.marketplace_add_args(plugin))
                     .err();
             }
-            self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin))
-                .map_err(|err| match marketplace_err {
-                    Some(add_err) => {
-                        err.context(format!("marketplace add failed first: {add_err:#}"))
-                    }
-                    None => err,
-                })?;
+            let mut installed = self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin));
+            // The host CLI installs by copying the plugin out of its own
+            // marketplace snapshot, and that copy failed for a file the
+            // snapshot should have had: "failed to copy plugin file: The
+            // system cannot find the file specified" (RUST-DQ, Codex on
+            // Windows). A snapshot with a file missing is missing it for every
+            // later add too, so re-register it from source and copy once more.
+            // Once: a second failure is not a torn snapshot.
+            if installed.as_ref().err().is_some_and(|err| {
+                plugin_install_failure_category(&format!("{err:#}")) == "host-file-missing"
+            }) {
+                log::info!(
+                    "{} [{}]: marketplace snapshot is missing a file; re-adding and retrying",
+                    plugin.id,
+                    host.label()
+                );
+                let _ =
+                    self.run_plugin_cmd(plugin, cli, host, &host.marketplace_remove_args(plugin));
+                marketplace_err = self
+                    .run_plugin_cmd(plugin, cli, host, &host.marketplace_add_args(plugin))
+                    .err();
+                installed = self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin));
+            }
+            installed.map_err(|err| match marketplace_err {
+                Some(add_err) => err.context(format!("marketplace add failed first: {add_err:#}")),
+                None => err,
+            })?;
         }
-        if !host.plugin_present(plugin) {
+        // Only a registry we can read may declare failure: when it is absent or
+        // relocated we cannot tell, and failing a CLI that exited 0 turns a
+        // working install into a hard error (RUST-DQ, same shape as RUST-EV).
+        if host.plugin_registration(plugin) == Some(false) {
             bail!("install completed but the plugin was not registered");
         }
         Ok(())
@@ -8651,9 +8835,17 @@ impl PluginHost {
     }
 
     fn plugin_present(self, plugin: &PluginAddon) -> bool {
+        self.plugin_registration(plugin) == Some(true)
+    }
+
+    /// `None` when the host's registry cannot be read at all -- absent,
+    /// relocated ($CODEX_HOME, a redirected home), or a shape we do not know.
+    /// "not registered" and "cannot tell" are different answers and only the
+    /// first one means the install failed (RUST-DQ).
+    fn plugin_registration(self, plugin: &PluginAddon) -> Option<bool> {
         match self {
-            PluginHost::ClaudeCode => claude_plugin_present(plugin),
-            PluginHost::Codex => codex_plugin_present(plugin),
+            PluginHost::ClaudeCode => claude_plugin_registration(plugin),
+            PluginHost::Codex => codex_plugin_registration(plugin),
         }
     }
 }
@@ -8673,26 +8865,29 @@ pub(crate) fn claude_installed_plugins() -> Option<Value> {
 /// Claude Code records installs in `~/.claude/plugins/installed_plugins.json`
 /// under `plugins["<plugin>@<marketplace>"]` as a non-empty array of install
 /// records.
-fn claude_plugin_present(plugin: &PluginAddon) -> bool {
-    claude_installed_plugins()
-        .and_then(|v| v.get("plugins")?.get(plugin.plugin_ref).cloned())
-        .and_then(|entry| entry.as_array().map(|installs| !installs.is_empty()))
-        .unwrap_or(false)
+fn claude_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
+    let plugins = claude_installed_plugins()?;
+    let entries = plugins.get("plugins")?;
+    Some(
+        entries
+            .get(plugin.plugin_ref)
+            .and_then(|entry| entry.as_array())
+            .is_some_and(|installs| !installs.is_empty()),
+    )
 }
 
-/// Codex records installs in `~/.codex/config.toml` under a
+/// Codex records installs in `$CODEX_HOME/config.toml` under a
 /// `[plugins."<plugin>@<marketplace>"]` table. Keys containing `@` are always
 /// quoted, so a header substring match is reliable and avoids a TOML parse
 /// dependency (matching how client_adapters edits this file).
-fn codex_plugin_present(plugin: &PluginAddon) -> bool {
-    let Some(path) = dirs::home_dir().map(|h| h.join(".codex").join("config.toml")) else {
-        return false;
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
+fn codex_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
+    // `client_adapters::codex_home()`, not `dirs::home_dir().join(".codex")`:
+    // Codex honors $CODEX_HOME, and on Windows the dirs crate reads the profile
+    // known folder and ignores a redirected $HOME.
+    let text =
+        std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml")).ok()?;
     let header = format!("[plugins.\"{}\"]", plugin.plugin_ref);
-    text.lines().any(|line| line.trim_start() == header)
+    Some(text.lines().any(|line| line.trim_start() == header))
 }
 
 /// One serena tool application logs exactly one line containing this marker
@@ -11173,31 +11368,14 @@ pub fn repair_headroom_learn_block_file(path: &Path) -> bool {
         .unwrap_or_default();
     match crate::client_adapters::atomic_write(path, repaired.as_bytes()) {
         Ok(()) => {
-            // The path, the mtime and the size are EXTRAS. Interpolated into
-            // the message they grouped per project -- RUST-ER, RUST-ES and
-            // RUST-ET are one host's three repos in the same second -- which
-            // destroys the one thing this warn exists for: a fleet count that
-            // tells a code bug (many hosts) from a hand edit (one host). The
-            // bridged twin is dropped in logging.rs; the local line keeps the
-            // path, which is what a support thread needs.
-            sentry::with_scope(
-                |scope| {
-                    scope.set_tag("flow", "learn_block_repair");
-                    scope.set_extra(
-                        "path",
-                        crate::logging::scrub_home(&path.display().to_string()).into(),
-                    );
-                    scope.set_extra("file_mtime", modified.clone().into());
-                    scope.set_extra("bytes", (content.len() as u64).into());
-                    scope.set_fingerprint(Some(&["learn_block_end_marker_restored"]));
-                },
-                || {
-                    sentry::capture_message(
-                        "learn block had no end marker; end marker restored",
-                        sentry::Level::Warning,
-                    );
-                },
-            );
+            // Local log only. The Sentry capture that sat here (fingerprint
+            // learn_block_end_marker_restored) answered its question: 64 events
+            // across nine hosts in one week (RUST-F1), every file's mtime from
+            // May to August 2026 and most of them 136 bytes -- the empty
+            // start-only block an older wheel wrote, not a live code bug. The
+            // heal is one-shot per file, so the count could only keep reopening
+            // the issue as more hosts upgraded. The bridged twin of this line
+            // is dropped in logging.rs; the path is what a support thread needs.
             log::warn!(
                 "learn block in {} had no end marker (file mtime {modified}, {} bytes); end marker restored",
                 path.display(),
@@ -12611,6 +12789,17 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         || lower.contains("errno 13")
     {
         "permission"
+    } else if lower.contains("was not registered") {
+        // Ours, not the CLI's: the CLI exited 0 but its registry never gained
+        // the plugin.
+        "not-registered"
+    } else if lower.contains("cannot find the file specified")
+        || lower.contains("no such file or directory")
+        || lower.contains("(os error 2)")
+    {
+        // The host CLI lost a file of its own mid-install (RUST-DQ: Codex
+        // `plugin add` failing "failed to copy plugin file" on Windows).
+        "host-file-missing"
     } else {
         "other"
     }
@@ -13101,6 +13290,58 @@ fn looks_like_corrupt_venv_error(err: &anyhow::Error) -> bool {
     stderr.contains("ModuleNotFoundError") || stderr.contains("ImportError")
 }
 
+/// Set the first time the startup path reinstalls the headroom wheel to repair
+/// a torn install, so the retry-driven start path cannot run pip repeatedly.
+static WHEEL_REPAIR_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+
+/// Set once the startup path has asked the onnx probe whether this machine's
+/// `import onnxruntime` is fatal, so the 15s probe runs at most once per
+/// process even though the tray retries a failed start every ~20s.
+static ONNX_CRASH_CHECKED: AtomicBool = AtomicBool::new(false);
+/// Set when that probe crashed. Every later backend spawn in this process then
+/// carries `HEADROOM_DISABLE_KOMPRESS=1`.
+static KOMPRESS_DISABLED_FOR_ONNX_CRASH: AtomicBool = AtomicBool::new(false);
+
+/// Claims a once-per-process `flag` for a failure that `applies`. The shape
+/// check comes first on purpose: `!flag.swap(true) && applies` burns the flag
+/// on the first failure of ANY shape, so an exit-1 start followed later in
+/// the same process by the crash (or the torn wheel) the flag guards never
+/// gets its one repair.
+fn claim_once(flag: &AtomicBool, applies: bool) -> bool {
+    applies && !flag.swap(true, Ordering::AcqRel)
+}
+
+/// True for a startup exit that means the process was taken down mid-flight
+/// rather than exiting on its own terms: Windows reports a native abort as
+/// 0xffffffff (and the 0xc00000xx family), unix as a signal.
+fn startup_exit_is_a_crash(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("0xffffffff") || lower.contains("0xc0000") || lower.contains("signal:")
+}
+
+/// True when the machine's `import onnxruntime` takes the interpreter down with
+/// it, rather than merely being absent or broken as a Python import.
+///
+/// `probe_onnx_import` reports the module's own diagnosis, and the two verdicts
+/// mean opposite things: an `ImportError` / `ModuleNotFoundError` is a venv we
+/// can reinstall, while a faulthandler marker (`<no Python frame>`, `Fatal
+/// Python error`) or a bare crash with nothing on stderr is the native library
+/// aborting during load -- which no try/except in the proxy can catch, so the
+/// process dies mid-import with the port never opened (RUST-C7).
+pub(crate) fn onnx_probe_crashed(verdict: &str) -> bool {
+    if !verdict.contains("import onnxruntime failed") {
+        return false;
+    }
+    let lower = verdict.to_ascii_lowercase();
+    if lower.contains("modulenotfounderror") || lower.contains("importerror") {
+        return false;
+    }
+    lower.contains("no python frame")
+        || lower.contains("fatal python error")
+        || lower.contains("no stderr")
+        || lower.contains("(killed)")
+}
+
 /// Structured error emitted when the headroom proxy subprocess fails to open
 /// its port. Capture sites downcast to pull the log tail into Sentry `extra`
 /// fields, which are not subject to the 8KB message cap.
@@ -13189,7 +13430,7 @@ mod tests {
         looks_like_corrupt_venv_error, occupant_image, parse_lsof_listener,
         parse_major_minor_patch, parse_netstat_listener, parse_pid_from_lsof_detail,
         parse_ss_listener, parse_tasklist_image, path_with_binary_dir, pending_addon_update,
-        pinned_headroom_release, pip_failure_category, pip_line_to_progress,
+        pinned_headroom_release, pip_failure_category, pip_line_to_progress, plugin_addon,
         plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
         proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
@@ -13198,11 +13439,11 @@ mod tests {
         savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
         summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
         wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PortState, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK,
-        HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
-        MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS,
-        PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
+        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PluginHost, PortState,
+        ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
+        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
+        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -14056,6 +14297,104 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_stats_get_recent() {
+        // Shape and gates only; behaviour is proven by
+        // stats_get_recent_vendor_behaves_against_the_installed_wheel.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains("HEADROOM_STATS_GET_RECENT"),
+            "kill switch missing"
+        );
+        assert!(
+            py.contains(r#"_hd_grc_meta.version("headroom-ai") == "0.37.0""#),
+            "exact-pin gate missing"
+        );
+        assert!(
+            py.contains("_hd_grc_rl.RequestLogger.get_recent = _hd_grc_get_recent"),
+            "seam binding missing"
+        );
+        // The heavy fields must be skipped by name BEFORE any read of them.
+        assert!(py.contains("if f.name in _hd_grc_heavy:\n                            continue\n                        v = getattr(entry, f.name)"));
+    }
+
+    #[test]
+    fn stats_get_recent_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel: a leaf
+        // whose __deepcopy__ raises is planted in both message payloads (the
+        // wheel's asdict walk would trip it), get_recent must still return the
+        // row without those keys and with COPIES of the kept containers; the
+        // kill switch must leave the wheel's own method bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-grc-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+import inspect, sys
+from headroom.proxy.request_logger import RequestLogger
+from headroom.proxy.models import RequestLog
+if RequestLogger.get_recent.__name__ != "_hd_grc_get_recent":
+    print("SKIP grc not bound"); sys.exit(0)
+class NoCopy:
+    def __deepcopy__(self, memo):
+        raise AssertionError("get_recent walked a message payload")
+sig = inspect.signature(RequestLog)
+kw = {n: 0 for n, p in sig.parameters.items() if p.default is inspect._empty}
+e = RequestLog(**kw)
+e.request_messages = [{"role": "user", "content": NoCopy()}]
+e.compressed_messages = [{"role": "user", "content": NoCopy()}]
+e.response_content = "r"
+e.tags = {"agent": "codex"}
+e.transforms_applied = ["smart_crusher"]
+logger = RequestLogger(log_file=None)
+logger._logs.append(e)
+rows = logger.get_recent(10)
+assert len(rows) == 1, rows
+row = rows[0]
+for k in ("request_messages", "compressed_messages", "response_content"):
+    assert k not in row, k
+assert row["tags"] == {"agent": "codex"} and row["transforms_applied"] == ["smart_crusher"], row
+row["tags"]["agent"] = "x"; row["transforms_applied"].append("y")
+assert e.tags == {"agent": "codex"} and e.transforms_applied == ["smart_crusher"], "aliased"
+print("OK grc")
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_STATS_GET_RECENT", flag)
+                .output()
+                .expect("run get_recent probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        if on_out.contains("SKIP grc not bound") {
+            eprintln!("skipping: get_recent vendor did not bind (wheel ships the fix?)");
+            return;
+        }
+        assert!(
+            on.status.success() && on_out.contains("OK grc"),
+            "get_recent vendor misbehaved against the installed wheel.\nstdout:\n{on_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        // Kill switch: the wheel's method stays bound, so the probe self-skips.
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        assert!(
+            off.status.success() && off_out.contains("SKIP grc not bound"),
+            "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
     fn tool_search_history_repair_behaves_against_the_installed_wheel() {
         // The tool_reference 400 ("... not found in available tools") lived in
         // the WHEEL's history repair, not the string blob. This runs the shipped
@@ -14430,6 +14769,53 @@ mod tests {
             !head.contains("--memory-db-path"),
             "args must not lead: {head}"
         );
+    }
+
+    #[test]
+    fn claim_once_is_not_burned_by_a_failure_of_another_shape() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = AtomicBool::new(false);
+        assert!(!super::claim_once(&flag, false));
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "a non-matching failure must not claim it"
+        );
+        assert!(super::claim_once(&flag, true));
+        assert!(
+            !super::claim_once(&flag, true),
+            "second matching failure: already claimed"
+        );
+    }
+
+    #[test]
+    fn onnx_crash_retry_fires_only_on_a_crash_shaped_exit_and_a_fatal_import() {
+        // RUST-C7: the retry costs a 15s probe and a launch, so it only runs
+        // for an exit that means the process was taken down.
+        assert!(super::startup_exit_is_a_crash(
+            "exited with status exit code: 0xffffffff before opening port 6768"
+        ));
+        assert!(super::startup_exit_is_a_crash("exit code: 0xc0000142"));
+        assert!(super::startup_exit_is_a_crash("signal: 6 (SIGABRT)"));
+        assert!(!super::startup_exit_is_a_crash(
+            "exited with status exit status: 1 before opening port 6768"
+        ));
+
+        // And only when the import is what took it down. A module that is
+        // merely absent or broken is the wheel repair's business.
+        assert!(super::onnx_probe_crashed(
+            "import onnxruntime failed (exit 1): <no Python frame>"
+        ));
+        assert!(super::onnx_probe_crashed(
+            "import onnxruntime failed (exit 0xffffffff): <no stderr>"
+        ));
+        assert!(!super::onnx_probe_crashed(
+            "import onnxruntime failed (exit 1): ModuleNotFoundError: No module named \
+             'onnxruntime'"
+        ));
+        assert!(!super::onnx_probe_crashed(
+            "import onnxruntime failed (exit 1): ImportError: DLL load failed"
+        ));
+        assert!(!super::onnx_probe_crashed("onnxruntime imports cleanly"));
     }
 
     #[test]
@@ -19288,6 +19674,52 @@ exit 0
     }
 
     #[test]
+    fn plugin_registration_says_unknown_when_the_registry_is_unreadable() {
+        // RUST-DQ: an absent registry used to read as "not installed", so a CLI
+        // that exited 0 was reported as a failed install. Only a registry we can
+        // actually read may say no.
+        let tmp = tempfile::tempdir().expect("temp home");
+        let _home = HomeGuard::new(tmp.path());
+        let plugin = plugin_addon("ponytail").expect("ponytail addon");
+
+        assert_eq!(PluginHost::ClaudeCode.plugin_registration(plugin), None);
+        assert_eq!(PluginHost::Codex.plugin_registration(plugin), None);
+
+        let claude = tmp.path().join(".claude").join("plugins");
+        fs::create_dir_all(&claude).unwrap();
+        let registry = claude.join("installed_plugins.json");
+        fs::write(&registry, br#"{"version":2,"plugins":{}}"#).unwrap();
+        assert_eq!(
+            PluginHost::ClaudeCode.plugin_registration(plugin),
+            Some(false)
+        );
+        fs::write(
+            &registry,
+            format!(
+                r#"{{"version":2,"plugins":{{"{}":[{{"scope":"user"}}]}}}}"#,
+                plugin.plugin_ref
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            PluginHost::ClaudeCode.plugin_registration(plugin),
+            Some(true)
+        );
+
+        let codex = tmp.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        fs::write(&config, "model = \"gpt-5\"\n").unwrap();
+        assert_eq!(PluginHost::Codex.plugin_registration(plugin), Some(false));
+        fs::write(
+            &config,
+            format!("[plugins.\"{}\"]\nenabled = true\n", plugin.plugin_ref),
+        )
+        .unwrap();
+        assert_eq!(PluginHost::Codex.plugin_registration(plugin), Some(true));
+    }
+
+    #[test]
     fn plugin_install_failure_category_splits_the_rust_6k_grab_bag() {
         // Every string below is a real RUST-6K event body. They arrived under ONE
         // fingerprint, which is why that issue could never be resolved: a resolve
@@ -19317,6 +19749,19 @@ exit 0
                  ~/.codex/config.toml:209:12: `wire_api = \"chat\"` is no longer supported.",
                 "cli-version-skew",
             ),
+            // RUST-DQ, both real: two unrelated causes that shared the "other"
+            // bucket -- our own post-install verification, and a Codex install
+            // that lost a file of its own halfway through.
+            (
+                "Claude Code: install completed but the plugin was not registered",
+                "not-registered",
+            ),
+            (
+                "Codex: command failed (exit 1): ~\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin\\codex.EXE \
+                 plugin add caveman@caveman\nstdout:\n\nstderr:\nError: failed to copy plugin \
+                 file: The system cannot find the file specified. (os error 2)",
+                "host-file-missing",
+            ),
             ("Codex: something we have not seen", "other"),
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -19329,8 +19774,8 @@ exit 0
             seen.insert(expected);
         }
         assert!(
-            seen.len() >= 5,
-            "the five RUST-6K shapes must land in distinct buckets, got: {seen:?}"
+            seen.len() >= 7,
+            "each known cause shape must land in its own bucket, got: {seen:?}"
         );
     }
 

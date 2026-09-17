@@ -2436,14 +2436,16 @@ export default function App() {
     const poll = () => {
       void (async () => {
         try {
-          const countsCommand = interceptOnlyVerify
-            ? "get_intercept_request_counts_by_agent"
-            : "get_headroom_request_counts_by_agent";
+          // Counts come from the Rust intercept, never from the backend's
+          // /stats: that endpoint rebuilds its whole payload per call and a
+          // 1/s poll of it saturated the backend (see get_headroom_request_count).
           const [runtime, counts] = await Promise.all([
             interceptOnlyVerify
               ? Promise.resolve<RuntimeStatus | null>(null)
               : invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
-            invoke<Record<string, number> | null>(countsCommand).catch(() => null)
+            invoke<Record<string, number> | null>("get_intercept_request_counts_by_agent").catch(
+              () => null
+            )
           ]);
 
           if (!active) {

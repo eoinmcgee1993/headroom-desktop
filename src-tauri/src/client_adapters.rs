@@ -777,12 +777,12 @@ pub fn repair_client_setups() -> Vec<String> {
         .collect();
     let mut repaired = Vec::new();
     for client_id in client_ids {
-        let failing = match verify_client_setup(&client_id) {
-            Ok(verification) => !verification.failures.is_empty(),
+        let broken = match verify_client_setup(&client_id) {
+            Ok(verification) => verification.failures,
             // Ids verification doesn't support are ids repair can't help.
-            Err(_) => false,
+            Err(_) => Vec::new(),
         };
-        if !failing {
+        if broken.is_empty() {
             continue;
         }
         if let Err(err) = apply_client_setup(&client_id) {
@@ -791,20 +791,37 @@ pub fn repair_client_setups() -> Vec<String> {
         }
         match verify_client_setup(&client_id) {
             Ok(verification) if verification.failures.is_empty() => {
-                // warn, not info: the log bridge forwards warns to Sentry, and
-                // a successful self-repair is the only fleet-visible trace of a
+                // A successful self-repair is the only fleet-visible trace of a
                 // config that was silently broken (e.g. the stale flagless
-                // Codex block, which 401'd every request until repaired).
+                // Codex block, which 401'd every request until repaired), so it
+                // is reported -- but from here, not through the log bridge.
                 // Info, not warn: the bridged warn carried no fingerprint,
                 // and Sentry grouped it on the SDK's stacktrace instead of the
                 // text -- so byte-identical "repaired codex_cli" lines opened
                 // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
                 // of them meant nothing. One issue per client, from here.
-                log::info!("repair_client_setups: repaired {client_id}");
+                log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
+                // WHICH check failed, in the fingerprint and in full as an
+                // extra. Grouping on the client alone said only "codex_cli
+                // drifted again" (RUST-CF, RUST-F0) -- no way to tell a Codex
+                // login that restamps its own config from a shell profile
+                // another installer rewrites, which are different bugs with
+                // different owners. The strings are fixed sentences from
+                // `verify_client_setup`, so they group across machines and
+                // carry nothing of the user's.
+                let cause: String = broken
+                    .first()
+                    .map(|f| f.chars().take(80).collect())
+                    .unwrap_or_else(|| "unknown".to_string());
                 sentry::with_scope(
                     |scope| {
                         scope.set_tag("flow", "repair_client_setups");
-                        scope.set_fingerprint(Some(&["repair_client_setups", client_id.as_str()]));
+                        scope.set_extra("failures", broken.clone().into());
+                        scope.set_fingerprint(Some(&[
+                            "repair_client_setups",
+                            client_id.as_str(),
+                            cause.as_str(),
+                        ]));
                     },
                     || {
                         sentry::capture_message(
@@ -2344,7 +2361,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // metadata can reach disk ahead of the data, so a crash/power loss leaves a
     // zero-length file where valid state used to be -- which is what the
     // "corrupt (expected value at line 1 column 1)" reports are (RUST-8P).
-    let write_tmp = || -> std::io::Result<()> {
+    let mut write_tmp = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp_path)?;
         std::io::Write::write_all(&mut f, contents)?;
         f.sync_all()
@@ -2361,14 +2378,36 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // (os error 5) even though nothing is wrong with the state (RUST-9M,
     // pricing-state on 0.8.9). Transient by nature -- retry briefly before
     // reporting.
-    retry_transient_denied(|| std::fs::rename(&tmp_path, path)).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
-        anyhow!(
-            "renaming {} -> {}: {err}",
-            tmp_path.display(),
-            path.display()
-        )
-    })
+    rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp).map_err(
+        |err| {
+            let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
+            anyhow!(
+                "renaming {} -> {}: {err}",
+                tmp_path.display(),
+                path.display()
+            )
+        },
+    )
+}
+
+/// Renames a freshly written tmp into place, rewriting it once if it vanished.
+///
+/// `NotFound` from the rename means the tmp we just wrote and fsynced is gone:
+/// a scanner deleted or quarantined it between close and rename (RUST-EZ, os
+/// error 2 on Windows). Retrying the rename alone can only fail the same way,
+/// so the tmp is written again and that one is moved. Once -- a second loss is
+/// not a race, and this is the primitive every persisted file goes through.
+fn rename_recovering_lost_tmp(
+    rename: &mut impl FnMut() -> std::io::Result<()>,
+    write_tmp: &mut impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match retry_transient_denied(&mut *rename) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            write_tmp()?;
+            retry_transient_denied(rename)
+        }
+        other => other,
+    }
 }
 
 /// Retries `op` while it fails `PermissionDenied`, sleeping 50/100/200ms
@@ -3776,12 +3815,12 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
     let end = format!("# <<< headroom:{block_id} <<<");
     let mut out = content.to_string();
     loop {
-        let (Some(start_idx), Some(end_idx)) = (out.find(&start), out.find(&end)) else {
+        let Some(start_idx) = out.find(&start) else {
             break;
         };
-        if end_idx < start_idx {
-            break; // malformed (stray end before start) — leave it alone
-        }
+        let Some(end_idx) = out[start_idx..].find(&end).map(|rel| start_idx + rel) else {
+            break;
+        };
         let tail = out[end_idx + end.len()..]
             .trim_start_matches('\n')
             .to_string();
@@ -3793,6 +3832,27 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
         }
         rebuilt.push_str(&tail);
         out = rebuilt;
+    }
+    // Stray markers. Codex's TOML writer keeps our start marker as the leading
+    // comment of `[model_providers.headroom]`, so when it drops that table the
+    // start goes with it and the trailing end marker (document trailer) stays.
+    // This used to `break` on "end before start" and leave the file alone,
+    // which made every render a no-op fixpoint and every verify a miss:
+    // hourly "still failing after re-apply" for as long as the file lived
+    // (RUST-BZ). Drop any marker line that is not part of a pair.
+    if out.contains(&start) || out.contains(&end) {
+        let had_newline = out.ends_with('\n');
+        out = out
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                line != start && line != end
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if had_newline && !out.is_empty() {
+            out.push('\n');
+        }
     }
     out
 }
@@ -4106,17 +4166,19 @@ fn find_grok_build_table(lines: &[&str]) -> Option<(usize, Option<usize>)> {
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             if trimmed == "[model.grok-build]" {
                 header_idx = Some(idx);
-            } else if header_idx.is_some() {
-                return Some((header_idx.unwrap(), None));
+            } else if let Some(header) = header_idx {
+                // Next table started: the grok-build table had no base_url.
+                return Some((header, None));
             }
             continue;
         }
-        if header_idx.is_some()
-            && trimmed
+        if let Some(header) = header_idx {
+            if trimmed
                 .split_once('=')
                 .is_some_and(|(key, _)| key.trim() == "base_url")
-        {
-            return Some((header_idx.unwrap(), Some(idx)));
+            {
+                return Some((header, Some(idx)));
+            }
         }
     }
     header_idx.map(|h| (h, None))
@@ -4864,11 +4926,17 @@ fn codex_provider_block_matches() -> Result<bool> {
 fn marker_block_contains(content: &str, block_id: &str, needle: &str) -> bool {
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
-    match (content.find(&start), content.find(&end)) {
-        (Some(start_idx), Some(end_idx)) if start_idx < end_idx => {
-            content[start_idx..end_idx].contains(needle)
-        }
-        _ => false,
+    // The end marker is searched AFTER the start. Searched from the top, a
+    // stray end marker earlier in the file read as "end before start" and the
+    // intact block behind it verified as missing on every hourly repair
+    // (RUST-BZ: 67 events, 8 hosts; see strip_marker_block for how the stray
+    // marker gets there).
+    let Some(start_idx) = content.find(&start) else {
+        return false;
+    };
+    match content[start_idx..].find(&end) {
+        Some(rel) => content[start_idx..start_idx + rel].contains(needle),
+        None => false,
     }
 }
 
@@ -5014,11 +5082,10 @@ fn build_codex_guard_script() -> String {
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 
 try:
     import tomllib
@@ -5028,7 +5095,7 @@ except ModuleNotFoundError:
 CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or (pathlib.Path.home() / ".codex"))
 CONFIG = CODEX_HOME / "config.toml"
 BASE_URL = "{base}"
-READYZ = "{readyz}"
+ADDR = ("127.0.0.1", 6767)
 # stderr fires every invocation; the macOS notification is rate-limited so an
 # app restart doesn't produce a storm of alerts.
 DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
@@ -5095,14 +5162,14 @@ def load_config():
 
 
 def probe():
-    # Any HTTP response means our server answered -- the app is up. A 503 during
-    # bypass mode is still "up", so only connection errors / timeouts count as down.
+    # A TCP accept on the intercept port means the desktop app is up. Not an
+    # HTTP round trip: /readyz is forwarded to the Python backend, which under
+    # heavy multi-agent load can miss a 2s window while perfectly healthy, and
+    # that false "down" surfaced as a SessionStart hook error in Claude Code.
     try:
-        urllib.request.urlopen(READYZ, timeout=2)
+        socket.create_connection(ADDR, timeout=2).close()
         return True
-    except urllib.error.HTTPError:
-        return True
-    except Exception:
+    except OSError:
         return False
 
 
@@ -5147,7 +5214,6 @@ if __name__ == "__main__":
     raise SystemExit(main())
 "##,
         base = HEADROOM_OPENAI_BASE_URL,
-        readyz = "http://127.0.0.1:6767/readyz",
     )
 }
 
@@ -5412,14 +5478,13 @@ fn build_claude_guard_script() -> String {
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 
 BASE_URL = "{base}"
-READYZ = "{readyz}"
+ADDR = ("127.0.0.1", 6767)
 # stderr fires every invocation; the macOS notification is rate-limited so an
 # app restart doesn't produce a storm of alerts.
 DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
@@ -5452,14 +5517,14 @@ def notify(message):
 
 
 def probe():
-    # Any HTTP response means our server answered -- the app is up. A 503 during
-    # bypass mode is still "up", so only connection errors / timeouts count as down.
+    # A TCP accept on the intercept port means the desktop app is up. Not an
+    # HTTP round trip: /readyz is forwarded to the Python backend, which under
+    # heavy multi-agent load can miss a 2s window while perfectly healthy, and
+    # that false "down" surfaced as a SessionStart hook error in Claude Code.
     try:
-        urllib.request.urlopen(READYZ, timeout=2)
+        socket.create_connection(ADDR, timeout=2).close()
         return True
-    except urllib.error.HTTPError:
-        return True
-    except Exception:
+    except OSError:
         return False
 
 
@@ -5528,7 +5593,6 @@ if __name__ == "__main__":
     raise SystemExit(main())
 "##,
         base = HEADROOM_ANTHROPIC_BASE_URL,
-        readyz = "http://127.0.0.1:6767/readyz",
     )
 }
 
@@ -6857,7 +6921,7 @@ pub(crate) fn home_dir() -> PathBuf {
 /// proxy: honor `$CODEX_HOME` when set, else `~/.codex`. Staying in sync with
 /// the proxy matters — if the two layers disagree on where Codex lives, the
 /// provider retag rewrites a different store than the config it edited.
-fn codex_home() -> PathBuf {
+pub(crate) fn codex_home() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -6892,6 +6956,29 @@ pub(crate) fn claude_desktop_installed() -> bool {
         candidates.push(PathBuf::from(base).join("AnthropicClaude"));
     }
     candidates.iter().any(|path| path.exists())
+}
+
+/// Which Claude-Desktop bucket this machine is in, for the identity payload.
+/// `absent` | `only` (the app and nothing we can route) | `with_agent`.
+///
+/// The `only` bucket cannot be served at all -- its bundled Claude Code pins
+/// provider routing to the host -- so an activation funnel that counts it as a
+/// drop-off is measuring a user we were never able to reach. `with_agent`
+/// separates the other invisible case: a routable client is installed and
+/// configured, but the user only ever prompts inside the app, which today
+/// looks identical to "installed it and lost interest".
+///
+/// `detect_clients` only runs when the app is present, so the common answer
+/// costs three `exists()` calls.
+pub(crate) fn claude_desktop_verdict() -> &'static str {
+    if !claude_desktop_installed() {
+        return "absent";
+    }
+    if detect_clients().iter().any(|client| client.installed) {
+        "with_agent"
+    } else {
+        "only"
+    }
 }
 
 fn detect_claude_code_client(configured: bool) -> ClientStatus {
@@ -11235,6 +11322,51 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn apply_codex_heals_a_stray_end_marker_left_by_a_codex_rewrite() {
+        // RUST-BZ: Codex's TOML writer carries our start marker as the
+        // leading comment of [model_providers.headroom]; dropping that table
+        // takes the start with it and leaves the trailing end marker behind.
+        // Render then saw "end before start", left the file untouched, and
+        // verify failed on every hourly repair.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "# >>> headroom:codex_cli >>>\nmodel_provider = \"headroom\"\nopenai_base_url = \"http://127.0.0.1:6767/v1\"\n# <<< headroom:codex_cli <<<\n\n[projects.\"/Users/x/app\"]\ntrust_level = \"trusted\"\n# <<< headroom:codex_cli_provider <<<\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+        let healed = super::verify_client_setup("codex").expect("verify runs");
+        assert!(healed.failures.is_empty(), "healed: {:?}", healed.failures);
+        let after = fs::read_to_string(&config_toml).unwrap();
+        assert_eq!(
+            after
+                .matches("# <<< headroom:codex_cli_provider <<<")
+                .count(),
+            1,
+            "{after}"
+        );
+        assert_eq!(
+            after.matches("[model_providers.headroom]").count(),
+            1,
+            "{after}"
+        );
+        assert!(after.contains("trust_level = \"trusted\""), "{after}");
+
+        super::apply_client_setup("codex").expect("second apply");
+        assert_eq!(
+            fs::read_to_string(&config_toml).unwrap(),
+            after,
+            "byte-stable"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn apply_then_disable_codex_restores_a_foreign_model_provider() {
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
@@ -11523,6 +11655,60 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         }
         assert!(path.exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_rewrites_a_tmp_that_vanished_before_the_rename() {
+        // RUST-EZ: on Windows a scanner removed the tmp between fsync and
+        // rename, so the write was lost with "os error 2" and every caller of
+        // this primitive silently failed to persist.
+        let mut renames = 0;
+        let mut writes = 0;
+        let out = super::rename_recovering_lost_tmp(
+            &mut || {
+                renames += 1;
+                if renames == 1 {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut || {
+                writes += 1;
+                Ok(())
+            },
+        );
+        assert!(out.is_ok());
+        assert_eq!((renames, writes), (2, 1));
+
+        // A tmp that keeps vanishing is not a race: report it instead of
+        // looping.
+        let mut renames = 0;
+        let mut writes = 0;
+        let out = super::rename_recovering_lost_tmp(
+            &mut || {
+                renames += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+            &mut || {
+                writes += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!((renames, writes), (2, 1));
+
+        // Anything else is returned as-is, with no rewrite.
+        let mut writes = 0;
+        let out = super::rename_recovering_lost_tmp(
+            &mut || Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+            &mut || {
+                writes += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(writes, 0);
     }
 
     #[test]
@@ -12039,9 +12225,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     fn claude_guard_script_is_diagnostic_and_reachable_tolerates_any_response() {
         let script = build_claude_guard_script();
-        // reachable() no longer flags a 503-during-bypass as "app down".
+        // reachable() is a TCP accept on the intercept port: an HTTP probe is
+        // forwarded to the backend and reads "down" under load (false
+        // SessionStart hook errors), and a 503-during-bypass is still "up".
         assert!(!script.contains("return response.status < 500"));
-        assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
+        assert!(!script.contains("urllib"));
+        assert!(script.contains("socket.create_connection(ADDR, timeout=2).close()"));
         // main() explains WHY instead of the flat "is not" message.
         assert!(script.contains("def diagnose_route"));
         assert!(script.contains("overrides Headroom's route"));
@@ -12060,7 +12249,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn codex_guard_script_names_actual_values_and_tolerates_any_response() {
         let script = build_codex_guard_script();
         assert!(!script.contains("return response.status < 500"));
-        assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
+        assert!(!script.contains("urllib"));
+        assert!(script.contains("socket.create_connection(ADDR, timeout=2).close()"));
         // Messages include the actual found value, not just "is not headroom".
         assert!(script.contains("(expected \"headroom\")"));
         assert!(script.contains("(expected \" + BASE_URL + \")"));

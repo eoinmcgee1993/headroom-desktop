@@ -15,11 +15,19 @@ describe("estimateCostSavingsUsd", () => {
   });
 
   it("applies the right rate for each model family", () => {
-    // Opus @ $15/M
-    expect(estimateCostSavingsUsd("claude-opus-4-7", 1_000_000)).toBeCloseTo(15);
-    // Sonnet @ $3/M
+    // Opus 4.6+ and Opus 5 @ $5/M — NOT the $15/M of Opus 4.1 and earlier.
+    expect(estimateCostSavingsUsd("claude-opus-5", 1_000_000)).toBeCloseTo(5);
+    expect(estimateCostSavingsUsd("claude-opus-4-8", 1_000_000)).toBeCloseTo(5);
+    expect(estimateCostSavingsUsd("claude-opus-4-7", 1_000_000)).toBeCloseTo(5);
+    expect(estimateCostSavingsUsd("claude-opus-4-6", 1_000_000)).toBeCloseTo(5);
+    // Legacy Opus (4.1 and earlier) stayed at $15/M.
+    expect(estimateCostSavingsUsd("claude-opus-4-1", 1_000_000)).toBeCloseTo(15);
+    // Fable/Mythos @ $10/M
+    expect(estimateCostSavingsUsd("claude-fable-5-1", 1_000_000)).toBeCloseTo(10);
+    // Sonnet 5 @ $2/M, earlier Sonnet @ $3/M
+    expect(estimateCostSavingsUsd("claude-sonnet-5", 1_000_000)).toBeCloseTo(2);
     expect(estimateCostSavingsUsd("claude-sonnet-4-6", 1_000_000)).toBeCloseTo(3);
-    // Haiku 4 @ $1/M
+    // Haiku 4.5 @ $1/M
     expect(estimateCostSavingsUsd("claude-haiku-4-5", 1_000_000)).toBeCloseTo(1);
     // GPT-4o mini is cheaper than GPT-4o — ensure mini matches first.
     expect(estimateCostSavingsUsd("gpt-4o-mini", 1_000_000)).toBeCloseTo(0.15);
