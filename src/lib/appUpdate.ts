@@ -122,7 +122,18 @@ export async function runAppUpdateCheck({
     };
   } catch (error) {
     if (background) {
-      Sentry.captureException(error, { tags: { flow: "app_update_check" } });
+      // A transport failure reaching github.com is the user's network
+      // (RUST-GM), and "Could not fetch a valid release JSON" is github.com
+      // answering with something other than latest.json (RUST-GW: two hosts
+      // on two OSes in the same minute), not a defect; keep both visible but
+      // below Error.
+      const transport = /error sending request|timed out|dns error|connection|valid release JSON/i.test(
+        describeInvokeError(error, "")
+      );
+      Sentry.captureException(error, {
+        level: transport ? "warning" : "error",
+        tags: { flow: "app_update_check" },
+      });
       return {};
     }
     return {
