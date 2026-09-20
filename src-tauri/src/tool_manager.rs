@@ -2642,6 +2642,122 @@ if _hd_grc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# Transformations feed bodies (upstream PR #3672):
+# /transformations/feed returned request_messages / compressed_messages /
+# response_content for every entry and built them with asdict(), so the
+# desktop's number-only poll paid a full deep copy plus ~44 MB of JSON per
+# limit=100 pull, serialized on the event loop; three concurrent pulls take
+# /stats?cached=1 from 45 ms to 1.3 s (RUST-86). The PR's method and handler
+# verbatim: get_recent_with_messages(n, include_messages=True), and the route
+# re-registered with the same loopback dependency, reading ?include_messages.
+# Default unchanged; the desktop passes include_messages=0 (lib.rs).
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_FEED_INCLUDE_MESSAGES=0.
+_hd_fm_flag = _hd_os.environ.get("HEADROOM_FEED_INCLUDE_MESSAGES", "1")
+if _hd_fm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_fm_meta
+
+        if _hd_fm_meta.version("headroom-ai") == "0.37.0":
+            from copy import deepcopy as _hd_fm_deepcopy
+            from dataclasses import asdict as _hd_fm_asdict
+            from dataclasses import fields as _hd_fm_fields
+
+            import headroom.proxy.server as _hd_fm_server
+            from headroom.proxy import request_logger as _hd_fm_rl
+
+            _hd_fm_rdp = _hd_fm_server.resolve_display_provider
+            _hd_fm_heavy = frozenset(
+                {"request_messages", "compressed_messages", "response_content"}
+            )
+
+            def _hd_fm_get_recent_with_messages(self, n=20, include_messages=True):
+                entries = list(self._logs)[-n:]
+                if include_messages:
+                    return [_hd_fm_asdict(e) for e in entries]
+                return [
+                    {
+                        f.name: _hd_fm_deepcopy(getattr(e, f.name))
+                        for f in _hd_fm_fields(e)
+                        if f.name not in _hd_fm_heavy
+                    }
+                    for e in entries
+                ]
+
+            _hd_fm_orig_create_app = _hd_fm_server.create_app
+
+            def _hd_fm_create_app(*args, **kwargs):
+                app = _hd_fm_orig_create_app(*args, **kwargs)
+                try:
+                    from fastapi import Request as _hd_fm_Request
+
+                    old = next(
+                        r
+                        for r in app.router.routes
+                        if getattr(r, "path", None) == "/transformations/feed"
+                    )
+
+                    async def transformations_feed(
+                        request: _hd_fm_Request,
+                        limit: int = 20,
+                        include_messages: bool = True,
+                    ):
+                        proxy = request.app.state.proxy
+                        if limit > 100:
+                            limit = 100
+                        transformations = []
+                        log_full_messages = proxy.config.log_full_messages if proxy else False
+                        if proxy and proxy.logger:
+                            logs = proxy.logger.get_recent_with_messages(
+                                limit, include_messages=include_messages
+                            )
+                            for log in logs:
+                                item = {
+                                    "request_id": log.get("request_id"),
+                                    "timestamp": log.get("timestamp"),
+                                    "provider": _hd_fm_rdp(
+                                        log.get("provider"),
+                                        openai_api_url=proxy.config.openai_api_url,
+                                        provider_name=proxy.config.provider_name,
+                                    ),
+                                    "model": log.get("model"),
+                                    "input_tokens_original": log.get("input_tokens_original"),
+                                    "input_tokens_optimized": log.get("input_tokens_optimized"),
+                                    "tokens_saved": log.get("tokens_saved"),
+                                    "savings_percent": log.get("savings_percent"),
+                                    "transforms_applied": log.get("transforms_applied", []),
+                                    "turn_id": log.get("turn_id"),
+                                }
+                                if include_messages:
+                                    item["request_messages"] = log.get("request_messages")
+                                    item["compressed_messages"] = log.get("compressed_messages")
+                                    item["response_content"] = log.get("response_content")
+                                transformations.append(item)
+                        return {
+                            "transformations": transformations,
+                            "log_full_messages": log_full_messages,
+                        }
+
+                    # Same position as the wheel's route: add_api_route
+                    # appends, and the catch-all upstream passthrough
+                    # registered later would match first.
+                    routes = app.router.routes
+                    index = routes.index(old)
+                    app.add_api_route(
+                        "/transformations/feed",
+                        transformations_feed,
+                        methods=["GET"],
+                        dependencies=old.dependencies,
+                    )
+                    routes[index] = routes.pop()
+                except Exception:
+                    pass
+                return app
+
+            _hd_fm_rl.RequestLogger.get_recent_with_messages = _hd_fm_get_recent_with_messages
+            _hd_fm_server.create_app = _hd_fm_create_app
+    except Exception:
+        pass
+
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
@@ -14389,6 +14505,125 @@ print("OK grc")
         let off_out = String::from_utf8_lossy(&off.stdout);
         assert!(
             off.status.success() && off_out.contains("SKIP grc not bound"),
+            "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
+    fn sitecustomize_vendors_feed_include_messages() {
+        // Shape and gates only; behaviour is proven by
+        // feed_include_messages_vendor_behaves_against_the_installed_wheel.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains("HEADROOM_FEED_INCLUDE_MESSAGES"),
+            "kill switch missing"
+        );
+        assert!(
+            py.contains(r#"_hd_fm_meta.version("headroom-ai") == "0.37.0""#),
+            "exact-pin gate missing"
+        );
+        assert!(
+            py.contains("_hd_fm_server.create_app = _hd_fm_create_app"),
+            "create_app seam binding missing"
+        );
+        assert!(py.contains(
+            "_hd_fm_rl.RequestLogger.get_recent_with_messages = _hd_fm_get_recent_with_messages"
+        ));
+        // The route keeps the wheel's own loopback dependency and position.
+        assert!(py.contains("dependencies=old.dependencies"));
+        assert!(py.contains("routes[index] = routes.pop()"));
+    }
+
+    #[test]
+    fn feed_include_messages_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel: an entry
+        // whose message payloads refuse to be deep-copied is planted, then
+        // `?include_messages=0` must return its numbers without the three body
+        // keys (never walking them), the default request must still carry the
+        // bodies, and the kill switch must leave the wheel's method bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-fm-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+import asyncio, inspect, sys
+from headroom.proxy.request_logger import RequestLogger
+if RequestLogger.get_recent_with_messages.__name__ != "_hd_fm_get_recent_with_messages":
+    print("SKIP fm not bound"); sys.exit(0)
+import httpx
+from headroom.proxy.models import RequestLog
+from headroom.proxy.server import create_app
+class NoCopy:
+    def __deepcopy__(self, memo):
+        raise AssertionError("feed walked a message payload")
+sig = inspect.signature(RequestLog)
+kw = {n: 0 for n, p in sig.parameters.items() if p.default is inspect._empty}
+heavy = RequestLog(**kw)
+heavy.request_id = "heavy"
+heavy.request_messages = [{"role": "user", "content": NoCopy()}]
+heavy.compressed_messages = [{"role": "user", "content": NoCopy()}]
+heavy.response_content = "r"
+heavy.tokens_saved = 60
+heavy.transforms_applied = ["smart_crusher"]
+plain = RequestLog(**kw)
+plain.request_id = "plain"
+plain.request_messages = [{"role": "user", "content": "hi"}]
+plain.response_content = "ok"
+app = create_app()
+app.state.proxy.logger._logs.append(heavy)
+app.state.proxy.logger._logs.append(plain)
+bodies = {"request_messages", "compressed_messages", "response_content"}
+async def main():
+    t = httpx.ASGITransport(app=app, client=("127.0.0.1", 1))
+    async with httpx.AsyncClient(transport=t, base_url="http://127.0.0.1") as c:
+        slim = await c.get("/transformations/feed?limit=2&include_messages=0")
+        assert slim.status_code == 200, slim.text
+        rows = slim.json()["transformations"]
+        assert [r["request_id"] for r in rows] == ["heavy", "plain"], rows
+        assert rows[0]["tokens_saved"] == 60 and rows[0]["transforms_applied"] == ["smart_crusher"], rows
+        for r in rows:
+            assert not (bodies & r.keys()), r
+        full = await c.get("/transformations/feed?limit=1")
+        assert full.status_code == 200, full.text
+        row = full.json()["transformations"][0]
+        assert row["request_id"] == "plain" and row["request_messages"] == [{"role": "user", "content": "hi"}], row
+        assert row["response_content"] == "ok", row
+        assert "log_full_messages" in full.json()
+asyncio.run(main())
+print("OK fm")
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_FEED_INCLUDE_MESSAGES", flag)
+                .output()
+                .expect("run feed probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        if on_out.contains("SKIP fm not bound") {
+            eprintln!("skipping: feed vendor did not bind (wheel ships #3672?)");
+            return;
+        }
+        assert!(
+            on.status.success() && on_out.contains("OK fm"),
+            "feed vendor misbehaved against the installed wheel.\nstdout:\n{on_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        assert!(
+            off.status.success() && off_out.contains("SKIP fm not bound"),
             "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
             String::from_utf8_lossy(&off.stderr)
         );

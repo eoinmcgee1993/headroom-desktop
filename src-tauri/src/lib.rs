@@ -4214,10 +4214,11 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
 /// how long ago that pull was.
 ///
 /// One pull costs far more than what is read off it: measured 2026-09-07,
-/// `limit=100` returns ~44 MB because every event carries `request_messages`
-/// plus a byte-identical `compressed_messages` (~160 KB per event, and the
-/// backend has no parameter to omit them) while the observer and the canary
-/// between them read ~403 bytes of each. The backend serializes all of it on
+/// `limit=100` returned ~44 MB because every event carried `request_messages`
+/// plus a byte-identical `compressed_messages` (~160 KB per event) while the
+/// observer and the canary between them read ~403 bytes of each; the fetch now
+/// asks for `include_messages=0` (upstream #3672, vendored), and this guard
+/// still bounds how often even the slim pull runs. The backend serializes all of it on
 /// its event loop, and `/stats` -- which the dashboard polls on its own cadence
 /// -- queues behind it: 45 ms idle against 1.3 s with three pulls in flight, on
 /// an otherwise idle machine. That is the shape behind RUST-86's 15s `/stats`
@@ -6892,8 +6893,8 @@ struct RawTransformationsFeedResponse {
 }
 
 /// 2s was silently fatal on exactly the users whose data matters most. The feed
-/// ships every event's full message bodies (~160 KB each, no way to ask the
-/// backend for less), so `limit=100` measured 44 MB / 0.38s on a heavy machine
+/// shipped every event's full message bodies (~160 KB each; now omitted via
+/// `include_messages=0`), so `limit=100` measured 44 MB / 0.38s on a heavy machine
 /// here -- and a machine with conversations a few times larger crosses 2s, at
 /// which point the activity observer AND the zero-savings canary get nothing,
 /// every tick, forever. Raising this costs the backend nothing: it serializes
@@ -6910,7 +6911,12 @@ fn fetch_transformations_feed_from(
         .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
         .build()
         .map_err(|err| err.to_string())?;
-    let url = format!("{base_url}/transformations/feed?limit={limit}");
+    // include_messages=0: the observer and the canary read ~400 B of numbers
+    // per event; the bodies were ~44 MB per limit=100 pull, serialized on the
+    // backend's event loop (RUST-86). Served by the #3672 vendor on the pinned
+    // wheel; a wheel without it ignores the parameter and sends bodies as
+    // before, which the deserializer already tolerates.
+    let url = format!("{base_url}/transformations/feed?limit={limit}&include_messages=0");
     let response = client.get(url).send().map_err(|err| err.to_string())?;
     if !response.status().is_success() {
         return Err(format!("proxy returned HTTP {}", response.status()));

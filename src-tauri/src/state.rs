@@ -847,6 +847,16 @@ impl AppState {
         // thread, so the one-time scan does not block the UI.
         self.tool_manager.seed_verbosity_baseline_if_needed();
 
+        // Which wheel this host actually runs. Every sitecustomize vendor is
+        // exact-pin gated, so a runtime that missed its upgrade is silently
+        // unvendored; this tag is what tells that host from one where the
+        // vendor bound and the fault lies elsewhere (RUST-86 on 0.9.16).
+        let wheel = self
+            .tool_manager
+            .installed_headroom_version()
+            .unwrap_or_else(|| "unknown".into());
+        sentry::configure_scope(|scope| scope.set_tag("headroom.wheel", wheel));
+
         match self.ensure_headroom_running() {
             Ok(()) => {
                 crate::port_conflict::note_proxy_started(app);
@@ -6279,6 +6289,30 @@ static STATS_FETCH_WARNED_AT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
 /// last fetch failed or nothing has failed yet.
 /// Lock order: take `STATS_FETCH_WARNED_AT` before this one.
 static STATS_FETCH_RECOVERED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// Last successful `/stats` fetch and the intercept's request total at that
+/// moment. A timeout report carries the deltas, so the fleet can tell a
+/// backend that stalls on an IDLE host (the build itself, e.g. an unvendored
+/// `get_recent`) from one starved by traffic (RUST-86 residual on 0.9.16).
+/// Never nested with the two locks above.
+static STATS_FETCH_LAST_OK: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+
+fn total_intercept_requests() -> u64 {
+    crate::proxy_intercept::intercept_request_counts()
+        .values()
+        .sum()
+}
+
+/// `(seconds, requests)` since the last good fetch; `-1` for both when none
+/// has succeeded this process.
+fn stats_fetch_stall_context(last_ok: Option<(Instant, u64)>, requests_now: u64) -> (i64, i64) {
+    match last_ok {
+        Some((at, requests_then)) => (
+            at.elapsed().as_secs() as i64,
+            requests_now.saturating_sub(requests_then) as i64,
+        ),
+        None => (-1, -1),
+    }
+}
 
 /// Window a warn must clear before the `streak`-th consecutive one may speak:
 /// 15m, 30m, 1h, 2h, 4h, then capped. `streak` is 1-based.
@@ -6359,9 +6393,13 @@ fn warn_stats_fetch_failed(reason: &str) {
     // which the local log states in full; Sentry gains nothing from a repeat.
     // Our OWN backend answering 4xx is a real fault and still reports.
     if !foreign_holder {
+        let (secs_since_ok, requests_since_ok) =
+            stats_fetch_stall_context(*STATS_FETCH_LAST_OK.lock(), total_intercept_requests());
         sentry::with_scope(
             |scope| {
                 scope.set_fingerprint(Some(&["stats-fetch-failed", &category]));
+                scope.set_extra("secs_since_last_ok", secs_since_ok.into());
+                scope.set_extra("requests_since_last_ok", requests_since_ok.into());
             },
             || {
                 sentry::capture_message(&message, sentry::Level::Warning);
@@ -6381,6 +6419,7 @@ fn warn_stats_fetch_failed(reason: &str) {
 /// immediate warn every poll, so the streak never advanced past 1 and the
 /// 15m..6h decay never applied (RUST-86).
 fn note_stats_fetch_success() {
+    *STATS_FETCH_LAST_OK.lock() = Some((Instant::now(), total_intercept_requests()));
     let mut warned = STATS_FETCH_WARNED_AT.lock();
     let mut recovered = STATS_FETCH_RECOVERED_AT.lock();
     if warned.is_none() {
@@ -9228,13 +9267,14 @@ mod tests {
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, savings_rate_implausible, settle_rollup_backfill,
-        stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
-        tool_schema_savings_usd, total_dir_size_bytes, warn_stats_fetch_failed, AppState,
-        BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
-        PersistedSavingsState, RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW,
-        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
+        stats_fetch_stall_context, stats_fetch_warn_interval, support_tier_for_platform,
+        tcp_port_accepts_connection, tool_schema_savings_usd, total_dir_size_bytes,
+        warn_stats_fetch_failed, AppState, BootValidationOutcome, ClaudeProjectScan,
+        DailySavingsBucket, Duration, HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant,
+        OutputSampleBucket, PersistedSavingsState, RingStartTotals, SavingsObservation,
+        SavingsRecord, SavingsTracker, OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_RECOVERED_AT,
+        STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
+        STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -12675,6 +12715,16 @@ mod tests {
                 "a retained payload must expire"
             );
         }
+    }
+
+    #[test]
+    fn stats_fetch_stall_context_reports_deltas_or_minus_one() {
+        assert_eq!(stats_fetch_stall_context(None, 7), (-1, -1));
+        let (secs, reqs) = stats_fetch_stall_context(Some((Instant::now(), 5)), 12);
+        assert!(secs >= 0);
+        assert_eq!(reqs, 7);
+        // Counter reset (process restart of the intercept) never goes negative.
+        assert_eq!(stats_fetch_stall_context(Some((Instant::now(), 9)), 3).1, 0);
     }
 
     #[test]
