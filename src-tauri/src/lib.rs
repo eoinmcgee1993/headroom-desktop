@@ -7329,6 +7329,15 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
             // ask your admin to enable access` -- an org policy on the
             // user's account, and the line names its own remedy.
             || lower.contains("disabled claude subscription access")
+            // RUST-HH: `Usage credits are required for long context requests.`
+            // -- the account is not entitled to the >200k window its CLI asked
+            // for, which is an entitlement on their side, not a prompt we built
+            // too big: the digest is capped at _MAX_DIGEST_TOKENS (80k) and
+            // every item inside it is truncated to 120-300 chars, so it cannot
+            // reach 200k. Deliberately NOT worded with "credit balance", which
+            // is the exhausted-balance line above; this one fires with a full
+            // balance and no long-context entitlement.
+            || lower.contains("credits are required")
     })
 }
 
@@ -12653,6 +12662,10 @@ Some unrelated content.
             "API Error: 404 {\"type\":\"error\",\"error\":{\"type\":\"not_found_error\"}}",
             "Credit balance is too low",
             "Your organization has disabled Claude subscription access for Claude Code \u{b7} Use an Anthropic API key instead, or ask your admin to enable access",
+            // RUST-HH verbatim: the account may not use the >200k window its
+            // CLI asked for. Our digest is capped well under that, so the
+            // entitlement is the whole cause.
+            "Usage credits are required for long context requests.",
         ] {
             let stderr = format!("{marker}{diagnosis}\n  Analysis failed: ...\n");
             assert_eq!(
