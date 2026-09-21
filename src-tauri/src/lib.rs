@@ -952,6 +952,19 @@ async fn install_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingAppUpdate>,
 ) -> Result<(), String> {
+    // Ahead of the download, not after it: the install is the only step that
+    // needs a writable folder, and failing it late costs the user the whole
+    // bundle transfer for nothing.
+    #[cfg(target_os = "macos")]
+    if bundle_is_read_only() {
+        log::warn!("update: refusing in-place install; the bundle folder is read-only");
+        log::info!(
+            "update: read-only bundle path {:?}",
+            current_app_bundle_path()
+        );
+        return Err(READ_ONLY_BUNDLE_MESSAGE.to_string());
+    }
+
     let emitter_app = app.clone();
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
@@ -1109,6 +1122,59 @@ fn current_app_bundle_path() -> Option<std::path::PathBuf> {
         .map(|p| p.to_path_buf())
 }
 
+/// The message shown when the running bundle sits on a read-only filesystem, so
+/// an update cannot be swapped into place. See `bundle_dir_is_read_only`.
+#[cfg(target_os = "macos")]
+const READ_ONLY_BUNDLE_MESSAGE: &str =
+    "Headroom cannot update itself because it is running from a read-only folder. \
+     If you opened it straight from the disk image, drag Headroom to your \
+     Applications folder and open it from there, then check for updates again.";
+
+/// Is `dir` on a read-only filesystem? Probes with a real file create: mode bits
+/// say nothing about a read-only MOUNT, and matching `/AppTranslocation/` in the
+/// path catches only one of the ways this happens (running straight off the
+/// mounted `.dmg` is the other).
+///
+/// Read-only specifically, not "unwritable": the updater renames the bundle
+/// aside to install, and on `PermissionDenied` (a `/Applications` this user does
+/// not own) the plugin retries the move under an admin prompt, which works. Only
+/// `EROFS` is the dead end, so only `EROFS` may block.
+#[cfg(target_os = "macos")]
+fn dir_is_read_only(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".headroom-write-probe-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(err) => is_read_only_filesystem(&err),
+    }
+}
+
+/// `EROFS` (30). Raw errno rather than `io::ErrorKind::ReadOnlyFilesystem` so
+/// this keeps compiling on the MSRV the CI images pin.
+#[cfg(target_os = "macos")]
+fn is_read_only_filesystem(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(30)
+}
+
+/// `true` when the running `.app` cannot be replaced in place because the folder
+/// holding it is read-only. Two ways in, both ending in a randomized or mounted
+/// read-only volume: App Translocation (the app was launched quarantined and
+/// never moved to `/Applications`) and running directly off the mounted `.dmg`.
+///
+/// Without this the updater downloads the whole update first and only then dies
+/// on a bare "Read-only file system (os error 30)" (RUST-HA), every check,
+/// forever - these installs can never update themselves (RUST-44 is the same
+/// cohort, seen from the uninstall side).
+#[cfg(target_os = "macos")]
+fn bundle_is_read_only() -> bool {
+    current_app_bundle_path()
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .is_some_and(dir_is_read_only)
+}
+
 #[cfg(target_os = "macos")]
 fn shell_quote_path(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
@@ -1202,11 +1268,12 @@ fn relauncher_script(pid: u32, expect: &str, launch: &str) -> String {
 fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
     let bundle = current_app_bundle_path()?;
 
-    // App Translocation: the app was launched quarantined (e.g. straight from a
-    // DMG, never moved to /Applications) and runs from a randomized read-only
-    // copy under `.../AppTranslocation/...`. Trashing that copy does nothing
-    // useful and leaves the real install in place, so skip it.
-    if bundle.to_string_lossy().contains("/AppTranslocation/") {
+    // A read-only folder means the app was launched from the DMG - either
+    // App-Translocated to a randomized read-only copy, or running straight off
+    // the mounted volume. Either way the `mv` below cannot move it and the real
+    // install stays put, so skip it. Probed rather than matched on
+    // `/AppTranslocation/`, which misses the mounted-volume half.
+    if bundle.parent().is_some_and(dir_is_read_only) {
         // No path in the warn: it is per-user random, so each host made its
         // own Sentry issue (RUST-44, RUST-GD).
         log::warn!(
@@ -9485,6 +9552,8 @@ mod tests {
         QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
+    #[cfg(target_os = "macos")]
+    use super::{dir_is_read_only, is_read_only_filesystem};
     use parking_lot::Mutex;
     use serde_json::json;
     use std::sync::Arc;
@@ -13388,6 +13457,42 @@ Some unrelated content.
             None,
             "a reload must not replay a spent code"
         );
+    }
+
+    /// The guard must fire on a read-only FILESYSTEM and on nothing else. A
+    /// merely unwritable folder (an `/Applications` this user does not own) is
+    /// the updater's admin-prompt path and still installs, so blocking it would
+    /// break updates that work today.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_bundle_guard_fires_on_erofs_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !dir_is_read_only(dir.path()),
+            "a writable folder must not block an install"
+        );
+
+        let unwritable = dir.path().join("unwritable");
+        std::fs::create_dir(&unwritable).expect("create");
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        assert!(
+            !dir_is_read_only(&unwritable),
+            "EACCES is the admin-prompt path, not a dead end, so it must not block"
+        );
+        // Leave it removable by the tempdir drop.
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+
+        assert!(
+            is_read_only_filesystem(&std::io::Error::from_raw_os_error(30)),
+            "EROFS is what App Translocation and a mounted DMG return"
+        );
+        assert!(!is_read_only_filesystem(
+            &std::io::Error::from_raw_os_error(13)
+        ));
     }
 }
 

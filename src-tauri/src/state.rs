@@ -2692,9 +2692,14 @@ impl AppState {
         let lifetime_estimated_savings_usd = lifetime_compression_savings_usd
             + lifetime_output_savings_usd
             + lifetime_tool_schema_savings_usd;
-        warn_once_if_savings_rate_implausible(&daily_savings, || {
-            self.tool_manager.installed_headroom_version()
-        });
+        warn_once_if_savings_rate_implausible(
+            &daily_savings,
+            savings_breakdown
+                .as_ref()
+                .map(|b| b.model_rates.as_slice())
+                .unwrap_or_default(),
+            || self.tool_manager.installed_headroom_version(),
+        );
         // Tokens stay input-only: the card is labelled "Total input tokens
         // saved", and this total also drives the milestone notifications, which
         // must not jump when a new savings layer starts reporting.
@@ -8769,11 +8774,29 @@ fn savings_rate_implausible(daily_savings: &[DailySavingsPoint]) -> Option<f64> 
     (savings_per_m > MAX_PLAUSIBLE_INPUT_USD_PER_M).then_some(savings_per_m)
 }
 
+/// The models carrying the most requests, most first, as `"name xN"` joined by
+/// `", "`. `"unknown"` when the backend predates `by_model` or every row fell
+/// under its sample floor.
+fn top_models_by_requests(model_rates: &[crate::models::ModelSavingsRate]) -> String {
+    let mut ranked: Vec<_> = model_rates.iter().collect();
+    ranked.sort_by(|a, b| b.requests.cmp(&a.requests));
+    let listed: Vec<_> = ranked
+        .iter()
+        .take(3)
+        .map(|r| format!("{} x{}", r.model, r.requests))
+        .collect();
+    if listed.is_empty() {
+        return "unknown".into();
+    }
+    listed.join(", ")
+}
+
 /// Warn-only canary, once per process: a contaminated rate silently corrected
 /// is worse than a loud one, so nothing is clamped -- the warn reaches Sentry
 /// through the log bridge and the numbers keep rendering as reported.
 fn warn_once_if_savings_rate_implausible(
     daily_savings: &[DailySavingsPoint],
+    model_rates: &[crate::models::ModelSavingsRate],
     installed_wheel: impl FnOnce() -> Option<String>,
 ) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -8813,6 +8836,13 @@ fn warn_once_if_savings_rate_implausible(
             })
             .unwrap_or_else(|| "none".into());
         let upstream = crate::upstream_override::get().mode;
+        // The one dimension the rate alone cannot supply. $43/M is contamination
+        // on a Sonnet-only install and an ordinary Tuesday on one running
+        // o1-pro ($150/M input), and every past firing of this canary
+        // (RUST-89/8C/DX/HB) was closed on a guess because the event did not say
+        // which. Requests-weighted, because that is what sets the blended rate --
+        // `model_rates` arrives sorted by savings percent instead.
+        let top_models = top_models_by_requests(model_rates);
         // Fixed fingerprint, numbers as extras: every dollar figure in the
         // message text is different on every host, so the bridged warn opened
         // one issue per machine per day (RUST-DX, RUST-89, RUST-8C are the same
@@ -8829,6 +8859,7 @@ fn warn_once_if_savings_rate_implausible(
                 scope.set_extra("saved_toks", saved_tokens.into());
                 scope.set_extra("worst_bucket", worst.clone().into());
                 scope.set_extra("upstream", format!("{upstream:?}").into());
+                scope.set_extra("top_models", top_models.clone().into());
                 scope.set_fingerprint(Some(&["savings_rate_implausible"]));
             },
             || {
@@ -8844,7 +8875,7 @@ fn warn_once_if_savings_rate_implausible(
              across {saved_tokens} tokens, wheel {wheel}), above the \
              ${MAX_PLAUSIBLE_INPUT_USD_PER_M:.2}/M ceiling for an input token; upstream savings \
              semantics likely changed under the pinned wheel; worst bucket {worst}, upstream \
-             {upstream:?}"
+             {upstream:?}, top models {top_models}"
         );
     }
 }
@@ -9271,13 +9302,13 @@ mod tests {
         proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, savings_rate_implausible, settle_rollup_backfill,
         stats_fetch_stall_context, stats_fetch_warn_interval, support_tier_for_platform,
-        tcp_port_accepts_connection, tool_schema_savings_usd, total_dir_size_bytes,
-        warn_stats_fetch_failed, AppState, BootValidationOutcome, ClaudeProjectScan,
-        DailySavingsBucket, Duration, HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant,
-        OutputSampleBucket, PersistedSavingsState, RingStartTotals, SavingsObservation,
-        SavingsRecord, SavingsTracker, OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_RECOVERED_AT,
-        STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
-        STATS_FETCH_WARN_MAX_INTERVAL,
+        tcp_port_accepts_connection, tool_schema_savings_usd, top_models_by_requests,
+        total_dir_size_bytes, warn_stats_fetch_failed, AppState, BootValidationOutcome,
+        ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
+        HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
+        RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
+        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW,
+        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -9566,6 +9597,31 @@ mod tests {
             None
         );
         assert_eq!(savings_rate_implausible(&[]), None);
+    }
+
+    /// The canary event is only actionable if it says which models were priced,
+    /// ranked by the thing that sets a blended rate. `model_rates` arrives
+    /// sorted by savings percent, so ranking has to be redone here.
+    #[test]
+    fn canary_model_mix_ranks_by_requests_not_savings() {
+        let rate =
+            |model: &str, requests: u64, savings_percent: f64| crate::models::ModelSavingsRate {
+                model: model.into(),
+                requests,
+                savings_percent,
+            };
+
+        assert_eq!(top_models_by_requests(&[]), "unknown");
+        assert_eq!(
+            top_models_by_requests(&[
+                rate("o1-pro", 4, 40.0),
+                rate("claude-sonnet-5", 900, 12.0),
+                rate("claude-opus-5", 120, 8.0),
+                rate("gpt-5", 60, 6.0),
+            ]),
+            "claude-sonnet-5 x900, claude-opus-5 x120, gpt-5 x60",
+            "the heaviest models decide the blended rate; the best-compressing one does not"
+        );
     }
 
     #[test]

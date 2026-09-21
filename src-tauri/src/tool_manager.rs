@@ -3503,6 +3503,15 @@ impl ManagedRuntime {
         })
     }
 
+    /// Drop the base interpreter so the next bootstrap re-downloads it.
+    ///
+    /// The venv is deliberately left alone: its `site-packages` does not live
+    /// under the base, so a corrupt base costs a ~30 MB redownload rather than
+    /// the full dependency install.
+    pub fn discard_base_interpreter(&self) -> std::io::Result<()> {
+        crate::client_adapters::remove_dir_all_retry(&self.python_dir)
+    }
+
     /// Base interpreter present and able to boot (see
     /// [`Self::standalone_stdlib_present`]). This, not `standalone_python()`
     /// alone, is the gate for both "installed" and "skip the download":
@@ -4926,7 +4935,34 @@ impl ToolManager {
                 });
             }
 
-            // All variants failed. If the proxy crashed because the venv has a
+            // All variants failed. A corrupt BASE interpreter comes first: the
+            // repairs below all drive pip through that interpreter, so they
+            // cannot run, and their failures would bury the real cause.
+            // Nothing here can mend bytes on disk either - what unblocks the
+            // user is dropping the base so `standalone_runtime_intact()` stops
+            // claiming this machine is installed, which routes the next launch
+            // (or the retry button already on screen) back through bootstrap's
+            // re-download. Same remedy RUST-C8 got for the missing-stdlib
+            // shape, reached by a different gate.
+            if let Some(failure) = failures
+                .iter()
+                .find(|f| is_corrupt_base_stdlib_signal(&f.log_tail))
+            {
+                log::warn!(
+                    "headroom proxy failed with a corrupt base interpreter stdlib; \
+                     discarding the base so bootstrap re-downloads it (reason: {})",
+                    failure.reason
+                );
+                if let Err(err) = self.runtime.discard_base_interpreter() {
+                    log::error!("discarding the corrupt base interpreter failed: {err:#}");
+                }
+                // Every repair below shells out to pip through the interpreter
+                // just deleted. Skipping them keeps their certain failures out
+                // of the log and the report.
+                allow_repair = false;
+            }
+
+            // If the proxy crashed because the venv has a
             // pydantic / pydantic-core skew (e.g. a partial upgrade left
             // pydantic-core ahead of pydantic), pin pydantic-core back to the
             // version pydantic asks for and retry once. The error message itself
@@ -13639,6 +13675,40 @@ pub(crate) fn onnx_probe_crashed(verdict: &str) -> bool {
         || lower.contains("(killed)")
 }
 
+/// A traceback raised from inside the BASE interpreter's own stdlib, in one of
+/// the ways only damaged bytes on disk produce.
+///
+/// `standalone_stdlib_present` asks whether `Lib/os.py` EXISTS, which is the
+/// third gate in this family to check presence and miss the shape one level
+/// deeper: a stdlib file that is there but truncated. RUST-BA is
+/// `asyncio/__init__.py` reaching its `__all__` line with `base_events` never
+/// bound - no import error, just a file that stops making sense partway
+/// through. The interpreter is unrunnable, every gate says "installed", and
+/// the proxy dies identically on every launch forever.
+///
+/// Anchored on the base stdlib directory, which is the part that makes this
+/// specific: nothing but the CPython distribution we unpack lives there. The
+/// venv (`runtime/venv/lib/...`) and site-packages are a different directory
+/// and a different repair, already handled above.
+pub(crate) fn is_corrupt_base_stdlib_signal(text: &str) -> bool {
+    // Failures of reading, parsing or executing bytes. Import errors are left
+    // out on purpose: a missing or blocked module is Application Control's
+    // signature, and `is_blocked_runtime_dll_signal` owns that class.
+    const DAMAGE: &[&str] = &[
+        "syntaxerror",
+        "indentationerror",
+        "nameerror",
+        "unicodedecodeerror",
+        "marshal data too short",
+        "bad marshal data",
+        "source code string cannot contain null bytes",
+    ];
+    // Separators normalized so one needle covers `runtime\python\Lib` on
+    // Windows and `runtime/python/lib/python3.12` everywhere else.
+    let text = text.to_ascii_lowercase().replace('\\', "/");
+    text.contains("/runtime/python/lib/") && DAMAGE.iter().any(|d| text.contains(d))
+}
+
 /// Structured error emitted when the headroom proxy subprocess fails to open
 /// its port. Capture sites downcast to pull the log tail into Sentry `extra`
 /// fields, which are not subject to the 8KB message cap.
@@ -15263,6 +15333,49 @@ print("OK fm")
         // No dump: plain tail, no marker section.
         std::fs::write(&log, "just\na\nlog\n").unwrap();
         assert_eq!(super::crash_log_excerpt(&log), "just\na\nlog");
+    }
+
+    /// Verbatim from RUST-BA (Windows, 0.9.16): the base stdlib's
+    /// `asyncio/__init__.py` present but damaged, so the interpreter cannot
+    /// boot and every presence gate still reads "installed".
+    #[test]
+    fn corrupt_base_stdlib_is_told_apart_from_the_venv_and_from_app_control() {
+        let rust_ba = "Traceback (most recent call last):\n  \
+             File \"<frozen runpy>\", line 198, in _run_module_as_main\n  \
+             File \"C:\\Users\\j\\AppData\\Local\\Headroom\\headroom\\runtime\\venv\\Lib\\\
+             site-packages\\headroom\\proxy\\server.py\", line 27, in <module>\n    \
+             import asyncio\n  \
+             File \"C:\\Users\\j\\AppData\\Local\\Headroom\\headroom\\runtime\\python\\Lib\\\
+             asyncio\\__init__.py\", line 25, in <module>\n    \
+             __all__ = (base_events.__all__ +\n               ^^^^^^^^^^^\n\
+             NameError: name 'base_events' is not defined";
+        assert!(super::is_corrupt_base_stdlib_signal(rust_ba));
+
+        // Unix layout, and a truncation that surfaces as a parse error.
+        assert!(super::is_corrupt_base_stdlib_signal(
+            "File \"/home/u/.local/share/Headroom/headroom/runtime/python/lib/python3.12/\
+             asyncio/base_events.py\", line 1904\n    async def _sendfile_native(\n\
+             SyntaxError: invalid syntax"
+        ));
+
+        // Our own code and our dependencies are a different directory and a
+        // different repair: reinstalling a wheel cannot be answered by throwing
+        // away the interpreter.
+        assert!(!super::is_corrupt_base_stdlib_signal(
+            "File \"C:\\...\\runtime\\venv\\Lib\\site-packages\\headroom\\proxy\\server.py\", \
+             line 27\nNameError: name 'settings' is not defined"
+        ));
+
+        // Application Control blocking a stdlib extension lives in the same
+        // directory but is `is_blocked_runtime_dll_signal`'s to classify, and
+        // deleting the base would not lift a machine policy.
+        let app_control = "File \"C:\\...\\runtime\\python\\Lib\\sqlite3\\dbapi2.py\", line 27\n\
+             ImportError: DLL load failed while importing _sqlite3: \
+             A dynamic link library (DLL) initialization routine failed.";
+        assert!(!super::is_corrupt_base_stdlib_signal(app_control));
+        assert!(crate::is_blocked_runtime_dll_signal(app_control));
+
+        assert!(!super::is_corrupt_base_stdlib_signal(""));
     }
 
     #[test]
