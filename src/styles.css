@@ -2470,33 +2470,6 @@ select {
   font-weight: 400;
 }
 
-/* RC-only live counter under the saved total. The dot blips once per mount;
-   the chip is remounted (React key) each time today's saved-token count
-   rises, so it restarts exactly when real savings land. Tokens only, so dark
-   mode needs no override. */
-.savings-chart__overlay-live {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  margin-top: 2px;
-  font-size: 0.7rem;
-  color: var(--text-muted);
-}
-
-.savings-chart__overlay-live-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: live-savings-blip 900ms ease-out 1;
-}
-
-@keyframes live-savings-blip {
-  0% { box-shadow: 0 0 0 0 var(--accent-tint-strong); transform: scale(1); }
-  40% { box-shadow: 0 0 0 6px var(--accent-tint); transform: scale(1.4); }
-  100% { box-shadow: 0 0 0 0 transparent; transform: scale(1); }
-}
-
 .savings-chart__nav-button {
   display: inline-flex;
   align-items: center;

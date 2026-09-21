@@ -1239,10 +1239,49 @@ fn shell_quote_path(path: &std::path::Path) -> String {
 #[cfg(target_os = "macos")]
 fn spawn_relauncher(launch: &str) {
     let cmd = relauncher_script(std::process::id(), &relauncher_expect_name(), launch);
-    match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
-        Ok(_) => log::info!("restart_app: relauncher spawned"),
+    match spawn_detached(&cmd) {
+        Ok(()) => log::info!("restart_app: relauncher spawned"),
         Err(err) => log::error!("restart_app: failed to spawn relauncher: {err}"),
     }
+}
+
+/// Runs `script` in a shell that must OUTLIVE this process. Every caller here
+/// is a helper whose whole job starts once we are dead (relaunch us, trash our
+/// bundle), so a helper that dies with us does nothing and says nothing.
+///
+/// A plain `spawn()` is not enough, which cost a user 3m44s of downtime on
+/// 2026-09-21: the update installed, the app exited cleanly, and the relauncher
+/// never reached its `open` (no outcome line in the log, no process left
+/// behind). It had gone 6-for-6 before that and lost the race on a busy box.
+/// Three ways a fork child of a quitting macOS GUI app dies, all closed here:
+///
+/// - It is still our direct child when we exit, so it is in the launchd domain
+///   being torn down (`[pid/N] shutting down`, which SIGKILLs what is left in
+///   it). `( ... ) &` makes the shell we spawn exit at once, so the real work is
+///   reparented to launchd NOW, while we are alive, instead of at our death.
+/// - A group-directed kill reaches it. `process_group(0)` puts it in its own.
+/// - The orphaned process group gets SIGHUP. Trapped.
+///
+/// Not `setsid`: macOS ships no such binary, and reparenting plus a fresh
+/// process group covers what a new session would buy us here.
+#[cfg(target_os = "macos")]
+fn spawn_detached(script: &str) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    crate::proc::command("/bin/sh")
+        .arg("-c")
+        .arg(detached_script(script))
+        .process_group(0)
+        .spawn()
+        .map(|_| ())
+}
+
+/// `( ... ) &` so the shell we spawn exits immediately and the work inside is
+/// reparented to launchd while we are still alive. stdio to `/dev/null`: it
+/// runs on after our fds are gone, and it reports by appending to the desktop
+/// log rather than through anything it inherited from us.
+#[cfg(target_os = "macos")]
+fn detached_script(script: &str) -> String {
+    format!("( trap '' HUP; {script} ) >/dev/null 2>&1 &")
 }
 
 /// What `ps -o comm=` reports for THIS process, for the identity gate below.
@@ -1280,7 +1319,13 @@ fn relauncher_expect_name() -> String {
 fn relauncher_script(pid: u32, expect: &str, launch: &str) -> String {
     let log_quoted = shell_quote_path(&logging::log_path());
     format!(
-        "alive=1; \
+        // One line as soon as the detached side is running, because its silence
+        // is otherwise unreadable: on 2026-09-21 only the outcome line existed,
+        // so a helper that died mid-wait looked exactly like one that never
+        // started. Written from inside the subshell, so it also proves the
+        // detach itself took.
+        "echo \"$(date '+%Y-%m-%d %H:%M:%S') helper: detached, waiting for pid {pid}\" >> {log_quoted}; \
+         alive=1; \
          for i in $(seq 1 100); do \
            if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
            sleep 0.1; \
@@ -1328,27 +1373,28 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
         return None;
     }
 
-    let pid = std::process::id();
     let quoted = shell_quote_path(&bundle);
     let log_quoted = shell_quote_path(&logging::log_path());
-    let cmd = format!(
-        "alive=1; \
-         for i in $(seq 1 100); do \
-           if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
-           sleep 0.1; \
-         done; \
-         if [ \"$alive\" = 1 ]; then kill -9 {pid} 2>/dev/null; sleep 0.5; fi; \
-         base=$(basename {quoted}); \
+    // The same wait-then-act helper the relaunch path uses, which buys the
+    // uninstall the two things this hand-rolled copy was missing: a shell that
+    // survives our exit (one killed with us leaves the bundle sitting there,
+    // silently, after the user asked for it to go), and the identity gate in
+    // front of the force-kill.
+    let cmd = relauncher_script(
+        std::process::id(),
+        &relauncher_expect_name(),
+        &format!(
+            "base=$(basename {quoted}); \
          dest=\"$HOME/.Trash/$base\"; \
          if [ -e \"$dest\" ]; then dest=\"$HOME/.Trash/${{base%.app}} $(date +%s).app\"; fi; \
          mv -f {quoted} \"$dest\"; rc=$?; \
-         echo \"$(date '+%Y-%m-%d %H:%M:%S') uninstall: mv {quoted} -> $dest exited rc=$rc (alive=$alive)\" >> {log_quoted}",
-        pid = pid,
-        quoted = quoted,
-        log_quoted = log_quoted,
+             echo \"$(date '+%Y-%m-%d %H:%M:%S') uninstall: mv {quoted} -> $dest exited rc=$rc (alive=$alive)\" >> {log_quoted}",
+            quoted = quoted,
+            log_quoted = log_quoted,
+        ),
     );
-    match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
-        Ok(_) => {
+    match spawn_detached(&cmd) {
+        Ok(()) => {
             log::info!("uninstall: scheduled app-bundle trash for {bundle:?}");
             Some(bundle)
         }
@@ -13560,14 +13606,65 @@ Some unrelated content.
                 script.contains("kill -9 4242"),
                 "lost the force-kill backstop: {script}"
             );
+            // The detached form is what actually runs, so that is what gets
+            // syntax-checked: the `( ... ) &` wrapper has to survive contact
+            // with the quotes and `$(...)` inside it.
+            let detached = super::detached_script(&script);
             let status = crate::proc::command("/bin/sh")
                 .arg("-n")
                 .arg("-c")
-                .arg(&script)
+                .arg(&detached)
                 .status()
                 .expect("run sh -n");
-            assert!(status.success(), "sh rejected the script: {script}");
+            assert!(status.success(), "sh rejected the script: {detached}");
         }
+    }
+
+    /// The helper's whole job starts once we are dead, so it has to outlive the
+    /// process that spawned it. It did not on 2026-09-21: the app installed its
+    /// update, exited cleanly, and nothing ever relaunched it.
+    ///
+    /// Checks the mechanism the fix rests on - the spawner returns at once and
+    /// the work runs on after that spawner is gone. It cannot reproduce
+    /// launchd's domain teardown from a test binary; what it does catch is the
+    /// wrapper losing its `&`, which puts the work back inside the spawner's
+    /// lifetime, the exact shape that failed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detached_helper_outlives_the_process_that_spawned_it() {
+        let dir = std::env::temp_dir().join(format!("headroom-detach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let marker = dir.join("survived");
+
+        let script = super::detached_script(&format!(
+            "sleep 0.6; touch {}",
+            super::shell_quote_path(&marker)
+        ));
+        // A shell we wait on, standing in for the app that is quitting.
+        let started = std::time::Instant::now();
+        let status = crate::proc::command("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run spawner");
+        let spawner_took = started.elapsed();
+
+        assert!(status.success(), "spawner failed: {script}");
+        assert!(
+            spawner_took < std::time::Duration::from_millis(400),
+            "spawner waited on the helper ({spawner_took:?}): the work is still inside its lifetime"
+        );
+        assert!(!marker.exists(), "helper finished before the spawner exited");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            marker.exists(),
+            "helper died with the process that spawned it: {script}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

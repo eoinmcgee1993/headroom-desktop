@@ -942,20 +942,9 @@ function DailySavingsChart({
   const [savingsToday, setSavingsToday] = useState<{ usd: number; tokens: number } | null>(
     null
   );
-  // Bumped each time today's saved-token count rises; keys the live chip so
-  // its blip animation restarts. Real savings only: a sample that saved
-  // nothing leaves the key alone.
-  const [savingsPulseKey, setSavingsPulseKey] = useState(0);
-  const lastSavingsTokensRef = useRef<number | null>(null);
-
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listen<{ usd: number; tokens: number }>("savings-today-updated", (event) => {
-      const previous = lastSavingsTokensRef.current;
-      if (previous !== null && event.payload.tokens > previous) {
-        setSavingsPulseKey((key) => key + 1);
-      }
-      lastSavingsTokensRef.current = event.payload.tokens;
       setSavingsToday(event.payload);
     }).then((fn) => {
       unlisten = fn;
@@ -1019,16 +1008,21 @@ function DailySavingsChart({
   // The live tray figure for today already sums the layers it knows, so it can
   // stand in for the bucket sum while today is still open.
   const liveToday = view === "day" && visibleDay >= today ? savingsToday : null;
-  const chartSaved = Math.max(
+  const chartTokens = Math.max(
     0,
-    chartMode === "usd"
-      ? liveToday !== null
-        ? liveToday.usd
-        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
-      : liveToday !== null && liveSavingsPulse
-        ? liveToday.tokens
-        : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
+    liveToday !== null && liveSavingsPulse
+      ? liveToday.tokens
+      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
   );
+  const chartSaved =
+    chartMode === "usd"
+      ? Math.max(
+          0,
+          liveToday !== null
+            ? liveToday.usd
+            : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
+        )
+      : chartTokens;
 
   useEffect(() => {
     const now = new Date();
@@ -1119,17 +1113,10 @@ function DailySavingsChart({
             </span>
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
+              {chartMode === "usd" && chartTokens > 0
+                ? ` across ${compactNumber(chartTokens)} tokens`
+                : ""}
             </span>
-            {liveSavingsPulse && liveToday !== null ? (
-              <span
-                className="savings-chart__overlay-live"
-                key={savingsPulseKey}
-                title="Updates as Headroom saves tokens"
-              >
-                <span className="savings-chart__overlay-live-dot" />
-                {chartMode === "usd" ? `${compactNumber(liveToday.tokens)} tokens` : "live"}
-              </span>
-            ) : null}
             {windowNewInput !== null ||
             windowBillable !== null ||
             windowOutput !== null ||
