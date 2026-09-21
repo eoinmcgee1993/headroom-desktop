@@ -13,7 +13,6 @@ import type {
   SerenaTodayStats,
   TrainSuggestionEvent,
   TransformationFeedEvent,
-  TransformationRequestMessage,
   WeeklyRecapEvent
 } from "../lib/types";
 
@@ -281,190 +280,6 @@ function workspaceBasename(path: string | null | undefined): string | null {
   return segments.length > 0 ? segments[segments.length - 1] : null;
 }
 
-// Extract displayable text from a single proxy-logged message. Anthropic sends
-// `content` as a block list (text / tool_use / tool_result / ...); OpenAI sends
-// a plain string. Text blocks are flattened verbatim; other block types are
-// shown as a short `[type]` marker rather than dropped, so the reader sees
-// that something was there.
-function messageText(msg: TransformationRequestMessage): string {
-  return flattenContent(msg.content);
-}
-
-// Flatten a message/block `content` value to text. `tool_result` blocks carry
-// their (compressible) payload in `block.content` — a string or a nested block
-// list — not in `block.text`, so without recursing here both the original and
-// compressed sides render as a bare `[tool_result]` and the diff sees no change.
-function flattenContent(c: unknown): string {
-  if (typeof c === "string") return c;
-  if (!Array.isArray(c)) return "";
-  return c
-    .map((block) => {
-      if (!block || typeof block !== "object") return "";
-      const b = block as { type?: unknown; text?: unknown; content?: unknown };
-      if (typeof b.text === "string") return b.text;
-      if (b.content !== undefined) {
-        const inner = flattenContent(b.content);
-        if (inner.length > 0) return inner;
-      }
-      if (typeof b.type === "string") return `[${b.type}]`;
-      return "";
-    })
-    .filter((s) => s.length > 0)
-    .join("\n");
-}
-
-export function formatRequestMessages(messages: TransformationRequestMessage[]): string {
-  return messages
-    .map((m) => {
-      const role = (m.role ?? "").trim() || "(unknown)";
-      return `${role}:\n${messageText(m)}`;
-    })
-    .join("\n\n");
-}
-
-export type DiffLine = { type: "same" | "add" | "del"; text: string };
-
-// LCS line diff. ponytail: O(n*m) flat Uint16 table. Large compressions — the
-// whole point of this view — routinely run to thousands of lines, so the cap is
-// on the cell product (memory), not per-side line count. ~30M cells = 60MB,
-// computed once on expand. Over that we fall back to side-by-side dumps.
-// Upgrade to Hirschberg/Myers if the cap ever bites.
-const MAX_DIFF_CELLS = 30_000_000;
-
-export function diffLines(a: string, b: string): DiffLine[] | null {
-  const oldL = a.split("\n");
-  const newL = b.split("\n");
-  const n = oldL.length;
-  const m = newL.length;
-  // Uint16 caps LCS values at 65535; the cell cap keeps n,m well under that.
-  if ((n + 1) * (m + 1) > MAX_DIFF_CELLS) return null;
-  const w = m + 1;
-  const dp = new Uint16Array((n + 1) * w);
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      dp[i * w + j] =
-        oldL[i] === newL[j]
-          ? dp[(i + 1) * w + (j + 1)] + 1
-          : Math.max(dp[(i + 1) * w + j], dp[i * w + (j + 1)]);
-    }
-  }
-  const out: DiffLine[] = [];
-  let i = 0;
-  let j = 0;
-  while (i < n && j < m) {
-    if (oldL[i] === newL[j]) {
-      out.push({ type: "same", text: oldL[i] });
-      i++;
-      j++;
-    } else if (dp[(i + 1) * w + j] >= dp[i * w + (j + 1)]) {
-      out.push({ type: "del", text: oldL[i] });
-      i++;
-    } else {
-      out.push({ type: "add", text: newL[j] });
-      j++;
-    }
-  }
-  while (i < n) out.push({ type: "del", text: oldL[i++] });
-  while (j < m) out.push({ type: "add", text: newL[j++] });
-  return out;
-}
-
-export type CollapsedDiffLine = DiffLine | { type: "skip"; text: string };
-
-// Keep `context` unchanged lines around each change and collapse the rest, so
-// the removed (red) / added (green) lines are visible the moment the row opens
-// instead of buried under hundreds of identical context lines.
-const DIFF_CONTEXT = 3;
-
-export function collapseDiff(diff: DiffLine[], context = DIFF_CONTEXT): CollapsedDiffLine[] {
-  const keep = new Array(diff.length).fill(false);
-  for (let i = 0; i < diff.length; i++) {
-    if (diff[i].type === "same") continue;
-    for (let j = Math.max(0, i - context); j <= Math.min(diff.length - 1, i + context); j++) {
-      keep[j] = true;
-    }
-  }
-  const out: CollapsedDiffLine[] = [];
-  let i = 0;
-  while (i < diff.length) {
-    if (diff[i].type !== "same" || keep[i]) {
-      out.push(diff[i]);
-      i++;
-      continue;
-    }
-    let j = i;
-    while (j < diff.length && diff[j].type === "same" && !keep[j]) j++;
-    const n = j - i;
-    out.push({ type: "skip", text: `... ${n} unchanged line${n === 1 ? "" : "s"}` });
-    i = j;
-  }
-  return out;
-}
-
-// Unified line diff of original vs compressed request bodies, so pruned content
-// (red) and inserted truncation markers (green) pop instead of two near-identical
-// dumps. Returns dt/dd fragment for the detail grid. Shared by the transformation
-// and record rows.
-function CompressionDiff({
-  requestMessages,
-  compressedMessages,
-  inputTokensOriginal,
-  inputTokensOptimized
-}: {
-  requestMessages: TransformationRequestMessage[];
-  compressedMessages: TransformationRequestMessage[];
-  inputTokensOriginal?: number | null;
-  inputTokensOptimized?: number | null;
-}) {
-  const original = formatRequestMessages(requestMessages);
-  const compressed = formatRequestMessages(compressedMessages);
-  const diff = diffLines(original, compressed);
-  if (!diff) {
-    // Too large to diff — fall back to side-by-side dumps.
-    return (
-      <>
-        <dt>Request (original)</dt>
-        <dd>
-          <pre className="activity-feed__message-dump">{original}</pre>
-        </dd>
-        <dt>Request (compressed)</dt>
-        <dd>
-          <pre className="activity-feed__message-dump">{compressed}</pre>
-        </dd>
-      </>
-    );
-  }
-  return (
-    <>
-      <dt>
-        Compression diff
-        {inputTokensOriginal != null && inputTokensOptimized != null
-          ? ` (${inputTokensOriginal.toLocaleString()} → ${inputTokensOptimized.toLocaleString()} tokens)`
-          : ""}
-      </dt>
-      <dd>
-        <pre className="activity-feed__message-dump activity-feed__diff">
-          {collapseDiff(diff).map((line, idx) => (
-            <div
-              key={idx}
-              className={`activity-feed__diff-line activity-feed__diff-line--${line.type}`}
-            >
-              {line.type === "del"
-                ? "- "
-                : line.type === "add"
-                  ? "+ "
-                  : line.type === "skip"
-                    ? ""
-                    : "  "}
-              {line.text}
-            </div>
-          ))}
-        </pre>
-      </dd>
-    </>
-  );
-}
-
 // Backends predating the upstream denominator fix (headroom#3106) measure
 // tokensSaved across all layers (tool schemas included) but count "in" over
 // messages only, so on schema-heavy turns "out" clamps to 0 and the percent
@@ -492,16 +307,8 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const groups = hasRawTransforms ? groupTransforms(event.transformsApplied) : [];
   const groupsWithTargets = groups.filter((g) => g.targets.length > 0);
   const estimatedUsd = estimateCostSavingsUsd(event.model, saved);
-  const hasRequestMessages = !!event.requestMessages && event.requestMessages.length > 0;
-  const hasCompressedMessages =
-    !!event.compressedMessages && event.compressedMessages.length > 0;
   const hasExtra =
-    hasRequestId ||
-    hasRawTransforms ||
-    event.workspace != null ||
-    estimatedUsd != null ||
-    hasRequestMessages ||
-    hasCompressedMessages;
+    hasRequestId || hasRawTransforms || event.workspace != null || estimatedUsd != null;
   const detail = hasExtra ? (
     <dl className="activity-feed__detail-grid">
       {estimatedUsd != null ? (
@@ -546,27 +353,6 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
         <>
           <dt>Request ID</dt>
           <dd className="activity-feed__detail-mono">{event.requestId}</dd>
-        </>
-      ) : null}
-      {hasRequestMessages && hasCompressedMessages ? (
-        <CompressionDiff
-          requestMessages={event.requestMessages!}
-          compressedMessages={event.compressedMessages!}
-          inputTokensOriginal={hasExactTokens ? event.inputTokensOriginal : null}
-          inputTokensOptimized={hasExactTokens ? event.inputTokensOptimized : null}
-        />
-      ) : hasRequestMessages ? (
-        // Legacy proxy shape: only `requestMessages` exists. Its content may
-        // actually be the post-compression list (field was inconsistent
-        // across sites before the upstream split) — we can't tell, so label
-        // it neutrally and keep today's behaviour.
-        <>
-          <dt>Request</dt>
-          <dd>
-            <pre className="activity-feed__message-dump">
-              {formatRequestMessages(event.requestMessages!)}
-            </pre>
-          </dd>
         </>
       ) : null}
     </dl>
@@ -863,9 +649,6 @@ function RecordRow({ event }: { event: RecordEvent }) {
   const workspace = workspaceBasename(event.workspace);
   const pct = event.savingsPercent;
   const orderedTags = RECORD_TAG_ORDER.filter((tag) => event.tags.includes(tag));
-  const hasRequestMessages = !!event.requestMessages && event.requestMessages.length > 0;
-  const hasCompressedMessages =
-    !!event.compressedMessages && event.compressedMessages.length > 0;
   const hasExactTokens =
     event.inputTokensOriginal != null &&
     event.inputTokensOptimized != null &&
@@ -876,12 +659,7 @@ function RecordRow({ event }: { event: RecordEvent }) {
     );
   const hasRequestId = !!event.requestId;
   const estimatedUsd = estimateCostSavingsUsd(event.model, event.tokensSaved);
-  const hasExtra =
-    estimatedUsd != null ||
-    hasExactTokens ||
-    hasRequestId ||
-    hasRequestMessages ||
-    hasCompressedMessages;
+  const hasExtra = estimatedUsd != null || hasExactTokens || hasRequestId;
   const detail = hasExtra ? (
     <dl className="activity-feed__detail-grid">
       {estimatedUsd != null ? (
@@ -903,23 +681,6 @@ function RecordRow({ event }: { event: RecordEvent }) {
         <>
           <dt>Request ID</dt>
           <dd className="activity-feed__detail-mono">{event.requestId}</dd>
-        </>
-      ) : null}
-      {hasRequestMessages && hasCompressedMessages ? (
-        <CompressionDiff
-          requestMessages={event.requestMessages!}
-          compressedMessages={event.compressedMessages!}
-          inputTokensOriginal={hasExactTokens ? event.inputTokensOriginal : null}
-          inputTokensOptimized={hasExactTokens ? event.inputTokensOptimized : null}
-        />
-      ) : hasRequestMessages ? (
-        <>
-          <dt>Request</dt>
-          <dd>
-            <pre className="activity-feed__message-dump">
-              {formatRequestMessages(event.requestMessages!)}
-            </pre>
-          </dd>
         </>
       ) : null}
     </dl>

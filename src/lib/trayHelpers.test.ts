@@ -74,9 +74,7 @@ describe("activityFeedSignature", () => {
           tokensSavedPercent: 12.5,
           estimatedCostSavingsUsd: 0.42,
           transforms: [],
-          requestMessages: null,
-          responseText: null,
-          compressedMessages: null
+          responseText: null
         } as never
       }
     });
@@ -99,9 +97,7 @@ describe("activityFeedSignature", () => {
           tokensSavedPercent: 0,
           estimatedCostSavingsUsd: 0,
           transforms: [],
-          requestMessages: null,
-          responseText: null,
-          compressedMessages: null
+          responseText: null
         } as never
       }
     });

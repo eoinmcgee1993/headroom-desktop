@@ -8648,7 +8648,21 @@ impl ToolManager {
     ) -> Result<()> {
         if host.plugin_present(plugin) {
             let _ = self.run_plugin_cmd(plugin, cli, host, &host.marketplace_update_args(plugin));
-            self.run_plugin_cmd(plugin, cli, host, &host.update_args(plugin))?;
+            match self.run_plugin_cmd(plugin, cli, host, &host.update_args(plugin)) {
+                Ok(()) => {}
+                // The registry lists the plugin, but at project/local scope
+                // (RUST-DQ: `Plugin "caveman" is not installed at scope user`).
+                // `update` only looks at user scope; `install` puts it there.
+                Err(err) if format!("{err:#}").contains("is not installed at scope") => {
+                    log::info!(
+                        "{} [{}]: installed at another scope; installing at user scope",
+                        plugin.id,
+                        host.label()
+                    );
+                    self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin))?;
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             // Re-adding an already-known marketplace is a benign error, so its
             // failure is not fatal on its own -- but it must not be discarded

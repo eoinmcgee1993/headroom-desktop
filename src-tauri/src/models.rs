@@ -584,19 +584,10 @@ pub struct TransformationFeedEvent {
     pub workspace: Option<String>,
     #[serde(default, alias = "turn_id")]
     pub turn_id: Option<String>,
-    // Raw request/response payload captured by the proxy's RequestLogger when
-    // `log_full_messages` is enabled. Pass-through as `serde_json::Value`.
-    // Nothing in the desktop reads it and the feed fetch asks the backend to
-    // omit it (`include_messages=0`), so it is `None` in practice; kept so a
-    // backend that still sends it deserializes.
-    #[serde(default, alias = "request_messages")]
-    pub request_messages: Option<serde_json::Value>,
-    // Post-compression message list — what was actually sent upstream after
-    // Headroom's pipeline ran. Present only on proxies that carry this field
-    // (compressed_messages was added after request_messages was already in
-    // use, so older proxies will emit `None` here).
-    #[serde(default, alias = "compressed_messages")]
-    pub compressed_messages: Option<serde_json::Value>,
+    // The feed's request_messages / compressed_messages / response_content
+    // bodies are not modelled: the fetch asks the backend to omit them
+    // (`include_messages=0`, lib.rs) and serde ignores them when an older
+    // backend or a persisted activity-facts.json still carries them.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -678,14 +669,6 @@ pub struct RecordEvent {
     pub input_tokens_original: Option<u64>,
     #[serde(default, alias = "input_tokens_optimized")]
     pub input_tokens_optimized: Option<u64>,
-    // Carried forward from the source transformation so the record row can
-    // show what the record-setting compression was actually about. Populated
-    // only when the proxy's `log_full_messages` is enabled. `compressed_messages`
-    // is only populated by proxies that carry the field (see struct doc above).
-    #[serde(default)]
-    pub request_messages: Option<serde_json::Value>,
-    #[serde(default)]
-    pub compressed_messages: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

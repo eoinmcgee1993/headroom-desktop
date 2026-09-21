@@ -1946,6 +1946,13 @@ pub(crate) fn is_blocked_runtime_dll_signal(text: &str) -> bool {
         "pyexpat",
         "select",
         "unicodedata",
+        // Our wheel's own Rust extension (`headroom._core`), a hard import
+        // with no Python fallback upstream. Same self-contained shape as the
+        // stdlib set: PyO3 links only the CRT python.exe already loaded, so a
+        // load failure is a verdict on our freshly written .pyd (RUST-C8/CY:
+        // German Windows, "Eine Anwendungssteuerungsrichtlinie hat diese
+        // Datei blockiert", no code, filed as two Errors per launch).
+        "_core",
     ];
     // Anchor on `dll load failed` and step over an optional `while `: CPython
     // 3.8+ writes "while importing", but the copy of this chain that reaches us
@@ -7118,7 +7125,13 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
         if lower.contains("too long") {
             return false;
         }
-        line.starts_with("API Error:") || lower.contains("credit balance is too low")
+        line.starts_with("API Error:")
+            || lower.contains("credit balance is too low")
+            // RUST-H7: `Your organization has disabled Claude subscription
+            // access for Claude Code · Use an Anthropic API key instead, or
+            // ask your admin to enable access` -- an org policy on the
+            // user's account, and the line names its own remedy.
+            || lower.contains("disabled claude subscription access")
     })
 }
 
@@ -12293,6 +12306,7 @@ Some unrelated content.
             "API Error: 502 Upstream service error. The upstream provider is temporarily unavailable.",
             "API Error: 404 {\"type\":\"error\",\"error\":{\"type\":\"not_found_error\"}}",
             "Credit balance is too low",
+            "Your organization has disabled Claude subscription access for Claude Code \u{b7} Use an Anthropic API key instead, or ask your admin to enable access",
         ] {
             let stderr = format!("{marker}{diagnosis}\n  Analysis failed: ...\n");
             assert_eq!(
@@ -12740,6 +12754,12 @@ Some unrelated content.
         assert!(is_blocked_runtime_dll_signal(
             "ImportError: DLL load failed while importing _ssl: 지정된 모듈을 찾을 수 없습니다."
         ));
+        // RUST-C8/CY verbatim: our own extension, German Windows.
+        let core = "  File \"...\\headroom\\transforms\\error_detection.py\", line 41, in <module>\n    \
+                    from headroom._core import (\nImportError: DLL load failed while importing _core: \
+                    Eine Anwendungssteuerungsrichtlinie hat diese Datei blockiert.";
+        assert!(is_blocked_runtime_dll_signal(core));
+        assert!(is_endpoint_protection_signal(core));
 
         // RUST-5C's `last_startup_error` carries the same verdict without the
         // `while`, in the copy upstream re-wraps into the error chain. Both

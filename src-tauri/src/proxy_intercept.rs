@@ -1764,7 +1764,19 @@ fn rewrite_use_responses_lite(body: &[u8]) -> ModelsRewrite {
 /// `unparseable_json`, `truncated_body`, `compressed`, `no_content_length`,
 /// `oversize` — fingerprinted per kind so each failure class is its own issue
 /// (mirrors report_upstream_error's grouping rationale).
-fn report_models_rewrite(kind: &str, level: sentry::Level, detail: &str) {
+fn report_models_rewrite(kind: &'static str, level: sentry::Level, detail: &str) {
+    // Once per kind per process. Codex refetches the catalog on every session
+    // start, and one host on a slow link filed 44 `truncated_body` events in
+    // three days (RUST-7S); hosts affected is the question, not fetches.
+    static REPORTED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        if reported.contains(&kind) {
+            log::info!("codex models rewrite {kind}: {detail}");
+            return;
+        }
+        reported.push(kind);
+    }
     sentry::with_scope(
         |scope| {
             scope.set_tag("models_rewrite", kind);

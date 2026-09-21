@@ -397,16 +397,6 @@ export interface HeadroomLearnPrereqStatus {
   codexLoggedIn: boolean;
 }
 
-// A single entry in `requestMessages`. Intentionally loose — the proxy passes
-// through whatever shape the upstream provider uses (Anthropic: `content` is a
-// string or structured blocks list; OpenAI: string-only). The UI extracts
-// displayable text in `ActivityFeed.tsx`.
-export interface TransformationRequestMessage {
-  role?: string;
-  content?: string | Array<{ type?: string; text?: string; [k: string]: unknown }>;
-  [k: string]: unknown;
-}
-
 export interface TransformationFeedEvent {
   requestId?: string | null;
   timestamp?: string | null;
@@ -419,18 +409,6 @@ export interface TransformationFeedEvent {
   transformsApplied: string[];
   workspace?: string | null;
   turnId?: string | null;
-  // Populated only when the proxy was started with `--log-messages` (or
-  // `HEADROOM_LOG_MESSAGES=1`), reflected in
-  // `TransformationFeedResponse.logFullMessages`. Both fields are
-  // pass-through from the proxy's `RequestLogger` — the desktop renders
-  // them, it does not reinterpret them.
-  //
-  // `compressedMessages` is the post-compression message list that was
-  // actually sent upstream; paired with `requestMessages` it lets consumers
-  // see what Headroom's pipeline stripped, replaced, or kept. Absent on
-  // proxies that predate the field.
-  requestMessages?: TransformationRequestMessage[] | null;
-  compressedMessages?: TransformationRequestMessage[] | null;
 }
 
 export interface TransformationFeedResponse {
@@ -486,13 +464,6 @@ export interface RecordEvent {
   workspace?: string | null;
   inputTokensOriginal?: number | null;
   inputTokensOptimized?: number | null;
-  // Carried forward from the record-setting transformation so the record row
-  // can surface the same request/compressed detail as the compression card.
-  // Populated only when the proxy's `log_full_messages` is enabled;
-  // `compressedMessages` additionally requires a proxy that carries the
-  // field (see TransformationFeedEvent above).
-  requestMessages?: TransformationRequestMessage[] | null;
-  compressedMessages?: TransformationRequestMessage[] | null;
 }
 
 export interface WeeklyRecapEvent {

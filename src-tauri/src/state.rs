@@ -11250,8 +11250,6 @@ mod tests {
             transforms_applied: vec!["kompress".into()],
             workspace: Some("/Users/u/Code/demo".into()),
             turn_id: None,
-            request_messages: None,
-            compressed_messages: None,
         };
 
         let first = state.observe_activity_from_transformations(&[transformation.clone()]);
