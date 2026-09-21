@@ -2601,6 +2601,125 @@ if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# Dense-line elision (upstream PR #3685): tool outputs that dump a fetched
+# page, a bundled asset or an encoded blob (minified JS/CSS, base64, RSC
+# payloads) arrive as a few very long lines with almost no whitespace, and
+# no structural compressor can shrink them: code_aware is disabled, log/text
+# return them unchanged, and the HTML extractor returns the whole thing or
+# "" (which the unit layer rejects as an empty block, keeping all of it).
+# Measured 2026-09-20: 75k of a Codex research session's tokens rode through
+# at ratio 1.0 and the session compressed at 7 percent of new input; the
+# same session replayed with elision reached 25 percent. The vendor wraps the
+# router's strategy dispatch: after the wheel's own chain has run, every
+# line of >= 300 chars with < 6 percent spaces (not JSON-shaped: that is
+# SmartCrusher's) keeps its head and tail and the middle becomes a marker.
+# The pre-elision block goes into the CCR store and a "Retrieve original:
+# hash=" marker is appended, so the messages path's marker-less lossy gate
+# (#1307) keeps the result and the agent can recover exact bytes. Only after
+# strategies whose result is still plain text (html, log, text, code_aware,
+# search, passthrough), never inside an embedded-JSON span, never in
+# lossless mode, and an empty HTML extraction on non-empty input counts as
+# "nothing extracted", not as a compression to zero tokens.
+# Exact-pin gated to wheel 0.37.0 and the fix absent (a wheel that ships
+# ContentRouterConfig.enable_dense_line_elision keeps its own). Kill switch:
+# HEADROOM_DENSE_LINE_ELISION=0.
+_hd_dle_flag = _hd_os.environ.get("HEADROOM_DENSE_LINE_ELISION", "1")
+if _hd_dle_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_dle_meta
+
+        if _hd_dle_meta.version("headroom-ai") == "0.37.0":
+            from headroom.transforms import content_router as _hd_dle_cr
+
+            if not hasattr(_hd_dle_cr.ContentRouterConfig, "enable_dense_line_elision"):
+                _hd_dle_orig = _hd_dle_cr.ContentRouter._apply_strategy_to_content
+                _hd_dle_est = _hd_dle_cr._estimate_tokens
+                _hd_dle_after = frozenset(
+                    {"html", "log", "text", "code_aware", "search", "passthrough"}
+                )
+
+                def _hd_dle_is_dense(line):
+                    n = len(line)
+                    if n < 300 or (line.count(" ") / n) >= 0.06:
+                        return False
+                    stripped = line.strip()
+                    return not (stripped[:1] in "{[" and stripped[-1:] in "}]")
+
+                def _hd_dle_elide(text):
+                    if len(text) < 300:
+                        return text, 0
+                    out = []
+                    n_elided = 0
+                    for line in text.split("\n"):
+                        if _hd_dle_is_dense(line):
+                            out.append(
+                                line[:160]
+                                + " ...[%d chars of dense machine-generated content elided]... "
+                                % (len(line) - 240)
+                                + line[-80:]
+                            )
+                            n_elided += 1
+                        else:
+                            out.append(line)
+                    if not n_elided:
+                        return text, 0
+                    return "\n".join(out), n_elided
+
+                def _hd_dle_apply(self, content, strategy, context, *args, **kwargs):
+                    result = _hd_dle_orig(self, content, strategy, context, *args, **kwargs)
+                    try:
+                        if kwargs.get("_allow_embedded", True) is False:
+                            return result
+                        if getattr(self.config, "lossless", False):
+                            return result
+                        out, toks, chain = result
+                        if not isinstance(out, str) or not isinstance(chain, list):
+                            return result
+                        base = out
+                        if isinstance(content, str) and content.strip() and not out.strip():
+                            # Empty extraction: nothing extracted, elide the input.
+                            base, toks = content, _hd_dle_est(content)
+                            last = "passthrough"
+                        elif out == content:
+                            # Byte-identical result: the chain changed nothing
+                            # (code_aware unchanged, then a disabled Kompress
+                            # fallback appended to the chain), so there is no
+                            # structured output to protect.
+                            last = "passthrough"
+                        else:
+                            last = chain[-1] if chain else getattr(strategy, "value", str(strategy))
+                        if last not in _hd_dle_after:
+                            return result
+                        elided, n_dense = _hd_dle_elide(base)
+                        if not n_dense:
+                            return result
+                        if getattr(self.config, "ccr_inject_marker", True):
+                            from headroom.cache.compression_store import get_compression_store
+
+                            key = get_compression_store().store(
+                                base,
+                                elided,
+                                original_tokens=_hd_dle_est(base),
+                                compressed_tokens=_hd_dle_est(elided),
+                                query_context=context or None,
+                                compression_strategy="dense_elide",
+                            )
+                            noun = "line" if n_dense == 1 else "lines"
+                            elided += (
+                                "\n[%d dense machine-generated %s elided."
+                                " Retrieve original: hash=%s]" % (n_dense, noun, key)
+                            )
+                        elided_tokens = _hd_dle_est(elided)
+                        if elided_tokens >= toks:
+                            return result
+                        return elided, elided_tokens, list(chain) + ["dense_elide"]
+                    except Exception:
+                        return result
+
+                _hd_dle_cr.ContentRouter._apply_strategy_to_content = _hd_dle_apply
+    except Exception:
+        pass
+
 # Stats request-log rows (upstream PR #3613):
 # RequestLogger.get_recent built each row with dataclasses.asdict(entry) and
 # only then dropped request_messages / compressed_messages / response_content,
@@ -14365,6 +14484,11 @@ mod tests {
                 r#"_hd_kmg_meta.version("headroom-ai") == "0.37.0""#,
                 "_hd_kmg_kc.KompressCompressor.compress_batch = _hd_kmg_batch",
             ),
+            (
+                "HEADROOM_DENSE_LINE_ELISION",
+                r#"_hd_dle_meta.version("headroom-ai") == "0.37.0""#,
+                "_hd_dle_cr.ContentRouter._apply_strategy_to_content = _hd_dle_apply",
+            ),
         ] {
             assert!(py.contains(flag), "{flag} kill switch missing");
             assert!(py.contains(gate), "{flag} exact-pin gate missing");
@@ -14445,6 +14569,45 @@ mod tests {
         );
         // The heavy fields must be skipped by name BEFORE any read of them.
         assert!(py.contains("if f.name in _hd_grc_heavy:\n                            continue\n                        v = getattr(entry, f.name)"));
+    }
+
+    #[test]
+    fn dense_line_elision_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel and
+        // asserts the dense-line elision contract end to end (see
+        // scripts/verify-dense-line-elision.py). Self-skips when the vendor
+        // does not bind, so green is NOT evidence after a wheel bump.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-dense-line-elision.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-dle-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run dense-line-elision probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stdout.contains("FAIL dle bound") {
+            eprintln!("skipping: dense-line elision vendor did not bind (wheel ships the fix?)");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "dense-line elision probe failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
     }
 
     #[test]
