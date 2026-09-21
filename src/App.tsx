@@ -102,6 +102,8 @@ import {
   tierRecommendationSourceLabel,
   scheduledPlanChange,
   upgradePlanIntentLabel,
+  pendingAuthStorageKey,
+  restorePendingAuth,
   type BillingPeriod,
   type PricingAudience,
   type UpgradePlanId
@@ -3351,6 +3353,43 @@ export default function App() {
     };
   }, [trayWindowFocused]);
 
+  // A webview reload (see `restorePendingAuth`) remounts this tree with no
+  // memory of the code that was just emailed. Put the main window back on the
+  // code step; the launcher has its own flow and never reads the slot.
+  useEffect(() => {
+    if (windowLabel !== "main") {
+      return;
+    }
+    const pending = restorePendingAuth(
+      window.localStorage.getItem(pendingAuthStorageKey),
+      Date.now()
+    );
+    if (!pending) {
+      return;
+    }
+    setAuthEmail(pending.email);
+    setAuthCodeRequestedFor(pending.email);
+    setActiveView("upgradeAuth");
+  }, [windowLabel]);
+
+  // The code step is local UI state, so a sign-in that happened elsewhere (the
+  // magic link redeemed in the launcher, the other window, a refresh) would
+  // leave this window on the "Sign in with email" card asking for a code nobody
+  // needs to enter. Keyed on the status flag so every path that lands a signed-
+  // in status is covered, including the payload path of `pricing-refreshed`.
+  useEffect(() => {
+    if (!pricingStatus?.authenticated) {
+      return;
+    }
+    window.localStorage.removeItem(pendingAuthStorageKey);
+    setAuthCode("");
+    setAuthCodeRequestedFor(null);
+    setActiveView((view) =>
+      view === "upgradeAuth" ? (pendingUpgradePlanId ? "upgrade" : "home") : view
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pricingStatus?.authenticated]);
+
   // headroom:// deep links from the backend trigger an immediate pricing
   // refresh — the typical case is Polar's checkout success page redirecting
   // to headroom://upgraded. Backend has already reconciled the runtime; this
@@ -3978,13 +4017,6 @@ export default function App() {
         return;
       }
       setPricingStatus(status);
-      // The code step is local UI state, so a sign-in that happened elsewhere
-      // (the magic link, or the other window) leaves this one still asking for
-      // a code nobody needs to enter. Every refresh path lands here.
-      if (status.authenticated) {
-        setAuthCode("");
-        setAuthCodeRequestedFor(null);
-      }
       // While gated, make the wall felt: how much went through unoptimized.
       let unsavedLabel: string | null = null;
       if (!status.optimizationAllowed || status.codex?.optimizationAllowed === false) {
@@ -4301,6 +4333,7 @@ export default function App() {
   }
 
   function resetUpgradeAuthStep() {
+    window.localStorage.removeItem(pendingAuthStorageKey);
     setAuthCode("");
     setAuthCodeRequestedFor(null);
     setAuthFlowError(null);
@@ -4321,6 +4354,24 @@ export default function App() {
       });
       reportFunnelStep("email_code_requested");
       setAuthCodeRequestedFor(result.email);
+      // Main window only: localStorage is shared per origin, so a request
+      // made on the launcher paywall would otherwise resurface here on the
+      // next mount. Best effort: the code is already sent, so a storage
+      // failure must not turn into a "could not send" error.
+      if (windowLabel === "main") {
+        try {
+          window.localStorage.setItem(
+            pendingAuthStorageKey,
+            JSON.stringify({
+              email: result.email,
+              expiresAt:
+                Date.now() + (result.expiresInSeconds || authCodeExpiryFallbackSeconds) * 1000
+            })
+          );
+        } catch {
+          // Reload recovery is lost for this request; the flow still works.
+        }
+      }
       setAuthFlowSuccess(
         authCodeSentMessage(
           result.email,

@@ -819,6 +819,31 @@ export function buildInstallFailureMailto(context: {
 // or code." as a typo, which is what sends people around the resend loop
 // (identity 3922 asked for eight codes in an hour before one worked). Saying
 // both facts up front is the whole fix.
+/// A sign-in code request that survives a webview reload. macOS can kill the
+/// hidden main window's WebContent process under memory pressure and Tauri
+/// answers by reloading the page, which remounts React with no memory of the
+/// code that was just emailed; every trip to the browser then restarts the
+/// flow. Stored as JSON under `pendingAuthStorageKey`.
+export const pendingAuthStorageKey = "headroom.pendingAuth";
+
+export interface PendingAuth {
+  email: string;
+  expiresAt: number;
+}
+
+/// The stored request, or null when absent, malformed or past its code expiry.
+export function restorePendingAuth(raw: string | null, now: number): PendingAuth | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<PendingAuth>;
+    if (typeof parsed.email !== "string" || typeof parsed.expiresAt !== "number") return null;
+    if (parsed.expiresAt <= now) return null;
+    return { email: parsed.email, expiresAt: parsed.expiresAt };
+  } catch {
+    return null;
+  }
+}
+
 export function authCodeSentMessage(email: string, expirySeconds: number): string {
   const minutes = Math.max(1, Math.round(expirySeconds / 60));
   const unit = minutes === 1 ? "minute" : "minutes";
