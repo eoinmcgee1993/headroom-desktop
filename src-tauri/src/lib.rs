@@ -6194,6 +6194,14 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            // First thing in setup, before anything that can pump the Windows
+            // message loop (set_size/center below re-enter the webview and can
+            // dispatch a frontend command): every analytics accessor resolves
+            // this state, and a command arriving before it existed aborted the
+            // process (Sentry RUST-HF/HG).
+            app.manage(analytics::AnalyticsClient::new(
+                app.package_info().version.to_string(),
+            ));
             #[cfg(target_os = "macos")]
             {
                 // Accessory policy makes this a menu-bar-only app (no dock icon).
@@ -6248,9 +6256,6 @@ pub fn run() {
             // which avoids triggering macOS's "Background item added" prompt
             // on first launch.
 
-            app.manage(analytics::AnalyticsClient::new(
-                app.package_info().version.to_string(),
-            ));
             app.manage(TraySessionSavings(Mutex::new(TraySavingsToday::default())));
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());

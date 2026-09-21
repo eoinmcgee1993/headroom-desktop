@@ -262,8 +262,27 @@ pub fn resolve_app_key() -> Option<String> {
         .or_else(|| HEADROOM_APTABASE_APP_KEY.and_then(|value| non_empty_string(value.to_string())))
 }
 
+// The client is managed part-way through `setup()`, which runs AFTER the
+// webview windows exist. On Windows, a call that pumps the message loop during
+// webview creation re-enters us before that `manage()`, and `state()` panics
+// inside a callback that cannot unwind -> process abort (Sentry RUST-HF/HG).
+// Analytics is never worth a crash, so every accessor tolerates a missing
+// client and drops the event.
+fn client<'a>(app: &'a AppHandle, what: &str) -> Option<tauri::State<'a, AnalyticsClient>> {
+    let client = app.try_state::<AnalyticsClient>();
+    if client.is_none() {
+        log_stderr(format_args!(
+            "analytics not ready yet, dropping {}",
+            what.trim()
+        ));
+    }
+    client
+}
+
 pub fn track_event(app: &AppHandle, name: &str, properties: Option<Value>) {
-    let client = app.state::<AnalyticsClient>();
+    let Some(client) = client(app, name) else {
+        return;
+    };
     if let Err(err) = client.track_event(name, properties) {
         log_stderr(format_args!(
             "failed to track analytics event {}: {err}",
@@ -273,8 +292,9 @@ pub fn track_event(app: &AppHandle, name: &str, properties: Option<Value>) {
 }
 
 pub fn set_headroom_ai_version(app: &AppHandle, version: Option<String>) {
-    let client = app.state::<AnalyticsClient>();
-    client.set_headroom_ai_version(version);
+    if let Some(client) = client(app, "headroom_ai_version") {
+        client.set_headroom_ai_version(version);
+    }
 }
 
 fn log_stderr(args: std::fmt::Arguments<'_>) {
@@ -282,8 +302,9 @@ fn log_stderr(args: std::fmt::Arguments<'_>) {
 }
 
 pub fn shutdown(app: &AppHandle) {
-    let client = app.state::<AnalyticsClient>();
-    client.shutdown();
+    if let Some(client) = client(app, "shutdown") {
+        client.shutdown();
+    }
 }
 
 fn spawn_dispatcher(config: &AnalyticsConfig) -> DispatcherHandle {
@@ -543,6 +564,22 @@ mod tests {
         assert!(ALLOWED_EVENTS.contains(&"account_activated"));
         assert!(!ALLOWED_EVENTS.contains(&"runtime_paused"));
         assert!(!ALLOWED_EVENTS.contains(&"bootstrap_skipped"));
+    }
+
+    // A panicking accessor aborts the process when a frontend command lands
+    // before setup's manage() (Sentry RUST-HF/HG). Mocking a tauri App just to
+    // prove that costs more than reading the source, so guard the source.
+    #[test]
+    fn accessors_never_unwrap_managed_state() {
+        let source = include_str!("analytics.rs");
+        // Needles are assembled so this test does not match itself.
+        let panicking = format!("app.{}::<AnalyticsClient>", "state");
+        let guarded = format!("app.try_{}::<AnalyticsClient>", "state");
+        assert!(
+            !source.contains(&panicking),
+            "use try_state via client(): state() panics before manage()"
+        );
+        assert_eq!(source.matches(&guarded).count(), 1);
     }
 
     #[test]
