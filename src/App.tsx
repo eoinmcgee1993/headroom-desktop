@@ -6150,6 +6150,12 @@ export default function App() {
   if (runtimeStatus?.proxyReachable === false) {
     runtimeIssues.push("proxy unreachable");
   }
+  // Backend is up but cannot verify the provider's certificate (TLS-inspecting
+  // network): every request 502s while the runtime looks healthy, so it must
+  // degrade the banner and carry its own what-to-do prose.
+  if (runtimeStatus?.upstreamTlsInterceptionHint) {
+    runtimeIssues.push(runtimeStatus.upstreamTlsInterceptionHint);
+  }
   if (runtimeStatus?.mcpConfigured === false) {
     runtimeIssues.push("MCP not configured");
   }
@@ -6177,6 +6183,7 @@ export default function App() {
       runtimeStatus.running &&
       runtimeStatus.proxyReachable &&
       runtimeStatus.mcpConfigured !== false &&
+      !runtimeStatus.upstreamTlsInterceptionHint &&
       (runtimeStatus.kompressEnabled !== false || kompressWarming)
   );
   const platformPreviewNotice = platformPreviewNoticeFor(

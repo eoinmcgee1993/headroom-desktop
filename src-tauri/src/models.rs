@@ -473,6 +473,10 @@ pub struct RuntimeStatus {
     pub headroom_learn_disabled_reason: Option<String>,
     pub startup_error: Option<String>,
     pub startup_error_hint: Option<String>,
+    /// Prose hint while the backend is failing certificate verification against
+    /// the provider (TLS-inspecting network); `None` once the failures age out.
+    #[serde(default)]
+    pub upstream_tls_interception_hint: Option<String>,
     pub runtime_upgrade_failure: Option<RuntimeUpgradeFailure>,
     pub rtk: RtkRuntimeStatus,
 }
@@ -584,10 +588,45 @@ pub struct TransformationFeedEvent {
     pub workspace: Option<String>,
     #[serde(default, alias = "turn_id")]
     pub turn_id: Option<String>,
+    // Per-request prefix-cache split, from the #3672 feed vendor on the
+    // pinned wheel. uncached + cache_write is the "new input" denominator the
+    // overview rate uses (state.rs session_savings_pct, dashboardHelpers
+    // newInputSavingsRate); see `apply_new_input_basis`. Absent on a wheel
+    // without the vendor.
+    #[serde(default, alias = "uncached_input_tokens")]
+    pub uncached_input_tokens: Option<u64>,
+    #[serde(default, alias = "cache_write_tokens")]
+    pub cache_write_tokens: Option<u64>,
     // The feed's request_messages / compressed_messages / response_content
     // bodies are not modelled: the fetch asks the backend to omit them
     // (`include_messages=0`, lib.rs) and serde ignores them when an older
     // backend or a persisted activity-facts.json still carries them.
+}
+
+impl TransformationFeedEvent {
+    /// Puts `savings_percent` on the NEW-INPUT basis every other displayed
+    /// input-savings figure uses (invariant set 2026-09-03; the formula is
+    /// `newInputSavingsRate` in dashboardHelpers.ts): saved / (saved +
+    /// uncached + cache_write). The feed's own `savings_percent` divides by
+    /// the whole transcript, cached prefix included, so in a long agentic
+    /// session a request the overview rates at 20%+ read as ~3% here and the
+    /// "large compression" tile starved (stuck from 2026-09-10). Left as-is
+    /// when the backend does not report the split; `None` when nothing new
+    /// entered context, matching the chart, which skips such buckets.
+    pub fn apply_new_input_basis(&mut self) {
+        let (Some(uncached), Some(cache_write)) =
+            (self.uncached_input_tokens, self.cache_write_tokens)
+        else {
+            return;
+        };
+        let new_input = uncached.saturating_add(cache_write);
+        if new_input == 0 {
+            self.savings_percent = None;
+            return;
+        }
+        let saved = self.tokens_saved.unwrap_or(0).max(0) as f64;
+        self.savings_percent = Some((saved / (saved + new_input as f64) * 100.0).min(100.0));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6928,7 +6928,11 @@ fn fetch_transformations_feed_from(
     if !response.status().is_success() {
         return Err(format!("proxy returned HTTP {}", response.status()));
     }
-    let raw: RawTransformationsFeedResponse = response.json().map_err(|err| err.to_string())?;
+    let mut raw: RawTransformationsFeedResponse = response.json().map_err(|err| err.to_string())?;
+    // One basis for every consumer (tiles, records, canary): see the method.
+    for event in &mut raw.transformations {
+        event.apply_new_input_basis();
+    }
     Ok(TransformationFeedResponse {
         log_full_messages: raw.log_full_messages,
         transformations: raw.transformations,
@@ -10848,7 +10852,20 @@ mod tests {
                     "input_tokens_optimized": 250,
                     "tokens_saved": 750,
                     "savings_percent": 75.0,
-                    "transforms_applied": ["interceptor:ast-grep"]
+                    "transforms_applied": ["interceptor:ast-grep"],
+                    "uncached_input_tokens": 2000,
+                    "cache_write_tokens": 250,
+                    "cache_read_tokens": 90000
+                }, {
+                    "request_id": "req-no-split",
+                    "tokens_saved": 31,
+                    "savings_percent": 3.1
+                }, {
+                    "request_id": "req-all-cached",
+                    "tokens_saved": 500,
+                    "savings_percent": 2.0,
+                    "uncached_input_tokens": 0,
+                    "cache_write_tokens": 0
                 }]
             })
             .to_string();
@@ -10866,12 +10883,35 @@ mod tests {
 
         assert!(result.proxy_reachable);
         assert!(result.log_full_messages);
-        assert_eq!(result.transformations.len(), 1);
+        assert_eq!(result.transformations.len(), 3);
         let event = &result.transformations[0];
         assert_eq!(event.request_id.as_deref(), Some("req-1"));
         assert_eq!(event.provider.as_deref(), Some("anthropic"));
         assert_eq!(event.tokens_saved, Some(750));
         assert_eq!(event.transforms_applied, vec!["interceptor:ast-grep"]);
+        // New-input basis: 750 / (750 + 2000 + 250), not the feed's 75%.
+        assert_eq!(event.savings_percent, Some(25.0));
+        // No split reported (vendor unbound): the feed's figure stands.
+        assert_eq!(result.transformations[1].savings_percent, Some(3.1));
+        // Nothing new entered context: no percent, like the chart.
+        assert_eq!(result.transformations[2].savings_percent, None);
+    }
+
+    #[test]
+    fn new_input_basis_zeroes_negative_saved_and_rates_against_new_input() {
+        let mut event = crate::models::TransformationFeedEvent {
+            tokens_saved: Some(-40),
+            savings_percent: Some(9.0),
+            uncached_input_tokens: Some(100),
+            cache_write_tokens: Some(0),
+            ..serde_json::from_str("{}").unwrap()
+        };
+        event.apply_new_input_basis();
+        assert_eq!(event.savings_percent, Some(0.0));
+        // saved 300 against 100 new input: 300 / (300 + 100).
+        event.tokens_saved = Some(300);
+        event.apply_new_input_basis();
+        assert_eq!(event.savings_percent, Some(75.0));
     }
 
     #[test]

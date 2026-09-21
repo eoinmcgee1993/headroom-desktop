@@ -258,6 +258,13 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
+Also makes the backend verify upstream TLS against the OS certificate
+store (truststore.inject_into_ssl, Windows and macOS). httpx verifies
+against certifi's bundle, so a corporate proxy or antivirus that re-signs
+HTTPS fails every forwarded request with CERTIFICATE_VERIFY_FAILED while
+Claude Code itself keeps working through the OS store. Kill switch:
+HEADROOM_OS_TRUSTSTORE=0.
+
 Also ports eight fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
@@ -475,6 +482,30 @@ except Exception:
     pass
 
 import os as _hd_os
+import sys as _hd_sys
+
+# OS trust store (desktop posture, no upstream equivalent). httpx verifies
+# upstream TLS against certifi's bundle, so a corporate proxy or antivirus
+# that re-signs HTTPS (self-signed root in the chain) fails every forwarded
+# request with CERTIFICATE_VERIFY_FAILED while Claude Code itself keeps
+# working through the OS store (Windows 11 churn, 2026-09-14). pip already
+# trusts the OS store the same way (pip >= 24.2 ships truststore), which is
+# why the install succeeds and only the proxy breaks. Injected here, before
+# any client builds an SSLContext, so every context is the OS-backed one; a
+# bundle set via SSL_CERT_FILE / REQUESTS_CA_BUNDLE still loads (truststore
+# consults it after the OS store). Linux keeps certifi: a box without
+# ca-certificates would otherwise lose public roots. Kill switch:
+# HEADROOM_OS_TRUSTSTORE=0.
+_hd_ost_flag = _hd_os.environ.get("HEADROOM_OS_TRUSTSTORE", "1")
+if _hd_sys.platform in ("win32", "darwin") and _hd_ost_flag.strip().lower() not in (
+    "", "0", "false", "no", "off"
+):
+    try:
+        import truststore as _hd_ost_truststore
+
+        _hd_ost_truststore.inject_into_ssl()
+    except Exception:
+        pass
 
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     # Context-limit guard (upstream PR #2942; remove once a wheel ships it).
@@ -2855,6 +2886,13 @@ if _hd_fm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                                     "savings_percent": log.get("savings_percent"),
                                     "transforms_applied": log.get("transforms_applied", []),
                                     "turn_id": log.get("turn_id"),
+                                    # Per-request prefix-cache split, so a number-only poller can put
+                                    # tokens_saved on the new-input basis /stats reports as
+                                    # new_input_savings_percent (saved / (saved + uncached + cache_write))
+                                    # instead of the full-transcript basis of savings_percent.
+                                    "uncached_input_tokens": log.get("uncached_input_tokens", 0),
+                                    "cache_write_tokens": log.get("cache_write_tokens", 0),
+                                    "cache_read_tokens": log.get("cache_read_tokens", 0),
                                 }
                                 if include_messages:
                                     item["request_messages"] = log.get("request_messages")
@@ -14251,6 +14289,89 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_injects_os_truststore_with_kill_switch() {
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_OS_TRUSTSTORE"), "kill switch missing");
+        assert!(
+            py.contains("_hd_ost_truststore.inject_into_ssl()"),
+            "inject missing"
+        );
+        assert!(
+            py.contains(r#"_hd_sys.platform in ("win32", "darwin")"#),
+            "Linux must keep certifi"
+        );
+        for lock in [
+            super::HEADROOM_REQUIREMENTS_LOCK,
+            super::HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        ] {
+            assert!(
+                lock.contains("\ntruststore==0.10.4\n"),
+                "truststore pin missing from a lock"
+            );
+        }
+        // Linux keeps certifi, so its lock must not carry (and repair for) the package.
+        assert!(!super::HEADROOM_LINUX_REQUIREMENTS_LOCK.contains("truststore"));
+    }
+
+    /// Functional: with the injection dir on PYTHONPATH the managed python's
+    /// default SSLContext is truststore's, httpx still builds a client on it,
+    /// and the kill switch restores the stock context. Self-skips when the
+    /// installed venv lacks truststore (pre-lock-bump runtime), so green is
+    /// only evidence once the lock has been applied locally.
+    #[test]
+    fn os_truststore_vendor_behaves_against_the_installed_wheel() {
+        if !cfg!(any(target_os = "windows", target_os = "macos")) {
+            eprintln!("skipping: truststore injection is Windows/macOS only");
+            return;
+        }
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let has_truststore = crate::proc::command(&python)
+            .args(["-c", "import truststore"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_truststore {
+            eprintln!("skipping: installed venv has no truststore (lock not applied yet)");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-os-truststore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import ssl, sys, truststore, httpx\n\
+            injected = ssl.SSLContext is truststore.SSLContext\n\
+            ctx = ssl.create_default_context()\n\
+            client = httpx.Client()\n\
+            client.close()\n\
+            print('injected' if injected and isinstance(ctx, truststore.SSLContext) else 'stock')";
+        for (flag, expect) in [("1", "injected"), ("0", "stock")] {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_OS_TRUSTSTORE", flag)
+                .output()
+                .expect("run truststore probe");
+            assert!(
+                out.status.success(),
+                "probe failed (flag={flag})\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                expect,
+                "HEADROOM_OS_TRUSTSTORE={flag}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cache_integrity_observer_behaves_against_the_installed_wheel() {
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
@@ -14717,6 +14838,10 @@ print("OK grc")
         assert!(py.contains(
             "_hd_fm_rl.RequestLogger.get_recent_with_messages = _hd_fm_get_recent_with_messages"
         ));
+        // The cache split is what puts Activity-tile percentages on the
+        // new-input basis (models.rs apply_new_input_basis).
+        assert!(py.contains(r#""uncached_input_tokens": log.get("uncached_input_tokens", 0)"#));
+        assert!(py.contains(r#""cache_write_tokens": log.get("cache_write_tokens", 0)"#));
         // The route keeps the wheel's own loopback dependency and position.
         assert!(py.contains("dependencies=old.dependencies"));
         assert!(py.contains("routes[index] = routes.pop()"));
@@ -14758,6 +14883,9 @@ heavy.request_messages = [{"role": "user", "content": NoCopy()}]
 heavy.compressed_messages = [{"role": "user", "content": NoCopy()}]
 heavy.response_content = "r"
 heavy.tokens_saved = 60
+heavy.uncached_input_tokens = 30
+heavy.cache_write_tokens = 5
+heavy.cache_read_tokens = 1000
 heavy.transforms_applied = ["smart_crusher"]
 plain = RequestLog(**kw)
 plain.request_id = "plain"
@@ -14775,6 +14903,7 @@ async def main():
         rows = slim.json()["transformations"]
         assert [r["request_id"] for r in rows] == ["heavy", "plain"], rows
         assert rows[0]["tokens_saved"] == 60 and rows[0]["transforms_applied"] == ["smart_crusher"], rows
+        assert (rows[0]["uncached_input_tokens"], rows[0]["cache_write_tokens"], rows[0]["cache_read_tokens"]) == (30, 5, 1000), rows
         for r in rows:
             assert not (bodies & r.keys()), r
         full = await c.get("/transformations/feed?limit=1")

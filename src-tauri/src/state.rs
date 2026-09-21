@@ -3427,6 +3427,9 @@ impl AppState {
             headroom_learn_disabled_reason,
             startup_error,
             startup_error_hint,
+            upstream_tls_interception_hint: crate::proxy_intercept::upstream_tls_interception_hint(
+            )
+            .map(str::to_string),
             runtime_upgrade_failure: self.runtime_upgrade_failure(),
             rtk: RtkRuntimeStatus {
                 installed: rtk_installed,
@@ -11250,6 +11253,8 @@ mod tests {
             transforms_applied: vec!["kompress".into()],
             workspace: Some("/Users/u/Code/demo".into()),
             turn_id: None,
+            uncached_input_tokens: None,
+            cache_write_tokens: None,
         };
 
         let first = state.observe_activity_from_transformations(&[transformation.clone()]);

@@ -50,6 +50,9 @@ pub(crate) const TRAIN_SUGGESTION_ACTIVE_WINDOW_DAYS: i64 = 2;
 // otherwise claim the slot and render "Saved 0 tokens". A high percent on a
 // tiny request ("saved 40 tokens, 30%") is also not worth surfacing, so we
 // also require an absolute floor on tokens saved.
+// Measured on the new-input basis (models.rs apply_new_input_basis); on the
+// feed's full-transcript basis nothing cleared this in long sessions and the
+// tile froze for 11 days.
 const TRANSFORMATION_TILE_MIN_SAVINGS_PERCENT: f64 = 20.0;
 const TRANSFORMATION_TILE_MIN_TOKENS_SAVED: u64 = 1_000;
 // Even a genuine huge compression shouldn't pin the tile forever — swap in
@@ -911,6 +914,8 @@ mod tests {
             transforms_applied: vec!["kompress".into()],
             workspace: None,
             turn_id: None,
+            uncached_input_tokens: None,
+            cache_write_tokens: None,
         }
     }
 

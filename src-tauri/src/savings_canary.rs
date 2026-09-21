@@ -375,6 +375,8 @@ mod tests {
             transforms_applied: transforms.iter().map(|t| t.to_string()).collect(),
             workspace: None,
             turn_id: None,
+            uncached_input_tokens: None,
+            cache_write_tokens: None,
         }
     }
 

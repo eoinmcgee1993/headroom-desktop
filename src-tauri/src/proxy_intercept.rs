@@ -173,6 +173,36 @@ const CODEX_RECONNECT_REPORT_MIN_INTERVAL_SECS: u64 = 60;
 static UPSTREAM_ERROR_LAST_REPORTED: Mutex<Vec<((&'static str, u16), u64)>> =
     Mutex::new(Vec::new());
 const UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS: u64 = 300;
+/// Epoch-second of the last backend 502 whose body said the provider's TLS
+/// certificate could not be verified (a corporate proxy / antivirus re-signing
+/// HTTPS). Read by `runtime_status` to show the user what to do: the failure
+/// is otherwise invisible to them (Claude Code shows a generic 502) and to us
+/// (5xx is not captured). 0 = never seen.
+static UPSTREAM_TLS_INTERCEPTION_LAST_SEEN: AtomicU64 = AtomicU64::new(0);
+const UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS: u64 = 15 * 60;
+const UPSTREAM_TLS_INTERCEPTION_HINT: &str = "Your network is intercepting secure connections, so Headroom cannot verify the AI provider's certificate and requests are failing. Point NODE_EXTRA_CA_CERTS or SSL_CERT_FILE at your organization's CA bundle and restart Headroom, or pause Headroom to send traffic direct. Contact support@extraheadroom.com if you need help.";
+
+/// True when an upstream error body is the backend's own connection failure on
+/// certificate verification (Python ssl's `CERTIFICATE_VERIFY_FAILED`, or the
+/// self-signed-chain reason it carries). Same signals `classify_bootstrap_failure`
+/// keys on for the install path. Substring match: the body is SSE for Claude
+/// (`event: error\ndata: {...}`) and JSON for Codex.
+fn is_tls_interception_error(body: &[u8]) -> bool {
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+    contains(body, b"CERTIFICATE_VERIFY_FAILED")
+        || contains(body, b"self-signed certificate in certificate chain")
+        || contains(body, b"self signed certificate in certificate chain")
+}
+
+/// User-facing hint while certificate-verification failures are recent (within
+/// the TTL), `None` otherwise so a fixed network clears the banner on its own.
+pub fn upstream_tls_interception_hint() -> Option<&'static str> {
+    let seen = UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.load(Ordering::Relaxed);
+    (seen != 0 && now_epoch_secs().saturating_sub(seen) < UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS)
+        .then_some(UPSTREAM_TLS_INTERCEPTION_HINT)
+}
 
 /// Epoch-second until which Codex reconnect warnings are suppressed. Set by the
 /// runtime lifecycle when it *intentionally* stops+restarts the backend (an
@@ -2018,7 +2048,16 @@ fn report_upstream_error(
     // Sentry quota (RUST-46/4G/4T were all this). Keep full detail in the local
     // log::warn! above; only forward non-5xx classes (4xx auth/challenge, novel
     // statuses) that can indicate an actionable request-construction bug.
-    if (500..600).contains(&status) {
+    // Except the backend's own 502 for a certificate it cannot verify: that is
+    // the user's network (TLS inspection), fixable on our side (OS trust store,
+    // CA bundle env) and it churned a Windows 11 user on 2026-09-14 as "does
+    // not work" because nothing surfaced it. Remembered for the dashboard hint
+    // and captured under its own fingerprint so the fleet count is visible.
+    let tls_interception = is_tls_interception_error(&body);
+    if tls_interception {
+        UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(now_epoch_secs(), Ordering::Relaxed);
+    }
+    if (500..600).contains(&status) && !tls_interception {
         return;
     }
     // A geo-block is a property of where the user is, not of anything we sent:
@@ -2053,7 +2092,9 @@ fn report_upstream_error(
     // any sibling status reappears (RUST-46). Codex keeps its historical
     // fingerprint so existing issues and their triage state carry over.
     let status_str = status.to_string();
-    let fingerprint: Vec<&str> = if client == "codex" {
+    let fingerprint: Vec<&str> = if tls_interception {
+        vec!["upstream-tls-interception", client]
+    } else if client == "codex" {
         vec!["codex-upstream-error", status_str.as_str()]
     } else {
         vec!["upstream-error", client, status_str.as_str()]
@@ -2067,9 +2108,13 @@ fn report_upstream_error(
     // 400 from any other. Classify by signature first so we can measure what the
     // ENABLE_TOOL_SEARCH rollout is actually costing (the tag value is a fixed
     // classification string, never the tool name).
-    let shape = anthropic_error_shape(&body)
-        .map(str::to_string)
-        .unwrap_or_else(|| codex_error_shape_tag(&body));
+    let shape = if tls_interception {
+        "tls_interception".to_string()
+    } else {
+        anthropic_error_shape(&body)
+            .map(str::to_string)
+            .unwrap_or_else(|| codex_error_shape_tag(&body))
+    };
     let content_type = response_content_type(head);
     // Default vs user-configured Anthropic upstream, never the URL itself. A
     // relay that lacks a route answers with a bare 405 (RUST-C4: 64 empty-body
@@ -4530,6 +4575,38 @@ mod tests {
         // 401 gets the body peek; report_upstream_error drops the
         // invalid-key kind and keeps only the missing-auth-header kind.
         assert!(is_reportable_upstream_error(&401));
+    }
+
+    #[test]
+    fn tls_interception_is_detected_in_backend_502_bodies_and_hinted_with_a_ttl() {
+        use super::{is_tls_interception_error, upstream_tls_interception_hint};
+        // DESKTOP-CTEE verbatim (Claude path: SSE frame from the backend).
+        assert!(is_tls_interception_error(
+            b"event: error\ndata: {\"type\": \"error\", \"error\": {\"type\": \"connection_error\", \"message\": \"Failed to connect to upstream API: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1010)\"}}\n\n"
+        ));
+        assert!(is_tls_interception_error(
+            br#"{"error":{"message":"self signed certificate in certificate chain"}}"#
+        ));
+        // A provider-side 502 stays a transient.
+        assert!(!is_tls_interception_error(b"<html>502 Bad Gateway</html>"));
+        assert!(!is_tls_interception_error(b""));
+
+        super::UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(upstream_tls_interception_hint().is_none());
+        super::UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(
+            super::now_epoch_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(upstream_tls_interception_hint().is_some_and(|h| h.contains("NODE_EXTRA_CA_CERTS")));
+        super::UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(
+            super::now_epoch_secs() - super::UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS - 1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(
+            upstream_tls_interception_hint().is_none(),
+            "hint must expire"
+        );
+        super::UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]

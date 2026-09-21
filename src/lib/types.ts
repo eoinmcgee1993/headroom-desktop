@@ -305,6 +305,9 @@ export interface RuntimeStatus {
   headroomLearnDisabledReason?: string | null;
   startupError?: string | null;
   startupErrorHint?: string | null;
+  /** Prose hint while the backend is failing certificate verification against
+   *  the provider (TLS-inspecting network); cleared once the failures age out. */
+  upstreamTlsInterceptionHint?: string | null;
   runtimeUpgradeFailure?: RuntimeUpgradeFailure | null;
   rtk: {
     installed: boolean;
@@ -405,6 +408,8 @@ export interface TransformationFeedEvent {
   inputTokensOriginal?: number | null;
   inputTokensOptimized?: number | null;
   tokensSaved?: number | null;
+  // New-input basis (saved / (saved + uncached + cache-write)), the same
+  // rate as the overview; rewritten in Rust (models.rs apply_new_input_basis).
   savingsPercent?: number | null;
   transformsApplied: string[];
   workspace?: string | null;
