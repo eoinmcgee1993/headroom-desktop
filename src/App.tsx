@@ -70,6 +70,7 @@ import {
 import {
   maybeFireSetupStallAlert,
   setupStallBannerLine,
+  shouldShowStallBannerLine,
   SETUP_STALL_CHECK_INTERVAL_MS,
   SETUP_STALL_EARLIEST_MS,
   type SetupStallAlert,
@@ -922,7 +923,8 @@ function DailySavingsChart({
   resetSignal,
   chartMode,
   setChartMode,
-  outputReduction
+  outputReduction,
+  liveSavingsPulse
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
@@ -930,18 +932,20 @@ function DailySavingsChart({
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
+  liveSavingsPulse: boolean;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
   const [visibleMonth, setVisibleMonth] = useState(() => currentMonth);
   const [visibleDay, setVisibleDay] = useState(() => today);
   const [view, setView] = useState<SavingsChartView>("day");
-  const [savingsTodayUsd, setSavingsTodayUsd] = useState<number | null>(null);
-
+  const [savingsToday, setSavingsToday] = useState<{ usd: number; tokens: number } | null>(
+    null
+  );
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void listen<number>("savings-today-updated", (event) => {
-      setSavingsTodayUsd(event.payload);
+    void listen<{ usd: number; tokens: number }>("savings-today-updated", (event) => {
+      setSavingsToday(event.payload);
     }).then((fn) => {
       unlisten = fn;
     });
@@ -1003,14 +1007,22 @@ function DailySavingsChart({
   // with Headroom out of the path, so it is not a benefit of running Headroom.
   // The live tray figure for today already sums the layers it knows, so it can
   // stand in for the bucket sum while today is still open.
-  const chartSaved = Math.max(
+  const liveToday = view === "day" && visibleDay >= today ? savingsToday : null;
+  const chartTokens = Math.max(
     0,
-    chartMode === "usd"
-      ? view === "day" && visibleDay >= today && savingsTodayUsd !== null
-        ? savingsTodayUsd
-        : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
+    liveToday !== null && liveSavingsPulse
+      ? liveToday.tokens
       : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
   );
+  const chartSaved =
+    chartMode === "usd"
+      ? Math.max(
+          0,
+          liveToday !== null
+            ? liveToday.usd
+            : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
+        )
+      : chartTokens;
 
   useEffect(() => {
     const now = new Date();
@@ -1101,6 +1113,9 @@ function DailySavingsChart({
             </span>
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
+              {chartMode === "usd" && chartTokens > 0
+                ? ` across ${compactNumber(chartTokens)} tokens`
+                : ""}
             </span>
             {windowNewInput !== null ||
             windowBillable !== null ||
@@ -1593,7 +1608,11 @@ export default function App() {
   // checkouts converted 13 of 74 and monthly-first 25 of 44, and 20 of the 24
   // lost annual starters never opened a monthly checkout. Subscribers still
   // open on the period they bought (effect below).
-  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("monthly");
+  // Annual, deliberately. This default is the single biggest lever on billing
+  // mix: it was flipped to "monthly" on 2026-09-06 (shipped in v0.9.10) and the
+  // annual share of new subscriptions fell from 36% to 12%, with Max x20 annual
+  // going to zero. Do not flip it without a measured reason.
+  const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
   // Launcher stage is a single source of truth for which onboarding screen
   // is showing. Only one screen can be active at a time; transitions go
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
@@ -1641,6 +1660,7 @@ export default function App() {
     { text: string; tone: "info" | "error" } | null
   >(null);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
+  const proxyVerifiedReportedRef = useRef(false);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   // Fresh install (no runtime on disk yet). Drives the onboarding email-harvest
   // step: every fresh install collects an email to start the card-free 7-day
@@ -2603,12 +2623,18 @@ export default function App() {
   }, [signupGateVisible]);
 
   // proxy_verified: every enabled client's test traffic reached the proxy.
+  // Once per launcher run: the poller rebuilds `proxyVerificationRows` every
+  // tick, so without the ref this re-fired the beacon (a grace/start POST) on
+  // every poll for as long as the screen stayed open -- one device sent it
+  // 1,312 times. Server dedup hides that from the funnel, not from the server.
   useEffect(() => {
     if (windowLabel !== "launcher" || launcherStage !== "post_install") return;
+    if (proxyVerifiedReportedRef.current) return;
     if (
       proxyVerificationRows.length > 0 &&
       proxyVerificationRows.every((row) => row.state === "verified")
     ) {
+      proxyVerifiedReportedRef.current = true;
       // Persist for the main window: its own phase poller honors this marker,
       // so the tray doesn't ask the user to verify a second time right after
       // onboarding just did.
@@ -5920,7 +5946,7 @@ export default function App() {
                         {plan.originalPrice}
                       </s>
                       <span className="upgrade-plan-card__sale-badge">
-                        {introSaleBadgeLabel(pricingStatus?.introOffer) ??
+                        {introSaleBadgeLabel(pricingStatus?.introOffer, billingPeriod) ??
                           `${(pricingStatus?.activePercentOff ?? 0) || 50}% off`}
                       </span>
                     </span>
@@ -6299,6 +6325,17 @@ export default function App() {
     } as const;
   })();
 
+  // A never-routed install sits in connectorPhase "verifying" indefinitely, so
+  // this cannot key off the healthy tone alone - see shouldShowStallBannerLine.
+  const showStallBannerLine = shouldShowStallBannerLine({
+    stallBannerLine,
+    tone: calloutBanner.tone,
+    connectorPhase,
+    runtimeHealthy,
+    paused: runtimeStatus?.paused,
+    starting: runtimeStatus?.starting,
+  });
+
   const calloutTitle =
     calloutBanner.title.length <= 110 || !primaryIssue
       ? calloutBanner.title
@@ -6316,6 +6353,22 @@ export default function App() {
         .filter(Boolean)
         .join(" and ") || tierRecommendationSourceLabel(tierMismatch.recommendedSource)
     : "";
+  // graceEndsAt is when the grace ran out, i.e. the day metering started.
+  // Only shown once clamped, where it is a fact rather than a threat.
+  const meteredSinceLabel = (() => {
+    if (!tierMismatch?.clamped) return "";
+    const ts = Date.parse(tierMismatch.graceEndsAt);
+    if (Number.isNaN(ts)) return "";
+    const since = new Date(ts);
+    // The year only when it is not this one. mismatch_since persists across
+    // launches, so a machine dormant since last autumn would otherwise read
+    // "since Sep 21" and sound like last week.
+    return since.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      ...(since.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }),
+    });
+  })();
   const sortedClaudeProjects = [...claudeProjects].sort((left, right) => {
     const leftTime = Date.parse(left.lastWorkedAt);
     const rightTime = Date.parse(right.lastWorkedAt);
@@ -6736,34 +6789,46 @@ export default function App() {
       </aside>
 
       <section className="tray-panel">
+        {/* Outside every tray-content pane on purpose: the clamp applies wherever
+            the user is, so the notice does too. Home-only meant a user parked on
+            Activity or Settings was metered with nothing on screen saying so. */}
+        {tierMismatch ? (
+          <section
+            className={`tier-mismatch-banner${tierMismatch.clamped ? " tier-mismatch-banner--clamped" : ""}`}
+            // status, not alert: this is a standing condition, not an event.
+            // Now that it renders outside every pane it is mounted for the
+            // whole session, and role="alert" made a screen reader re-announce
+            // it on each view switch.
+            role="status"
+          >
+            <div className="tier-mismatch-banner__body">
+              <h2 className="tier-mismatch-banner__title">
+                {tierMismatch.clamped ? "Headroom is limiting your usage" : "Upgrade your Headroom plan"}
+              </h2>
+              <p className="tier-mismatch-banner__message">
+                {tierMismatch.clamped
+                  ? `Your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan, above your current Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan, so weekly usage limits ${meteredSinceLabel ? `have applied to ${clampScopeLabel} since ${meteredSinceLabel}` : `now apply to ${clampScopeLabel}`}. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to restore unlimited optimization.`
+                  : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to match.`}
+              </p>
+              {upgradeActionError && upgradeActionBusy === null ? (
+                <p className="tier-mismatch-banner__error" role="status">
+                  {upgradeActionError}
+                </p>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              className="tier-mismatch-banner__action"
+              disabled={upgradeActionBusy === tierMismatch.recommendedTier}
+              onClick={() => void handleUpgradeAction(tierMismatch.recommendedTier)}
+            >
+              {upgradeActionBusy === tierMismatch.recommendedTier
+                ? "Updating…"
+                : `Upgrade to ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}`}
+            </button>
+          </section>
+        ) : null}
         <div className="tray-content" hidden={activeView !== "home"}>
-            {tierMismatch ? (
-              <section className="tier-mismatch-banner" role="alert">
-                <div className="tier-mismatch-banner__body">
-                  <h2 className="tier-mismatch-banner__title">Upgrade your Headroom plan</h2>
-                  <p className="tier-mismatch-banner__message">
-                    {tierMismatch.clamped
-                      ? `Your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan, above your current Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan, so weekly usage limits now apply to ${clampScopeLabel}. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to restore unlimited optimization.`
-                      : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to match.`}
-                  </p>
-                  {upgradeActionError && upgradeActionBusy === null ? (
-                    <p className="tier-mismatch-banner__error" role="status">
-                      {upgradeActionError}
-                    </p>
-                  ) : null}
-                </div>
-                <button
-                  type="button"
-                  className="tier-mismatch-banner__action"
-                  disabled={upgradeActionBusy === tierMismatch.recommendedTier}
-                  onClick={() => void handleUpgradeAction(tierMismatch.recommendedTier)}
-                >
-                  {upgradeActionBusy === tierMismatch.recommendedTier
-                    ? "Updating…"
-                    : `Upgrade to ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}`}
-                </button>
-              </section>
-            ) : null}
             <section
               className={`callout-banner callout-banner--${calloutBanner.tone}${
                 calloutIsUpgradeNudge ? " callout-banner--clickable" : ""
@@ -6812,15 +6877,14 @@ export default function App() {
                 {showUpgradeSavingsLine ? (
                   <p className="callout-banner__subtitle">{upgradeSavingsLine}</p>
                 ) : null}
-                {calloutBanner.tone === "healthy" && dashboard.lifetimeEstimatedTokensSaved < 1_000_000 && (
-                  stallBannerLine ? (
-                    // Nothing has ever been saved on this install, so the
-                    // reassuring "check back later" below would be a lie.
-                    <p className="callout-banner__subtitle">{stallBannerLine}</p>
-                  ) : (
-                    <p className="callout-banner__subtitle">Use your AI coding agents as normal, and check back later to see what Headroom is saving you.</p>
-                  )
-                )}
+                {showStallBannerLine ? (
+                  // Nothing has ever been saved on this install, so the
+                  // reassuring "check back later" below would be a lie.
+                  <p className="callout-banner__subtitle">{stallBannerLine}</p>
+                ) : calloutBanner.tone === "healthy" &&
+                  dashboard.lifetimeEstimatedTokensSaved < 1_000_000 ? (
+                  <p className="callout-banner__subtitle">Use your AI coding agents as normal, and check back later to see what Headroom is saving you.</p>
+                ) : null}
                 {(calloutBanner.tone === "auto-paused" || calloutBanner.tone === "paused") && (
                   <div className="callout-banner__resume">
                     <button
@@ -6936,6 +7000,7 @@ export default function App() {
                 resetSignal={chartResetSignal}
                 chartMode={chartMode}
                 setChartMode={setChartMode}
+                liveSavingsPulse={debugOverrides?.liveSavingsPulse ?? false}
                 // Withheld when the estimate covers too thin a slice of this
                 // machine's traffic to be its headline. The per-window chip is
                 // a different lineage (sampled buckets) and stands either way.
@@ -7666,7 +7731,7 @@ export default function App() {
                             <s className="upgrade-plan-card__original-price">{plan.originalPrice}</s>
                             <span className="upgrade-plan-card__sale-badge">
                               {plan.saleBadge ??
-                                introSaleBadgeLabel(pricingStatus?.introOffer) ??
+                                introSaleBadgeLabel(pricingStatus?.introOffer, billingPeriod) ??
                                 `${pricingStatus?.activePercentOff ?? 50}% off`}
                             </span>
                           </div>

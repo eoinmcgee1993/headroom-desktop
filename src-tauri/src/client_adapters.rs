@@ -775,73 +775,121 @@ pub fn repair_client_setups() -> Vec<String> {
         .keys()
         .cloned()
         .collect();
-    let mut repaired = Vec::new();
-    for client_id in client_ids {
-        let broken = match verify_client_setup(&client_id) {
-            Ok(verification) => verification.failures,
-            // Ids verification doesn't support are ids repair can't help.
-            Err(_) => Vec::new(),
-        };
-        if broken.is_empty() {
-            continue;
+    client_ids
+        .into_iter()
+        .filter(|client_id| repair_client_setup_now(client_id))
+        .collect()
+}
+
+/// Codex answered a request with 401 "Missing bearer": the provider block was
+/// written before `codex login` and lacks `requires_openai_auth`, so Codex
+/// attaches no credentials at all. The hourly scan above would fix it within
+/// the hour, but the user is failing NOW, on every prompt, with no hint that
+/// Headroom is the cause (RUST-C1, ~16 hosts/week; the Sep 14-20 cohort of
+/// activated-but-never-saved users was 80% Codex-plan). Repair immediately,
+/// bounded to once per five minutes so a retry loop cannot churn config.toml,
+/// and only while the connector is still enabled (the pricing gate disables it
+/// on purpose and must not be fought).
+/// Claim the next repair slot, or `false` if one was claimed under five
+/// minutes ago. One mutex and no I/O, because this is what the forwarding task
+/// calls on EVERY 401: in the missing-bearer state every prompt 401s and Codex
+/// retries, so deciding this inside a spawned thread meant one OS thread per
+/// failed response whose whole job was to take this lock and give up. Claim
+/// first, spawn only on success.
+pub fn claim_codex_missing_bearer_slot() -> bool {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let mut last = LAST.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    if last.is_some_and(|at| at.elapsed() < Duration::from_secs(300)) {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
+}
+
+/// The repair itself, unthrottled: [`claim_codex_missing_bearer_slot`] is the
+/// throttle, and both the enabled check and the rewrite touch the filesystem,
+/// so this belongs on a thread of its own rather than the forwarding task.
+pub fn repair_codex_missing_bearer_now() -> bool {
+    // Only while the connector is still enabled: the pricing gate disables it
+    // on purpose and must not be fought.
+    if !is_codex_enabled() {
+        return false;
+    }
+    repair_client_setup_now("codex_cli")
+}
+
+/// One client's verify -> re-apply -> re-verify cycle, unthrottled. Returns
+/// true only when the re-verify comes back clean.
+fn repair_client_setup_now(client_id: &str) -> bool {
+    let broken = match verify_client_setup(client_id) {
+        Ok(verification) => verification.failures,
+        // Ids verification doesn't support are ids repair can't help.
+        Err(_) => Vec::new(),
+    };
+    if broken.is_empty() {
+        return false;
+    }
+    if let Err(err) = apply_client_setup(client_id) {
+        log::warn!("repair_client_setups: re-apply for {client_id} failed: {err:#}");
+        return false;
+    }
+    match verify_client_setup(client_id) {
+        Ok(verification) if verification.failures.is_empty() => {
+            // A successful self-repair is the only fleet-visible trace of a
+            // config that was silently broken (e.g. the stale flagless
+            // Codex block, which 401'd every request until repaired), so it
+            // is reported -- but from here, not through the log bridge.
+            // Info, not warn: the bridged warn carried no fingerprint,
+            // and Sentry grouped it on the SDK's stacktrace instead of the
+            // text -- so byte-identical "repaired codex_cli" lines opened
+            // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
+            // of them meant nothing. One issue per client, from here.
+            log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
+            // WHICH check failed, in the fingerprint and in full as an
+            // extra. Grouping on the client alone said only "codex_cli
+            // drifted again" (RUST-CF, RUST-F0) -- no way to tell a Codex
+            // login that restamps its own config from a shell profile
+            // another installer rewrites, which are different bugs with
+            // different owners. The strings are fixed sentences from
+            // `verify_client_setup`, so they group across machines and
+            // carry nothing of the user's.
+            let cause: String = broken
+                .first()
+                .map(|f| f.chars().take(80).collect())
+                .unwrap_or_else(|| "unknown".to_string());
+            sentry::with_scope(
+                |scope| {
+                    scope.set_tag("flow", "repair_client_setups");
+                    scope.set_extra("failures", broken.clone().into());
+                    scope.set_fingerprint(Some(&[
+                        "repair_client_setups",
+                        client_id,
+                        cause.as_str(),
+                    ]));
+                },
+                || {
+                    sentry::capture_message(
+                        &format!("repair_client_setups: repaired {client_id}"),
+                        sentry::Level::Warning,
+                    );
+                },
+            );
+            true
         }
-        if let Err(err) = apply_client_setup(&client_id) {
-            log::warn!("repair_client_setups: re-apply for {client_id} failed: {err:#}");
-            continue;
-        }
-        match verify_client_setup(&client_id) {
-            Ok(verification) if verification.failures.is_empty() => {
-                // A successful self-repair is the only fleet-visible trace of a
-                // config that was silently broken (e.g. the stale flagless
-                // Codex block, which 401'd every request until repaired), so it
-                // is reported -- but from here, not through the log bridge.
-                // Info, not warn: the bridged warn carried no fingerprint,
-                // and Sentry grouped it on the SDK's stacktrace instead of the
-                // text -- so byte-identical "repaired codex_cli" lines opened
-                // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
-                // of them meant nothing. One issue per client, from here.
-                log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
-                // WHICH check failed, in the fingerprint and in full as an
-                // extra. Grouping on the client alone said only "codex_cli
-                // drifted again" (RUST-CF, RUST-F0) -- no way to tell a Codex
-                // login that restamps its own config from a shell profile
-                // another installer rewrites, which are different bugs with
-                // different owners. The strings are fixed sentences from
-                // `verify_client_setup`, so they group across machines and
-                // carry nothing of the user's.
-                let cause: String = broken
-                    .first()
-                    .map(|f| f.chars().take(80).collect())
-                    .unwrap_or_else(|| "unknown".to_string());
-                sentry::with_scope(
-                    |scope| {
-                        scope.set_tag("flow", "repair_client_setups");
-                        scope.set_extra("failures", broken.clone().into());
-                        scope.set_fingerprint(Some(&[
-                            "repair_client_setups",
-                            client_id.as_str(),
-                            cause.as_str(),
-                        ]));
-                    },
-                    || {
-                        sentry::capture_message(
-                            &format!("repair_client_setups: repaired {client_id}"),
-                            sentry::Level::Warning,
-                        );
-                    },
-                );
-                repaired.push(client_id);
-            }
-            Ok(verification) => log::warn!(
+        Ok(verification) => {
+            log::warn!(
                 "repair_client_setups: {client_id} still failing after re-apply: {:?}",
                 verification.failures
-            ),
-            Err(err) => {
-                log::warn!("repair_client_setups: re-verify for {client_id} errored: {err:#}")
-            }
+            );
+            false
+        }
+        Err(err) => {
+            log::warn!("repair_client_setups: re-verify for {client_id} errored: {err:#}");
+            false
         }
     }
-    repaired
 }
 
 /// The agent must have run this recently for its silence to mean anything.
@@ -5107,6 +5155,22 @@ ADDR = ("127.0.0.1", 6767)
 # app restart doesn't produce a storm of alerts.
 DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
 DEBOUNCE_SECONDS = 600
+# The app cannot see what this script can: it only knows the config files it
+# wrote itself, which always verify. Leave the verdict where the app can read
+# it, or the real cause never leaves this process. See `read_guard_verdict`.
+VERDICT_PATH = pathlib.Path(__file__).with_name(".headroom-guard-verdict.json")
+
+
+def record_verdict(issues):
+    # Written on every run, including the healthy one: "guard ran, route was
+    # fine" and "guard never ran" are different facts and the app needs both.
+    try:
+        payload = json.dumps({{"at": int(time.time()), "issues": issues}})
+        tmp = VERDICT_PATH.with_suffix(".tmp")
+        tmp.write_text(payload)
+        os.replace(str(tmp), str(VERDICT_PATH))
+    except Exception:
+        pass
 
 
 def notify(message):
@@ -5205,6 +5269,7 @@ def main():
     if not reachable():
         issues.append("Headroom Desktop isn't running; open it to optimize Codex")
 
+    record_verdict(issues)
     # Never block (exit 2): Codex is the user's own OpenAI account and must keep
     # working whether or not Headroom is active. Surface issues as a once-per-
     # session notification so a genuinely broken route is visible, without
@@ -5458,6 +5523,46 @@ fn remove_codex_guard_hook() -> Result<()> {
 
 const CLAUDE_GUARD_STATUS_MESSAGE: &str = "Verifying Headroom route";
 
+/// What the session-start guard saw from INSIDE the agent's own process, the
+/// last time it ran.
+///
+/// This is the only honest view of the route. The app can verify the files it
+/// wrote (`~/.claude/settings.json`, `~/.codex/config.toml`) and they always
+/// pass, because it wrote them - which is why `detect_unrouted_clients`
+/// re-applies a setup that was never wrong and reports `reapplied=true` while
+/// nothing changes (434 of 436 such re-applies on the fleet over 30 days, with
+/// hosts recurring across days). The break is elsewhere: a project-local
+/// `.claude/settings.json` at a higher precedence, or a session env pointing
+/// somewhere else. Only the guard, inheriting the agent's environment, can see
+/// those - and until now it wrote its verdict to stderr and dropped it.
+pub fn read_guard_verdict(client_id: &str) -> Option<Vec<String>> {
+    // Explicit on both sides: a `_ => claude` fallback would hand the next
+    // client id added to `detect_unrouted_clients` Claude's verdict under
+    // another agent's name, which is worse than no diagnosis at all.
+    let path = match client_id {
+        "codex" | "codex_cli" => codex_guard_hook_path(),
+        "claude_code" | "claude" => claude_guard_hook_path(),
+        _ => return None,
+    }
+    .with_file_name(".headroom-guard-verdict.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    // A verdict older than a day describes a session that has since ended; the
+    // unrouted check it feeds is itself defined over a 24h window.
+    let at = parsed.get("at")?.as_i64()?;
+    if chrono::Utc::now().timestamp() - at > 24 * 3600 {
+        return None;
+    }
+    Some(
+        parsed
+            .get("issues")?
+            .as_array()?
+            .iter()
+            .filter_map(|issue| issue.as_str().map(str::to_owned))
+            .collect(),
+    )
+}
+
 fn claude_guard_hook_path() -> PathBuf {
     home_dir()
         .join(".claude")
@@ -5496,6 +5601,22 @@ ADDR = ("127.0.0.1", 6767)
 # app restart doesn't produce a storm of alerts.
 DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
 DEBOUNCE_SECONDS = 600
+# The app cannot see what this script can: it only knows the config files it
+# wrote itself, which always verify. Leave the verdict where the app can read
+# it, or the real cause never leaves this process. See `read_guard_verdict`.
+VERDICT_PATH = pathlib.Path(__file__).with_name(".headroom-guard-verdict.json")
+
+
+def record_verdict(issues):
+    # Written on every run, including the healthy one: "guard ran, route was
+    # fine" and "guard never ran" are different facts and the app needs both.
+    try:
+        payload = json.dumps({{"at": int(time.time()), "issues": issues}})
+        tmp = VERDICT_PATH.with_suffix(".tmp")
+        tmp.write_text(payload)
+        os.replace(str(tmp), str(VERDICT_PATH))
+    except Exception:
+        pass
 
 
 def notify(message):
@@ -5587,6 +5708,7 @@ def main():
     if not reachable():
         issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- it may be restarting; open the app if it isn't")
 
+    record_verdict(issues)
     if issues:
         notify("; ".join(issues))
         sys.stderr.write("Headroom Claude guard failed:\n")
@@ -11296,6 +11418,104 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     // NOTE: keep this the only test that calls repair_client_setups: the
     // function carries a process-wide hourly scan throttle, so a second
     // caller in the same test binary would get an empty no-op back.
+    #[test]
+    #[serial_test::serial]
+    fn codex_missing_bearer_repair_rewrites_flagless_block_at_once() {
+        // Install-then-login: the block is written logged out (no
+        // requires_openai_auth), the user logs into Codex, every request 401s.
+        // The intercept's 401 hook must fix it now, not on the hourly scan.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        super::apply_client_setup("codex").expect("apply succeeds");
+        fs::write(
+            codex_dir.join("auth.json"),
+            "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"account_id\":\"acct_123\"}}",
+        )
+        .unwrap();
+
+        // Exactly what the 401 hook does: claim the slot on the caller, then
+        // do the filesystem work.
+        assert!(super::claim_codex_missing_bearer_slot(), "first 401 claims");
+        assert!(
+            super::repair_codex_missing_bearer_now(),
+            "stale block is repaired"
+        );
+        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(toml.contains("requires_openai_auth = true"), "got:\n{toml}");
+        // Five-minute throttle: a retry loop of 401s must not churn the file,
+        // and must not get as far as spawning a thread to find that out.
+        assert!(!super::claim_codex_missing_bearer_slot());
+    }
+
+    /// The guards are Python built through `format!`, so a single unescaped
+    /// brace yields a script that parses fine as Rust and then dies at
+    /// runtime inside the user's agent, where nobody sees it.
+    #[test]
+    fn guard_scripts_emit_the_verdict_write_with_real_braces() {
+        for script in [
+            super::build_claude_guard_script(),
+            super::build_codex_guard_script(),
+        ] {
+            assert!(
+                script.contains("record_verdict(issues)"),
+                "verdict recorded"
+            );
+            // format! collapses {{ to {: the emitted dict must be real Python.
+            assert!(
+                script.contains(r#"json.dumps({"at": int(time.time()), "issues": issues})"#),
+                "escaping collapsed to a literal dict, got:\n{script}"
+            );
+            assert!(
+                !script.contains("{{"),
+                "unescaped brace survived into output"
+            );
+        }
+    }
+
+    /// The whole point of the verdict file: a cause the app CANNOT see from
+    /// its own config files still reaches it. Without this the app re-applies
+    /// a correct config, reports success, and tells the user to restart.
+    #[test]
+    #[serial_test::serial]
+    fn guard_verdict_carries_a_cause_the_app_cannot_see() {
+        let home = TestHome::new();
+        let hooks = home.path().join(".claude").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let verdict = hooks.join(".headroom-guard-verdict.json");
+
+        assert_eq!(
+            super::read_guard_verdict("claude_code"),
+            None,
+            "no file yet"
+        );
+
+        let fresh = chrono::Utc::now().timestamp();
+        fs::write(
+            &verdict,
+            format!(r#"{{"at": {fresh}, "issues": ["project-local override"]}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_guard_verdict("claude_code"),
+            Some(vec!["project-local override".to_string()])
+        );
+
+        // A healthy run records an empty list, which must stay distinct from
+        // "the guard never ran" - the caller filters on emptiness.
+        fs::write(&verdict, format!(r#"{{"at": {fresh}, "issues": []}}"#)).unwrap();
+        assert_eq!(super::read_guard_verdict("claude_code"), Some(Vec::new()));
+
+        // Yesterday's verdict describes a session that has since ended.
+        let stale = fresh - 25 * 3600;
+        fs::write(&verdict, format!(r#"{{"at": {stale}, "issues": ["old"]}}"#)).unwrap();
+        assert_eq!(super::read_guard_verdict("claude_code"), None, "stale");
+
+        fs::write(&verdict, "not json").unwrap();
+        assert_eq!(super::read_guard_verdict("claude_code"), None, "garbage");
+    }
+
     #[test]
     #[serial_test::serial]
     fn repair_client_setups_reapplies_a_clobbered_config() {

@@ -1964,6 +1964,21 @@ select {
   color: var(--text-primary);
 }
 
+/* Clamped is not a warning, it is a thing already happening to them: the app
+   is optimizing less right now. Danger tokens, and it sticks to the top of the
+   panel so scrolling a long view cannot bury it. */
+.tier-mismatch-banner--clamped {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  border-color: var(--danger);
+  background: var(--danger-tint);
+}
+
+.tier-mismatch-banner--clamped .tier-mismatch-banner__title {
+  color: var(--danger);
+}
+
 .tier-mismatch-banner__body {
   flex: 1;
   min-width: 0;

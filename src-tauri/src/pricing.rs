@@ -984,24 +984,15 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     Ok(status)
 }
 
-/// Set (or clear) the Sentry user scope from the Headroom account. Email is the
-/// support-triage key; tier is added as a tag so issues can be filtered by plan.
+/// Set (or clear) the Sentry user from the Headroom account. Email is the
+/// support-triage key; tier rides along as the `headroom.tier` tag.
 fn set_sentry_user(account: Option<&HeadroomAccountProfile>) {
-    sentry::configure_scope(|scope| match account {
-        Some(acc) => {
-            scope.set_user(Some(sentry::User {
-                email: Some(acc.email.clone()),
-                ..Default::default()
-            }));
-            scope.set_tag(
-                "headroom.tier",
-                acc.subscription_tier
-                    .map(|t| format!("{t:?}"))
-                    .unwrap_or_else(|| "none".into()),
-            );
-        }
-        None => scope.set_user(None),
-    });
+    // Not `sentry::configure_scope`: that is per-thread, and this runs on the
+    // pricing-loop thread while the captures that need it come from everywhere.
+    crate::logging::set_sentry_user(
+        account.map(|acc| acc.email.clone()),
+        account.and_then(|acc| acc.subscription_tier.map(|t| format!("{t:?}"))),
+    );
 }
 
 /// Debug-only: force the weekly-limit nudge or gate so the savings-counterfactual

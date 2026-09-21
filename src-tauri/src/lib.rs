@@ -518,9 +518,12 @@ fn onboarding_recovery_copy(any_connector_enabled: bool) -> (&'static str, &'sta
 /// its pre-Headroom environment) — the condition the generic nudge can only
 /// guess at from a timer. Reports the `unrouted_usage_detected` funnel step
 /// independently of the notification's once-per-install gate, so the fleet
-/// count measures the leak, not the nag budget.
-/// ponytail: reads Claude Code sessions only; Codex/OpenCode usage is
-/// invisible to it until their session paths are taught here.
+/// count measures the leak, not the nag budget. Also reports
+/// `agent_activity_absent` for the opposite case — a finished install with no
+/// traffic AND no agent running — which is the larger, previously silent bucket.
+/// ponytail: sees Claude Code and Codex only, so `agent_activity_absent` means
+/// "absent among the agents we can see"; OpenCode and friends stay invisible
+/// until their session paths are taught here, and would read as absent today.
 fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard: &DashboardState) {
     static FIRST_POLLED_AT: std::sync::OnceLock<chrono::DateTime<Utc>> = std::sync::OnceLock::new();
     let since = *FIRST_POLLED_AT.get_or_init(Utc::now);
@@ -551,6 +554,23 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     // most once a minute, not on every 5s poll.
     let codex = codex_ran_locally_since(since);
     if !claude && !codex {
+        // Nothing visible anywhere: no proxied request, and no agent session
+        // growing either. Age-matched cohorts (2026-08-11..09-07) put Windows
+        // at 46% reaching `first_prompt_request` against macOS's 73%, while
+        // `unrouted_usage_detected` fires for only 10% of Windows installs --
+        // so most of the loss lands in this branch and used to leave silently.
+        // The beacon cannot say WHY, but paired with
+        // `client_setup_no_clients_detected` it separates "never had an agent"
+        // from "has one we cannot see", which is the fork worth knowing.
+        // Absence needs a longer settle than the positive case above: three
+        // minutes of uptime only proves the user has not opened their editor
+        // yet. Fires once per process, like the two beacons below.
+        static ABSENT_BEACON_SENT: AtomicBool = AtomicBool::new(false);
+        if Utc::now() - since >= chrono::Duration::minutes(45)
+            && !ABSENT_BEACON_SENT.swap(true, Ordering::AcqRel)
+        {
+            pricing::report_funnel_step(state, "agent_activity_absent");
+        }
         return;
     }
     // One beacon per agent: Codex users save at 55-66% against ~90% for
@@ -737,7 +757,25 @@ fn get_debug_overrides() -> DebugOverrides {
     DebugOverrides {
         setup_stall: fake_override("HEADROOM_FAKE_SETUP_STALL")
             .filter(|mode| mode == "no_traffic" || mode == "no_savings" || mode == "drift"),
+        live_savings_pulse: live_savings_pulse_enabled(),
     }
+}
+
+/// Live savings pulse: the tray icon blips and the home chart shows a live
+/// token counter each time today's saved-token total rises. Driven by the
+/// same 20s dashboard sample as the tray dollar badge, so it never fires on
+/// traffic that saved nothing. RC-only while it soaks (user request 2026-09-21,
+/// stable stays silent until tested); HEADROOM_LIVE_SAVINGS_PULSE=0 turns it
+/// off on an RC for A/B testing.
+fn live_savings_pulse_enabled_from(version: &str, env: Option<&str>) -> bool {
+    version.contains("-rc") && env.map(str::trim) != Some("0")
+}
+
+fn live_savings_pulse_enabled() -> bool {
+    live_savings_pulse_enabled_from(
+        env!("CARGO_PKG_VERSION"),
+        std::env::var("HEADROOM_LIVE_SAVINGS_PULSE").ok().as_deref(),
+    )
 }
 
 /// Test affordance (opt-in via env, works in release/RC builds): when
@@ -952,6 +990,19 @@ async fn install_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingAppUpdate>,
 ) -> Result<(), String> {
+    // Ahead of the download, not after it: the install is the only step that
+    // needs a writable folder, and failing it late costs the user the whole
+    // bundle transfer for nothing.
+    #[cfg(target_os = "macos")]
+    if bundle_is_read_only() {
+        log::warn!("update: refusing in-place install; the bundle folder is read-only");
+        log::info!(
+            "update: read-only bundle path {:?}",
+            current_app_bundle_path()
+        );
+        return Err(READ_ONLY_BUNDLE_MESSAGE.to_string());
+    }
+
     let emitter_app = app.clone();
     let emitter: AppUpdateProgressEmitter = Arc::new(move |event| {
         let _ = emitter_app.emit(APP_UPDATE_PROGRESS_EVENT, &event);
@@ -988,9 +1039,15 @@ where
 {
     let update = {
         let mut pending = pending_update.lock();
-        pending
-            .take()
-            .ok_or_else(|| "No downloaded update is ready to install.".to_string())?
+        // `install` consumes the update handle, so a FAILED install empties the
+        // slot too (RUST-HA's read-only mount failed seven times, and the eighth
+        // click landed here). The remedy is a fresh check, so say that instead of
+        // "nothing is ready", which reads as a bug to the user staring at a
+        // "Restart to update" affordance.
+        pending.take().ok_or_else(|| {
+            "The downloaded update is no longer staged. Check for updates again, then retry."
+                .to_string()
+        })?
     };
 
     // The window hides 150ms after losing focus, and a .deb install raises a
@@ -1109,6 +1166,59 @@ fn current_app_bundle_path() -> Option<std::path::PathBuf> {
         .map(|p| p.to_path_buf())
 }
 
+/// The message shown when the running bundle sits on a read-only filesystem, so
+/// an update cannot be swapped into place. See `bundle_dir_is_read_only`.
+#[cfg(target_os = "macos")]
+const READ_ONLY_BUNDLE_MESSAGE: &str =
+    "Headroom cannot update itself because it is running from a read-only folder. \
+     If you opened it straight from the disk image, drag Headroom to your \
+     Applications folder and open it from there, then check for updates again.";
+
+/// Is `dir` on a read-only filesystem? Probes with a real file create: mode bits
+/// say nothing about a read-only MOUNT, and matching `/AppTranslocation/` in the
+/// path catches only one of the ways this happens (running straight off the
+/// mounted `.dmg` is the other).
+///
+/// Read-only specifically, not "unwritable": the updater renames the bundle
+/// aside to install, and on `PermissionDenied` (a `/Applications` this user does
+/// not own) the plugin retries the move under an admin prompt, which works. Only
+/// `EROFS` is the dead end, so only `EROFS` may block.
+#[cfg(target_os = "macos")]
+fn dir_is_read_only(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".headroom-write-probe-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(err) => is_read_only_filesystem(&err),
+    }
+}
+
+/// `EROFS` (30). Raw errno rather than `io::ErrorKind::ReadOnlyFilesystem` so
+/// this keeps compiling on the MSRV the CI images pin.
+#[cfg(target_os = "macos")]
+fn is_read_only_filesystem(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(30)
+}
+
+/// `true` when the running `.app` cannot be replaced in place because the folder
+/// holding it is read-only. Two ways in, both ending in a randomized or mounted
+/// read-only volume: App Translocation (the app was launched quarantined and
+/// never moved to `/Applications`) and running directly off the mounted `.dmg`.
+///
+/// Without this the updater downloads the whole update first and only then dies
+/// on a bare "Read-only file system (os error 30)" (RUST-HA), every check,
+/// forever - these installs can never update themselves (RUST-44 is the same
+/// cohort, seen from the uninstall side).
+#[cfg(target_os = "macos")]
+fn bundle_is_read_only() -> bool {
+    current_app_bundle_path()
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .is_some_and(dir_is_read_only)
+}
+
 #[cfg(target_os = "macos")]
 fn shell_quote_path(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();
@@ -1129,10 +1239,49 @@ fn shell_quote_path(path: &std::path::Path) -> String {
 #[cfg(target_os = "macos")]
 fn spawn_relauncher(launch: &str) {
     let cmd = relauncher_script(std::process::id(), &relauncher_expect_name(), launch);
-    match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
-        Ok(_) => log::info!("restart_app: relauncher spawned"),
+    match spawn_detached(&cmd) {
+        Ok(()) => log::info!("restart_app: relauncher spawned"),
         Err(err) => log::error!("restart_app: failed to spawn relauncher: {err}"),
     }
+}
+
+/// Runs `script` in a shell that must OUTLIVE this process. Every caller here
+/// is a helper whose whole job starts once we are dead (relaunch us, trash our
+/// bundle), so a helper that dies with us does nothing and says nothing.
+///
+/// A plain `spawn()` is not enough, which cost a user 3m44s of downtime on
+/// 2026-09-21: the update installed, the app exited cleanly, and the relauncher
+/// never reached its `open` (no outcome line in the log, no process left
+/// behind). It had gone 6-for-6 before that and lost the race on a busy box.
+/// Three ways a fork child of a quitting macOS GUI app dies, all closed here:
+///
+/// - It is still our direct child when we exit, so it is in the launchd domain
+///   being torn down (`[pid/N] shutting down`, which SIGKILLs what is left in
+///   it). `( ... ) &` makes the shell we spawn exit at once, so the real work is
+///   reparented to launchd NOW, while we are alive, instead of at our death.
+/// - A group-directed kill reaches it. `process_group(0)` puts it in its own.
+/// - The orphaned process group gets SIGHUP. Trapped.
+///
+/// Not `setsid`: macOS ships no such binary, and reparenting plus a fresh
+/// process group covers what a new session would buy us here.
+#[cfg(target_os = "macos")]
+fn spawn_detached(script: &str) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    crate::proc::command("/bin/sh")
+        .arg("-c")
+        .arg(detached_script(script))
+        .process_group(0)
+        .spawn()
+        .map(|_| ())
+}
+
+/// `( ... ) &` so the shell we spawn exits immediately and the work inside is
+/// reparented to launchd while we are still alive. stdio to `/dev/null`: it
+/// runs on after our fds are gone, and it reports by appending to the desktop
+/// log rather than through anything it inherited from us.
+#[cfg(target_os = "macos")]
+fn detached_script(script: &str) -> String {
+    format!("( trap '' HUP; {script} ) >/dev/null 2>&1 &")
 }
 
 /// What `ps -o comm=` reports for THIS process, for the identity gate below.
@@ -1170,7 +1319,13 @@ fn relauncher_expect_name() -> String {
 fn relauncher_script(pid: u32, expect: &str, launch: &str) -> String {
     let log_quoted = shell_quote_path(&logging::log_path());
     format!(
-        "alive=1; \
+        // One line as soon as the detached side is running, because its silence
+        // is otherwise unreadable: on 2026-09-21 only the outcome line existed,
+        // so a helper that died mid-wait looked exactly like one that never
+        // started. Written from inside the subshell, so it also proves the
+        // detach itself took.
+        "echo \"$(date '+%Y-%m-%d %H:%M:%S') helper: detached, waiting for pid {pid}\" >> {log_quoted}; \
+         alive=1; \
          for i in $(seq 1 100); do \
            if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
            sleep 0.1; \
@@ -1202,11 +1357,12 @@ fn relauncher_script(pid: u32, expect: &str, launch: &str) -> String {
 fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
     let bundle = current_app_bundle_path()?;
 
-    // App Translocation: the app was launched quarantined (e.g. straight from a
-    // DMG, never moved to /Applications) and runs from a randomized read-only
-    // copy under `.../AppTranslocation/...`. Trashing that copy does nothing
-    // useful and leaves the real install in place, so skip it.
-    if bundle.to_string_lossy().contains("/AppTranslocation/") {
+    // A read-only folder means the app was launched from the DMG - either
+    // App-Translocated to a randomized read-only copy, or running straight off
+    // the mounted volume. Either way the `mv` below cannot move it and the real
+    // install stays put, so skip it. Probed rather than matched on
+    // `/AppTranslocation/`, which misses the mounted-volume half.
+    if bundle.parent().is_some_and(dir_is_read_only) {
         // No path in the warn: it is per-user random, so each host made its
         // own Sentry issue (RUST-44, RUST-GD).
         log::warn!(
@@ -1217,27 +1373,28 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
         return None;
     }
 
-    let pid = std::process::id();
     let quoted = shell_quote_path(&bundle);
     let log_quoted = shell_quote_path(&logging::log_path());
-    let cmd = format!(
-        "alive=1; \
-         for i in $(seq 1 100); do \
-           if ! kill -0 {pid} 2>/dev/null; then alive=0; break; fi; \
-           sleep 0.1; \
-         done; \
-         if [ \"$alive\" = 1 ]; then kill -9 {pid} 2>/dev/null; sleep 0.5; fi; \
-         base=$(basename {quoted}); \
+    // The same wait-then-act helper the relaunch path uses, which buys the
+    // uninstall the two things this hand-rolled copy was missing: a shell that
+    // survives our exit (one killed with us leaves the bundle sitting there,
+    // silently, after the user asked for it to go), and the identity gate in
+    // front of the force-kill.
+    let cmd = relauncher_script(
+        std::process::id(),
+        &relauncher_expect_name(),
+        &format!(
+            "base=$(basename {quoted}); \
          dest=\"$HOME/.Trash/$base\"; \
          if [ -e \"$dest\" ]; then dest=\"$HOME/.Trash/${{base%.app}} $(date +%s).app\"; fi; \
          mv -f {quoted} \"$dest\"; rc=$?; \
-         echo \"$(date '+%Y-%m-%d %H:%M:%S') uninstall: mv {quoted} -> $dest exited rc=$rc (alive=$alive)\" >> {log_quoted}",
-        pid = pid,
-        quoted = quoted,
-        log_quoted = log_quoted,
+             echo \"$(date '+%Y-%m-%d %H:%M:%S') uninstall: mv {quoted} -> $dest exited rc=$rc (alive=$alive)\" >> {log_quoted}",
+            quoted = quoted,
+            log_quoted = log_quoted,
+        ),
     );
-    match crate::proc::command("/bin/sh").arg("-c").arg(cmd).spawn() {
-        Ok(_) => {
+    match spawn_detached(&cmd) {
+        Ok(()) => {
             log::info!("uninstall: scheduled app-bundle trash for {bundle:?}");
             Some(bundle)
         }
@@ -3814,6 +3971,9 @@ pub struct DebugOverrides {
     /// setup-stall alert to fire immediately, ignoring uptime, savings,
     /// connector state, the account gate and the once-per-day throttle.
     pub setup_stall: Option<String>,
+    /// True on RC builds (unless HEADROOM_LIVE_SAVINGS_PULSE=0): the home
+    /// chart renders the live saved-tokens chip. See `live_savings_pulse_enabled`.
+    pub live_savings_pulse: bool,
 }
 
 /// Cached launch flags. On a cold cache, performs one bounded config fetch so
@@ -5125,6 +5285,12 @@ struct UnroutedClient {
     /// it up. Only ever true when `enabled`.
     reapplied: bool,
     active_at: String,
+    /// What the session-start guard saw from inside the agent's own process,
+    /// when it names a cause the app cannot see from its own config files (a
+    /// project-local override, a session env pointing elsewhere). None when
+    /// the guard has not run recently or found nothing - then the generic
+    /// restart advice is still the best we have.
+    diagnosis: Option<String>,
 }
 
 /// Agents that ran on this machine while Headroom, up the whole time, saw
@@ -5213,6 +5379,11 @@ async fn detect_unrouted_clients(
                 _ => client_adapters::is_claude_code_enabled(),
             };
             let reapplied = enabled && client_adapters::apply_client_setup(client_id).is_ok();
+            // Re-applying our own config is only a fix when our own config was
+            // the problem. Ask the guard what the agent actually saw.
+            let diagnosis = client_adapters::read_guard_verdict(client_id)
+                .filter(|issues| !issues.is_empty())
+                .map(|issues| issues.join("; "));
             let active_at: chrono::DateTime<chrono::Utc> = activity.unwrap_or(now).into();
             log::info!(
                 "unrouted client {client_id}: active locally at {active_at}, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
@@ -5229,6 +5400,13 @@ async fn detect_unrouted_clients(
                     scope.set_tag("enabled", enabled);
                     scope.set_tag("reapplied", reapplied);
                     scope.set_extra("active_at", active_at.to_rfc3339().into());
+                    // Turns a blind fleet signal into a diagnosed one: without
+                    // this every event says only "ran unrouted", which is the
+                    // symptom we already knew.
+                    scope.set_tag("diagnosed", diagnosis.is_some());
+                    if let Some(diagnosis) = diagnosis.as_deref() {
+                        scope.set_extra("guard_diagnosis", diagnosis.into());
+                    }
                     scope.set_fingerprint(Some(&["unrouted_client", client_id]));
                 },
                 || {
@@ -5251,6 +5429,7 @@ async fn detect_unrouted_clients(
                 enabled,
                 reapplied,
                 active_at: active_at.to_rfc3339(),
+                diagnosis,
             });
         }
         found
@@ -5928,6 +6107,10 @@ pub fn run() {
     // of docs/beta-smoke-test.md.
     storage::snapshot_state_on_version_change(&storage::app_data_dir(), env!("CARGO_PKG_VERSION"));
 
+    // Did the restart that led here actually relaunch us, or did the user have
+    // to open the app themselves? Only this launch can tell.
+    storage::report_unfinished_restart(&storage::app_data_dir());
+
     let state = AppState::new().expect("failed to create app state");
 
     // A previous bootstrap attempt that never reached a verdict: the app was
@@ -6068,7 +6251,7 @@ pub fn run() {
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
             ));
-            app.manage(TraySessionSavings(Mutex::new(0.0)));
+            app.manage(TraySessionSavings(Mutex::new(TraySavingsToday::default())));
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
             spawn_tray_savings_updater(app.handle().clone());
@@ -8138,6 +8321,13 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut frame_index = 0usize;
         let mut last_non_booting: Option<TrayRuntimeVisual> = None;
         let mut last_displayed_dollars: Option<u32> = None;
+        // Live savings pulse (RC-only): tokens seen at the previous tick, the
+        // countdown of accent-tinted frames still to draw, and whether the
+        // last tick drew one (so the next tick restores the plain icon fast).
+        let pulse_enabled = live_savings_pulse_enabled();
+        let mut last_seen_tokens: Option<u64> = None;
+        let mut pulse_frames_left: usize = 0;
+        let mut pulse_drawn_last_tick = false;
         let mut last_tooltip: Option<String> = None;
         let mut last_pause_label: Option<&str> = None;
         let mut unhealthy_streak: u8 = 0;
@@ -8211,19 +8401,28 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 debounced_tray_runtime_visual(raw_visual, last_non_booting, &mut unhealthy_streak);
 
             if let Some(tray) = app.tray_by_id("headroom-tray") {
-                let tooltip = match visual {
-                    TrayRuntimeVisual::Booting => "Headroom — starting",
-                    TrayRuntimeVisual::Running => "Headroom — active",
+                let today = {
+                    let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
+                    let today = *savings_state.0.lock();
+                    today
+                };
+                let tooltip: String = match visual {
+                    TrayRuntimeVisual::Booting => "Headroom — starting".into(),
+                    TrayRuntimeVisual::Running if pulse_enabled => format!(
+                        "Headroom — active, {} tokens saved today",
+                        tool_manager::compact_token_count(today.tokens)
+                    ),
+                    TrayRuntimeVisual::Running => "Headroom — active".into(),
                     TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code or ChatGPT running normally)"
+                        "Headroom — paused (Claude Code or ChatGPT running normally)".into()
                     }
                     TrayRuntimeVisual::Unhealthy => {
-                        "Headroom — proxy unreachable, attempting restart"
+                        "Headroom — proxy unreachable, attempting restart".into()
                     }
                     TrayRuntimeVisual::Disconnected => {
-                        "Headroom — Claude Code or ChatGPT not connected"
+                        "Headroom — Claude Code or ChatGPT not connected".into()
                     }
-                    TrayRuntimeVisual::Off => "Headroom — off",
+                    TrayRuntimeVisual::Off => "Headroom — off".into(),
                 };
 
                 let pause_label = if visual == TrayRuntimeVisual::Paused {
@@ -8250,19 +8449,37 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     }
                     TrayRuntimeVisual::Running => {
                         let dollars = {
-                            let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
-                            let v = *savings_state.0.lock();
-                            let d = v.floor() as u32;
+                            let d = today.usd.floor() as u32;
                             #[cfg(debug_assertions)]
                             let d = d.max(1);
                             d
                         };
+                        // Blip only when saved tokens actually rose since the
+                        // last tick: a request that saved nothing stays silent.
+                        if pulse_enabled && last_seen_tokens.is_some_and(|t| today.tokens > t) {
+                            pulse_frames_left = TRAY_PULSE_FRAMES.len();
+                        }
+                        last_seen_tokens = Some(today.tokens);
+                        let pulse = if pulse_frames_left > 0 {
+                            pulse_frames_left -= 1;
+                            Some(TRAY_PULSE_FRAMES[pulse_frames_left])
+                        } else {
+                            None
+                        };
                         let changed_visual = last_non_booting != Some(TrayRuntimeVisual::Running);
                         let changed_dollars = last_displayed_dollars != Some(dollars);
-                        if changed_visual || changed_dollars {
+                        if changed_visual
+                            || changed_dollars
+                            || pulse.is_some()
+                            || pulse_drawn_last_tick
+                        {
                             let (bw, bh) = icons.running_dims;
+                            let base = match pulse {
+                                Some(strength) => tint_toward_accent(&icons.running_rgba, strength),
+                                None => icons.running_rgba.clone(),
+                            };
                             let (new_rgba, new_w, new_h) =
-                                build_running_with_savings(&icons.running_rgba, bw, bh, dollars);
+                                build_running_with_savings(&base, bw, bh, dollars);
                             let _ = tray.set_icon(Some(tauri::image::Image::new_owned(
                                 new_rgba, new_w, new_h,
                             )));
@@ -8270,6 +8487,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             last_non_booting = Some(TrayRuntimeVisual::Running);
                             last_displayed_dollars = Some(dollars);
                         }
+                        pulse_drawn_last_tick = pulse.is_some();
                     }
                     TrayRuntimeVisual::Off => {
                         if last_non_booting != Some(TrayRuntimeVisual::Off) {
@@ -8316,10 +8534,10 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
 
                 // set_icon clobbers the tooltip on macOS, so re-apply whenever
                 // we just swapped the icon — not only on tooltip text change.
-                let tooltip_changed = last_tooltip.as_deref() != Some(tooltip);
+                let tooltip_changed = last_tooltip.as_deref() != Some(tooltip.as_str());
                 if icon_changed || tooltip_changed {
-                    match tray.set_tooltip(Some(tooltip)) {
-                        Ok(()) => last_tooltip = Some(tooltip.to_string()),
+                    match tray.set_tooltip(Some(tooltip.as_str())) {
+                        Ok(()) => last_tooltip = Some(tooltip.clone()),
                         // Windows returns E_FAIL (0x80004005) while the
                         // notification area is busy -- explorer restarting, or
                         // a shell extension holding it. Caching the tooltip
@@ -8337,10 +8555,15 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
             // Only transitional states need quick polling. In steady state the
             // tray icon is unchanged, and `runtime_status()` is one of the few
             // always-on paths that can still hit the local proxy / filesystem.
-            let sleep = match visual {
-                TrayRuntimeVisual::Booting => std::time::Duration::from_millis(260),
-                TrayRuntimeVisual::Unhealthy => std::time::Duration::from_millis(1500),
-                _ => std::time::Duration::from_secs(5),
+            let sleep = if pulse_drawn_last_tick {
+                // Mid-blip: the next frame (or the plain icon) is due now.
+                std::time::Duration::from_millis(160)
+            } else {
+                match visual {
+                    TrayRuntimeVisual::Booting => std::time::Duration::from_millis(260),
+                    TrayRuntimeVisual::Unhealthy => std::time::Duration::from_millis(1500),
+                    _ => std::time::Duration::from_secs(5),
+                }
             };
             std::thread::sleep(sleep);
         }
@@ -8847,13 +9070,15 @@ fn spawn_tray_savings_updater(app: AppHandle) {
         let state: tauri::State<'_, AppState> = app.state();
         let dashboard = state.dashboard();
         let today_key = Local::now().format("%Y-%m-%d").to_string();
-        let savings: f64 = dashboard
+        // Both Headroom layers, matching the home chart's headline total.
+        let savings = dashboard
             .hourly_savings
             .iter()
             .filter(|p| p.hour.starts_with(&today_key))
-            // Both Headroom layers, matching the home chart's headline total.
-            .map(|p| p.estimated_savings_usd + p.output_savings_usd)
-            .sum();
+            .fold(TraySavingsToday::default(), |acc, p| TraySavingsToday {
+                usd: acc.usd + p.estimated_savings_usd + p.output_savings_usd,
+                tokens: acc.tokens + p.estimated_tokens_saved + p.output_tokens_saved,
+            });
         let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
         *savings_state.0.lock() = savings;
         let _ = app.emit("savings-today-updated", savings);
@@ -8904,6 +9129,26 @@ fn to_grayscale_strength(rgba: &[u8], strength: f32) -> Vec<u8> {
         pixel[0] = (r * (1.0 - s) + gray * s).round() as u8;
         pixel[1] = (g * (1.0 - s) + gray * s).round() as u8;
         pixel[2] = (b * (1.0 - s) + gray * s).round() as u8;
+    }
+    out
+}
+
+/// Accent strengths for the tray blip, drawn last-to-first as the countdown
+/// in `spawn_tray_runtime_icon_updater` falls: bright, then fading out.
+const TRAY_PULSE_FRAMES: [f32; 3] = [0.2, 0.45, 0.8];
+
+/// Blend every non-transparent pixel toward the savings-badge green.
+fn tint_toward_accent(rgba: &[u8], strength: f32) -> Vec<u8> {
+    const ACCENT: [f32; 3] = [80.0, 210.0, 100.0];
+    let s = strength.clamp(0.0, 1.0);
+    let mut out = rgba.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        if pixel[3] == 0 {
+            continue;
+        }
+        for (channel, accent) in pixel.iter_mut().take(3).zip(ACCENT) {
+            *channel = (*channel as f32 * (1.0 - s) + accent * s).round() as u8;
+        }
     }
     out
 }
@@ -8980,7 +9225,16 @@ fn handle_window_event(window: &Window, event: &WindowEvent) {
     }
 }
 
-struct TraySessionSavings(Mutex<f64>);
+/// Today's savings as the tray and the home chart's live figure see them:
+/// both Headroom layers, sampled every 20s from the dashboard.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TraySavingsToday {
+    usd: f64,
+    tokens: u64,
+}
+
+struct TraySessionSavings(Mutex<TraySavingsToday>);
 
 // Returns a (possibly wider) RGBA image with whole-dollar savings stacked
 // vertically to the right of the base icon. Returns the base unchanged when
@@ -9485,6 +9739,8 @@ mod tests {
         QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
+    #[cfg(target_os = "macos")]
+    use super::{dir_is_read_only, is_read_only_filesystem};
     use parking_lot::Mutex;
     use serde_json::json;
     use std::sync::Arc;
@@ -10130,6 +10386,32 @@ mod tests {
     }
 
     #[test]
+    fn live_savings_pulse_is_rc_only_with_env_kill_switch() {
+        assert!(super::live_savings_pulse_enabled_from("0.9.18-rc.1", None));
+        assert!(super::live_savings_pulse_enabled_from(
+            "0.9.18-rc.1",
+            Some("1")
+        ));
+        assert!(!super::live_savings_pulse_enabled_from(
+            "0.9.18-rc.1",
+            Some(" 0 ")
+        ));
+        assert!(!super::live_savings_pulse_enabled_from("0.9.18", None));
+        assert!(!super::live_savings_pulse_enabled_from("0.9.18", Some("1")));
+    }
+
+    #[test]
+    fn tint_toward_accent_blends_opaque_pixels_only() {
+        let base = vec![10u8, 20, 30, 255, 10, 20, 30, 0];
+        assert_eq!(super::tint_toward_accent(&base, 0.0), base);
+        let full = super::tint_toward_accent(&base, 1.0);
+        assert_eq!(&full[..4], &[80, 210, 100, 255]);
+        assert_eq!(&full[4..], &[10, 20, 30, 0], "transparent pixels untouched");
+        let half = super::tint_toward_accent(&base, 0.5);
+        assert_eq!(&half[..4], &[45, 115, 65, 255]);
+    }
+
+    #[test]
     fn fake_override_treats_blank_and_unset_alike() {
         std::env::set_var("HEADROOM_FAKE_OVERRIDE_BLANK", "   ");
         let blank = fake_override("HEADROOM_FAKE_OVERRIDE_BLANK");
@@ -10337,7 +10619,10 @@ mod tests {
             ))
             .expect_err("missing update should fail");
 
-        assert_eq!(error, "No downloaded update is ready to install.");
+        assert_eq!(
+            error,
+            "The downloaded update is no longer staged. Check for updates again, then retry."
+        );
     }
 
     #[test]
@@ -13305,10 +13590,11 @@ Some unrelated content.
         use std::path::Path;
         let app = super::shell_quote_path(Path::new("/Applications/Headroom RC.app"));
         let log = super::shell_quote_path(Path::new("/Users/a b/Library/Logs/Headroom/d.log"));
+        let marker = super::shell_quote_path(Path::new("/Users/a b/Headroom/restart-attempted"));
         let launches = [
             // macOS
             format!(
-                "/usr/bin/open -n {app}; rc=$?; \
+                "touch {marker}; /usr/bin/open -n {app}; rc=$?; \
                  echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {app} exited rc=$rc (alive=$alive)\" >> {log}"
             ),
             // Linux
@@ -13325,14 +13611,68 @@ Some unrelated content.
                 script.contains("kill -9 4242"),
                 "lost the force-kill backstop: {script}"
             );
+            // The detached form is what actually runs, so that is what gets
+            // syntax-checked: the `( ... ) &` wrapper has to survive contact
+            // with the quotes and `$(...)` inside it.
+            let detached = super::detached_script(&script);
             let status = crate::proc::command("/bin/sh")
                 .arg("-n")
                 .arg("-c")
-                .arg(&script)
+                .arg(&detached)
                 .status()
                 .expect("run sh -n");
-            assert!(status.success(), "sh rejected the script: {script}");
+            assert!(status.success(), "sh rejected the script: {detached}");
         }
+    }
+
+    /// The helper's whole job starts once we are dead, so it has to outlive the
+    /// process that spawned it. It did not on 2026-09-21: the app installed its
+    /// update, exited cleanly, and nothing ever relaunched it.
+    ///
+    /// Checks the mechanism the fix rests on - the spawner returns at once and
+    /// the work runs on after that spawner is gone. It cannot reproduce
+    /// launchd's domain teardown from a test binary; what it does catch is the
+    /// wrapper losing its `&`, which puts the work back inside the spawner's
+    /// lifetime, the exact shape that failed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detached_helper_outlives_the_process_that_spawned_it() {
+        let dir = std::env::temp_dir().join(format!("headroom-detach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let marker = dir.join("survived");
+
+        let script = super::detached_script(&format!(
+            "sleep 0.6; touch {}",
+            super::shell_quote_path(&marker)
+        ));
+        // A shell we wait on, standing in for the app that is quitting.
+        let started = std::time::Instant::now();
+        let status = crate::proc::command("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("run spawner");
+        let spawner_took = started.elapsed();
+
+        assert!(status.success(), "spawner failed: {script}");
+        assert!(
+            spawner_took < std::time::Duration::from_millis(400),
+            "spawner waited on the helper ({spawner_took:?}): the work is still inside its lifetime"
+        );
+        assert!(
+            !marker.exists(),
+            "helper finished before the spawner exited"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            marker.exists(),
+            "helper died with the process that spawned it: {script}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -13388,6 +13728,42 @@ Some unrelated content.
             None,
             "a reload must not replay a spent code"
         );
+    }
+
+    /// The guard must fire on a read-only FILESYSTEM and on nothing else. A
+    /// merely unwritable folder (an `/Applications` this user does not own) is
+    /// the updater's admin-prompt path and still installs, so blocking it would
+    /// break updates that work today.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_only_bundle_guard_fires_on_erofs_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !dir_is_read_only(dir.path()),
+            "a writable folder must not block an install"
+        );
+
+        let unwritable = dir.path().join("unwritable");
+        std::fs::create_dir(&unwritable).expect("create");
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        assert!(
+            !dir_is_read_only(&unwritable),
+            "EACCES is the admin-prompt path, not a dead end, so it must not block"
+        );
+        // Leave it removable by the tempdir drop.
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+
+        assert!(
+            is_read_only_filesystem(&std::io::Error::from_raw_os_error(30)),
+            "EROFS is what App Translocation and a mounted DMG return"
+        );
+        assert!(!is_read_only_filesystem(
+            &std::io::Error::from_raw_os_error(13)
+        ));
     }
 }
 

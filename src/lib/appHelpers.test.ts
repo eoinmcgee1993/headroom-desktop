@@ -10,6 +10,8 @@ import {
   getPlanRenewalPriceLabel,
   getUpgradePlans,
   higherSubscriptionTier,
+  annualFirstYearSavingCents,
+  introFirstYearCents,
   introPercentOff,
   introSaleBadgeLabel,
   isTierDowngrade,
@@ -340,9 +342,66 @@ describe("app helpers", () => {
       expect(introPercentOff(null)).toBe(0);
     });
 
+    it("uses the annual percent for the annual tab when the server sends one", () => {
+      const split: IntroOffer = { ...intro, percentOff: 25, annualPercentOff: 12.5 };
+      expect(introPercentOff(split, "monthly")).toBe(25);
+      expect(introPercentOff(split, "annual")).toBe(12.5);
+    });
+
+    // An old server's single percent meant "off the first N months", which on a
+    // yearly invoice is N/12ths of it. Reading it as a straight 50% off the year
+    // would quote $90 for a plan Polar bills at $157.50.
+    it("derives the annual percent from durationMonths on an old server", () => {
+      expect(introPercentOff(intro, "annual")).toBe(12.5);
+      expect(introFirstYearCents(1_500, "annual", intro)).toBe(15_750);
+    });
+
+    it("prices the first year the same way the server does", () => {
+      const split: IntroOffer = { ...intro, percentOff: 25, annualPercentOff: 12.5 };
+      // max20x: 3 months at 25% off $40, then 9 at $40.
+      expect(introFirstYearCents(4_000, "monthly", split)).toBe(45_000);
+      expect(introFirstYearCents(3_000, "annual", split)).toBe(31_500);
+      expect(annualFirstYearSavingCents(3_000, 4_000, split)).toBe(13_500);
+    });
+
+    // The whole reason the periods were split: annual has to win, or the
+    // cheaper-looking monthly tab takes the sale.
+    it("keeps annual cheaper than the discounted monthly rate on every tier", () => {
+      const split: IntroOffer = { ...intro, percentOff: 25, annualPercentOff: 12.5 };
+      ([
+        [300, 400],
+        [1_500, 2_000],
+        [3_000, 4_000],
+      ] as const).forEach(([annualCents, monthlyCents]) => {
+        const annualPerMonth = introFirstYearCents(annualCents, "annual", split) / 12;
+        const introMonthly = (monthlyCents * (100 - 25)) / 100;
+        expect(annualPerMonth).toBeLessThan(introMonthly);
+        expect(annualFirstYearSavingCents(annualCents, monthlyCents, split)).toBeGreaterThan(0);
+      });
+    });
+
+    it("names the year on the annual badge and the months on monthly", () => {
+      const split: IntroOffer = { ...intro, percentOff: 25, annualPercentOff: 12.5 };
+      expect(introSaleBadgeLabel(split, "monthly")).toBe("25% off first 3 months");
+      expect(introSaleBadgeLabel(split, "annual")).toBe("12.5% off your first year");
+    });
+
     it("labels the sale badge with the offer duration", () => {
       expect(introSaleBadgeLabel(intro)).toBe("50% off first 3 months");
       expect(introSaleBadgeLabel(null)).toBeNull();
+    });
+
+    // The annual fallback divides by 12, so a duration that does not divide it
+    // yields 8.333333333333334 and the badge would print all of it. Rounded
+    // DOWN, so the badge never claims more discount than the invoice gives.
+    it("prints a printable percent on the annual badge", () => {
+      const awkward: IntroOffer = { active: true, percentOff: 50, durationMonths: 2 };
+      expect(introSaleBadgeLabel(awkward, "annual")).toBe("8.3% off your first year");
+      // Today's live constants, whose fallback is also not a whole number.
+      const live: IntroOffer = { active: true, percentOff: 25, durationMonths: 3 };
+      expect(introSaleBadgeLabel(live, "annual")).toBe("6.2% off your first year");
+      // A whole number keeps no decimal point.
+      expect(introSaleBadgeLabel(live, "monthly")).toBe("25% off first 3 months");
     });
 
     it("drives discounted monthly prices from the intro offer", () => {
@@ -366,10 +425,11 @@ describe("app helpers", () => {
         intro
       );
 
+      // 12.5% off the yearly invoice (see introPercentOff), not 50% off it.
       expect(result.plans.map((plan) => [plan.id, plan.price, plan.originalPrice])).toEqual([
-        ["max5x", "$7.50", "$15"],
-        ["pro", "$1.50", "$3"],
-        ["max20x", "$15", "$30"],
+        ["max5x", "$13.13", "$15"],
+        ["pro", "$2.63", "$3"],
+        ["max20x", "$26.25", "$30"],
       ]);
     });
 
@@ -382,7 +442,9 @@ describe("app helpers", () => {
 
       const max5x = result.plans.find((p) => p.id === "max5x");
       expect(max5x?.billingLines).toEqual(["USD / month", "billed annually"]);
-      expect(max5x?.reversionLine).toBe("then $15/mo after 3 months");
+      // Annual states the year total and the gap to monthly; "then $X/mo after
+      // 3 months" would describe a rate annual never charges.
+      expect(max5x?.reversionLine).toBe("$157.50 for your first year, $52.50 less than monthly");
     });
 
     it("lets an account forever discount win over the intro offer", () => {

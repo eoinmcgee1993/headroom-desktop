@@ -358,6 +358,153 @@ pub fn observe_basis(stats_body: &str) {
     );
 }
 
+// --- Compression-quarantine canary -----------------------------------------
+//
+// The third canary here, for a failure the other two cannot see: compression
+// that never ran at all, on requests that reported no error to the user.
+//
+// Python cannot preempt an executor thread, so when one compression outruns
+// `COMPRESSION_TIMEOUT_SECONDS` (30s) the worker keeps running and the backend
+// arms a timeout-debt quarantine: EVERY subsequent compression raises
+// `CompressionQuarantinedError` until that worker exits or
+// `HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS` (60s) lapses. One slow call
+// therefore costs a minute of compression across all traffic. Measured on one
+// machine 2026-09-21: a single 34s Kompress ONNX inference (188 words, saving
+// 41 tokens) starved 125 of 2,336 requests -- 5.35% forwarded uncompressed,
+// silently, since a quarantined request still succeeds.
+//
+// This reads the backend's own counters off `/metrics` rather than inferring
+// the condition, and reports once per process on the fixed fingerprint the
+// other two use: one machine is a lead, a hundred is a graph. It exists to
+// answer whether the 5.35% is one host or the fleet, and goes quiet on its own
+// once the backend stops failing quarantined requests outright.
+
+/// Starved requests needed before a report means anything. A quarantine that
+/// caught a handful of requests during one slow inference is the mechanism
+/// working as designed; a persistent one is the bug.
+const QUARANTINE_MIN_SKIPS: u64 = 20;
+/// ...and they must be a real share of traffic. Absolute counts alone would
+/// page a long-running backend that accumulated 20 skips over a week, which is
+/// noise. Both bars, for the reason the compression rules give: a ratio is not
+/// a measurement, and neither is a bare count.
+const QUARANTINE_MIN_SHARE: f64 = 0.02;
+
+/// One report per process, same reasoning as the two canaries above.
+static QUARANTINE_REPORTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, PartialEq)]
+pub struct QuarantineStarvation {
+    /// Times a timed-out worker armed the quarantine.
+    pub activations: u64,
+    /// Requests that were refused compression because of it. These forwarded
+    /// uncompressed and returned 200, so nothing else reports them.
+    pub skipped: u64,
+    /// `headroom_requests_total`, from the same scrape, so the share cannot
+    /// break its basis the way a cross-endpoint denominator would.
+    pub requests: u64,
+    /// `skipped / requests`.
+    pub share: f64,
+}
+
+/// Read a single-sample Prometheus counter (`name{labels} value`) out of a
+/// scrape body. Returns `None` when the series is absent -- which is the
+/// normal state, since the backend only emits the quarantine series once it
+/// has something to report.
+fn counter(body: &str, series: &str) -> Option<u64> {
+    body.lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let value = line.strip_prefix(series)?;
+            // Guard against `foo_total_extra` matching the prefix `foo_total`:
+            // a real sample continues with a label block or whitespace.
+            if !value.starts_with(['{', ' ']) {
+                return None;
+            }
+            value.rsplit(' ').next()?.trim().parse().ok()
+        })
+}
+
+/// Read the starvation off a `/metrics` body, or `None` when compression is
+/// running normally or the scrape cannot answer. Pure: `observe_quarantine`
+/// owns the reporting.
+pub fn detect_quarantine_starvation(metrics_body: &str) -> Option<QuarantineStarvation> {
+    let skipped = counter(
+        metrics_body,
+        "headroom_compression_quarantine_total{event=\"skipped\"}",
+    )?;
+    if skipped < QUARANTINE_MIN_SKIPS {
+        return None;
+    }
+    // A zero denominator means the scrape predates any traffic, which cannot
+    // have produced skips; treat it as unanswerable rather than dividing.
+    let requests = counter(metrics_body, "headroom_requests_total").filter(|total| *total > 0)?;
+    let share = skipped as f64 / requests as f64;
+    if share < QUARANTINE_MIN_SHARE {
+        return None;
+    }
+    Some(QuarantineStarvation {
+        activations: counter(
+            metrics_body,
+            "headroom_compression_quarantine_total{event=\"activated\"}",
+        )
+        .unwrap_or(0),
+        skipped,
+        requests,
+        share,
+    })
+}
+
+/// Report quarantine starvation to Sentry, at most once per process.
+pub fn observe_quarantine(metrics_body: &str) {
+    let Some(starved) = detect_quarantine_starvation(metrics_body) else {
+        return;
+    };
+    if QUARANTINE_REPORTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    // Requests lost per activation is the number that decides whether this is
+    // worth fixing: it is the blast radius of ONE slow inference.
+    let per_activation = starved.skipped as f64 / starved.activations.max(1) as f64;
+    let fingerprint: [&str; 1] = ["compression_quarantine_canary"];
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("flow", "compression_quarantine_canary");
+            scope.set_extra("activations", starved.activations.into());
+            scope.set_extra("skipped", starved.skipped.into());
+            scope.set_extra("requests", starved.requests.into());
+            scope.set_extra("share", format!("{:.4}", starved.share).into());
+            scope.set_extra(
+                "skipped_per_activation",
+                format!("{per_activation:.1}").into(),
+            );
+            scope.set_fingerprint(Some(fingerprint.as_slice()));
+        },
+        || {
+            sentry::capture_message(
+                &format!(
+                    "compression_quarantine_canary: {} of {} requests forwarded with NO \
+                     compression ({:.1}%) after {} timeout-debt quarantine(s)",
+                    starved.skipped,
+                    starved.requests,
+                    starved.share * 100.0,
+                    starved.activations
+                ),
+                sentry::Level::Warning,
+            );
+        },
+    );
+    log::warn!(
+        "compression-quarantine canary: {} of {} requests ({:.1}%) were refused compression \
+         after {} quarantine activation(s), {per_activation:.1} requests lost per activation; \
+         one slow compression worker starves every request behind it",
+        starved.skipped,
+        starved.requests,
+        starved.share * 100.0,
+        starved.activations
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +747,74 @@ mod tests {
         assert!(!BASIS_REPORTED.swap(true, Ordering::AcqRel));
         assert!(BASIS_REPORTED.swap(true, Ordering::AcqRel));
         BASIS_REPORTED.store(false, Ordering::Release);
+    }
+
+    /// Shaped like a real scrape, including the `# HELP`/`# TYPE` comments and
+    /// a neighbouring series that shares the `_total` prefix.
+    fn metrics_body(activated: u64, skipped: u64, requests: u64) -> String {
+        format!(
+            "# HELP headroom_requests_total Requests\n\
+             # TYPE headroom_requests_total counter\n\
+             headroom_requests_total {requests}\n\
+             headroom_requests_failed_total 9\n\
+             # TYPE headroom_compression_quarantine_total counter\n\
+             headroom_compression_quarantine_total{{event=\"activated\"}} {activated}\n\
+             headroom_compression_quarantine_total{{event=\"skipped\"}} {skipped}\n"
+        )
+    }
+
+    /// The 2026-09-21 measurement: 2 activations starved 72 of 327 requests.
+    #[test]
+    fn reads_starvation_off_a_real_scrape() {
+        let starved = detect_quarantine_starvation(&metrics_body(2, 72, 327)).expect("starvation");
+        assert_eq!(starved.activations, 2);
+        assert_eq!(starved.skipped, 72);
+        assert_eq!(starved.requests, 327);
+        assert!((starved.share - 72.0 / 327.0).abs() < 1e-9);
+    }
+
+    /// A backend that never quarantined emits no such series at all.
+    #[test]
+    fn stays_quiet_when_compression_never_stalled() {
+        assert!(detect_quarantine_starvation("headroom_requests_total 500\n").is_none());
+    }
+
+    /// The mechanism catching a few requests during one slow inference is it
+    /// working, not failing.
+    #[test]
+    fn ignores_a_handful_of_skips() {
+        assert!(detect_quarantine_starvation(&metrics_body(1, 19, 40)).is_none());
+    }
+
+    /// Enough skips, but spread thin enough to be the designed backpressure --
+    /// the count alone must not page.
+    #[test]
+    fn ignores_skips_that_are_a_trivial_share_of_traffic() {
+        assert!(detect_quarantine_starvation(&metrics_body(3, 100, 50_000)).is_none());
+    }
+
+    /// `headroom_requests_failed_total` must not be mistaken for
+    /// `headroom_requests_total` by prefix.
+    #[test]
+    fn does_not_match_a_longer_series_sharing_the_prefix() {
+        let body = "headroom_requests_failed_total 9\n\
+                    headroom_compression_quarantine_total{event=\"skipped\"} 72\n";
+        assert!(detect_quarantine_starvation(body).is_none());
+    }
+
+    /// A scrape with skips but no traffic counter cannot produce a share, and
+    /// guessing one is how a basis breaks.
+    #[test]
+    fn refuses_to_divide_without_a_denominator() {
+        let body = "headroom_compression_quarantine_total{event=\"skipped\"} 72\n\
+                    headroom_requests_total 0\n";
+        assert!(detect_quarantine_starvation(body).is_none());
+    }
+
+    #[test]
+    fn observe_quarantine_reports_at_most_once_per_process() {
+        assert!(!QUARANTINE_REPORTED.swap(true, Ordering::AcqRel));
+        assert!(QUARANTINE_REPORTED.swap(true, Ordering::AcqRel));
+        QUARANTINE_REPORTED.store(false, Ordering::Release);
     }
 }

@@ -278,6 +278,65 @@ export function setupStallBannerLine(
   return stallBannerBody("no_savings");
 }
 
+export interface StallLineVisibility {
+  /// Result of `setupStallBannerLine`. Null means there is nothing honest to
+  /// say and the caller keeps its existing copy.
+  stallBannerLine: string | null;
+  /// Tone of the Home callout banner.
+  tone: string;
+  /// Connector verification phase. An install that has never routed a request
+  /// stays "verifying" forever - `connectorPhase` only flips to "healthy" once
+  /// the request count is observed to climb.
+  connectorPhase: "disabled" | "verifying" | "healthy";
+  runtimeHealthy: boolean;
+  paused?: boolean;
+  starting?: boolean;
+}
+
+/// Whether the Home banner should show the diagnosis line instead of its
+/// default copy.
+///
+/// Gating this on `tone === "healthy"` alone - as the Home banner did until
+/// 2026-09-21 - made the line unreachable for precisely the installs it was
+/// written for. A connector that never saw traffic holds `connectorPhase` at
+/// "verifying", which the banner renders as tone "starting", so every
+/// never-routed install fell through to the static "send a message to verify"
+/// title and the computed diagnosis was discarded on every poll. Measured on
+/// the fleet the same day: of 51 installs running 7+ days with zero tokens
+/// saved, 4 had ever reached `proxy_verified` and 1 `first_prompt_request` -
+/// so ~47 of them could not have been shown this line.
+///
+/// The runtime gates below are what the old tone check bought implicitly: when
+/// Headroom itself is down, paused or still booting, "no request has come
+/// through" is true but "restart your terminal" is advice that cannot work -
+/// the same reasoning as `intercept_bind_failed` in the Rust nudge.
+///
+/// Deliberately NOT gated on lifetime tokens saved, which the Home banner also
+/// checked (`< 1_000_000`) until 2026-09-21. That bound belonged to the
+/// sibling "check back later" copy, which is new-install reassurance; it was
+/// never a judgement about this line. Dropping it widens exactly one case: the
+/// DRIFT body now reaches established installs. That is the case drift is for
+/// - `savingsDrifted` requires traffic flowing with literally zero savings
+/// across the whole window, so a user who has banked 5M tokens and is now
+/// saving none has a regression worth being told about, and was the one person
+/// guaranteed not to hear it.
+export function shouldShowStallBannerLine({
+  stallBannerLine,
+  tone,
+  connectorPhase,
+  runtimeHealthy,
+  paused,
+  starting,
+}: StallLineVisibility): boolean {
+  if (stallBannerLine === null) {
+    return false;
+  }
+  if (!runtimeHealthy || paused || starting) {
+    return false;
+  }
+  return tone === "healthy" || connectorPhase === "verifying";
+}
+
 /// Fire the alert at most once per local day, and never once savings exist.
 /// Returns the alert when this call consumed the day's slot (the caller should
 /// then show the modal), null when throttled or not due.
@@ -335,6 +394,15 @@ export function unroutedTitle(clients: UnroutedClient[]): string {
 }
 
 export function unroutedBody(client: UnroutedClient): string {
+  // The guard runs inside the agent and sees the route the agent actually
+  // used, so when it names a cause it beats anything inferred out here. It is
+  // also the only branch that can be right about a project-local override:
+  // "quit and reopen" cannot fix a file that will still be there on restart,
+  // and telling 434-of-436 re-applied hosts to restart is what left them
+  // unrouted for weeks.
+  if (client.diagnosis) {
+    return `${client.name} was used on this machine, but none of its requests reached Headroom. ${client.diagnosis}`;
+  }
   return client.enabled
     ? `${client.name} was used on this machine, but none of its requests reached Headroom. Its connection was just re-applied. Quit and reopen ${client.name} so it picks the settings up.`
     : `${client.name} was used on this machine, but its Headroom connection is switched off, so nothing was optimized. Turn the connection back on to resume saving.`;
