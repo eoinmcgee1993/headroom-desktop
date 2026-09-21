@@ -6400,7 +6400,17 @@ fn warn_stats_fetch_failed(reason: &str) {
     // throttle cannot reach zero. The user-visible remedy is freeing the port,
     // which the local log states in full; Sentry gains nothing from a repeat.
     // Our OWN backend answering 4xx is a real fault and still reports.
-    if !foreign_holder {
+    //
+    // Same for a backend that is not READY. RUST-86's lone post-vendor event
+    // (0.9.18-rc.1) landed 1.1s after "watchdog: proxy unreachable (failure
+    // 1/3)": /stats stalling is a SYMPTOM of a backend that answers nothing,
+    // and the watchdog already reports that episode with diagnostics this
+    // message does not have. Probing costs one 800ms request per warn window,
+    // the same budget the lsof lookup above already spends. What survives the
+    // gate is the fault worth a Sentry event: /stats stalling while the
+    // backend is demonstrably serving.
+    let backend_ready = crate::tool_manager::probe_backend_readyz_ok(crate::backend_port::get());
+    if !foreign_holder && backend_ready {
         let (secs_since_ok, requests_since_ok) =
             stats_fetch_stall_context(*STATS_FETCH_LAST_OK.lock(), total_intercept_requests());
         sentry::with_scope(
@@ -6415,8 +6425,10 @@ fn warn_stats_fetch_failed(reason: &str) {
         );
     }
     // Local only: the fingerprinted capture above is the Sentry path, and the
-    // bridged warn would double-report it under the old flat grouping.
-    log::warn!("{message}");
+    // bridged warn would double-report it under the old flat grouping. The
+    // readiness verdict rides along so a support log still says which half of
+    // the gate suppressed the event.
+    log::warn!("{message} (backend_ready={backend_ready})");
 }
 
 /// Record a successful `/stats` fetch, clearing the warn backoff only once the
@@ -6620,6 +6632,10 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
             // Same body, same pass: whether the savings this parse just turned
             // into a percentage can have come out of the input it divides by.
             crate::savings_canary::observe_basis(&body);
+            // Whether compression ran at all. `/stats` cannot answer this --
+            // the quarantine counters are Prometheus-only -- so this rides the
+            // same poll on its own throttle.
+            scrape_compression_quarantine();
             // Only a SUSTAINED recovery resets the backoff; a lone success
             // between two timeouts must not (see STATS_FETCH_RECOVERY_WINDOW).
             note_stats_fetch_success();
@@ -6630,6 +6646,46 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
 
     warn_stats_fetch_failed(last_failure.as_deref().unwrap_or("no local host answered"));
     None
+}
+
+/// How often the `/metrics` scrape behind the compression-quarantine canary
+/// runs. The counters are monotonic and the canary reports once per process,
+/// so the `/stats` cadence (12s) would buy nothing; five minutes still catches
+/// a starving backend inside one sitting. Deliberately cheap: the scrape
+/// measured 15 KB at 1.45 ms backend-side on 2026-09-21, four orders off the
+/// feed pull that caused RUST-86, but it lands on the same event loop and the
+/// lesson there was that a poll's cost is what you pay, not what you read.
+const QUARANTINE_SCRAPE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Scrape `/metrics` and let the canary decide whether compression is being
+/// starved. Silent on every failure: this is an observer, and a backend that
+/// cannot answer a scrape has louder problems already reported elsewhere.
+fn scrape_compression_quarantine() {
+    static LAST_SCRAPE: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST_SCRAPE.lock();
+        if last.is_some_and(|at: Instant| at.elapsed() < QUARANTINE_SCRAPE_INTERVAL) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return;
+    };
+    let Ok(response) = client.get("http://127.0.0.1:6767/metrics").send() else {
+        return;
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    if let Ok(body) = response.text() {
+        crate::savings_canary::observe_quarantine(&body);
+    }
 }
 
 fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {

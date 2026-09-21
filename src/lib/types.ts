@@ -279,6 +279,10 @@ export interface UnroutedClient {
   enabled: boolean;
   reapplied: boolean;
   activeAt: string;
+  /** What the session-start guard saw from inside the agent's own process.
+   *  Present only when it names a cause the app cannot see from its own
+   *  config files, such as a project-local override. */
+  diagnosis?: string | null;
 }
 
 export interface RuntimeStatus {
@@ -679,11 +683,17 @@ export interface PricingCohort {
   spotsLeft?: number | null;
 }
 
-/// Slack-style intro offer surfaced by headroom-web: percentOff for the first
-/// durationMonths months on every plan.
+/// Slack-style intro offer surfaced by headroom-web. The two billing periods
+/// carry DIFFERENT discounts and are quoted in different units:
+///   monthly - `percentOff` off the first `durationMonths` months.
+///   annual  - `annualPercentOff` off the first yearly invoice, one time.
+/// `annualPercentOff` is absent on servers older than 2026-09; callers derive
+/// it as percentOff * durationMonths / 12, which is what that single percent
+/// always meant on a yearly invoice.
 export interface IntroOffer {
   active: boolean;
   percentOff: number;
+  annualPercentOff?: number;
   durationMonths: number;
 }
 

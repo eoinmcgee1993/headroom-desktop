@@ -5142,6 +5142,22 @@ ADDR = ("127.0.0.1", 6767)
 # app restart doesn't produce a storm of alerts.
 DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
 DEBOUNCE_SECONDS = 600
+# The app cannot see what this script can: it only knows the config files it
+# wrote itself, which always verify. Leave the verdict where the app can read
+# it, or the real cause never leaves this process. See `read_guard_verdict`.
+VERDICT_PATH = pathlib.Path(__file__).with_name(".headroom-guard-verdict.json")
+
+
+def record_verdict(issues):
+    # Written on every run, including the healthy one: "guard ran, route was
+    # fine" and "guard never ran" are different facts and the app needs both.
+    try:
+        payload = json.dumps({{"at": int(time.time()), "issues": issues}})
+        tmp = VERDICT_PATH.with_suffix(".tmp")
+        tmp.write_text(payload)
+        os.replace(str(tmp), str(VERDICT_PATH))
+    except Exception:
+        pass
 
 
 def notify(message):
@@ -5240,6 +5256,7 @@ def main():
     if not reachable():
         issues.append("Headroom Desktop isn't running; open it to optimize Codex")
 
+    record_verdict(issues)
     # Never block (exit 2): Codex is the user's own OpenAI account and must keep
     # working whether or not Headroom is active. Surface issues as a once-per-
     # session notification so a genuinely broken route is visible, without
@@ -5493,6 +5510,42 @@ fn remove_codex_guard_hook() -> Result<()> {
 
 const CLAUDE_GUARD_STATUS_MESSAGE: &str = "Verifying Headroom route";
 
+/// What the session-start guard saw from INSIDE the agent's own process, the
+/// last time it ran.
+///
+/// This is the only honest view of the route. The app can verify the files it
+/// wrote (`~/.claude/settings.json`, `~/.codex/config.toml`) and they always
+/// pass, because it wrote them - which is why `detect_unrouted_clients`
+/// re-applies a setup that was never wrong and reports `reapplied=true` while
+/// nothing changes (434 of 436 such re-applies on the fleet over 30 days, with
+/// hosts recurring across days). The break is elsewhere: a project-local
+/// `.claude/settings.json` at a higher precedence, or a session env pointing
+/// somewhere else. Only the guard, inheriting the agent's environment, can see
+/// those - and until now it wrote its verdict to stderr and dropped it.
+pub fn read_guard_verdict(client_id: &str) -> Option<Vec<String>> {
+    let path = match client_id {
+        "codex" => codex_guard_hook_path(),
+        _ => claude_guard_hook_path(),
+    }
+    .with_file_name(".headroom-guard-verdict.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    // A verdict older than a day describes a session that has since ended; the
+    // unrouted check it feeds is itself defined over a 24h window.
+    let at = parsed.get("at")?.as_i64()?;
+    if chrono::Utc::now().timestamp() - at > 24 * 3600 {
+        return None;
+    }
+    Some(
+        parsed
+            .get("issues")?
+            .as_array()?
+            .iter()
+            .filter_map(|issue| issue.as_str().map(str::to_owned))
+            .collect(),
+    )
+}
+
 fn claude_guard_hook_path() -> PathBuf {
     home_dir()
         .join(".claude")
@@ -5531,6 +5584,22 @@ ADDR = ("127.0.0.1", 6767)
 # app restart doesn't produce a storm of alerts.
 DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
 DEBOUNCE_SECONDS = 600
+# The app cannot see what this script can: it only knows the config files it
+# wrote itself, which always verify. Leave the verdict where the app can read
+# it, or the real cause never leaves this process. See `read_guard_verdict`.
+VERDICT_PATH = pathlib.Path(__file__).with_name(".headroom-guard-verdict.json")
+
+
+def record_verdict(issues):
+    # Written on every run, including the healthy one: "guard ran, route was
+    # fine" and "guard never ran" are different facts and the app needs both.
+    try:
+        payload = json.dumps({{"at": int(time.time()), "issues": issues}})
+        tmp = VERDICT_PATH.with_suffix(".tmp")
+        tmp.write_text(payload)
+        os.replace(str(tmp), str(VERDICT_PATH))
+    except Exception:
+        pass
 
 
 def notify(message):
@@ -5622,6 +5691,7 @@ def main():
     if not reachable():
         issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- it may be restarting; open the app if it isn't")
 
+    record_verdict(issues)
     if issues:
         notify("; ".join(issues))
         sys.stderr.write("Headroom Claude guard failed:\n")
@@ -11356,6 +11426,73 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(toml.contains("requires_openai_auth = true"), "got:\n{toml}");
         // Five-minute throttle: a retry loop of 401s must not churn the file.
         assert!(!super::repair_codex_missing_bearer());
+    }
+
+    /// The guards are Python built through `format!`, so a single unescaped
+    /// brace yields a script that parses fine as Rust and then dies at
+    /// runtime inside the user's agent, where nobody sees it.
+    #[test]
+    fn guard_scripts_emit_the_verdict_write_with_real_braces() {
+        for script in [
+            super::build_claude_guard_script(),
+            super::build_codex_guard_script(),
+        ] {
+            assert!(
+                script.contains("record_verdict(issues)"),
+                "verdict recorded"
+            );
+            // format! collapses {{ to {: the emitted dict must be real Python.
+            assert!(
+                script.contains(r#"json.dumps({"at": int(time.time()), "issues": issues})"#),
+                "escaping collapsed to a literal dict, got:\n{script}"
+            );
+            assert!(
+                !script.contains("{{"),
+                "unescaped brace survived into output"
+            );
+        }
+    }
+
+    /// The whole point of the verdict file: a cause the app CANNOT see from
+    /// its own config files still reaches it. Without this the app re-applies
+    /// a correct config, reports success, and tells the user to restart.
+    #[test]
+    #[serial_test::serial]
+    fn guard_verdict_carries_a_cause_the_app_cannot_see() {
+        let home = TestHome::new();
+        let hooks = home.path().join(".claude").join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let verdict = hooks.join(".headroom-guard-verdict.json");
+
+        assert_eq!(
+            super::read_guard_verdict("claude_code"),
+            None,
+            "no file yet"
+        );
+
+        let fresh = chrono::Utc::now().timestamp();
+        fs::write(
+            &verdict,
+            format!(r#"{{"at": {fresh}, "issues": ["project-local override"]}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_guard_verdict("claude_code"),
+            Some(vec!["project-local override".to_string()])
+        );
+
+        // A healthy run records an empty list, which must stay distinct from
+        // "the guard never ran" - the caller filters on emptiness.
+        fs::write(&verdict, format!(r#"{{"at": {fresh}, "issues": []}}"#)).unwrap();
+        assert_eq!(super::read_guard_verdict("claude_code"), Some(Vec::new()));
+
+        // Yesterday's verdict describes a session that has since ended.
+        let stale = fresh - 25 * 3600;
+        fs::write(&verdict, format!(r#"{{"at": {stale}, "issues": ["old"]}}"#)).unwrap();
+        assert_eq!(super::read_guard_verdict("claude_code"), None, "stale");
+
+        fs::write(&verdict, "not json").unwrap();
+        assert_eq!(super::read_guard_verdict("claude_code"), None, "garbage");
     }
 
     #[test]

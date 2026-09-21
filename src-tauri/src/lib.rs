@@ -1039,9 +1039,15 @@ where
 {
     let update = {
         let mut pending = pending_update.lock();
-        pending
-            .take()
-            .ok_or_else(|| "No downloaded update is ready to install.".to_string())?
+        // `install` consumes the update handle, so a FAILED install empties the
+        // slot too (RUST-HA's read-only mount failed seven times, and the eighth
+        // click landed here). The remedy is a fresh check, so say that instead of
+        // "nothing is ready", which reads as a bug to the user staring at a
+        // "Restart to update" affordance.
+        pending.take().ok_or_else(|| {
+            "The downloaded update is no longer staged. Check for updates again, then retry."
+                .to_string()
+        })?
     };
 
     // The window hides 150ms after losing focus, and a .deb install raises a
@@ -5233,6 +5239,12 @@ struct UnroutedClient {
     /// it up. Only ever true when `enabled`.
     reapplied: bool,
     active_at: String,
+    /// What the session-start guard saw from inside the agent's own process,
+    /// when it names a cause the app cannot see from its own config files (a
+    /// project-local override, a session env pointing elsewhere). None when
+    /// the guard has not run recently or found nothing - then the generic
+    /// restart advice is still the best we have.
+    diagnosis: Option<String>,
 }
 
 /// Agents that ran on this machine while Headroom, up the whole time, saw
@@ -5321,6 +5333,11 @@ async fn detect_unrouted_clients(
                 _ => client_adapters::is_claude_code_enabled(),
             };
             let reapplied = enabled && client_adapters::apply_client_setup(client_id).is_ok();
+            // Re-applying our own config is only a fix when our own config was
+            // the problem. Ask the guard what the agent actually saw.
+            let diagnosis = client_adapters::read_guard_verdict(client_id)
+                .filter(|issues| !issues.is_empty())
+                .map(|issues| issues.join("; "));
             let active_at: chrono::DateTime<chrono::Utc> = activity.unwrap_or(now).into();
             log::info!(
                 "unrouted client {client_id}: active locally at {active_at}, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
@@ -5337,6 +5354,13 @@ async fn detect_unrouted_clients(
                     scope.set_tag("enabled", enabled);
                     scope.set_tag("reapplied", reapplied);
                     scope.set_extra("active_at", active_at.to_rfc3339().into());
+                    // Turns a blind fleet signal into a diagnosed one: without
+                    // this every event says only "ran unrouted", which is the
+                    // symptom we already knew.
+                    scope.set_tag("diagnosed", diagnosis.is_some());
+                    if let Some(diagnosis) = diagnosis.as_deref() {
+                        scope.set_extra("guard_diagnosis", diagnosis.into());
+                    }
                     scope.set_fingerprint(Some(&["unrouted_client", client_id]));
                 },
                 || {
@@ -5359,6 +5383,7 @@ async fn detect_unrouted_clients(
                 enabled,
                 reapplied,
                 active_at: active_at.to_rfc3339(),
+                diagnosis,
             });
         }
         found
@@ -10544,7 +10569,10 @@ mod tests {
             ))
             .expect_err("missing update should fail");
 
-        assert_eq!(error, "No downloaded update is ready to install.");
+        assert_eq!(
+            error,
+            "The downloaded update is no longer staged. Check for updates again, then retry."
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@ import {
   maybeFireSetupStallAlert,
   setupStallBannerLine,
   setupStallNoTrafficMinutes,
+  shouldShowStallBannerLine,
+  unroutedBody,
   SETUP_STALL_NO_SAVINGS_AFTER_MS,
   SETUP_STALL_NO_SAVINGS_MIN_REQUESTS,
   SETUP_STALL_NO_TRAFFIC_AFTER_MS,
@@ -535,5 +537,79 @@ describe("drift branch", () => {
       dailySavings: [driftDay(1, { estimatedTokensSaved: 500 }), driftDay(0)],
     });
     expect(setupStallBannerLine(dashboard, PAST_WINDOW)).toBeNull();
+  });
+});
+
+describe("shouldShowStallBannerLine", () => {
+  // The state every never-routed install is actually in: runtime fine, a
+  // connector enabled, and connectorPhase pinned at "verifying" because the
+  // request count never climbs. The Home banner renders that as tone
+  // "starting", which is why a healthy-only gate hid the line forever.
+  const verifying = {
+    stallBannerLine: "No request has come through Headroom yet.",
+    tone: "starting",
+    connectorPhase: "verifying" as const,
+    runtimeHealthy: true,
+  };
+
+  it("shows the diagnosis on an install stuck verifying", () => {
+    expect(shouldShowStallBannerLine(verifying)).toBe(true);
+  });
+
+  it("shows the diagnosis on a healthy install that never saved", () => {
+    expect(
+      shouldShowStallBannerLine({ ...verifying, tone: "healthy", connectorPhase: "healthy" })
+    ).toBe(true);
+  });
+
+  it("stays quiet when there is no line to show", () => {
+    expect(shouldShowStallBannerLine({ ...verifying, stallBannerLine: null })).toBe(false);
+  });
+
+  // "Restart your terminal" is advice that cannot work while Headroom itself
+  // is down, paused or still booting - those banners own the moment instead.
+  it("stays quiet while Headroom itself is the problem", () => {
+    expect(shouldShowStallBannerLine({ ...verifying, runtimeHealthy: false })).toBe(false);
+    expect(shouldShowStallBannerLine({ ...verifying, paused: true })).toBe(false);
+    expect(shouldShowStallBannerLine({ ...verifying, starting: true })).toBe(false);
+  });
+
+  it("stays quiet behind an account gate, which owns the banner", () => {
+    expect(
+      shouldShowStallBannerLine({ ...verifying, tone: "disabled", connectorPhase: "disabled" })
+    ).toBe(false);
+    expect(
+      shouldShowStallBannerLine({ ...verifying, tone: "degraded", connectorPhase: "disabled" })
+    ).toBe(false);
+  });
+});
+
+describe("unroutedBody", () => {
+  const base = { clientId: "claude_code", name: "Claude Code", activeAt: "2026-09-21T13:07:33Z" };
+
+  it("leads with the guard's verdict when it has one", () => {
+    const body = unroutedBody({
+      ...base,
+      enabled: true,
+      reapplied: true,
+      diagnosis:
+        "ANTHROPIC_BASE_URL -- /repo/.claude/settings.json sets it to http://other, which overrides Headroom's route.",
+    });
+    expect(body).toContain("/repo/.claude/settings.json");
+    // The restart advice is wrong here: the file is still there after a restart.
+    expect(body).not.toContain("Quit and reopen");
+  });
+
+  it("falls back to the restart ask when the guard saw nothing", () => {
+    expect(unroutedBody({ ...base, enabled: true, reapplied: true })).toContain("Quit and reopen");
+    expect(unroutedBody({ ...base, enabled: true, reapplied: true, diagnosis: null })).toContain(
+      "Quit and reopen"
+    );
+  });
+
+  it("asks a switched-off connector to be turned back on", () => {
+    expect(unroutedBody({ ...base, enabled: false, reapplied: false })).toContain(
+      "Turn the connection back on"
+    );
   });
 });

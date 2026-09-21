@@ -133,19 +133,73 @@ export function getPlanRenewalPriceLabel(
   return `${formatCents(projectPerMonthCents(toTier, billingPeriod, options))} / month`;
 }
 
-/// The intro percent while the offer runs, else 0. Both billing periods show
-/// the straight percent off the period's sticker price; on annual the charge
-/// still works out identically (6 half-price + 6 full months per invoice).
-export function introPercentOff(introOffer: IntroOffer | null | undefined): number {
-  if (!introOffer?.active || introOffer.percentOff <= 0) return 0;
-  return introOffer.percentOff;
+/// The intro percent for a billing period while the offer runs, else 0. The
+/// periods carry different discounts: monthly is a repeating percent off the
+/// first `durationMonths` months, annual is a one-off percent off the yearly
+/// invoice. Servers older than 2026-09 send only `percentOff`, so annual falls
+/// back to it.
+export function introPercentOff(
+  introOffer: IntroOffer | null | undefined,
+  billingPeriod: BillingPeriod = "monthly"
+): number {
+  if (!introOffer?.active) return 0;
+  if (billingPeriod !== "annual") {
+    return introOffer.percentOff > 0 ? introOffer.percentOff : 0;
+  }
+  // Old servers send one percent meaning "off the first N months", which on a
+  // yearly invoice was always N/12ths of that percent - 50% off 3 of 12 months
+  // is 12.5% off the invoice. Falling back to the raw percent would quote a
+  // year at half price and undercharge by the difference.
+  const annual =
+    introOffer.annualPercentOff ??
+    (introOffer.percentOff * (introOffer.durationMonths ?? 0)) / 12;
+  return annual > 0 ? annual : 0;
 }
 
-/// Sale-badge copy for the intro offer, or null when it is not running.
-export function introSaleBadgeLabel(introOffer: IntroOffer | null | undefined): string | null {
-  const pct = introPercentOff(introOffer);
+/// Sale-badge copy for the intro offer, or null when it is not running. Annual
+/// names the year rather than a month count, because its discount is one
+/// invoice and not a rate that expires partway through.
+export function introSaleBadgeLabel(
+  introOffer: IntroOffer | null | undefined,
+  billingPeriod: BillingPeriod = "monthly"
+): string | null {
+  const pct = introPercentOff(introOffer, billingPeriod);
   if (pct <= 0 || !introOffer) return null;
-  return `${pct}% off first ${introOffer.durationMonths} months`;
+  return billingPeriod === "annual"
+    ? `${pct}% off your first year`
+    : `${pct}% off first ${introOffer.durationMonths} months`;
+}
+
+/// What a new subscriber pays over their first twelve months, in cents, given
+/// a period's per-month sticker price. Mirrors Pricing::IntroOffer#first_year_cents
+/// on the server so the app and the website cannot quote different totals.
+export function introFirstYearCents(
+  perMonthCents: number,
+  billingPeriod: BillingPeriod,
+  introOffer: IntroOffer | null | undefined
+): number {
+  const pct = introPercentOff(introOffer, billingPeriod);
+  if (billingPeriod === "annual") {
+    return Math.round((perMonthCents * 12 * (100 - pct)) / 100);
+  }
+  const months = introOffer?.durationMonths ?? 0;
+  const discounted = (perMonthCents * (100 - pct)) / 100;
+  return Math.round(discounted * months + perMonthCents * (12 - months));
+}
+
+/// What picking annual saves over paying monthly for a year, in cents. Positive
+/// whenever annual is the better deal, which it must be on every tier - a
+/// monthly tab that looks cheaper than annual is what emptied the annual plan
+/// between 2026-08 and 2026-09.
+export function annualFirstYearSavingCents(
+  annualPerMonthCents: number,
+  monthlyPerMonthCents: number,
+  introOffer: IntroOffer | null | undefined
+): number {
+  return (
+    introFirstYearCents(monthlyPerMonthCents, "monthly", introOffer) -
+    introFirstYearCents(annualPerMonthCents, "annual", introOffer)
+  );
 }
 
 /// Average daily savings over the trailing `days` window (default 7), used to
@@ -523,7 +577,7 @@ export function getUpgradePlans(
       // still signal launchDiscountActive.
       const accountDiscountPct = activePurchaseInfo?.discountPct ?? 0;
       const newCheckout = !hasActiveHeadroomSubscription;
-      const introPct = newCheckout ? introPercentOff(introOffer) : 0;
+      const introPct = newCheckout ? introPercentOff(introOffer, billingPeriod) : 0;
       const legacyPct = newCheckout && launchDiscountActive
         ? (activePercentOff > 0 ? activePercentOff : 50)
         : 0;
@@ -565,8 +619,24 @@ export function getUpgradePlans(
         billingLines: ["USD / month", billingLabel],
         // Full-width line under the price so "$10/mo billed annually" can't
         // be misread as the full-year rate; the badge names the duration.
+        // Annual's discount is one invoice, not a rate that expires partway
+        // through, so "then $X/mo after 3 months" would be plainly wrong there.
+        // It gets the year total and the saving instead - the two numbers that
+        // actually decide annual against the monthly tab sitting next to it.
         ...(showDiscount && introPct > 0 && introOffer
-          ? { reversionLine: `then ${prices.full}/mo after ${introOffer.durationMonths} months` }
+          ? {
+              reversionLine:
+                billingPeriod === "annual"
+                  ? `${formatCents(introFirstYearCents(prices.fullCents, "annual", introOffer))} for your first year, ` +
+                    `${formatCents(
+                      annualFirstYearSavingCents(
+                        prices.fullCents,
+                        planPrice(id, "monthly").fullCents,
+                        introOffer
+                      )
+                    )} less than monthly`
+                  : `then ${prices.full}/mo after ${introOffer.durationMonths} months`
+            }
           : {}),
         featureIntro,
         features,
