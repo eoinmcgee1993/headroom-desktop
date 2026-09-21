@@ -9358,7 +9358,7 @@ fn compact_duration(duration: Duration) -> String {
     }
 }
 
-fn compact_token_count(tokens: u64) -> String {
+pub(crate) fn compact_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
     } else if tokens >= 1_000 {

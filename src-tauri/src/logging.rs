@@ -559,8 +559,38 @@ pub(crate) fn scrub_home(msg: &str) -> String {
 /// failure (RUST-7R) correctly suppresses, carrying an unscrubbed
 /// `/Users/<name>/...` path. Only the target-agnostic rule is applied here -
 /// the target-scoped ones need a `Record` that a direct capture does not have.
+/// Signed-in Headroom account, stamped onto every outgoing event by
+/// [`sanitize_event`]. Process-wide on purpose: `sentry::configure_scope` only
+/// touches the calling thread's hub (each thread snapshots the global scope
+/// on first use), so a user set from the `pricing-loop` thread never reached
+/// the intercept, watchdog, or log-bridge captures. Measured 2026-09-21: 4%
+/// of events carried `user.email`, which made support lookups by email blind.
+static SENTRY_USER: std::sync::RwLock<Option<(String, String)>> = std::sync::RwLock::new(None);
+
+/// Set (or clear) the account every later event is attributed to. `tier` is
+/// added as the `headroom.tier` tag so issues can be filtered by plan.
+pub(crate) fn set_sentry_user(email: Option<String>, tier: Option<String>) {
+    *SENTRY_USER.write().unwrap_or_else(|e| e.into_inner()) =
+        email.map(|email| (email, tier.unwrap_or_else(|| "none".into())));
+}
+
+fn attach_sentry_user(event: &mut sentry::protocol::Event<'static>) {
+    let guard = SENTRY_USER.read().unwrap_or_else(|e| e.into_inner());
+    let Some((email, tier)) = guard.as_ref() else {
+        return;
+    };
+    let user = event.user.get_or_insert_with(Default::default);
+    if user.email.is_none() {
+        user.email = Some(email.clone());
+    }
+    event
+        .tags
+        .entry("headroom.tier".into())
+        .or_insert_with(|| tier.clone());
+}
+
 pub(crate) fn sanitize_event(
-    event: sentry::protocol::Event<'static>,
+    mut event: sentry::protocol::Event<'static>,
 ) -> Option<sentry::protocol::Event<'static>> {
     let environmental = event.message.as_deref().is_some_and(is_unreportable)
         || event
@@ -576,6 +606,7 @@ pub(crate) fn sanitize_event(
     if environmental {
         return None;
     }
+    attach_sentry_user(&mut event);
     Some(scrub_event(event))
 }
 
@@ -1475,6 +1506,32 @@ mod tests {
         let chain = serde_json::to_string(&scrubbed.extra["error_chain"]).unwrap();
         assert!(!chain.contains(&home), "home leaked in extras: {chain}");
         assert!(chain.contains("no such file: ~/y"), "{chain}");
+    }
+
+    #[test]
+    fn sanitize_event_attaches_the_process_wide_user_to_any_thread_capture() {
+        super::set_sentry_user(Some("jeremy@example.com".into()), Some("Max5x".into()));
+        let mut event = sentry::protocol::Event::new();
+        event.message = Some("codex upstream error 401 on /v1/responses".into());
+        // Captured from a thread that never touched the Sentry scope.
+        let sent = std::thread::spawn(move || super::sanitize_event(event).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(
+            sent.user.unwrap().email.as_deref(),
+            Some("jeremy@example.com")
+        );
+        assert_eq!(
+            sent.tags.get("headroom.tier").map(String::as_str),
+            Some("Max5x")
+        );
+
+        super::set_sentry_user(None, None);
+        let mut event = sentry::protocol::Event::new();
+        event.message = Some("signed out".into());
+        let sent = super::sanitize_event(event).unwrap();
+        assert!(sent.user.is_none());
+        assert!(!sent.tags.contains_key("headroom.tier"));
     }
 
     #[test]

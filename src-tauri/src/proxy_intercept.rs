@@ -2079,6 +2079,17 @@ fn report_upstream_error(
     if status == 401 && !is_missing_auth_error(&body) {
         return;
     }
+    // Codex sent no bearer: the flagless provider block. Repair it now (own
+    // thread: this runs on the forwarding task) rather than within the hour;
+    // the user is failing every prompt until it lands. Before the Sentry
+    // throttle so a retry storm still gets exactly one repair per interval.
+    if status == 401 && client == "codex" {
+        std::thread::spawn(|| {
+            if crate::client_adapters::repair_codex_missing_bearer() {
+                log::info!("codex missing-bearer 401: provider block repaired");
+            }
+        });
+    }
     // After the drop filters, so a discarded class never claims the slot of a
     // reportable one; before the capture, so a retry loop costs one event per
     // interval instead of one per request (RUST-BT).
@@ -2185,11 +2196,16 @@ fn codex_error_summary(body: &[u8]) -> String {
             // two months. Describe the shape instead, so the next one is a
             // lead rather than another tally mark.
             if kind.is_none() && code.is_none() && param.is_none() {
-                return format!(
+                let mut summary = format!(
                     "no structural error fields; shape={} ({} bytes)",
                     codex_error_body_shape(&json),
                     body.len()
                 );
+                if let Some(detail) = safe_detail_text(&json) {
+                    summary.push_str(" detail=");
+                    summary.push_str(&detail);
+                }
+                return summary;
             }
             format!(
                 "type={} code={} param={}",
@@ -2201,6 +2217,26 @@ fn codex_error_summary(body: &[u8]) -> String {
         // Truncated (peek is bounded) or non-JSON body — report size only.
         Err(_) => format!("unparseable error body ({} bytes)", body.len()),
     }
+}
+
+/// chatgpt.com's Codex backend answers 400 as `{"detail": "<sentence>"}` and
+/// nothing else, so the shape alone ("object{detail}", RUST-4V: 23 hosts in
+/// the week of 2026-09-14) never says what was wrong. Keep the sentence when it
+/// is plainly a server-generated one: short, printable ASCII, and free of the
+/// quote/bracket characters an echoed request fragment would carry. Anything
+/// else is dropped, so the "no free text to Sentry" rule bends only for a
+/// bounded, structure-free string.
+fn safe_detail_text(json: &serde_json::Value) -> Option<String> {
+    const MAX_LEN: usize = 120;
+    let detail = json.get("detail")?.as_str()?.trim();
+    let plain = !detail.is_empty()
+        && detail.len() <= MAX_LEN
+        && detail.chars().all(|c| {
+            c.is_ascii_graphic()
+                && !matches!(c, '"' | '\'' | '{' | '}' | '[' | ']' | '<' | '>' | '\\')
+                || c == ' '
+        });
+    plain.then(|| detail.to_string())
 }
 
 /// Content-free descriptor of an error body's JSON shape.
@@ -5690,8 +5726,16 @@ mod tests {
         let summary = codex_error_summary(br#"{"detail":"nope","status":400}"#);
         assert_eq!(
             summary,
-            "no structural error fields; shape=object{detail,status} (30 bytes)"
+            "no structural error fields; shape=object{detail,status} (30 bytes) detail=nope"
         );
+        // A detail that could be echoing request content (quotes, brackets,
+        // too long) is dropped; the shape still reports.
+        assert_eq!(
+            codex_error_summary(br#"{"detail":"bad input: {\"x\": 1}"}"#),
+            "no structural error fields; shape=object{detail} (34 bytes)"
+        );
+        let long = format!(r#"{{"detail":"{}"}}"#, "a".repeat(121));
+        assert!(!codex_error_summary(long.as_bytes()).contains("detail="));
         // `{"error": "..."}` — error present but a string, so no fields resolve.
         assert_eq!(
             codex_error_summary(br#"{"error":"boom"}"#),

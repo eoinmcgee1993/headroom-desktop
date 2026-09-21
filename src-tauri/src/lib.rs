@@ -518,9 +518,12 @@ fn onboarding_recovery_copy(any_connector_enabled: bool) -> (&'static str, &'sta
 /// its pre-Headroom environment) — the condition the generic nudge can only
 /// guess at from a timer. Reports the `unrouted_usage_detected` funnel step
 /// independently of the notification's once-per-install gate, so the fleet
-/// count measures the leak, not the nag budget.
-/// ponytail: reads Claude Code sessions only; Codex/OpenCode usage is
-/// invisible to it until their session paths are taught here.
+/// count measures the leak, not the nag budget. Also reports
+/// `agent_activity_absent` for the opposite case — a finished install with no
+/// traffic AND no agent running — which is the larger, previously silent bucket.
+/// ponytail: sees Claude Code and Codex only, so `agent_activity_absent` means
+/// "absent among the agents we can see"; OpenCode and friends stay invisible
+/// until their session paths are taught here, and would read as absent today.
 fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard: &DashboardState) {
     static FIRST_POLLED_AT: std::sync::OnceLock<chrono::DateTime<Utc>> = std::sync::OnceLock::new();
     let since = *FIRST_POLLED_AT.get_or_init(Utc::now);
@@ -551,6 +554,23 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     // most once a minute, not on every 5s poll.
     let codex = codex_ran_locally_since(since);
     if !claude && !codex {
+        // Nothing visible anywhere: no proxied request, and no agent session
+        // growing either. Age-matched cohorts (2026-08-11..09-07) put Windows
+        // at 46% reaching `first_prompt_request` against macOS's 73%, while
+        // `unrouted_usage_detected` fires for only 10% of Windows installs --
+        // so most of the loss lands in this branch and used to leave silently.
+        // The beacon cannot say WHY, but paired with
+        // `client_setup_no_clients_detected` it separates "never had an agent"
+        // from "has one we cannot see", which is the fork worth knowing.
+        // Absence needs a longer settle than the positive case above: three
+        // minutes of uptime only proves the user has not opened their editor
+        // yet. Fires once per process, like the two beacons below.
+        static ABSENT_BEACON_SENT: AtomicBool = AtomicBool::new(false);
+        if Utc::now() - since >= chrono::Duration::minutes(45)
+            && !ABSENT_BEACON_SENT.swap(true, Ordering::AcqRel)
+        {
+            pricing::report_funnel_step(state, "agent_activity_absent");
+        }
         return;
     }
     // One beacon per agent: Codex users save at 55-66% against ~90% for
@@ -737,7 +757,25 @@ fn get_debug_overrides() -> DebugOverrides {
     DebugOverrides {
         setup_stall: fake_override("HEADROOM_FAKE_SETUP_STALL")
             .filter(|mode| mode == "no_traffic" || mode == "no_savings" || mode == "drift"),
+        live_savings_pulse: live_savings_pulse_enabled(),
     }
+}
+
+/// Live savings pulse: the tray icon blips and the home chart shows a live
+/// token counter each time today's saved-token total rises. Driven by the
+/// same 20s dashboard sample as the tray dollar badge, so it never fires on
+/// traffic that saved nothing. RC-only while it soaks (user request 2026-09-21,
+/// stable stays silent until tested); HEADROOM_LIVE_SAVINGS_PULSE=0 turns it
+/// off on an RC for A/B testing.
+fn live_savings_pulse_enabled_from(version: &str, env: Option<&str>) -> bool {
+    version.contains("-rc") && env.map(str::trim) != Some("0")
+}
+
+fn live_savings_pulse_enabled() -> bool {
+    live_savings_pulse_enabled_from(
+        env!("CARGO_PKG_VERSION"),
+        std::env::var("HEADROOM_LIVE_SAVINGS_PULSE").ok().as_deref(),
+    )
 }
 
 /// Test affordance (opt-in via env, works in release/RC builds): when
@@ -3881,6 +3919,9 @@ pub struct DebugOverrides {
     /// setup-stall alert to fire immediately, ignoring uptime, savings,
     /// connector state, the account gate and the once-per-day throttle.
     pub setup_stall: Option<String>,
+    /// True on RC builds (unless HEADROOM_LIVE_SAVINGS_PULSE=0): the home
+    /// chart renders the live saved-tokens chip. See `live_savings_pulse_enabled`.
+    pub live_savings_pulse: bool,
 }
 
 /// Cached launch flags. On a cold cache, performs one bounded config fetch so
@@ -6135,7 +6176,7 @@ pub fn run() {
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
             ));
-            app.manage(TraySessionSavings(Mutex::new(0.0)));
+            app.manage(TraySessionSavings(Mutex::new(TraySavingsToday::default())));
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
             spawn_tray_savings_updater(app.handle().clone());
@@ -8205,6 +8246,13 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
         let mut frame_index = 0usize;
         let mut last_non_booting: Option<TrayRuntimeVisual> = None;
         let mut last_displayed_dollars: Option<u32> = None;
+        // Live savings pulse (RC-only): tokens seen at the previous tick, the
+        // countdown of accent-tinted frames still to draw, and whether the
+        // last tick drew one (so the next tick restores the plain icon fast).
+        let pulse_enabled = live_savings_pulse_enabled();
+        let mut last_seen_tokens: Option<u64> = None;
+        let mut pulse_frames_left: usize = 0;
+        let mut pulse_drawn_last_tick = false;
         let mut last_tooltip: Option<String> = None;
         let mut last_pause_label: Option<&str> = None;
         let mut unhealthy_streak: u8 = 0;
@@ -8278,19 +8326,28 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                 debounced_tray_runtime_visual(raw_visual, last_non_booting, &mut unhealthy_streak);
 
             if let Some(tray) = app.tray_by_id("headroom-tray") {
-                let tooltip = match visual {
-                    TrayRuntimeVisual::Booting => "Headroom — starting",
-                    TrayRuntimeVisual::Running => "Headroom — active",
+                let today = {
+                    let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
+                    let today = *savings_state.0.lock();
+                    today
+                };
+                let tooltip: String = match visual {
+                    TrayRuntimeVisual::Booting => "Headroom — starting".into(),
+                    TrayRuntimeVisual::Running if pulse_enabled => format!(
+                        "Headroom — active, {} tokens saved today",
+                        tool_manager::compact_token_count(today.tokens)
+                    ),
+                    TrayRuntimeVisual::Running => "Headroom — active".into(),
                     TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code or ChatGPT running normally)"
+                        "Headroom — paused (Claude Code or ChatGPT running normally)".into()
                     }
                     TrayRuntimeVisual::Unhealthy => {
-                        "Headroom — proxy unreachable, attempting restart"
+                        "Headroom — proxy unreachable, attempting restart".into()
                     }
                     TrayRuntimeVisual::Disconnected => {
-                        "Headroom — Claude Code or ChatGPT not connected"
+                        "Headroom — Claude Code or ChatGPT not connected".into()
                     }
-                    TrayRuntimeVisual::Off => "Headroom — off",
+                    TrayRuntimeVisual::Off => "Headroom — off".into(),
                 };
 
                 let pause_label = if visual == TrayRuntimeVisual::Paused {
@@ -8317,19 +8374,37 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     }
                     TrayRuntimeVisual::Running => {
                         let dollars = {
-                            let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
-                            let v = *savings_state.0.lock();
-                            let d = v.floor() as u32;
+                            let d = today.usd.floor() as u32;
                             #[cfg(debug_assertions)]
                             let d = d.max(1);
                             d
                         };
+                        // Blip only when saved tokens actually rose since the
+                        // last tick: a request that saved nothing stays silent.
+                        if pulse_enabled && last_seen_tokens.is_some_and(|t| today.tokens > t) {
+                            pulse_frames_left = TRAY_PULSE_FRAMES.len();
+                        }
+                        last_seen_tokens = Some(today.tokens);
+                        let pulse = if pulse_frames_left > 0 {
+                            pulse_frames_left -= 1;
+                            Some(TRAY_PULSE_FRAMES[pulse_frames_left])
+                        } else {
+                            None
+                        };
                         let changed_visual = last_non_booting != Some(TrayRuntimeVisual::Running);
                         let changed_dollars = last_displayed_dollars != Some(dollars);
-                        if changed_visual || changed_dollars {
+                        if changed_visual
+                            || changed_dollars
+                            || pulse.is_some()
+                            || pulse_drawn_last_tick
+                        {
                             let (bw, bh) = icons.running_dims;
+                            let base = match pulse {
+                                Some(strength) => tint_toward_accent(&icons.running_rgba, strength),
+                                None => icons.running_rgba.clone(),
+                            };
                             let (new_rgba, new_w, new_h) =
-                                build_running_with_savings(&icons.running_rgba, bw, bh, dollars);
+                                build_running_with_savings(&base, bw, bh, dollars);
                             let _ = tray.set_icon(Some(tauri::image::Image::new_owned(
                                 new_rgba, new_w, new_h,
                             )));
@@ -8337,6 +8412,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             last_non_booting = Some(TrayRuntimeVisual::Running);
                             last_displayed_dollars = Some(dollars);
                         }
+                        pulse_drawn_last_tick = pulse.is_some();
                     }
                     TrayRuntimeVisual::Off => {
                         if last_non_booting != Some(TrayRuntimeVisual::Off) {
@@ -8383,10 +8459,10 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
 
                 // set_icon clobbers the tooltip on macOS, so re-apply whenever
                 // we just swapped the icon — not only on tooltip text change.
-                let tooltip_changed = last_tooltip.as_deref() != Some(tooltip);
+                let tooltip_changed = last_tooltip.as_deref() != Some(tooltip.as_str());
                 if icon_changed || tooltip_changed {
-                    match tray.set_tooltip(Some(tooltip)) {
-                        Ok(()) => last_tooltip = Some(tooltip.to_string()),
+                    match tray.set_tooltip(Some(tooltip.as_str())) {
+                        Ok(()) => last_tooltip = Some(tooltip.clone()),
                         // Windows returns E_FAIL (0x80004005) while the
                         // notification area is busy -- explorer restarting, or
                         // a shell extension holding it. Caching the tooltip
@@ -8404,10 +8480,15 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
             // Only transitional states need quick polling. In steady state the
             // tray icon is unchanged, and `runtime_status()` is one of the few
             // always-on paths that can still hit the local proxy / filesystem.
-            let sleep = match visual {
-                TrayRuntimeVisual::Booting => std::time::Duration::from_millis(260),
-                TrayRuntimeVisual::Unhealthy => std::time::Duration::from_millis(1500),
-                _ => std::time::Duration::from_secs(5),
+            let sleep = if pulse_drawn_last_tick {
+                // Mid-blip: the next frame (or the plain icon) is due now.
+                std::time::Duration::from_millis(160)
+            } else {
+                match visual {
+                    TrayRuntimeVisual::Booting => std::time::Duration::from_millis(260),
+                    TrayRuntimeVisual::Unhealthy => std::time::Duration::from_millis(1500),
+                    _ => std::time::Duration::from_secs(5),
+                }
             };
             std::thread::sleep(sleep);
         }
@@ -8914,13 +8995,15 @@ fn spawn_tray_savings_updater(app: AppHandle) {
         let state: tauri::State<'_, AppState> = app.state();
         let dashboard = state.dashboard();
         let today_key = Local::now().format("%Y-%m-%d").to_string();
-        let savings: f64 = dashboard
+        // Both Headroom layers, matching the home chart's headline total.
+        let savings = dashboard
             .hourly_savings
             .iter()
             .filter(|p| p.hour.starts_with(&today_key))
-            // Both Headroom layers, matching the home chart's headline total.
-            .map(|p| p.estimated_savings_usd + p.output_savings_usd)
-            .sum();
+            .fold(TraySavingsToday::default(), |acc, p| TraySavingsToday {
+                usd: acc.usd + p.estimated_savings_usd + p.output_savings_usd,
+                tokens: acc.tokens + p.estimated_tokens_saved + p.output_tokens_saved,
+            });
         let savings_state: tauri::State<'_, TraySessionSavings> = app.state();
         *savings_state.0.lock() = savings;
         let _ = app.emit("savings-today-updated", savings);
@@ -8971,6 +9054,26 @@ fn to_grayscale_strength(rgba: &[u8], strength: f32) -> Vec<u8> {
         pixel[0] = (r * (1.0 - s) + gray * s).round() as u8;
         pixel[1] = (g * (1.0 - s) + gray * s).round() as u8;
         pixel[2] = (b * (1.0 - s) + gray * s).round() as u8;
+    }
+    out
+}
+
+/// Accent strengths for the tray blip, drawn last-to-first as the countdown
+/// in `spawn_tray_runtime_icon_updater` falls: bright, then fading out.
+const TRAY_PULSE_FRAMES: [f32; 3] = [0.2, 0.45, 0.8];
+
+/// Blend every non-transparent pixel toward the savings-badge green.
+fn tint_toward_accent(rgba: &[u8], strength: f32) -> Vec<u8> {
+    const ACCENT: [f32; 3] = [80.0, 210.0, 100.0];
+    let s = strength.clamp(0.0, 1.0);
+    let mut out = rgba.to_vec();
+    for pixel in out.chunks_exact_mut(4) {
+        if pixel[3] == 0 {
+            continue;
+        }
+        for (channel, accent) in pixel.iter_mut().take(3).zip(ACCENT) {
+            *channel = (*channel as f32 * (1.0 - s) + accent * s).round() as u8;
+        }
     }
     out
 }
@@ -9047,7 +9150,16 @@ fn handle_window_event(window: &Window, event: &WindowEvent) {
     }
 }
 
-struct TraySessionSavings(Mutex<f64>);
+/// Today's savings as the tray and the home chart's live figure see them:
+/// both Headroom layers, sampled every 20s from the dashboard.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TraySavingsToday {
+    usd: f64,
+    tokens: u64,
+}
+
+struct TraySessionSavings(Mutex<TraySavingsToday>);
 
 // Returns a (possibly wider) RGBA image with whole-dollar savings stacked
 // vertically to the right of the base icon. Returns the base unchanged when
@@ -10196,6 +10308,32 @@ mod tests {
         } else {
             assert_eq!(resolved, None, "stable builds must ignore HEADROOM_FAKE_*");
         }
+    }
+
+    #[test]
+    fn live_savings_pulse_is_rc_only_with_env_kill_switch() {
+        assert!(super::live_savings_pulse_enabled_from("0.9.18-rc.1", None));
+        assert!(super::live_savings_pulse_enabled_from(
+            "0.9.18-rc.1",
+            Some("1")
+        ));
+        assert!(!super::live_savings_pulse_enabled_from(
+            "0.9.18-rc.1",
+            Some(" 0 ")
+        ));
+        assert!(!super::live_savings_pulse_enabled_from("0.9.18", None));
+        assert!(!super::live_savings_pulse_enabled_from("0.9.18", Some("1")));
+    }
+
+    #[test]
+    fn tint_toward_accent_blends_opaque_pixels_only() {
+        let base = vec![10u8, 20, 30, 255, 10, 20, 30, 0];
+        assert_eq!(super::tint_toward_accent(&base, 0.0), base);
+        let full = super::tint_toward_accent(&base, 1.0);
+        assert_eq!(&full[..4], &[80, 210, 100, 255]);
+        assert_eq!(&full[4..], &[10, 20, 30, 0], "transparent pixels untouched");
+        let half = super::tint_toward_accent(&base, 0.5);
+        assert_eq!(&half[..4], &[45, 115, 65, 255]);
     }
 
     #[test]

@@ -775,73 +775,108 @@ pub fn repair_client_setups() -> Vec<String> {
         .keys()
         .cloned()
         .collect();
-    let mut repaired = Vec::new();
-    for client_id in client_ids {
-        let broken = match verify_client_setup(&client_id) {
-            Ok(verification) => verification.failures,
-            // Ids verification doesn't support are ids repair can't help.
-            Err(_) => Vec::new(),
-        };
-        if broken.is_empty() {
-            continue;
+    client_ids
+        .into_iter()
+        .filter(|client_id| repair_client_setup_now(client_id))
+        .collect()
+}
+
+/// Codex answered a request with 401 "Missing bearer": the provider block was
+/// written before `codex login` and lacks `requires_openai_auth`, so Codex
+/// attaches no credentials at all. The hourly scan above would fix it within
+/// the hour, but the user is failing NOW, on every prompt, with no hint that
+/// Headroom is the cause (RUST-C1, ~16 hosts/week; the Sep 14-20 cohort of
+/// activated-but-never-saved users was 80% Codex-plan). Repair immediately,
+/// bounded to once per five minutes so a retry loop cannot churn config.toml,
+/// and only while the connector is still enabled (the pricing gate disables it
+/// on purpose and must not be fought).
+pub fn repair_codex_missing_bearer() -> bool {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    {
+        let mut last = LAST.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        if last.is_some_and(|at| at.elapsed() < Duration::from_secs(300)) {
+            return false;
         }
-        if let Err(err) = apply_client_setup(&client_id) {
-            log::warn!("repair_client_setups: re-apply for {client_id} failed: {err:#}");
-            continue;
+        *last = Some(Instant::now());
+    }
+    if !is_codex_enabled() {
+        return false;
+    }
+    repair_client_setup_now("codex_cli")
+}
+
+/// One client's verify -> re-apply -> re-verify cycle, unthrottled. Returns
+/// true only when the re-verify comes back clean.
+fn repair_client_setup_now(client_id: &str) -> bool {
+    let broken = match verify_client_setup(client_id) {
+        Ok(verification) => verification.failures,
+        // Ids verification doesn't support are ids repair can't help.
+        Err(_) => Vec::new(),
+    };
+    if broken.is_empty() {
+        return false;
+    }
+    if let Err(err) = apply_client_setup(client_id) {
+        log::warn!("repair_client_setups: re-apply for {client_id} failed: {err:#}");
+        return false;
+    }
+    match verify_client_setup(client_id) {
+        Ok(verification) if verification.failures.is_empty() => {
+            // A successful self-repair is the only fleet-visible trace of a
+            // config that was silently broken (e.g. the stale flagless
+            // Codex block, which 401'd every request until repaired), so it
+            // is reported -- but from here, not through the log bridge.
+            // Info, not warn: the bridged warn carried no fingerprint,
+            // and Sentry grouped it on the SDK's stacktrace instead of the
+            // text -- so byte-identical "repaired codex_cli" lines opened
+            // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
+            // of them meant nothing. One issue per client, from here.
+            log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
+            // WHICH check failed, in the fingerprint and in full as an
+            // extra. Grouping on the client alone said only "codex_cli
+            // drifted again" (RUST-CF, RUST-F0) -- no way to tell a Codex
+            // login that restamps its own config from a shell profile
+            // another installer rewrites, which are different bugs with
+            // different owners. The strings are fixed sentences from
+            // `verify_client_setup`, so they group across machines and
+            // carry nothing of the user's.
+            let cause: String = broken
+                .first()
+                .map(|f| f.chars().take(80).collect())
+                .unwrap_or_else(|| "unknown".to_string());
+            sentry::with_scope(
+                |scope| {
+                    scope.set_tag("flow", "repair_client_setups");
+                    scope.set_extra("failures", broken.clone().into());
+                    scope.set_fingerprint(Some(&[
+                        "repair_client_setups",
+                        client_id,
+                        cause.as_str(),
+                    ]));
+                },
+                || {
+                    sentry::capture_message(
+                        &format!("repair_client_setups: repaired {client_id}"),
+                        sentry::Level::Warning,
+                    );
+                },
+            );
+            true
         }
-        match verify_client_setup(&client_id) {
-            Ok(verification) if verification.failures.is_empty() => {
-                // A successful self-repair is the only fleet-visible trace of a
-                // config that was silently broken (e.g. the stale flagless
-                // Codex block, which 401'd every request until repaired), so it
-                // is reported -- but from here, not through the log bridge.
-                // Info, not warn: the bridged warn carried no fingerprint,
-                // and Sentry grouped it on the SDK's stacktrace instead of the
-                // text -- so byte-identical "repaired codex_cli" lines opened
-                // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
-                // of them meant nothing. One issue per client, from here.
-                log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
-                // WHICH check failed, in the fingerprint and in full as an
-                // extra. Grouping on the client alone said only "codex_cli
-                // drifted again" (RUST-CF, RUST-F0) -- no way to tell a Codex
-                // login that restamps its own config from a shell profile
-                // another installer rewrites, which are different bugs with
-                // different owners. The strings are fixed sentences from
-                // `verify_client_setup`, so they group across machines and
-                // carry nothing of the user's.
-                let cause: String = broken
-                    .first()
-                    .map(|f| f.chars().take(80).collect())
-                    .unwrap_or_else(|| "unknown".to_string());
-                sentry::with_scope(
-                    |scope| {
-                        scope.set_tag("flow", "repair_client_setups");
-                        scope.set_extra("failures", broken.clone().into());
-                        scope.set_fingerprint(Some(&[
-                            "repair_client_setups",
-                            client_id.as_str(),
-                            cause.as_str(),
-                        ]));
-                    },
-                    || {
-                        sentry::capture_message(
-                            &format!("repair_client_setups: repaired {client_id}"),
-                            sentry::Level::Warning,
-                        );
-                    },
-                );
-                repaired.push(client_id);
-            }
-            Ok(verification) => log::warn!(
+        Ok(verification) => {
+            log::warn!(
                 "repair_client_setups: {client_id} still failing after re-apply: {:?}",
                 verification.failures
-            ),
-            Err(err) => {
-                log::warn!("repair_client_setups: re-verify for {client_id} errored: {err:#}")
-            }
+            );
+            false
+        }
+        Err(err) => {
+            log::warn!("repair_client_setups: re-verify for {client_id} errored: {err:#}");
+            false
         }
     }
-    repaired
 }
 
 /// The agent must have run this recently for its silence to mean anything.
@@ -11296,6 +11331,33 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     // NOTE: keep this the only test that calls repair_client_setups: the
     // function carries a process-wide hourly scan throttle, so a second
     // caller in the same test binary would get an empty no-op back.
+    #[test]
+    #[serial_test::serial]
+    fn codex_missing_bearer_repair_rewrites_flagless_block_at_once() {
+        // Install-then-login: the block is written logged out (no
+        // requires_openai_auth), the user logs into Codex, every request 401s.
+        // The intercept's 401 hook must fix it now, not on the hourly scan.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        super::apply_client_setup("codex").expect("apply succeeds");
+        fs::write(
+            codex_dir.join("auth.json"),
+            "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"account_id\":\"acct_123\"}}",
+        )
+        .unwrap();
+
+        assert!(
+            super::repair_codex_missing_bearer(),
+            "stale block is repaired"
+        );
+        let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(toml.contains("requires_openai_auth = true"), "got:\n{toml}");
+        // Five-minute throttle: a retry loop of 401s must not churn the file.
+        assert!(!super::repair_codex_missing_bearer());
+    }
+
     #[test]
     #[serial_test::serial]
     fn repair_client_setups_reapplies_a_clobbered_config() {

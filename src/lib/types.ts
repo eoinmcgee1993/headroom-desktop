@@ -257,6 +257,8 @@ export interface ClientSetupVerification {
 /// production behaviour is the all-null case.
 export interface DebugOverrides {
   setupStall: "no_traffic" | "no_savings" | "drift" | null;
+  /** RC-only live savings pulse (tray blip + live token chip). Absent on older backends. */
+  liveSavingsPulse?: boolean;
 }
 
 export interface ClientConnectorStatus {

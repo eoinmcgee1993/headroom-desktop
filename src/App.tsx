@@ -922,7 +922,8 @@ function DailySavingsChart({
   resetSignal,
   chartMode,
   setChartMode,
-  outputReduction
+  outputReduction,
+  liveSavingsPulse
 }: {
   data: DailySavingsPoint[];
   hourlyData: HourlySavingsPoint[];
@@ -930,18 +931,31 @@ function DailySavingsChart({
   chartMode: SavingsChartMode;
   setChartMode: (mode: SavingsChartMode) => void;
   outputReduction: OutputReduction | null;
+  liveSavingsPulse: boolean;
 }) {
   const currentMonth = startOfMonth(new Date());
   const today = startOfDay(new Date());
   const [visibleMonth, setVisibleMonth] = useState(() => currentMonth);
   const [visibleDay, setVisibleDay] = useState(() => today);
   const [view, setView] = useState<SavingsChartView>("day");
-  const [savingsTodayUsd, setSavingsTodayUsd] = useState<number | null>(null);
+  const [savingsToday, setSavingsToday] = useState<{ usd: number; tokens: number } | null>(
+    null
+  );
+  // Bumped each time today's saved-token count rises; keys the live chip so
+  // its blip animation restarts. Real savings only: a sample that saved
+  // nothing leaves the key alone.
+  const [savingsPulseKey, setSavingsPulseKey] = useState(0);
+  const lastSavingsTokensRef = useRef<number | null>(null);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void listen<number>("savings-today-updated", (event) => {
-      setSavingsTodayUsd(event.payload);
+    void listen<{ usd: number; tokens: number }>("savings-today-updated", (event) => {
+      const previous = lastSavingsTokensRef.current;
+      if (previous !== null && event.payload.tokens > previous) {
+        setSavingsPulseKey((key) => key + 1);
+      }
+      lastSavingsTokensRef.current = event.payload.tokens;
+      setSavingsToday(event.payload);
     }).then((fn) => {
       unlisten = fn;
     });
@@ -1003,13 +1017,16 @@ function DailySavingsChart({
   // with Headroom out of the path, so it is not a benefit of running Headroom.
   // The live tray figure for today already sums the layers it knows, so it can
   // stand in for the bucket sum while today is still open.
+  const liveToday = view === "day" && visibleDay >= today ? savingsToday : null;
   const chartSaved = Math.max(
     0,
     chartMode === "usd"
-      ? view === "day" && visibleDay >= today && savingsTodayUsd !== null
-        ? savingsTodayUsd
+      ? liveToday !== null
+        ? liveToday.usd
         : chartData.reduce((s, d) => s + d.estimatedSavingsUsd + d.outputSavingsUsd, 0)
-      : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
+      : liveToday !== null && liveSavingsPulse
+        ? liveToday.tokens
+        : chartData.reduce((s, d) => s + d.estimatedTokensSaved + d.outputTokensSaved, 0)
   );
 
   useEffect(() => {
@@ -1102,6 +1119,16 @@ function DailySavingsChart({
             <span className="savings-chart__overlay-label">
               {view === "day" ? "saved today" : "saved this month"}
             </span>
+            {liveSavingsPulse && liveToday !== null ? (
+              <span
+                className="savings-chart__overlay-live"
+                key={savingsPulseKey}
+                title="Updates as Headroom saves tokens"
+              >
+                <span className="savings-chart__overlay-live-dot" />
+                {chartMode === "usd" ? `${compactNumber(liveToday.tokens)} tokens` : "live"}
+              </span>
+            ) : null}
             {windowNewInput !== null ||
             windowBillable !== null ||
             windowOutput !== null ||
@@ -1641,6 +1668,7 @@ export default function App() {
     { text: string; tone: "info" | "error" } | null
   >(null);
   const proxyVerificationRequestAnchorRef = useRef<Record<string, number> | null>(null);
+  const proxyVerifiedReportedRef = useRef(false);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   // Fresh install (no runtime on disk yet). Drives the onboarding email-harvest
   // step: every fresh install collects an email to start the card-free 7-day
@@ -2603,12 +2631,18 @@ export default function App() {
   }, [signupGateVisible]);
 
   // proxy_verified: every enabled client's test traffic reached the proxy.
+  // Once per launcher run: the poller rebuilds `proxyVerificationRows` every
+  // tick, so without the ref this re-fired the beacon (a grace/start POST) on
+  // every poll for as long as the screen stayed open -- one device sent it
+  // 1,312 times. Server dedup hides that from the funnel, not from the server.
   useEffect(() => {
     if (windowLabel !== "launcher" || launcherStage !== "post_install") return;
+    if (proxyVerifiedReportedRef.current) return;
     if (
       proxyVerificationRows.length > 0 &&
       proxyVerificationRows.every((row) => row.state === "verified")
     ) {
+      proxyVerifiedReportedRef.current = true;
       // Persist for the main window: its own phase poller honors this marker,
       // so the tray doesn't ask the user to verify a second time right after
       // onboarding just did.
@@ -6936,6 +6970,7 @@ export default function App() {
                 resetSignal={chartResetSignal}
                 chartMode={chartMode}
                 setChartMode={setChartMode}
+                liveSavingsPulse={debugOverrides?.liveSavingsPulse ?? false}
                 // Withheld when the estimate covers too thin a slice of this
                 // machine's traffic to be its headline. The per-window chip is
                 // a different lineage (sampled buckets) and stands either way.
