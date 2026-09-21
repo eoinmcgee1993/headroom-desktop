@@ -128,6 +128,94 @@ pub fn snapshot_state_on_version_change(base_dir: &Path, current_version: &str) 
     }
 }
 
+/// Written just before an update-restart tears the app down, cleared by the
+/// launch that follows.
+pub fn restart_pending_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("restart-pending")
+}
+
+/// Touched by the detached helper immediately before it calls `open`.
+pub fn restart_attempted_path(base_dir: &Path) -> PathBuf {
+    base_dir.join("restart-attempted")
+}
+
+/// Records that we are quitting expecting to come straight back.
+#[cfg(target_os = "macos")]
+pub fn mark_restart_pending(base_dir: &Path, from_version: &str) {
+    // Clear the other half first: a leftover `attempted` from an earlier
+    // restart would read as "the helper tried" on the next launch.
+    let _ = std::fs::remove_file(restart_attempted_path(base_dir));
+    let note = format!("{from_version} at {}", chrono::Utc::now().to_rfc3339());
+    if let Err(err) =
+        crate::client_adapters::atomic_write(&restart_pending_path(base_dir), note.as_bytes())
+    {
+        log::warn!("restart: writing the pending marker failed: {err}");
+    }
+}
+
+/// Reports an update-restart that never brought the app back, then clears both
+/// markers. Call once at startup.
+///
+/// The one thing a restart cannot check for itself: when the detached helper
+/// dies, there is no process left to notice, so the app is simply gone until
+/// the user opens it by hand (twice on 2026-09-21, found both times by their
+/// sessions failing). The two markers separate "the helper never reached its
+/// `open`" from "it tried", which a missing log line cannot, and the warn
+/// carries it to Sentry so this is not per-machine archaeology next time.
+pub fn report_unfinished_restart(base_dir: &Path) {
+    let pending = restart_pending_path(base_dir);
+    let Ok(note) = std::fs::read_to_string(&pending) else {
+        return;
+    };
+    let attempted = restart_attempted_path(base_dir);
+    if attempted.exists() {
+        log::info!("restart: relaunch completed (requested by {})", note.trim());
+    } else {
+        log::warn!(
+            "restart: the previous update-restart never relaunched the app; \
+             its detached helper died before reaching `open` (requested by {})",
+            note.trim()
+        );
+    }
+    let _ = std::fs::remove_file(&pending);
+    let _ = std::fs::remove_file(&attempted);
+}
+
+#[cfg(test)]
+mod restart_marker_tests {
+    use super::*;
+
+    /// A relaunch that never happened has to be distinguishable from one that
+    /// worked, and neither may leave markers behind to confuse the next launch.
+    #[test]
+    fn unfinished_restart_is_detected_and_both_markers_are_cleared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+
+        // Nothing pending: nothing to report, nothing to clean.
+        report_unfinished_restart(base);
+
+        // Helper died before `open`: pending stands alone.
+        std::fs::write(restart_pending_path(base), "0.9.18 at now").unwrap();
+        assert!(!restart_attempted_path(base).exists());
+        report_unfinished_restart(base);
+        assert!(
+            !restart_pending_path(base).exists(),
+            "a reported restart must not be reported again on every later launch"
+        );
+
+        // Helper tried: both markers, both cleared.
+        std::fs::write(restart_pending_path(base), "0.9.18 at now").unwrap();
+        std::fs::write(restart_attempted_path(base), "").unwrap();
+        report_unfinished_restart(base);
+        assert!(!restart_pending_path(base).exists());
+        assert!(
+            !restart_attempted_path(base).exists(),
+            "a stale attempted marker reads as success on the next failure"
+        );
+    }
+}
+
 #[cfg(test)]
 mod pre_update_snapshot_tests {
     use super::*;

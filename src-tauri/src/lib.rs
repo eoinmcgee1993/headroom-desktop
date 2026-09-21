@@ -6107,6 +6107,10 @@ pub fn run() {
     // of docs/beta-smoke-test.md.
     storage::snapshot_state_on_version_change(&storage::app_data_dir(), env!("CARGO_PKG_VERSION"));
 
+    // Did the restart that led here actually relaunch us, or did the user have
+    // to open the app themselves? Only this launch can tell.
+    storage::report_unfinished_restart(&storage::app_data_dir());
+
     let state = AppState::new().expect("failed to create app state");
 
     // A previous bootstrap attempt that never reached a verdict: the app was
@@ -13586,10 +13590,11 @@ Some unrelated content.
         use std::path::Path;
         let app = super::shell_quote_path(Path::new("/Applications/Headroom RC.app"));
         let log = super::shell_quote_path(Path::new("/Users/a b/Library/Logs/Headroom/d.log"));
+        let marker = super::shell_quote_path(Path::new("/Users/a b/Headroom/restart-attempted"));
         let launches = [
             // macOS
             format!(
-                "/usr/bin/open -n {app}; rc=$?; \
+                "touch {marker}; /usr/bin/open -n {app}; rc=$?; \
                  echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {app} exited rc=$rc (alive=$alive)\" >> {log}"
             ),
             // Linux
@@ -13654,7 +13659,10 @@ Some unrelated content.
             spawner_took < std::time::Duration::from_millis(400),
             "spawner waited on the helper ({spawner_took:?}): the work is still inside its lifetime"
         );
-        assert!(!marker.exists(), "helper finished before the spawner exited");
+        assert!(
+            !marker.exists(),
+            "helper finished before the spawner exited"
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !marker.exists() && std::time::Instant::now() < deadline {
