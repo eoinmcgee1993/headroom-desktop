@@ -473,6 +473,10 @@ pub struct RuntimeStatus {
     pub headroom_learn_disabled_reason: Option<String>,
     pub startup_error: Option<String>,
     pub startup_error_hint: Option<String>,
+    /// Prose hint while the backend is failing certificate verification against
+    /// the provider (TLS-inspecting network); `None` once the failures age out.
+    #[serde(default)]
+    pub upstream_tls_interception_hint: Option<String>,
     pub runtime_upgrade_failure: Option<RuntimeUpgradeFailure>,
     pub rtk: RtkRuntimeStatus,
 }
@@ -584,19 +588,56 @@ pub struct TransformationFeedEvent {
     pub workspace: Option<String>,
     #[serde(default, alias = "turn_id")]
     pub turn_id: Option<String>,
-    // Raw request/response payload captured by the proxy's RequestLogger when
-    // `log_full_messages` is enabled. Pass-through as `serde_json::Value` so
-    // the exact Anthropic/OpenAI message shape (role + structured content
-    // blocks) reaches the frontend unchanged; the desktop renders it, it
-    // does not need to re-parse it.
-    #[serde(default, alias = "request_messages")]
-    pub request_messages: Option<serde_json::Value>,
-    // Post-compression message list — what was actually sent upstream after
-    // Headroom's pipeline ran. Present only on proxies that carry this field
-    // (compressed_messages was added after request_messages was already in
-    // use, so older proxies will emit `None` here).
-    #[serde(default, alias = "compressed_messages")]
-    pub compressed_messages: Option<serde_json::Value>,
+    // Per-request prefix-cache split, from the #3672 feed vendor on the
+    // pinned wheel. uncached + cache_write is the "new input" denominator the
+    // overview rate uses (state.rs session_savings_pct, dashboardHelpers
+    // newInputSavingsRate); see `apply_new_input_basis`. Absent on a wheel
+    // without the vendor.
+    #[serde(default, alias = "uncached_input_tokens")]
+    pub uncached_input_tokens: Option<u64>,
+    #[serde(default, alias = "cache_write_tokens")]
+    pub cache_write_tokens: Option<u64>,
+    // The feed's request_messages / compressed_messages / response_content
+    // bodies are not modelled: the fetch asks the backend to omit them
+    // (`include_messages=0`, lib.rs) and serde ignores them when an older
+    // backend or a persisted activity-facts.json still carries them.
+}
+
+impl TransformationFeedEvent {
+    /// Puts `savings_percent` on the NEW-INPUT basis every other displayed
+    /// input-savings figure uses (invariant set 2026-09-03; the formula is
+    /// `newInputSavingsRate` in dashboardHelpers.ts): saved / (saved +
+    /// uncached + cache_write). The feed's own `savings_percent` divides by
+    /// the whole transcript, cached prefix included, so in a long agentic
+    /// session a request the overview rates at 20%+ read as ~3% here and the
+    /// "large compression" tile starved (stuck from 2026-09-10).
+    ///
+    /// The in/out pair moves with it, or the tile reads "66% on
+    /// 183,904 -> 167,728": `input_tokens_original` becomes the overview's
+    /// "Baseline" (new input plus what Headroom removed) and
+    /// `input_tokens_optimized` the new input that reached the provider.
+    /// Left as-is when the backend does not report the split; percent and
+    /// pair are `None` when nothing new entered context, matching the chart,
+    /// which skips such buckets.
+    pub fn apply_new_input_basis(&mut self) {
+        let (Some(uncached), Some(cache_write)) =
+            (self.uncached_input_tokens, self.cache_write_tokens)
+        else {
+            return;
+        };
+        let new_input = uncached.saturating_add(cache_write);
+        if new_input == 0 {
+            self.savings_percent = None;
+            self.input_tokens_original = None;
+            self.input_tokens_optimized = None;
+            return;
+        }
+        let saved = u64::try_from(self.tokens_saved.unwrap_or(0)).unwrap_or(0);
+        let baseline = saved.saturating_add(new_input);
+        self.savings_percent = Some((saved as f64 / baseline as f64 * 100.0).min(100.0));
+        self.input_tokens_original = Some(baseline);
+        self.input_tokens_optimized = Some(new_input);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -678,14 +719,6 @@ pub struct RecordEvent {
     pub input_tokens_original: Option<u64>,
     #[serde(default, alias = "input_tokens_optimized")]
     pub input_tokens_optimized: Option<u64>,
-    // Carried forward from the source transformation so the record row can
-    // show what the record-setting compression was actually about. Populated
-    // only when the proxy's `log_full_messages` is enabled. `compressed_messages`
-    // is only populated by proxies that carry the field (see struct doc above).
-    #[serde(default)]
-    pub request_messages: Option<serde_json::Value>,
-    #[serde(default)]
-    pub compressed_messages: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

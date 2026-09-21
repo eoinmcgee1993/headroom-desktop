@@ -154,6 +154,7 @@ tree-sitter-embedded-template==0.25.0
 tree-sitter-language-pack==0.13.0
 tree-sitter-yaml==0.7.2
 typer==0.25.1
+truststore==0.10.4
 typing-extensions==4.15.0
 typing-inspection==0.4.2
 tzlocal==5.4.4

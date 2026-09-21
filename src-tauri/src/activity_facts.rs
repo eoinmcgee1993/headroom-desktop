@@ -29,20 +29,9 @@ const SCHEMA_VERSION: u8 = 5;
 // The pre-v2 schema embedded full request/response bodies into queues that
 // could grow past 100MB; loading those synchronously hangs the boot path and
 // then the IPC hot path on every save. Anything bigger than this is treated
-// as a schema mismatch and reset. Paired with PER_SLOT_PERSIST_MAX_BYTES
-// below: the per-slot trim keeps individual events from dominating the file,
-// and this overall cap is the belt-and-suspenders backstop.
+// as a schema mismatch and reset. Slots no longer carry message bodies (the
+// feed is fetched with `include_messages=0`), so this is the only cap left.
 const MAX_FACTS_FILE_BYTES: u64 = 3 * 1024 * 1024;
-
-// Above this serialized size, a `last_transformation` / `last_record` slot
-// drops its `request_messages` and `compressed_messages` before persisting.
-// A single record-setting compression can carry 100+ messages with long
-// tool outputs and blow past any reasonable overall file cap on its own;
-// stripping those arrays keeps the headline state (tokens, model, workspace,
-// timestamp) intact across restarts. The in-memory slot is untouched, so
-// the current session's expanded detail still renders — only a restart
-// loses the message bodies for that one tile.
-const PER_SLOT_PERSIST_MAX_BYTES: usize = 512 * 1024;
 
 // Minimum Claude Code session count before we nudge a never-trained project.
 // Below this, the user probably hasn't done enough real work on the project
@@ -61,6 +50,9 @@ pub(crate) const TRAIN_SUGGESTION_ACTIVE_WINDOW_DAYS: i64 = 2;
 // otherwise claim the slot and render "Saved 0 tokens". A high percent on a
 // tiny request ("saved 40 tokens, 30%") is also not worth surfacing, so we
 // also require an absolute floor on tokens saved.
+// Measured on the new-input basis (models.rs apply_new_input_basis); on the
+// feed's full-transcript basis nothing cleared this in long sessions and the
+// tile froze for 11 days.
 const TRANSFORMATION_TILE_MIN_SAVINGS_PERCENT: f64 = 20.0;
 const TRANSFORMATION_TILE_MIN_TOKENS_SAVED: u64 = 1_000;
 // Even a genuine huge compression shouldn't pin the tile forever — swap in
@@ -508,8 +500,6 @@ impl ActivityFacts {
                     workspace: event.workspace.clone(),
                     input_tokens_original: event.input_tokens_original,
                     input_tokens_optimized: event.input_tokens_optimized,
-                    request_messages: event.request_messages.clone(),
-                    compressed_messages: event.compressed_messages.clone(),
                 };
                 self.last_record = Some(tile_record);
                 self.dirty = true;
@@ -534,8 +524,6 @@ impl ActivityFacts {
                     workspace: event.workspace.clone(),
                     input_tokens_original: event.input_tokens_original,
                     input_tokens_optimized: event.input_tokens_optimized,
-                    request_messages: event.request_messages.clone(),
-                    compressed_messages: event.compressed_messages.clone(),
                 };
                 emitted.push(ActivityEvent::Record(record));
             }
@@ -850,11 +838,8 @@ impl ActivityFacts {
             last_weekly_recap_check_at: self.last_weekly_recap_check_at,
             train_suggestions_fired: self.train_suggestions_fired.clone(),
             stale_train_suggestions_fired_at: self.stale_train_suggestions_fired_at.clone(),
-            last_transformation: self
-                .last_transformation
-                .as_ref()
-                .map(persist_copy_transformation),
-            last_record: self.last_record.as_ref().map(persist_copy_record),
+            last_transformation: self.last_transformation.clone(),
+            last_record: self.last_record.clone(),
             last_learnings_milestone: self.last_learnings_milestone.clone(),
             last_weekly_recap: self.last_weekly_recap.clone(),
             last_train_suggestion: self.last_train_suggestion.clone(),
@@ -864,28 +849,6 @@ impl ActivityFacts {
         self.dirty = false;
         Ok(())
     }
-}
-
-fn persist_copy_transformation(event: &TransformationFeedEvent) -> TransformationFeedEvent {
-    let size = serde_json::to_vec(event).map(|v| v.len()).unwrap_or(0);
-    if size <= PER_SLOT_PERSIST_MAX_BYTES {
-        return event.clone();
-    }
-    let mut trimmed = event.clone();
-    trimmed.request_messages = None;
-    trimmed.compressed_messages = None;
-    trimmed
-}
-
-fn persist_copy_record(event: &RecordEvent) -> RecordEvent {
-    let size = serde_json::to_vec(event).map(|v| v.len()).unwrap_or(0);
-    if size <= PER_SLOT_PERSIST_MAX_BYTES {
-        return event.clone();
-    }
-    let mut trimmed = event.clone();
-    trimmed.request_messages = None;
-    trimmed.compressed_messages = None;
-    trimmed
 }
 
 #[cfg(test)]
@@ -951,8 +914,8 @@ mod tests {
             transforms_applied: vec!["kompress".into()],
             workspace: None,
             turn_id: None,
-            request_messages: None,
-            compressed_messages: None,
+            uncached_input_tokens: None,
+            cache_write_tokens: None,
         }
     }
 
@@ -1205,58 +1168,6 @@ mod tests {
         );
         assert!(events.is_empty(), "no new events after reload");
         assert_eq!(reloaded.all_time_record_tokens, 1000);
-    }
-
-    #[test]
-    fn oversize_slots_are_persisted_without_message_bodies() {
-        // A single record-setting compression with a very long conversation
-        // can carry a request_messages array that by itself exceeds the
-        // overall file cap. The persist path must strip the message bodies
-        // from oversize slots so headline state (tokens, model, timestamp)
-        // survives a restart instead of tripping the wipe-on-oversize guard.
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-
-        let big = serde_json::Value::String("x".repeat(600 * 1024));
-        let mut tx = mk_transformation(Some("claude-x"), Some(10_000), Some(80.0));
-        tx.request_messages = Some(big);
-        facts.observe_transformation(&tx, at(10, 0));
-        facts.save_if_dirty().unwrap();
-
-        let reloaded = ActivityFacts::load_or_create(&base).unwrap();
-        assert_eq!(reloaded.all_time_record_tokens, 10_000);
-
-        let record = reloaded.last_record.as_ref().expect("record persisted");
-        assert_eq!(record.tokens_saved, 10_000);
-        assert_eq!(record.model.as_deref(), Some("claude-x"));
-        assert!(record.request_messages.is_none());
-        assert!(record.compressed_messages.is_none());
-
-        let tx = reloaded
-            .last_transformation
-            .as_ref()
-            .expect("transformation persisted");
-        assert_eq!(tx.tokens_saved, Some(10_000));
-        assert!(tx.request_messages.is_none());
-        assert!(tx.compressed_messages.is_none());
-    }
-
-    #[test]
-    fn small_slots_keep_message_bodies_on_persist() {
-        // Opposite guard for the test above: a normal-sized slot should
-        // round-trip its messages through persistence unchanged.
-        let (_tmp, base) = base_dir();
-        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-
-        let small = serde_json::json!([{"role": "user", "content": "hello"}]);
-        let mut tx = mk_transformation(Some("claude-x"), Some(2_000), Some(60.0));
-        tx.request_messages = Some(small.clone());
-        facts.observe_transformation(&tx, at(10, 0));
-        facts.save_if_dirty().unwrap();
-
-        let reloaded = ActivityFacts::load_or_create(&base).unwrap();
-        let record = reloaded.last_record.as_ref().expect("record persisted");
-        assert_eq!(record.request_messages, Some(small));
     }
 
     /// Bring every `de_or_none`-decorated slot into a populated state by

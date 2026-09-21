@@ -1946,6 +1946,13 @@ pub(crate) fn is_blocked_runtime_dll_signal(text: &str) -> bool {
         "pyexpat",
         "select",
         "unicodedata",
+        // Our wheel's own Rust extension (`headroom._core`), a hard import
+        // with no Python fallback upstream. Same self-contained shape as the
+        // stdlib set: PyO3 links only the CRT python.exe already loaded, so a
+        // load failure is a verdict on our freshly written .pyd (RUST-C8/CY:
+        // German Windows, "Eine Anwendungssteuerungsrichtlinie hat diese
+        // Datei blockiert", no code, filed as two Errors per launch).
+        "_core",
     ];
     // Anchor on `dll load failed` and step over an optional `while `: CPython
     // 3.8+ writes "while importing", but the copy of this chain that reaches us
@@ -4214,10 +4221,11 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
 /// how long ago that pull was.
 ///
 /// One pull costs far more than what is read off it: measured 2026-09-07,
-/// `limit=100` returns ~44 MB because every event carries `request_messages`
-/// plus a byte-identical `compressed_messages` (~160 KB per event, and the
-/// backend has no parameter to omit them) while the observer and the canary
-/// between them read ~403 bytes of each. The backend serializes all of it on
+/// `limit=100` returned ~44 MB because every event carried `request_messages`
+/// plus a byte-identical `compressed_messages` (~160 KB per event) while the
+/// observer and the canary between them read ~403 bytes of each; the fetch now
+/// asks for `include_messages=0` (upstream #3672, vendored), and this guard
+/// still bounds how often even the slim pull runs. The backend serializes all of it on
 /// its event loop, and `/stats` -- which the dashboard polls on its own cadence
 /// -- queues behind it: 45 ms idle against 1.3 s with three pulls in flight, on
 /// an otherwise idle machine. That is the shape behind RUST-86's 15s `/stats`
@@ -6892,8 +6900,8 @@ struct RawTransformationsFeedResponse {
 }
 
 /// 2s was silently fatal on exactly the users whose data matters most. The feed
-/// ships every event's full message bodies (~160 KB each, no way to ask the
-/// backend for less), so `limit=100` measured 44 MB / 0.38s on a heavy machine
+/// shipped every event's full message bodies (~160 KB each; now omitted via
+/// `include_messages=0`), so `limit=100` measured 44 MB / 0.38s on a heavy machine
 /// here -- and a machine with conversations a few times larger crosses 2s, at
 /// which point the activity observer AND the zero-savings canary get nothing,
 /// every tick, forever. Raising this costs the backend nothing: it serializes
@@ -6910,12 +6918,21 @@ fn fetch_transformations_feed_from(
         .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
         .build()
         .map_err(|err| err.to_string())?;
-    let url = format!("{base_url}/transformations/feed?limit={limit}");
+    // include_messages=0: the observer and the canary read ~400 B of numbers
+    // per event; the bodies were ~44 MB per limit=100 pull, serialized on the
+    // backend's event loop (RUST-86). Served by the #3672 vendor on the pinned
+    // wheel; a wheel without it ignores the parameter and sends bodies as
+    // before, which the deserializer already tolerates.
+    let url = format!("{base_url}/transformations/feed?limit={limit}&include_messages=0");
     let response = client.get(url).send().map_err(|err| err.to_string())?;
     if !response.status().is_success() {
         return Err(format!("proxy returned HTTP {}", response.status()));
     }
-    let raw: RawTransformationsFeedResponse = response.json().map_err(|err| err.to_string())?;
+    let mut raw: RawTransformationsFeedResponse = response.json().map_err(|err| err.to_string())?;
+    // One basis for every consumer (tiles, records, canary): see the method.
+    for event in &mut raw.transformations {
+        event.apply_new_input_basis();
+    }
     Ok(TransformationFeedResponse {
         log_full_messages: raw.log_full_messages,
         transformations: raw.transformations,
@@ -7112,7 +7129,13 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
         if lower.contains("too long") {
             return false;
         }
-        line.starts_with("API Error:") || lower.contains("credit balance is too low")
+        line.starts_with("API Error:")
+            || lower.contains("credit balance is too low")
+            // RUST-H7: `Your organization has disabled Claude subscription
+            // access for Claude Code · Use an Anthropic API key instead, or
+            // ask your admin to enable access` -- an org policy on the
+            // user's account, and the line names its own remedy.
+            || lower.contains("disabled claude subscription access")
     })
 }
 
@@ -10829,7 +10852,20 @@ mod tests {
                     "input_tokens_optimized": 250,
                     "tokens_saved": 750,
                     "savings_percent": 75.0,
-                    "transforms_applied": ["interceptor:ast-grep"]
+                    "transforms_applied": ["interceptor:ast-grep"],
+                    "uncached_input_tokens": 2000,
+                    "cache_write_tokens": 250,
+                    "cache_read_tokens": 90000
+                }, {
+                    "request_id": "req-no-split",
+                    "tokens_saved": 31,
+                    "savings_percent": 3.1
+                }, {
+                    "request_id": "req-all-cached",
+                    "tokens_saved": 500,
+                    "savings_percent": 2.0,
+                    "uncached_input_tokens": 0,
+                    "cache_write_tokens": 0
                 }]
             })
             .to_string();
@@ -10847,12 +10883,46 @@ mod tests {
 
         assert!(result.proxy_reachable);
         assert!(result.log_full_messages);
-        assert_eq!(result.transformations.len(), 1);
+        assert_eq!(result.transformations.len(), 3);
         let event = &result.transformations[0];
         assert_eq!(event.request_id.as_deref(), Some("req-1"));
         assert_eq!(event.provider.as_deref(), Some("anthropic"));
         assert_eq!(event.tokens_saved, Some(750));
         assert_eq!(event.transforms_applied, vec!["interceptor:ast-grep"]);
+        // New-input basis: 750 / (750 + 2000 + 250), not the feed's 75%, and
+        // the in/out pair is the overview's baseline -> new input, not the
+        // transcript's 1000 -> 250.
+        assert_eq!(event.savings_percent, Some(25.0));
+        assert_eq!(event.input_tokens_original, Some(3000));
+        assert_eq!(event.input_tokens_optimized, Some(2250));
+        // No split reported (vendor unbound): the feed's figures stand.
+        assert_eq!(result.transformations[1].savings_percent, Some(3.1));
+        // Nothing new entered context: no percent and no pair, like the chart.
+        let cached = &result.transformations[2];
+        assert_eq!(cached.savings_percent, None);
+        assert_eq!(cached.input_tokens_original, None);
+        assert_eq!(cached.input_tokens_optimized, None);
+    }
+
+    #[test]
+    fn new_input_basis_zeroes_negative_saved_and_rates_against_new_input() {
+        let mut event = crate::models::TransformationFeedEvent {
+            tokens_saved: Some(-40),
+            savings_percent: Some(9.0),
+            uncached_input_tokens: Some(100),
+            cache_write_tokens: Some(0),
+            ..serde_json::from_str("{}").unwrap()
+        };
+        event.apply_new_input_basis();
+        assert_eq!(event.savings_percent, Some(0.0));
+        assert_eq!(event.input_tokens_original, Some(100));
+        assert_eq!(event.input_tokens_optimized, Some(100));
+        // saved 300 against 100 new input: 300 / (300 + 100), pair 400 -> 100.
+        event.tokens_saved = Some(300);
+        event.apply_new_input_basis();
+        assert_eq!(event.savings_percent, Some(75.0));
+        assert_eq!(event.input_tokens_original, Some(400));
+        assert_eq!(event.input_tokens_optimized, Some(100));
     }
 
     #[test]
@@ -12287,6 +12357,7 @@ Some unrelated content.
             "API Error: 502 Upstream service error. The upstream provider is temporarily unavailable.",
             "API Error: 404 {\"type\":\"error\",\"error\":{\"type\":\"not_found_error\"}}",
             "Credit balance is too low",
+            "Your organization has disabled Claude subscription access for Claude Code \u{b7} Use an Anthropic API key instead, or ask your admin to enable access",
         ] {
             let stderr = format!("{marker}{diagnosis}\n  Analysis failed: ...\n");
             assert_eq!(
@@ -12734,6 +12805,12 @@ Some unrelated content.
         assert!(is_blocked_runtime_dll_signal(
             "ImportError: DLL load failed while importing _ssl: 지정된 모듈을 찾을 수 없습니다."
         ));
+        // RUST-C8/CY verbatim: our own extension, German Windows.
+        let core = "  File \"...\\headroom\\transforms\\error_detection.py\", line 41, in <module>\n    \
+                    from headroom._core import (\nImportError: DLL load failed while importing _core: \
+                    Eine Anwendungssteuerungsrichtlinie hat diese Datei blockiert.";
+        assert!(is_blocked_runtime_dll_signal(core));
+        assert!(is_endpoint_protection_signal(core));
 
         // RUST-5C's `last_startup_error` carries the same verdict without the
         // `while`, in the copy upstream re-wraps into the error chain. Both

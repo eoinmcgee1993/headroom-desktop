@@ -258,6 +258,13 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
+Also makes the backend verify upstream TLS against the OS certificate
+store (truststore.inject_into_ssl, Windows and macOS). httpx verifies
+against certifi's bundle, so a corporate proxy or antivirus that re-signs
+HTTPS fails every forwarded request with CERTIFICATE_VERIFY_FAILED while
+Claude Code itself keeps working through the OS store. Kill switch:
+HEADROOM_OS_TRUSTSTORE=0.
+
 Also ports eight fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-desktop-proxy so only the backend process
 pays the proxy import cost:
@@ -475,6 +482,30 @@ except Exception:
     pass
 
 import os as _hd_os
+import sys as _hd_sys
+
+# OS trust store (desktop posture, no upstream equivalent). httpx verifies
+# upstream TLS against certifi's bundle, so a corporate proxy or antivirus
+# that re-signs HTTPS (self-signed root in the chain) fails every forwarded
+# request with CERTIFICATE_VERIFY_FAILED while Claude Code itself keeps
+# working through the OS store (Windows 11 churn, 2026-09-14). pip already
+# trusts the OS store the same way (pip >= 24.2 ships truststore), which is
+# why the install succeeds and only the proxy breaks. Injected here, before
+# any client builds an SSLContext, so every context is the OS-backed one; a
+# bundle set via SSL_CERT_FILE / REQUESTS_CA_BUNDLE still loads (truststore
+# consults it after the OS store). Linux keeps certifi: a box without
+# ca-certificates would otherwise lose public roots. Kill switch:
+# HEADROOM_OS_TRUSTSTORE=0.
+_hd_ost_flag = _hd_os.environ.get("HEADROOM_OS_TRUSTSTORE", "1")
+if _hd_sys.platform in ("win32", "darwin") and _hd_ost_flag.strip().lower() not in (
+    "", "0", "false", "no", "off"
+):
+    try:
+        import truststore as _hd_ost_truststore
+
+        _hd_ost_truststore.inject_into_ssl()
+    except Exception:
+        pass
 
 if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
     # Context-limit guard (upstream PR #2942; remove once a wheel ships it).
@@ -2601,6 +2632,135 @@ if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# Dense-line elision (upstream PR #3685): tool outputs that dump a fetched
+# page, a bundled asset or an encoded blob (minified JS/CSS, base64, RSC
+# payloads) arrive as a few very long lines with almost no whitespace, and
+# no structural compressor can shrink them: code_aware is disabled, log/text
+# return them unchanged, and the HTML extractor returns the whole thing or
+# "" (which the unit layer rejects as an empty block, keeping all of it).
+# Measured 2026-09-20: 75k of a Codex research session's tokens rode through
+# at ratio 1.0 and the session compressed at 7 percent of new input; the
+# same session replayed with elision reached 25 percent. The vendor wraps the
+# router's strategy dispatch: after the wheel's own chain has run, every
+# line of >= 300 chars with < 6 percent spaces (no tabs, not JSON-shaped:
+# that is SmartCrusher's) keeps its head and tail and the middle becomes a
+# marker, but only when the block carries >= 2000 chars of such lines: a
+# lone JWT / signed URL / PATH is a value the agent asked for, not a dump.
+# The pre-elision block goes into the CCR store and a "Retrieve original:
+# hash=" marker is appended, so the messages path's marker-less lossy gate
+# (#1307) keeps the result and the agent can recover exact bytes. Only after
+# strategies whose result is still plain text (html, log, text, code_aware,
+# search, passthrough), never inside an embedded-JSON span, never in
+# lossless mode, and an empty HTML extraction on non-empty input counts as
+# "nothing extracted", not as a compression to zero tokens.
+# Exact-pin gated to wheel 0.37.0 and the fix absent (a wheel that ships
+# ContentRouterConfig.enable_dense_line_elision keeps its own). Kill switch:
+# HEADROOM_DENSE_LINE_ELISION=0.
+_hd_dle_flag = _hd_os.environ.get("HEADROOM_DENSE_LINE_ELISION", "1")
+if _hd_dle_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_dle_meta
+
+        if _hd_dle_meta.version("headroom-ai") == "0.37.0":
+            from headroom.transforms import content_router as _hd_dle_cr
+
+            if not hasattr(_hd_dle_cr.ContentRouterConfig, "enable_dense_line_elision"):
+                _hd_dle_orig = _hd_dle_cr.ContentRouter._apply_strategy_to_content
+                _hd_dle_est = _hd_dle_cr._estimate_tokens
+                _hd_dle_after = frozenset(
+                    {"html", "log", "text", "code_aware", "search", "passthrough"}
+                )
+
+                def _hd_dle_is_dense(line):
+                    n = len(line)
+                    # Tabs: TSV/psql -A rows are dense by the space ratio but are
+                    # data the agent asked for; minified/base64 never carry tabs.
+                    if n < 300 or "\t" in line or (line.count(" ") / n) >= 0.06:
+                        return False
+                    stripped = line.strip()
+                    return not (stripped[:1] in "{[" and stripped[-1:] in "}]")
+
+                def _hd_dle_elide(text):
+                    if len(text) < 300:
+                        return text, 0
+                    # A single dense line (JWT, signed URL, PATH, modulus) is a
+                    # VALUE the agent asked for, not a dump: only elide when the
+                    # block carries >= 2000 chars of dense content.
+                    lines = text.split("\n")
+                    if sum(len(l) for l in lines if _hd_dle_is_dense(l)) < 2000:
+                        return text, 0
+                    out = []
+                    n_elided = 0
+                    for line in lines:
+                        if _hd_dle_is_dense(line):
+                            out.append(
+                                line[:160]
+                                + " ...[%d chars of dense machine-generated content elided]... "
+                                % (len(line) - 240)
+                                + line[-80:]
+                            )
+                            n_elided += 1
+                        else:
+                            out.append(line)
+                    if not n_elided:
+                        return text, 0
+                    return "\n".join(out), n_elided
+
+                def _hd_dle_apply(self, content, strategy, context, *args, **kwargs):
+                    result = _hd_dle_orig(self, content, strategy, context, *args, **kwargs)
+                    try:
+                        if kwargs.get("_allow_embedded", True) is False:
+                            return result
+                        if getattr(self.config, "lossless", False):
+                            return result
+                        out, toks, chain = result
+                        if not isinstance(out, str) or not isinstance(chain, list):
+                            return result
+                        base = out
+                        if isinstance(content, str) and content.strip() and not out.strip():
+                            # Empty extraction: nothing extracted, elide the input.
+                            base, toks = content, _hd_dle_est(content)
+                            last = "passthrough"
+                        elif out == content:
+                            # Byte-identical result: the chain changed nothing
+                            # (code_aware unchanged, then a disabled Kompress
+                            # fallback appended to the chain), so there is no
+                            # structured output to protect.
+                            last = "passthrough"
+                        else:
+                            last = chain[-1] if chain else getattr(strategy, "value", str(strategy))
+                        if last not in _hd_dle_after:
+                            return result
+                        elided, n_dense = _hd_dle_elide(base)
+                        if not n_dense:
+                            return result
+                        if getattr(self.config, "ccr_inject_marker", True):
+                            from headroom.cache.compression_store import get_compression_store
+
+                            key = get_compression_store().store(
+                                base,
+                                elided,
+                                original_tokens=_hd_dle_est(base),
+                                compressed_tokens=_hd_dle_est(elided),
+                                query_context=context or None,
+                                compression_strategy="dense_elide",
+                            )
+                            noun = "line" if n_dense == 1 else "lines"
+                            elided += (
+                                "\n[%d dense machine-generated %s elided."
+                                " Retrieve original: hash=%s]" % (n_dense, noun, key)
+                            )
+                        elided_tokens = _hd_dle_est(elided)
+                        if elided_tokens >= toks:
+                            return result
+                        return elided, elided_tokens, list(chain) + ["dense_elide"]
+                    except Exception:
+                        return result
+
+                _hd_dle_cr.ContentRouter._apply_strategy_to_content = _hd_dle_apply
+    except Exception:
+        pass
+
 # Stats request-log rows (upstream PR #3613):
 # RequestLogger.get_recent built each row with dataclasses.asdict(entry) and
 # only then dropped request_messages / compressed_messages / response_content,
@@ -2639,6 +2799,129 @@ if _hd_grc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 return rows
 
             _hd_grc_rl.RequestLogger.get_recent = _hd_grc_get_recent
+    except Exception:
+        pass
+
+# Transformations feed bodies (upstream PR #3672):
+# /transformations/feed returned request_messages / compressed_messages /
+# response_content for every entry and built them with asdict(), so the
+# desktop's number-only poll paid a full deep copy plus ~44 MB of JSON per
+# limit=100 pull, serialized on the event loop; three concurrent pulls take
+# /stats?cached=1 from 45 ms to 1.3 s (RUST-86). The PR's method and handler
+# verbatim: get_recent_with_messages(n, include_messages=True), and the route
+# re-registered with the same loopback dependency, reading ?include_messages.
+# Default unchanged; the desktop passes include_messages=0 (lib.rs).
+# Exact-pin gated to wheel 0.37.0. Kill switch: HEADROOM_FEED_INCLUDE_MESSAGES=0.
+_hd_fm_flag = _hd_os.environ.get("HEADROOM_FEED_INCLUDE_MESSAGES", "1")
+if _hd_fm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_fm_meta
+
+        if _hd_fm_meta.version("headroom-ai") == "0.37.0":
+            from copy import deepcopy as _hd_fm_deepcopy
+            from dataclasses import asdict as _hd_fm_asdict
+            from dataclasses import fields as _hd_fm_fields
+
+            import headroom.proxy.server as _hd_fm_server
+            from headroom.proxy import request_logger as _hd_fm_rl
+
+            _hd_fm_rdp = _hd_fm_server.resolve_display_provider
+            _hd_fm_heavy = frozenset(
+                {"request_messages", "compressed_messages", "response_content"}
+            )
+
+            def _hd_fm_get_recent_with_messages(self, n=20, include_messages=True):
+                entries = list(self._logs)[-n:]
+                if include_messages:
+                    return [_hd_fm_asdict(e) for e in entries]
+                return [
+                    {
+                        f.name: _hd_fm_deepcopy(getattr(e, f.name))
+                        for f in _hd_fm_fields(e)
+                        if f.name not in _hd_fm_heavy
+                    }
+                    for e in entries
+                ]
+
+            _hd_fm_orig_create_app = _hd_fm_server.create_app
+
+            def _hd_fm_create_app(*args, **kwargs):
+                app = _hd_fm_orig_create_app(*args, **kwargs)
+                try:
+                    from fastapi import Request as _hd_fm_Request
+
+                    old = next(
+                        r
+                        for r in app.router.routes
+                        if getattr(r, "path", None) == "/transformations/feed"
+                    )
+
+                    async def transformations_feed(
+                        request: _hd_fm_Request,
+                        limit: int = 20,
+                        include_messages: bool = True,
+                    ):
+                        proxy = request.app.state.proxy
+                        if limit > 100:
+                            limit = 100
+                        transformations = []
+                        log_full_messages = proxy.config.log_full_messages if proxy else False
+                        if proxy and proxy.logger:
+                            logs = proxy.logger.get_recent_with_messages(
+                                limit, include_messages=include_messages
+                            )
+                            for log in logs:
+                                item = {
+                                    "request_id": log.get("request_id"),
+                                    "timestamp": log.get("timestamp"),
+                                    "provider": _hd_fm_rdp(
+                                        log.get("provider"),
+                                        openai_api_url=proxy.config.openai_api_url,
+                                        provider_name=proxy.config.provider_name,
+                                    ),
+                                    "model": log.get("model"),
+                                    "input_tokens_original": log.get("input_tokens_original"),
+                                    "input_tokens_optimized": log.get("input_tokens_optimized"),
+                                    "tokens_saved": log.get("tokens_saved"),
+                                    "savings_percent": log.get("savings_percent"),
+                                    "transforms_applied": log.get("transforms_applied", []),
+                                    "turn_id": log.get("turn_id"),
+                                    # Per-request prefix-cache split, so a number-only poller can put
+                                    # tokens_saved on the new-input basis /stats reports as
+                                    # new_input_savings_percent (saved / (saved + uncached + cache_write))
+                                    # instead of the full-transcript basis of savings_percent.
+                                    "uncached_input_tokens": log.get("uncached_input_tokens", 0),
+                                    "cache_write_tokens": log.get("cache_write_tokens", 0),
+                                    "cache_read_tokens": log.get("cache_read_tokens", 0),
+                                }
+                                if include_messages:
+                                    item["request_messages"] = log.get("request_messages")
+                                    item["compressed_messages"] = log.get("compressed_messages")
+                                    item["response_content"] = log.get("response_content")
+                                transformations.append(item)
+                        return {
+                            "transformations": transformations,
+                            "log_full_messages": log_full_messages,
+                        }
+
+                    # Same position as the wheel's route: add_api_route
+                    # appends, and the catch-all upstream passthrough
+                    # registered later would match first.
+                    routes = app.router.routes
+                    index = routes.index(old)
+                    app.add_api_route(
+                        "/transformations/feed",
+                        transformations_feed,
+                        methods=["GET"],
+                        dependencies=old.dependencies,
+                    )
+                    routes[index] = routes.pop()
+                except Exception:
+                    pass
+                return app
+
+            _hd_fm_rl.RequestLogger.get_recent_with_messages = _hd_fm_get_recent_with_messages
+            _hd_fm_server.create_app = _hd_fm_create_app
     except Exception:
         pass
 
@@ -8532,7 +8815,21 @@ impl ToolManager {
     ) -> Result<()> {
         if host.plugin_present(plugin) {
             let _ = self.run_plugin_cmd(plugin, cli, host, &host.marketplace_update_args(plugin));
-            self.run_plugin_cmd(plugin, cli, host, &host.update_args(plugin))?;
+            match self.run_plugin_cmd(plugin, cli, host, &host.update_args(plugin)) {
+                Ok(()) => {}
+                // The registry lists the plugin, but at project/local scope
+                // (RUST-DQ: `Plugin "caveman" is not installed at scope user`).
+                // `update` only looks at user scope; `install` puts it there.
+                Err(err) if format!("{err:#}").contains("is not installed at scope") => {
+                    log::info!(
+                        "{} [{}]: installed at another scope; installing at user scope",
+                        plugin.id,
+                        host.label()
+                    );
+                    self.run_plugin_cmd(plugin, cli, host, &host.install_args(plugin))?;
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             // Re-adding an already-known marketplace is a benign error, so its
             // failure is not fatal on its own -- but it must not be discarded
@@ -13992,6 +14289,89 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_injects_os_truststore_with_kill_switch() {
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_OS_TRUSTSTORE"), "kill switch missing");
+        assert!(
+            py.contains("_hd_ost_truststore.inject_into_ssl()"),
+            "inject missing"
+        );
+        assert!(
+            py.contains(r#"_hd_sys.platform in ("win32", "darwin")"#),
+            "Linux must keep certifi"
+        );
+        for lock in [
+            super::HEADROOM_REQUIREMENTS_LOCK,
+            super::HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        ] {
+            assert!(
+                lock.lines().any(|l| l.trim() == "truststore==0.10.4"),
+                "truststore pin missing from a lock"
+            );
+        }
+        // Linux keeps certifi, so its lock must not carry (and repair for) the package.
+        assert!(!super::HEADROOM_LINUX_REQUIREMENTS_LOCK.contains("truststore"));
+    }
+
+    /// Functional: with the injection dir on PYTHONPATH the managed python's
+    /// default SSLContext is truststore's, httpx still builds a client on it,
+    /// and the kill switch restores the stock context. Self-skips when the
+    /// installed venv lacks truststore (pre-lock-bump runtime), so green is
+    /// only evidence once the lock has been applied locally.
+    #[test]
+    fn os_truststore_vendor_behaves_against_the_installed_wheel() {
+        if !cfg!(any(target_os = "windows", target_os = "macos")) {
+            eprintln!("skipping: truststore injection is Windows/macOS only");
+            return;
+        }
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let has_truststore = crate::proc::command(&python)
+            .args(["-c", "import truststore"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_truststore {
+            eprintln!("skipping: installed venv has no truststore (lock not applied yet)");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-os-truststore-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import ssl, sys, truststore, httpx\n\
+            injected = ssl.SSLContext is truststore.SSLContext\n\
+            ctx = ssl.create_default_context()\n\
+            client = httpx.Client()\n\
+            client.close()\n\
+            print('injected' if injected and isinstance(ctx, truststore.SSLContext) else 'stock')";
+        for (flag, expect) in [("1", "injected"), ("0", "stock")] {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_OS_TRUSTSTORE", flag)
+                .output()
+                .expect("run truststore probe");
+            assert!(
+                out.status.success(),
+                "probe failed (flag={flag})\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                expect,
+                "HEADROOM_OS_TRUSTSTORE={flag}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cache_integrity_observer_behaves_against_the_installed_wheel() {
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
@@ -14235,6 +14615,11 @@ mod tests {
                 r#"_hd_kmg_meta.version("headroom-ai") == "0.37.0""#,
                 "_hd_kmg_kc.KompressCompressor.compress_batch = _hd_kmg_batch",
             ),
+            (
+                "HEADROOM_DENSE_LINE_ELISION",
+                r#"_hd_dle_meta.version("headroom-ai") == "0.37.0""#,
+                "_hd_dle_cr.ContentRouter._apply_strategy_to_content = _hd_dle_apply",
+            ),
         ] {
             assert!(py.contains(flag), "{flag} kill switch missing");
             assert!(py.contains(gate), "{flag} exact-pin gate missing");
@@ -14318,6 +14703,45 @@ mod tests {
     }
 
     #[test]
+    fn dense_line_elision_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel and
+        // asserts the dense-line elision contract end to end (see
+        // scripts/verify-dense-line-elision.py). Self-skips when the vendor
+        // does not bind, so green is NOT evidence after a wheel bump.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-dense-line-elision.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-dle-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run dense-line-elision probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stdout.contains("FAIL dle bound") {
+            eprintln!("skipping: dense-line elision vendor did not bind (wheel ships the fix?)");
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "dense-line elision probe failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
     fn stats_get_recent_vendor_behaves_against_the_installed_wheel() {
         // Runs the shipped sitecustomize against the installed wheel: a leaf
         // whose __deepcopy__ raises is planted in both message payloads (the
@@ -14389,6 +14813,133 @@ print("OK grc")
         let off_out = String::from_utf8_lossy(&off.stdout);
         assert!(
             off.status.success() && off_out.contains("SKIP grc not bound"),
+            "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
+    fn sitecustomize_vendors_feed_include_messages() {
+        // Shape and gates only; behaviour is proven by
+        // feed_include_messages_vendor_behaves_against_the_installed_wheel.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains("HEADROOM_FEED_INCLUDE_MESSAGES"),
+            "kill switch missing"
+        );
+        assert!(
+            py.contains(r#"_hd_fm_meta.version("headroom-ai") == "0.37.0""#),
+            "exact-pin gate missing"
+        );
+        assert!(
+            py.contains("_hd_fm_server.create_app = _hd_fm_create_app"),
+            "create_app seam binding missing"
+        );
+        assert!(py.contains(
+            "_hd_fm_rl.RequestLogger.get_recent_with_messages = _hd_fm_get_recent_with_messages"
+        ));
+        // The cache split is what puts Activity-tile percentages on the
+        // new-input basis (models.rs apply_new_input_basis).
+        assert!(py.contains(r#""uncached_input_tokens": log.get("uncached_input_tokens", 0)"#));
+        assert!(py.contains(r#""cache_write_tokens": log.get("cache_write_tokens", 0)"#));
+        // The route keeps the wheel's own loopback dependency and position.
+        assert!(py.contains("dependencies=old.dependencies"));
+        assert!(py.contains("routes[index] = routes.pop()"));
+    }
+
+    #[test]
+    fn feed_include_messages_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel: an entry
+        // whose message payloads refuse to be deep-copied is planted, then
+        // `?include_messages=0` must return its numbers without the three body
+        // keys (never walking them), the default request must still carry the
+        // bodies, and the kill switch must leave the wheel's method bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-fm-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+import asyncio, inspect, sys
+from headroom.proxy.request_logger import RequestLogger
+if RequestLogger.get_recent_with_messages.__name__ != "_hd_fm_get_recent_with_messages":
+    print("SKIP fm not bound"); sys.exit(0)
+import httpx
+from headroom.proxy.models import RequestLog
+from headroom.proxy.server import create_app
+class NoCopy:
+    def __deepcopy__(self, memo):
+        raise AssertionError("feed walked a message payload")
+sig = inspect.signature(RequestLog)
+kw = {n: 0 for n, p in sig.parameters.items() if p.default is inspect._empty}
+heavy = RequestLog(**kw)
+heavy.request_id = "heavy"
+heavy.request_messages = [{"role": "user", "content": NoCopy()}]
+heavy.compressed_messages = [{"role": "user", "content": NoCopy()}]
+heavy.response_content = "r"
+heavy.tokens_saved = 60
+heavy.uncached_input_tokens = 30
+heavy.cache_write_tokens = 5
+heavy.cache_read_tokens = 1000
+heavy.transforms_applied = ["smart_crusher"]
+plain = RequestLog(**kw)
+plain.request_id = "plain"
+plain.request_messages = [{"role": "user", "content": "hi"}]
+plain.response_content = "ok"
+app = create_app()
+app.state.proxy.logger._logs.append(heavy)
+app.state.proxy.logger._logs.append(plain)
+bodies = {"request_messages", "compressed_messages", "response_content"}
+async def main():
+    t = httpx.ASGITransport(app=app, client=("127.0.0.1", 1))
+    async with httpx.AsyncClient(transport=t, base_url="http://127.0.0.1") as c:
+        slim = await c.get("/transformations/feed?limit=2&include_messages=0")
+        assert slim.status_code == 200, slim.text
+        rows = slim.json()["transformations"]
+        assert [r["request_id"] for r in rows] == ["heavy", "plain"], rows
+        assert rows[0]["tokens_saved"] == 60 and rows[0]["transforms_applied"] == ["smart_crusher"], rows
+        assert (rows[0]["uncached_input_tokens"], rows[0]["cache_write_tokens"], rows[0]["cache_read_tokens"]) == (30, 5, 1000), rows
+        for r in rows:
+            assert not (bodies & r.keys()), r
+        full = await c.get("/transformations/feed?limit=1")
+        assert full.status_code == 200, full.text
+        row = full.json()["transformations"][0]
+        assert row["request_id"] == "plain" and row["request_messages"] == [{"role": "user", "content": "hi"}], row
+        assert row["response_content"] == "ok", row
+        assert "log_full_messages" in full.json()
+asyncio.run(main())
+print("OK fm")
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_FEED_INCLUDE_MESSAGES", flag)
+                .output()
+                .expect("run feed probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        if on_out.contains("SKIP fm not bound") {
+            eprintln!("skipping: feed vendor did not bind (wheel ships #3672?)");
+            return;
+        }
+        assert!(
+            on.status.success() && on_out.contains("OK fm"),
+            "feed vendor misbehaved against the installed wheel.\nstdout:\n{on_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        assert!(
+            off.status.success() && off_out.contains("SKIP fm not bound"),
             "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
             String::from_utf8_lossy(&off.stderr)
         );

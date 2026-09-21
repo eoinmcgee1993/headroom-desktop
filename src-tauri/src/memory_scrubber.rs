@@ -101,7 +101,16 @@ fn discover_memory_md_files_in(projects_root: &Path) -> Vec<PathBuf> {
 /// Strip the `### Learned: error recovery` subsection from a MEMORY.md file.
 /// Returns the number of lines removed (0 if the section was absent).
 fn scrub_memory_md_file(path: &Path) -> std::io::Result<usize> {
-    let original = fs::read_to_string(path)?;
+    // Not UTF-8 (RUST-H8: a Windows editor saved it as UTF-16/ANSI): the
+    // learner only ever writes UTF-8, so its section cannot be in there, and
+    // a lossy round-trip would corrupt the user's own notes. Skip quietly.
+    let Ok(original) = String::from_utf8(fs::read(path)?) else {
+        log::info!(
+            "memory_scrubber: skipping {}: not valid UTF-8",
+            path.display()
+        );
+        return Ok(0);
+    };
     let (cleaned, removed) = strip_error_recovery_subsection(&original);
     if removed == 0 {
         return Ok(0);
@@ -425,6 +434,20 @@ mod tests {
         // Should not panic.
         scrub_all_in(Some(&missing_projects), &missing_db);
         scrub_all_in(None, &missing_db);
+    }
+
+    #[test]
+    fn scrub_memory_md_file_skips_non_utf8_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("MEMORY.md");
+        // UTF-16LE with BOM, as Notepad's "Unicode" encoding writes it.
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "# notes\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(scrub_memory_md_file(&path).unwrap(), 0);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 
     /// A file scrubbed by a pre-0.9.10 build (start marker, no end marker)

@@ -2410,16 +2410,18 @@ fn rename_recovering_lost_tmp(
     }
 }
 
-/// Retries `op` while it fails `PermissionDenied`, sleeping 50/100/200ms
-/// between attempts (4 tries total). Any other error, or the final denial,
-/// is returned as-is.
+/// Retries `op` while it fails `PermissionDenied` (or, on Windows, a sharing
+/// violation: os error 32, which std maps to `Uncategorized`, raised when the
+/// client itself holds its config open mid-write - RUST-5X), sleeping
+/// 50/100/200ms between attempts (4 tries total). Any other error, or the
+/// final denial, is returned as-is.
 pub(crate) fn retry_transient_denied<T>(
     mut op: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     let mut delay = std::time::Duration::from_millis(50);
     for _ in 0..3 {
         match op() {
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(err) if is_transient_denied(&err) => {
                 std::thread::sleep(delay);
                 delay *= 2;
             }
@@ -2427,6 +2429,11 @@ pub(crate) fn retry_transient_denied<T>(
         }
     }
     op()
+}
+
+fn is_transient_denied(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || (cfg!(windows) && err.raw_os_error() == Some(32))
 }
 
 /// Move an unparsable state file aside instead of letting the next write
@@ -5928,7 +5935,7 @@ pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
 
     let stamp = Utc::now().format("%Y%m%d%H%M%S");
     let backup_path = PathBuf::from(format!("{}.headroom-backup-{}", path.display(), stamp));
-    std::fs::copy(path, &backup_path)
+    retry_transient_denied(|| std::fs::copy(path, &backup_path))
         .with_context(|| format!("creating backup {}", backup_path.display()))?;
 
     // Prune old backups — keep only the 3 most recent for this base path.
@@ -11617,6 +11624,23 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         });
         assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::NotFound);
         assert_eq!(calls, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retry_transient_denied_retries_windows_sharing_violation() {
+        // RUST-5X: os error 32 (ERROR_SHARING_VIOLATION) is `Uncategorized`
+        // in std, so a kind check alone never retried it.
+        let mut calls = 0;
+        let out = super::retry_transient_denied(|| {
+            calls += 1;
+            if calls < 2 {
+                Err(std::io::Error::from_raw_os_error(32))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(out.unwrap(), 2);
     }
 
     #[test]

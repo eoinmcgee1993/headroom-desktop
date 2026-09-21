@@ -16,6 +16,7 @@ import {
   paybackLabel,
   scheduledPlanChange,
   recentDailySavingsUsd,
+  restorePendingAuth,
   setServerPlanPrices,
   unsavedWhileBlockedLabel,
   upgradePlanIntentLabel,
@@ -840,5 +841,16 @@ describe("authCodeSentMessage", () => {
 
   it("never rounds a short expiry down to zero minutes", () => {
     expect(authCodeSentMessage("dev@example.com", 20)).toContain("1 minute.");
+  });
+});
+
+describe("restorePendingAuth", () => {
+  it("restores a live request and drops expired, malformed or absent ones", () => {
+    const live = JSON.stringify({ email: "a@b.c", expiresAt: 1_000 });
+    expect(restorePendingAuth(live, 999)).toEqual({ email: "a@b.c", expiresAt: 1_000 });
+    expect(restorePendingAuth(live, 1_000)).toBeNull();
+    expect(restorePendingAuth(null, 0)).toBeNull();
+    expect(restorePendingAuth("{not json", 0)).toBeNull();
+    expect(restorePendingAuth(JSON.stringify({ email: 5 }), 0)).toBeNull();
   });
 });
