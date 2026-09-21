@@ -14305,7 +14305,7 @@ mod tests {
             super::HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
         ] {
             assert!(
-                lock.contains("\ntruststore==0.10.4\n"),
+                lock.lines().any(|l| l.trim() == "truststore==0.10.4"),
                 "truststore pin missing from a lock"
             );
         }

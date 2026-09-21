@@ -180,7 +180,7 @@ const UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS: u64 = 300;
 /// (5xx is not captured). 0 = never seen.
 static UPSTREAM_TLS_INTERCEPTION_LAST_SEEN: AtomicU64 = AtomicU64::new(0);
 const UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS: u64 = 15 * 60;
-const UPSTREAM_TLS_INTERCEPTION_HINT: &str = "Your network is intercepting secure connections, so Headroom cannot verify the AI provider's certificate and requests are failing. Point NODE_EXTRA_CA_CERTS or SSL_CERT_FILE at your organization's CA bundle and restart Headroom, or pause Headroom to send traffic direct. Contact support@extraheadroom.com if you need help.";
+const UPSTREAM_TLS_INTERCEPTION_HINT: &str = "Your network is intercepting secure connections, so Headroom cannot verify the AI provider's certificate and requests are failing. Point SSL_CERT_FILE at your organization's CA bundle and restart Headroom, or pause Headroom to send traffic direct. Contact support@extraheadroom.com if you need help.";
 
 /// True when an upstream error body is the backend's own connection failure on
 /// certificate verification (Python ssl's `CERTIFICATE_VERIFY_FAILED`, or the
@@ -4597,7 +4597,7 @@ mod tests {
             super::now_epoch_secs(),
             std::sync::atomic::Ordering::Relaxed,
         );
-        assert!(upstream_tls_interception_hint().is_some_and(|h| h.contains("NODE_EXTRA_CA_CERTS")));
+        assert!(upstream_tls_interception_hint().is_some_and(|h| h.contains("SSL_CERT_FILE")));
         super::UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(
             super::now_epoch_secs() - super::UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS - 1,
             std::sync::atomic::Ordering::Relaxed,
