@@ -2083,9 +2083,15 @@ fn report_upstream_error(
     // thread: this runs on the forwarding task) rather than within the hour;
     // the user is failing every prompt until it lands. Before the Sentry
     // throttle so a retry storm still gets exactly one repair per interval.
-    if status == 401 && client == "codex" {
+    // The slot is claimed HERE, on this task, because it is a bare mutex:
+    // spawning first and throttling inside the thread cost one OS thread per
+    // 401, and in this state every prompt 401s and Codex retries.
+    if status == 401
+        && client == "codex"
+        && crate::client_adapters::claim_codex_missing_bearer_slot()
+    {
         std::thread::spawn(|| {
-            if crate::client_adapters::repair_codex_missing_bearer() {
+            if crate::client_adapters::repair_codex_missing_bearer_now() {
                 log::info!("codex missing-bearer 401: provider block repaired");
             }
         });
@@ -2226,6 +2232,10 @@ fn codex_error_summary(body: &[u8]) -> String {
 /// quote/bracket characters an echoed request fragment would carry. Anything
 /// else is dropped, so the "no free text to Sentry" rule bends only for a
 /// bounded, structure-free string.
+///
+/// `@` is on the blocklist with the brackets: an auth error is exactly where a
+/// backend names the account it rejected, and `scrub_event` only knows how to
+/// redact `$HOME` paths, so an address in here would reach Sentry verbatim.
 fn safe_detail_text(json: &serde_json::Value) -> Option<String> {
     const MAX_LEN: usize = 120;
     let detail = json.get("detail")?.as_str()?.trim();
@@ -2233,7 +2243,10 @@ fn safe_detail_text(json: &serde_json::Value) -> Option<String> {
         && detail.len() <= MAX_LEN
         && detail.chars().all(|c| {
             c.is_ascii_graphic()
-                && !matches!(c, '"' | '\'' | '{' | '}' | '[' | ']' | '<' | '>' | '\\')
+                && !matches!(
+                    c,
+                    '"' | '\'' | '{' | '}' | '[' | ']' | '<' | '>' | '\\' | '@'
+                )
                 || c == ' '
         });
     plain.then(|| detail.to_string())
@@ -5736,6 +5749,12 @@ mod tests {
         );
         let long = format!(r#"{{"detail":"{}"}}"#, "a".repeat(121));
         assert!(!codex_error_summary(long.as_bytes()).contains("detail="));
+        // An auth error naming the rejected account is the likeliest way a
+        // real address ends up here, and extras are only scrubbed for $HOME.
+        assert!(!codex_error_summary(
+            br#"{"detail":"user jeremy@example.com is not authorized for this org"}"#
+        )
+        .contains("detail="));
         // `{"error": "..."}` — error present but a string, so no fields resolve.
         assert_eq!(
             codex_error_summary(br#"{"error":"boom"}"#),

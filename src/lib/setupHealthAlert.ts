@@ -310,6 +310,16 @@ export interface StallLineVisibility {
 /// Headroom itself is down, paused or still booting, "no request has come
 /// through" is true but "restart your terminal" is advice that cannot work -
 /// the same reasoning as `intercept_bind_failed` in the Rust nudge.
+///
+/// Deliberately NOT gated on lifetime tokens saved, which the Home banner also
+/// checked (`< 1_000_000`) until 2026-09-21. That bound belonged to the
+/// sibling "check back later" copy, which is new-install reassurance; it was
+/// never a judgement about this line. Dropping it widens exactly one case: the
+/// DRIFT body now reaches established installs. That is the case drift is for
+/// - `savingsDrifted` requires traffic flowing with literally zero savings
+/// across the whole window, so a user who has banked 5M tokens and is now
+/// saving none has a regression worth being told about, and was the one person
+/// guaranteed not to hear it.
 export function shouldShowStallBannerLine({
   stallBannerLine,
   tone,

@@ -13690,6 +13690,19 @@ pub(crate) fn onnx_probe_crashed(verdict: &str) -> bool {
 /// specific: nothing but the CPython distribution we unpack lives there. The
 /// venv (`runtime/venv/lib/...`) and site-packages are a different directory
 /// and a different repair, already handled above.
+///
+/// The damage has to be ATTRIBUTED to a base-stdlib frame, not merely
+/// co-occur with one in the same text. Our venv holds only `site-packages`,
+/// so its stdlib IS the base install: every traceback the proxy ever emits
+/// carries `/runtime/python/lib/...` frames, because `asyncio.run` and
+/// uvicorn's entry path both live there. A plain `contains && contains` would
+/// therefore fire on any `NameError` from our own code or a dependency, throw
+/// away a 30 MB interpreter that was fine, and - because the caller clears
+/// `allow_repair` - skip the pydantic-core repair that would actually have
+/// fixed it. So: walk the frames, remember which file the most recent one
+/// named, and only believe a damage line that follows a base-stdlib frame.
+/// That is exactly CPython's layout, where the raising frame is the last
+/// `File "..."` line before the exception.
 pub(crate) fn is_corrupt_base_stdlib_signal(text: &str) -> bool {
     // Failures of reading, parsing or executing bytes. Import errors are left
     // out on purpose: a missing or blocked module is Application Control's
@@ -13706,7 +13719,20 @@ pub(crate) fn is_corrupt_base_stdlib_signal(text: &str) -> bool {
     // Separators normalized so one needle covers `runtime\python\Lib` on
     // Windows and `runtime/python/lib/python3.12` everywhere else.
     let text = text.to_ascii_lowercase().replace('\\', "/");
-    text.contains("/runtime/python/lib/") && DAMAGE.iter().any(|d| text.contains(d))
+    // Whether the frame we are currently inside belongs to the base stdlib.
+    // Reset by every new frame, so a base frame deeper in the stack cannot
+    // lend its verdict to a site-packages frame that raised.
+    let mut raised_in_base_stdlib = false;
+    for line in text.lines() {
+        if let Some(frame) = line.trim_start().strip_prefix("file \"") {
+            raised_in_base_stdlib = frame.contains("/runtime/python/lib/");
+            continue;
+        }
+        if raised_in_base_stdlib && DAMAGE.iter().any(|d| line.contains(d)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Structured error emitted when the headroom proxy subprocess fails to open
@@ -15376,6 +15402,44 @@ print("OK fm")
         assert!(crate::is_blocked_runtime_dll_signal(app_control));
 
         assert!(!super::is_corrupt_base_stdlib_signal(""));
+    }
+
+    /// The shape that matters more than RUST-BA itself, because it is the
+    /// COMMON one: our venv holds only `site-packages`, so its stdlib is the
+    /// base install and every traceback under `asyncio.run` carries base
+    /// frames. A `NameError` in our own code therefore sits in the same text
+    /// as `/runtime/python/lib/`, and a co-occurrence test would answer
+    /// "corrupt interpreter" to an ordinary bug - deleting a healthy 30 MB
+    /// runtime and skipping the repair that would have worked.
+    #[test]
+    fn a_bug_in_our_own_code_under_asyncio_is_not_a_corrupt_interpreter() {
+        let ours_raised_under_base_frames = "Traceback (most recent call last):\n  \
+             File \"/Users/j/Library/Application Support/Headroom/headroom/runtime/python/lib/\
+             python3.12/asyncio/runners.py\", line 194, in run\n    \
+             return runner.run(main)\n  \
+             File \"/Users/j/Library/Application Support/Headroom/headroom/runtime/python/lib/\
+             python3.12/asyncio/base_events.py\", line 687, in run_until_complete\n    \
+             return future.result()\n  \
+             File \"/Users/j/Library/Application Support/Headroom/headroom/runtime/venv/lib/\
+             python3.12/site-packages/headroom/proxy/server.py\", line 412, in _serve\n    \
+             await settings.bind()\n\
+             NameError: name 'settings' is not defined";
+        assert!(
+            !super::is_corrupt_base_stdlib_signal(ours_raised_under_base_frames),
+            "base frames in the stack must not convict a site-packages frame that raised"
+        );
+
+        // Same stack, but the damage really is in the base stdlib: the deepest
+        // frame is the stdlib file, so the verdict flips.
+        let base_frame_raised = "Traceback (most recent call last):\n  \
+             File \"/Users/j/Library/Application Support/Headroom/headroom/runtime/venv/lib/\
+             python3.12/site-packages/headroom/proxy/server.py\", line 27, in <module>\n    \
+             import asyncio\n  \
+             File \"/Users/j/Library/Application Support/Headroom/headroom/runtime/python/lib/\
+             python3.12/asyncio/__init__.py\", line 25, in <module>\n    \
+             __all__ = (base_events.__all__ +\n\
+             NameError: name 'base_events' is not defined";
+        assert!(super::is_corrupt_base_stdlib_signal(base_frame_raised));
     }
 
     #[test]

@@ -6372,7 +6372,15 @@ export default function App() {
     if (!tierMismatch?.clamped) return "";
     const ts = Date.parse(tierMismatch.graceEndsAt);
     if (Number.isNaN(ts)) return "";
-    return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    const since = new Date(ts);
+    // The year only when it is not this one. mismatch_since persists across
+    // launches, so a machine dormant since last autumn would otherwise read
+    // "since Sep 21" and sound like last week.
+    return since.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      ...(since.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }),
+    });
   })();
   const sortedClaudeProjects = [...claudeProjects].sort((left, right) => {
     const leftTime = Date.parse(left.lastWorkedAt);
@@ -6800,7 +6808,11 @@ export default function App() {
         {tierMismatch ? (
           <section
             className={`tier-mismatch-banner${tierMismatch.clamped ? " tier-mismatch-banner--clamped" : ""}`}
-            role="alert"
+            // status, not alert: this is a standing condition, not an event.
+            // Now that it renders outside every pane it is mounted for the
+            // whole session, and role="alert" made a screen reader re-announce
+            // it on each view switch.
+            role="status"
           >
             <div className="tier-mismatch-banner__body">
               <h2 className="tier-mismatch-banner__title">

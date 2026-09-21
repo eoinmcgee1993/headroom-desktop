@@ -391,6 +391,19 @@ describe("app helpers", () => {
       expect(introSaleBadgeLabel(null)).toBeNull();
     });
 
+    // The annual fallback divides by 12, so a duration that does not divide it
+    // yields 8.333333333333334 and the badge would print all of it. Rounded
+    // DOWN, so the badge never claims more discount than the invoice gives.
+    it("prints a printable percent on the annual badge", () => {
+      const awkward: IntroOffer = { active: true, percentOff: 50, durationMonths: 2 };
+      expect(introSaleBadgeLabel(awkward, "annual")).toBe("8.3% off your first year");
+      // Today's live constants, whose fallback is also not a whole number.
+      const live: IntroOffer = { active: true, percentOff: 25, durationMonths: 3 };
+      expect(introSaleBadgeLabel(live, "annual")).toBe("6.2% off your first year");
+      // A whole number keeps no decimal point.
+      expect(introSaleBadgeLabel(live, "monthly")).toBe("25% off first 3 months");
+    });
+
     it("drives discounted monthly prices from the intro offer", () => {
       const result = getUpgradePlans(
         "individual", "free", undefined, undefined, undefined, false, "monthly",

@@ -790,17 +790,30 @@ pub fn repair_client_setups() -> Vec<String> {
 /// bounded to once per five minutes so a retry loop cannot churn config.toml,
 /// and only while the connector is still enabled (the pricing gate disables it
 /// on purpose and must not be fought).
-pub fn repair_codex_missing_bearer() -> bool {
+/// Claim the next repair slot, or `false` if one was claimed under five
+/// minutes ago. One mutex and no I/O, because this is what the forwarding task
+/// calls on EVERY 401: in the missing-bearer state every prompt 401s and Codex
+/// retries, so deciding this inside a spawned thread meant one OS thread per
+/// failed response whose whole job was to take this lock and give up. Claim
+/// first, spawn only on success.
+pub fn claim_codex_missing_bearer_slot() -> bool {
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
     static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
-    {
-        let mut last = LAST.get_or_init(|| Mutex::new(None)).lock().unwrap();
-        if last.is_some_and(|at| at.elapsed() < Duration::from_secs(300)) {
-            return false;
-        }
-        *last = Some(Instant::now());
+    let mut last = LAST.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    if last.is_some_and(|at| at.elapsed() < Duration::from_secs(300)) {
+        return false;
     }
+    *last = Some(Instant::now());
+    true
+}
+
+/// The repair itself, unthrottled: [`claim_codex_missing_bearer_slot`] is the
+/// throttle, and both the enabled check and the rewrite touch the filesystem,
+/// so this belongs on a thread of its own rather than the forwarding task.
+pub fn repair_codex_missing_bearer_now() -> bool {
+    // Only while the connector is still enabled: the pricing gate disables it
+    // on purpose and must not be fought.
     if !is_codex_enabled() {
         return false;
     }
@@ -5523,9 +5536,13 @@ const CLAUDE_GUARD_STATUS_MESSAGE: &str = "Verifying Headroom route";
 /// somewhere else. Only the guard, inheriting the agent's environment, can see
 /// those - and until now it wrote its verdict to stderr and dropped it.
 pub fn read_guard_verdict(client_id: &str) -> Option<Vec<String>> {
+    // Explicit on both sides: a `_ => claude` fallback would hand the next
+    // client id added to `detect_unrouted_clients` Claude's verdict under
+    // another agent's name, which is worse than no diagnosis at all.
     let path = match client_id {
-        "codex" => codex_guard_hook_path(),
-        _ => claude_guard_hook_path(),
+        "codex" | "codex_cli" => codex_guard_hook_path(),
+        "claude_code" | "claude" => claude_guard_hook_path(),
+        _ => return None,
     }
     .with_file_name(".headroom-guard-verdict.json");
     let raw = std::fs::read_to_string(path).ok()?;
@@ -11418,14 +11435,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         )
         .unwrap();
 
+        // Exactly what the 401 hook does: claim the slot on the caller, then
+        // do the filesystem work.
+        assert!(super::claim_codex_missing_bearer_slot(), "first 401 claims");
         assert!(
-            super::repair_codex_missing_bearer(),
+            super::repair_codex_missing_bearer_now(),
             "stale block is repaired"
         );
         let toml = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
         assert!(toml.contains("requires_openai_auth = true"), "got:\n{toml}");
-        // Five-minute throttle: a retry loop of 401s must not churn the file.
-        assert!(!super::repair_codex_missing_bearer());
+        // Five-minute throttle: a retry loop of 401s must not churn the file,
+        // and must not get as far as spawning a thread to find that out.
+        assert!(!super::claim_codex_missing_bearer_slot());
     }
 
     /// The guards are Python built through `format!`, so a single unescaped

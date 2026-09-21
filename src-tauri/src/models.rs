@@ -1301,7 +1301,20 @@ pub type PlanPrices = std::collections::HashMap<String, std::collections::HashMa
 #[serde(rename_all = "camelCase", default)]
 pub struct IntroOffer {
     pub active: bool,
+    /// Percent off the first `duration_months` months, on MONTHLY plans only.
     pub percent_off: i64,
+    /// Percent off the first yearly invoice. Not `percent_off` rescaled: since
+    /// 2026-09 the two billing periods carry independent discounts (monthly
+    /// 25% off three months, annual 12.5% off one invoice), so this cannot be
+    /// derived from the monthly number. `None` from servers predating the
+    /// split, and the frontend then falls back to
+    /// `percent_off * duration_months / 12`, which is what the single percent
+    /// always meant on a yearly invoice.
+    ///
+    /// f64, not i64: the annual percent is fractional (12.5). Dropping this
+    /// field is not a visible error, it just silently prices annual off the
+    /// fallback -- which is how a build shipped quoting 6.25%.
+    pub annual_percent_off: Option<f64>,
     pub duration_months: i64,
 }
 
@@ -1501,6 +1514,42 @@ mod tests {
         assert_eq!(back.nudge_level, 2);
         assert_eq!(back.secondary.unwrap().used_percent, 80.0);
         assert!(back.primary.is_none());
+    }
+
+    #[test]
+    fn intro_offer_carries_the_annual_percent_through_to_the_frontend() {
+        // The frontend prices the annual tab off annualPercentOff. serde drops
+        // unknown fields, so a struct missing it deserializes fine and quietly
+        // hands the frontend nothing -- which shipped an annual card quoting
+        // 6.25% (the fallback) instead of the 12.5% Polar actually charges.
+        let value = json!({
+            "active": true,
+            "percentOff": 25,
+            "annualPercentOff": 12.5,
+            "durationMonths": 3,
+        });
+        let offer: IntroOffer = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(offer.percent_off, 25);
+        assert_eq!(offer.annual_percent_off, Some(12.5));
+        assert_eq!(offer.duration_months, 3);
+        // Round-trips back out unchanged: the desktop re-serializes this to the
+        // webview, so a field that survives parsing but not emitting is the
+        // same bug one layer along.
+        assert_eq!(serde_json::to_value(&offer).unwrap(), value);
+    }
+
+    #[test]
+    fn intro_offer_without_the_annual_percent_stays_deserializable() {
+        // Servers predating the split send only percentOff; the frontend
+        // derives the annual number itself in that case.
+        let offer: IntroOffer = serde_json::from_value(json!({
+            "active": true,
+            "percentOff": 50,
+            "durationMonths": 3,
+        }))
+        .unwrap();
+        assert_eq!(offer.annual_percent_off, None);
+        assert_eq!(offer.percent_off, 50);
     }
 
     #[test]

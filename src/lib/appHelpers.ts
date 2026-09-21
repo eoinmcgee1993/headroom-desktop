@@ -166,8 +166,19 @@ export function introSaleBadgeLabel(
   const pct = introPercentOff(introOffer, billingPeriod);
   if (pct <= 0 || !introOffer) return null;
   return billingPeriod === "annual"
-    ? `${pct}% off your first year`
-    : `${pct}% off first ${introOffer.durationMonths} months`;
+    ? `${percentLabel(pct)}% off your first year`
+    : `${percentLabel(pct)}% off first ${introOffer.durationMonths} months`;
+}
+
+/// A percent fit to print: one decimal at most, and no trailing ".0". Mirrors
+/// Pricing::IntroOffer#percent_label on the server.
+///
+/// Rounded DOWN, not to nearest: the annual fallback derives its percent
+/// (`percentOff * durationMonths / 12`), and a duration that does not divide
+/// 12 gives things like 8.333333333333334. Quoting less than we charge is the
+/// safe direction for a number a customer will compare against their invoice.
+function percentLabel(pct: number): string {
+  return String(Math.floor(pct * 10) / 10);
 }
 
 /// What a new subscriber pays over their first twelve months, in cents, given
