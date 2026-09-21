@@ -6064,6 +6064,11 @@ pub fn run() {
     // records flow into Sentry too. Failure here cannot abort startup.
     let _ = logging::init();
 
+    // Attribute every later event (including panics from threads that never
+    // touched the Sentry scope) to this install. Off-thread on purpose: see
+    // logging::spawn_install_id_resolver.
+    logging::spawn_install_id_resolver();
+
     // Linux AppImage launches export PYTHONHOME pointing into the transient
     // /tmp/.mount_* squashfs (RUST-5C/RUST-1M: the managed venv's python
     // resolved its stdlib there and exited 1 before the proxy port opened,

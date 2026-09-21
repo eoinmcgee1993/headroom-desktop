@@ -574,7 +574,32 @@ pub(crate) fn set_sentry_user(email: Option<String>, tier: Option<String>) {
         email.map(|email| (email, tier.unwrap_or_else(|| "none".into())));
 }
 
+/// sha256 of the hardware UUID, the same value `trial_identities.machine_id_digest`
+/// stores, so a crash can be joined to an install even when nobody is signed in.
+/// Sentry's own identity fields were empty on every fatal before this: RUST-HF/HG
+/// named a hostname and an IP geo, and neither exists in our database, so the
+/// crashing user was unidentifiable.
+static SENTRY_INSTALL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Resolve the install id off the boot path. `device::current()` shells out to
+/// ioreg/reg and reads the keychain, so it belongs on neither the first
+/// milliseconds of `run()` nor inside [`sanitize_event`] - that runs in the
+/// panic hook, where re-entering `device`'s own (non-reentrant) mutex would hang
+/// a dying process instead of letting it die. A crash in the window before this
+/// lands simply carries no id.
+pub(crate) fn spawn_install_id_resolver() {
+    std::thread::spawn(|| {
+        let _ = SENTRY_INSTALL.set(crate::device::current().machine_id_digest);
+    });
+}
+
 fn attach_sentry_user(event: &mut sentry::protocol::Event<'static>) {
+    if let Some(install) = SENTRY_INSTALL.get() {
+        let user = event.user.get_or_insert_with(Default::default);
+        if user.id.is_none() {
+            user.id = Some(install.clone());
+        }
+    }
     let guard = SENTRY_USER.read().unwrap_or_else(|e| e.into_inner());
     let Some((email, tier)) = guard.as_ref() else {
         return;
@@ -1530,8 +1555,24 @@ mod tests {
         let mut event = sentry::protocol::Event::new();
         event.message = Some("signed out".into());
         let sent = super::sanitize_event(event).unwrap();
-        assert!(sent.user.is_none());
+        // The install id outlives sign-out by design, so only the account is gone.
+        assert!(sent.user.and_then(|user| user.email).is_none());
         assert!(!sent.tags.contains_key("headroom.tier"));
+    }
+
+    #[test]
+    fn sanitize_event_attributes_events_to_the_install_without_an_account() {
+        let _ = super::SENTRY_INSTALL.set("f00dcafe".repeat(8));
+        let mut event = sentry::protocol::Event::new();
+        event.message = Some("panic: state() called before manage()".into());
+        // Panic captures come off whatever thread died, never the scope's.
+        let sent = std::thread::spawn(move || super::sanitize_event(event).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(
+            sent.user.unwrap().id.as_deref(),
+            Some(super::SENTRY_INSTALL.get().unwrap().as_str())
+        );
     }
 
     #[test]
