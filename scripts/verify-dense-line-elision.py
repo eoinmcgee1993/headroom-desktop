@@ -10,8 +10,8 @@ Checks, in order:
   2. the three real shapes (a script-only page, a raw bundle dump behind a
      path header, a base64 blob) shrink by more than half, carry a "Retrieve
      original: hash=" marker, and the hash retrieves the pre-elision block;
-  3. prose, indented code and JSON-lines output are byte-identical (JSON is
-     SmartCrusher's);
+  3. prose, indented code, JSON-lines output (SmartCrusher's), TSV rows and
+     single dense values (JWT, signed URL, PATH) are byte-identical;
   4. lossless mode never elides;
   5. the messages path (router.apply, the #1307 marker-less lossy gate)
      keeps the elided tool_result instead of restoring the original;
@@ -44,6 +44,11 @@ BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChw
 PROSE = "This is an ordinary paragraph with plenty of spaces in it, " * 12
 CODE = "\n".join(f"    value_{i} = compute(arg_{i}, other_{i})  # comment {i}" for i in range(40))
 JSONL = " ".join(f'{{"file":"src/m_{i}.py","line":{i},"text":"repeated search payload"}}' for i in range(160))
+# Values the agent asked for: dense by the space ratio, but never a dump.
+TSV = "\n".join("\t".join(f"column_{i}_value_{j}" for i in range(35)) for j in range(5))
+JWT = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4iLCJpYXQiOjE1MTYyMzkwMjJ9" * 12 + ".sig"
+SIGNED_URL = "https://d1.cloudfront.net/video.mp4?Policy=" + "A" * 500 + "&Signature=" + "b" * 128 + "&Key-Pair-Id=APKA"
+PATH_LINE = "PATH=" + ":".join(f"/opt/homebrew/opt/package{i}/bin" for i in range(24))
 
 
 def main() -> int:
@@ -77,7 +82,11 @@ def main() -> int:
             key = out.rsplit("hash=", 1)[1].rstrip("]\n")
             check(get_compression_store().retrieve(key) is not None, f"{label} hash retrieves the pre-elision block")
 
-    for label, text in (("prose", PROSE), ("indented code", CODE), ("JSON lines", JSONL)):
+    for label, text in (
+        ("prose", PROSE), ("indented code", CODE), ("JSON lines", JSONL),
+        ("TSV rows", HEADER + TSV), ("bare JWT", HEADER + JWT),
+        ("signed URL", HEADER + SIGNED_URL), ("env PATH", HEADER + PATH_LINE),
+    ):
         r = router.compress(text, context="tool_result").compressed
         check("content elided" not in r, f"{label} never elided")
 

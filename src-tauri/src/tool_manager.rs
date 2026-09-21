@@ -2611,8 +2611,10 @@ if _hd_kmg_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # at ratio 1.0 and the session compressed at 7 percent of new input; the
 # same session replayed with elision reached 25 percent. The vendor wraps the
 # router's strategy dispatch: after the wheel's own chain has run, every
-# line of >= 300 chars with < 6 percent spaces (not JSON-shaped: that is
-# SmartCrusher's) keeps its head and tail and the middle becomes a marker.
+# line of >= 300 chars with < 6 percent spaces (no tabs, not JSON-shaped:
+# that is SmartCrusher's) keeps its head and tail and the middle becomes a
+# marker, but only when the block carries >= 2000 chars of such lines: a
+# lone JWT / signed URL / PATH is a value the agent asked for, not a dump.
 # The pre-elision block goes into the CCR store and a "Retrieve original:
 # hash=" marker is appended, so the messages path's marker-less lossy gate
 # (#1307) keeps the result and the agent can recover exact bytes. Only after
@@ -2640,7 +2642,9 @@ if _hd_dle_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 
                 def _hd_dle_is_dense(line):
                     n = len(line)
-                    if n < 300 or (line.count(" ") / n) >= 0.06:
+                    # Tabs: TSV/psql -A rows are dense by the space ratio but are
+                    # data the agent asked for; minified/base64 never carry tabs.
+                    if n < 300 or "\t" in line or (line.count(" ") / n) >= 0.06:
                         return False
                     stripped = line.strip()
                     return not (stripped[:1] in "{[" and stripped[-1:] in "}]")
@@ -2648,9 +2652,15 @@ if _hd_dle_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 def _hd_dle_elide(text):
                     if len(text) < 300:
                         return text, 0
+                    # A single dense line (JWT, signed URL, PATH, modulus) is a
+                    # VALUE the agent asked for, not a dump: only elide when the
+                    # block carries >= 2000 chars of dense content.
+                    lines = text.split("\n")
+                    if sum(len(l) for l in lines if _hd_dle_is_dense(l)) < 2000:
+                        return text, 0
                     out = []
                     n_elided = 0
-                    for line in text.split("\n"):
+                    for line in lines:
                         if _hd_dle_is_dense(line):
                             out.append(
                                 line[:160]
