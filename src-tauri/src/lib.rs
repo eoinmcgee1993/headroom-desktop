@@ -10889,12 +10889,19 @@ mod tests {
         assert_eq!(event.provider.as_deref(), Some("anthropic"));
         assert_eq!(event.tokens_saved, Some(750));
         assert_eq!(event.transforms_applied, vec!["interceptor:ast-grep"]);
-        // New-input basis: 750 / (750 + 2000 + 250), not the feed's 75%.
+        // New-input basis: 750 / (750 + 2000 + 250), not the feed's 75%, and
+        // the in/out pair is the overview's baseline -> new input, not the
+        // transcript's 1000 -> 250.
         assert_eq!(event.savings_percent, Some(25.0));
-        // No split reported (vendor unbound): the feed's figure stands.
+        assert_eq!(event.input_tokens_original, Some(3000));
+        assert_eq!(event.input_tokens_optimized, Some(2250));
+        // No split reported (vendor unbound): the feed's figures stand.
         assert_eq!(result.transformations[1].savings_percent, Some(3.1));
-        // Nothing new entered context: no percent, like the chart.
-        assert_eq!(result.transformations[2].savings_percent, None);
+        // Nothing new entered context: no percent and no pair, like the chart.
+        let cached = &result.transformations[2];
+        assert_eq!(cached.savings_percent, None);
+        assert_eq!(cached.input_tokens_original, None);
+        assert_eq!(cached.input_tokens_optimized, None);
     }
 
     #[test]
@@ -10908,10 +10915,14 @@ mod tests {
         };
         event.apply_new_input_basis();
         assert_eq!(event.savings_percent, Some(0.0));
-        // saved 300 against 100 new input: 300 / (300 + 100).
+        assert_eq!(event.input_tokens_original, Some(100));
+        assert_eq!(event.input_tokens_optimized, Some(100));
+        // saved 300 against 100 new input: 300 / (300 + 100), pair 400 -> 100.
         event.tokens_saved = Some(300);
         event.apply_new_input_basis();
         assert_eq!(event.savings_percent, Some(75.0));
+        assert_eq!(event.input_tokens_original, Some(400));
+        assert_eq!(event.input_tokens_optimized, Some(100));
     }
 
     #[test]

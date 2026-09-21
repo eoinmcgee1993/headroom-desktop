@@ -610,9 +610,15 @@ impl TransformationFeedEvent {
     /// uncached + cache_write). The feed's own `savings_percent` divides by
     /// the whole transcript, cached prefix included, so in a long agentic
     /// session a request the overview rates at 20%+ read as ~3% here and the
-    /// "large compression" tile starved (stuck from 2026-09-10). Left as-is
-    /// when the backend does not report the split; `None` when nothing new
-    /// entered context, matching the chart, which skips such buckets.
+    /// "large compression" tile starved (stuck from 2026-09-10).
+    ///
+    /// The in/out pair moves with it, or the tile reads "66% on
+    /// 183,904 -> 167,728": `input_tokens_original` becomes the overview's
+    /// "Baseline" (new input plus what Headroom removed) and
+    /// `input_tokens_optimized` the new input that reached the provider.
+    /// Left as-is when the backend does not report the split; percent and
+    /// pair are `None` when nothing new entered context, matching the chart,
+    /// which skips such buckets.
     pub fn apply_new_input_basis(&mut self) {
         let (Some(uncached), Some(cache_write)) =
             (self.uncached_input_tokens, self.cache_write_tokens)
@@ -622,10 +628,15 @@ impl TransformationFeedEvent {
         let new_input = uncached.saturating_add(cache_write);
         if new_input == 0 {
             self.savings_percent = None;
+            self.input_tokens_original = None;
+            self.input_tokens_optimized = None;
             return;
         }
-        let saved = self.tokens_saved.unwrap_or(0).max(0) as f64;
-        self.savings_percent = Some((saved / (saved + new_input as f64) * 100.0).min(100.0));
+        let saved = u64::try_from(self.tokens_saved.unwrap_or(0)).unwrap_or(0);
+        let baseline = saved.saturating_add(new_input);
+        self.savings_percent = Some((saved as f64 / baseline as f64 * 100.0).min(100.0));
+        self.input_tokens_original = Some(baseline);
+        self.input_tokens_optimized = Some(new_input);
     }
 }
 

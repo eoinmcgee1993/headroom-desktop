@@ -408,8 +408,10 @@ export interface TransformationFeedEvent {
   inputTokensOriginal?: number | null;
   inputTokensOptimized?: number | null;
   tokensSaved?: number | null;
-  // New-input basis (saved / (saved + uncached + cache-write)), the same
-  // rate as the overview; rewritten in Rust (models.rs apply_new_input_basis).
+  // New-input basis, the same as the overview chip: inputTokensOriginal is
+  // the baseline (new input + removed), inputTokensOptimized the new input
+  // that reached the provider, savingsPercent their ratio. Rewritten in Rust
+  // (models.rs apply_new_input_basis); the transcript-wide figures are gone.
   savingsPercent?: number | null;
   transformsApplied: string[];
   workspace?: string | null;
