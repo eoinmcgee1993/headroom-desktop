@@ -456,8 +456,12 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // and model list are baked into the text). Same split as the intercept-port
     // and backend-port lines above. Keep the local log -- it is what a support
     // thread reads -- and drop the Sentry twin.
+    // The compression-quarantine canary joined the split late: its bridged twin
+    // opened RUST-HE next to the capture, RUST-HD, in the same millisecond.
     if target.starts_with("headroom_desktop_lib::savings_canary")
-        && (msg.starts_with("zero-savings canary:") || msg.starts_with("savings-basis canary:"))
+        && (msg.starts_with("zero-savings canary:")
+            || msg.starts_with("savings-basis canary:")
+            || msg.starts_with("compression-quarantine canary:"))
     {
         return true;
     }
@@ -927,6 +931,20 @@ mod tests {
         assert!(!super::skip_sentry(
             "headroom_desktop_lib",
             "transformations feed returned an unparseable payload"
+        ));
+    }
+
+    /// RUST-HD (the capture) and RUST-HE (this warn) for one detection.
+    #[test]
+    fn skips_the_compression_quarantine_canary_log_twin() {
+        assert!(super::skip_sentry(
+            "headroom_desktop_lib::savings_canary",
+            "compression-quarantine canary: 48 of 560 requests (8.6%) were refused compression after 5 quarantine activation(s), 9.6 requests lost per activation; one slow compression worker starves every request behind it"
+        ));
+        // The capture's own message must still go through.
+        assert!(!super::skip_sentry(
+            "headroom_desktop_lib::savings_canary",
+            "compression_quarantine_canary: 48 of 560 requests forwarded with NO compression (8.6%) after 5 timeout-debt quarantine(s)"
         ));
     }
 
