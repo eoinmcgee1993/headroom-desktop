@@ -2774,10 +2774,15 @@ if _hd_dle_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # costs ~1.6 ms/word and serializes (concurrency 1), opt_ms reached 67s on a
 # 245k-token request, and 250 requests were refused compression in one day --
 # ~3.56M tokens, 8.7% of that day's achievable savings.
-# A ContextVar, not a threading.local: the router's Pass 2 fan-out compresses
-# blocks on spawned threads and explicitly contextvars.copy_context()s into
-# them, so a thread-local origin would be lost for exactly the multi-block
-# requests this exists to bound.
+# A ContextVar, not a threading.local, plus context-propagating subclasses
+# for content_router's two thread-spawning names: the Pass 2 fan-out runs
+# every string-content cache miss on ThreadPoolExecutor workers (2+) or one
+# watchdog Thread (exactly 1), and on Python 3.12 neither inherits the
+# caller's context by itself (only asyncio.to_thread does). Without the
+# subclasses the origin was None on every fan-out thread and each string
+# block got its own budget again (measured 2026-09-22: 3 tool msgs ->
+# origins [None, None, None]). Content-block messages compress inline on the
+# apply() thread and never needed this.
 # Self-neutralizes once the wheel carries the fix (KompressCompressor grows
 # `shares_request_deadline`). Exact-pin gated to wheel 0.37.0. Kill switch:
 # HEADROOM_KOMPRESS_REQUEST_DEADLINE=0.
@@ -2792,6 +2797,7 @@ if _hd_krd_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 
             if not hasattr(_hd_krd_kc.KompressCompressor, "shares_request_deadline"):
                 import contextvars as _hd_krd_cv
+                import threading as _hd_krd_threading
                 import time as _hd_krd_time
 
                 _hd_krd_origin = _hd_krd_cv.ContextVar(
@@ -2833,6 +2839,33 @@ if _hd_krd_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                         self, contents, *args, **_hd_krd_with_origin(kwargs)
                     )
 
+                class _HdKrdExecutor(_hd_krd_cr.ThreadPoolExecutor):
+                    # Pass 2 parallel path. Same copy_context() per submit
+                    # that asyncio.to_thread does.
+                    def submit(self, fn, /, *args, **kwargs):
+                        ctx = _hd_krd_cv.copy_context()
+                        return super().submit(ctx.run, fn, *args, **kwargs)
+
+                class _HdKrdThread(_hd_krd_cr.threading.Thread):
+                    # Pass 2 single-cache-miss watchdog path.
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self._hd_krd_ctx = _hd_krd_cv.copy_context()
+
+                    def run(self):
+                        self._hd_krd_ctx.run(super().run)
+
+                class _HdKrdThreading:
+                    # Module-scoped stand-in for content_router's `threading`
+                    # name so only ITS Thread() calls change; every other
+                    # attribute is the real module's.
+                    Thread = _HdKrdThread
+
+                    def __getattr__(self, name):
+                        return getattr(_hd_krd_threading, name)
+
+                _hd_krd_cr.ThreadPoolExecutor = _HdKrdExecutor
+                _hd_krd_cr.threading = _HdKrdThreading()
                 _hd_krd_cr.ContentRouter.apply = _hd_krd_apply
                 _hd_krd_kc.KompressCompressor.compress = _hd_krd_compress
                 _hd_krd_kc.KompressCompressor.compress_batch = _hd_krd_batch

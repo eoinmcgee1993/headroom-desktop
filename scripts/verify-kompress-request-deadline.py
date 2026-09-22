@@ -132,5 +132,37 @@ router.apply(messages("b"), tok, force_kompress=True)
 fresh = set(rec.origins) - first
 check(len(fresh) == 1, f"the next request gets a fresh origin ({sorted(fresh)})")
 
+
+
+def string_tool_messages(salt: str, n: int) -> list[dict]:
+    """OpenAI/Codex shape: role:"tool" with STRING content.
+
+    Unlike content blocks these are not compressed inline: apply() defers every
+    cache miss to Pass 2, which runs them on ThreadPoolExecutor workers (2+) or
+    a watchdog Thread (exactly 1). Neither inherits contextvars on its own, so
+    this is the half the vendor has to patch explicitly; rc.1-rc.3 did not and
+    every origin here was None.
+    """
+    return [
+        {
+            "role": "tool",
+            "tool_call_id": f"call_{salt}_{k}",
+            "content": " ".join(
+                f'{{"file":"src/mod_{i}.py","line":{i},"text":"payload {salt}{k}"}}'
+                for i in range(160)
+            ),
+        }
+        for k in range(n)
+    ]
+
+
+for label, n in (("executor fan-out", 3), ("single watchdog thread", 1)):
+    rec = OriginReader()
+    router._get_kompress = lambda rec=rec: rec  # type: ignore[method-assign]
+    router.apply(string_tool_messages(label[:4], n), tok, force_kompress=True)
+    check(len(rec.origins) == n, f"{label}: all {n} string blocks reached kompress ({len(rec.origins)})")
+    check(all(o is not None for o in rec.origins), f"{label}: every block sees a live origin")
+    check(len(set(rec.origins)) == 1, f"{label}: one origin for the request ({rec.origins})")
+
 print("FAILURES:", failures if failures else "none")
 sys.exit(1 if failures else 0)
