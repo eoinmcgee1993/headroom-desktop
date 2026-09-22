@@ -6766,6 +6766,13 @@ fn parse_output_reduction(root: &Value) -> Option<OutputReduction> {
     // and blows up (e.g. -6130%), which the dashboard renders as a
     // double-negative "Output −-6,130.7%". Treat an out-of-range estimate as
     // "baseline not ready yet" and hide the stat, same as available:false.
+    // Wheel 0.38.0 (#3386) emits the block with `available: true` and
+    // `method: "inactive"` when the shaper is off, so the ledger's stale
+    // estimate is not advertised as a live layer. That is a non-claim, not a
+    // zero-percent claim.
+    if node.get("method").and_then(Value::as_str) == Some("inactive") {
+        return None;
+    }
     let reduction_percent = node
         .get("reduction_percent")
         .and_then(Value::as_f64)
@@ -12462,6 +12469,19 @@ mod tests {
         // No rollout block (older wheel) => unknown, and the report gate must
         // stay open rather than mislabel the layer inactive.
         assert_eq!(fallback.output_shaper_active, None);
+        // 0.38.0 emits the layer as available-but-inactive on a shaper-off
+        // deployment; that must not parse as a 0% estimate.
+        let inactive = parse_headroom_stats_from_json(
+            r#"{
+                "requests": { "total": 1 },
+                "savings": { "by_layer": { "output_shaping": {
+                    "available": true, "active": false, "method": "inactive",
+                    "reduction_percent": 0.0, "requests": 0
+                } } }
+            }"#,
+        )
+        .expect("inactive fixture must parse");
+        assert!(inactive.output_reduction.is_none());
     }
 
     #[test]
