@@ -12874,7 +12874,11 @@ mod tests {
         std::fs::write(dir.join("proxy.log"), b"old").unwrap();
         std::fs::write(dir.join("proxy-stdio-6768.log"), b"stdout").unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::open(dir.join("proxy.log"))
+        // Write access: on Windows `set_modified` needs FILE_WRITE_ATTRIBUTES,
+        // which a read-only `File::open` handle lacks (Access is denied).
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("proxy.log"))
             .unwrap()
             .set_modified(old)
             .unwrap();
