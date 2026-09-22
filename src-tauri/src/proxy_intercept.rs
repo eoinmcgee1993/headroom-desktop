@@ -1321,6 +1321,28 @@ async fn handle(
                 _ => INTERCEPT_CLAUDE_REQUESTS.fetch_add(1, Ordering::AcqRel),
             };
             crate::usage_counters::record_request(client_key);
+            // Telemetry-only subset of `claude-code`, to size which Claude
+            // Code surface the fleet actually uses: the VS Code panel renders
+            // no custom statusLine (its webview bundle has no statusline code
+            // at all), the terminal TUI does, so a statusLine feature is
+            // invisible to VS Code users and we have no fleet number for that
+            // split.
+            //
+            // Recorded as an EXTRA key rather than by splitting `claude-code`
+            // in two. That bucket feeds `requests_since_yesterday`, which
+            // feeds `client_ran_unrouted`: a VS Code-only user reading zero
+            // requests there would trip the false "ran without Headroom"
+            // alert, which is exactly the 0.9.11 regression. So
+            // `claude-code-vscode` is a SUBSET of `claude-code`, never a
+            // sibling - never sum this map. The intercept atomics above are a
+            // separate store and stay disjoint, so `.values().sum()` on them
+            // is unaffected.
+            if client_key == "claude-code"
+                && extract_header_value(&buf, "user-agent")
+                    .is_some_and(|ua| is_vscode_claude_ua(&ua))
+            {
+                crate::usage_counters::record_request("claude-code-vscode");
+            }
         }
     }
 
@@ -3460,6 +3482,18 @@ fn is_codex_request_head(head: &ParsedRequestHead) -> bool {
     is_openai_path(&head.path) || is_codex_models_fetch(head)
 }
 
+/// Return true if a Claude Code User-Agent came from the VS Code extension
+/// rather than the terminal. Claude Code names its surface in the parenthesised
+/// client list: `claude-cli/2.1.278 (external, claude-vscode, agent-sdk/0.3.278)`
+/// for the panel, without `claude-vscode` for the terminal TUI.
+///
+/// Matches only the positive marker, never "absence means terminal": new
+/// surfaces (a JetBrains plugin, say) must fall outside this subset rather than
+/// be silently counted as VS Code.
+fn is_vscode_claude_ua(user_agent: &str) -> bool {
+    user_agent.contains("claude-vscode")
+}
+
 /// Return true if the request's Host header targets the loopback listener
 /// and no browser Origin header is present. Protects against DNS-rebinding
 /// attacks that aim the user's browser at 127.0.0.1 via an attacker domain.
@@ -3528,10 +3562,10 @@ mod tests {
         is_codex_request_head, is_codex_sse_response, is_geo_blocked_codex_error,
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
         is_missing_auth_error, is_openai_path, is_prompt_request_head,
-        is_reportable_upstream_error, os_error_key, parse_codex_rate_limit_headers,
-        parse_request_head, parse_response_status, read_http_headers, request_has_header,
-        request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
-        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
+        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
+        response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, should_report_upstream_error,
         stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
         stamp_request_header, strip_request_header, verdict_permits_reuse, BypassFlag,
@@ -4552,6 +4586,23 @@ mod tests {
         assert!(should_report_upstream_error("throttle-test", 497));
         // Same status on another client too: the fingerprint keys on both.
         assert!(should_report_upstream_error("throttle-test-2", 498));
+    }
+
+    #[test]
+    fn vscode_claude_ua_is_detected_from_the_real_user_agent_shapes() {
+        // Captured from ~/.headroom/logs/proxy.log on 2026-09-22.
+        assert!(is_vscode_claude_ua(
+            "claude-cli/2.1.278 (external, claude-vscode, agent-sdk/0.3.278)"
+        ));
+        assert!(is_vscode_claude_ua(
+            "claude-cli/2.1.259 (external, claude-vscode, agent-sdk/0.3.259)"
+        ));
+        // Terminal TUI, and any future surface, must fall outside the subset.
+        assert!(!is_vscode_claude_ua("claude-cli/2.1.278 (external, cli)"));
+        assert!(!is_vscode_claude_ua(
+            "claude-cli/2.1.278 (external, claude-jetbrains)"
+        ));
+        assert!(!is_vscode_claude_ua("opencode/1.18.5"));
     }
 
     #[test]

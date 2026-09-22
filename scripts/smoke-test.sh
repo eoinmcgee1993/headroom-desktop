@@ -108,10 +108,16 @@ installed=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP
 expected=$(jq -r '.version // empty' "$REPO/src-tauri/tauri.conf.json" 2>/dev/null)
 if [ -z "$installed" ]; then
   row FAIL "1 version" "Info.plist unreadable"
-elif [ -n "$expected" ] && [ "$installed" != "$expected" ]; then
-  row FAIL "1 version" "installed $installed, repo says $expected"
-else
+elif [ -z "$expected" ] || [ "$installed" = "$expected" ]; then
   row PASS "1 version" "$installed${expected:+ (matches repo)}"
+# A release branch bumps the repo to the stable X.Y.Z while the build under
+# test is still its last X.Y.Z-rc.N, so an exact match here would FAIL every
+# promotion pass (0.9.18-rc.6 against release/0.9.18, 2026-09-21). Only the
+# rc's OWN stable is accepted: a stale rc from an older line still FAILs.
+elif [[ "$expected" != *-rc.* && "$installed" == "$expected"-rc.* ]]; then
+  row PASS "1 version" "$installed (rc of the repo's $expected; release branch)"
+else
+  row FAIL "1 version" "installed $installed, repo says $expected"
 fi
 
 # --- 2. proxy is intercepting ----------------------------------------------

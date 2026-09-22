@@ -6064,6 +6064,11 @@ pub fn run() {
     // records flow into Sentry too. Failure here cannot abort startup.
     let _ = logging::init();
 
+    // Attribute every later event (including panics from threads that never
+    // touched the Sentry scope) to this install. Off-thread on purpose: see
+    // logging::spawn_install_id_resolver.
+    logging::spawn_install_id_resolver();
+
     // Linux AppImage launches export PYTHONHOME pointing into the transient
     // /tmp/.mount_* squashfs (RUST-5C/RUST-1M: the managed venv's python
     // resolved its stdlib there and exited 1 before the proxy port opened,
@@ -6194,6 +6199,14 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            // First thing in setup, before anything that can pump the Windows
+            // message loop (set_size/center below re-enter the webview and can
+            // dispatch a frontend command): every analytics accessor resolves
+            // this state, and a command arriving before it existed aborted the
+            // process (Sentry RUST-HF/HG).
+            app.manage(analytics::AnalyticsClient::new(
+                app.package_info().version.to_string(),
+            ));
             #[cfg(target_os = "macos")]
             {
                 // Accessory policy makes this a menu-bar-only app (no dock icon).
@@ -6248,9 +6261,6 @@ pub fn run() {
             // which avoids triggering macOS's "Background item added" prompt
             // on first launch.
 
-            app.manage(analytics::AnalyticsClient::new(
-                app.package_info().version.to_string(),
-            ));
             app.manage(TraySessionSavings(Mutex::new(TraySavingsToday::default())));
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
@@ -7319,6 +7329,15 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
             // ask your admin to enable access` -- an org policy on the
             // user's account, and the line names its own remedy.
             || lower.contains("disabled claude subscription access")
+            // RUST-HH: `Usage credits are required for long context requests.`
+            // -- the account is not entitled to the >200k window its CLI asked
+            // for, which is an entitlement on their side, not a prompt we built
+            // too big: the digest is capped at _MAX_DIGEST_TOKENS (80k) and
+            // every item inside it is truncated to 120-300 chars, so it cannot
+            // reach 200k. Deliberately NOT worded with "credit balance", which
+            // is the exhausted-balance line above; this one fires with a full
+            // balance and no long-context entitlement.
+            || lower.contains("credits are required")
     })
 }
 
@@ -12643,6 +12662,10 @@ Some unrelated content.
             "API Error: 404 {\"type\":\"error\",\"error\":{\"type\":\"not_found_error\"}}",
             "Credit balance is too low",
             "Your organization has disabled Claude subscription access for Claude Code \u{b7} Use an Anthropic API key instead, or ask your admin to enable access",
+            // RUST-HH verbatim: the account may not use the >200k window its
+            // CLI asked for. Our digest is capped well under that, so the
+            // entitlement is the whole cause.
+            "Usage credits are required for long context requests.",
         ] {
             let stderr = format!("{marker}{diagnosis}\n  Analysis failed: ...\n");
             assert_eq!(

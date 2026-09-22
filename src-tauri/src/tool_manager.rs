@@ -2761,6 +2761,122 @@ if _hd_dle_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# Kompress request deadline (upstream PR #3693):
+# HEADROOM_COMPRESSION_DEADLINE_MS (20s) is checked at chunk boundaries
+# against a clock compress() starts ITSELF whenever the caller passes no
+# _deadline_started_at -- and nothing in the wheel ever passes one. So the
+# budget bounds a BLOCK, not a request: a request with a dozen compressible
+# blocks gets a dozen full budgets. That is how one request runs past the
+# pipeline's own COMPRESSION_TIMEOUT_SECONDS (30s). The overrunning worker
+# cannot be preempted, so it becomes timeout debt, opens the quarantine, and
+# every request behind it forwards with NO compression until that worker
+# exits or the 60s cap lapses. Measured here 2026-09-21: kompress inference
+# costs ~1.6 ms/word and serializes (concurrency 1), opt_ms reached 67s on a
+# 245k-token request, and 250 requests were refused compression in one day --
+# ~3.56M tokens, 8.7% of that day's achievable savings.
+# A ContextVar, not a threading.local, plus context-propagating subclasses
+# for content_router's two thread-spawning names: the Pass 2 fan-out runs
+# every string-content cache miss on ThreadPoolExecutor workers (2+) or one
+# watchdog Thread (exactly 1), and on Python 3.12 neither inherits the
+# caller's context by itself (only asyncio.to_thread does). Without the
+# subclasses the origin was None on every fan-out thread and each string
+# block got its own budget again (measured 2026-09-22: 3 tool msgs ->
+# origins [None, None, None]). Content-block messages compress inline on the
+# apply() thread and never needed this.
+# Self-neutralizes once the wheel carries the fix (KompressCompressor grows
+# `shares_request_deadline`). Exact-pin gated to wheel 0.37.0. Kill switch:
+# HEADROOM_KOMPRESS_REQUEST_DEADLINE=0.
+_hd_krd_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_REQUEST_DEADLINE", "1")
+if _hd_krd_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_krd_meta
+
+        if _hd_krd_meta.version("headroom-ai") == "0.37.0":
+            from headroom.transforms import content_router as _hd_krd_cr
+            from headroom.transforms import kompress_compressor as _hd_krd_kc
+
+            if not hasattr(_hd_krd_kc.KompressCompressor, "shares_request_deadline"):
+                import contextvars as _hd_krd_cv
+                import threading as _hd_krd_threading
+                import time as _hd_krd_time
+
+                _hd_krd_origin = _hd_krd_cv.ContextVar(
+                    "headroom_kompress_deadline_origin", default=None
+                )
+                _hd_krd_apply_orig = _hd_krd_cr.ContentRouter.apply
+                _hd_krd_compress_orig = _hd_krd_kc.KompressCompressor.compress
+                _hd_krd_batch_orig = _hd_krd_kc.KompressCompressor.compress_batch
+
+                def _hd_krd_apply(self, *args, **kwargs):
+                    # One origin per top-level request. A nested apply() keeps
+                    # the outer one: an inner call must not hand the request a
+                    # second full budget, which is the bug being fixed.
+                    if _hd_krd_origin.get() is not None:
+                        return _hd_krd_apply_orig(self, *args, **kwargs)
+                    token = _hd_krd_origin.set(_hd_krd_time.perf_counter())
+                    try:
+                        return _hd_krd_apply_orig(self, *args, **kwargs)
+                    finally:
+                        _hd_krd_origin.reset(token)
+
+                def _hd_krd_with_origin(kwargs):
+                    # Never override a caller that already passed one: inside
+                    # compress_batch the wheel threads its own shared origin
+                    # down to each compress() call.
+                    if kwargs.get("_deadline_started_at") is None:
+                        origin = _hd_krd_origin.get()
+                        if origin is not None:
+                            kwargs["_deadline_started_at"] = origin
+                    return kwargs
+
+                def _hd_krd_compress(self, content, *args, **kwargs):
+                    return _hd_krd_compress_orig(
+                        self, content, *args, **_hd_krd_with_origin(kwargs)
+                    )
+
+                def _hd_krd_batch(self, contents, *args, **kwargs):
+                    return _hd_krd_batch_orig(
+                        self, contents, *args, **_hd_krd_with_origin(kwargs)
+                    )
+
+                class _HdKrdExecutor(_hd_krd_cr.ThreadPoolExecutor):
+                    # Pass 2 parallel path. Same copy_context() per submit
+                    # that asyncio.to_thread does.
+                    def submit(self, fn, /, *args, **kwargs):
+                        ctx = _hd_krd_cv.copy_context()
+                        return super().submit(ctx.run, fn, *args, **kwargs)
+
+                class _HdKrdThread(_hd_krd_cr.threading.Thread):
+                    # Pass 2 single-cache-miss watchdog path.
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self._hd_krd_ctx = _hd_krd_cv.copy_context()
+
+                    def run(self):
+                        self._hd_krd_ctx.run(super().run)
+
+                class _HdKrdThreading:
+                    # Module-scoped stand-in for content_router's `threading`
+                    # name so only ITS Thread() calls change; every other
+                    # attribute is the real module's.
+                    Thread = _HdKrdThread
+
+                    def __getattr__(self, name):
+                        return getattr(_hd_krd_threading, name)
+
+                _hd_krd_cr.ThreadPoolExecutor = _HdKrdExecutor
+                _hd_krd_cr.threading = _HdKrdThreading()
+                _hd_krd_cr.ContentRouter.apply = _hd_krd_apply
+                _hd_krd_kc.KompressCompressor.compress = _hd_krd_compress
+                _hd_krd_kc.KompressCompressor.compress_batch = _hd_krd_batch
+                # Exposed so the probe can assert the half that actually
+                # breaks on a wheel bump: that the origin is LIVE at the
+                # moment the router invokes kompress, including on the Pass 2
+                # fan-out threads. Injection itself is the three lines above.
+                _hd_krd_kc._headroom_request_deadline_origin = _hd_krd_origin
+    except Exception:
+        pass
+
 # Stats request-log rows (upstream PR #3613):
 # RequestLogger.get_recent built each row with dataclasses.asdict(entry) and
 # only then dropped request_messages / compressed_messages / response_content,
@@ -14716,6 +14832,11 @@ mod tests {
                 r#"_hd_dle_meta.version("headroom-ai") == "0.37.0""#,
                 "_hd_dle_cr.ContentRouter._apply_strategy_to_content = _hd_dle_apply",
             ),
+            (
+                "HEADROOM_KOMPRESS_REQUEST_DEADLINE",
+                r#"_hd_krd_meta.version("headroom-ai") == "0.37.0""#,
+                "_hd_krd_kc.KompressCompressor.compress = _hd_krd_compress",
+            ),
         ] {
             assert!(py.contains(flag), "{flag} kill switch missing");
             assert!(py.contains(gate), "{flag} exact-pin gate missing");
@@ -14834,6 +14955,63 @@ mod tests {
         assert!(
             out.status.success(),
             "dense-line elision probe failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn kompress_request_deadline_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel and
+        // asserts the request-origin contract end to end (see
+        // scripts/verify-kompress-request-deadline.py). Self-skips when the
+        // vendor does not bind, so green is NOT evidence after a wheel bump --
+        // and a wheel that ships #3693 makes it self-neutralize on purpose.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-kompress-request-deadline.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-krd-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .arg(&probe)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_KOMPRESS_REQUEST_DEADLINE", flag)
+                .output()
+                .expect("run kompress-request-deadline probe")
+        };
+
+        let out = run("1");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if stdout.contains("FAIL krd bound") {
+            eprintln!(
+                "skipping: kompress request-deadline vendor did not bind (wheel ships #3693?)"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "kompress request-deadline probe failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        // The kill switch has to actually leave the wheel's own methods bound,
+        // or it is not a switch. The probe reports that as "FAIL krd bound".
+        let off = run("0");
+        let off_stdout = String::from_utf8_lossy(&off.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            off_stdout.contains("FAIL krd bound"),
+            "HEADROOM_KOMPRESS_REQUEST_DEADLINE=0 did not unbind the vendor\nstdout:\n{off_stdout}"
         );
     }
 
