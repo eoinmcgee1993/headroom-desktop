@@ -21,6 +21,9 @@ export type AppUpdateProgressListener = (
 
 const APP_UPDATE_PROGRESS_EVENT = "app-update://progress";
 
+// Matches the backend's empty-slot error (lib.rs `install_pending_update`).
+const STALE_STAGED_UPDATE = /no longer staged/i;
+
 // Releases are quiet by default: no dialog, no notification, and (on macOS)
 // a silent background install that only asks for a restart. A release that
 // users must take promptly opts back into the old loud flow by carrying this
@@ -264,7 +267,27 @@ export async function runAppUpdateInstall({
   }
 
   try {
-    await invokeFn("install_app_update");
+    try {
+      await invokeFn("install_app_update");
+    } catch (error) {
+      // `install` consumes the staged handle even when it FAILS (RUST-HA's
+      // read-only mount, then RUST-HP), so the retry the error text asks for
+      // dead-ends on an empty slot until the user also runs a check by hand.
+      // Run that check here instead, and only install again when the feed
+      // still offers the exact version this call was asked to install - a
+      // mismatch means the slot moved on and re-installing would be a
+      // different build than the one the UI named.
+      if (!STALE_STAGED_UPDATE.test(describeInvokeError(error, ""))) {
+        throw error;
+      }
+      const rechecked = await invokeFn<AvailableAppUpdate | null>("check_for_app_update").catch(
+        () => null
+      );
+      if (rechecked?.version !== availableUpdate.version) {
+        throw error;
+      }
+      await invokeFn("install_app_update");
+    }
     return {
       stagedVersion: availableUpdate.version,
       ...(quiet ? {} : { showDialog: true }),

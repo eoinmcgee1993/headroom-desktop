@@ -380,6 +380,43 @@ describe("app update helpers", () => {
     });
   });
 
+  it("re-checks and retries once when the staged update was already consumed", async () => {
+    const invokeFn = vi
+      .fn()
+      .mockRejectedValueOnce(
+        "The downloaded update is no longer staged. Check for updates again, then retry."
+      )
+      .mockResolvedValueOnce(availableUpdate)
+      .mockResolvedValueOnce(undefined);
+
+    const result = await runAppUpdateInstall({ availableUpdate, invokeFn });
+
+    expect(invokeFn.mock.calls.map((call) => call[0])).toEqual([
+      "install_app_update",
+      "check_for_app_update",
+      "install_app_update",
+    ]);
+    expect(result).toEqual({
+      stagedVersion: "0.3.0",
+      showDialog: true,
+      statusCopy: "Headroom 0.3.0 is installed and ready to restart.",
+    });
+  });
+
+  it("keeps the stale-slot error when the re-check no longer offers that version", async () => {
+    const staleError =
+      "The downloaded update is no longer staged. Check for updates again, then retry.";
+    const invokeFn = vi
+      .fn()
+      .mockRejectedValueOnce(staleError)
+      .mockResolvedValueOnce({ ...availableUpdate, version: "0.4.0" });
+
+    const result = await runAppUpdateInstall({ availableUpdate, invokeFn });
+
+    expect(invokeFn).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({ statusCopy: staleError });
+  });
+
   it("returns an empty patch when install is requested without an update", async () => {
     const invokeFn = vi.fn();
 
