@@ -1736,6 +1736,48 @@ if _hd_fm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+
+# Request-log body window (upstream PR pending; self-neutralizes once
+# RequestLogger grows `MESSAGE_WINDOW`):
+# RequestLogger keeps MAX_LOG_ENTRIES (10,000) entries, and because the desktop
+# passes --log-messages (without it /transformations/feed is empty) every one
+# of them holds request_messages + compressed_messages + response_content: two
+# parsed copies of the whole conversation, ~1.9x their JSON size as Python
+# objects. The feed serves at most the newest 100 (server cap), so the other
+# 9,900 are retained for nothing, linearly, for as long as the app runs. User
+# report 2026-09-22: 100 GB RSS on a 128 GB Linux box after one overnight
+# Claude Code run (~3,500 requests at ~92k tokens each). Null the three heavy
+# fields on the entry that leaves the window on every append; light fields
+# stay on all 10,000 for /stats. Exact-pin gated to wheel 0.38.0.
+# Kill switch: HEADROOM_REQUEST_LOG_WINDOW=0.
+_hd_rlw_flag = _hd_os.environ.get("HEADROOM_REQUEST_LOG_WINDOW", "1")
+if _hd_rlw_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_rlw_meta
+
+        if _hd_rlw_meta.version("headroom-ai") == "0.38.0":
+            from headroom.proxy import request_logger as _hd_rlw_mod
+
+            if not hasattr(_hd_rlw_mod.RequestLogger, "MESSAGE_WINDOW"):
+                _hd_rlw_WINDOW = 100  # the feed's hard cap in server.py
+                _hd_rlw_orig = _hd_rlw_mod.RequestLogger.log
+
+                def _hd_rlw_log(self, entry):
+                    _hd_rlw_orig(self, entry)
+                    try:
+                        logs = self._logs
+                        if len(logs) > _hd_rlw_WINDOW:
+                            old = logs[-_hd_rlw_WINDOW - 1]
+                            old.request_messages = None
+                            old.compressed_messages = None
+                            old.response_content = None
+                    except Exception:
+                        pass
+
+                _hd_rlw_mod.RequestLogger.log = _hd_rlw_log
+    except Exception:
+        pass
+
 "#;
 /// Default-on passthrough for the rollout registry's `read_maturation` feature.
 ///
@@ -3415,6 +3457,12 @@ impl ToolManager {
                     // default. Desktop has its own telemetry; keep the
                     // upstream upload off.
                     .env("HEADROOM_BEACON", "off")
+                    // Periodic allocator trim. The wheel defaults it on only
+                    // for macOS (#2820); glibc has the same retained-page
+                    // ratchet (100 GB RSS on a 128 GB Linux host, 2026-09-22)
+                    // and the task self-disables where there is no trim call
+                    // (Windows), so ask for it everywhere.
+                    .env("HEADROOM_MALLOC_TRIM", "1")
                     .env("HEADROOM_HTTP2", "false")
                     // Disable the HTTP/1.1 keep-alive pool for the upstream
                     // (proxy -> api.anthropic.com) client. Claude Code cancels
@@ -9878,15 +9926,30 @@ fn headroom_learn_startup_args() -> Vec<String> {
 
 fn headroom_propagated_proxy_log_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home)
-        .join(".headroom")
-        .join("logs")
-        .join("proxy.log");
-    if path.exists() {
-        Some(path)
-    } else {
-        None
+    newest_wheel_proxy_log(&PathBuf::from(home).join(".headroom").join("logs"))
+}
+
+/// The wheel's own runtime log. 0.38.0 (#3204) writes `proxy-<port>.log` and
+/// stops writing the shared `proxy.log`, which an upgraded machine keeps as a
+/// stale 0.37.0 file, so pick the newest `proxy*.log` by mtime rather than a
+/// fixed name. `proxy-stdio*.log` is the CLI's stdout capture, not the logger.
+fn newest_wheel_proxy_log(logs_dir: &Path) -> Option<PathBuf> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(logs_dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("proxy") || !name.ends_with(".log") || name.starts_with("proxy-stdio")
+        {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            newest = Some((mtime, entry.path()));
+        }
     }
+    newest.map(|(_, p)| p)
 }
 
 struct DownloadArtifact {
@@ -12805,6 +12868,31 @@ mod tests {
     }
 
     #[test]
+    fn wheel_proxy_log_prefers_the_per_port_file_over_a_stale_shared_one() {
+        let dir = std::env::temp_dir().join(format!("hd-wheel-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proxy.log"), b"old").unwrap();
+        std::fs::write(dir.join("proxy-stdio-6768.log"), b"stdout").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(dir.join("proxy.log"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::write(dir.join("proxy-6768.log"), b"new").unwrap();
+        let picked = super::newest_wheel_proxy_log(&dir).unwrap();
+        assert_eq!(picked.file_name().unwrap(), "proxy-6768.log");
+        std::fs::remove_file(dir.join("proxy-6768.log")).unwrap();
+        assert_eq!(
+            super::newest_wheel_proxy_log(&dir)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "proxy.log"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn ledger_purge_clears_nonempty_control_only() {
         // Non-empty control -> rewrite with control emptied; baseline/treatment kept.
         let with_control =
@@ -13599,6 +13687,45 @@ print("OK fm")
         assert!(
             out.status.success() && stdout.contains("OK tool-ref hint"),
             "tool-ref hint vendor misbehaved against the installed wheel.\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn request_log_window_vendor_behaves_against_the_installed_wheel() {
+        // Bodies survive only on the newest 100 request-log entries; light
+        // fields stay on all of them; the kill switch really unbinds.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-request-log-window.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("hd-request-log-window-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let out = crate::proc::command(&python)
+            .arg(&probe)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .output()
+            .expect("run request-log-window probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stdout.contains("FAIL rlw bound") && stderr.is_empty() {
+            eprintln!("skipping: request-log window vendor did not bind (not 0.38.0 pin)");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("OK request-log window"),
+            "request-log window vendor misbehaved against installed wheel.\n\
              stdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
