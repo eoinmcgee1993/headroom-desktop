@@ -1724,6 +1724,12 @@ pub struct SavingsDay {
     /// None on buckets with no cache coverage; the server then has no billable
     /// baseline for the day and reports "-" rather than a scale-mixed guess.
     pub cache_savings_usd: Option<f64>,
+    /// What the day's cache reads cost, priced per request by the backend
+    /// rollup. None where the day's cache fields came from the discount-only
+    /// derivation; the server then falls back to `cache_savings_usd / 9`, which
+    /// overstates the read cost on models with a steeper read discount
+    /// (claude-fable-5-1 reads bill at 0.025x) and so inflates the input rate.
+    pub cache_read_cost_usd: Option<f64>,
     pub output_sampled_tokens_saved: Option<u64>,
     pub output_baseline_tokens: Option<u64>,
     /// Aggregate per-client counters from the intercept proxy (local day

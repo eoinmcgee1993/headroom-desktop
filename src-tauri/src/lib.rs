@@ -6790,6 +6790,7 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
                 actual_cost_usd: point.actual_cost_usd,
                 cache_read_tokens: point.cache_read_tokens,
                 cache_savings_usd: point.cache_savings_usd,
+                cache_read_cost_usd: point.cache_read_cost_usd,
                 output_sampled_tokens_saved: point.output_sampled_tokens_saved,
                 output_baseline_tokens: point.output_baseline_tokens,
                 client_requests: day_counters.map(|c| c.client_requests.clone()),
@@ -9870,6 +9871,23 @@ mod tests {
         assert_eq!(days.first().unwrap().date, "2026-06-09");
         assert_eq!(days.last().unwrap().date, "2026-06-40");
         assert!(days.iter().all(|d| d.tokens_saved == 1_000));
+    }
+
+    #[test]
+    fn recent_savings_days_reports_the_rollup_read_cost() {
+        // The server rates the input layer against spend minus read cost; it
+        // needs the rollup's priced figure, and null where there is none.
+        let mut exact = daily_point("2026-06-01", 7.23, 1_000, 54.48, 9_000);
+        exact.cache_savings_usd = Some(324.72);
+        exact.cache_read_cost_usd = Some(8.33);
+        let mut legacy = daily_point("2026-06-02", 1.0, 1_000, 5.0, 9_000);
+        legacy.cache_savings_usd = Some(9.0);
+
+        let days = recent_savings_days(&[exact, legacy]);
+        assert_eq!(days[0].cache_read_cost_usd, Some(8.33));
+        assert_eq!(days[1].cache_read_cost_usd, None);
+        let json = serde_json::to_value(&days[1]).unwrap();
+        assert!(json.get("cache_read_cost_usd").unwrap().is_null());
     }
 
     #[test]
