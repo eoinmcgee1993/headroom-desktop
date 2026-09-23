@@ -9925,8 +9925,13 @@ fn headroom_learn_startup_args() -> Vec<String> {
 }
 
 fn headroom_propagated_proxy_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    newest_wheel_proxy_log(&PathBuf::from(home).join(".headroom").join("logs"))
+    // Not a raw HOME read: the desktop process on Windows has USERPROFILE but
+    // no HOME, so that returned None on every Windows install and the Kompress
+    // status dot rendered unknown while the model was warm (0.9.20-rc.3 pass).
+    let logs = crate::client_adapters::home_dir()
+        .join(".headroom")
+        .join("logs");
+    newest_wheel_proxy_log(&logs)
 }
 
 /// The wheel's own runtime log. 0.38.0 (#3204) writes `proxy-<port>.log` and

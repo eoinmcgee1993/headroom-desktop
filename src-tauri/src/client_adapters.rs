@@ -25,6 +25,17 @@ const HEADROOM_ANTHROPIC_BASE_URL: &str = "http://127.0.0.1:6767";
 // wiring must too. We write it only when unset so a user's own value wins.
 const HEADROOM_ENABLE_TOOL_SEARCH_KEY: &str = "ENABLE_TOOL_SEARCH";
 const HEADROOM_ENABLE_TOOL_SEARCH_VALUE: &str = "true";
+// Claude Code hides /remote-control whenever ANTHROPIC_BASE_URL is not
+// api.anthropic.com (pure host compare, loopback included), so a Headroom-routed
+// session can never turn it on. The /remote-control command Headroom installs
+// asks the session to exit, and the `claude` shell function relaunches the SAME
+// session by id with this `--settings` layer, which outranks the settings.json
+// env for that one process. (`ANTHROPIC_BASE_URL= claude` does not work: the
+// settings.json env beats an empty process env.)
+const CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE: &str =
+    r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com"}}"#;
+const CLAUDE_REMOTE_CONTROL_COMMAND_MARKER: &str =
+    "<!-- managed by Headroom Desktop -- do not edit -->";
 const HEADROOM_OPENAI_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const HEADROOM_GROK_PROXY_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const ZSH_PROFILE_FILE: &str = ".zprofile";
@@ -376,10 +387,19 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             let mut guard = ensure_claude_guard_hook()?;
             updates.0.append(&mut guard.0);
             updates.1.append(&mut guard.1);
+            // Convenience, never a setup blocker: the /remote-control relaunch
+            // command (see CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE).
+            match ensure_claude_remote_control_command() {
+                Ok(mut rc) => {
+                    updates.0.append(&mut rc.0);
+                    updates.1.append(&mut rc.1);
+                }
+                Err(err) => log::warn!("installing /remote-control command failed: {err}"),
+            }
 
             // Shell profile (RTK PATH + env export) is convenience; tolerate an
             // unwritable profile rather than failing the whole setup.
-            let env_block = format!("export ANTHROPIC_BASE_URL={}", HEADROOM_ANTHROPIC_BASE_URL);
+            let env_block = claude_code_shell_block();
             let shell_step = ensure_rtk_integrations_for_targets(
                 &default_headroom_rtk_path(),
                 &default_headroom_managed_python_path(),
@@ -1155,6 +1175,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
                 let _ = std::fs::remove_file(&hook_path);
             }
             let _ = remove_claude_guard_hook();
+            let _ = remove_claude_remote_control_command();
         }
         "vscode" => {
             let preserved = state
@@ -1494,6 +1515,9 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     }
     if let Err(err) = remove_claude_guard_hook() {
         log::warn!("cleanup: removing Claude guard hook failed: {err}");
+    }
+    if let Err(err) = remove_claude_remote_control_command() {
+        log::warn!("cleanup: removing /remote-control command failed: {err}");
     }
 
     // Restore the open-source Claude Code plugin hook if we neutralized it.
@@ -5829,6 +5853,159 @@ fn claude_guard_registered() -> Result<bool> {
 /// Strip the Claude guard from every settings candidate and delete the script.
 /// Never deletes settings.json (it carries other keys), so `delete_if_empty` is
 /// false.
+fn claude_remote_control_script_path() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("hooks")
+        .join("headroom-remote-control.sh")
+}
+
+fn claude_remote_control_command_path() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("commands")
+        .join("remote-control.md")
+}
+
+/// The managed `claude_code` shell block: the routing export plus a `claude`
+/// function that (a) adds the api.anthropic.com settings layer whenever the
+/// user passes `--remote-control`, and (b) after the wrapped session exits,
+/// resumes the session named in the relaunch marker for this tty. The marker
+/// is written by the /remote-control script (`build_claude_remote_control_script`),
+/// keyed by tty so two terminals never swap sessions, and ignored once stale so
+/// a terminal without the function (opened before setup) cannot leave a marker
+/// that hijacks some later exit.
+fn claude_code_shell_block() -> String {
+    let block = r#"export ANTHROPIC_BASE_URL=__BASE__
+# /remote-control needs api.anthropic.com; this relaunches the same session without Headroom.
+claude() {
+  case " $* " in *" --remote-control "*) set -- --settings '__OVERRIDE__' "$@";; esac
+  command claude "$@"
+  local rc=$?
+  local m="$HOME/.headroom/remote-control/$(basename "$(tty 2>/dev/null)" 2>/dev/null)"
+  if [ -s "$m" ] && [ -n "$(find "$m" -mmin -2 2>/dev/null)" ]; then
+    local sid; sid=$(cat "$m"); rm -f "$m"
+    command claude --settings '__OVERRIDE__' -r "$sid" --remote-control
+    return $?
+  fi
+  return $rc
+}"#;
+    block
+        .replace("__BASE__", HEADROOM_ANTHROPIC_BASE_URL)
+        .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE)
+}
+
+/// POSIX sh script run by the /remote-control command (via the model's Bash
+/// tool, so it inherits CLAUDE_CODE_SESSION_ID and CLAUDE_PID). Refuses when
+/// Remote Control is already reachable, or when the session has no tty (IDE
+/// panels: nothing would relaunch it), and otherwise writes the tty-keyed
+/// marker and asks the session to exit from a detached child so the command's
+/// own output lands first.
+fn build_claude_remote_control_script() -> String {
+    r#"#!/bin/sh
+# Headroom Remote Control relaunch (managed by Headroom Desktop -- do not edit).
+# Claude Code hides /remote-control whenever ANTHROPIC_BASE_URL is not
+# api.anthropic.com, so a Headroom-routed session can never turn it on. This
+# leaves a marker and asks the session to exit; the `claude` shell function
+# Headroom manages then resumes the SAME session by id with the base URL
+# overridden for that one process.
+case "${ANTHROPIC_BASE_URL:-}" in
+  ""|https://api.anthropic.com*)
+    echo "Remote Control is already available in this session: type /rc."
+    exit 0;;
+esac
+if [ -z "${CLAUDE_CODE_SESSION_ID:-}" ] || [ -z "${CLAUDE_PID:-}" ]; then
+  echo "Could not identify this session. Exit it, then run: claude -r <session-id> --remote-control"
+  exit 0
+fi
+fallback="claude -r $CLAUDE_CODE_SESSION_ID --remote-control"
+tty_name=${HEADROOM_REMOTE_CONTROL_TTY:-$(ps -o tty= -p "$CLAUDE_PID" 2>/dev/null | tr -d ' ')}
+case "$tty_name" in ""|"??"|"-"|"?") 
+  echo "Remote Control needs a terminal session; this one has no terminal to relaunch into."
+  echo "Open a terminal and run: $fallback"
+  exit 0;;
+esac
+dir="$HOME/.headroom/remote-control"
+mkdir -p "$dir" && printf '%s\n' "$CLAUDE_CODE_SESSION_ID" > "$dir/$tty_name"
+echo "Restarting this session with Remote Control. Headroom is off for the restarted session."
+echo "If it does not come back by itself, run: $fallback"
+nohup sh -c "sleep 1; kill -TERM $CLAUDE_PID" >/dev/null 2>&1 &
+"#
+    .to_string()
+}
+
+/// User-level command that shadows Claude Code's hidden built-in. Every user
+/// command costs one model turn (its body is the prompt), so that turn is the
+/// confirmation dialog. `disable-model-invocation` matters: a shell-only
+/// "type it again to confirm" was defeated in testing by the model invoking
+/// the skill itself. Only the script and the question tool are allowed.
+fn build_claude_remote_control_command() -> String {
+    let script = claude_remote_control_script_path().display().to_string();
+    format!(
+        "---\n\
+description: Restart this session with Remote Control (Headroom off for that session)\n\
+allowed-tools: Bash({script}:*), AskUserQuestion\n\
+disable-model-invocation: true\n\
+---\n\
+{CLAUDE_REMOTE_CONTROL_COMMAND_MARKER}\n\
+Remote Control is unavailable while this session is routed through Headroom. \
+Call the AskUserQuestion tool now (a tool call, never prose) with exactly one question: \
+\"Remote Control needs this session to exit and restart without Headroom. \
+The restart replays the full conversation uncached, and Headroom stays off for the restarted session. Continue?\" \
+with the options \"Restart with Remote Control\" and \"Stay here\". \
+If the answer is \"Restart with Remote Control\", run `{script}` with the Bash tool and output nothing else. \
+If the answer is \"Stay here\", reply only \"Staying in this session.\"\n"
+    )
+}
+
+/// Install the /remote-control relaunch command and its script. Unix only:
+/// the relaunch needs the managed zsh/bash function, which Windows does not get.
+fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> {
+    if cfg!(target_os = "windows") {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut changed = Vec::new();
+    let mut backups = Vec::new();
+    for (path, content, executable) in [
+        (
+            claude_remote_control_script_path(),
+            build_claude_remote_control_script(),
+            true,
+        ),
+        (
+            claude_remote_control_command_path(),
+            build_claude_remote_control_command(),
+            false,
+        ),
+    ] {
+        let (did_change, backup) = write_file_if_changed(&path, &content, executable)?;
+        if did_change {
+            changed.push(path.display().to_string());
+            if let Some(backup) = backup {
+                backups.push(backup.display().to_string());
+            }
+        }
+    }
+    Ok((changed, backups))
+}
+
+/// Remove the script, and the command file only when it is ours: a user's own
+/// ~/.claude/commands/remote-control.md is never touched.
+fn remove_claude_remote_control_command() -> Result<()> {
+    let script = claude_remote_control_script_path();
+    if script.exists() {
+        std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
+    }
+    let command = claude_remote_control_command_path();
+    if let Ok(content) = std::fs::read_to_string(&command) {
+        if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER) {
+            std::fs::remove_file(&command)
+                .with_context(|| format!("removing {}", command.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn remove_claude_guard_hook() -> Result<()> {
     let script_path = claude_guard_hook_path();
     // Match on the script path, not the full interpreter command (see codex counterpart).
@@ -7605,6 +7782,13 @@ mod tests {
         shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
         ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
+    };
+    #[cfg(unix)]
+    use super::{
+        claude_code_shell_block, claude_remote_control_command_path,
+        claude_remote_control_script_path, ensure_claude_remote_control_command,
+        remove_claude_remote_control_command, CLAUDE_REMOTE_CONTROL_COMMAND_MARKER,
+        CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE, HEADROOM_ANTHROPIC_BASE_URL,
     };
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
@@ -11861,6 +12045,166 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             }
         });
         assert_eq!(out.unwrap(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_control_command_installs_and_removes_only_its_own_file() {
+        let home = TestHome::new();
+        let (changed, _) = ensure_claude_remote_control_command().expect("install");
+        assert_eq!(changed.len(), 2, "script + command written: {changed:?}");
+        let command = std::fs::read_to_string(claude_remote_control_command_path()).unwrap();
+        let script_path = claude_remote_control_script_path();
+        assert!(command.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER));
+        assert!(command.contains("disable-model-invocation: true"));
+        assert!(command.contains(&format!(
+            "Bash({}:*), AskUserQuestion",
+            script_path.display()
+        )));
+        assert!(command.contains("Call the AskUserQuestion tool now"));
+        let script = std::fs::read_to_string(&script_path).unwrap();
+        assert!(script.starts_with("#!/bin/sh\n"));
+        assert!(script.contains("kill -TERM $CLAUDE_PID"));
+        let (changed, _) = ensure_claude_remote_control_command().expect("reinstall");
+        assert!(changed.is_empty(), "idempotent: {changed:?}");
+
+        // A user-authored command of the same name survives removal.
+        std::fs::write(claude_remote_control_command_path(), "my own command\n").unwrap();
+        remove_claude_remote_control_command().expect("remove");
+        assert!(!script_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(claude_remote_control_command_path()).unwrap(),
+            "my own command\n"
+        );
+
+        ensure_claude_remote_control_command().expect("install again");
+        remove_claude_remote_control_command().expect("remove again");
+        assert!(!claude_remote_control_command_path().exists());
+        assert!(!home
+            .path()
+            .join(".claude/commands/remote-control.md")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_control_script_marks_the_tty_and_terminates_only_a_terminal_session() {
+        let home = TestHome::new();
+        ensure_claude_remote_control_command().expect("install");
+        let script = claude_remote_control_script_path();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().to_string();
+        let run = |base_url: &str, tty: &str| -> String {
+            let out = std::process::Command::new("sh")
+                .arg(&script)
+                .env("HOME", home.path())
+                .env("ANTHROPIC_BASE_URL", base_url)
+                .env("CLAUDE_PID", &pid)
+                .env("CLAUDE_CODE_SESSION_ID", "sid-123")
+                .env("HEADROOM_REMOTE_CONTROL_TTY", tty)
+                .output()
+                .expect("run script");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let marker_dir = home.path().join(".headroom/remote-control");
+
+        let out = run("https://api.anthropic.com", "ttys999");
+        assert!(out.contains("already available"), "{out}");
+        assert!(!marker_dir.exists());
+
+        // No tty (empty override falls back to ps, and the sleep has none).
+        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "");
+        assert!(out.contains("needs a terminal session"), "{out}");
+        assert!(out.contains("claude -r sid-123 --remote-control"), "{out}");
+        assert!(!marker_dir.exists());
+        assert!(child.try_wait().unwrap().is_none(), "sleep must survive");
+
+        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "ttys999");
+        assert!(
+            out.contains("Restarting this session with Remote Control"),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker_dir.join("ttys999")).unwrap(),
+            "sid-123\n"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut status = None;
+        while std::time::Instant::now() < deadline {
+            status = child.try_wait().unwrap();
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let status = status.unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("session was not terminated")
+        });
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_shell_function_resumes_the_marked_session_without_headroom() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = home.path().join("claude.log");
+        let marker_dir = home.path().join(".headroom/remote-control");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        // Fake claude: logs its argv; on first launch leaves a relaunch marker
+        // for this tty, exactly like the /remote-control script does.
+        let fake_claude = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\nif [ ! -e '{first}' ]; then touch '{first}'; echo sid-123 > '{marker}'; fi\nexit 7\n",
+            log = log.display(),
+            first = home.path().join("first").display(),
+            marker = marker_dir.join("ttys999").display(),
+        );
+        std::fs::write(bin.join("claude"), fake_claude).unwrap();
+        std::fs::write(bin.join("tty"), "#!/bin/sh\necho /dev/ttys999\n").unwrap();
+        for name in ["claude", "tty"] {
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let block = home.path().join("block.sh");
+        std::fs::write(&block, claude_code_shell_block()).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |cmd: &str| {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(". '{}'; {cmd}", block.display()))
+                .env("HOME", home.path())
+                .env("PATH", &path)
+                .status()
+                .expect("run bash")
+        };
+        let status = run("claude hello world");
+        let lines = std::fs::read_to_string(&log).unwrap();
+        let expected_resume = format!(
+            "--settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} -r sid-123 --remote-control"
+        );
+        assert_eq!(lines, format!("hello world\n{expected_resume}\n"));
+        assert!(!marker_dir.join("ttys999").exists(), "marker consumed");
+        assert_eq!(status.code(), Some(7), "relaunch exit code propagates");
+
+        // Manual fallback: the flag alone gets the override added.
+        std::fs::remove_file(&log).unwrap();
+        let status = run("claude -r sid-123 --remote-control");
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("--settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} -r sid-123 --remote-control\n")
+        );
     }
 
     #[test]

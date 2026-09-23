@@ -58,7 +58,7 @@ Then screenshot just the window rather than the whole screen - `screencapture -x
 The window is a tray popover and hides 150 ms after losing focus (`MAIN_WINDOW_BLUR_HIDE_DELAY_MS`, `handle_window_event` in lib.rs), so anyone clicking elsewhere on the machine between Show Headroom and the AX read turns a healthy build into "no window" - the 0.9.11-rc.5 quick re-run failed exactly this way while the full run minutes earlier had passed. A timed replay showed the window up 14/14 times at +0.3s and gone by +1.5s only when the frontmost app changed. Read the geometry and take the screenshot as soon as the window appears (the script polls every 250 ms for up to 5 s); before calling a miss a render failure, confirm with the CG window list that the window never came onscreen rather than came up and blurred away.
 
 ### 6. Pause / resume cleanly strips and restores interception
-In Settings (or via the tray menu, see check 5), toggle Pause then Resume, checking after each:
+From the tray menu ("Pause Headroom" / "Resume Headroom", see check 5; there is no Pause control on the Settings page), toggle Pause then Resume, checking after each:
 ```bash
 grep -c 'headroom:claude_code' ~/.zprofile ~/.zshrc
 ```
@@ -345,10 +345,10 @@ Codex is billed per token, so unlike a Claude Code subscription it runs in `toke
 Expect: `mode` is `token`, `primary_model` is a `gpt-*` model (confirms Codex — not Claude — is the traffic being measured), `requests_compressed` increased by at least 1, and `total_tokens_removed` is strictly greater. If `primary_model` is a `claude-*` model, the proxy is dominated by Claude traffic — confirm the prompt actually ran through Codex before trusting this check.
 
 ### C3. Codex savings are attributed on the dashboard
-Open the dashboard and confirm a **Codex** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the Codex group (`mergeProviderSavingsForDisplay` in `dashboardHelpers.ts`); a missing Codex group after Codex traffic means per-provider attribution isn't tagging OpenAI requests.
+Open the dashboard and confirm a **ChatGPT** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the group labelled "ChatGPT" (the `codex` key in `mergeProviderSavingsForDisplay`, dashboardHelpers.ts; the display name follows OpenAI's 2026-07 rename, the internal id stays `codex`). A missing ChatGPT group after Codex traffic means per-provider attribution isn't tagging OpenAI requests.
 
 ### C4. Pause / resume cleanly strips and restores Codex routing
-The Claude equivalent is check 6; Pause clears *all* client setups, so it must remove Codex's config too. In Settings, toggle Pause then Resume (restore runs on a background thread, so give it a second), checking after each:
+The Claude equivalent is check 6; Pause clears *all* client setups, so it must remove Codex's config too. Pause lives in the TRAY MENU ("Pause Headroom" / "Resume Headroom", see check 5), not on the Settings page. Toggle Pause then Resume (restore runs on a background thread, so give it a second), checking after each:
 ```bash
 grep -c 'headroom:codex_cli' ~/.codex/config.toml
 cat ~/.zshrc ~/.zprofile 2>/dev/null | grep -c 'OPENAI_BASE_URL=http://127.0.0.1:6767'

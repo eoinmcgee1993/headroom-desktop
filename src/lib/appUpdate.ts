@@ -185,36 +185,79 @@ export async function sendAppUpdateNotification(
   }
 }
 
-const STALE_UPDATE_NOTIFIED_KEY = "headroom_stale_update_notified_version";
+const STALE_UPDATE_WAITING_KEY = "headroom_update_waiting";
 const STALE_UPDATE_THRESHOLD_DAYS = 5;
 
-// Fire a nag notification when an available update has been published
-// for at least 5 days and the user hasn't installed it. Deduped per version.
+interface WaitingUpdateRecord {
+  // The build that was RUNNING when the clock started, not the one on offer.
+  onVersion: string;
+  since: number;
+  notified?: boolean;
+}
+
+function readWaitingUpdate(onVersion: string): WaitingUpdateRecord | null {
+  try {
+    const raw = localStorage.getItem(STALE_UPDATE_WAITING_KEY);
+    if (!raw) return null;
+    const record = JSON.parse(raw) as WaitingUpdateRecord;
+    // A record left by an older build is spent: upgrading is the exact thing
+    // the nag asks for, so the clock restarts on whatever is running now.
+    if (record?.onVersion !== onVersion || !Number.isFinite(record.since)) return null;
+    return record;
+  } catch {
+    return null;
+  }
+}
+
+function writeWaitingUpdate(record: WaitingUpdateRecord): void {
+  try {
+    localStorage.setItem(STALE_UPDATE_WAITING_KEY, JSON.stringify(record));
+  } catch {
+    // Storage is best-effort; a failed write just restarts the clock.
+  }
+}
+
+// Fire a nag notification when THIS install has had an update waiting for at
+// least 5 days, deduped per running build.
+//
+// It used to measure the age of the newest release instead, which our cadence
+// made unfireable: a user sitting on 0.9.15 for a fortnight is offered 0.9.19,
+// published yesterday, so `ageDays < 5` and nothing ever fired. Every release
+// reset the clock for everyone, including the people furthest behind (gaps
+// between 0.9.15 and 0.9.19 were 7, 4, 0 and 1 days). Since the quiet-update
+// default landed in 0.9.8 this nag is the only thing that reaches Windows and
+// Linux at all -- neither can install without the user, so a quiet release is
+// otherwise invisible there.
 export async function maybeFireStaleAppUpdateNotification(
   availableUpdate: AvailableAppUpdate | null,
   invokeFn: AppUpdateInvoker = invoke
 ): Promise<void> {
-  if (!availableUpdate?.publishedAt) return;
+  if (!availableUpdate?.currentVersion) return;
 
-  const publishedMs = Date.parse(availableUpdate.publishedAt);
-  if (Number.isNaN(publishedMs)) return;
+  const onVersion = availableUpdate.currentVersion;
+  const record = readWaitingUpdate(onVersion);
 
-  const ageDays = (Date.now() - publishedMs) / (24 * 60 * 60 * 1000);
-  if (ageDays < STALE_UPDATE_THRESHOLD_DAYS) return;
-
-  if (localStorage.getItem(STALE_UPDATE_NOTIFIED_KEY) === availableUpdate.version) {
+  // First sighting on this build starts the clock; it cannot also fire, or a
+  // fresh install one release behind would be nagged on its first check.
+  if (!record) {
+    writeWaitingUpdate({ onVersion, since: Date.now() });
     return;
   }
+
+  if (record.notified) return;
+
+  const waitingDays = (Date.now() - record.since) / (24 * 60 * 60 * 1000);
+  if (waitingDays < STALE_UPDATE_THRESHOLD_DAYS) return;
 
   try {
     await invokeFn("show_notification", {
       title: "Headroom update waiting",
-      body: `Headroom ${availableUpdate.version} has been out for ${Math.floor(
-        ageDays
+      body: `Headroom ${availableUpdate.version} is ready, and ${onVersion} has had an update waiting for ${Math.floor(
+        waitingDays
       )} days. Open Headroom to install it.`,
       action: "update",
     });
-    localStorage.setItem(STALE_UPDATE_NOTIFIED_KEY, availableUpdate.version);
+    writeWaitingUpdate({ ...record, notified: true });
   } catch {
     // best-effort
   }
