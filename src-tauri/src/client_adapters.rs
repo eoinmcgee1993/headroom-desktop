@@ -5989,13 +5989,15 @@ fn build_claude_remote_control_command() -> String {
     format!(
         "---\n\
 description: Restart this session with Remote Control (Headroom off for that session)\n\
-allowed-tools: Bash({script}:*), AskUserQuestion\n\
+allowed-tools: Bash({script}:*), AskUserQuestion, ToolSearch\n\
 disable-model-invocation: true\n\
 ---\n\
 {CLAUDE_REMOTE_CONTROL_COMMAND_MARKER}\n\
 First write exactly this one line of plain text and nothing else before it: \
 \"Remote Control is unavailable while this session runs through Headroom: Claude Code switches it off for any custom endpoint.\" \
-Then call the AskUserQuestion tool (a tool call, never prose) with header \"Remote Control\" and exactly one question: \
+Then call the AskUserQuestion tool (a tool call, never prose). If AskUserQuestion is not loaded yet, \
+load it first with ToolSearch using the query \"select:AskUserQuestion\"; never fall back to asking in prose. \
+Call it with header \"Remote Control\" and exactly one question: \
 \"Headroom is incompatible with Remote Control due to design decisions by Anthropic. \
 Headroom can restart this session with itself disabled so Remote Control does work. How do you want to proceed?\" \
 Offer exactly two options, in this order: \
@@ -12411,6 +12413,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         )));
         assert!(command.contains("First write exactly this one line of plain text"));
         assert!(command.contains("Then call the AskUserQuestion tool"));
+        assert!(command
+            .contains("load it first with ToolSearch using the query \"select:AskUserQuestion\""));
+        assert!(command.contains("AskUserQuestion, ToolSearch\n"));
         assert!(command.contains(
             "Headroom is incompatible with Remote Control due to design decisions by Anthropic."
         ));
