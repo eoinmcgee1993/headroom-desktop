@@ -5992,9 +5992,15 @@ exit_file="$dir/exit-$CLAUDE_CODE_SESSION_ID"
 printf '%s\n' "$CLAUDE_PID" > "$exit_file"
 echo "Restarting this session with Remote Control. Headroom is off for the restarted session."
 echo "If it does not come back by itself, run: $fallback"
-# Safety net if the Stop hook never fires (unregistered, or the turn hangs):
-# the pending exit is still honoured, at the cost of an interrupted turn.
-nohup sh -c "sleep 15; [ -f '$exit_file' ] && rm -f '$exit_file' && kill -TERM $CLAUDE_PID" >/dev/null 2>&1 &
+# Only when the Stop hook is NOT registered (settings.json edited by hand):
+# a timed exit, at the cost of an interrupted turn. With the hook registered
+# there is no timer at all. A timer that raced a slow turn killed the session
+# mid-turn and the CLI lost every transcript entry after the confirmation, which
+# is what "No response requested." on the phone was.
+if ! grep -q 'headroom-remote-control\.sh[^"]* --stop' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" 2>/dev/null; then
+  secs=${HEADROOM_REMOTE_CONTROL_FALLBACK_SECS:-15}
+  nohup sh -c "sleep $secs; [ -f '$exit_file' ] && rm -f '$exit_file' && kill -TERM $CLAUDE_PID" >/dev/null 2>&1 &
+fi
 "#
     .to_string()
 }
@@ -6023,7 +6029,7 @@ Headroom can restart this session with itself disabled so Remote Control does wo
 Offer exactly two options, in this order: \
 \"Restart with Remote Control\" (description: \"Exit and restart this session without Headroom. The restart replays the conversation uncached.\") and \
 \"Do nothing and keep this session routed through Headroom\" (description: \"Remote Control stays unavailable here.\"). \
-If the answer is \"Restart with Remote Control\", run `{script}` with the Bash tool and output nothing else. \
+If the answer is \"Restart with Remote Control\", run `{script}` with the Bash tool, then reply with exactly one line: \"Restarting with Remote Control.\" \
 Otherwise reply only \"Staying in this session.\"\n"
     )
 }
@@ -12458,6 +12464,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             script_path.display()
         )));
         assert!(command.contains("First write exactly this one line of plain text"));
+        assert!(command
+            .contains("then reply with exactly one line: \"Restarting with Remote Control.\""));
         assert!(command.contains("Then call the AskUserQuestion tool"));
         assert!(command
             .contains("load it first with ToolSearch using the query \"select:AskUserQuestion\""));
@@ -12524,6 +12532,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .env("CLAUDE_PID", &pid)
                 .env("CLAUDE_CODE_SESSION_ID", "sid-123")
                 .env("HEADROOM_REMOTE_CONTROL_TTY", tty)
+                .env("HEADROOM_REMOTE_CONTROL_FALLBACK_SECS", "1")
                 .output()
                 .expect("run script");
             String::from_utf8_lossy(&out.stdout).into_owned()
@@ -12580,6 +12589,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             child.try_wait().unwrap().is_none(),
             "session must outlive the tool call"
         );
+        // With the Stop hook registered there is no fallback timer at all.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "no timed exit while the Stop hook is registered"
+        );
 
         // A Stop for some other session leaves it alone.
         stop("sid-other");
@@ -12615,6 +12630,41 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "foreign pid must survive"
         );
         let _ = other.kill();
+
+        // Without the Stop hook (settings edited by hand) the timed exit still
+        // honours the pending restart.
+        std::fs::write(claude_settings_path(), "{}\n").unwrap();
+        let mut child = crate::proc::command(bin.join("claude"))
+            .arg("30")
+            .spawn()
+            .expect("spawn fake claude");
+        let pid = child.id().to_string();
+        let out = crate::proc::command("sh")
+            .arg(&script)
+            .env("HOME", home.path())
+            .env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)
+            .env("CLAUDE_PID", &pid)
+            .env("CLAUDE_CODE_SESSION_ID", "sid-456")
+            .env("HEADROOM_REMOTE_CONTROL_TTY", "ttys998")
+            .env("HEADROOM_REMOTE_CONTROL_FALLBACK_SECS", "1")
+            .output()
+            .expect("run script");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Restarting"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut status = None;
+        while std::time::Instant::now() < deadline {
+            status = child.try_wait().unwrap();
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let status = status.unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("timed exit did not fire without the Stop hook")
+        });
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(!marker_dir.join("exit-sid-456").exists());
     }
 
     #[cfg(unix)]
