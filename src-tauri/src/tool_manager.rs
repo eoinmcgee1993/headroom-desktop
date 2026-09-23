@@ -1737,6 +1737,254 @@ if _hd_fm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         pass
 
 
+# Rollup cache-read cost (upstream PR #3734; self-neutralizes once the
+# wheel's tracker grows `_empty_cache_delta`):
+# The /stats-history rollups carried no cache dimension, so the dashboard took
+# cache reads out of the input bill as "read discount / 9", i.e. assumed reads
+# bill at 0.1x list. They bill at 0.025x on claude-fable-5-1 and 0.05x on
+# claude-opus-5-5, so the read cost came out 4.3x / 2.1x too high, the "Spent"
+# figure too low, and the Claude Code input rate inflated (19.5% shown vs 12.6%
+# real on one Fable-heavy day). The per-provider tooltip compounded it by
+# applying one bucket-wide ratio to every connector. The PR's rollup, exec'd
+# verbatim into the tracker module so its private helpers resolve: every bucket,
+# by_provider and by_model entry gains cache_read_tokens_delta,
+# cache_savings_usd_delta and cache_read_cost_usd_delta (priced per checkpoint
+# with the same function that priced total_input_cost_usd; None when a
+# model-less legacy checkpoint cannot be priced). Additive keys only; older
+# desktops ignore them. Exact-pin gated to wheel 0.38.0.
+# Kill switch: HEADROOM_ROLLUP_READ_COST=0.
+_hd_rrc_flag = _hd_os.environ.get("HEADROOM_ROLLUP_READ_COST", "1")
+if _hd_rrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_rrc_meta
+
+        if _hd_rrc_meta.version("headroom-ai") == "0.38.0":
+            from headroom.proxy import savings_tracker as _hd_rrc_st
+
+            if not hasattr(_hd_rrc_st, "_empty_cache_delta"):
+                _hd_rrc_src = '''
+def _empty_cache_delta() -> dict[str, Any]:
+    """Zeroed cache fields for a rollup bucket or one of its breakdowns.
+
+    ``cache_read_cost_usd_delta`` is None when any contributing checkpoint's
+    reads could not be priced (see ``_build_rollup``).
+    """
+    return {
+        "cache_read_tokens_delta": 0,
+        "cache_savings_usd_delta": 0.0,
+        "cache_read_cost_usd_delta": 0.0,
+    }
+
+
+def _hd_rrc_build_rollup(
+    self,
+    history: list[dict[str, Any]],
+    bucket: str,
+) -> list[dict[str, Any]]:
+    if not history:
+        return []
+
+    aggregated: dict[str, dict[str, Any]] = {}
+    prev_total_tokens = 0
+    prev_total_usd = 0.0
+    prev_total_input_tokens = 0
+    prev_total_input_cost_usd = 0.0
+    prev_output_tokens = 0
+    prev_output_usd = 0.0
+    prev_cache_read_tokens = 0
+    prev_cache_savings_usd = 0.0
+    # What the bucket's cache reads actually COST, priced per checkpoint
+    # with the same function that put them into ``total_input_cost_usd``.
+    # Consumers need it to take reads out of the input bill, and cannot
+    # derive it from ``cache_savings_usd``: the read discount is not a
+    # fixed multiple of the read cost (reads bill at 0.1x on most models,
+    # 0.05x or 0.025x on others), so "discount / 9" misprices exactly the
+    # models with the steepest cache discount.
+    read_cost_per_token: dict[str, float] = {}
+
+    def _read_cost(model: str, reads: int) -> float | None:
+        if reads <= 0:
+            return 0.0
+        # Checkpoints written before per-model attribution carry no model,
+        # so their reads cannot be priced the way the request was. Report
+        # the bucket's read cost as unknown rather than guess.
+        if model == MODEL_UNKNOWN:
+            return None
+        if model not in read_cost_per_token:
+            read_cost_per_token[model] = (
+                _estimate_input_cost_usd(model, 1_000_000, cache_read_tokens=1_000_000)
+                / 1_000_000
+            )
+        return reads * read_cost_per_token[model]
+
+    def _add_cache(
+        target: dict[str, Any], reads: int, discount: float, cost: float | None
+    ) -> None:
+        target["cache_read_tokens_delta"] += reads
+        target["cache_savings_usd_delta"] = round(
+            target["cache_savings_usd_delta"] + discount, 6
+        )
+        if cost is None or target["cache_read_cost_usd_delta"] is None:
+            target["cache_read_cost_usd_delta"] = None
+        else:
+            target["cache_read_cost_usd_delta"] = round(
+                target["cache_read_cost_usd_delta"] + cost, 6
+            )
+
+    for point in history:
+        timestamp = _parse_timestamp(point["timestamp"])
+        if timestamp is None:
+            continue
+
+        bucket_start = _bucket_start(timestamp, bucket)
+
+        bucket_key = _to_utc_iso(bucket_start)
+        total_tokens_saved = _coerce_int(point.get("total_tokens_saved"))
+        total_usd = _coerce_float(point.get("compression_savings_usd"))
+        total_input_tokens = _coerce_int(point.get("total_input_tokens"))
+        total_input_cost_usd = _coerce_float(point.get("total_input_cost_usd"))
+        total_output_tokens = _coerce_int(point.get("output_tokens_saved"))
+        total_output_usd = _coerce_float(point.get("output_savings_usd"))
+        delta_tokens = max(total_tokens_saved - prev_total_tokens, 0)
+        delta_usd = max(total_usd - prev_total_usd, 0.0)
+        delta_input_tokens = max(total_input_tokens - prev_total_input_tokens, 0)
+        delta_input_cost_usd = max(
+            total_input_cost_usd - prev_total_input_cost_usd,
+            0.0,
+        )
+
+        delta_output_tokens = max(total_output_tokens - prev_output_tokens, 0)
+        delta_output_usd = max(total_output_usd - prev_output_usd, 0.0)
+
+        total_cache_read_tokens = _coerce_int(point.get("cache_read_tokens"))
+        total_cache_savings_usd = _coerce_float(point.get("cache_savings_usd"))
+        delta_cache_read_tokens = max(total_cache_read_tokens - prev_cache_read_tokens, 0)
+        delta_cache_savings_usd = max(total_cache_savings_usd - prev_cache_savings_usd, 0.0)
+        prev_cache_read_tokens = total_cache_read_tokens
+        prev_cache_savings_usd = total_cache_savings_usd
+        model = _normalize_model(point.get("model"))
+        delta_cache_read_cost_usd = _read_cost(model, delta_cache_read_tokens)
+
+        prev_total_tokens = total_tokens_saved
+        prev_total_usd = total_usd
+        prev_total_input_tokens = total_input_tokens
+        prev_total_input_cost_usd = total_input_cost_usd
+        prev_output_tokens = total_output_tokens
+        prev_output_usd = total_output_usd
+
+        entry = aggregated.setdefault(
+            bucket_key,
+            {
+                "timestamp": bucket_key,
+                "tokens_saved": 0,
+                "compression_savings_usd_delta": 0.0,
+                "total_tokens_saved": total_tokens_saved,
+                "compression_savings_usd": total_usd,
+                "total_input_tokens_delta": 0,
+                "total_input_tokens": total_input_tokens,
+                "total_input_cost_usd_delta": 0.0,
+                "total_input_cost_usd": total_input_cost_usd,
+                "output_tokens_saved_delta": 0,
+                "output_savings_usd_delta": 0.0,
+                **_empty_cache_delta(),
+                "by_provider": {},
+                "by_model": {},
+            },
+        )
+        entry["tokens_saved"] += delta_tokens
+        entry["compression_savings_usd_delta"] = round(
+            entry["compression_savings_usd_delta"] + delta_usd,
+            6,
+        )
+        entry["total_input_tokens_delta"] += delta_input_tokens
+        entry["total_input_cost_usd_delta"] = round(
+            entry["total_input_cost_usd_delta"] + delta_input_cost_usd,
+            6,
+        )
+        entry["total_tokens_saved"] = total_tokens_saved
+        entry["compression_savings_usd"] = round(total_usd, 6)
+        entry["total_input_tokens"] = total_input_tokens
+        entry["total_input_cost_usd"] = round(total_input_cost_usd, 6)
+        entry["output_tokens_saved_delta"] += delta_output_tokens
+        entry["output_savings_usd_delta"] = round(
+            entry["output_savings_usd_delta"] + delta_output_usd,
+            6,
+        )
+        _add_cache(
+            entry, delta_cache_read_tokens, delta_cache_savings_usd, delta_cache_read_cost_usd
+        )
+
+        # Attribute this checkpoint's delta to the provider that produced
+        # it. Each checkpoint comes from a single request, so its delta is
+        # wholly owned by one provider. Skip no-op checkpoints so providers
+        # only appear in a bucket where they actually moved a counter.
+        if (
+            delta_tokens
+            or delta_usd
+            or delta_input_tokens
+            or delta_input_cost_usd
+            or delta_cache_read_tokens
+        ):
+            provider = _normalize_provider(point.get("provider"))
+            prov = entry["by_provider"].setdefault(
+                provider,
+                {
+                    "tokens_saved": 0,
+                    "compression_savings_usd_delta": 0.0,
+                    "total_input_tokens_delta": 0,
+                    "total_input_cost_usd_delta": 0.0,
+                    **_empty_cache_delta(),
+                },
+            )
+            _add_cache(
+                prov,
+                delta_cache_read_tokens,
+                delta_cache_savings_usd,
+                delta_cache_read_cost_usd,
+            )
+            prov["tokens_saved"] += delta_tokens
+            prov["compression_savings_usd_delta"] = round(
+                prov["compression_savings_usd_delta"] + delta_usd,
+                6,
+            )
+            prov["total_input_tokens_delta"] += delta_input_tokens
+            prov["total_input_cost_usd_delta"] = round(
+                prov["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                6,
+            )
+
+            mod = entry["by_model"].setdefault(
+                model,
+                {
+                    "tokens_saved": 0,
+                    "compression_savings_usd_delta": 0.0,
+                    "total_input_tokens_delta": 0,
+                    "total_input_cost_usd_delta": 0.0,
+                    **_empty_cache_delta(),
+                },
+            )
+            _add_cache(
+                mod, delta_cache_read_tokens, delta_cache_savings_usd, delta_cache_read_cost_usd
+            )
+            mod["tokens_saved"] += delta_tokens
+            mod["compression_savings_usd_delta"] = round(
+                mod["compression_savings_usd_delta"] + delta_usd,
+                6,
+            )
+            mod["total_input_tokens_delta"] += delta_input_tokens
+            mod["total_input_cost_usd_delta"] = round(
+                mod["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                6,
+            )
+
+    return list(aggregated.values())
+'''
+                exec(compile(_hd_rrc_src, "<headroom-desktop rollup read cost>", "exec"), _hd_rrc_st.__dict__)
+                _hd_rrc_st.SavingsTracker._build_rollup = _hd_rrc_st._hd_rrc_build_rollup
+    except Exception:
+        pass
+
+
 # Request-log body window (upstream PR pending; self-neutralizes once
 # RequestLogger grows `MESSAGE_WINDOW`):
 # RequestLogger keeps MAX_LOG_ENTRIES (10,000) entries, and because the desktop
@@ -13515,6 +13763,103 @@ mod tests {
         // The route keeps the wheel's own loopback dependency and position.
         assert!(py.contains("dependencies=old.dependencies"));
         assert!(py.contains("routes[index] = routes.pop()"));
+    }
+
+    #[test]
+    fn sitecustomize_vendors_rollup_read_cost() {
+        // Shape and gates only; behaviour is proven by
+        // rollup_read_cost_vendor_behaves_against_the_installed_wheel.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains("HEADROOM_ROLLUP_READ_COST"),
+            "kill switch missing"
+        );
+        assert!(
+            py.contains(r#"_hd_rrc_meta.version("headroom-ai") == "0.38.0""#),
+            "exact-pin gate missing"
+        );
+        assert!(
+            py.contains(r#"if not hasattr(_hd_rrc_st, "_empty_cache_delta"):"#),
+            "self-neutralizing gate missing"
+        );
+        assert!(py
+            .contains("_hd_rrc_st.SavingsTracker._build_rollup = _hd_rrc_st._hd_rrc_build_rollup"));
+    }
+
+    #[test]
+    fn rollup_read_cost_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel's REAL
+        // litellm catalog: a Fable-5.1 request (reads at 0.025x) and a GPT
+        // request (0.1x) in one hour. The bucket and each provider must carry
+        // a read cost equal to the read component of their recorded input
+        // cost, the rollup's existing keys must be unchanged, and the kill
+        // switch must leave the wheel's own rollup bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-rrc-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+import os, sys, tempfile
+from headroom.proxy import savings_tracker as st
+if st.SavingsTracker._build_rollup.__name__ != "_hd_rrc_build_rollup":
+    print("SKIP rrc not bound"); sys.exit(0)
+t = st.SavingsTracker(path=os.path.join(tempfile.mkdtemp(), "s.json"), max_history_points=100, max_history_age_days=30)
+t.record_request(model="claude-fable-5-1", provider="anthropic", input_tokens=1010000, tokens_saved=5000,
+                 cache_read_tokens=1000000, uncached_input_tokens=10000, timestamp="2026-03-27T09:10:00Z")
+t.record_request(model="gpt-6-sol", provider="openai", input_tokens=150000, tokens_saved=2000,
+                 cache_read_tokens=100000, uncached_input_tokens=50000, timestamp="2026-03-27T09:20:00Z")
+b = t.history_response()["series"]["hourly"][0]
+a, o = b["by_provider"]["anthropic"], b["by_provider"]["openai"]
+fa = st._estimate_input_cost_usd("claude-fable-5-1", 1000000, cache_read_tokens=1000000)
+fo = st._estimate_input_cost_usd("gpt-6-sol", 100000, cache_read_tokens=100000)
+assert fa > 0 and fo > 0, (fa, fo)
+assert abs(a["cache_read_cost_usd_delta"] - fa) < 1e-9, (a, fa)
+assert abs(o["cache_read_cost_usd_delta"] - fo) < 1e-9, (o, fo)
+# The read cost is exactly the read slice of the provider's input cost.
+ua = st._estimate_input_cost_usd("claude-fable-5-1", 10000, uncached_input_tokens=10000)
+assert abs(a["total_input_cost_usd_delta"] - a["cache_read_cost_usd_delta"] - ua) < 1e-6, (a, ua)
+# Fable reads bill well under 0.1x, so the old discount/9 estimate overstates them.
+assert a["cache_savings_usd_delta"] / 9 > 2 * a["cache_read_cost_usd_delta"], a
+assert b["cache_read_tokens_delta"] == 1100000, b
+assert abs(b["cache_read_cost_usd_delta"] - (fa + fo)) < 1e-9, b
+for k in ("tokens_saved", "compression_savings_usd_delta", "total_input_tokens_delta", "total_input_cost_usd_delta", "by_model"):
+    assert k in b, k
+print("OK rrc")
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_ROLLUP_READ_COST", flag)
+                .output()
+                .expect("run rollup read-cost probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        if on_out.contains("SKIP rrc not bound") {
+            eprintln!("skipping: rollup read-cost vendor did not bind (wheel ships it?)");
+            return;
+        }
+        assert!(
+            on.status.success() && on_out.contains("OK rrc"),
+            "rollup read-cost vendor misbehaved against the installed wheel.\nstdout:\n{on_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        assert!(
+            off.status.success() && off_out.contains("SKIP rrc not bound"),
+            "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&off.stderr)
+        );
     }
 
     #[test]

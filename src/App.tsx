@@ -620,10 +620,13 @@ function SavingsChartTooltip({
   }
 
   const providerSavings = mergeProviderSavingsForDisplay(point.byProvider ?? []);
-  // The backend's by_provider rollup has no cache dimension, so the bucket's
-  // compressible share is pro-rated across its providers. Exact whenever one
-  // connector was active in the hour (the common case); an approximation only
-  // when two ran concurrently with different cache hit rates.
+  // Each connector's spend drops its OWN cache reads when the backend rollup
+  // reports them per provider (compressibleCostUsd). Older buckets carry no
+  // per-provider cache dimension and pro-rate the bucket's compressible share
+  // instead: exact when one connector was active in the hour, but wrong in
+  // both directions when two ran with different cache profiles (a near-fully
+  // cached Claude Code hour shrank a concurrent ChatGPT's spend to a fraction
+  // and showed an 82% rate that was really ~25%).
   const costScale = point.actualCostUsd > 0 ? point.compressibleCostUsd / point.actualCostUsd : 1;
   const tokenScale =
     point.totalTokensSent > 0 ? point.compressibleTokensSent / point.totalTokensSent : 1;
@@ -662,8 +665,12 @@ function SavingsChartTooltip({
                 {/* "Spent" for brevity; the figure is the compressible slice,
                     matching the bar and the chip's denominator. */}
                 {chartMode === "usd"
-                  ? `Spent ${currencyExact(provider.actualCostUsd * costScale)}`
-                  : `Spent ${compactNumber(provider.totalTokensSent * tokenScale)} tokens`}
+                  ? `Spent ${currencyExact(
+                      provider.compressibleCostUsd ?? provider.actualCostUsd * costScale
+                    )}`
+                  : `Spent ${compactNumber(
+                      provider.compressibleTokensSent ?? provider.totalTokensSent * tokenScale
+                    )} tokens`}
               </span>
             </div>
           ))

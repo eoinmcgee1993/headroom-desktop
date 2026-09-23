@@ -83,8 +83,11 @@ export interface DailySavingsPoint {
   // that aged out of history retention.
   cacheReadTokens?: number | null;
   // The provider read discount earned in the bucket, same coverage as
-  // cacheReadTokens. Actual read cost = this / 9 (reads bill at ~0.1x).
+  // cacheReadTokens.
   cacheSavingsUsd?: number | null;
+  // What those reads cost, priced per request by the backend rollup. Null/
+  // absent on older backends and older archived buckets; see `readCostUsd`.
+  cacheReadCostUsd?: number | null;
   // Locally-sampled output-shaper deltas (saved / baseline) for the bucket.
   // Null/absent for periods before this build or while the app wasn't
   // running. Window reduction = saved / baseline over covered buckets.
@@ -142,6 +145,10 @@ export interface ProviderSavingsPoint {
   estimatedTokensSaved: number;
   actualCostUsd: number;
   totalTokensSent: number;
+  // This provider's own slice of the bucket's cache reads, so its spend can
+  // drop its own reads. Null/absent on backends without the rollup fields.
+  cacheSavingsUsd?: number | null;
+  cacheReadCostUsd?: number | null;
 }
 
 export interface HourlySavingsPoint {
@@ -159,6 +166,7 @@ export interface HourlySavingsPoint {
   toolSchemaTokensSaved?: number;
   cacheReadTokens?: number | null;
   cacheSavingsUsd?: number | null;
+  cacheReadCostUsd?: number | null;
   outputSampledTokensSaved?: number | null;
   outputBaselineTokens?: number | null;
   byProvider: ProviderSavingsPoint[];

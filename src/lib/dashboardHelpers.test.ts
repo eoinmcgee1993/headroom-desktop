@@ -7,6 +7,8 @@ import {
   buildMonthlySavingsChartData,
   buildMonthlySavingsWindow,
   compressibleInputSavingsRate,
+  compressibleSpend,
+  readCostUsd,
   newInputSavingsRate,
   newInputTokensForBar,
   allTimeCacheHitPair,
@@ -469,21 +471,28 @@ describe("mergeProviderSavingsForDisplay", () => {
         estimatedSavingsUsd: 0.1 + 0.01,
         estimatedTokensSaved: 115,
         actualCostUsd: 0.24 + 0.03,
-        totalTokensSent: 140
+        totalTokensSent: 140,
+        // No per-provider cache fields: the tooltip keeps the bucket-ratio fallback.
+        compressibleCostUsd: null,
+        compressibleTokensSent: null
       },
       {
         label: "ChatGPT",
         estimatedSavingsUsd: 0.04,
         estimatedTokensSaved: 40,
         actualCostUsd: 0.16,
-        totalTokensSent: 80
+        totalTokensSent: 80,
+        compressibleCostUsd: null,
+        compressibleTokensSent: null
       },
       {
         label: "Grok Build",
         estimatedSavingsUsd: 0.02,
         estimatedTokensSaved: 25,
         actualCostUsd: 0.08,
-        totalTokensSent: 50
+        totalTokensSent: 50,
+        compressibleCostUsd: null,
+        compressibleTokensSent: null
       }
     ]);
   });
@@ -507,6 +516,95 @@ describe("mergeProviderSavingsForDisplay", () => {
     expect(mergeProviderSavingsForDisplay([])).toEqual([]);
   });
 
+  it("drops each connector's OWN cache reads from its spend", () => {
+    // Claude Code heavily cached, ChatGPT much less, in the same hour. The old
+    // bucket-wide ratio gives both the hour's 0.55 share (ChatGPT $0.54,
+    // Claude Code $7.92); each connector's own reads give $0.62 and $6.90,
+    // so the fix lowers ChatGPT's rate and raises Claude Code's.
+    const [claude, chatgpt] = mergeProviderSavingsForDisplay([
+      {
+        provider: "anthropic",
+        estimatedSavingsUsd: 5.03,
+        estimatedTokensSaved: 400_000,
+        actualCostUsd: 14.5,
+        totalTokensSent: 9_000_000,
+        cacheSavingsUsd: 60,
+        cacheReadCostUsd: 7.6
+      },
+      {
+        provider: "openai",
+        estimatedSavingsUsd: 1.98,
+        estimatedTokensSaved: 200_000,
+        actualCostUsd: 0.98,
+        totalTokensSent: 1_000_000,
+        cacheSavingsUsd: 3.24,
+        cacheReadCostUsd: 0.36
+      }
+    ]);
+    expect(claude.compressibleCostUsd).toBeCloseTo(6.9);
+    expect(chatgpt.compressibleCostUsd).toBeCloseTo(0.62);
+    // Tokens split by each connector's own dollar share, not the hour's.
+    expect(chatgpt.compressibleTokensSent).toBe(Math.round(1_000_000 * (0.62 / (0.98 + 3.24))));
+    expect(claude.compressibleTokensSent).toBe(Math.round(9_000_000 * (6.9 / (14.5 + 60))));
+  });
+
+  it("falls back for a whole group when any of its providers lacks priced reads", () => {
+    // anthropic priced, "unknown" legacy: both fold into Claude Code, whose own
+    // spend is then unknowable, so the tooltip must fall back rather than show
+    // anthropic's slice as the whole group.
+    const [claude] = mergeProviderSavingsForDisplay([
+      {
+        provider: "anthropic",
+        estimatedSavingsUsd: 1,
+        estimatedTokensSaved: 10,
+        actualCostUsd: 4,
+        totalTokensSent: 100,
+        cacheSavingsUsd: 9,
+        cacheReadCostUsd: 1
+      },
+      {
+        provider: "unknown",
+        estimatedSavingsUsd: 0.5,
+        estimatedTokensSaved: 5,
+        actualCostUsd: 2,
+        totalTokensSent: 50
+      }
+    ]);
+    expect(claude.compressibleCostUsd).toBeNull();
+    expect(claude.compressibleTokensSent).toBeNull();
+  });
+
+});
+
+describe("readCostUsd", () => {
+  it("prefers the rollup-priced read cost and falls back to discount / 9", () => {
+    // Fable 5.1 reads: $10/MTok list, $0.25/MTok read -> discount $9.75,
+    // cost $0.25 per MTok. discount / 9 would say $1.083 (4.3x too high).
+    expect(readCostUsd({ cacheSavingsUsd: 9.75, cacheReadCostUsd: 0.25 })).toBeCloseTo(0.25);
+    expect(readCostUsd({ cacheSavingsUsd: 9.75 })).toBeCloseTo(9.75 / 9);
+    expect(readCostUsd({ cacheSavingsUsd: null, cacheReadCostUsd: null })).toBe(0);
+  });
+
+  it("feeds the exact read cost through every rate built on it", () => {
+    // $54.48 Fable spend, $7.23 saved, 1M-token-scale reads. With the rollup's
+    // read cost the compressible spend is $54.48 - $8.33; with /9 it would be
+    // $54.48 - $36.08 and the rate would read 28.2% instead of 13.5%.
+    const bucket = {
+      actualCostUsd: 54.48,
+      estimatedSavingsUsd: 7.23,
+      cacheSavingsUsd: 324.72,
+      cacheReadCostUsd: 8.33
+    };
+    expect(compressibleInputSavingsRate([bucket])!.pct).toBeCloseTo(
+      (7.23 / (7.23 + 54.48 - 8.33)) * 100
+    );
+    expect(compressibleSpend({ ...bucket, totalTokensSent: 0 }).compressibleCostUsd).toBeCloseTo(
+      54.48 - 8.33
+    );
+    const pair = cacheHitPair([bucket])!;
+    expect(pair.hitPct).toBeCloseTo(((8.33 + 324.72) / (54.48 + 324.72)) * 100);
+    expect(pair.compressedPct).toBeCloseTo((7.23 / (7.23 + 54.48 - 8.33)) * 100);
+  });
 });
 
 describe("cacheHitPair", () => {

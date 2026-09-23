@@ -236,9 +236,18 @@ pub struct DailySavingsPoint {
     #[serde(default)]
     pub cache_read_tokens: Option<u64>,
     /// The provider read discount earned in the bucket, same derivation and
-    /// coverage as `cache_read_tokens`. Actual read cost = this / 9.
+    /// coverage as `cache_read_tokens`.
     #[serde(default)]
     pub cache_savings_usd: Option<f64>,
+    /// What the bucket's cache reads actually cost, priced per request by the
+    /// backend rollup with the same function that priced `actual_cost_usd`.
+    /// When present, the three cache fields all come from that rollup. None on
+    /// backends without it and for buckets archived before it; consumers then
+    /// fall back to `cache_savings_usd / 9`, which assumes reads bill at 0.1x
+    /// and overstates the read cost on models with a steeper discount
+    /// (claude-fable-5-1 reads bill at 0.025x).
+    #[serde(default)]
+    pub cache_read_cost_usd: Option<f64>,
     /// Locally-sampled output-shaper deltas for the bucket (poll-over-poll
     /// diffs of the estimator's durable cumulative counters, attributed to the
     /// sampling moment). None for buckets without samples: periods before this
@@ -262,6 +271,14 @@ pub struct ProviderSavingsPoint {
     pub estimated_tokens_saved: u64,
     pub actual_cost_usd: f64,
     pub total_tokens_sent: u64,
+    /// This provider's own read discount and read cost inside the bucket,
+    /// from the backend rollup. With them the hover can take cache reads out
+    /// of each provider's spend exactly, instead of applying the bucket's
+    /// blended ratio to every provider. None on backends without the fields.
+    #[serde(default)]
+    pub cache_savings_usd: Option<f64>,
+    #[serde(default)]
+    pub cache_read_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +307,8 @@ pub struct HourlySavingsPoint {
     pub cache_read_tokens: Option<u64>,
     #[serde(default)]
     pub cache_savings_usd: Option<f64>,
+    #[serde(default)]
+    pub cache_read_cost_usd: Option<f64>,
     /// See `DailySavingsPoint::output_sampled_tokens_saved`.
     #[serde(default)]
     pub output_sampled_tokens_saved: Option<u64>,

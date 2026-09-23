@@ -104,22 +104,25 @@ export function savingsRate(saved: number, spent: number) {
  * totalTokensSent (our tokenizer) must never be differenced or ratioed, and
  * on real data reads exceed forwarded input, which pinned the token form of
  * this pair at a meaningless "100% hits / 100% compressed". The read
- * discount (`cacheSavingsUsd`) and the bucket's input cost come from one
- * pricing function: reads bill at ~0.1x, so read cost = discount / 9 and the
- * reads' full-price value = discount * 10/9. */
+ * discount (`cacheSavingsUsd`), the read cost (`readCostUsd`) and the bucket's
+ * input cost come from one pricing function, and the reads' full-price value
+ * is exactly read cost + discount. */
 export function cacheHitPair(
   points: Array<{
     cacheSavingsUsd?: number | null;
+    cacheReadCostUsd?: number | null;
     actualCostUsd: number;
     estimatedSavingsUsd: number;
   }>
 ) {
   let cacheSavings = 0;
+  let readCost = 0;
   let actual = 0;
   let saved = 0;
   for (const point of points) {
     if (point.cacheSavingsUsd == null) continue;
     cacheSavings += Math.max(0, point.cacheSavingsUsd);
+    readCost += readCostUsd(point);
     actual += Math.max(0, point.actualCostUsd);
     saved += Math.max(0, point.estimatedSavingsUsd);
   }
@@ -127,14 +130,29 @@ export function cacheHitPair(
   // the cache earned.
   const fullPriceInput = actual + cacheSavings;
   if (fullPriceInput <= 0) return null;
-  const hitPct = Math.min(100, (((cacheSavings * 10) / 9) / fullPriceInput) * 100);
+  const hitPct = Math.min(100, ((readCost + cacheSavings) / fullPriceInput) * 100);
   // What survived the cache and was paid at full input price.
-  const rest = Math.max(0, actual - cacheSavings / 9);
+  const rest = Math.max(0, actual - readCost);
   const baseline = saved + rest;
   // A fully-cached window leaves nothing to compress: report 0% of an empty
   // remainder rather than hiding the (excellent) hit rate.
   const compressedPct = baseline > 0 ? Math.min(100, (saved / baseline) * 100) : 0;
   return { hitPct, compressedPct };
+}
+
+/** What a bucket's cache reads cost. The backend rollup's own figure when it
+ * has one (priced per request by model, the same way `actualCostUsd` was);
+ * otherwise recovered from the read discount as `discount / 9`, which assumes
+ * reads bill at 0.1x list. That holds for most models but overstates the read
+ * cost wherever the discount is steeper (claude-fable-5-1 reads bill at
+ * 0.025x, so /9 reads them 4.3x too high and the compressible spend too low),
+ * so it is only the fallback for buckets the rollup never priced. */
+export function readCostUsd(point: {
+  cacheSavingsUsd?: number | null;
+  cacheReadCostUsd?: number | null;
+}) {
+  if (point.cacheReadCostUsd != null) return Math.max(0, point.cacheReadCostUsd);
+  return Math.max(0, point.cacheSavingsUsd ?? 0) / 9;
 }
 
 /** The all-time cache-hit pair, from the lifetime breakdown rather than a
@@ -174,15 +192,16 @@ export function allTimeCacheHitPair(
  * always be computed for them). Priced in dollars because only the dollar
  * figures are on one scale: `totalTokensSent` is our own tokenizer's count
  * while `cacheReadTokens` is the provider's ("must never be differenced",
- * proxy/outcome.py; see cacheHitPair). Read cost is recovered from the read
- * discount (`cacheSavingsUsd / 9`) and subtracted from the bucket's actual
- * input cost -- both from one pricing function, so the subtraction is sound.
+ * proxy/outcome.py; see cacheHitPair). The read cost (`readCostUsd`) is
+ * subtracted from the bucket's actual input cost -- both from one pricing
+ * function, so the subtraction is sound.
  *
  * Only buckets with cache coverage count, so numerator and denominator always
  * describe the same slice; null when the window has no coverage. */
 export function compressibleInputSavingsRate(
   points: Array<{
     cacheSavingsUsd?: number | null;
+    cacheReadCostUsd?: number | null;
     actualCostUsd: number;
     estimatedSavingsUsd: number;
   }>
@@ -192,9 +211,8 @@ export function compressibleInputSavingsRate(
   let remaining = 0;
   for (const point of points) {
     if (point.cacheSavingsUsd == null) continue;
-    const readCostUsd = Math.max(0, point.cacheSavingsUsd) / 9;
     saved += Math.max(0, point.estimatedSavingsUsd);
-    remaining += Math.max(0, point.actualCostUsd - readCostUsd);
+    remaining += Math.max(0, point.actualCostUsd - readCostUsd(point));
   }
   const baseline = saved + remaining;
   if (baseline <= 0) return null;
@@ -395,7 +413,7 @@ export function buildHourlySavingsWindow(data: HourlySavingsPoint[], day: Date) 
  * cached prefix is deliberately left intact, so counting them makes every bar
  * dwarf its own savings segment and contradicts the compression-rate chip
  * above it (which uses the same denominator, see `compressibleInputSavingsRate`).
- * Read cost is recovered from the read discount the same way: `usd / 9`.
+ * Read cost comes from `readCostUsd`.
  *
  * The TOKEN figure is priced the same way rather than differenced, for the
  * reason spelled out on `compressibleInputSavingsRate`: `cacheReadTokens` is
@@ -404,13 +422,14 @@ export function buildHourlySavingsWindow(data: HourlySavingsPoint[], day: Date) 
  * input -- `totalTokensSent - cacheReadTokens` clamped 27 of 36 live hourly
  * buckets to a flat zero bar while the same buckets' dollar bars were fine.
  * So we split our own token count by the compressible share the dollar pair
- * implies (reads bill at ~0.1x, so their full-price value is `discount * 10/9`
- * and full-price input is `actualCostUsd + cacheSavingsUsd`).
+ * implies (full-price input is `actualCostUsd + cacheSavingsUsd`: what was
+ * paid plus the discount the reads earned).
  *
  * Falls back to the full figure on buckets with no cache coverage - local
  * tracker buckets, and days aged out of the backend's checkpoint history. */
 export function compressibleSpend(point: {
   cacheSavingsUsd?: number | null;
+  cacheReadCostUsd?: number | null;
   actualCostUsd: number;
   totalTokensSent: number;
 }) {
@@ -421,7 +440,7 @@ export function compressibleSpend(point: {
     };
   }
   const cacheSavingsUsd = Math.max(0, point.cacheSavingsUsd);
-  const compressibleCostUsd = Math.max(0, point.actualCostUsd - cacheSavingsUsd / 9);
+  const compressibleCostUsd = Math.max(0, point.actualCostUsd - readCostUsd(point));
   const fullPriceInput = Math.max(0, point.actualCostUsd) + cacheSavingsUsd;
   const compressibleShare = fullPriceInput > 0 ? compressibleCostUsd / fullPriceInput : 1;
   return {
@@ -447,6 +466,7 @@ export function compressibleSpend(point: {
 export function newInputTokensForBar(point: {
   newInputTokens?: number;
   cacheSavingsUsd?: number | null;
+  cacheReadCostUsd?: number | null;
   actualCostUsd: number;
   totalTokensSent: number;
 }) {
@@ -484,6 +504,13 @@ export interface ProviderSavingsDisplay {
   estimatedTokensSaved: number;
   actualCostUsd: number;
   totalTokensSent: number;
+  // The group's own compressible spend (its input cost minus its own cache
+  // reads) and the matching token figure, when every provider folded into it
+  // reported its reads. Null when any did not, and the tooltip falls back to
+  // the bucket-wide ratio. Tokens are split by the dollar share, never
+  // differenced against provider read counts (see `compressibleSpend`).
+  compressibleCostUsd: number | null;
+  compressibleTokensSent: number | null;
 }
 
 // Fold the upstream per-provider breakdown into the two connectors the desktop
@@ -507,7 +534,9 @@ export function mergeProviderSavingsForDisplay(
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,
       actualCostUsd: 0,
-      totalTokensSent: 0
+      totalTokensSent: 0,
+      cacheSavingsUsd: 0,
+      compressibleCostUsd: 0 as number | null
     },
     codex: {
       label: "ChatGPT",
@@ -515,7 +544,9 @@ export function mergeProviderSavingsForDisplay(
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,
       actualCostUsd: 0,
-      totalTokensSent: 0
+      totalTokensSent: 0,
+      cacheSavingsUsd: 0,
+      compressibleCostUsd: 0 as number | null
     },
     grok: {
       label: "Grok Build",
@@ -523,7 +554,9 @@ export function mergeProviderSavingsForDisplay(
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,
       actualCostUsd: 0,
-      totalTokensSent: 0
+      totalTokensSent: 0,
+      cacheSavingsUsd: 0,
+      compressibleCostUsd: 0 as number | null
     }
   };
   for (const point of byProvider) {
@@ -539,10 +572,31 @@ export function mergeProviderSavingsForDisplay(
     group.estimatedTokensSaved += point.estimatedTokensSaved;
     group.actualCostUsd += point.actualCostUsd;
     group.totalTokensSent += point.totalTokensSent;
+    group.cacheSavingsUsd += Math.max(0, point.cacheSavingsUsd ?? 0);
+    // Exact only when the rollup priced THIS provider's reads; one provider
+    // without it makes the group's figure unknowable.
+    group.compressibleCostUsd =
+      group.compressibleCostUsd == null || point.cacheReadCostUsd == null
+        ? null
+        : group.compressibleCostUsd +
+          Math.max(0, point.actualCostUsd - Math.max(0, point.cacheReadCostUsd));
   }
   return [groups.claude, groups.codex, groups.grok]
     .filter((group) => group.count > 0)
-    .map(({ count: _count, ...display }) => display);
+    .map(({ count: _count, cacheSavingsUsd, ...display }) => {
+      const cost = display.compressibleCostUsd;
+      const fullPriceInput = Math.max(0, display.actualCostUsd) + cacheSavingsUsd;
+      return {
+        ...display,
+        compressibleTokensSent:
+          cost == null
+            ? null
+            : Math.round(
+                Math.max(0, display.totalTokensSent) *
+                  (fullPriceInput > 0 ? cost / fullPriceInput : 1)
+              )
+      };
+    });
 }
 
 export function buildHourlySavingsChartData(data: HourlySavingsPoint[]): SavingsChartDatum[] {
