@@ -1658,6 +1658,10 @@ async fn handle(
                 .filter(|head| client_key == "claude-code" && is_prompt_request_head(head))
                 .and_then(|_| extract_header_value(&buf, "x-claude-code-session-id"))
                 .filter(|id| is_claude_session_id(id));
+            // The request is with the backend now: statusline "compressing".
+            if let Some(id) = savings_session.as_deref() {
+                crate::claude_statusline::record_request(id);
+            }
             let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path)
                 .with_savings_session(savings_session);
             let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;

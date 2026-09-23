@@ -5993,13 +5993,16 @@ allowed-tools: Bash({script}:*), AskUserQuestion\n\
 disable-model-invocation: true\n\
 ---\n\
 {CLAUDE_REMOTE_CONTROL_COMMAND_MARKER}\n\
-Remote Control is unavailable while this session is routed through Headroom. \
-Call the AskUserQuestion tool now (a tool call, never prose) with exactly one question: \
-\"Remote Control needs this session to exit and restart without Headroom. \
-The restart replays the full conversation uncached, and Headroom stays off for the restarted session. Continue?\" \
-with the options \"Restart with Remote Control\" and \"Stay here\". \
+First write exactly this one line of plain text and nothing else before it: \
+\"Remote Control is unavailable while this session runs through Headroom: Claude Code switches it off for any custom endpoint.\" \
+Then call the AskUserQuestion tool (a tool call, never prose) with header \"Remote Control\" and exactly one question: \
+\"Headroom is incompatible with Remote Control due to design decisions by Anthropic. \
+Headroom can restart this session with itself disabled so Remote Control does work. How do you want to proceed?\" \
+Offer exactly two options, in this order: \
+\"Restart with Remote Control\" (description: \"Exit and restart this session without Headroom. The restart replays the conversation uncached.\") and \
+\"Do nothing and keep this session routed through Headroom\" (description: \"Remote Control stays unavailable here.\"). \
 If the answer is \"Restart with Remote Control\", run `{script}` with the Bash tool and output nothing else. \
-If the answer is \"Stay here\", reply only \"Staying in this session.\"\n"
+Otherwise reply only \"Staying in this session.\"\n"
     )
 }
 
@@ -6064,41 +6067,51 @@ fn claude_statusline_script_path() -> PathBuf {
 
 /// Prints this conversation's Headroom input savings from the file the
 /// intercept keeps (claude_statusline.rs), looked up by the `session_id`
-/// Claude Code passes on stdin. Silent until the conversation has a saving,
-/// and on any error. `-I -S` keeps the managed interpreter from importing
-/// site-packages: ~16 ms per render.
-fn build_claude_statusline_script(python_path: &Path, state_path: &Path) -> String {
-    let python = shell_double_quote(&python_path.to_string_lossy());
+/// Claude Code passes on stdin: "Headroom saved 31k tokens this session", bold
+/// green with the new saving appended for a few seconds after one lands, and
+/// "Headroom compressing..." for a moment after each request goes out. The
+/// real compression is ~100 ms (p50); the moment is stretched to a couple of
+/// seconds so a 1 s render cycle cannot miss it. A saving outranks it, so a
+/// follow-up request never cuts a saving's highlight short. Silent until the
+/// conversation has sent a request or saved something, and on any error.
+///
+/// Plain bash, parsing with regexes, because it runs every second
+/// (`refreshInterval`): ~4 ms per render against ~30 ms for a Python start.
+/// Stays bash 3.2 compatible (macOS /bin/bash): no EPOCHREALTIME, no printf %T.
+fn build_claude_statusline_script(state_path: &Path) -> String {
     let state = shell_double_quote(&state_path.to_string_lossy());
     format!(
-        r#"#!/usr/bin/env bash
+        r#"#!/bin/bash
 # Headroom statusline (managed by Headroom Desktop - do not edit).
-HEADROOM_PYTHON="{python}"
-[ -x "$HEADROOM_PYTHON" ] || exit 0
-HEADROOM_STATUSLINE_STATE="{state}" exec "$HEADROOM_PYTHON" -I -S -c '
-import json, os, sys
-def fmt(n):
-    for div, unit in ((1000000, "M"), (1000, "k")):
-        if n >= div:
-            v = n / div
-            text = ("%.1f" % v).rstrip("0").rstrip(".") if v < 10 else "%d" % round(v)
-            return text + unit
-    return str(n)
-try:
-    sid = json.load(sys.stdin)["session_id"]
-    with open(os.environ["HEADROOM_STATUSLINE_STATE"]) as f:
-        entry = json.load(f)["sessions"][sid]
-    total = int(entry.get("tokensSaved", 0))
-    last = int(entry.get("lastRequestSaved", 0))
-except Exception:
-    sys.exit(0)
-if total <= 0:
-    sys.exit(0)
-if last > 0:
-    print("Headroom: saved %s input tokens on the last request, %s in this session so far" % (fmt(last), fmt(total)))
-else:
-    print("Headroom: saved %s input tokens in this session so far" % fmt(total))
-' 2>/dev/null
+state_file="{state}"
+flash_secs=4
+compress_secs=2
+IFS= read -r -d '' input
+[[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]] || exit 0
+sid=${{BASH_REMATCH[1]}}
+[ -r "$state_file" ] || exit 0
+state=$(<"$state_file")
+[[ $state =~ \"$sid\":\{{\"tokensSaved\":([0-9]+),\"lastSaved\":([0-9]+),\"lastSavedAtMs\":([0-9]+)(,\"lastRequestAtMs\":([0-9]+))?\}} ]] || exit 0
+total=${{BASH_REMATCH[1]}} last=${{BASH_REMATCH[2]}} last_at=${{BASH_REMATCH[3]}} req_at=${{BASH_REMATCH[5]:-0}}
+now_ms=$(( $(date +%s) * 1000 ))
+fmt() {{
+  local n=$1 d u t
+  if [ "$n" -ge 999500 ]; then d=1000000 u=M
+  elif [ "$n" -ge 1000 ]; then d=1000 u=k
+  else echo "$n"; return; fi
+  t=$(( (n * 10 + d / 2) / d ))
+  if [ "$t" -ge 100 ]; then echo "$(( (n + d / 2) / d ))$u"
+  elif [ $(( t % 10 )) -eq 0 ]; then echo "$(( t / 10 ))$u"
+  else echo "$(( t / 10 )).$(( t % 10 ))$u"; fi
+}}
+line="Headroom saved $(fmt "$total") tokens this session"
+if [ "$last" -gt 0 ] && [ $(( now_ms - last_at )) -lt $(( flash_secs * 1000 )) ]; then
+  printf '\033[1;32m%s (+%s)\033[0m\n' "$line" "$(fmt "$last")"
+elif [ $(( now_ms - req_at )) -lt $(( compress_secs * 1000 )) ]; then
+  printf '\033[32mHeadroom compressing...\033[0m\n'
+elif [ "$total" -gt 0 ]; then
+  printf '%s\n' "$line"
+fi
 "#
     )
 }
@@ -6136,7 +6149,10 @@ fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
             if current.is_some_and(|v| !is_our_statusline(v)) {
                 return Ok(false);
             }
-            let desired = serde_json::json!({ "type": "command", "command": command });
+            // refreshInterval: the highlight has to switch off on time, and a
+            // saving can land between Claude Code's own event-driven renders.
+            let desired =
+                serde_json::json!({ "type": "command", "command": command, "refreshInterval": 1 });
             if current == Some(&desired) {
                 return Ok(false);
             }
@@ -6175,10 +6191,7 @@ fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
     let script = claude_statusline_script_path();
     let (did_change, backup) = write_file_if_changed(
         &script,
-        &build_claude_statusline_script(
-            &default_headroom_managed_python_path(),
-            &crate::claude_statusline::state_path(),
-        ),
+        &build_claude_statusline_script(&crate::claude_statusline::state_path()),
         true,
     )?;
     if did_change {
@@ -12296,25 +12309,46 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[cfg(unix)]
     #[test]
     fn statusline_script_prints_this_conversation_and_is_otherwise_silent() {
-        let python = Path::new("/usr/bin/python3");
-        if !python.exists() {
-            eprintln!("skipping: no /usr/bin/python3");
-            return;
-        }
+        use crate::claude_statusline::{Persisted, Session, SCHEMA_VERSION};
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("claude-statusline.json");
-        std::fs::write(
-            &state,
-            r#"{"schemaVersion":1,"sessions":{
-                "busy":{"tokensSaved":1100000,"lastRequestSaved":15400},
-                "idle":{"tokensSaved":1100000,"lastRequestSaved":0}}}"#,
-        )
-        .unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let session = |total, last, at, req| Session {
+            tokens_saved: total,
+            last_saved: last,
+            last_saved_at_ms: at,
+            last_request_at_ms: req,
+        };
+        let old = now_ms - 60_000;
+        // Serialized by the store itself, so the script's regex is checked
+        // against the real field order, not a hand-written copy of it.
+        let persisted = Persisted {
+            schema_version: SCHEMA_VERSION,
+            sessions: BTreeMap::from([
+                // A follow-up request must not cut a fresh saving short.
+                (
+                    "aaaa-just-saved".into(),
+                    session(1_100_000, 15_400, now_ms, now_ms),
+                ),
+                ("bbbb-quiet".into(), session(3_067, 2_865, old, old)),
+                ("cccc-small".into(), session(700, 700, old, old)),
+                ("dddd-sending".into(), session(3_067, 2_865, old, now_ms)),
+                ("eeee-first-request".into(), session(0, 0, 0, now_ms)),
+                ("ffff-nothing-yet".into(), session(0, 0, 0, old)),
+            ]),
+        };
+        // Plus an entry as the previous build wrote it, without lastRequestAtMs.
+        let json = serde_json::to_string(&persisted).unwrap().replacen(
+            r#""sessions":{"#,
+            r#""sessions":{"0000-old-format":{"tokensSaved":42,"lastSaved":0,"lastSavedAtMs":1},"#,
+            1,
+        );
+        std::fs::write(&state, json).unwrap();
         let script = dir.path().join(CLAUDE_STATUSLINE_SCRIPT);
-        std::fs::write(&script, build_claude_statusline_script(python, &state)).unwrap();
+        std::fs::write(&script, build_claude_statusline_script(&state)).unwrap();
         let render = |stdin: &str| -> String {
             use std::io::Write;
-            let mut child = crate::proc::command("bash")
+            let mut child = crate::proc::command("/bin/bash")
                 .arg(&script)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -12334,12 +12368,28 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             String::from_utf8(out.stdout).unwrap()
         };
         assert_eq!(
-            render(r#"{"session_id":"busy"}"#),
-            "Headroom: saved 15k input tokens on the last request, 1.1M in this session so far\n"
+            render(r#"{"session_id":"aaaa-just-saved","cwd":"/x"}"#),
+            "\x1b[1;32mHeadroom saved 1.1M tokens this session (+15k)\x1b[0m\n"
+        );
+        // Claude Code's real payload is pretty-printed; spacing must not matter.
+        assert_eq!(
+            render("{\n  \"session_id\": \"bbbb-quiet\"\n}"),
+            "Headroom saved 3.1k tokens this session\n"
         );
         assert_eq!(
-            render(r#"{"session_id":"idle"}"#),
-            "Headroom: saved 1.1M input tokens in this session so far\n"
+            render(r#"{"session_id":"cccc-small"}"#),
+            "Headroom saved 700 tokens this session\n"
+        );
+        let compressing = "\x1b[32mHeadroom compressing...\x1b[0m\n";
+        assert_eq!(render(r#"{"session_id":"dddd-sending"}"#), compressing);
+        assert_eq!(
+            render(r#"{"session_id":"eeee-first-request"}"#),
+            compressing
+        );
+        assert_eq!(render(r#"{"session_id":"ffff-nothing-yet"}"#), "");
+        assert_eq!(
+            render(r#"{"session_id":"0000-old-format"}"#),
+            "Headroom saved 42 tokens this session\n"
         );
         assert_eq!(render(r#"{"session_id":"unknown"}"#), "");
         assert_eq!(render("not json"), "");
@@ -12359,7 +12409,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "Bash({}:*), AskUserQuestion",
             script_path.display()
         )));
-        assert!(command.contains("Call the AskUserQuestion tool now"));
+        assert!(command.contains("First write exactly this one line of plain text"));
+        assert!(command.contains("Then call the AskUserQuestion tool"));
+        assert!(command.contains(
+            "Headroom is incompatible with Remote Control due to design decisions by Anthropic."
+        ));
         let script = std::fs::read_to_string(&script_path).unwrap();
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("kill -TERM $CLAUDE_PID"));
