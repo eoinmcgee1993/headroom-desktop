@@ -3,6 +3,7 @@ mod analytics;
 mod backend_port;
 mod bearer;
 mod claude_cli;
+mod claude_statusline;
 mod client_adapters;
 mod device;
 mod keychain;
@@ -815,6 +816,7 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
         })
@@ -5803,6 +5805,21 @@ async fn set_rtk_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
 }
 
 #[tauri::command]
+fn get_claude_statusline_enabled() -> bool {
+    !client_adapters::is_statusline_disabled()
+}
+
+/// Toggle the per-conversation savings line under Claude Code's prompt. Takes
+/// effect on Claude Code's next statusline render; no proxy restart needed.
+#[tauri::command]
+async fn set_claude_statusline_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    client_adapters::set_statusline_enabled(enabled).map_err(|err| err.to_string())?;
+    let action = if enabled { "enabled" } else { "disabled" };
+    analytics::track_event(&app, &format!("claude_statusline_{action}"), None);
+    Ok(!client_adapters::is_statusline_disabled())
+}
+
+#[tauri::command]
 fn get_auto_learn_enabled() -> bool {
     !client_adapters::is_auto_learn_disabled()
 }
@@ -6589,6 +6606,8 @@ pub fn run() {
             set_rtk_enabled,
             get_auto_learn_enabled,
             set_auto_learn_enabled,
+            get_claude_statusline_enabled,
+            set_claude_statusline_enabled,
             uninstall_and_quit,
             quit_headroom,
             #[cfg(debug_assertions)]
@@ -6789,6 +6808,8 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
                 actual_cost_usd: point.actual_cost_usd,
                 cache_read_tokens: point.cache_read_tokens,
                 cache_savings_usd: point.cache_savings_usd,
+                cache_read_cost_usd: point.cache_read_cost_usd,
+                new_input_tokens: (point.new_input_tokens > 0).then_some(point.new_input_tokens),
                 output_sampled_tokens_saved: point.output_sampled_tokens_saved,
                 output_baseline_tokens: point.output_baseline_tokens,
                 client_requests: day_counters.map(|c| c.client_requests.clone()),
@@ -9829,6 +9850,7 @@ mod tests {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
         }
@@ -9868,6 +9890,40 @@ mod tests {
         assert_eq!(days.first().unwrap().date, "2026-06-09");
         assert_eq!(days.last().unwrap().date, "2026-06-40");
         assert!(days.iter().all(|d| d.tokens_saved == 1_000));
+    }
+
+    #[test]
+    fn recent_savings_days_reports_the_rollup_read_cost() {
+        // The server rates the input layer against spend minus read cost; it
+        // needs the rollup's priced figure, and null where there is none.
+        let mut exact = daily_point("2026-06-01", 7.23, 1_000, 54.48, 9_000);
+        exact.cache_savings_usd = Some(324.72);
+        exact.cache_read_cost_usd = Some(8.33);
+        let mut legacy = daily_point("2026-06-02", 1.0, 1_000, 5.0, 9_000);
+        legacy.cache_savings_usd = Some(9.0);
+
+        let days = recent_savings_days(&[exact, legacy]);
+        assert_eq!(days[0].cache_read_cost_usd, Some(8.33));
+        assert_eq!(days[1].cache_read_cost_usd, None);
+        let json = serde_json::to_value(&days[1]).unwrap();
+        assert!(json.get("cache_read_cost_usd").unwrap().is_null());
+    }
+
+    #[test]
+    fn recent_savings_days_reports_new_input_only_where_sampled() {
+        // The server rates the day like the Input chip: tokens_saved over
+        // tokens_saved + new_input_tokens. An unsampled day must arrive as
+        // null, never 0, or it would read as "100% removed".
+        let mut sampled = daily_point("2026-06-01", 1.0, 2_000, 5.0, 90_000);
+        sampled.new_input_tokens = 6_000;
+        let rollup = daily_point("2026-06-02", 1.0, 1_000, 5.0, 9_000);
+
+        let days = recent_savings_days(&[sampled, rollup]);
+        assert_eq!(days[0].new_input_tokens, Some(6_000));
+        assert_eq!(days[0].tokens_saved, 2_000);
+        assert_eq!(days[1].new_input_tokens, None);
+        let json = serde_json::to_value(&days[1]).unwrap();
+        assert!(json.get("new_input_tokens").unwrap().is_null());
     }
 
     #[test]

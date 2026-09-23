@@ -50,7 +50,7 @@ Have Claude call `mcp__headroom__headroom_retrieve` with any small query and exp
 Click the tray icon, open the dashboard. Expect savings chart and per-client stats render without a blank/error state.
 
 ### 6. Pause / resume cleanly strips and restores interception
-In Settings, toggle Pause then Resume. After Pause, `grep -c '127.0.0.1:6767' "$USERPROFILE/.claude/settings.json"` should return `0`; after Resume it should be non-zero. The base-URL marker exists on every install; do not grep for `headroom-rtk-rewrite` here - that hook only exists when the opt-in RTK addon is installed, so its baseline is already `0` on a fresh install. This verifies the Claude Code config only — Pause clears *all* clients, so check C4 in the Codex pass confirms Codex's config is stripped and restored too.
+From the tray icon menu ("Pause Headroom" / "Resume Headroom"; there is no Pause control on the Settings page), toggle Pause then Resume. After Pause, `grep -c '127.0.0.1:6767' "$USERPROFILE/.claude/settings.json"` should return `0`; after Resume it should be non-zero. The base-URL marker exists on every install; do not grep for `headroom-rtk-rewrite` here - that hook only exists when the opt-in RTK addon is installed, so its baseline is already `0` on a fresh install. This verifies the Claude Code config only — Pause clears *all* clients, so check C4 in the Codex pass confirms Codex's config is stripped and restored too.
 
 ### 7. Proxy is actively optimizing this conversation (not just a heartbeat)
 The proxy always runs in `token` mode now (`HEADROOM_MODE=token`, hardcoded). The compression policy is chosen per request by the auth-mode classifier from the client `User-Agent`: Claude Code subscription/OAuth traffic (UA `claude-code/`) is classified `SUBSCRIPTION` → conservative policy; pay-per-token API-key / Codex traffic is classified `PAYG`/`OAUTH` → aggressive policy, so `requests_compressed` and `total_tokens_removed` move directly.
@@ -242,10 +242,10 @@ Expect: `PASS`.
 Expect: `mode` is `token`, `primary_model` is a `gpt-*` model, `requests_compressed` increased by at least 1, and `total_tokens_removed` is strictly greater.
 
 ### C3. Codex savings are attributed on the dashboard
-Open the dashboard and confirm a **Codex** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the Codex group.
+Open the dashboard and confirm a **ChatGPT** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the group labelled "ChatGPT" (internal key `codex`; the display name follows OpenAI's 2026-07 rename).
 
 ### C4. Pause / resume cleanly strips and restores Codex routing
-In Settings, toggle Pause then Resume, checking after each:
+From the tray menu ("Pause Headroom" / "Resume Headroom"), toggle Pause then Resume, checking after each:
 ```bash
 grep -c 'headroom:codex_cli' "$USERPROFILE/.codex/config.toml"
 ```

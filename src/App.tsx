@@ -80,6 +80,7 @@ import {
 import { SetupStallModal } from "./components/SetupStallModal";
 import { ReconnectModal } from "./components/ReconnectModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
+import { ClaudeStatuslinePanel } from "./components/ClaudeStatuslinePanel";
 import {
   authCodeSentMessage,
   buildInstallFailureMailto,
@@ -328,7 +329,7 @@ const addonCopy: Record<string, AddonCopy> = {
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
-    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom.",
+    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Claude Code disables Remote Control behind any proxy, so Headroom also installs a /remote-control command that, after confirming, restarts the current session without Headroom.",
   codex:
     "The ChatGPT app (previously Codex), its IDE extension, and the Codex CLI share ~/.codex/config.toml. Headroom adds a managed provider there and an OPENAI_BASE_URL shell export, plus a SessionStart guard that warns when routing breaks. In the Codex CLI, run /hooks once to review and trust the guard (and again after it changes).",
   grok_build:
@@ -620,10 +621,13 @@ function SavingsChartTooltip({
   }
 
   const providerSavings = mergeProviderSavingsForDisplay(point.byProvider ?? []);
-  // The backend's by_provider rollup has no cache dimension, so the bucket's
-  // compressible share is pro-rated across its providers. Exact whenever one
-  // connector was active in the hour (the common case); an approximation only
-  // when two ran concurrently with different cache hit rates.
+  // Each connector's spend drops its OWN cache reads when the backend rollup
+  // reports them per provider (compressibleCostUsd). Older buckets carry no
+  // per-provider cache dimension and pro-rate the bucket's compressible share
+  // instead: exact when one connector was active in the hour, but wrong in
+  // both directions when two ran with different cache profiles (a near-fully
+  // cached Claude Code hour shrank a concurrent ChatGPT's spend to a fraction
+  // and showed an 82% rate that was really ~25%).
   const costScale = point.actualCostUsd > 0 ? point.compressibleCostUsd / point.actualCostUsd : 1;
   const tokenScale =
     point.totalTokensSent > 0 ? point.compressibleTokensSent / point.totalTokensSent : 1;
@@ -662,8 +666,12 @@ function SavingsChartTooltip({
                 {/* "Spent" for brevity; the figure is the compressible slice,
                     matching the bar and the chip's denominator. */}
                 {chartMode === "usd"
-                  ? `Spent ${currencyExact(provider.actualCostUsd * costScale)}`
-                  : `Spent ${compactNumber(provider.totalTokensSent * tokenScale)} tokens`}
+                  ? `Spent ${currencyExact(
+                      provider.compressibleCostUsd ?? provider.actualCostUsd * costScale
+                    )}`
+                  : `Spent ${compactNumber(
+                      provider.compressibleTokensSent ?? provider.totalTokensSent * tokenScale
+                    )} tokens`}
               </span>
             </div>
           ))
@@ -1392,6 +1400,7 @@ function AddonCard({
   onUpdate,
   availableVersion,
   unavailableReason,
+  managedExternally,
   children
 }: {
   name: string;
@@ -1420,6 +1429,8 @@ function AddonCard({
   availableVersion?: string | null;
   /** Platform has no installable build: gray the card, drop the actions. */
   unavailableReason?: string | null;
+  /** Installed by the user outside Headroom: show it, but own none of it. */
+  managedExternally?: boolean;
   children?: ReactNode;
 }) {
   return (
@@ -1461,6 +1472,11 @@ function AddonCard({
         </button>
         {unavailableReason ? (
           <p className="addon-card__notice">{unavailableReason}</p>
+        ) : managedExternally ? (
+          <p className="addon-card__notice">
+            You installed this yourself, so Headroom leaves it alone. Manage it with
+            /plugin in your agent.
+          </p>
         ) : null}
         {busy && busyLabel ? (
           <p className="addon-card__progress">{busyLabel}</p>
@@ -1484,7 +1500,7 @@ function AddonCard({
           <button type="button" className="addon-card__action" disabled>
             Unavailable
           </button>
-        ) : !installed ? (
+        ) : managedExternally ? null : !installed ? (
           <button
             type="button"
             className="addon-card__action addon-card__action--primary"
@@ -7542,6 +7558,7 @@ export default function App() {
                       updateAvailable={tool.updateAvailable ?? false}
                       availableVersion={tool.availableVersion ?? null}
                       unavailableReason={tool.unavailableReason ?? null}
+                      managedExternally={tool.managedExternally ?? false}
                       onUpdate={() =>
                         void runAddonAction("install_addon", tool.id, undefined, {
                           busy: `Updating ${tool.name}...`,
@@ -8266,6 +8283,7 @@ export default function App() {
                 <summary>Advanced</summary>
                 <div className="advanced-section__body">
                   <UpstreamPanel />
+                  <ClaudeStatuslinePanel />
                 </div>
               </details>
 

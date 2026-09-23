@@ -25,6 +25,17 @@ const HEADROOM_ANTHROPIC_BASE_URL: &str = "http://127.0.0.1:6767";
 // wiring must too. We write it only when unset so a user's own value wins.
 const HEADROOM_ENABLE_TOOL_SEARCH_KEY: &str = "ENABLE_TOOL_SEARCH";
 const HEADROOM_ENABLE_TOOL_SEARCH_VALUE: &str = "true";
+// Claude Code hides /remote-control whenever ANTHROPIC_BASE_URL is not
+// api.anthropic.com (pure host compare, loopback included), so a Headroom-routed
+// session can never turn it on. The /remote-control command Headroom installs
+// asks the session to exit, and the `claude` shell function relaunches the SAME
+// session by id with this `--settings` layer, which outranks the settings.json
+// env for that one process. (`ANTHROPIC_BASE_URL= claude` does not work: the
+// settings.json env beats an empty process env.)
+const CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE: &str =
+    r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com"}}"#;
+const CLAUDE_REMOTE_CONTROL_COMMAND_MARKER: &str =
+    "<!-- managed by Headroom Desktop -- do not edit -->";
 const HEADROOM_OPENAI_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const HEADROOM_GROK_PROXY_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const ZSH_PROFILE_FILE: &str = ".zprofile";
@@ -189,6 +200,25 @@ pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
     let mut state = load_setup_state();
     state.auto_learn_disabled = !enabled;
     write_setup_state(&state)
+}
+
+/// True when the user turned the Claude Code savings statusline off.
+pub fn is_statusline_disabled() -> bool {
+    load_setup_state().statusline_disabled
+}
+
+/// Persist the statusline opt-out and apply it now: install it when Claude
+/// Code routes through Headroom, remove it otherwise.
+pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
+    let mut state = load_setup_state();
+    state.statusline_disabled = !enabled;
+    write_setup_state(&state)?;
+    if enabled && is_claude_code_enabled() {
+        ensure_claude_statusline()?;
+    } else {
+        remove_claude_statusline()?;
+    }
+    Ok(())
 }
 
 /// Enable or disable RTK from the tool status toggle. Disabling tears down the
@@ -376,10 +406,28 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             let mut guard = ensure_claude_guard_hook()?;
             updates.0.append(&mut guard.0);
             updates.1.append(&mut guard.1);
+            // Convenience, never a setup blocker: the /remote-control relaunch
+            // command (see CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE).
+            match ensure_claude_remote_control_command() {
+                Ok(mut rc) => {
+                    updates.0.append(&mut rc.0);
+                    updates.1.append(&mut rc.1);
+                }
+                Err(err) => log::warn!("installing /remote-control command failed: {err}"),
+            }
+            // Same: the per-conversation savings statusline. Rides routing, so
+            // it is never on screen while Claude Code bypasses Headroom.
+            match ensure_claude_statusline() {
+                Ok(mut line) => {
+                    updates.0.append(&mut line.0);
+                    updates.1.append(&mut line.1);
+                }
+                Err(err) => log::warn!("installing Claude statusline failed: {err}"),
+            }
 
             // Shell profile (RTK PATH + env export) is convenience; tolerate an
             // unwritable profile rather than failing the whole setup.
-            let env_block = format!("export ANTHROPIC_BASE_URL={}", HEADROOM_ANTHROPIC_BASE_URL);
+            let env_block = claude_code_shell_block();
             let shell_step = ensure_rtk_integrations_for_targets(
                 &default_headroom_rtk_path(),
                 &default_headroom_managed_python_path(),
@@ -1155,6 +1203,8 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
                 let _ = std::fs::remove_file(&hook_path);
             }
             let _ = remove_claude_guard_hook();
+            let _ = remove_claude_remote_control_command();
+            let _ = remove_claude_statusline();
         }
         "vscode" => {
             let preserved = state
@@ -1494,6 +1544,12 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     }
     if let Err(err) = remove_claude_guard_hook() {
         log::warn!("cleanup: removing Claude guard hook failed: {err}");
+    }
+    if let Err(err) = remove_claude_remote_control_command() {
+        log::warn!("cleanup: removing /remote-control command failed: {err}");
+    }
+    if let Err(err) = remove_claude_statusline() {
+        log::warn!("cleanup: removing Claude statusline failed: {err}");
     }
 
     // Restore the open-source Claude Code plugin hook if we neutralized it.
@@ -2240,6 +2296,10 @@ struct ClientSetupState {
     /// is spawned without the passive traffic-learning flags.
     #[serde(default)]
     auto_learn_disabled: bool,
+    /// User turned the Claude Code statusline off in Settings > Advanced. When
+    /// true, client setup skips installing it.
+    #[serde(default)]
+    statusline_disabled: bool,
 }
 
 fn is_configured(state: &ClientSetupState, client_id: &str) -> bool {
@@ -5829,6 +5889,383 @@ fn claude_guard_registered() -> Result<bool> {
 /// Strip the Claude guard from every settings candidate and delete the script.
 /// Never deletes settings.json (it carries other keys), so `delete_if_empty` is
 /// false.
+fn claude_remote_control_script_path() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("hooks")
+        .join("headroom-remote-control.sh")
+}
+
+fn claude_remote_control_command_path() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("commands")
+        .join("remote-control.md")
+}
+
+/// The managed `claude_code` shell block: the routing export plus a `claude`
+/// function that (a) adds the api.anthropic.com settings layer whenever the
+/// user passes `--remote-control`, and (b) after the wrapped session exits,
+/// resumes the session named in the relaunch marker for this tty. The marker
+/// is written by the /remote-control script (`build_claude_remote_control_script`),
+/// keyed by tty so two terminals never swap sessions, and ignored once stale so
+/// a terminal without the function (opened before setup) cannot leave a marker
+/// that hijacks some later exit.
+///
+/// The function is defined through `eval`, and only when `claude` is not an
+/// alias: zsh and bash alias-expand a function name at parse time, so a bare
+/// `claude() {` below a user's `alias claude=...` (Claude Code's own local
+/// installer writes one) is a parse error that aborts the rest of the rc file.
+fn claude_code_shell_block() -> String {
+    let function = r#"claude() {
+  case " $* " in *" --remote-control "*) set -- --settings '__OVERRIDE__' "$@";; esac
+  command claude "$@"
+  local rc=$?
+  local m="$HOME/.headroom/remote-control/$(basename "$(tty 2>/dev/null)" 2>/dev/null)"
+  if [ -s "$m" ] && [ -n "$(find "$m" -mmin -2 2>/dev/null)" ]; then
+    local sid; sid=$(cat "$m"); rm -f "$m"
+    command claude --settings '__OVERRIDE__' -r "$sid" --remote-control
+    return $?
+  fi
+  return $rc
+}"#
+    .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE);
+    format!(
+        "export ANTHROPIC_BASE_URL={HEADROOM_ANTHROPIC_BASE_URL}\n\
+         # /remote-control needs api.anthropic.com; this relaunches the same session without Headroom.\n\
+         if ! alias claude >/dev/null 2>&1; then eval '{}'; fi",
+        function.replace('\'', r"'\''")
+    )
+}
+
+/// POSIX sh script run by the /remote-control command (via the model's Bash
+/// tool, so it inherits CLAUDE_CODE_SESSION_ID and CLAUDE_PID). Refuses when
+/// Remote Control is already reachable, or when the session has no tty (IDE
+/// panels: nothing would relaunch it), and otherwise writes the tty-keyed
+/// marker and asks the session to exit from a detached child so the command's
+/// own output lands first.
+fn build_claude_remote_control_script() -> String {
+    r#"#!/bin/sh
+# Headroom Remote Control relaunch (managed by Headroom Desktop -- do not edit).
+# Claude Code hides /remote-control whenever ANTHROPIC_BASE_URL is not
+# api.anthropic.com, so a Headroom-routed session can never turn it on. This
+# leaves a marker and asks the session to exit; the `claude` shell function
+# Headroom manages then resumes the SAME session by id with the base URL
+# overridden for that one process.
+# Two phases. Without arguments (run by the model's Bash tool after the user
+# confirms): record the pending exit. With --stop (Claude Code's Stop hook,
+# fired once the model's turn has ended): perform it. Killing only after the
+# turn ends keeps the transcript clean, so the resumed session shows no
+# "interrupted" turn in the terminal or on the phone.
+if [ "${1:-}" = "--stop" ]; then
+  sid=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  exit_file="$HOME/.headroom/remote-control/exit-$sid"
+  [ -n "$sid" ] && [ -f "$exit_file" ] || exit 0
+  pid=$(cat "$exit_file"); rm -f "$exit_file"
+  # Never signal a pid without checking it is still the Claude Code process.
+  case "$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)")" in
+    claude|claude.exe) kill -TERM "$pid";;
+  esac
+  exit 0
+fi
+case "${ANTHROPIC_BASE_URL:-}" in
+  ""|https://api.anthropic.com*)
+    echo "Remote Control is already available in this session: type /rc."
+    exit 0;;
+esac
+if [ -z "${CLAUDE_CODE_SESSION_ID:-}" ] || [ -z "${CLAUDE_PID:-}" ]; then
+  echo "Could not identify this session. Exit it, then run: claude -r <session-id> --remote-control"
+  exit 0
+fi
+fallback="claude -r $CLAUDE_CODE_SESSION_ID --remote-control"
+tty_name=${HEADROOM_REMOTE_CONTROL_TTY:-$(ps -o tty= -p "$CLAUDE_PID" 2>/dev/null | tr -d ' ')}
+# Linux ps says "pts/3" where the shell function's `basename $(tty)` says "3".
+tty_name=${tty_name##*/}
+case "$tty_name" in ""|"??"|"-"|"?") 
+  echo "Remote Control needs a terminal session; this one has no terminal to relaunch into."
+  echo "Open a terminal and run: $fallback"
+  exit 0;;
+esac
+dir="$HOME/.headroom/remote-control"
+mkdir -p "$dir" && printf '%s\n' "$CLAUDE_CODE_SESSION_ID" > "$dir/$tty_name"
+exit_file="$dir/exit-$CLAUDE_CODE_SESSION_ID"
+printf '%s\n' "$CLAUDE_PID" > "$exit_file"
+echo "Restarting this session with Remote Control. Headroom is off for the restarted session."
+echo "If it does not come back by itself, run: $fallback"
+# Only when the Stop hook is NOT registered (settings.json edited by hand):
+# a timed exit, at the cost of an interrupted turn. With the hook registered
+# there is no timer at all. A timer that raced a slow turn killed the session
+# mid-turn and the CLI lost every transcript entry after the confirmation, which
+# is what "No response requested." on the phone was.
+if ! grep -q 'headroom-remote-control\.sh[^"]* --stop' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" 2>/dev/null; then
+  secs=${HEADROOM_REMOTE_CONTROL_FALLBACK_SECS:-15}
+  nohup sh -c "sleep $secs; [ -f '$exit_file' ] && rm -f '$exit_file' && kill -TERM $CLAUDE_PID" >/dev/null 2>&1 &
+fi
+"#
+    .to_string()
+}
+
+/// User-level command that shadows Claude Code's hidden built-in. Every user
+/// command costs one model turn (its body is the prompt), so that turn is the
+/// confirmation dialog. `disable-model-invocation` matters: a shell-only
+/// "type it again to confirm" was defeated in testing by the model invoking
+/// the skill itself. Only the script and the question tool are allowed.
+fn build_claude_remote_control_command() -> String {
+    let script = claude_remote_control_script_path().display().to_string();
+    format!(
+        "---\n\
+description: Restart this session with Remote Control (Headroom off for that session)\n\
+allowed-tools: Bash({script}:*), AskUserQuestion, ToolSearch\n\
+disable-model-invocation: true\n\
+---\n\
+{CLAUDE_REMOTE_CONTROL_COMMAND_MARKER}\n\
+First write exactly this one line of plain text and nothing else before it: \
+\"Remote Control is unavailable while this session runs through Headroom: Claude Code switches it off for any custom endpoint.\" \
+Then call the AskUserQuestion tool (a tool call, never prose). If AskUserQuestion is not loaded yet, \
+load it first with ToolSearch using the query \"select:AskUserQuestion\"; never fall back to asking in prose. \
+Call it with header \"Remote Control\" and exactly one question: \
+\"Headroom is incompatible with Remote Control due to design decisions by Anthropic. \
+Headroom can restart this session with itself disabled so Remote Control does work. How do you want to proceed?\" \
+Offer exactly two options, in this order: \
+\"Restart with Remote Control\" (description: \"Exit and restart this session without Headroom. The restart replays the conversation uncached.\") and \
+\"Do nothing and keep this session routed through Headroom\" (description: \"Remote Control stays unavailable here.\"). \
+If the answer is \"Restart with Remote Control\", run `{script}` with the Bash tool, then reply with exactly one line: \"Restarting with Remote Control.\" \
+Otherwise reply only \"Staying in this session.\"\n"
+    )
+}
+
+/// Install the /remote-control relaunch command and its script. Unix only:
+/// the relaunch needs the managed zsh/bash function, which Windows does not get.
+fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> {
+    if cfg!(target_os = "windows") {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut changed = Vec::new();
+    let mut backups = Vec::new();
+    for (path, content, executable) in [
+        (
+            claude_remote_control_script_path(),
+            build_claude_remote_control_script(),
+            true,
+        ),
+        (
+            claude_remote_control_command_path(),
+            build_claude_remote_control_command(),
+            false,
+        ),
+    ] {
+        let (did_change, backup) = write_file_if_changed(&path, &content, executable)?;
+        if did_change {
+            changed.push(path.display().to_string());
+            if let Some(backup) = backup {
+                backups.push(backup.display().to_string());
+            }
+        }
+    }
+    // The Stop hook performs the exit the script recorded, once the turn ends.
+    let (mut hook_changed, mut hook_backups) = register_guard_hook_entries(
+        &claude_settings_path(),
+        &claude_remote_control_stop_command(),
+        "Headroom: checking for a pending Remote Control restart",
+        &[("Stop", None)],
+    )?;
+    changed.append(&mut hook_changed);
+    backups.append(&mut hook_backups);
+    Ok((changed, backups))
+}
+
+fn claude_remote_control_stop_command() -> String {
+    format!(
+        "{} --stop",
+        shell_double_quote(&claude_remote_control_script_path().to_string_lossy())
+    )
+}
+
+/// Remove the script, and the command file only when it is ours: a user's own
+/// ~/.claude/commands/remote-control.md is never touched.
+fn remove_claude_remote_control_command() -> Result<()> {
+    let script = claude_remote_control_script_path();
+    // Match on the script path so any earlier command form is stripped too.
+    let fragment = script.display().to_string();
+    for settings_path in claude_settings_candidates() {
+        let _ = remove_guard_hook_entries(&settings_path, &fragment, false, Some(&["Stop"]));
+    }
+    if script.exists() {
+        std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
+    }
+    let command = claude_remote_control_command_path();
+    if let Ok(content) = std::fs::read_to_string(&command) {
+        if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER) {
+            std::fs::remove_file(&command)
+                .with_context(|| format!("removing {}", command.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// File name of the statusline script; also how our `statusLine` entry is
+/// recognised in settings.json.
+const CLAUDE_STATUSLINE_SCRIPT: &str = "headroom-statusline.sh";
+
+fn claude_statusline_script_path() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("hooks")
+        .join(CLAUDE_STATUSLINE_SCRIPT)
+}
+
+/// Prints this conversation's Headroom input savings from the file the
+/// intercept keeps (claude_statusline.rs), looked up by the `session_id`
+/// Claude Code passes on stdin: "Headroom saved 31k tokens this session", bold
+/// green with the new saving appended for a few seconds after one lands, and
+/// "Headroom compressing..." for a moment after each request goes out. The
+/// real compression is ~100 ms (p50); the moment is stretched to a couple of
+/// seconds so a 1 s render cycle cannot miss it. A saving outranks it, so a
+/// follow-up request never cuts a saving's highlight short. Silent until the
+/// conversation has sent a request or saved something, and on any error.
+///
+/// Plain bash, parsing with regexes, because it runs every second
+/// (`refreshInterval`): ~4 ms per render against ~30 ms for a Python start.
+/// Stays bash 3.2 compatible (macOS /bin/bash): no EPOCHREALTIME, no printf %T.
+fn build_claude_statusline_script(state_path: &Path) -> String {
+    let state = shell_double_quote(&state_path.to_string_lossy());
+    format!(
+        r#"#!/bin/bash
+# Headroom statusline (managed by Headroom Desktop - do not edit).
+state_file="{state}"
+flash_secs=4
+compress_secs=2
+IFS= read -r -d '' input
+[[ $input =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9-]+)\" ]] || exit 0
+sid=${{BASH_REMATCH[1]}}
+[ -r "$state_file" ] || exit 0
+state=$(<"$state_file")
+[[ $state =~ \"$sid\":\{{\"tokensSaved\":([0-9]+),\"lastSaved\":([0-9]+),\"lastSavedAtMs\":([0-9]+)(,\"lastRequestAtMs\":([0-9]+))?\}} ]] || exit 0
+total=${{BASH_REMATCH[1]}} last=${{BASH_REMATCH[2]}} last_at=${{BASH_REMATCH[3]}} req_at=${{BASH_REMATCH[5]:-0}}
+now_ms=$(( $(date +%s) * 1000 ))
+fmt() {{
+  local n=$1 d u t
+  if [ "$n" -ge 999500 ]; then d=1000000 u=M
+  elif [ "$n" -ge 1000 ]; then d=1000 u=k
+  else echo "$n"; return; fi
+  t=$(( (n * 10 + d / 2) / d ))
+  if [ "$t" -ge 100 ]; then echo "$(( (n + d / 2) / d ))$u"
+  elif [ $(( t % 10 )) -eq 0 ]; then echo "$(( t / 10 ))$u"
+  else echo "$(( t / 10 )).$(( t % 10 ))$u"; fi
+}}
+line="Headroom saved $(fmt "$total") tokens this session"
+if [ "$last" -gt 0 ] && [ $(( now_ms - last_at )) -lt $(( flash_secs * 1000 )) ]; then
+  printf '\033[1;32m%s (+%s)\033[0m\n' "$line" "$(fmt "$last")"
+elif [ $(( now_ms - req_at )) -lt $(( compress_secs * 1000 )) ]; then
+  printf '\033[32mHeadroom compressing...\033[0m\n'
+elif [ "$total" -gt 0 ]; then
+  printf '%s\n' "$line"
+fi
+"#
+    )
+}
+
+fn is_our_statusline(value: &Value) -> bool {
+    value
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| command.contains(CLAUDE_STATUSLINE_SCRIPT))
+}
+
+/// `statusLine` is a single slot in ~/.claude/settings.json. Ours goes in only
+/// when the slot is empty or already ours: a user's own statusline is never
+/// replaced, and removal only ever deletes our entry. Returns whether the file
+/// changed.
+fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
+    let settings_path = claude_settings_path();
+    // Only a missing file reads as empty: an unreadable one (permissions,
+    // non-UTF-8) would otherwise be replaced by a file holding just statusLine.
+    let raw = match std::fs::read_to_string(&settings_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        other => other.with_context(|| format!("reading {}", settings_path.display()))?,
+    };
+    let mut root = if raw.trim().is_empty() {
+        if command.is_none() {
+            return Ok(false);
+        }
+        serde_json::Map::new()
+    } else {
+        parse_json_object(&raw, &settings_path)?
+    };
+    let current = root.get("statusLine");
+    match command {
+        Some(command) => {
+            if current.is_some_and(|v| !is_our_statusline(v)) {
+                return Ok(false);
+            }
+            // refreshInterval: the highlight has to switch off on time, and a
+            // saving can land between Claude Code's own event-driven renders.
+            let desired =
+                serde_json::json!({ "type": "command", "command": command, "refreshInterval": 1 });
+            if current == Some(&desired) {
+                return Ok(false);
+            }
+            root.insert("statusLine".into(), desired);
+        }
+        None => {
+            if !current.is_some_and(is_our_statusline) {
+                return Ok(false);
+            }
+            root.remove("statusLine");
+        }
+    }
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let _ = backup_if_exists(&settings_path)?;
+    atomic_write(
+        &settings_path,
+        &serde_json::to_vec_pretty(&Value::Object(root))
+            .context("serializing Claude statusline settings")?,
+    )
+    .with_context(|| format!("writing {}", settings_path.display()))?;
+    Ok(true)
+}
+
+/// Install the savings statusline. Unix only for now: Windows runs statusline
+/// commands through Git Bash and is untested. A no-op when the user turned it
+/// off or already has a statusline of their own.
+fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
+    if cfg!(target_os = "windows") || is_statusline_disabled() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut changed = Vec::new();
+    let mut backups = Vec::new();
+    let script = claude_statusline_script_path();
+    let (did_change, backup) = write_file_if_changed(
+        &script,
+        &build_claude_statusline_script(&crate::claude_statusline::state_path()),
+        true,
+    )?;
+    if did_change {
+        changed.push(script.display().to_string());
+    }
+    if let Some(backup) = backup {
+        backups.push(backup.display().to_string());
+    }
+    let command = format!("\"{}\"", shell_double_quote(&script.to_string_lossy()));
+    if set_claude_statusline_setting(Some(&command))? {
+        changed.push(claude_settings_path().display().to_string());
+    }
+    Ok((changed, backups))
+}
+
+/// Remove our `statusLine` entry (never a user's own) and the script.
+fn remove_claude_statusline() -> Result<()> {
+    set_claude_statusline_setting(None)?;
+    let script = claude_statusline_script_path();
+    if script.exists() {
+        std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
+    }
+    Ok(())
+}
+
 fn remove_claude_guard_hook() -> Result<()> {
     let script_path = claude_guard_hook_path();
     // Match on the script path, not the full interpreter command (see codex counterpart).
@@ -7606,9 +8043,25 @@ mod tests {
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
         ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
     };
+    #[cfg(unix)]
+    use super::{
+        build_claude_statusline_script, claude_settings_path, claude_statusline_script_path,
+        ensure_claude_statusline, is_our_statusline, remove_claude_statusline,
+        set_statusline_enabled, CLAUDE_STATUSLINE_SCRIPT,
+    };
+    #[cfg(unix)]
+    use super::{
+        claude_code_shell_block, claude_remote_control_command_path,
+        claude_remote_control_script_path, claude_remote_control_stop_command,
+        ensure_claude_remote_control_command, remove_claude_remote_control_command,
+        CLAUDE_REMOTE_CONTROL_COMMAND_MARKER, CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE,
+        HEADROOM_ANTHROPIC_BASE_URL,
+    };
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
     use rusqlite::Connection;
+    #[cfg(unix)]
+    use serde_json::Value;
 
     #[test]
     fn strip_headroom_mcp_toml_removes_owned_tables_keeps_user_tables() {
@@ -7863,6 +8316,7 @@ mod tests {
             preserved_base_urls: BTreeMap::new(),
             rtk_disabled: false,
             auto_learn_disabled: false,
+            statusline_disabled: false,
         };
 
         let normalized = normalize_setup_state(state);
@@ -11861,6 +12315,440 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             }
         });
         assert_eq!(out.unwrap(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn statusline_takes_only_an_empty_slot_and_removes_only_its_own() {
+        let _home = TestHome::new();
+        let settings = claude_settings_path();
+        let read = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap()
+        };
+
+        let (changed, _) = ensure_claude_statusline().expect("install");
+        assert_eq!(changed.len(), 2, "script + settings written: {changed:?}");
+        assert!(is_our_statusline(&read()["statusLine"]));
+        let script = std::fs::read_to_string(claude_statusline_script_path()).unwrap();
+        assert!(script.contains(&crate::claude_statusline::state_path().display().to_string()));
+        let (changed, _) = ensure_claude_statusline().expect("reinstall");
+        assert!(changed.is_empty(), "idempotent: {changed:?}");
+
+        // The opt-out removes it and keeps later setups from putting it back.
+        set_statusline_enabled(false).expect("disable");
+        assert!(read().get("statusLine").is_none());
+        assert!(!claude_statusline_script_path().exists());
+        ensure_claude_statusline().expect("setup while disabled");
+        assert!(read().get("statusLine").is_none());
+        set_statusline_enabled(true).expect("enable");
+
+        // A user's own statusline is never replaced and never removed.
+        let own = serde_json::json!({ "type": "command", "command": "~/my-line.sh" });
+        std::fs::write(
+            &settings,
+            serde_json::to_vec(&serde_json::json!({ "statusLine": own, "model": "opus" })).unwrap(),
+        )
+        .unwrap();
+        ensure_claude_statusline().expect("setup over a user line");
+        assert_eq!(read()["statusLine"], own);
+        remove_claude_statusline().expect("remove");
+        assert_eq!(read()["statusLine"], own);
+        assert_eq!(read()["model"], "opus");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn statusline_script_prints_this_conversation_and_is_otherwise_silent() {
+        use crate::claude_statusline::{Persisted, Session, SCHEMA_VERSION};
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("claude-statusline.json");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let session = |total, last, at, req| Session {
+            tokens_saved: total,
+            last_saved: last,
+            last_saved_at_ms: at,
+            last_request_at_ms: req,
+        };
+        let old = now_ms - 60_000;
+        // Serialized by the store itself, so the script's regex is checked
+        // against the real field order, not a hand-written copy of it.
+        let persisted = Persisted {
+            schema_version: SCHEMA_VERSION,
+            sessions: BTreeMap::from([
+                // A follow-up request must not cut a fresh saving short.
+                (
+                    "aaaa-just-saved".into(),
+                    session(1_100_000, 15_400, now_ms, now_ms),
+                ),
+                ("bbbb-quiet".into(), session(3_067, 2_865, old, old)),
+                ("cccc-small".into(), session(700, 700, old, old)),
+                ("dddd-sending".into(), session(3_067, 2_865, old, now_ms)),
+                ("eeee-first-request".into(), session(0, 0, 0, now_ms)),
+                ("ffff-nothing-yet".into(), session(0, 0, 0, old)),
+            ]),
+        };
+        // Plus an entry as the previous build wrote it, without lastRequestAtMs.
+        let json = serde_json::to_string(&persisted).unwrap().replacen(
+            r#""sessions":{"#,
+            r#""sessions":{"0000-old-format":{"tokensSaved":42,"lastSaved":0,"lastSavedAtMs":1},"#,
+            1,
+        );
+        std::fs::write(&state, json).unwrap();
+        let script = dir.path().join(CLAUDE_STATUSLINE_SCRIPT);
+        std::fs::write(&script, build_claude_statusline_script(&state)).unwrap();
+        let render = |stdin: &str| -> String {
+            use std::io::Write;
+            let mut child = crate::proc::command("/bin/bash")
+                .arg(&script)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stdin.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "script must never fail the statusline"
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(
+            render(r#"{"session_id":"aaaa-just-saved","cwd":"/x"}"#),
+            "\x1b[1;32mHeadroom saved 1.1M tokens this session (+15k)\x1b[0m\n"
+        );
+        // Claude Code's real payload is pretty-printed; spacing must not matter.
+        assert_eq!(
+            render("{\n  \"session_id\": \"bbbb-quiet\"\n}"),
+            "Headroom saved 3.1k tokens this session\n"
+        );
+        assert_eq!(
+            render(r#"{"session_id":"cccc-small"}"#),
+            "Headroom saved 700 tokens this session\n"
+        );
+        let compressing = "\x1b[32mHeadroom compressing...\x1b[0m\n";
+        assert_eq!(render(r#"{"session_id":"dddd-sending"}"#), compressing);
+        assert_eq!(
+            render(r#"{"session_id":"eeee-first-request"}"#),
+            compressing
+        );
+        assert_eq!(render(r#"{"session_id":"ffff-nothing-yet"}"#), "");
+        assert_eq!(
+            render(r#"{"session_id":"0000-old-format"}"#),
+            "Headroom saved 42 tokens this session\n"
+        );
+        assert_eq!(render(r#"{"session_id":"unknown"}"#), "");
+        assert_eq!(render("not json"), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_control_command_installs_and_removes_only_its_own_file() {
+        let home = TestHome::new();
+        let (changed, _) = ensure_claude_remote_control_command().expect("install");
+        assert_eq!(
+            changed.len(),
+            3,
+            "script + command + Stop hook written: {changed:?}"
+        );
+        let command = std::fs::read_to_string(claude_remote_control_command_path()).unwrap();
+        let script_path = claude_remote_control_script_path();
+        assert!(command.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER));
+        assert!(command.contains("disable-model-invocation: true"));
+        assert!(command.contains(&format!(
+            "Bash({}:*), AskUserQuestion",
+            script_path.display()
+        )));
+        assert!(command.contains("First write exactly this one line of plain text"));
+        assert!(command
+            .contains("then reply with exactly one line: \"Restarting with Remote Control.\""));
+        assert!(command.contains("Then call the AskUserQuestion tool"));
+        assert!(command
+            .contains("load it first with ToolSearch using the query \"select:AskUserQuestion\""));
+        assert!(command.contains("AskUserQuestion, ToolSearch\n"));
+        assert!(command.contains(
+            "Headroom is incompatible with Remote Control due to design decisions by Anthropic."
+        ));
+        let script = std::fs::read_to_string(&script_path).unwrap();
+        assert!(script.starts_with("#!/bin/sh\n"));
+        assert!(script.contains("--stop"));
+        let settings = std::fs::read_to_string(claude_settings_path()).unwrap();
+        assert!(
+            settings.contains(&claude_remote_control_stop_command()),
+            "{settings}"
+        );
+        assert!(settings.contains("\"Stop\""), "{settings}");
+        let (changed, _) = ensure_claude_remote_control_command().expect("reinstall");
+        assert!(changed.is_empty(), "idempotent: {changed:?}");
+
+        // A user-authored command of the same name survives removal.
+        std::fs::write(claude_remote_control_command_path(), "my own command\n").unwrap();
+        remove_claude_remote_control_command().expect("remove");
+        assert!(!script_path.exists());
+        let settings = std::fs::read_to_string(claude_settings_path()).unwrap();
+        assert!(!settings.contains("headroom-remote-control"), "{settings}");
+        assert_eq!(
+            std::fs::read_to_string(claude_remote_control_command_path()).unwrap(),
+            "my own command\n"
+        );
+
+        ensure_claude_remote_control_command().expect("install again");
+        remove_claude_remote_control_command().expect("remove again");
+        assert!(!claude_remote_control_command_path().exists());
+        assert!(!home
+            .path()
+            .join(".claude/commands/remote-control.md")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_control_script_records_the_exit_and_the_stop_hook_performs_it() {
+        use std::os::unix::process::ExitStatusExt;
+        let home = TestHome::new();
+        ensure_claude_remote_control_command().expect("install");
+        let script = claude_remote_control_script_path();
+        // A real process whose executable name is `claude`, since the stop
+        // phase refuses to signal anything else.
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // A symlink, not a copy: a copied platform binary wedges on macOS
+        // (unkillable "UE" state) and hangs the test harness on its stdout pipe.
+        std::os::unix::fs::symlink("/bin/sleep", bin.join("claude")).unwrap();
+        let mut child = crate::proc::command(bin.join("claude"))
+            .arg("30")
+            .spawn()
+            .expect("spawn fake claude");
+        let pid = child.id().to_string();
+        let run = |base_url: &str, tty: &str| -> String {
+            let out = crate::proc::command("sh")
+                .arg(&script)
+                .env("HOME", home.path())
+                .env("ANTHROPIC_BASE_URL", base_url)
+                .env("CLAUDE_PID", &pid)
+                .env("CLAUDE_CODE_SESSION_ID", "sid-123")
+                .env("HEADROOM_REMOTE_CONTROL_TTY", tty)
+                .env("HEADROOM_REMOTE_CONTROL_FALLBACK_SECS", "1")
+                .output()
+                .expect("run script");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let stop = |session_id: &str| {
+            use std::io::Write;
+            let mut proc = crate::proc::command("sh")
+                .arg(&script)
+                .arg("--stop")
+                .env("HOME", home.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("run stop hook");
+            proc.stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    format!(r#"{{"session_id": "{session_id}", "hook_event_name": "Stop", "stop_hook_active": false}}"#)
+                        .as_bytes(),
+                )
+                .unwrap();
+            assert!(proc.wait().unwrap().success());
+        };
+        let marker_dir = home.path().join(".headroom/remote-control");
+        let exit_file = marker_dir.join("exit-sid-123");
+
+        let out = run("https://api.anthropic.com", "ttys999");
+        assert!(out.contains("already available"), "{out}");
+        assert!(!marker_dir.exists());
+
+        // No tty (empty override falls back to ps, and the fake claude has none).
+        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "");
+        assert!(out.contains("needs a terminal session"), "{out}");
+        assert!(out.contains("claude -r sid-123 --remote-control"), "{out}");
+        assert!(!marker_dir.exists());
+
+        // Confirmed: records the tty marker and the pending exit, kills nothing yet.
+        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "ttys999");
+        assert!(
+            out.contains("Restarting this session with Remote Control"),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker_dir.join("ttys999")).unwrap(),
+            "sid-123\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exit_file).unwrap(),
+            format!("{pid}\n")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "session must outlive the tool call"
+        );
+        // With the Stop hook registered there is no fallback timer at all.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "no timed exit while the Stop hook is registered"
+        );
+
+        // A Stop for some other session leaves it alone.
+        stop("sid-other");
+        assert!(exit_file.exists());
+        assert!(child.try_wait().unwrap().is_none());
+
+        // The Stop for this session performs the exit and consumes the record.
+        stop("sid-123");
+        assert!(!exit_file.exists());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut status = None;
+        while std::time::Instant::now() < deadline {
+            status = child.try_wait().unwrap();
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let status = status.unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("session was not terminated by the stop hook")
+        });
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+
+        // The stop phase never signals a pid that is not Claude Code any more.
+        let mut other = crate::proc::command("sleep").arg("30").spawn().unwrap();
+        std::fs::write(&exit_file, format!("{}\n", other.id())).unwrap();
+        stop("sid-123");
+        assert!(!exit_file.exists());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "foreign pid must survive"
+        );
+        let _ = other.kill();
+
+        // Without the Stop hook (settings edited by hand) the timed exit still
+        // honours the pending restart.
+        std::fs::write(claude_settings_path(), "{}\n").unwrap();
+        let mut child = crate::proc::command(bin.join("claude"))
+            .arg("30")
+            .spawn()
+            .expect("spawn fake claude");
+        let pid = child.id().to_string();
+        let out = crate::proc::command("sh")
+            .arg(&script)
+            .env("HOME", home.path())
+            .env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)
+            .env("CLAUDE_PID", &pid)
+            .env("CLAUDE_CODE_SESSION_ID", "sid-456")
+            .env("HEADROOM_REMOTE_CONTROL_TTY", "ttys998")
+            .env("HEADROOM_REMOTE_CONTROL_FALLBACK_SECS", "1")
+            .output()
+            .expect("run script");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Restarting"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut status = None;
+        while std::time::Instant::now() < deadline {
+            status = child.try_wait().unwrap();
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let status = status.unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("timed exit did not fire without the Stop hook")
+        });
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(!marker_dir.join("exit-sid-456").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_shell_function_resumes_the_marked_session_without_headroom() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = home.path().join("claude.log");
+        let marker_dir = home.path().join(".headroom/remote-control");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        // Fake claude: logs its argv; on first launch leaves a relaunch marker
+        // for this tty, exactly like the /remote-control script does.
+        let fake_claude = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\nif [ ! -e '{first}' ]; then touch '{first}'; echo sid-123 > '{marker}'; fi\nexit 7\n",
+            log = log.display(),
+            first = home.path().join("first").display(),
+            marker = marker_dir.join("ttys999").display(),
+        );
+        std::fs::write(bin.join("claude"), fake_claude).unwrap();
+        std::fs::write(bin.join("tty"), "#!/bin/sh\necho /dev/ttys999\n").unwrap();
+        for name in ["claude", "tty"] {
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let block = home.path().join("block.sh");
+        std::fs::write(&block, claude_code_shell_block()).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |cmd: &str| {
+            crate::proc::command("bash")
+                .arg("-c")
+                .arg(format!(". '{}'; {cmd}", block.display()))
+                .env("HOME", home.path())
+                .env("PATH", &path)
+                .status()
+                .expect("run bash")
+        };
+        let status = run("claude hello world");
+        let lines = std::fs::read_to_string(&log).unwrap();
+        let expected_resume = format!(
+            "--settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} -r sid-123 --remote-control"
+        );
+        assert_eq!(lines, format!("hello world\n{expected_resume}\n"));
+        assert!(!marker_dir.join("ttys999").exists(), "marker consumed");
+        assert_eq!(status.code(), Some(7), "relaunch exit code propagates");
+
+        // Manual fallback: the flag alone gets the override added.
+        std::fs::remove_file(&log).unwrap();
+        let status = run("claude -r sid-123 --remote-control");
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("--settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} -r sid-123 --remote-control\n")
+        );
+
+        // A user's `alias claude=...` above the block (interactive shells
+        // expand aliases) must not turn the block into a parse error that
+        // aborts the rest of their rc file; the alias keeps winning.
+        let out = crate::proc::command("bash")
+            .arg("-c")
+            .arg(format!(
+                "shopt -s expand_aliases\nalias claude='claude --aliased'\n. '{}'\necho rc-tail-ran; type -t claude",
+                block.display()
+            ))
+            .env("HOME", home.path())
+            .env("PATH", &path)
+            .output()
+            .expect("run bash");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "rc-tail-ran\nalias\n",
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

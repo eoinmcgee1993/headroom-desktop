@@ -2597,8 +2597,23 @@ impl AppState {
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
                 if let Some(bucket) = tracker.daily_savings.get(&point.date) {
-                    point.cache_read_tokens = bucket.cache_read_tokens.or(point.cache_read_tokens);
-                    point.cache_savings_usd = bucket.cache_savings_usd.or(point.cache_savings_usd);
+                    (
+                        point.cache_read_tokens,
+                        point.cache_savings_usd,
+                        point.cache_read_cost_usd,
+                    ) = pick_cache_fields(
+                        (
+                            point.cache_read_tokens,
+                            point.cache_savings_usd,
+                            point.cache_read_cost_usd,
+                        ),
+                        (
+                            bucket.cache_read_tokens,
+                            bucket.cache_savings_usd,
+                            bucket.cache_read_cost_usd,
+                        ),
+                        false,
+                    );
                 }
                 if let Some(tokens) = tracker.tool_schema_daily_samples.get(&point.date) {
                     point.tool_schema_tokens_saved = *tokens;
@@ -2615,8 +2630,23 @@ impl AppState {
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
                 if let Some(bucket) = tracker.hourly_savings.get(&point.hour) {
-                    point.cache_read_tokens = bucket.cache_read_tokens.or(point.cache_read_tokens);
-                    point.cache_savings_usd = bucket.cache_savings_usd.or(point.cache_savings_usd);
+                    (
+                        point.cache_read_tokens,
+                        point.cache_savings_usd,
+                        point.cache_read_cost_usd,
+                    ) = pick_cache_fields(
+                        (
+                            point.cache_read_tokens,
+                            point.cache_savings_usd,
+                            point.cache_read_cost_usd,
+                        ),
+                        (
+                            bucket.cache_read_tokens,
+                            bucket.cache_savings_usd,
+                            bucket.cache_read_cost_usd,
+                        ),
+                        false,
+                    );
                 }
                 if let Some(tokens) = tracker.tool_schema_hourly_samples.get(&point.hour) {
                     point.tool_schema_tokens_saved = *tokens;
@@ -4715,6 +4745,38 @@ struct DailySavingsBucket {
     // before this field existed or observed only by the local tracker.
     cache_read_tokens: Option<u64>,
     cache_savings_usd: Option<f64>,
+    // The reads' actual cost, from the backend rollup. Set only together with
+    // the two fields above from that same rollup (see `pick_cache_fields`);
+    // None for buckets archived before it existed, which keep the old
+    // discount-derived estimate.
+    cache_read_cost_usd: Option<f64>,
+}
+
+/// A bucket's cache reads, read discount and read cost. The three always come
+/// from ONE source: a rollup-priced read cost is only meaningful against the
+/// reads and discount that rollup produced, never against a discount
+/// re-derived from the compacted checkpoint ring.
+type CacheFields = (Option<u64>, Option<f64>, Option<f64>);
+
+/// Choose a bucket's cache fields between a fresh poll and the archive.
+/// Exact coverage (a rollup-priced read cost) wins, fresh before archived: the
+/// rollup is recomputed from the backend's full per-request ring, so unlike the
+/// compacted derivation it does not drift for a settled period. Without exact
+/// coverage on either side this is the pre-existing field-wise preference,
+/// `fresh_first` for the live day and archive-first for settled periods.
+fn pick_cache_fields(fresh: CacheFields, archived: CacheFields, fresh_first: bool) -> CacheFields {
+    if fresh.2.is_some() {
+        return fresh;
+    }
+    if archived.2.is_some() {
+        return archived;
+    }
+    let (first, second) = if fresh_first {
+        (fresh, archived)
+    } else {
+        (archived, fresh)
+    };
+    (first.0.or(second.0), first.1.or(second.1), None)
 }
 
 /// One bucket of the locally-sampled output-shaper series: poll-over-poll
@@ -5085,6 +5147,7 @@ impl SavingsTracker {
                 // buckets the local tracker observed on its own.
                 cache_read_tokens: bucket.cache_read_tokens,
                 cache_savings_usd: bucket.cache_savings_usd,
+                cache_read_cost_usd: bucket.cache_read_cost_usd,
                 // Filled by the sampler overlay in build_dashboard.
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
@@ -5108,6 +5171,7 @@ impl SavingsTracker {
                 output_tokens_saved: bucket.output_tokens_saved,
                 cache_read_tokens: bucket.cache_read_tokens,
                 cache_savings_usd: bucket.cache_savings_usd,
+                cache_read_cost_usd: bucket.cache_read_cost_usd,
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
                 // The local pre-cutoff tracker has no provider dimension.
@@ -5181,9 +5245,22 @@ impl SavingsTracker {
             // first archived value. The live UTC day keeps taking the fresh
             // derivation, which grows with the day.
             let archived = self.daily_savings.get(&point.date).copied();
-            let archived_read = archived.and_then(|b| b.cache_read_tokens);
-            let archived_usd = archived.and_then(|b| b.cache_savings_usd);
             let live_day = point.date.as_str() == utc_today_key;
+            let (cache_read_tokens, cache_savings_usd, cache_read_cost_usd) = pick_cache_fields(
+                (
+                    point.cache_read_tokens,
+                    point.cache_savings_usd,
+                    point.cache_read_cost_usd,
+                ),
+                archived.map_or((None, None, None), |b| {
+                    (
+                        b.cache_read_tokens,
+                        b.cache_savings_usd,
+                        b.cache_read_cost_usd,
+                    )
+                }),
+                live_day,
+            );
             let bucket = DailySavingsBucket {
                 estimated_savings_usd: point.estimated_savings_usd,
                 estimated_tokens_saved: point.estimated_tokens_saved,
@@ -5194,16 +5271,9 @@ impl SavingsTracker {
                 new_input_tokens: archived.map_or(0, |b| b.new_input_tokens),
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
-                cache_read_tokens: if live_day {
-                    point.cache_read_tokens.or(archived_read)
-                } else {
-                    archived_read.or(point.cache_read_tokens)
-                },
-                cache_savings_usd: if live_day {
-                    point.cache_savings_usd.or(archived_usd)
-                } else {
-                    archived_usd.or(point.cache_savings_usd)
-                },
+                cache_read_tokens,
+                cache_savings_usd,
+                cache_read_cost_usd,
             };
             if archived.as_ref() != Some(&bucket) {
                 self.daily_savings.insert(point.date.clone(), bucket);
@@ -5219,6 +5289,21 @@ impl SavingsTracker {
             // Hourly ingest only ever sees settled hours, so freeze cache
             // coverage at the first archived value (see the daily loop above).
             let archived = self.hourly_savings.get(&point.hour).copied();
+            let (cache_read_tokens, cache_savings_usd, cache_read_cost_usd) = pick_cache_fields(
+                (
+                    point.cache_read_tokens,
+                    point.cache_savings_usd,
+                    point.cache_read_cost_usd,
+                ),
+                archived.map_or((None, None, None), |b| {
+                    (
+                        b.cache_read_tokens,
+                        b.cache_savings_usd,
+                        b.cache_read_cost_usd,
+                    )
+                }),
+                false,
+            );
             let bucket = DailySavingsBucket {
                 estimated_savings_usd: point.estimated_savings_usd,
                 estimated_tokens_saved: point.estimated_tokens_saved,
@@ -5229,12 +5314,9 @@ impl SavingsTracker {
                 new_input_tokens: archived.map_or(0, |b| b.new_input_tokens),
                 output_savings_usd: point.output_savings_usd,
                 output_tokens_saved: point.output_tokens_saved,
-                cache_read_tokens: archived
-                    .and_then(|b| b.cache_read_tokens)
-                    .or(point.cache_read_tokens),
-                cache_savings_usd: archived
-                    .and_then(|b| b.cache_savings_usd)
-                    .or(point.cache_savings_usd),
+                cache_read_tokens,
+                cache_savings_usd,
+                cache_read_cost_usd,
             };
             if archived.as_ref() != Some(&bucket) {
                 self.hourly_savings.insert(point.hour.clone(), bucket);
@@ -6150,6 +6232,10 @@ struct ProviderRollupDelta {
     compression_savings_usd_delta: f64,
     total_input_tokens_delta: u64,
     total_input_cost_usd_delta: f64,
+    // This provider's cache slice, set only when the rollup priced its reads
+    // (see `rollup_cache_fields`).
+    cache_savings_usd_delta: Option<f64>,
+    cache_read_cost_usd_delta: Option<f64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -6167,9 +6253,12 @@ struct HeadroomSavingsRollupPoint {
     // checkpoints (the rollup series has no cache dimension). None when no
     // checkpoint fell inside the bucket.
     cache_read_tokens_delta: Option<u64>,
-    // The read discount earned inside the bucket, same derivation. Actual
-    // read cost = this / 9 (reads bill at ~0.1x; the discount is the 0.9x).
+    // The read discount earned inside the bucket, same derivation.
     cache_savings_usd_delta: Option<f64>,
+    // What those reads cost. Only the backend rollup can price them (per
+    // request, by model), so when it does, all three cache fields come from
+    // the rollup instead of the checkpoint derivation. None otherwise.
+    cache_read_cost_usd_delta: Option<f64>,
     by_provider: Vec<ProviderRollupDelta>,
 }
 
@@ -6222,6 +6311,7 @@ impl HeadroomSavingsHistoryResponse {
                 output_tokens_saved: point.output_tokens_saved_delta,
                 cache_read_tokens: point.cache_read_tokens_delta,
                 cache_savings_usd: point.cache_savings_usd_delta,
+                cache_read_cost_usd: point.cache_read_cost_usd_delta,
                 // Filled by the sampler overlay in build_dashboard.
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
@@ -6247,6 +6337,7 @@ impl HeadroomSavingsHistoryResponse {
                 output_tokens_saved: point.output_tokens_saved_delta,
                 cache_read_tokens: point.cache_read_tokens_delta,
                 cache_savings_usd: point.cache_savings_usd_delta,
+                cache_read_cost_usd: point.cache_read_cost_usd_delta,
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
                 by_provider: point
@@ -6258,6 +6349,8 @@ impl HeadroomSavingsHistoryResponse {
                         estimated_tokens_saved: p.tokens_saved,
                         actual_cost_usd: p.total_input_cost_usd_delta,
                         total_tokens_sent: p.total_input_tokens_delta,
+                        cache_savings_usd: p.cache_savings_usd_delta,
+                        cache_read_cost_usd: p.cache_read_cost_usd_delta,
                     })
                     .collect(),
             })
@@ -7079,6 +7172,8 @@ struct RingStartTotals {
     total_input_cost_usd: f64,
     output_tokens_saved: u64,
     output_savings_usd: f64,
+    cache_read_tokens: u64,
+    cache_savings_usd: f64,
 }
 
 fn ring_start_totals(root: &Value) -> Option<RingStartTotals> {
@@ -7121,6 +7216,14 @@ fn ring_start_totals(root: &Value) -> Option<RingStartTotals> {
                 .get("output_savings_usd")
                 .and_then(parse_f64_value)
                 .unwrap_or(0.0),
+            cache_read_tokens: map
+                .get("cache_read_tokens")
+                .and_then(parse_u64_value)
+                .unwrap_or(0),
+            cache_savings_usd: map
+                .get("cache_savings_usd")
+                .and_then(parse_f64_value)
+                .unwrap_or(0.0),
         })
 }
 
@@ -7138,12 +7241,20 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
     // into per-bucket cache-read deltas and attach to the rollup points.
     // Keys are UTC (same identity as the rollup buckets; see daily_savings).
     let (daily_cache_reads, hourly_cache_reads) = derive_cache_read_deltas(&root);
-    for point in &mut daily {
+    // Rollups that priced their reads already carry exact cache fields; those
+    // are never mixed with the derivation.
+    for point in daily
+        .iter_mut()
+        .filter(|p| p.cache_read_cost_usd_delta.is_none())
+    {
         let delta = daily_cache_reads.get(&point.timestamp.format("%Y-%m-%d").to_string());
         point.cache_read_tokens_delta = delta.map(|d| d.read_tokens);
         point.cache_savings_usd_delta = delta.map(|d| d.savings_usd);
     }
-    for point in &mut hourly {
+    for point in hourly
+        .iter_mut()
+        .filter(|p| p.cache_read_cost_usd_delta.is_none())
+    {
         let delta = hourly_cache_reads.get(&point.timestamp.format("%Y-%m-%dT%H").to_string());
         point.cache_read_tokens_delta = delta.map(|d| d.read_tokens);
         point.cache_savings_usd_delta = delta.map(|d| d.savings_usd);
@@ -7398,12 +7509,16 @@ fn parse_savings_rollup_point(value: &Value) -> Option<HeadroomSavingsRollupPoin
         .and_then(|value| value.as_str())
         .and_then(parse_history_timestamp)?;
 
+    // Rollups that price their reads carry all three cache fields; older
+    // backends carry none, and those are attached afterwards from the raw
+    // history checkpoints instead.
+    let (cache_read_tokens_delta, cache_savings_usd_delta, cache_read_cost_usd_delta) =
+        rollup_cache_fields(value);
     Some(HeadroomSavingsRollupPoint {
         timestamp,
-        // Attached afterwards from the raw history checkpoints; the rollup
-        // object itself has no cache field.
-        cache_read_tokens_delta: None,
-        cache_savings_usd_delta: None,
+        cache_read_tokens_delta,
+        cache_savings_usd_delta,
+        cache_read_cost_usd_delta,
         tokens_saved: map
             .get("tokens_saved")
             .and_then(parse_u64_value)
@@ -7453,17 +7568,50 @@ fn parse_rollup_by_provider(value: Option<&Value>) -> Vec<ProviderRollupDelta> {
                     .unwrap_or_default()
                     .max(0.0)
             };
+            let cache = rollup_cache_fields(entry);
             ProviderRollupDelta {
                 provider: provider.clone(),
                 tokens_saved: get_u64("tokens_saved"),
                 compression_savings_usd_delta: get_f64("compression_savings_usd_delta"),
                 total_input_tokens_delta: get_u64("total_input_tokens_delta"),
                 total_input_cost_usd_delta: get_f64("total_input_cost_usd_delta"),
+                cache_savings_usd_delta: cache.1,
+                cache_read_cost_usd_delta: cache.2,
             }
         })
         .collect();
     out.sort_by(|a, b| a.provider.cmp(&b.provider));
     out
+}
+
+/// A rollup entry's (bucket's or provider's) cache reads, read discount and
+/// read cost -- all three, or none. The backend reports the read cost as null
+/// when a model-less legacy checkpoint left the reads unpriceable, and omits
+/// the fields entirely before it carried them; either way the entry has no
+/// exact coverage and none of the three is taken from it.
+fn rollup_cache_fields(entry: &Value) -> CacheFields {
+    let Some(read_cost) = entry
+        .get("cache_read_cost_usd_delta")
+        .and_then(parse_f64_value)
+    else {
+        return (None, None, None);
+    };
+    (
+        Some(
+            entry
+                .get("cache_read_tokens_delta")
+                .and_then(parse_u64_value)
+                .unwrap_or(0),
+        ),
+        Some(
+            entry
+                .get("cache_savings_usd_delta")
+                .and_then(parse_f64_value)
+                .unwrap_or(0.0)
+                .max(0.0),
+        ),
+        Some(read_cost.max(0.0)),
+    )
 }
 
 fn parse_history_timestamp(text: &str) -> Option<chrono::DateTime<Utc>> {
@@ -8713,6 +8861,25 @@ fn drop_rollup_backfill<T>(
     native.into_iter().filter(|p| key(p) != first).collect()
 }
 
+/// Rollup-sourced cache fields on the leading bucket diff the ring's first
+/// checkpoint against zero like every other rollup field, so they carry the
+/// lifetime cumulative too. Reads and discount settle exactly from the ring's
+/// starting totals; the read cost cannot (the ring start records no read
+/// cost), so the bucket drops to the discount-derived estimate. Derived cache
+/// fields (read cost None) already skip the first checkpoint and are left alone.
+fn settle_rollup_cache(
+    read_tokens: &mut Option<u64>,
+    savings_usd: &mut Option<f64>,
+    read_cost_usd: &mut Option<f64>,
+    start: &RingStartTotals,
+) {
+    if read_cost_usd.take().is_none() {
+        return;
+    }
+    *read_tokens = read_tokens.map(|r| r.saturating_sub(start.cache_read_tokens));
+    *savings_usd = savings_usd.map(|u| (u - start.cache_savings_usd).max(0.0));
+}
+
 /// A rollup bucket whose leading against-zero delta can be settled exactly by
 /// subtracting the ring's starting totals (see `settle_rollup_backfill`).
 trait BackfillSettle {
@@ -8735,6 +8902,12 @@ impl BackfillSettle for DailySavingsPoint {
             .output_tokens_saved
             .saturating_sub(start.output_tokens_saved);
         self.output_savings_usd = (self.output_savings_usd - start.output_savings_usd).max(0.0);
+        settle_rollup_cache(
+            &mut self.cache_read_tokens,
+            &mut self.cache_savings_usd,
+            &mut self.cache_read_cost_usd,
+            start,
+        );
     }
     fn is_empty_after_settle(&self) -> bool {
         self.estimated_tokens_saved == 0 && self.total_tokens_sent == 0
@@ -8756,6 +8929,12 @@ impl BackfillSettle for HourlySavingsPoint {
             .output_tokens_saved
             .saturating_sub(start.output_tokens_saved);
         self.output_savings_usd = (self.output_savings_usd - start.output_savings_usd).max(0.0);
+        settle_rollup_cache(
+            &mut self.cache_read_tokens,
+            &mut self.cache_savings_usd,
+            &mut self.cache_read_cost_usd,
+            start,
+        );
     }
     fn is_empty_after_settle(&self) -> bool {
         self.estimated_tokens_saved == 0 && self.total_tokens_sent == 0
@@ -9370,11 +9549,12 @@ mod tests {
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
-        proxy_readyz_503_body_is_upstream_only, proxy_readyz_status_is_reachable,
-        rebuild_persisted_savings_from_records, savings_rate_implausible, settle_rollup_backfill,
-        stats_fetch_stall_context, stats_fetch_warn_interval, support_tier_for_platform,
-        tcp_port_accepts_connection, tool_schema_savings_usd, top_models_by_requests,
-        total_dir_size_bytes, warn_stats_fetch_failed, AppState, BootValidationOutcome,
+        pick_cache_fields, proxy_readyz_503_body_is_upstream_only,
+        proxy_readyz_status_is_reachable, rebuild_persisted_savings_from_records,
+        savings_rate_implausible, settle_rollup_backfill, stats_fetch_stall_context,
+        stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
+        tool_schema_savings_usd, top_models_by_requests, total_dir_size_bytes,
+        warn_stats_fetch_failed, AppState, BackfillSettle, BootValidationOutcome,
         ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
         HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
         RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
@@ -9426,6 +9606,7 @@ mod tests {
             total_input_cost_usd: 0.11771,
             output_tokens_saved: 0,
             output_savings_usd: 0.0,
+            ..Default::default()
         };
         let settled = settle_rollup_backfill(native, Some("2026-08-20"), Some(&ring_start), |p| {
             p.date.as_str()
@@ -13338,6 +13519,166 @@ mod tests {
     }
 
     #[test]
+    fn rollup_priced_reads_replace_the_checkpoint_derivation() {
+        // The rollup prices reads per request (0.025x on the Fable-shaped
+        // anthropic slice, 0.1x on openai); the raw checkpoints would derive a
+        // different discount for the same hour. Exact coverage wins as a SET:
+        // reads, discount and read cost all come from the rollup.
+        let parsed = parse_headroom_stats_history_from_json(
+            r#"{
+                "series": {
+                    "hourly": [
+                        {
+                            "timestamp": "2026-03-27T09:00:00Z",
+                            "tokens_saved": 7000,
+                            "compression_savings_usd_delta": 1.0,
+                            "total_input_tokens_delta": 1160000,
+                            "total_input_cost_usd_delta": 0.47,
+                            "cache_read_tokens_delta": 1100000,
+                            "cache_savings_usd_delta": 9.93,
+                            "cache_read_cost_usd_delta": 0.27,
+                            "by_provider": {
+                                "anthropic": {
+                                    "tokens_saved": 5000,
+                                    "compression_savings_usd_delta": 0.8,
+                                    "total_input_tokens_delta": 1010000,
+                                    "total_input_cost_usd_delta": 0.35,
+                                    "cache_read_tokens_delta": 1000000,
+                                    "cache_savings_usd_delta": 9.75,
+                                    "cache_read_cost_usd_delta": 0.25
+                                },
+                                "openai": {
+                                    "tokens_saved": 2000,
+                                    "compression_savings_usd_delta": 0.2,
+                                    "total_input_tokens_delta": 150000,
+                                    "total_input_cost_usd_delta": 0.12,
+                                    "cache_read_tokens_delta": 100000,
+                                    "cache_savings_usd_delta": 0.18,
+                                    "cache_read_cost_usd_delta": 0.02
+                                },
+                                "unknown": {
+                                    "tokens_saved": 0,
+                                    "compression_savings_usd_delta": 0.0,
+                                    "total_input_tokens_delta": 0,
+                                    "total_input_cost_usd_delta": 0.0,
+                                    "cache_read_tokens_delta": 500,
+                                    "cache_savings_usd_delta": 0.9,
+                                    "cache_read_cost_usd_delta": null
+                                }
+                            }
+                        },
+                        {
+                            "timestamp": "2026-03-27T10:00:00Z",
+                            "tokens_saved": 10,
+                            "compression_savings_usd_delta": 0.01,
+                            "total_input_tokens_delta": 100,
+                            "total_input_cost_usd_delta": 0.2,
+                            "cache_read_tokens_delta": 40,
+                            "cache_savings_usd_delta": 0.5,
+                            "cache_read_cost_usd_delta": null
+                        }
+                    ]
+                },
+                "history": [
+                    {"timestamp": "2026-03-27T08:59:00Z", "cache_read_tokens": 0, "cache_savings_usd": 0.0},
+                    {"timestamp": "2026-03-27T09:30:00Z", "cache_read_tokens": 700, "cache_savings_usd": 4.0},
+                    {"timestamp": "2026-03-27T10:30:00Z", "cache_read_tokens": 900, "cache_savings_usd": 4.9}
+                ]
+            }"#,
+        )
+        .expect("parsed history");
+        let hourly = parsed.hourly_savings();
+
+        let exact = &hourly[0];
+        assert_eq!(exact.cache_read_tokens, Some(1_100_000));
+        assert_eq!(exact.cache_savings_usd, Some(9.93));
+        assert_eq!(exact.cache_read_cost_usd, Some(0.27));
+        let anthropic = &exact.by_provider[0];
+        assert_eq!(anthropic.provider, "anthropic");
+        assert_eq!(anthropic.cache_savings_usd, Some(9.75));
+        assert_eq!(anthropic.cache_read_cost_usd, Some(0.25));
+        assert_eq!(exact.by_provider[1].cache_read_cost_usd, Some(0.02));
+        // An unpriceable provider slice carries no cache fields at all.
+        let unknown = &exact.by_provider[2];
+        assert_eq!(unknown.provider, "unknown");
+        assert_eq!(
+            (unknown.cache_savings_usd, unknown.cache_read_cost_usd),
+            (None, None)
+        );
+
+        // A null read cost on the bucket means no exact coverage: the
+        // checkpoint derivation fills the bucket as before (900-700 reads,
+        // 4.9-4.0 discount), and nothing is taken from the rollup's figures.
+        let derived = &hourly[1];
+        assert_eq!(derived.cache_read_tokens, Some(200));
+        assert!((derived.cache_savings_usd.unwrap() - 0.9).abs() < 1e-9);
+        assert_eq!(derived.cache_read_cost_usd, None);
+    }
+
+    #[test]
+    fn pick_cache_fields_takes_exact_coverage_as_a_set() {
+        let exact_fresh = (Some(100), Some(9.75), Some(0.25));
+        let legacy_archived = (Some(90), Some(8.0), None);
+        let exact_archived = (Some(80), Some(7.0), Some(0.2));
+        let legacy_fresh = (Some(70), Some(6.0), None);
+        // Exact fresh beats any archive, even on a settled period.
+        assert_eq!(
+            pick_cache_fields(exact_fresh, legacy_archived, false),
+            exact_fresh
+        );
+        assert_eq!(
+            pick_cache_fields(exact_fresh, exact_archived, false),
+            exact_fresh
+        );
+        // An exact archive beats a legacy fresh derivation.
+        assert_eq!(
+            pick_cache_fields(legacy_fresh, exact_archived, true),
+            exact_archived
+        );
+        // Legacy on both sides keeps the old field-wise preference.
+        assert_eq!(
+            pick_cache_fields(legacy_fresh, legacy_archived, false),
+            (Some(90), Some(8.0), None)
+        );
+        assert_eq!(
+            pick_cache_fields(legacy_fresh, legacy_archived, true),
+            (Some(70), Some(6.0), None)
+        );
+        assert_eq!(
+            pick_cache_fields((None, None, None), legacy_archived, true),
+            (Some(90), Some(8.0), None)
+        );
+    }
+
+    #[test]
+    fn settling_the_leading_bucket_drops_its_rollup_read_cost() {
+        // The leading bucket's rollup cache fields diff the first checkpoint
+        // against zero; reads and discount settle from the ring start, the read
+        // cost cannot and falls back. A derived bucket (no read cost) already
+        // skips the first checkpoint and must not be settled twice.
+        let start = RingStartTotals {
+            cache_read_tokens: 900,
+            cache_savings_usd: 8.0,
+            ..Default::default()
+        };
+        let mut rollup = daily("2026-08-27", 10, 1.0);
+        rollup.cache_read_tokens = Some(1_000);
+        rollup.cache_savings_usd = Some(9.0);
+        rollup.cache_read_cost_usd = Some(0.5);
+        rollup.subtract_ring_start(&start);
+        assert_eq!(rollup.cache_read_tokens, Some(100));
+        assert!((rollup.cache_savings_usd.unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(rollup.cache_read_cost_usd, None);
+
+        let mut derived = daily("2026-08-27", 10, 1.0);
+        derived.cache_read_tokens = Some(1_000);
+        derived.cache_savings_usd = Some(9.0);
+        derived.subtract_ring_start(&start);
+        assert_eq!(derived.cache_read_tokens, Some(1_000));
+        assert_eq!(derived.cache_savings_usd, Some(9.0));
+    }
+
+    #[test]
     fn parse_headroom_stats_accepts_naive_local_savings_history_timestamps() {
         let parsed = parse_headroom_stats_from_json(
             r#"{
@@ -14169,6 +14510,7 @@ mod tests {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
         }
@@ -14189,6 +14531,7 @@ mod tests {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
         }
@@ -14521,6 +14864,7 @@ mod tests {
             output_tokens_saved: 0,
             cache_read_tokens: None,
             cache_savings_usd: None,
+            cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
         }];

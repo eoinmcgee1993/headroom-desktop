@@ -5,8 +5,9 @@
 //! from any failed-then-succeeded tool pair within 5 history entries, with no
 //! semantic check that the calls are related. This produces contradictory and
 //! one-shot rules that bloat MEMORY.md and conversation context every turn.
-//! Until upstream tightens the matcher and the fix lands in a release, the
-//! desktop scrubs the bad output on launch.
+//! The sitecustomize (HEADROOM_LEARN_DROP_ERROR_RECOVERY in tool_manager.rs)
+//! stops new output at the source; this launch scrub removes what older
+//! builds already wrote.
 //!
 //! Other learned categories (environment / architecture / preference) are
 //! left alone — they are net-positive in practice. The scrub is idempotent,

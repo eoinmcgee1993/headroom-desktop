@@ -365,6 +365,16 @@ switch rewrote the client onto that port and out of the intercept, where
 the activity feed, request counts and savings accounting live. The
 desktop passes the intercept URL in HEADROOM_CC_SWITCH_PROXY_URL and the
 guard writes it onto every reconciler instance.
+
+Also stops the traffic learner writing "Learned: error recovery" into the
+user's Claude Code MEMORY.md. It pairs any failed tool call with the next
+success regardless of intent, so the bullets are wrong ("grep X fails, use
+sed on an unrelated file instead"), and multi-line Bash commands land
+verbatim. MEMORY.md is the auto-memory index Claude Code truncates at 200
+lines, so up to 15 such bullets pushed the user's own entries off the end.
+The desktop's launch scrub (memory_scrubber.rs) only cleaned it between
+flushes. Environment/architecture (CLAUDE.md) and preference routing are
+untouched. Kill switch: HEADROOM_LEARN_DROP_ERROR_RECOVERY=0.
 """
 import faulthandler
 import signal
@@ -1497,6 +1507,76 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
 
+# --- Codex exec reads: parse JS object-literal arguments (upstream PR #3737) ---
+# Read protection (#3621, on via the `coding` profile's HEADROOM_PROTECT_READS)
+# keeps Codex file reads (cat/sed -n/nl) verbatim because the agent patches
+# against them. It finds the command by JSON-decoding the argument of
+# `tools.exec_command(...)` in the code-mode `exec` input, but Codex usually
+# writes that argument as a JavaScript literal with a bare key
+# (`{cmd: "cat f.py"}`), which is not JSON, so the read went unprotected. On
+# 1,125 real Codex 0.15x exec calls (2026-09-23) the wheel parsed 129; this
+# parses 696, and protected read output grows from 50k to 425k tokens. Falls
+# back to the literal's `cmd` property only when strict JSON fails; a template
+# literal with ${...} or a non-literal value still yields nothing, so that
+# output stays compressible exactly as before. The handler late-imports the
+# helper, so rebinding the module symbol reaches it. Copied verbatim from PR
+# #3737 (branch fix/codex-exec-js-object-args). Self-neutralizes once the
+# wheel parses the literal form. Exact-pin gated to wheel 0.38.0.
+# Kill switch: HEADROOM_CODEX_EXEC_JS_ARGS=0.
+_hd_xj_flag = _hd_os.environ.get("HEADROOM_CODEX_EXEC_JS_ARGS", "1")
+if _hd_xj_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_xj_meta
+
+        if _hd_xj_meta.version("headroom-ai") == "0.38.0":
+            import json as _hd_xj_json
+            import re as _hd_xj_re
+
+            from headroom.transforms import content_router as _hd_xj_cr
+
+            if not _hd_xj_cr._custom_tool_call_commands("tools.exec_command({cmd: 'cat f'})"):
+                _hd_xj_prop = _hd_xj_re.compile(
+                    r"""\{[^{}]*?(?<![\w$])(?:cmd|"cmd"|'cmd')\s*:\s*"""
+                    r"""(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\$]|\\.|\$(?!\{))*)`)"""
+                )
+                _hd_xj_escapes = {"n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+
+                def _hd_xj_string(body):
+                    return _hd_xj_re.sub(
+                        r"\\(.)",
+                        lambda m: _hd_xj_escapes.get(m.group(1), m.group(1)),
+                        body,
+                        flags=_hd_xj_re.S,
+                    )
+
+                def _hd_xj_commands(raw):
+                    if not isinstance(raw, str) or "exec_command" not in raw:
+                        return []
+                    decoder = _hd_xj_json.JSONDecoder()
+                    commands = []
+                    for match in _hd_xj_cr._EXEC_COMMAND_CALL_RE.finditer(raw):
+                        start = raw.find("{", match.end())
+                        if start < 0 or raw[match.end() : start].strip():
+                            continue
+                        try:
+                            args, _end = decoder.raw_decode(raw, start)
+                        except ValueError:
+                            literal = _hd_xj_prop.match(raw, start)
+                            if literal is None:
+                                continue
+                            body = next(g for g in literal.groups() if g is not None)
+                            args = {"cmd": _hd_xj_string(body)}
+                        command = _hd_xj_cr._tool_call_command_text(args)
+                        if command:
+                            commands.append(command)
+                    return commands
+
+                _hd_xj_cr._custom_tool_call_commands = _hd_xj_commands
+    except Exception:
+        # Protection-widening only: on any binding failure the wheel's parser
+        # stays bound (the pre-vendor behavior).
+        pass
+
 # Kompress request deadline (upstream PR #3693):
 # HEADROOM_COMPRESSION_DEADLINE_MS (20s) is checked at chunk boundaries
 # against a clock compress() starts ITSELF whenever the caller passes no
@@ -1737,6 +1817,319 @@ if _hd_fm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         pass
 
 
+# Streaming metering headers (upstream PR owed):
+# The buffered path stamps x-headroom-tokens-before/-after/-saved on its
+# response; the streaming path forwards only the upstream rate-limit and
+# request-id headers, so a streaming client (every real Claude Code and Codex
+# turn) never learns what its request saved. The counts are _stream_response
+# arguments, known before the first byte, so stamp them on the response it
+# returns: Starlette's headers write through to raw_headers, which go out when
+# the response is sent, after this returns. The desktop intercept pairs
+# x-headroom-tokens-saved with x-claude-code-session-id to show per-conversation
+# savings in Claude Code's statusline (claude_statusline.rs).
+# Exact-pin gated to wheel 0.38.0. Kill switch: HEADROOM_STREAM_METERING_HEADERS=0.
+_hd_smh_flag = _hd_os.environ.get("HEADROOM_STREAM_METERING_HEADERS", "1")
+if _hd_smh_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_smh_meta
+
+        if _hd_smh_meta.version("headroom-ai") == "0.38.0":
+            from headroom.proxy.handlers import streaming as _hd_smh_streaming
+
+            _hd_smh_orig = _hd_smh_streaming.StreamingMixin._stream_response
+
+            # The wheel's leading parameters, spelled out. Not
+            # inspect.signature(_hd_smh_orig): two earlier vendors (#2942
+            # context guard, tool-ref hint) already wrap this method with *args
+            # signatures, so the chain hides the names. Safe to hard-code under
+            # the exact pin; binds positional and keyword calls alike.
+            def _hd_smh_counts(
+                self,
+                url,
+                headers,
+                body,
+                provider,
+                model,
+                request_id,
+                original_tokens,
+                optimized_tokens,
+                tokens_saved,
+                *rest,
+                **extra,
+            ):
+                return original_tokens, optimized_tokens, tokens_saved
+
+            async def _hd_smh_stream_response(self, *args, **kwargs):
+                response = await _hd_smh_orig(self, *args, **kwargs)
+                try:
+                    counts = _hd_smh_counts(self, *args, **kwargs)
+                    for header, value in zip(
+                        (
+                            "x-headroom-tokens-before",
+                            "x-headroom-tokens-after",
+                            "x-headroom-tokens-saved",
+                        ),
+                        counts,
+                    ):
+                        if header not in response.headers:
+                            response.headers[header] = str(int(value))
+                except Exception:
+                    pass
+                return response
+
+            _hd_smh_streaming.StreamingMixin._stream_response = _hd_smh_stream_response
+    except Exception:
+        pass
+
+
+# Rollup cache-read cost (upstream PR #3734; self-neutralizes once the
+# wheel's tracker grows `_empty_cache_delta`):
+# The /stats-history rollups carried no cache dimension, so the dashboard took
+# cache reads out of the input bill as "read discount / 9", i.e. assumed reads
+# bill at 0.1x list. They bill at 0.025x on claude-fable-5-1 and 0.05x on
+# claude-opus-5-5, so the read cost came out 4.3x / 2.1x too high, the "Spent"
+# figure too low, and the Claude Code input rate inflated (19.5% shown vs 12.6%
+# real on one Fable-heavy day). The per-provider tooltip compounded it by
+# applying one bucket-wide ratio to every connector. The PR's rollup, exec'd
+# verbatim into the tracker module so its private helpers resolve: every bucket,
+# by_provider and by_model entry gains cache_read_tokens_delta,
+# cache_savings_usd_delta and cache_read_cost_usd_delta (priced per checkpoint
+# with the same function that priced total_input_cost_usd; None when a
+# model-less legacy checkpoint cannot be priced). Additive keys only; older
+# desktops ignore them. Exact-pin gated to wheel 0.38.0.
+# Kill switch: HEADROOM_ROLLUP_READ_COST=0.
+_hd_rrc_flag = _hd_os.environ.get("HEADROOM_ROLLUP_READ_COST", "1")
+if _hd_rrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_rrc_meta
+
+        if _hd_rrc_meta.version("headroom-ai") == "0.38.0":
+            from headroom.proxy import savings_tracker as _hd_rrc_st
+
+            if not hasattr(_hd_rrc_st, "_empty_cache_delta"):
+                _hd_rrc_src = '''
+def _empty_cache_delta() -> dict[str, Any]:
+    """Zeroed cache fields for a rollup bucket or one of its breakdowns.
+
+    ``cache_read_cost_usd_delta`` is None when any contributing checkpoint's
+    reads could not be priced (see ``_build_rollup``).
+    """
+    return {
+        "cache_read_tokens_delta": 0,
+        "cache_savings_usd_delta": 0.0,
+        "cache_read_cost_usd_delta": 0.0,
+    }
+
+
+def _hd_rrc_build_rollup(
+    self,
+    history: list[dict[str, Any]],
+    bucket: str,
+) -> list[dict[str, Any]]:
+    if not history:
+        return []
+
+    aggregated: dict[str, dict[str, Any]] = {}
+    prev_total_tokens = 0
+    prev_total_usd = 0.0
+    prev_total_input_tokens = 0
+    prev_total_input_cost_usd = 0.0
+    prev_output_tokens = 0
+    prev_output_usd = 0.0
+    prev_cache_read_tokens = 0
+    prev_cache_savings_usd = 0.0
+    # What the bucket's cache reads actually COST, priced per checkpoint
+    # with the same function that put them into ``total_input_cost_usd``.
+    # Consumers need it to take reads out of the input bill, and cannot
+    # derive it from ``cache_savings_usd``: the read discount is not a
+    # fixed multiple of the read cost (reads bill at 0.1x on most models,
+    # 0.05x or 0.025x on others), so "discount / 9" misprices exactly the
+    # models with the steepest cache discount.
+    read_cost_per_token: dict[str, float] = {}
+
+    def _read_cost(model: str, reads: int) -> float | None:
+        if reads <= 0:
+            return 0.0
+        # Checkpoints written before per-model attribution carry no model,
+        # so their reads cannot be priced the way the request was. Report
+        # the bucket's read cost as unknown rather than guess.
+        if model == MODEL_UNKNOWN:
+            return None
+        if model not in read_cost_per_token:
+            read_cost_per_token[model] = (
+                _estimate_input_cost_usd(model, 1_000_000, cache_read_tokens=1_000_000)
+                / 1_000_000
+            )
+        return reads * read_cost_per_token[model]
+
+    def _add_cache(
+        target: dict[str, Any], reads: int, discount: float, cost: float | None
+    ) -> None:
+        target["cache_read_tokens_delta"] += reads
+        target["cache_savings_usd_delta"] = round(
+            target["cache_savings_usd_delta"] + discount, 6
+        )
+        if cost is None or target["cache_read_cost_usd_delta"] is None:
+            target["cache_read_cost_usd_delta"] = None
+        else:
+            target["cache_read_cost_usd_delta"] = round(
+                target["cache_read_cost_usd_delta"] + cost, 6
+            )
+
+    for point in history:
+        timestamp = _parse_timestamp(point["timestamp"])
+        if timestamp is None:
+            continue
+
+        bucket_start = _bucket_start(timestamp, bucket)
+
+        bucket_key = _to_utc_iso(bucket_start)
+        total_tokens_saved = _coerce_int(point.get("total_tokens_saved"))
+        total_usd = _coerce_float(point.get("compression_savings_usd"))
+        total_input_tokens = _coerce_int(point.get("total_input_tokens"))
+        total_input_cost_usd = _coerce_float(point.get("total_input_cost_usd"))
+        total_output_tokens = _coerce_int(point.get("output_tokens_saved"))
+        total_output_usd = _coerce_float(point.get("output_savings_usd"))
+        delta_tokens = max(total_tokens_saved - prev_total_tokens, 0)
+        delta_usd = max(total_usd - prev_total_usd, 0.0)
+        delta_input_tokens = max(total_input_tokens - prev_total_input_tokens, 0)
+        delta_input_cost_usd = max(
+            total_input_cost_usd - prev_total_input_cost_usd,
+            0.0,
+        )
+
+        delta_output_tokens = max(total_output_tokens - prev_output_tokens, 0)
+        delta_output_usd = max(total_output_usd - prev_output_usd, 0.0)
+
+        total_cache_read_tokens = _coerce_int(point.get("cache_read_tokens"))
+        total_cache_savings_usd = _coerce_float(point.get("cache_savings_usd"))
+        delta_cache_read_tokens = max(total_cache_read_tokens - prev_cache_read_tokens, 0)
+        delta_cache_savings_usd = max(total_cache_savings_usd - prev_cache_savings_usd, 0.0)
+        prev_cache_read_tokens = total_cache_read_tokens
+        prev_cache_savings_usd = total_cache_savings_usd
+        model = _normalize_model(point.get("model"))
+        delta_cache_read_cost_usd = _read_cost(model, delta_cache_read_tokens)
+
+        prev_total_tokens = total_tokens_saved
+        prev_total_usd = total_usd
+        prev_total_input_tokens = total_input_tokens
+        prev_total_input_cost_usd = total_input_cost_usd
+        prev_output_tokens = total_output_tokens
+        prev_output_usd = total_output_usd
+
+        entry = aggregated.setdefault(
+            bucket_key,
+            {
+                "timestamp": bucket_key,
+                "tokens_saved": 0,
+                "compression_savings_usd_delta": 0.0,
+                "total_tokens_saved": total_tokens_saved,
+                "compression_savings_usd": total_usd,
+                "total_input_tokens_delta": 0,
+                "total_input_tokens": total_input_tokens,
+                "total_input_cost_usd_delta": 0.0,
+                "total_input_cost_usd": total_input_cost_usd,
+                "output_tokens_saved_delta": 0,
+                "output_savings_usd_delta": 0.0,
+                **_empty_cache_delta(),
+                "by_provider": {},
+                "by_model": {},
+            },
+        )
+        entry["tokens_saved"] += delta_tokens
+        entry["compression_savings_usd_delta"] = round(
+            entry["compression_savings_usd_delta"] + delta_usd,
+            6,
+        )
+        entry["total_input_tokens_delta"] += delta_input_tokens
+        entry["total_input_cost_usd_delta"] = round(
+            entry["total_input_cost_usd_delta"] + delta_input_cost_usd,
+            6,
+        )
+        entry["total_tokens_saved"] = total_tokens_saved
+        entry["compression_savings_usd"] = round(total_usd, 6)
+        entry["total_input_tokens"] = total_input_tokens
+        entry["total_input_cost_usd"] = round(total_input_cost_usd, 6)
+        entry["output_tokens_saved_delta"] += delta_output_tokens
+        entry["output_savings_usd_delta"] = round(
+            entry["output_savings_usd_delta"] + delta_output_usd,
+            6,
+        )
+        _add_cache(
+            entry, delta_cache_read_tokens, delta_cache_savings_usd, delta_cache_read_cost_usd
+        )
+
+        # Attribute this checkpoint's delta to the provider that produced
+        # it. Each checkpoint comes from a single request, so its delta is
+        # wholly owned by one provider. Skip no-op checkpoints so providers
+        # only appear in a bucket where they actually moved a counter.
+        if (
+            delta_tokens
+            or delta_usd
+            or delta_input_tokens
+            or delta_input_cost_usd
+            or delta_cache_read_tokens
+        ):
+            provider = _normalize_provider(point.get("provider"))
+            prov = entry["by_provider"].setdefault(
+                provider,
+                {
+                    "tokens_saved": 0,
+                    "compression_savings_usd_delta": 0.0,
+                    "total_input_tokens_delta": 0,
+                    "total_input_cost_usd_delta": 0.0,
+                    **_empty_cache_delta(),
+                },
+            )
+            _add_cache(
+                prov,
+                delta_cache_read_tokens,
+                delta_cache_savings_usd,
+                delta_cache_read_cost_usd,
+            )
+            prov["tokens_saved"] += delta_tokens
+            prov["compression_savings_usd_delta"] = round(
+                prov["compression_savings_usd_delta"] + delta_usd,
+                6,
+            )
+            prov["total_input_tokens_delta"] += delta_input_tokens
+            prov["total_input_cost_usd_delta"] = round(
+                prov["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                6,
+            )
+
+            mod = entry["by_model"].setdefault(
+                model,
+                {
+                    "tokens_saved": 0,
+                    "compression_savings_usd_delta": 0.0,
+                    "total_input_tokens_delta": 0,
+                    "total_input_cost_usd_delta": 0.0,
+                    **_empty_cache_delta(),
+                },
+            )
+            _add_cache(
+                mod, delta_cache_read_tokens, delta_cache_savings_usd, delta_cache_read_cost_usd
+            )
+            mod["tokens_saved"] += delta_tokens
+            mod["compression_savings_usd_delta"] = round(
+                mod["compression_savings_usd_delta"] + delta_usd,
+                6,
+            )
+            mod["total_input_tokens_delta"] += delta_input_tokens
+            mod["total_input_cost_usd_delta"] = round(
+                mod["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                6,
+            )
+
+    return list(aggregated.values())
+'''
+                exec(compile(_hd_rrc_src, "<headroom-desktop rollup read cost>", "exec"), _hd_rrc_st.__dict__)
+                _hd_rrc_st.SavingsTracker._build_rollup = _hd_rrc_st._hd_rrc_build_rollup
+    except Exception:
+        pass
+
+
 # Request-log body window (upstream PR pending; self-neutralizes once
 # RequestLogger grows `MESSAGE_WINDOW`):
 # RequestLogger keeps MAX_LOG_ENTRIES (10,000) entries, and because the desktop
@@ -1775,6 +2168,20 @@ if _hd_rlw_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                         pass
 
                 _hd_rlw_mod.RequestLogger.log = _hd_rlw_log
+    except Exception:
+        pass
+
+# --- Traffic learner: no error-recovery section in MEMORY.md (posture) ---------
+# The recommendation builder skips any category missing from this routing table,
+# so dropping ERROR_RECOVERY stops the section at the source. Not version-gated:
+# a wheel that renames the table just leaves this inert. Kill switch:
+# HEADROOM_LEARN_DROP_ERROR_RECOVERY=0.
+_hd_ler_flag = _hd_os.environ.get("HEADROOM_LEARN_DROP_ERROR_RECOVERY", "1")
+if _hd_ler_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        from headroom.memory import traffic_learner as _hd_ler_mod
+
+        _hd_ler_mod._CATEGORY_TO_TARGET.pop(_hd_ler_mod.PatternCategory.ERROR_RECOVERY, None)
     except Exception:
         pass
 
@@ -2798,6 +3205,7 @@ impl ToolManager {
                     update_available,
                     available_version: pending.filter(|version| !version.is_empty()),
                     unavailable_reason: addon_unavailable_reason(&manifest.id),
+                    managed_externally: self.plugin_managed_externally(&manifest.id),
                 }
             })
             .collect()
@@ -7913,10 +8321,25 @@ impl ToolManager {
         Ok(())
     }
 
+    /// Registered with a host but never installed by Headroom: the user ran
+    /// `/plugin install` themselves, so the card must not offer Install.
+    fn plugin_managed_externally(&self, tool_id: &str) -> bool {
+        plugin_addon(tool_id).is_some_and(|plugin| {
+            !self.plugin_receipt_exists(plugin)
+                && PluginHost::ALL
+                    .iter()
+                    .any(|host| host.plugin_present(plugin))
+        })
+    }
+
     fn detect_status(&self, tool_id: &str) -> ToolStatus {
         if let Some(plugin) = plugin_addon(tool_id) {
             let Some(receipt) = self.read_tool_receipt(plugin.id) else {
-                return ToolStatus::NotInstalled;
+                return if self.plugin_managed_externally(tool_id) {
+                    ToolStatus::Healthy
+                } else {
+                    ToolStatus::NotInstalled
+                };
             };
             // Intentionally disabled via the app: the plugin may be gone from
             // hosts that lack a disable verb (Codex), but the receipt means it's
@@ -9925,8 +10348,13 @@ fn headroom_learn_startup_args() -> Vec<String> {
 }
 
 fn headroom_propagated_proxy_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    newest_wheel_proxy_log(&PathBuf::from(home).join(".headroom").join("logs"))
+    // Not a raw HOME read: the desktop process on Windows has USERPROFILE but
+    // no HOME, so that returned None on every Windows install and the Kompress
+    // status dot rendered unknown while the model was warm (0.9.20-rc.3 pass).
+    let logs = crate::client_adapters::home_dir()
+        .join(".headroom")
+        .join("logs");
+    newest_wheel_proxy_log(&logs)
 }
 
 /// The wheel's own runtime log. 0.38.0 (#3204) writes `proxy-<port>.log` and
@@ -13171,6 +13599,22 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_codex_exec_js_args() {
+        // Codex exec reads with a JS object-literal argument get read
+        // protection. Behaviour is proven by
+        // codex_exec_js_args_vendor_behaves_against_the_installed_wheel.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_CODEX_EXEC_JS_ARGS"));
+        assert!(py.contains(r#"_hd_xj_meta.version("headroom-ai") == "0.38.0""#));
+        // Self-neutralizes on a wheel that already parses the literal form.
+        assert!(py.contains(
+            r#"if not _hd_xj_cr._custom_tool_call_commands("tools.exec_command({cmd: 'cat f'})"):"#
+        ));
+        // Rebinds the module symbol the Responses handler late-imports.
+        assert!(py.contains("_hd_xj_cr._custom_tool_call_commands = _hd_xj_commands"));
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -13513,6 +13957,103 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_rollup_read_cost() {
+        // Shape and gates only; behaviour is proven by
+        // rollup_read_cost_vendor_behaves_against_the_installed_wheel.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains("HEADROOM_ROLLUP_READ_COST"),
+            "kill switch missing"
+        );
+        assert!(
+            py.contains(r#"_hd_rrc_meta.version("headroom-ai") == "0.38.0""#),
+            "exact-pin gate missing"
+        );
+        assert!(
+            py.contains(r#"if not hasattr(_hd_rrc_st, "_empty_cache_delta"):"#),
+            "self-neutralizing gate missing"
+        );
+        assert!(py
+            .contains("_hd_rrc_st.SavingsTracker._build_rollup = _hd_rrc_st._hd_rrc_build_rollup"));
+    }
+
+    #[test]
+    fn rollup_read_cost_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel's REAL
+        // litellm catalog: a Fable-5.1 request (reads at 0.025x) and a GPT
+        // request (0.1x) in one hour. The bucket and each provider must carry
+        // a read cost equal to the read component of their recorded input
+        // cost, the rollup's existing keys must be unchanged, and the kill
+        // switch must leave the wheel's own rollup bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-rrc-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+import os, sys, tempfile
+from headroom.proxy import savings_tracker as st
+if st.SavingsTracker._build_rollup.__name__ != "_hd_rrc_build_rollup":
+    print("SKIP rrc not bound"); sys.exit(0)
+t = st.SavingsTracker(path=os.path.join(tempfile.mkdtemp(), "s.json"), max_history_points=100, max_history_age_days=30)
+t.record_request(model="claude-fable-5-1", provider="anthropic", input_tokens=1010000, tokens_saved=5000,
+                 cache_read_tokens=1000000, uncached_input_tokens=10000, timestamp="2026-03-27T09:10:00Z")
+t.record_request(model="gpt-6-sol", provider="openai", input_tokens=150000, tokens_saved=2000,
+                 cache_read_tokens=100000, uncached_input_tokens=50000, timestamp="2026-03-27T09:20:00Z")
+b = t.history_response()["series"]["hourly"][0]
+a, o = b["by_provider"]["anthropic"], b["by_provider"]["openai"]
+fa = st._estimate_input_cost_usd("claude-fable-5-1", 1000000, cache_read_tokens=1000000)
+fo = st._estimate_input_cost_usd("gpt-6-sol", 100000, cache_read_tokens=100000)
+assert fa > 0 and fo > 0, (fa, fo)
+assert abs(a["cache_read_cost_usd_delta"] - fa) < 1e-9, (a, fa)
+assert abs(o["cache_read_cost_usd_delta"] - fo) < 1e-9, (o, fo)
+# The read cost is exactly the read slice of the provider's input cost.
+ua = st._estimate_input_cost_usd("claude-fable-5-1", 10000, uncached_input_tokens=10000)
+assert abs(a["total_input_cost_usd_delta"] - a["cache_read_cost_usd_delta"] - ua) < 1e-6, (a, ua)
+# Fable reads bill well under 0.1x, so the old discount/9 estimate overstates them.
+assert a["cache_savings_usd_delta"] / 9 > 2 * a["cache_read_cost_usd_delta"], a
+assert b["cache_read_tokens_delta"] == 1100000, b
+assert abs(b["cache_read_cost_usd_delta"] - (fa + fo)) < 1e-9, b
+for k in ("tokens_saved", "compression_savings_usd_delta", "total_input_tokens_delta", "total_input_cost_usd_delta", "by_model"):
+    assert k in b, k
+print("OK rrc")
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_ROLLUP_READ_COST", flag)
+                .output()
+                .expect("run rollup read-cost probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        if on_out.contains("SKIP rrc not bound") {
+            eprintln!("skipping: rollup read-cost vendor did not bind (wheel ships it?)");
+            return;
+        }
+        assert!(
+            on.status.success() && on_out.contains("OK rrc"),
+            "rollup read-cost vendor misbehaved against the installed wheel.\nstdout:\n{on_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        assert!(
+            off.status.success() && off_out.contains("SKIP rrc not bound"),
+            "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
     fn feed_include_messages_vendor_behaves_against_the_installed_wheel() {
         // Runs the shipped sitecustomize against the installed wheel: an entry
         // whose message payloads refuse to be deep-copied is planted, then
@@ -13605,6 +14146,174 @@ print("OK fm")
         let off_out = String::from_utf8_lossy(&off.stdout);
         assert!(
             off.status.success() && off_out.contains("SKIP fm not bound"),
+            "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
+    fn codex_exec_js_args_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel: a Codex
+        // exec read whose argument is a JS object literal must reach the model
+        // verbatim through the wheel's own Responses compression, a non-read
+        // exec output must still compress, and the kill switch must leave the
+        // wheel's parser bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-xj-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+from types import MethodType, SimpleNamespace
+from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.transforms import content_router as cr
+print("BOUND" if cr._custom_tool_call_commands.__name__ == "_hd_xj_commands" else "UNBOUND")
+router = cr.ContentRouter()
+def compress(self, content, **_kw):
+    return cr.RouterCompressionResult(compressed="kept words", original=content, strategy_used=cr.CompressionStrategy.KOMPRESS)
+router.compress = MethodType(compress, router)
+handler = OpenAIHandlerMixin()
+handler.openai_pipeline = SimpleNamespace(transforms=[router])
+handler.openai_provider = SimpleNamespace(get_token_counter=lambda _m: SimpleNamespace(count_text=lambda t: len(t.split())))
+listing = "\n".join(f"{i}\tline {i} of the roadmap file with a handful of words in it" for i in range(1, 110))
+def exec_call(cid, cmd):
+    return {"type": "custom_tool_call", "call_id": cid, "name": "exec",
+            "input": "const r = await tools.exec_command({cmd: \"" + cmd + "\", workdir: \"/repo\"});\ntext(r.output);\n"}
+def exec_out(cid, text):
+    return {"type": "custom_tool_call_output", "call_id": cid,
+            "output": [{"type": "input_text", "text": "Script completed\nOutput:\n"}, {"type": "input_text", "text": text}]}
+read_out, other_out = exec_out("c1", listing), exec_out("c2", listing)
+payload = {"model": "gpt-5", "input": [
+    exec_call("c1", "nl -ba roadmap.md"), read_out, exec_call("c2", "python3 gen_report.py"), other_out]}
+out = handler._compress_openai_responses_live_text_units_with_router(payload, model="gpt-5", request_id="xj")[0]
+print("READ " + ("verbatim" if out["input"][1] == read_out else "compressed"))
+print("OTHER " + ("verbatim" if out["input"][3] == other_out else "compressed"))
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_PROTECT_READS", "1")
+                .env("HEADROOM_TELEMETRY", "off")
+                .env("HEADROOM_BEACON", "off")
+                .env("HEADROOM_CODEX_EXEC_JS_ARGS", flag)
+                .output()
+                .expect("run codex exec probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        let detail = format!(
+            "on stdout:\n{on_out}\non stderr:\n{}\noff stdout:\n{off_out}\noff stderr:\n{}",
+            String::from_utf8_lossy(&on.stderr),
+            String::from_utf8_lossy(&off.stderr)
+        );
+        if on_out.contains("UNBOUND") {
+            eprintln!("skipping: codex exec vendor did not bind (wheel parses JS literals?)");
+            return;
+        }
+        assert!(
+            on.status.success() && off.status.success(),
+            "probe failed\n{detail}"
+        );
+        // The vendor is what keeps the JS-literal read verbatim: with the kill
+        // switch the wheel's parser misses it and the read is compressed.
+        assert!(
+            on_out.contains("BOUND") && on_out.contains("READ verbatim"),
+            "{detail}"
+        );
+        assert!(
+            off_out.contains("UNBOUND") && off_out.contains("READ compressed"),
+            "{detail}"
+        );
+        // A non-read exec output still compresses with the vendor bound.
+        assert!(on_out.contains("OTHER compressed"), "{detail}");
+    }
+
+    #[test]
+    fn stream_metering_headers_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel: the
+        // wheel's own _stream_response runs over a stub inner stream, and the
+        // response that reaches the ASGI wire must carry the three metering
+        // headers next to the upstream ones it already forwarded. The kill
+        // switch must leave the wheel's method bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-smh-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+import asyncio, sys
+from headroom.proxy.handlers.streaming import StreamingMixin
+if StreamingMixin._stream_response.__name__ != "_hd_smh_stream_response":
+    print("SKIP smh not bound"); sys.exit(0)
+from fastapi.responses import StreamingResponse
+class Stub:
+    def _get_session_key(self, body):
+        return "k"
+    def _cleanup_mid_turn_stream(self, key):
+        pass
+    async def _stream_response_inner(self, **kw):
+        async def gen():
+            yield b"data: {}\n\n"
+        return StreamingResponse(gen(), media_type="text/event-stream", headers={"request-id": "r1"})
+async def main():
+    r = await StreamingMixin._stream_response(
+        Stub(), "u", {}, {}, "anthropic", "m", "rid", 1000, 400, 600, ["x"], {}, 0.0
+    )
+    sent = []
+    async def send(message):
+        sent.append(message)
+    async def receive():
+        await asyncio.Event().wait()
+    await r({"type": "http", "method": "POST", "path": "/v1/messages", "headers": []}, receive, send)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    headers = dict(start["headers"])
+    assert headers.get(b"x-headroom-tokens-saved") == b"600", headers
+    assert headers.get(b"x-headroom-tokens-before") == b"1000", headers
+    assert headers.get(b"x-headroom-tokens-after") == b"400", headers
+    assert headers.get(b"request-id") == b"r1", headers
+asyncio.run(main())
+print("OK smh")
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_STREAM_METERING_HEADERS", flag)
+                .output()
+                .expect("run stream metering probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        if on_out.contains("SKIP smh not bound") {
+            eprintln!("skipping: stream metering vendor did not bind (wheel not 0.38.0?)");
+            return;
+        }
+        assert!(
+            on.status.success() && on_out.contains("OK smh"),
+            "stream metering vendor misbehaved against the installed wheel.\nstdout:\n{on_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        assert!(
+            off.status.success() && off_out.contains("SKIP smh not bound"),
             "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
             String::from_utf8_lossy(&off.stderr)
         );
@@ -13741,6 +14450,45 @@ print("OK fm")
             "request-log window vendor misbehaved against installed wheel.\n\
              stdout:\n{stdout}\nstderr:\n{stderr}"
         );
+    }
+
+    #[test]
+    fn learn_error_recovery_drop_behaves_against_the_installed_wheel() {
+        // Error recovery no longer routes anywhere (so it never reaches
+        // MEMORY.md); preference routing survives; the kill switch unbinds.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-er-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from headroom.memory.traffic_learner import _CATEGORY_TO_TARGET as t, PatternCategory as c\n\
+                     print(c.ERROR_RECOVERY in t, t.get(c.PREFERENCE))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_DROP_ERROR_RECOVERY", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on_err.contains("ImportError") || on_err.contains("ModuleNotFoundError") {
+            eprintln!("skipping: installed wheel has no traffic_learner routing table");
+            return;
+        }
+        assert_eq!(on, "False memory_file", "stderr:\n{on_err}");
+        assert_eq!(off, "True memory_file", "stderr:\n{off_err}");
     }
 
     #[test]
@@ -18347,6 +19095,35 @@ after
                 br#"{"version":"latest","enabled":false}"#,
             )
             .expect("receipt");
+            assert!(matches!(
+                manager.detect_status(plugin.id),
+                crate::models::ToolStatus::Healthy
+            ));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_installed_outside_headroom_reports_installed_and_external() {
+        // The user installed the plugin with `/plugin install` themselves: no
+        // receipt, but Claude Code's registry lists it. The card must show it
+        // installed, not offer Install (which would adopt it into our uninstall).
+        let (root, _runtime, manager) = seed_test_runtime("plugin-external");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        for plugin in &PLUGIN_ADDONS {
+            assert!(!manager.plugin_managed_externally(plugin.id));
+            fs::write(
+                registry.join("installed_plugins.json"),
+                format!(
+                    r#"{{"plugins":{{"{}":[{{"scope":"user"}}]}}}}"#,
+                    plugin.plugin_ref
+                ),
+            )
+            .expect("registry");
+            assert!(manager.plugin_managed_externally(plugin.id));
             assert!(matches!(
                 manager.detect_status(plugin.id),
                 crate::models::ToolStatus::Healthy
