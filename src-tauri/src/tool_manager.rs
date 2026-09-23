@@ -1507,6 +1507,76 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
         pass
 
+# --- Codex exec reads: parse JS object-literal arguments (upstream PR #3737) ---
+# Read protection (#3621, on via the `coding` profile's HEADROOM_PROTECT_READS)
+# keeps Codex file reads (cat/sed -n/nl) verbatim because the agent patches
+# against them. It finds the command by JSON-decoding the argument of
+# `tools.exec_command(...)` in the code-mode `exec` input, but Codex usually
+# writes that argument as a JavaScript literal with a bare key
+# (`{cmd: "cat f.py"}`), which is not JSON, so the read went unprotected. On
+# 1,125 real Codex 0.15x exec calls (2026-09-23) the wheel parsed 129; this
+# parses 696, and protected read output grows from 50k to 425k tokens. Falls
+# back to the literal's `cmd` property only when strict JSON fails; a template
+# literal with ${...} or a non-literal value still yields nothing, so that
+# output stays compressible exactly as before. The handler late-imports the
+# helper, so rebinding the module symbol reaches it. Copied verbatim from PR
+# #3737 (branch fix/codex-exec-js-object-args). Self-neutralizes once the
+# wheel parses the literal form. Exact-pin gated to wheel 0.38.0.
+# Kill switch: HEADROOM_CODEX_EXEC_JS_ARGS=0.
+_hd_xj_flag = _hd_os.environ.get("HEADROOM_CODEX_EXEC_JS_ARGS", "1")
+if _hd_xj_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_xj_meta
+
+        if _hd_xj_meta.version("headroom-ai") == "0.38.0":
+            import json as _hd_xj_json
+            import re as _hd_xj_re
+
+            from headroom.transforms import content_router as _hd_xj_cr
+
+            if not _hd_xj_cr._custom_tool_call_commands("tools.exec_command({cmd: 'cat f'})"):
+                _hd_xj_prop = _hd_xj_re.compile(
+                    r"""\{[^{}]*?(?<![\w$])(?:cmd|"cmd"|'cmd')\s*:\s*"""
+                    r"""(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\$]|\\.|\$(?!\{))*)`)"""
+                )
+                _hd_xj_escapes = {"n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+
+                def _hd_xj_string(body):
+                    return _hd_xj_re.sub(
+                        r"\\(.)",
+                        lambda m: _hd_xj_escapes.get(m.group(1), m.group(1)),
+                        body,
+                        flags=_hd_xj_re.S,
+                    )
+
+                def _hd_xj_commands(raw):
+                    if not isinstance(raw, str) or "exec_command" not in raw:
+                        return []
+                    decoder = _hd_xj_json.JSONDecoder()
+                    commands = []
+                    for match in _hd_xj_cr._EXEC_COMMAND_CALL_RE.finditer(raw):
+                        start = raw.find("{", match.end())
+                        if start < 0 or raw[match.end() : start].strip():
+                            continue
+                        try:
+                            args, _end = decoder.raw_decode(raw, start)
+                        except ValueError:
+                            literal = _hd_xj_prop.match(raw, start)
+                            if literal is None:
+                                continue
+                            body = next(g for g in literal.groups() if g is not None)
+                            args = {"cmd": _hd_xj_string(body)}
+                        command = _hd_xj_cr._tool_call_command_text(args)
+                        if command:
+                            commands.append(command)
+                    return commands
+
+                _hd_xj_cr._custom_tool_call_commands = _hd_xj_commands
+    except Exception:
+        # Protection-widening only: on any binding failure the wheel's parser
+        # stays bound (the pre-vendor behavior).
+        pass
+
 # Kompress request deadline (upstream PR #3693):
 # HEADROOM_COMPRESSION_DEADLINE_MS (20s) is checked at chunk boundaries
 # against a clock compress() starts ITSELF whenever the caller passes no
@@ -13529,6 +13599,22 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_codex_exec_js_args() {
+        // Codex exec reads with a JS object-literal argument get read
+        // protection. Behaviour is proven by
+        // codex_exec_js_args_vendor_behaves_against_the_installed_wheel.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_CODEX_EXEC_JS_ARGS"));
+        assert!(py.contains(r#"_hd_xj_meta.version("headroom-ai") == "0.38.0""#));
+        // Self-neutralizes on a wheel that already parses the literal form.
+        assert!(py.contains(
+            r#"if not _hd_xj_cr._custom_tool_call_commands("tools.exec_command({cmd: 'cat f'})"):"#
+        ));
+        // Rebinds the module symbol the Responses handler late-imports.
+        assert!(py.contains("_hd_xj_cr._custom_tool_call_commands = _hd_xj_commands"));
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -14063,6 +14149,93 @@ print("OK fm")
             "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
             String::from_utf8_lossy(&off.stderr)
         );
+    }
+
+    #[test]
+    fn codex_exec_js_args_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel: a Codex
+        // exec read whose argument is a JS object literal must reach the model
+        // verbatim through the wheel's own Responses compression, a non-read
+        // exec output must still compress, and the kill switch must leave the
+        // wheel's parser bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-xj-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+from types import MethodType, SimpleNamespace
+from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.transforms import content_router as cr
+print("BOUND" if cr._custom_tool_call_commands.__name__ == "_hd_xj_commands" else "UNBOUND")
+router = cr.ContentRouter()
+def compress(self, content, **_kw):
+    return cr.RouterCompressionResult(compressed="kept words", original=content, strategy_used=cr.CompressionStrategy.KOMPRESS)
+router.compress = MethodType(compress, router)
+handler = OpenAIHandlerMixin()
+handler.openai_pipeline = SimpleNamespace(transforms=[router])
+handler.openai_provider = SimpleNamespace(get_token_counter=lambda _m: SimpleNamespace(count_text=lambda t: len(t.split())))
+listing = "\n".join(f"{i}\tline {i} of the roadmap file with a handful of words in it" for i in range(1, 110))
+def exec_call(cid, cmd):
+    return {"type": "custom_tool_call", "call_id": cid, "name": "exec",
+            "input": "const r = await tools.exec_command({cmd: \"" + cmd + "\", workdir: \"/repo\"});\ntext(r.output);\n"}
+def exec_out(cid, text):
+    return {"type": "custom_tool_call_output", "call_id": cid,
+            "output": [{"type": "input_text", "text": "Script completed\nOutput:\n"}, {"type": "input_text", "text": text}]}
+read_out, other_out = exec_out("c1", listing), exec_out("c2", listing)
+payload = {"model": "gpt-5", "input": [
+    exec_call("c1", "nl -ba roadmap.md"), read_out, exec_call("c2", "python3 gen_report.py"), other_out]}
+out = handler._compress_openai_responses_live_text_units_with_router(payload, model="gpt-5", request_id="xj")[0]
+print("READ " + ("verbatim" if out["input"][1] == read_out else "compressed"))
+print("OTHER " + ("verbatim" if out["input"][3] == other_out else "compressed"))
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_PROTECT_READS", "1")
+                .env("HEADROOM_TELEMETRY", "off")
+                .env("HEADROOM_BEACON", "off")
+                .env("HEADROOM_CODEX_EXEC_JS_ARGS", flag)
+                .output()
+                .expect("run codex exec probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        let detail = format!(
+            "on stdout:\n{on_out}\non stderr:\n{}\noff stdout:\n{off_out}\noff stderr:\n{}",
+            String::from_utf8_lossy(&on.stderr),
+            String::from_utf8_lossy(&off.stderr)
+        );
+        if on_out.contains("UNBOUND") {
+            eprintln!("skipping: codex exec vendor did not bind (wheel parses JS literals?)");
+            return;
+        }
+        assert!(
+            on.status.success() && off.status.success(),
+            "probe failed\n{detail}"
+        );
+        // The vendor is what keeps the JS-literal read verbatim: with the kill
+        // switch the wheel's parser misses it and the read is compressed.
+        assert!(
+            on_out.contains("BOUND") && on_out.contains("READ verbatim"),
+            "{detail}"
+        );
+        assert!(
+            off_out.contains("UNBOUND") && off_out.contains("READ compressed"),
+            "{detail}"
+        );
+        // A non-read exec output still compresses with the vendor bound.
+        assert!(on_out.contains("OTHER compressed"), "{detail}");
     }
 
     #[test]
