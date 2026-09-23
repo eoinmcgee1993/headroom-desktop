@@ -6809,6 +6809,7 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
                 cache_read_tokens: point.cache_read_tokens,
                 cache_savings_usd: point.cache_savings_usd,
                 cache_read_cost_usd: point.cache_read_cost_usd,
+                new_input_tokens: (point.new_input_tokens > 0).then_some(point.new_input_tokens),
                 output_sampled_tokens_saved: point.output_sampled_tokens_saved,
                 output_baseline_tokens: point.output_baseline_tokens,
                 client_requests: day_counters.map(|c| c.client_requests.clone()),
@@ -9906,6 +9907,23 @@ mod tests {
         assert_eq!(days[1].cache_read_cost_usd, None);
         let json = serde_json::to_value(&days[1]).unwrap();
         assert!(json.get("cache_read_cost_usd").unwrap().is_null());
+    }
+
+    #[test]
+    fn recent_savings_days_reports_new_input_only_where_sampled() {
+        // The server rates the day like the Input chip: tokens_saved over
+        // tokens_saved + new_input_tokens. An unsampled day must arrive as
+        // null, never 0, or it would read as "100% removed".
+        let mut sampled = daily_point("2026-06-01", 1.0, 2_000, 5.0, 90_000);
+        sampled.new_input_tokens = 6_000;
+        let rollup = daily_point("2026-06-02", 1.0, 1_000, 5.0, 9_000);
+
+        let days = recent_savings_days(&[sampled, rollup]);
+        assert_eq!(days[0].new_input_tokens, Some(6_000));
+        assert_eq!(days[0].tokens_saved, 2_000);
+        assert_eq!(days[1].new_input_tokens, None);
+        let json = serde_json::to_value(&days[1]).unwrap();
+        assert!(json.get("new_input_tokens").unwrap().is_null());
     }
 
     #[test]

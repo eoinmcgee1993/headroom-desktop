@@ -1730,6 +1730,12 @@ pub struct SavingsDay {
     /// overstates the read cost on models with a steeper read discount
     /// (claude-fable-5-1 reads bill at 0.025x) and so inflates the input rate.
     pub cache_read_cost_usd: Option<f64>,
+    /// New input (uncached + cache-write) tokens, the denominator of the app's
+    /// Input chip (`newInputSavingsRate`: tokens_saved / (tokens_saved +
+    /// new_input_tokens)). Cache reads never enter it, so the server can rate
+    /// the day exactly as the app does without pricing reads. None on days the
+    /// session sampler did not cover (backend rollups, pre-coverage buckets).
+    pub new_input_tokens: Option<u64>,
     pub output_sampled_tokens_saved: Option<u64>,
     pub output_baseline_tokens: Option<u64>,
     /// Aggregate per-client counters from the intercept proxy (local day
