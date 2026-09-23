@@ -2480,9 +2480,12 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let mut write_tmp = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp_path)?;
         // Before any byte lands, so the contents never sit under a wider mode.
+        // Best effort: a filesystem without Unix modes (vfat, some network
+        // mounts) rejects fchmod, and there the mode meant nothing anyway;
+        // failing the write over it would break every caller.
         #[cfg(unix)]
         if let Some(perms) = &keep_mode {
-            f.set_permissions(perms.clone())?;
+            let _ = f.set_permissions(perms.clone());
         }
         std::io::Write::write_all(&mut f, contents)?;
         f.sync_all()
@@ -3212,16 +3215,19 @@ pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
     // 0644 inside a home that other local accounts can traverse (macOS homes
     // are 0750 group staff, and every user is in staff). Only the owner, who
     // runs Claude Code, needs to read it. atomic_write keeps the mode after.
+    // Logged, not returned: the token is already written by now, and failing
+    // the save would leave it applied behind an error the user cannot act on.
     #[cfg(unix)]
     if token.is_some_and(|token| !token.is_empty()) {
         use std::os::unix::fs::PermissionsExt;
         let path = claude_settings_path();
-        let mode = std::fs::metadata(&path)
-            .with_context(|| format!("reading {}", path.display()))?
-            .permissions()
-            .mode();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o700))
-            .with_context(|| format!("chmod {}", path.display()))?;
+        let narrowed = std::fs::metadata(&path).and_then(|meta| {
+            let mode = meta.permissions().mode() & 0o700;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+        });
+        if let Err(err) = narrowed {
+            log::warn!("could not make {} owner-only: {err}", path.display());
+        }
     }
     Ok(())
 }

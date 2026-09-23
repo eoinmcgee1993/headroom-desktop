@@ -8,6 +8,9 @@ updates:
     target-branch: staging
     schedule:
       interval: monthly
+    # Minor/patch bumps share one PR; a major (checkout v4 -> v5) gets its own
+    # so a breaking change is reviewed on its own.
     groups:
       actions:
         patterns: ["*"]
+        update-types: [minor, patch]
