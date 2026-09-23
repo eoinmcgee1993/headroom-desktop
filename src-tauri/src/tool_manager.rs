@@ -12007,6 +12007,15 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         // The host CLI lost a file of its own mid-install (RUST-DQ: Codex
         // `plugin add` failing "failed to copy plugin file" on Windows).
         "host-file-missing"
+    } else if lower.contains("oauth access token is invalid")
+        || lower.contains("authentication_error")
+        || lower.contains("please run /login")
+    {
+        // The host CLI is signed out, so every command we hand it 401s before
+        // it touches a plugin (RUST-DQ: `claude plugin marketplace add` and the
+        // install behind it, both "Please run /login"). User-side: nothing we
+        // ship installs until they log in again.
+        "cli-not-authenticated"
     } else {
         "other"
     }
@@ -19089,6 +19098,14 @@ exit 0
                  file: The system cannot find the file specified. (os error 2)",
                 "host-file-missing",
             ),
+            (
+                "Claude Code: marketplace add failed first: command failed (exit 1): \
+                 ~\\AppData\\Roaming\\npm\\claude.CMD plugin marketplace add \
+                 DietrichGebert/ponytail\nstdout:\nAPI Error: 401 {\"type\":\"error\",\"error\":\
+                 {\"type\":\"authentication_error\",\"message\":\"OAuth access token is \
+                 invalid.\"},\"request_id\":null} \u{b7} Please run /login\n\nstderr:\n",
+                "cli-not-authenticated",
+            ),
             ("Codex: something we have not seen", "other"),
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -19101,7 +19118,7 @@ exit 0
             seen.insert(expected);
         }
         assert!(
-            seen.len() >= 7,
+            seen.len() >= 8,
             "each known cause shape must land in its own bucket, got: {seen:?}"
         );
     }

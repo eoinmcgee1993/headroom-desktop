@@ -6684,7 +6684,15 @@ fn scrape_compression_quarantine() {
         return;
     }
     if let Ok(body) = response.text() {
-        crate::savings_canary::observe_quarantine(&body);
+        // `/health` carries the executor counters (queue wait, run seconds,
+        // pool width) that say WHICH overrun this was; `/metrics` exports none
+        // of them. Fetched only when the canary is about to fire, so the
+        // every-five-minutes path stays exactly one scrape.
+        let health = crate::savings_canary::detect_quarantine_starvation(&body)
+            .and_then(|_| client.get("http://127.0.0.1:6767/health").send().ok())
+            .filter(|response| response.status().is_success())
+            .and_then(|response| response.text().ok());
+        crate::savings_canary::observe_quarantine(&body, health.as_deref());
     }
 }
 

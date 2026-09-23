@@ -24,6 +24,7 @@ if (!navigator.userAgent.includes("Mac")) {
 if (import.meta.env.PROD) {
   Sentry.init({
     dsn: import.meta.env.VITE_SENTRY_DSN,
+    release: `headroom-desktop@${__APP_VERSION__}`,
     integrations: [],
   });
 }

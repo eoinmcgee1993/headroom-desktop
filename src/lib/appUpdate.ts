@@ -24,6 +24,13 @@ const APP_UPDATE_PROGRESS_EVENT = "app-update://progress";
 // Matches the backend's empty-slot error (lib.rs `install_pending_update`).
 const STALE_STAGED_UPDATE = /no longer staged/i;
 
+// Anything that failed on the way to or from github.com rather than in our
+// code: the user's network, not a defect. Covers the manifest fetch (RUST-GM,
+// RUST-GW) and the bundle download the install runs (RUST-HS, a reqwest
+// "error decoding response body" = the body stopped arriving mid-transfer).
+const TRANSPORT_FAILURE =
+  /error sending request|error decoding response body|timed out|dns error|connection|valid release JSON/i;
+
 // Releases are quiet by default: no dialog, no notification, and (on macOS)
 // a silent background install that only asks for a restart. A release that
 // users must take promptly opts back into the old loud flow by carrying this
@@ -130,9 +137,7 @@ export async function runAppUpdateCheck({
       // answering with something other than latest.json (RUST-GW: two hosts
       // on two OSes in the same minute), not a defect; keep both visible but
       // below Error.
-      const transport = /error sending request|timed out|dns error|connection|valid release JSON/i.test(
-        describeInvokeError(error, "")
-      );
+      const transport = TRANSPORT_FAILURE.test(describeInvokeError(error, ""));
       Sentry.captureException(error, {
         level: transport ? "warning" : "error",
         tags: { flow: "app_update_check" },
@@ -294,9 +299,20 @@ export async function runAppUpdateInstall({
       statusCopy: `Headroom ${availableUpdate.version} is installed and ready to restart.`,
     };
   } catch (error) {
-    Sentry.captureException(error, { tags: { flow: "app_update_install" } });
+    // The download runs inside `install`, so a dropped connection surfaces here
+    // as raw reqwest text ("error decoding response body", RUST-HS) at Error
+    // level. Same class the check flow already keeps below Error, and the same
+    // recovery: the failed install consumed the staged handle, so the retry is
+    // a fresh check plus install - which the branch above now does for them.
+    const transport = TRANSPORT_FAILURE.test(describeInvokeError(error, ""));
+    Sentry.captureException(error, {
+      level: transport ? "warning" : "error",
+      tags: { flow: "app_update_install" },
+    });
     return {
-      statusCopy: describeInvokeError(error, "Could not install the update."),
+      statusCopy: transport
+        ? "Could not download the update: the connection dropped. Try again."
+        : describeInvokeError(error, "Could not install the update."),
     };
   } finally {
     unlisten?.();

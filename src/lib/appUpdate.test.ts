@@ -380,6 +380,16 @@ describe("app update helpers", () => {
     });
   });
 
+  it("replaces a dropped-download error with copy the user can act on", async () => {
+    const invokeFn = vi.fn().mockRejectedValueOnce("error decoding response body");
+
+    const result = await runAppUpdateInstall({ availableUpdate, invokeFn });
+
+    expect(result).toEqual({
+      statusCopy: "Could not download the update: the connection dropped. Try again.",
+    });
+  });
+
   it("re-checks and retries once when the staged update was already consumed", async () => {
     const invokeFn = vi
       .fn()
