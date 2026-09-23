@@ -454,8 +454,61 @@ pub fn detect_quarantine_starvation(metrics_body: &str) -> Option<QuarantineStar
     })
 }
 
+/// The slowest single compressor call this process has made, across the
+/// `compressor:*` families in the scrape we already hold.
+///
+/// This is the number the executor counters cannot give: kompress inference is
+/// hard-limited to ONE slot process-wide, and that wait happens INSIDE the
+/// executor worker, so `run_seconds_max` counts queueing for the slot and the
+/// inference itself as one lump while `queue_wait_seconds_max` stays at zero.
+/// A `run_seconds_max` far above this value means workers sat behind the slot;
+/// close to it means one inference really is that slow.
+fn slowest_compressor_ms(metrics_body: &str) -> Option<f64> {
+    metrics_body
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let sample =
+                line.strip_prefix("headroom_transform_timing_ms_max{transform=\"compressor:")?;
+            sample.rsplit(' ').next()?.trim().parse::<f64>().ok()
+        })
+        .max_by(f64::total_cmp)
+}
+
+/// The compression executor's own counters, read off `/health`
+/// (`runtime.compression_executor`). `/metrics` exports the quarantine
+/// counters and nothing else, which is why RUST-HD stood for two days with
+/// two unfalsifiable causes. These are what separate them: a worker that
+/// overran because it waited behind others shows up in
+/// `queue_wait_seconds_max`, one that overran on its own inference in
+/// `run_seconds_max`, and `max_workers` says how much of the pool the global
+/// quarantine was idling while it refused every request.
+fn executor_extras(health_body: &str) -> Vec<(&'static str, String)> {
+    const KEYS: [&str; 8] = [
+        "max_workers",
+        "queued_max",
+        "queue_timeouts_total",
+        "queue_wait_seconds_max",
+        "run_seconds_max",
+        "run_seconds_total",
+        "leaked_threads_total",
+        "timed_out_workers_max",
+    ];
+    let Ok(health) = serde_json::from_str::<serde_json::Value>(health_body) else {
+        return Vec::new();
+    };
+    let Some(executor) = health.pointer("/runtime/compression_executor") else {
+        return Vec::new();
+    };
+    KEYS.iter()
+        .filter_map(|key| Some((*key, executor.get(key)?.to_string())))
+        .collect()
+}
+
 /// Report quarantine starvation to Sentry, at most once per process.
-pub fn observe_quarantine(metrics_body: &str) {
+/// `health_body` is the `/health` payload when the caller could fetch one; the
+/// report still goes out without it, just without the executor counters.
+pub fn observe_quarantine(metrics_body: &str, health_body: Option<&str>) {
     let Some(starved) = detect_quarantine_starvation(metrics_body) else {
         return;
     };
@@ -466,9 +519,16 @@ pub fn observe_quarantine(metrics_body: &str) {
     // Requests lost per activation is the number that decides whether this is
     // worth fixing: it is the blast radius of ONE slow inference.
     let per_activation = starved.skipped as f64 / starved.activations.max(1) as f64;
+    let executor = health_body.map(executor_extras).unwrap_or_default();
     let fingerprint: [&str; 1] = ["compression_quarantine_canary"];
     sentry::with_scope(
         |scope| {
+            for (key, value) in &executor {
+                scope.set_extra(&format!("executor_{key}"), value.as_str().into());
+            }
+            if let Some(slowest) = slowest_compressor_ms(metrics_body) {
+                scope.set_extra("slowest_compressor_ms", format!("{slowest:.0}").into());
+            }
             scope.set_tag("flow", "compression_quarantine_canary");
             scope.set_extra("activations", starved.activations.into());
             scope.set_extra("skipped", starved.skipped.into());
@@ -816,5 +876,64 @@ mod tests {
         assert!(!QUARANTINE_REPORTED.swap(true, Ordering::AcqRel));
         assert!(QUARANTINE_REPORTED.swap(true, Ordering::AcqRel));
         QUARANTINE_REPORTED.store(false, Ordering::Release);
+    }
+
+    /// The shape is the live one: captured from `/health` on 2026-09-22, where
+    /// a 26.1s worker against a 5s Codex-WS awaiter had opened the quarantine
+    /// with seven of eight workers idle.
+    #[test]
+    fn executor_extras_read_the_counters_that_separate_the_two_overruns() {
+        let health = r#"{"runtime":{"compression_executor":{
+            "max_workers":8,"queued":0,"queued_max":1,"queue_timeouts_total":0,
+            "queue_wait_seconds_total":0.41,"queue_wait_seconds_max":0.229,
+            "run_seconds_total":101.1,"run_seconds_max":26.1,
+            "leaked_threads_total":1,"timed_out_workers_max":1,"source":"auto"}}}"#;
+
+        let extras: Vec<(&str, String)> = executor_extras(health);
+
+        assert_eq!(
+            extras,
+            vec![
+                ("max_workers", "8".to_string()),
+                ("queued_max", "1".to_string()),
+                ("queue_timeouts_total", "0".to_string()),
+                ("queue_wait_seconds_max", "0.229".to_string()),
+                ("run_seconds_max", "26.1".to_string()),
+                ("run_seconds_total", "101.1".to_string()),
+                ("leaked_threads_total", "1".to_string()),
+                ("timed_out_workers_max", "1".to_string()),
+            ]
+        );
+    }
+
+    /// Live shape from `/metrics` on 2026-09-22: the slowest call was 7.1s of
+    /// `code_aware` while the executor reported a 26.1s worker, which is the
+    /// signature of waiting for the one process-wide kompress slot rather than
+    /// of a single slow inference.
+    #[test]
+    fn slowest_compressor_ms_takes_the_max_across_the_compressor_families() {
+        let body = concat!(
+            "# HELP headroom_transform_timing_ms_max whatever\n",
+            "headroom_transform_timing_ms_max{transform=\"compressor:text\"} 1115.74\n",
+            "headroom_transform_timing_ms_max{transform=\"compressor:code_aware\"} 7137.48\n",
+            "headroom_transform_timing_ms_max{transform=\"compressor:diff\"} 24.77\n",
+            // Not a compressor family, and far larger: must not be picked up.
+            "headroom_transform_timing_ms_max{transform=\"tool_crusher\"} 99999\n",
+        );
+
+        assert_eq!(slowest_compressor_ms(body), Some(7137.48));
+        assert_eq!(slowest_compressor_ms("headroom_requests_total 12\n"), None);
+    }
+
+    /// An unreachable or reshaped `/health` must cost the report nothing: the
+    /// canary's own five extras are the part that must always ship.
+    #[test]
+    fn executor_extras_are_empty_when_health_cannot_answer() {
+        assert!(executor_extras("not json").is_empty());
+        assert!(executor_extras(r#"{"runtime":{}}"#).is_empty());
+        assert_eq!(
+            executor_extras(r#"{"runtime":{"compression_executor":{"max_workers":4}}}"#),
+            vec![("max_workers", "4".to_string())]
+        );
     }
 }

@@ -1,9 +1,17 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
+import pkg from "./package.json";
+
 export default defineConfig({
   plugins: [react()],
   clearScreen: false,
+  // Frontend Sentry events carried no release at all, so every JS issue was
+  // untriageable by version AND unable to regress: RUST-GM sat "resolved"
+  // while firing 15 times a day. Same string the Rust SDK reports
+  // (`sentry::release_name!()` = crate name @ version), and bump-version.sh
+  // keeps package.json in step with Cargo.toml.
+  define: { __APP_VERSION__: JSON.stringify(pkg.version) },
   test: {
     environment: "jsdom",
     setupFiles: ["src/test/setup.ts"],

@@ -6,7 +6,14 @@
 # Resolution lineage: 0.25.0 freeze -> carried to 0.26.0/0.27.0 -> regenerated
 # for 0.28.0 (base of the current pin set) -> carried through 0.29.0-0.31.0
 # point-version churn -> 0.32.0 -> carried unchanged to 0.33.0 -> 0.34.0
-# CVE top-up -> 0.35.0 CVE top-up.
+# CVE top-up -> 0.35.0 CVE top-up -> carried to 0.37.0 -> 0.38.0 CVE top-up.
+#   - 0.38.0: one transitive pin topped up to match upstream's #3662 CVE
+#     clearance: anyio 4.14.1 -> 4.14.2 (CVE-2026-63374, CVE-2026-64847),
+#     pure-Python, wheel swap only. requires_dist raised the litellm floor to
+#     1.96.2 for Python 3.14 wheel availability only (the API headroom uses
+#     is unchanged and the venv is cp312), so litellm stays at 1.90.1: 1.96.2
+#     would add pydantic-settings to every lock for nothing this runtime
+#     runs. No package is added to or removed from the installed set.
 #   - 0.35.0: requires_dist only moves the ruff dev pin (dev extra not
 #     installed), so no resolution change. One transitive pin topped up to
 #     match upstream's #2839 CVE clearance: h2 4.3.0 -> 4.4.1
@@ -75,7 +82,7 @@ aiosignal==1.4.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anthropic==0.113.0
-anyio==4.14.1
+anyio==4.14.2
 ast-grep-cli==0.44.0
 attrs==26.1.0
 babel==2.18.0

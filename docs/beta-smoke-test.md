@@ -104,7 +104,7 @@ Expect: at least one `claude-*` entry whose count increased, `total_tokens_befor
 
 The cache side of the trade is read per request from the proxy log, not from `/stats`. Do not gate on `.summary.cost.breakdown.cache_savings_usd`: it is `prefix_cache_stats.totals.net_savings_usd` (`cost.py`), provider read savings MINUS the cache-write premium over the cost window, so it moves both ways by design (0.31 -> 2.87 -> 0.90 -> 12.93 inside ten minutes with no restart, 0.9.11-rc.5 pass) and reads as a FAIL on a healthy build. The PERF line of the request that carried the Read settles it:
 ```bash
-grep 'PERF model=claude-' ~/.headroom/logs/proxy.log | tail -12 \
+grep 'PERF model=claude-' "$(ls -t ~/.headroom/logs/proxy*.log | grep -v proxy-stdio | head -1)" | tail -12 \
   | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^(model|tok_before|tok_saved|cache_read|cache_write)=/) printf "%s ", $i; print substr($0, 1, 19) }'
 ```
 Expect: `cache_read` on the request carrying the Read in the same band as the previous request of that session (the frozen prefix was replayed, not busted); a bust reads as `cache_read` collapsing towards the system-prompt size with a `cache_write` the size of the whole prompt. `cache_hit_pct` on that line is read/(read+write) and ignores the uncached tail, so it is not a hit rate. The script prints the same figures on its `7 cache side` row (per-request cache_read/cache_write, tok_saved/tok_before), which is the minimum both-sides evidence the compression rules in CLAUDE.md ask for.
@@ -191,11 +191,12 @@ Checks 2 and 7 confirm the proxy *reports* savings. They cannot tell you the opt
 
 The proxy log settles it on a single line. `source=` is the bytes actually forwarded and `mutation_reasons=` is what the pipeline changed, so `body_mutated=true ... source=passthrough` is a literal contradiction: work was done and the original bytes went out anyway.
 
-Every count in checks 11 and 13 has to be scoped to the current backend boot. `proxy.log` persists across backend restarts, so a whole-file grep keeps reporting pre-fix history forever (observed on the 0.9.4-rc.1 pass: 148 `output_shaper` discards from the same morning's 0.35.0 run, 0 since the rc boot). Define the filter once and pipe every count through it - the `on` state carries across untimestamped continuation lines, so a traceback under a matching line is not silently dropped:
+Every count in checks 11 and 13 has to be scoped to the current backend boot, and read from the log the wheel actually writes: since 0.38.0 that is `proxy-<port>.log`, and the old `proxy.log` sits beside it untouched, so a count against the fixed name reads `0` on any wheel and passes vacuously (caught on the 0.9.20-rc.3 pass). The log persists across backend restarts, so a whole-file grep keeps reporting pre-fix history forever (observed on the 0.9.4-rc.1 pass: 148 `output_shaper` discards from the same morning's 0.35.0 run, 0 since the rc boot). Define the filter once and pipe every count through it - the `on` state carries across untimestamped continuation lines, so a traceback under a matching line is not silently dropped:
 ```bash
 BOOT=$(date -j -f "%a %b %e %T %Y" \
   "$(ps -o lstart= -p "$(lsof -ti TCP:6768 -sTCP:LISTEN | head -1)")" +"%Y-%m-%d %H:%M:%S")
-since_boot() { awk -v B="$BOOT" '/^[0-9-]{10} /{on=(substr($0,1,19)>=B)} on' ~/.headroom/logs/proxy.log; }
+PROXY_LOG=$(ls -t ~/.headroom/logs/proxy*.log | grep -v proxy-stdio | head -1)   # 0.38.0 writes proxy-<port>.log; proxy.log is a stale 0.37.0 leftover
+since_boot() { awk -v B="$BOOT" '/^[0-9-]{10} /{on=(substr($0,1,19)>=B)} on' "$PROXY_LOG"; }
 ```
 Use the live backend port from check 9 if it fell back off `6768`.
 

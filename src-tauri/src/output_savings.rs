@@ -57,17 +57,46 @@ const ESTIMATED_MIN_COVERAGE_PCT: f64 = 20.0;
 /// averaging 40 tokens each booked ~809 "saved" against it).
 const MIN_BASELINE_N: u64 = 10;
 
+/// Distinct conversations each arm of a stratum needs before its A/B
+/// difference counts, mirroring the backend (#3460). A stratum's requests
+/// come from one conversation at a time, so five requests from one
+/// conversation are one observation, not five.
+const MEASURED_MIN_CLUSTERS: usize = 5;
+
 /// Running count / sum / sum-of-squares, mirroring the backend's `_Accum` so
 /// mean and variance come out bit-comparable.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct Accum {
     n: u64,
     sum: f64,
     sumsq: f64,
+    /// Conversation-qualified observations only (upstream #3460, wheel
+    /// 0.38.0): legacy rows carry no conversation, so they never enter the
+    /// measured mean and cannot clear [`MEASURED_MIN_CLUSTERS`].
+    qn: u64,
+    qsum: f64,
+    qsumsq: f64,
+    clusters: Vec<String>,
 }
 
 impl Accum {
+    fn qmean(&self) -> f64 {
+        if self.qn == 0 {
+            0.0
+        } else {
+            self.qsum / self.qn as f64
+        }
+    }
+
+    fn qvar(&self) -> f64 {
+        if self.qn < 2 {
+            return 0.0;
+        }
+        let n = self.qn as f64;
+        ((self.qsumsq - self.qsum * self.qsum / n) / (n - 1.0)).max(0.0)
+    }
+
     fn mean(&self) -> f64 {
         if self.n == 0 {
             0.0
@@ -318,14 +347,17 @@ fn estimate_from_holdout(ledger: &Ledger) -> Option<OutputEstimate> {
         let Some(c) = ledger.control.get(key) else {
             continue;
         };
-        if t.n == 0 || c.n == 0 {
+        if t.qn == 0 || c.qn == 0 {
             continue;
         }
-        let n = t.n as f64;
-        requests += t.n;
-        saved += n * (c.mean() - t.mean());
-        baseline_tokens += n * c.mean();
-        var += (n * n) * (c.var() / c.n as f64 + t.var() / t.n as f64);
+        if t.clusters.len() < MEASURED_MIN_CLUSTERS || c.clusters.len() < MEASURED_MIN_CLUSTERS {
+            continue;
+        }
+        let n = t.qn as f64;
+        requests += t.qn;
+        saved += n * (c.qmean() - t.qmean());
+        baseline_tokens += n * c.qmean();
+        var += (n * n) * (c.qvar() / c.qn as f64 + t.qvar() / t.qn as f64);
     }
 
     finalize(
@@ -433,8 +465,12 @@ mod tests {
         "strata": {"opus|ask|l|tools": {"n": 100, "sum": 95000, "sumsq": 90490000}},
         "glob":   {"n": 100, "sum": 95000, "sumsq": 90490000}
       },
-      "treatment": {"opus|ask|l|tools": {"n": 1000, "sum": 800000, "sumsq": 649990000}},
-      "control":   {"opus|ask|l|tools": {"n": 100,  "sum": 100000, "sumsq": 100990000}}
+      "treatment": {"opus|ask|l|tools": {"n": 1000, "sum": 800000, "sumsq": 649990000,
+                                         "qn": 1000, "qsum": 800000, "qsumsq": 649990000,
+                                         "clusters": ["c1", "c2", "c3", "c4", "c5"]}},
+      "control":   {"opus|ask|l|tools": {"n": 100,  "sum": 100000, "sumsq": 100990000,
+                                         "qn": 100,  "qsum": 100000, "qsumsq": 100990000,
+                                         "clusters": ["c1", "c2", "c3", "c4", "c5"]}}
     }"#;
 
     /// `MIXED` with a control arm swapped in.
@@ -526,7 +562,9 @@ mod tests {
         // Three-sample-control territory: the point estimate looks fine (20%)
         // but the band spans -257%..297%, so the synthetic control stands.
         let e = estimate(&with_control(
-            r#""control": {"opus|ask|l|tools": {"n": 2, "sum": 2000, "sumsq": 6000000}}"#,
+            r#""control": {"opus|ask|l|tools": {"n": 2, "sum": 2000, "sumsq": 6000000,
+                                               "qn": 2, "qsum": 2000, "qsumsq": 6000000,
+                                               "clusters": ["c1", "c2", "c3", "c4", "c5"]}}"#,
         ));
         assert_eq!(e.method, "estimated");
         assert!((e.reduction_percent - 15.789_474).abs() < 1e-5);
@@ -537,9 +575,9 @@ mod tests {
         // Same tight holdout, but a second stratum carries 4/5 of the shaped
         // requests and has no control samples at all.
         let json = HOLDOUT.replace(
-            r#""treatment": {"opus|ask|l|tools": {"n": 1000, "sum": 800000, "sumsq": 649990000}}"#,
-            r#""treatment": {"opus|ask|l|tools": {"n": 1000, "sum": 800000, "sumsq": 649990000},
-                             "opus|ask|xl|tools": {"n": 4000, "sum": 4000000, "sumsq": 4009990000}}"#,
+            r#""treatment": {"opus|ask|l|tools": {"n": 1000, "sum": 800000, "sumsq": 649990000,"#,
+            r#""treatment": {"opus|ask|xl|tools": {"n": 4000, "sum": 4000000, "sumsq": 4009990000},
+                             "opus|ask|l|tools": {"n": 1000, "sum": 800000, "sumsq": 649990000,"#,
         ).replace(
             r#""strata": {"opus|ask|l|tools": {"n": 100, "sum": 95000, "sumsq": 90490000}}"#,
             r#""strata": {"opus|ask|l|tools": {"n": 100, "sum": 95000, "sumsq": 90490000},
@@ -629,6 +667,25 @@ mod tests {
         assert_eq!(e.tokens_saved, 0);
     }
 
+    /// Upstream #3460 (wheel 0.38.0): an arm written before conversations
+    /// were tracked, or one whose requests all came from a few conversations,
+    /// is not evidence -- five requests from one session are one observation.
+    /// The estimate must stay "estimated" so the holdout boost keeps feeding
+    /// control traffic until both arms really are conversation-diverse.
+    #[test]
+    fn a_holdout_short_on_conversations_never_takes_over() {
+        let legacy = estimate(&with_control(
+            r#""control": {"opus|ask|l|tools": {"n": 100, "sum": 100000, "sumsq": 100990000}}"#,
+        ));
+        assert_eq!(legacy.method, "estimated");
+        let few = estimate(&with_control(
+            r#""control": {"opus|ask|l|tools": {"n": 100, "sum": 100000, "sumsq": 100990000,
+                                               "qn": 100, "qsum": 100000, "qsumsq": 100990000,
+                                               "clusters": ["c1", "c2", "c3", "c4"]}}"#,
+        ));
+        assert_eq!(few.method, "estimated");
+    }
+
     #[test]
     fn a_solid_holdout_measuring_no_reduction_still_takes_over() {
         // Control replies come out SHORTER than treatment: the true effect is
@@ -637,7 +694,9 @@ mod tests {
         // old [0,100] validity check discarded it, so a shaper that saved
         // nothing kept its estimated percentage forever.
         let e = estimate(&with_control(
-            r#""control": {"opus|ask|l|tools": {"n": 100, "sum": 70000, "sumsq": 49010000}}"#,
+            r#""control": {"opus|ask|l|tools": {"n": 100, "sum": 70000, "sumsq": 49010000,
+                                               "qn": 100, "qsum": 70000, "qsumsq": 49010000,
+                                               "clusters": ["c1", "c2", "c3", "c4", "c5"]}}"#,
         ));
         assert_eq!(e.method, "measured");
         assert_eq!(e.reduction_percent, 0.0);

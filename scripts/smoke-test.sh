@@ -22,7 +22,12 @@ APP="/Applications/Headroom.app"
 SUP="$HOME/Library/Application Support/Headroom"
 CFG="$SUP/config"
 HR="$SUP/headroom"
-PROXY_LOG="$HOME/.headroom/logs/proxy.log"
+# Wheel 0.38.0 (#3204) writes proxy-<port>.log and stops touching proxy.log, so
+# an upgraded machine keeps a stale proxy.log forever; every boot-scoped count
+# below would then read 0 against a file the backend no longer writes and pass
+# vacuously (0.9.20-rc.3 pass). Pick the newest proxy*.log the logger writes.
+PROXY_LOG=$(ls -t "$HOME"/.headroom/logs/proxy*.log 2>/dev/null | grep -v '/proxy-stdio' | head -1)
+PROXY_LOG=${PROXY_LOG:-"$HOME/.headroom/logs/proxy.log"}
 BASELINE="${TMPDIR:-/tmp}/hr-smoke-baseline.json"
 SHOTS="${TMPDIR:-/tmp}/hr-smoke-shots"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
