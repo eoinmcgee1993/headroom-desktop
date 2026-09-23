@@ -5911,10 +5911,13 @@ fn claude_remote_control_command_path() -> PathBuf {
 /// keyed by tty so two terminals never swap sessions, and ignored once stale so
 /// a terminal without the function (opened before setup) cannot leave a marker
 /// that hijacks some later exit.
+///
+/// The function is defined through `eval`, and only when `claude` is not an
+/// alias: zsh and bash alias-expand a function name at parse time, so a bare
+/// `claude() {` below a user's `alias claude=...` (Claude Code's own local
+/// installer writes one) is a parse error that aborts the rest of the rc file.
 fn claude_code_shell_block() -> String {
-    let block = r#"export ANTHROPIC_BASE_URL=__BASE__
-# /remote-control needs api.anthropic.com; this relaunches the same session without Headroom.
-claude() {
+    let function = r#"claude() {
   case " $* " in *" --remote-control "*) set -- --settings '__OVERRIDE__' "$@";; esac
   command claude "$@"
   local rc=$?
@@ -5925,10 +5928,14 @@ claude() {
     return $?
   fi
   return $rc
-}"#;
-    block
-        .replace("__BASE__", HEADROOM_ANTHROPIC_BASE_URL)
-        .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE)
+}"#
+    .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE);
+    format!(
+        "export ANTHROPIC_BASE_URL={HEADROOM_ANTHROPIC_BASE_URL}\n\
+         # /remote-control needs api.anthropic.com; this relaunches the same session without Headroom.\n\
+         if ! alias claude >/dev/null 2>&1; then eval '{}'; fi",
+        function.replace('\'', r"'\''")
+    )
 }
 
 /// POSIX sh script run by the /remote-control command (via the model's Bash
@@ -5956,6 +5963,8 @@ if [ -z "${CLAUDE_CODE_SESSION_ID:-}" ] || [ -z "${CLAUDE_PID:-}" ]; then
 fi
 fallback="claude -r $CLAUDE_CODE_SESSION_ID --remote-control"
 tty_name=${HEADROOM_REMOTE_CONTROL_TTY:-$(ps -o tty= -p "$CLAUDE_PID" 2>/dev/null | tr -d ' ')}
+# Linux ps says "pts/3" where the shell function's `basename $(tty)` says "3".
+tty_name=${tty_name##*/}
 case "$tty_name" in ""|"??"|"-"|"?") 
   echo "Remote Control needs a terminal session; this one has no terminal to relaunch into."
   echo "Open a terminal and run: $fallback"
@@ -6107,7 +6116,12 @@ fn is_our_statusline(value: &Value) -> bool {
 /// changed.
 fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
     let settings_path = claude_settings_path();
-    let raw = std::fs::read_to_string(&settings_path).unwrap_or_default();
+    // Only a missing file reads as empty: an unreadable one (permissions,
+    // non-UTF-8) would otherwise be replaced by a file holding just statusLine.
+    let raw = match std::fs::read_to_string(&settings_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        other => other.with_context(|| format!("reading {}", settings_path.display()))?,
+    };
     let mut root = if raw.trim().is_empty() {
         if command.is_none() {
             return Ok(false);
@@ -12406,13 +12420,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(!marker_dir.exists());
         assert!(child.try_wait().unwrap().is_none(), "sleep must survive");
 
-        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "ttys999");
+        // Linux ps spelling; the marker must land under the name the shell
+        // function's `basename $(tty)` looks for ("999"), not "pts/999".
+        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "pts/999");
         assert!(
             out.contains("Restarting this session with Remote Control"),
             "{out}"
         );
         assert_eq!(
-            std::fs::read_to_string(marker_dir.join("ttys999")).unwrap(),
+            std::fs::read_to_string(marker_dir.join("999")).unwrap(),
             "sid-123\n"
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
@@ -12488,6 +12504,31 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             format!("--settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} -r sid-123 --remote-control\n")
+        );
+
+        // A user's `alias claude=...` above the block (interactive shells
+        // expand aliases) must not turn the block into a parse error that
+        // aborts the rest of their rc file; the alias keeps winning.
+        let out = crate::proc::command("bash")
+            .arg("-c")
+            .arg(format!(
+                "shopt -s expand_aliases\nalias claude='claude --aliased'\n. '{}'\necho rc-tail-ran; type -t claude",
+                block.display()
+            ))
+            .env("HOME", home.path())
+            .env("PATH", &path)
+            .output()
+            .expect("run bash");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "rc-tail-ran\nalias\n",
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
