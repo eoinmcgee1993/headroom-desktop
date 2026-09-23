@@ -5952,6 +5952,22 @@ fn build_claude_remote_control_script() -> String {
 # leaves a marker and asks the session to exit; the `claude` shell function
 # Headroom manages then resumes the SAME session by id with the base URL
 # overridden for that one process.
+# Two phases. Without arguments (run by the model's Bash tool after the user
+# confirms): record the pending exit. With --stop (Claude Code's Stop hook,
+# fired once the model's turn has ended): perform it. Killing only after the
+# turn ends keeps the transcript clean, so the resumed session shows no
+# "interrupted" turn in the terminal or on the phone.
+if [ "${1:-}" = "--stop" ]; then
+  sid=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  exit_file="$HOME/.headroom/remote-control/exit-$sid"
+  [ -n "$sid" ] && [ -f "$exit_file" ] || exit 0
+  pid=$(cat "$exit_file"); rm -f "$exit_file"
+  # Never signal a pid without checking it is still the Claude Code process.
+  case "$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)")" in
+    claude|claude.exe) kill -TERM "$pid";;
+  esac
+  exit 0
+fi
 case "${ANTHROPIC_BASE_URL:-}" in
   ""|https://api.anthropic.com*)
     echo "Remote Control is already available in this session: type /rc."
@@ -5972,9 +5988,13 @@ case "$tty_name" in ""|"??"|"-"|"?")
 esac
 dir="$HOME/.headroom/remote-control"
 mkdir -p "$dir" && printf '%s\n' "$CLAUDE_CODE_SESSION_ID" > "$dir/$tty_name"
+exit_file="$dir/exit-$CLAUDE_CODE_SESSION_ID"
+printf '%s\n' "$CLAUDE_PID" > "$exit_file"
 echo "Restarting this session with Remote Control. Headroom is off for the restarted session."
 echo "If it does not come back by itself, run: $fallback"
-nohup sh -c "sleep 1; kill -TERM $CLAUDE_PID" >/dev/null 2>&1 &
+# Safety net if the Stop hook never fires (unregistered, or the turn hangs):
+# the pending exit is still honoured, at the cost of an interrupted turn.
+nohup sh -c "sleep 15; [ -f '$exit_file' ] && rm -f '$exit_file' && kill -TERM $CLAUDE_PID" >/dev/null 2>&1 &
 "#
     .to_string()
 }
@@ -6036,13 +6056,34 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
             }
         }
     }
+    // The Stop hook performs the exit the script recorded, once the turn ends.
+    let (mut hook_changed, mut hook_backups) = register_guard_hook_entries(
+        &claude_settings_path(),
+        &claude_remote_control_stop_command(),
+        "Headroom: checking for a pending Remote Control restart",
+        &[("Stop", None)],
+    )?;
+    changed.append(&mut hook_changed);
+    backups.append(&mut hook_backups);
     Ok((changed, backups))
+}
+
+fn claude_remote_control_stop_command() -> String {
+    format!(
+        "{} --stop",
+        shell_double_quote(&claude_remote_control_script_path().to_string_lossy())
+    )
 }
 
 /// Remove the script, and the command file only when it is ours: a user's own
 /// ~/.claude/commands/remote-control.md is never touched.
 fn remove_claude_remote_control_command() -> Result<()> {
     let script = claude_remote_control_script_path();
+    // Match on the script path so any earlier command form is stripped too.
+    let fragment = script.display().to_string();
+    for settings_path in claude_settings_candidates() {
+        let _ = remove_guard_hook_entries(&settings_path, &fragment, false, Some(&["Stop"]));
+    }
     if script.exists() {
         std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
     }
@@ -8005,9 +8046,10 @@ mod tests {
     #[cfg(unix)]
     use super::{
         claude_code_shell_block, claude_remote_control_command_path,
-        claude_remote_control_script_path, ensure_claude_remote_control_command,
-        remove_claude_remote_control_command, CLAUDE_REMOTE_CONTROL_COMMAND_MARKER,
-        CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE, HEADROOM_ANTHROPIC_BASE_URL,
+        claude_remote_control_script_path, claude_remote_control_stop_command,
+        ensure_claude_remote_control_command, remove_claude_remote_control_command,
+        CLAUDE_REMOTE_CONTROL_COMMAND_MARKER, CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE,
+        HEADROOM_ANTHROPIC_BASE_URL,
     };
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
@@ -12402,7 +12444,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn remote_control_command_installs_and_removes_only_its_own_file() {
         let home = TestHome::new();
         let (changed, _) = ensure_claude_remote_control_command().expect("install");
-        assert_eq!(changed.len(), 2, "script + command written: {changed:?}");
+        assert_eq!(
+            changed.len(),
+            3,
+            "script + command + Stop hook written: {changed:?}"
+        );
         let command = std::fs::read_to_string(claude_remote_control_command_path()).unwrap();
         let script_path = claude_remote_control_script_path();
         assert!(command.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER));
@@ -12421,7 +12467,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         ));
         let script = std::fs::read_to_string(&script_path).unwrap();
         assert!(script.starts_with("#!/bin/sh\n"));
-        assert!(script.contains("kill -TERM $CLAUDE_PID"));
+        assert!(script.contains("--stop"));
+        let settings = std::fs::read_to_string(claude_settings_path()).unwrap();
+        assert!(
+            settings.contains(&claude_remote_control_stop_command()),
+            "{settings}"
+        );
+        assert!(settings.contains("\"Stop\""), "{settings}");
         let (changed, _) = ensure_claude_remote_control_command().expect("reinstall");
         assert!(changed.is_empty(), "idempotent: {changed:?}");
 
@@ -12429,6 +12481,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         std::fs::write(claude_remote_control_command_path(), "my own command\n").unwrap();
         remove_claude_remote_control_command().expect("remove");
         assert!(!script_path.exists());
+        let settings = std::fs::read_to_string(claude_settings_path()).unwrap();
+        assert!(!settings.contains("headroom-remote-control"), "{settings}");
         assert_eq!(
             std::fs::read_to_string(claude_remote_control_command_path()).unwrap(),
             "my own command\n"
@@ -12445,14 +12499,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[cfg(unix)]
     #[test]
-    fn remote_control_script_marks_the_tty_and_terminates_only_a_terminal_session() {
+    fn remote_control_script_records_the_exit_and_the_stop_hook_performs_it() {
+        use std::os::unix::process::ExitStatusExt;
         let home = TestHome::new();
         ensure_claude_remote_control_command().expect("install");
         let script = claude_remote_control_script_path();
-        let mut child = crate::proc::command("sleep")
+        // A real process whose executable name is `claude`, since the stop
+        // phase refuses to signal anything else.
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // A symlink, not a copy: a copied platform binary wedges on macOS
+        // (unkillable "UE" state) and hangs the test harness on its stdout pipe.
+        std::os::unix::fs::symlink("/bin/sleep", bin.join("claude")).unwrap();
+        let mut child = crate::proc::command(bin.join("claude"))
             .arg("30")
             .spawn()
-            .expect("spawn sleep");
+            .expect("spawn fake claude");
         let pid = child.id().to_string();
         let run = |base_url: &str, tty: &str| -> String {
             let out = crate::proc::command("sh")
@@ -12466,30 +12528,67 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .expect("run script");
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
+        let stop = |session_id: &str| {
+            use std::io::Write;
+            let mut proc = crate::proc::command("sh")
+                .arg(&script)
+                .arg("--stop")
+                .env("HOME", home.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("run stop hook");
+            proc.stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    format!(r#"{{"session_id": "{session_id}", "hook_event_name": "Stop", "stop_hook_active": false}}"#)
+                        .as_bytes(),
+                )
+                .unwrap();
+            assert!(proc.wait().unwrap().success());
+        };
         let marker_dir = home.path().join(".headroom/remote-control");
+        let exit_file = marker_dir.join("exit-sid-123");
 
         let out = run("https://api.anthropic.com", "ttys999");
         assert!(out.contains("already available"), "{out}");
         assert!(!marker_dir.exists());
 
-        // No tty (empty override falls back to ps, and the sleep has none).
+        // No tty (empty override falls back to ps, and the fake claude has none).
         let out = run(HEADROOM_ANTHROPIC_BASE_URL, "");
         assert!(out.contains("needs a terminal session"), "{out}");
         assert!(out.contains("claude -r sid-123 --remote-control"), "{out}");
         assert!(!marker_dir.exists());
-        assert!(child.try_wait().unwrap().is_none(), "sleep must survive");
 
-        // Linux ps spelling; the marker must land under the name the shell
-        // function's `basename $(tty)` looks for ("999"), not "pts/999".
-        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "pts/999");
+        // Confirmed: records the tty marker and the pending exit, kills nothing yet.
+        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "ttys999");
         assert!(
             out.contains("Restarting this session with Remote Control"),
             "{out}"
         );
         assert_eq!(
-            std::fs::read_to_string(marker_dir.join("999")).unwrap(),
+            std::fs::read_to_string(marker_dir.join("ttys999")).unwrap(),
             "sid-123\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(&exit_file).unwrap(),
+            format!("{pid}\n")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "session must outlive the tool call"
+        );
+
+        // A Stop for some other session leaves it alone.
+        stop("sid-other");
+        assert!(exit_file.exists());
+        assert!(child.try_wait().unwrap().is_none());
+
+        // The Stop for this session performs the exit and consumes the record.
+        stop("sid-123");
+        assert!(!exit_file.exists());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let mut status = None;
         while std::time::Instant::now() < deadline {
@@ -12501,10 +12600,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         }
         let status = status.unwrap_or_else(|| {
             let _ = child.kill();
-            panic!("session was not terminated")
+            panic!("session was not terminated by the stop hook")
         });
-        use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGTERM));
+
+        // The stop phase never signals a pid that is not Claude Code any more.
+        let mut other = crate::proc::command("sleep").arg("30").spawn().unwrap();
+        std::fs::write(&exit_file, format!("{}\n", other.id())).unwrap();
+        stop("sid-123");
+        assert!(!exit_file.exists());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "foreign pid must survive"
+        );
+        let _ = other.kill();
     }
 
     #[cfg(unix)]
