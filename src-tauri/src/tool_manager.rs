@@ -1737,6 +1737,71 @@ if _hd_fm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         pass
 
 
+# Streaming metering headers (upstream PR owed):
+# The buffered path stamps x-headroom-tokens-before/-after/-saved on its
+# response; the streaming path forwards only the upstream rate-limit and
+# request-id headers, so a streaming client (every real Claude Code and Codex
+# turn) never learns what its request saved. The counts are _stream_response
+# arguments, known before the first byte, so stamp them on the response it
+# returns: Starlette's headers write through to raw_headers, which go out when
+# the response is sent, after this returns. The desktop intercept pairs
+# x-headroom-tokens-saved with x-claude-code-session-id to show per-conversation
+# savings in Claude Code's statusline (claude_statusline.rs).
+# Exact-pin gated to wheel 0.38.0. Kill switch: HEADROOM_STREAM_METERING_HEADERS=0.
+_hd_smh_flag = _hd_os.environ.get("HEADROOM_STREAM_METERING_HEADERS", "1")
+if _hd_smh_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_smh_meta
+
+        if _hd_smh_meta.version("headroom-ai") == "0.38.0":
+            from headroom.proxy.handlers import streaming as _hd_smh_streaming
+
+            _hd_smh_orig = _hd_smh_streaming.StreamingMixin._stream_response
+
+            # The wheel's leading parameters, spelled out. Not
+            # inspect.signature(_hd_smh_orig): two earlier vendors (#2942
+            # context guard, tool-ref hint) already wrap this method with *args
+            # signatures, so the chain hides the names. Safe to hard-code under
+            # the exact pin; binds positional and keyword calls alike.
+            def _hd_smh_counts(
+                self,
+                url,
+                headers,
+                body,
+                provider,
+                model,
+                request_id,
+                original_tokens,
+                optimized_tokens,
+                tokens_saved,
+                *rest,
+                **extra,
+            ):
+                return original_tokens, optimized_tokens, tokens_saved
+
+            async def _hd_smh_stream_response(self, *args, **kwargs):
+                response = await _hd_smh_orig(self, *args, **kwargs)
+                try:
+                    counts = _hd_smh_counts(self, *args, **kwargs)
+                    for header, value in zip(
+                        (
+                            "x-headroom-tokens-before",
+                            "x-headroom-tokens-after",
+                            "x-headroom-tokens-saved",
+                        ),
+                        counts,
+                    ):
+                        if header not in response.headers:
+                            response.headers[header] = str(int(value))
+                except Exception:
+                    pass
+                return response
+
+            _hd_smh_streaming.StreamingMixin._stream_response = _hd_smh_stream_response
+    except Exception:
+        pass
+
+
 # Rollup cache-read cost (upstream PR #3734; self-neutralizes once the
 # wheel's tracker grows `_empty_cache_delta`):
 # The /stats-history rollups carried no cache dimension, so the dashboard took
@@ -3046,6 +3111,7 @@ impl ToolManager {
                     update_available,
                     available_version: pending.filter(|version| !version.is_empty()),
                     unavailable_reason: addon_unavailable_reason(&manifest.id),
+                    managed_externally: self.plugin_managed_externally(&manifest.id),
                 }
             })
             .collect()
@@ -8161,10 +8227,25 @@ impl ToolManager {
         Ok(())
     }
 
+    /// Registered with a host but never installed by Headroom: the user ran
+    /// `/plugin install` themselves, so the card must not offer Install.
+    fn plugin_managed_externally(&self, tool_id: &str) -> bool {
+        plugin_addon(tool_id).is_some_and(|plugin| {
+            !self.plugin_receipt_exists(plugin)
+                && PluginHost::ALL
+                    .iter()
+                    .any(|host| host.plugin_present(plugin))
+        })
+    }
+
     fn detect_status(&self, tool_id: &str) -> ToolStatus {
         if let Some(plugin) = plugin_addon(tool_id) {
             let Some(receipt) = self.read_tool_receipt(plugin.id) else {
-                return ToolStatus::NotInstalled;
+                return if self.plugin_managed_externally(tool_id) {
+                    ToolStatus::Healthy
+                } else {
+                    ToolStatus::NotInstalled
+                };
             };
             // Intentionally disabled via the app: the plugin may be gone from
             // hosts that lack a disable verb (Codex), but the receipt means it's
@@ -13961,6 +14042,87 @@ print("OK fm")
     }
 
     #[test]
+    fn stream_metering_headers_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel: the
+        // wheel's own _stream_response runs over a stub inner stream, and the
+        // response that reaches the ASGI wire must carry the three metering
+        // headers next to the upstream ones it already forwarded. The kill
+        // switch must leave the wheel's method bound.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-smh-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        const PROBE: &str = r#"
+import asyncio, sys
+from headroom.proxy.handlers.streaming import StreamingMixin
+if StreamingMixin._stream_response.__name__ != "_hd_smh_stream_response":
+    print("SKIP smh not bound"); sys.exit(0)
+from fastapi.responses import StreamingResponse
+class Stub:
+    def _get_session_key(self, body):
+        return "k"
+    def _cleanup_mid_turn_stream(self, key):
+        pass
+    async def _stream_response_inner(self, **kw):
+        async def gen():
+            yield b"data: {}\n\n"
+        return StreamingResponse(gen(), media_type="text/event-stream", headers={"request-id": "r1"})
+async def main():
+    r = await StreamingMixin._stream_response(
+        Stub(), "u", {}, {}, "anthropic", "m", "rid", 1000, 400, 600, ["x"], {}, 0.0
+    )
+    sent = []
+    async def send(message):
+        sent.append(message)
+    async def receive():
+        await asyncio.Event().wait()
+    await r({"type": "http", "method": "POST", "path": "/v1/messages", "headers": []}, receive, send)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    headers = dict(start["headers"])
+    assert headers.get(b"x-headroom-tokens-saved") == b"600", headers
+    assert headers.get(b"x-headroom-tokens-before") == b"1000", headers
+    assert headers.get(b"x-headroom-tokens-after") == b"400", headers
+    assert headers.get(b"request-id") == b"r1", headers
+asyncio.run(main())
+print("OK smh")
+"#;
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .args(["-c", PROBE])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_STREAM_METERING_HEADERS", flag)
+                .output()
+                .expect("run stream metering probe")
+        };
+        let on = run("1");
+        let off = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let on_out = String::from_utf8_lossy(&on.stdout);
+        if on_out.contains("SKIP smh not bound") {
+            eprintln!("skipping: stream metering vendor did not bind (wheel not 0.38.0?)");
+            return;
+        }
+        assert!(
+            on.status.success() && on_out.contains("OK smh"),
+            "stream metering vendor misbehaved against the installed wheel.\nstdout:\n{on_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&on.stderr)
+        );
+        let off_out = String::from_utf8_lossy(&off.stdout);
+        assert!(
+            off.status.success() && off_out.contains("SKIP smh not bound"),
+            "kill switch left the vendor bound.\nstdout:\n{off_out}\nstderr:\n{}",
+            String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
     fn tool_search_history_repair_behaves_against_the_installed_wheel() {
         // The tool_reference 400 ("... not found in available tools") lived in
         // the WHEEL's history repair, not the string blob. This runs the shipped
@@ -18697,6 +18859,35 @@ after
                 br#"{"version":"latest","enabled":false}"#,
             )
             .expect("receipt");
+            assert!(matches!(
+                manager.detect_status(plugin.id),
+                crate::models::ToolStatus::Healthy
+            ));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_installed_outside_headroom_reports_installed_and_external() {
+        // The user installed the plugin with `/plugin install` themselves: no
+        // receipt, but Claude Code's registry lists it. The card must show it
+        // installed, not offer Install (which would adopt it into our uninstall).
+        let (root, _runtime, manager) = seed_test_runtime("plugin-external");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        for plugin in &PLUGIN_ADDONS {
+            assert!(!manager.plugin_managed_externally(plugin.id));
+            fs::write(
+                registry.join("installed_plugins.json"),
+                format!(
+                    r#"{{"plugins":{{"{}":[{{"scope":"user"}}]}}}}"#,
+                    plugin.plugin_ref
+                ),
+            )
+            .expect("registry");
+            assert!(manager.plugin_managed_externally(plugin.id));
             assert!(matches!(
                 manager.detect_status(plugin.id),
                 crate::models::ToolStatus::Healthy

@@ -80,6 +80,7 @@ import {
 import { SetupStallModal } from "./components/SetupStallModal";
 import { ReconnectModal } from "./components/ReconnectModal";
 import { UpstreamPanel } from "./components/UpstreamPanel";
+import { ClaudeStatuslinePanel } from "./components/ClaudeStatuslinePanel";
 import {
   authCodeSentMessage,
   buildInstallFailureMailto,
@@ -1399,6 +1400,7 @@ function AddonCard({
   onUpdate,
   availableVersion,
   unavailableReason,
+  managedExternally,
   children
 }: {
   name: string;
@@ -1427,6 +1429,8 @@ function AddonCard({
   availableVersion?: string | null;
   /** Platform has no installable build: gray the card, drop the actions. */
   unavailableReason?: string | null;
+  /** Installed by the user outside Headroom: show it, but own none of it. */
+  managedExternally?: boolean;
   children?: ReactNode;
 }) {
   return (
@@ -1468,6 +1472,11 @@ function AddonCard({
         </button>
         {unavailableReason ? (
           <p className="addon-card__notice">{unavailableReason}</p>
+        ) : managedExternally ? (
+          <p className="addon-card__notice">
+            You installed this yourself, so Headroom leaves it alone. Manage it with
+            /plugin in your agent.
+          </p>
         ) : null}
         {busy && busyLabel ? (
           <p className="addon-card__progress">{busyLabel}</p>
@@ -1491,7 +1500,7 @@ function AddonCard({
           <button type="button" className="addon-card__action" disabled>
             Unavailable
           </button>
-        ) : !installed ? (
+        ) : managedExternally ? null : !installed ? (
           <button
             type="button"
             className="addon-card__action addon-card__action--primary"
@@ -7549,6 +7558,7 @@ export default function App() {
                       updateAvailable={tool.updateAvailable ?? false}
                       availableVersion={tool.availableVersion ?? null}
                       unavailableReason={tool.unavailableReason ?? null}
+                      managedExternally={tool.managedExternally ?? false}
                       onUpdate={() =>
                         void runAddonAction("install_addon", tool.id, undefined, {
                           busy: `Updating ${tool.name}...`,
@@ -8273,6 +8283,7 @@ export default function App() {
                 <summary>Advanced</summary>
                 <div className="advanced-section__body">
                   <UpstreamPanel />
+                  <ClaudeStatuslinePanel />
                 </div>
               </details>
 

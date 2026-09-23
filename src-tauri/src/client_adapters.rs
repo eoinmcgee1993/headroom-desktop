@@ -202,6 +202,25 @@ pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
     write_setup_state(&state)
 }
 
+/// True when the user turned the Claude Code savings statusline off.
+pub fn is_statusline_disabled() -> bool {
+    load_setup_state().statusline_disabled
+}
+
+/// Persist the statusline opt-out and apply it now: install it when Claude
+/// Code routes through Headroom, remove it otherwise.
+pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
+    let mut state = load_setup_state();
+    state.statusline_disabled = !enabled;
+    write_setup_state(&state)?;
+    if enabled && is_claude_code_enabled() {
+        ensure_claude_statusline()?;
+    } else {
+        remove_claude_statusline()?;
+    }
+    Ok(())
+}
+
 /// Enable or disable RTK from the tool status toggle. Disabling tears down the
 /// RTK PATH export, the Claude Code hook, and the Codex AGENTS.md nudge (without
 /// touching `ANTHROPIC_BASE_URL` routing) and persists the opt-out so bootstrap
@@ -395,6 +414,15 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                     updates.1.append(&mut rc.1);
                 }
                 Err(err) => log::warn!("installing /remote-control command failed: {err}"),
+            }
+            // Same: the per-conversation savings statusline. Rides routing, so
+            // it is never on screen while Claude Code bypasses Headroom.
+            match ensure_claude_statusline() {
+                Ok(mut line) => {
+                    updates.0.append(&mut line.0);
+                    updates.1.append(&mut line.1);
+                }
+                Err(err) => log::warn!("installing Claude statusline failed: {err}"),
             }
 
             // Shell profile (RTK PATH + env export) is convenience; tolerate an
@@ -1176,6 +1204,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             }
             let _ = remove_claude_guard_hook();
             let _ = remove_claude_remote_control_command();
+            let _ = remove_claude_statusline();
         }
         "vscode" => {
             let preserved = state
@@ -1518,6 +1547,9 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     }
     if let Err(err) = remove_claude_remote_control_command() {
         log::warn!("cleanup: removing /remote-control command failed: {err}");
+    }
+    if let Err(err) = remove_claude_statusline() {
+        log::warn!("cleanup: removing Claude statusline failed: {err}");
     }
 
     // Restore the open-source Claude Code plugin hook if we neutralized it.
@@ -2264,6 +2296,10 @@ struct ClientSetupState {
     /// is spawned without the passive traffic-learning flags.
     #[serde(default)]
     auto_learn_disabled: bool,
+    /// User turned the Claude Code statusline off in Settings > Advanced. When
+    /// true, client setup skips installing it.
+    #[serde(default)]
+    statusline_disabled: bool,
 }
 
 fn is_configured(state: &ClientSetupState, client_id: &str) -> bool {
@@ -6006,6 +6042,154 @@ fn remove_claude_remote_control_command() -> Result<()> {
     Ok(())
 }
 
+/// File name of the statusline script; also how our `statusLine` entry is
+/// recognised in settings.json.
+const CLAUDE_STATUSLINE_SCRIPT: &str = "headroom-statusline.sh";
+
+fn claude_statusline_script_path() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("hooks")
+        .join(CLAUDE_STATUSLINE_SCRIPT)
+}
+
+/// Prints this conversation's Headroom input savings from the file the
+/// intercept keeps (claude_statusline.rs), looked up by the `session_id`
+/// Claude Code passes on stdin. Silent until the conversation has a saving,
+/// and on any error. `-I -S` keeps the managed interpreter from importing
+/// site-packages: ~16 ms per render.
+fn build_claude_statusline_script(python_path: &Path, state_path: &Path) -> String {
+    let python = shell_double_quote(&python_path.to_string_lossy());
+    let state = shell_double_quote(&state_path.to_string_lossy());
+    format!(
+        r#"#!/usr/bin/env bash
+# Headroom statusline (managed by Headroom Desktop - do not edit).
+HEADROOM_PYTHON="{python}"
+[ -x "$HEADROOM_PYTHON" ] || exit 0
+HEADROOM_STATUSLINE_STATE="{state}" exec "$HEADROOM_PYTHON" -I -S -c '
+import json, os, sys
+def fmt(n):
+    for div, unit in ((1000000, "M"), (1000, "k")):
+        if n >= div:
+            v = n / div
+            text = ("%.1f" % v).rstrip("0").rstrip(".") if v < 10 else "%d" % round(v)
+            return text + unit
+    return str(n)
+try:
+    sid = json.load(sys.stdin)["session_id"]
+    with open(os.environ["HEADROOM_STATUSLINE_STATE"]) as f:
+        entry = json.load(f)["sessions"][sid]
+    total = int(entry.get("tokensSaved", 0))
+    last = int(entry.get("lastRequestSaved", 0))
+except Exception:
+    sys.exit(0)
+if total <= 0:
+    sys.exit(0)
+if last > 0:
+    print("Headroom: saved %s input tokens on the last request, %s in this session so far" % (fmt(last), fmt(total)))
+else:
+    print("Headroom: saved %s input tokens in this session so far" % fmt(total))
+' 2>/dev/null
+"#
+    )
+}
+
+fn is_our_statusline(value: &Value) -> bool {
+    value
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| command.contains(CLAUDE_STATUSLINE_SCRIPT))
+}
+
+/// `statusLine` is a single slot in ~/.claude/settings.json. Ours goes in only
+/// when the slot is empty or already ours: a user's own statusline is never
+/// replaced, and removal only ever deletes our entry. Returns whether the file
+/// changed.
+fn set_claude_statusline_setting(command: Option<&str>) -> Result<bool> {
+    let settings_path = claude_settings_path();
+    let raw = std::fs::read_to_string(&settings_path).unwrap_or_default();
+    let mut root = if raw.trim().is_empty() {
+        if command.is_none() {
+            return Ok(false);
+        }
+        serde_json::Map::new()
+    } else {
+        parse_json_object(&raw, &settings_path)?
+    };
+    let current = root.get("statusLine");
+    match command {
+        Some(command) => {
+            if current.is_some_and(|v| !is_our_statusline(v)) {
+                return Ok(false);
+            }
+            let desired = serde_json::json!({ "type": "command", "command": command });
+            if current == Some(&desired) {
+                return Ok(false);
+            }
+            root.insert("statusLine".into(), desired);
+        }
+        None => {
+            if !current.is_some_and(is_our_statusline) {
+                return Ok(false);
+            }
+            root.remove("statusLine");
+        }
+    }
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let _ = backup_if_exists(&settings_path)?;
+    atomic_write(
+        &settings_path,
+        &serde_json::to_vec_pretty(&Value::Object(root))
+            .context("serializing Claude statusline settings")?,
+    )
+    .with_context(|| format!("writing {}", settings_path.display()))?;
+    Ok(true)
+}
+
+/// Install the savings statusline. Unix only for now: Windows runs statusline
+/// commands through Git Bash and is untested. A no-op when the user turned it
+/// off or already has a statusline of their own.
+fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
+    if cfg!(target_os = "windows") || is_statusline_disabled() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut changed = Vec::new();
+    let mut backups = Vec::new();
+    let script = claude_statusline_script_path();
+    let (did_change, backup) = write_file_if_changed(
+        &script,
+        &build_claude_statusline_script(
+            &default_headroom_managed_python_path(),
+            &crate::claude_statusline::state_path(),
+        ),
+        true,
+    )?;
+    if did_change {
+        changed.push(script.display().to_string());
+    }
+    if let Some(backup) = backup {
+        backups.push(backup.display().to_string());
+    }
+    let command = format!("\"{}\"", shell_double_quote(&script.to_string_lossy()));
+    if set_claude_statusline_setting(Some(&command))? {
+        changed.push(claude_settings_path().display().to_string());
+    }
+    Ok((changed, backups))
+}
+
+/// Remove our `statusLine` entry (never a user's own) and the script.
+fn remove_claude_statusline() -> Result<()> {
+    set_claude_statusline_setting(None)?;
+    let script = claude_statusline_script_path();
+    if script.exists() {
+        std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
+    }
+    Ok(())
+}
+
 fn remove_claude_guard_hook() -> Result<()> {
     let script_path = claude_guard_hook_path();
     // Match on the script path, not the full interpreter command (see codex counterpart).
@@ -7785,6 +7969,12 @@ mod tests {
     };
     #[cfg(unix)]
     use super::{
+        build_claude_statusline_script, claude_settings_path, claude_statusline_script_path,
+        ensure_claude_statusline, is_our_statusline, remove_claude_statusline,
+        set_statusline_enabled, CLAUDE_STATUSLINE_SCRIPT,
+    };
+    #[cfg(unix)]
+    use super::{
         claude_code_shell_block, claude_remote_control_command_path,
         claude_remote_control_script_path, ensure_claude_remote_control_command,
         remove_claude_remote_control_command, CLAUDE_REMOTE_CONTROL_COMMAND_MARKER,
@@ -7793,6 +7983,8 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
     use rusqlite::Connection;
+    #[cfg(unix)]
+    use serde_json::Value;
 
     #[test]
     fn strip_headroom_mcp_toml_removes_owned_tables_keeps_user_tables() {
@@ -8047,6 +8239,7 @@ mod tests {
             preserved_base_urls: BTreeMap::new(),
             rtk_disabled: false,
             auto_learn_disabled: false,
+            statusline_disabled: false,
         };
 
         let normalized = normalize_setup_state(state);
@@ -12049,6 +12242,97 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[cfg(unix)]
     #[test]
+    fn statusline_takes_only_an_empty_slot_and_removes_only_its_own() {
+        let _home = TestHome::new();
+        let settings = claude_settings_path();
+        let read = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap()
+        };
+
+        let (changed, _) = ensure_claude_statusline().expect("install");
+        assert_eq!(changed.len(), 2, "script + settings written: {changed:?}");
+        assert!(is_our_statusline(&read()["statusLine"]));
+        let script = std::fs::read_to_string(claude_statusline_script_path()).unwrap();
+        assert!(script.contains(&crate::claude_statusline::state_path().display().to_string()));
+        let (changed, _) = ensure_claude_statusline().expect("reinstall");
+        assert!(changed.is_empty(), "idempotent: {changed:?}");
+
+        // The opt-out removes it and keeps later setups from putting it back.
+        set_statusline_enabled(false).expect("disable");
+        assert!(read().get("statusLine").is_none());
+        assert!(!claude_statusline_script_path().exists());
+        ensure_claude_statusline().expect("setup while disabled");
+        assert!(read().get("statusLine").is_none());
+        set_statusline_enabled(true).expect("enable");
+
+        // A user's own statusline is never replaced and never removed.
+        let own = serde_json::json!({ "type": "command", "command": "~/my-line.sh" });
+        std::fs::write(
+            &settings,
+            serde_json::to_vec(&serde_json::json!({ "statusLine": own, "model": "opus" })).unwrap(),
+        )
+        .unwrap();
+        ensure_claude_statusline().expect("setup over a user line");
+        assert_eq!(read()["statusLine"], own);
+        remove_claude_statusline().expect("remove");
+        assert_eq!(read()["statusLine"], own);
+        assert_eq!(read()["model"], "opus");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn statusline_script_prints_this_conversation_and_is_otherwise_silent() {
+        let python = Path::new("/usr/bin/python3");
+        if !python.exists() {
+            eprintln!("skipping: no /usr/bin/python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("claude-statusline.json");
+        std::fs::write(
+            &state,
+            r#"{"schemaVersion":1,"sessions":{
+                "busy":{"tokensSaved":1100000,"lastRequestSaved":15400},
+                "idle":{"tokensSaved":1100000,"lastRequestSaved":0}}}"#,
+        )
+        .unwrap();
+        let script = dir.path().join(CLAUDE_STATUSLINE_SCRIPT);
+        std::fs::write(&script, build_claude_statusline_script(python, &state)).unwrap();
+        let render = |stdin: &str| -> String {
+            use std::io::Write;
+            let mut child = crate::proc::command("bash")
+                .arg(&script)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(stdin.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "script must never fail the statusline"
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(
+            render(r#"{"session_id":"busy"}"#),
+            "Headroom: saved 15k input tokens on the last request, 1.1M in this session so far\n"
+        );
+        assert_eq!(
+            render(r#"{"session_id":"idle"}"#),
+            "Headroom: saved 1.1M input tokens in this session so far\n"
+        );
+        assert_eq!(render(r#"{"session_id":"unknown"}"#), "");
+        assert_eq!(render("not json"), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remote_control_command_installs_and_removes_only_its_own_file() {
         let home = TestHome::new();
         let (changed, _) = ensure_claude_remote_control_command().expect("install");
@@ -12092,13 +12376,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let home = TestHome::new();
         ensure_claude_remote_control_command().expect("install");
         let script = claude_remote_control_script_path();
-        let mut child = std::process::Command::new("sleep")
+        let mut child = crate::proc::command("sleep")
             .arg("30")
             .spawn()
             .expect("spawn sleep");
         let pid = child.id().to_string();
         let run = |base_url: &str, tty: &str| -> String {
-            let out = std::process::Command::new("sh")
+            let out = crate::proc::command("sh")
                 .arg(&script)
                 .env("HOME", home.path())
                 .env("ANTHROPIC_BASE_URL", base_url)
@@ -12180,7 +12464,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             std::env::var("PATH").unwrap_or_default()
         );
         let run = |cmd: &str| {
-            std::process::Command::new("bash")
+            crate::proc::command("bash")
                 .arg("-c")
                 .arg(format!(". '{}'; {cmd}", block.display()))
                 .env("HOME", home.path())

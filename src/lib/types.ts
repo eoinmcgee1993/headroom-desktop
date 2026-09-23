@@ -19,6 +19,8 @@ export interface ManagedTool {
   /** Set when this platform has no installable build. The card grays out and
    *  shows this sentence instead of an Install button that only ever errors. */
   unavailableReason?: string | null;
+  /** Plugin the user installed via the host CLI, not Headroom: no actions. */
+  managedExternally?: boolean;
 }
 
 export interface PipelineStageMetric {

@@ -394,6 +394,10 @@ struct ResponseSniffer<R> {
     /// Request path for error attribution; `None` disables error capture
     /// (local proxy paths like /stats, or an unparseable request head).
     capture_path: Option<String>,
+    /// Claude Code conversation this response belongs to. On a 2xx the head
+    /// is read to its end and `x-headroom-tokens-saved` is booked against it
+    /// for the statusline (claude_statusline.rs).
+    savings_session: Option<String>,
 }
 
 /// A real status line ("HTTP/1.1 429 Too Many Requests\r\n") fits well within
@@ -409,7 +413,13 @@ impl<R> ResponseSniffer<R> {
             done: false,
             client_key,
             capture_path,
+            savings_session: None,
         }
+    }
+
+    fn with_savings_session(mut self, session: Option<String>) -> Self {
+        self.savings_session = session;
+        self
     }
 
     fn observe(&mut self, bytes: &[u8]) {
@@ -437,11 +447,31 @@ impl<R> ResponseSniffer<R> {
                 && self
                     .status
                     .is_some_and(|s| is_reportable_upstream_error(&s));
-            if !capture {
+            if !self.status.is_some_and(|s| (200..300).contains(&s)) {
+                self.savings_session = None;
+            }
+            if !capture && self.savings_session.is_none() {
                 self.done = true;
                 self.buf = Vec::new();
                 return;
             }
+        }
+        // 2xx for a Claude Code conversation: read on to the end of the head,
+        // book its saving, stop. The cap bounds a head that never ends.
+        if let Some(session) = self.savings_session.as_deref() {
+            if find_header_end(&self.buf).is_some() {
+                if let Some(saved) = extract_header_value(&self.buf, "x-headroom-tokens-saved")
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                {
+                    crate::claude_statusline::record(session, saved);
+                }
+                self.done = true;
+                self.buf = Vec::new();
+            } else if self.buf.len() >= MAX_ERROR_BODY {
+                self.done = true;
+                self.buf = Vec::new();
+            }
+            return;
         }
         // Capturing: keep the bounded slice; stop observing once full. Error
         // responses are small JSON, so the cap is about hostile inputs, not a
@@ -1623,7 +1653,13 @@ async fn handle(
                         && !is_client_probe_path(&head.path)
                 })
                 .map(|head| head.path.clone());
-            let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path);
+            let savings_session = parsed_head
+                .as_ref()
+                .filter(|head| client_key == "claude-code" && is_prompt_request_head(head))
+                .and_then(|_| extract_header_value(&buf, "x-claude-code-session-id"))
+                .filter(|id| is_claude_session_id(id));
+            let mut stamped = ResponseSniffer::new(StampReader(backend_rd), client_key, error_path)
+                .with_savings_session(savings_session);
             let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
             let _ = client_wr.shutdown().await;
         };
@@ -3494,6 +3530,13 @@ fn is_vscode_claude_ua(user_agent: &str) -> bool {
     user_agent.contains("claude-vscode")
 }
 
+/// Claude Code's `x-claude-code-session-id` is a UUID. It becomes a key in a
+/// file the statusline reads, so anything else (oversized, odd characters) is
+/// refused rather than stored.
+fn is_claude_session_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 /// Return true if the request's Host header targets the loopback listener
 /// and no browser Origin header is present. Protects against DNS-rebinding
 /// attacks that aim the user's browser at 127.0.0.1 via an attacker domain.
@@ -3558,7 +3601,7 @@ mod tests {
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
         codex_error_summary, codex_snapshot_from_usage_payload, codex_window_label,
         decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
-        grok_upstream_header, intercept_request_counts, is_client_probe_path,
+        grok_upstream_header, intercept_request_counts, is_claude_session_id, is_client_probe_path,
         is_codex_request_head, is_codex_sse_response, is_geo_blocked_codex_error,
         is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
         is_missing_auth_error, is_openai_path, is_prompt_request_head,
@@ -4586,6 +4629,44 @@ mod tests {
         assert!(should_report_upstream_error("throttle-test", 497));
         // Same status on another client too: the fingerprint keys on both.
         assert!(should_report_upstream_error("throttle-test-2", 498));
+    }
+
+    #[test]
+    fn sniffer_books_the_head_saving_against_the_claude_conversation() {
+        // Head split across reads, the saving arriving in the second chunk:
+        // the sniffer must read on past the status line to the head's end.
+        let mut ok = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()))
+            .with_savings_session(Some("sess-ok".into()));
+        ok.observe(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n");
+        assert_eq!(crate::claude_statusline::recorded("sess-ok"), None);
+        ok.observe(b"x-headroom-tokens-saved: 15000\r\n\r\nevent: message_start\n");
+        assert_eq!(
+            crate::claude_statusline::recorded("sess-ok"),
+            Some((15_000, 15_000))
+        );
+        assert!(ok.done && ok.buf.is_empty());
+
+        // An upstream error books nothing, even with the header present.
+        let mut err = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()))
+            .with_savings_session(Some("sess-err".into()));
+        err.observe(b"HTTP/1.1 400 Bad Request\r\nx-headroom-tokens-saved: 9\r\n\r\n{}");
+        assert_eq!(crate::claude_statusline::recorded("sess-err"), None);
+
+        // A 2xx with no saving header (wheel without the vendor) is harmless.
+        let mut bare = ResponseSniffer::new((), "claude-code", Some("/v1/messages".into()))
+            .with_savings_session(Some("sess-bare".into()));
+        bare.observe(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n");
+        assert!(bare.done);
+        assert_eq!(crate::claude_statusline::recorded("sess-bare"), None);
+    }
+
+    #[test]
+    fn claude_session_ids_are_validated_before_they_become_file_keys() {
+        assert!(is_claude_session_id("bc293782-c551-4c05-ad7a-b7b49201f545"));
+        assert!(!is_claude_session_id(""));
+        assert!(!is_claude_session_id("../../etc"));
+        assert!(!is_claude_session_id("a\"b"));
+        assert!(!is_claude_session_id(&"a".repeat(65)));
     }
 
     #[test]

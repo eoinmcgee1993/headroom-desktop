@@ -43,6 +43,11 @@ pub struct ManagedTool {
     /// installable here.
     #[serde(default)]
     pub unavailable_reason: Option<String>,
+    /// A plugin addon the user installed through the host CLI themselves (no
+    /// Headroom receipt). The card shows it installed but offers no actions:
+    /// adopting it would let Headroom's uninstall remove the user's plugin.
+    #[serde(default)]
+    pub managed_externally: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

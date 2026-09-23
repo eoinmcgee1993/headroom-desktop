@@ -3,6 +3,7 @@ mod analytics;
 mod backend_port;
 mod bearer;
 mod claude_cli;
+mod claude_statusline;
 mod client_adapters;
 mod device;
 mod keychain;
@@ -5804,6 +5805,21 @@ async fn set_rtk_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
 }
 
 #[tauri::command]
+fn get_claude_statusline_enabled() -> bool {
+    !client_adapters::is_statusline_disabled()
+}
+
+/// Toggle the per-conversation savings line under Claude Code's prompt. Takes
+/// effect on Claude Code's next statusline render; no proxy restart needed.
+#[tauri::command]
+async fn set_claude_statusline_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    client_adapters::set_statusline_enabled(enabled).map_err(|err| err.to_string())?;
+    let action = if enabled { "enabled" } else { "disabled" };
+    analytics::track_event(&app, &format!("claude_statusline_{action}"), None);
+    Ok(!client_adapters::is_statusline_disabled())
+}
+
+#[tauri::command]
 fn get_auto_learn_enabled() -> bool {
     !client_adapters::is_auto_learn_disabled()
 }
@@ -6590,6 +6606,8 @@ pub fn run() {
             set_rtk_enabled,
             get_auto_learn_enabled,
             set_auto_learn_enabled,
+            get_claude_statusline_enabled,
+            set_claude_statusline_enabled,
             uninstall_and_quit,
             quit_headroom,
             #[cfg(debug_assertions)]
