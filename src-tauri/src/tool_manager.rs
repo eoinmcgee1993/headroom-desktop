@@ -365,6 +365,16 @@ switch rewrote the client onto that port and out of the intercept, where
 the activity feed, request counts and savings accounting live. The
 desktop passes the intercept URL in HEADROOM_CC_SWITCH_PROXY_URL and the
 guard writes it onto every reconciler instance.
+
+Also stops the traffic learner writing "Learned: error recovery" into the
+user's Claude Code MEMORY.md. It pairs any failed tool call with the next
+success regardless of intent, so the bullets are wrong ("grep X fails, use
+sed on an unrelated file instead"), and multi-line Bash commands land
+verbatim. MEMORY.md is the auto-memory index Claude Code truncates at 200
+lines, so up to 15 such bullets pushed the user's own entries off the end.
+The desktop's launch scrub (memory_scrubber.rs) only cleaned it between
+flushes. Environment/architecture (CLAUDE.md) and preference routing are
+untouched. Kill switch: HEADROOM_LEARN_DROP_ERROR_RECOVERY=0.
 """
 import faulthandler
 import signal
@@ -2088,6 +2098,20 @@ if _hd_rlw_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                         pass
 
                 _hd_rlw_mod.RequestLogger.log = _hd_rlw_log
+    except Exception:
+        pass
+
+# --- Traffic learner: no error-recovery section in MEMORY.md (posture) ---------
+# The recommendation builder skips any category missing from this routing table,
+# so dropping ERROR_RECOVERY stops the section at the source. Not version-gated:
+# a wheel that renames the table just leaves this inert. Kill switch:
+# HEADROOM_LEARN_DROP_ERROR_RECOVERY=0.
+_hd_ler_flag = _hd_os.environ.get("HEADROOM_LEARN_DROP_ERROR_RECOVERY", "1")
+if _hd_ler_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        from headroom.memory import traffic_learner as _hd_ler_mod
+
+        _hd_ler_mod._CATEGORY_TO_TARGET.pop(_hd_ler_mod.PatternCategory.ERROR_RECOVERY, None)
     except Exception:
         pass
 
@@ -14253,6 +14277,45 @@ print("OK smh")
             "request-log window vendor misbehaved against installed wheel.\n\
              stdout:\n{stdout}\nstderr:\n{stderr}"
         );
+    }
+
+    #[test]
+    fn learn_error_recovery_drop_behaves_against_the_installed_wheel() {
+        // Error recovery no longer routes anywhere (so it never reaches
+        // MEMORY.md); preference routing survives; the kill switch unbinds.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-er-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from headroom.memory.traffic_learner import _CATEGORY_TO_TARGET as t, PatternCategory as c\n\
+                     print(c.ERROR_RECOVERY in t, t.get(c.PREFERENCE))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_DROP_ERROR_RECOVERY", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if on_err.contains("ImportError") || on_err.contains("ModuleNotFoundError") {
+            eprintln!("skipping: installed wheel has no traffic_learner routing table");
+            return;
+        }
+        assert_eq!(on, "False memory_file", "stderr:\n{on_err}");
+        assert_eq!(off, "True memory_file", "stderr:\n{off_err}");
     }
 
     #[test]
