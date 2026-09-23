@@ -1693,6 +1693,44 @@ if _hd_krd_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# Quarantine only a saturated pool (no upstream PR yet):
+# the timeout-debt quarantine refuses ALL compression while even one
+# timed-out worker is still running, on a pool of cpu_count workers. One
+# overrun -- often the cold-start fast pass missing its deliberately short
+# 10s budget, which is fail-open by design -- therefore forwards every other
+# session uncompressed for up to 60s while 7 of 8 workers sit idle. Fleet
+# canary RUST-HD, 2026-09-21..23: 9 hosts on macOS/Windows/Linux, 2.1-38.9%
+# of requests refused. Measured on this machine's proxy logs: 211 of 262
+# refusals happened with ONE stuck worker, none with more than 3 of 8.
+# The quarantine exists so timed-out work cannot saturate the pool (#2292,
+# #2360); that risk starts at saturation, not at the first straggler. So
+# stand the quarantine down while fewer than half the workers are stuck:
+# zeroing the deadline makes the wheel's own check read "not quarantined"
+# and skips its "released" branch, and a timeout that brings the debt to
+# half the pool re-arms it exactly as before. Pools of 1-3 workers keep
+# today's behaviour (half rounds down to 1). Exact-pin gated to wheel
+# 0.38.0. Kill switch: HEADROOM_QUARANTINE_SPARE_CAPACITY=0.
+_hd_cq_flag = _hd_os.environ.get("HEADROOM_QUARANTINE_SPARE_CAPACITY", "1")
+if _hd_cq_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_cq_meta
+
+        if _hd_cq_meta.version("headroom-ai") == "0.38.0":
+            from headroom.proxy import server as _hd_cq_server
+
+            _hd_cq_orig = _hd_cq_server.HeadroomProxy._run_compression_in_executor
+
+            async def _hd_cq_run(self, fn, *, timeout):
+                with self._compression_metrics_lock:
+                    debt = self._compression_timed_out_in_flight
+                    if 0 < debt < max(1, self.compression_max_workers // 2):
+                        self._compression_quarantine_deadline = 0.0
+                return await _hd_cq_orig(self, fn, timeout=timeout)
+
+            _hd_cq_server.HeadroomProxy._run_compression_in_executor = _hd_cq_run
+    except Exception:
+        pass
+
 # Transformations feed bodies (upstream PR #3672):
 # /transformations/feed returned request_messages / compressed_messages /
 # response_content for every entry and built them with asdict(), so the
@@ -7201,6 +7239,20 @@ impl ToolManager {
             return Ok(McpInstallMethod::FallbackJson);
         };
 
+        // An unwritable ~/.claude.json (EPERM: an immutable flag or security
+        // software; RUST-HW/HX) defeats `claude mcp add` too -- the CLI printed
+        // "registered" on two runs 30s apart and the entry never landed. That
+        // is the user's environment, not a registration we missed.
+        if let Err(err) = &direct_write {
+            if crate::client_adapters::is_permission_denied(err) {
+                log::warn!(
+                    "Headroom MCP install: ~/.claude.json is not writable, so Claude Code \
+                     cannot persist the server either: {err:#}"
+                );
+                return Ok(McpInstallMethod::FallbackJson);
+            }
+        }
+
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let claude_json_write_error = direct_write
@@ -7209,6 +7261,9 @@ impl ToolManager {
             .unwrap_or_default();
         sentry::with_scope(
             |scope| {
+                // The stack is unsymbolized, so default grouping split this one
+                // message into RUST-21/23/D1/HW/HX.
+                scope.set_fingerprint(Some(&["mcp_install_not_seen"]));
                 scope.set_extra("claude_cli_detected", detected.clone().into());
                 scope.set_extra(
                     "claude_json_write_error",
@@ -8195,10 +8250,28 @@ impl ToolManager {
         // Only a registry we can read may declare failure: when it is absent or
         // relocated we cannot tell, and failing a CLI that exited 0 turns a
         // working install into a hard error (RUST-DQ, same shape as RUST-EV).
-        if host.plugin_registration(plugin) == Some(false) {
+        // Codex's own listing breaks the tie before declaring failure: on
+        // Windows our config.toml read can disagree with the CLI's home
+        // (RUST-HT: every `plugin add` on one host exited 0 and still read as
+        // unregistered). A plugin Codex itself lists as not installed still fails.
+        if host.plugin_registration(plugin) == Some(false)
+            && !(matches!(host, PluginHost::Codex) && self.codex_lists_installed(plugin, cli))
+        {
             bail!("install completed but the plugin was not registered");
         }
         Ok(())
+    }
+
+    fn codex_lists_installed(&self, plugin: &PluginAddon, cli: &Path) -> bool {
+        let mut listed = false;
+        let _ = run_command_streaming(
+            cli,
+            &["plugin", "list", "-m", plugin.marketplace_name],
+            &self.runtime.root_dir,
+            None,
+            &mut |line: &str| listed |= codex_list_line_installed(line, plugin.plugin_ref),
+        );
+        listed
     }
 
     /// Installs a plugin addon into every host that has a CLI on PATH. Returns
@@ -8326,9 +8399,10 @@ impl ToolManager {
     fn plugin_managed_externally(&self, tool_id: &str) -> bool {
         plugin_addon(tool_id).is_some_and(|plugin| {
             !self.plugin_receipt_exists(plugin)
-                && PluginHost::ALL
-                    .iter()
-                    .any(|host| host.plugin_present(plugin))
+                && (claude_standalone_install(plugin)
+                    || PluginHost::ALL
+                        .iter()
+                        .any(|host| host.plugin_present(plugin)))
         })
     }
 
@@ -8491,6 +8565,23 @@ fn claude_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
     )
 }
 
+/// A copy installed without the plugin manager, so the registry never lists
+/// it: `npx skills add <repo> -g` drops `skills/<id>/`, and caveman's own
+/// installer wires `hooks/caveman-activate.js` into settings.json whenever its
+/// plugin install fails. Offering Install on top would fire every hook twice.
+fn claude_standalone_install(plugin: &PluginAddon) -> bool {
+    let claude = crate::client_adapters::home_dir().join(".claude");
+    claude
+        .join("skills")
+        .join(plugin.id)
+        .join("SKILL.md")
+        .exists()
+        || claude
+            .join("hooks")
+            .join(format!("{}-activate.js", plugin.id))
+            .exists()
+}
+
 /// Codex records installs in `$CODEX_HOME/config.toml` under a
 /// `[plugins."<plugin>@<marketplace>"]` table. Keys containing `@` are always
 /// quoted, so a header substring match is reliable and avoids a TOML parse
@@ -8503,6 +8594,13 @@ fn codex_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
         std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml")).ok()?;
     let header = format!("[plugins.\"{}\"]", plugin.plugin_ref);
     Some(text.lines().any(|line| line.trim_start() == header))
+}
+
+/// One row of `codex plugin list`: `<ref>  installed, enabled  4.10.0  <src>`,
+/// or `<ref>  not installed ...` for an available one.
+fn codex_list_line_installed(line: &str, plugin_ref: &str) -> bool {
+    let mut words = line.split_whitespace();
+    words.next() == Some(plugin_ref) && words.next().is_some_and(|w| w.starts_with("installed"))
 }
 
 /// One serena tool application logs exactly one line containing this marker
@@ -13115,6 +13213,7 @@ mod tests {
 
     use chrono::Local;
 
+    use super::codex_list_line_installed;
     #[cfg(windows)]
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
@@ -13924,6 +14023,74 @@ mod tests {
         assert!(
             off_stdout.contains("FAIL krd bound"),
             "HEADROOM_KOMPRESS_REQUEST_DEADLINE=0 did not unbind the vendor\nstdout:\n{off_stdout}"
+        );
+    }
+
+    #[test]
+    fn sitecustomize_vendors_quarantine_spare_capacity() {
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains("HEADROOM_QUARANTINE_SPARE_CAPACITY"),
+            "kill switch missing"
+        );
+        assert!(
+            py.contains(r#"_hd_cq_meta.version("headroom-ai") == "0.38.0""#),
+            "exact-pin gate missing"
+        );
+    }
+
+    #[test]
+    fn quarantine_spare_capacity_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel's real
+        // _run_compression_in_executor (scripts/verify-quarantine-spare-capacity.py).
+        // Self-skips when the vendor does not bind, so green is NOT evidence
+        // after a wheel bump.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-quarantine-spare-capacity.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-cq-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .arg(&probe)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_QUARANTINE_SPARE_CAPACITY", flag)
+                .output()
+                .expect("run quarantine spare-capacity probe")
+        };
+
+        let out = run("1");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if stdout.contains("FAIL cq bound") {
+            eprintln!("skipping: quarantine spare-capacity vendor did not bind (wheel bumped?)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "quarantine spare-capacity probe failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        // With the switch off the wheel's own method refuses at 1 of 8 stuck,
+        // which is also what proves the probe can tell the two apart.
+        let off = run("0");
+        let off_stdout = String::from_utf8_lossy(&off.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            off_stdout.contains("FAIL cq bound")
+                && off_stdout.contains("FAIL 1 of 8 stuck: compression still runs"),
+            "HEADROOM_QUARANTINE_SPARE_CAPACITY=0 did not unbind the vendor\nstdout:\n{off_stdout}"
         );
     }
 
@@ -19133,6 +19300,23 @@ after
     }
 
     #[test]
+    fn plugin_installed_standalone_reports_external() {
+        // caveman's own installer / `npx skills add`: no registry entry at all.
+        let (root, _runtime, manager) = seed_test_runtime("plugin-standalone");
+        let _home = HomeGuard::new(&root);
+        let hooks = root.join(".claude").join("hooks");
+        fs::create_dir_all(&hooks).expect("hooks dir");
+        assert!(!manager.plugin_managed_externally("caveman"));
+        fs::write(hooks.join("caveman-activate.js"), "").expect("hook");
+        assert!(manager.plugin_managed_externally("caveman"));
+        let skill = root.join(".claude").join("skills").join("ponytail");
+        fs::create_dir_all(&skill).expect("skill dir");
+        fs::write(skill.join("SKILL.md"), "").expect("skill");
+        assert!(manager.plugin_managed_externally("ponytail"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn uninstall_plugin_is_noop_without_receipt() {
         // Cleanup must not touch plugin/marketplace config Headroom never wrote.
         let (root, _runtime, manager) = seed_test_runtime("plugin-uninstall-noreceipt");
@@ -19830,6 +20014,32 @@ exit 0
         )
         .unwrap();
         assert_eq!(PluginHost::Codex.plugin_registration(plugin), Some(true));
+    }
+
+    #[test]
+    fn codex_list_line_installed_reads_the_status_column() {
+        // Rows as codex-cli 0.153.0 prints them.
+        let r = "ponytail@ponytail";
+        assert!(codex_list_line_installed(
+            "  ponytail@ponytail   installed, enabled   4.10.0   https://github.com/DietrichGebert/ponytail.git",
+            r
+        ));
+        assert!(codex_list_line_installed(
+            "ponytail@ponytail installed, disabled 4.10.0",
+            r
+        ));
+        assert!(!codex_list_line_installed(
+            "ponytail@ponytail not installed 4.10.0",
+            r
+        ));
+        assert!(!codex_list_line_installed(
+            "engineering-suite-ponytail@openai-curated-remote installed, enabled",
+            r
+        ));
+        assert!(!codex_list_line_installed(
+            "PLUGIN STATUS VERSION SOURCE",
+            r
+        ));
     }
 
     #[test]

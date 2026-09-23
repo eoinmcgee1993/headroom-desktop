@@ -1474,8 +1474,8 @@ function AddonCard({
           <p className="addon-card__notice">{unavailableReason}</p>
         ) : managedExternally ? (
           <p className="addon-card__notice">
-            You installed this yourself, so Headroom leaves it alone. Manage it with
-            /plugin in your agent.
+            You installed this yourself, so Headroom leaves it alone. Manage it with the
+            tool you installed it with.
           </p>
         ) : null}
         {busy && busyLabel ? (

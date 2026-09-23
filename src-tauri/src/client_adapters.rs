@@ -2469,8 +2469,21 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // metadata can reach disk ahead of the data, so a crash/power loss leaves a
     // zero-length file where valid state used to be -- which is what the
     // "corrupt (expected value at line 1 column 1)" reports are (RUST-8P).
+    // Keep the replaced file's mode. The tmp is created with the umask default
+    // (0644), so without this a rewrite silently widened a 0600 settings.json
+    // holding ANTHROPIC_AUTH_TOKEN to readable by every other local account.
+    #[cfg(unix)]
+    let keep_mode = std::fs::metadata(path).ok().map(|meta| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(meta.permissions().mode() & 0o777)
+    });
     let mut write_tmp = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp_path)?;
+        // Before any byte lands, so the contents never sit under a wider mode.
+        #[cfg(unix)]
+        if let Some(perms) = &keep_mode {
+            f.set_permissions(perms.clone())?;
+        }
         std::io::Write::write_all(&mut f, contents)?;
         f.sync_all()
     };
@@ -3194,7 +3207,23 @@ fn ensure_claude_settings_hook(
 /// `None` removes the key -- used when the override is cleared, so a stale
 /// provider token cannot outlive the endpoint it belonged to.
 pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
-    set_or_clear_claude_settings_env("ANTHROPIC_AUTH_TOKEN", token)
+    set_or_clear_claude_settings_env("ANTHROPIC_AUTH_TOKEN", token)?;
+    // settings.json now holds a provider credential, and Claude Code creates it
+    // 0644 inside a home that other local accounts can traverse (macOS homes
+    // are 0750 group staff, and every user is in staff). Only the owner, who
+    // runs Claude Code, needs to read it. atomic_write keeps the mode after.
+    #[cfg(unix)]
+    if token.is_some_and(|token| !token.is_empty()) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = claude_settings_path();
+        let mode = std::fs::metadata(&path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o700))
+            .with_context(|| format!("chmod {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Set one `env` key in the client's settings, or remove it when the value is
@@ -8223,6 +8252,29 @@ mod tests {
         assert!(state.rtk_disabled);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn upstream_auth_token_makes_claude_settings_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = TestHome::new();
+        let path = super::claude_settings_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::apply_upstream_auth_token(Some("sk-provider")).expect("apply");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("sk-provider"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // A later rewrite (clearing it) must not widen it again.
+        super::apply_upstream_auth_token(None).expect("clear");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     /// RUST-5T: both load attempts failed in `read` (the machine was out of
     /// file descriptors), and the old code quarantined on that -- renaming the
     /// user's real setup away and handing every caller the empty default. An
@@ -12761,6 +12813,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::atomic_write(&path, b"{}").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_the_replaced_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600, 0o755] {
+            let path = dir.path().join(format!("f{mode:o}"));
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            super::atomic_write(&path, b"new").unwrap();
+            let got = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(got, mode, "mode {mode:o} was not kept");
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        }
     }
 
     #[test]
