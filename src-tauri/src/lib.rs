@@ -2044,7 +2044,7 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::SslInterception
     } else if is_ssl_library_conflict_signal(&haystack) {
         BootstrapFailureKind::SslLibraryConflict
-    } else if is_app_control_signal(&haystack) {
+    } else if is_app_control_signal(&haystack) || is_blocked_runtime_dll_signal(&haystack) {
         BootstrapFailureKind::AppControlBlocked
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
@@ -2142,6 +2142,14 @@ pub(crate) fn is_blocked_runtime_dll_signal(text: &str) -> bool {
     // specific, so tolerating the shorter phrasing costs no precision.
     const MARKER: &str = "dll load failed ";
     let lower = text.to_ascii_lowercase();
+    // A refused `_ctypes` that never says so: pip's vendored platformdirs takes
+    // its registry fallback only when `import ctypes` raised, and swallows that
+    // ImportError. The fallback then dies on a missing Shell Folders value, so
+    // this frame in a traceback IS the block (RUST-8K/GR: the retry on a host
+    // whose first attempt was refused `select`, told "check your internet").
+    if lower.contains("get_win_folder_from_registry") {
+        return true;
+    }
     let mut rest = lower.as_str();
     while let Some(idx) = rest.find(MARKER) {
         let after = &rest[idx + MARKER.len()..];
@@ -11610,6 +11618,39 @@ mod tests {
         assert_eq!(
             classify_bootstrap_failure(&localized).as_str(),
             "app_control_blocked"
+        );
+    }
+
+    #[test]
+    fn classify_bootstrap_failure_flags_a_silently_blocked_ctypes_as_app_control() {
+        // RUST-8K/GR verbatim tail: the retry on a host whose first attempt
+        // was refused `select`. `_ctypes` was refused too, but platformdirs
+        // swallows that ImportError, so only its registry fallback shows.
+        let err: anyhow::Error = make_command_failure(
+            "  File \"~\\AppData\\Local\\Temp\\tmpaqz25su7\\pip-25.0.1-py3-none-any.whl\\pip\\_vendor\\platformdirs\\windows.py\", line 209, in get_win_folder_from_registry\n\
+             FileNotFoundError: [WinError 2] The system cannot find the file specified",
+        )
+        .into();
+        assert_eq!(
+            classify_bootstrap_failure(&err).as_str(),
+            "app_control_blocked"
+        );
+        // Localized DLL verdict with no code: startup already read it as a
+        // block, bootstrap told the user to check their internet.
+        let localized: anyhow::Error = make_command_failure(
+            "ImportError: DLL load failed while importing select: \
+             Eine Anwendungssteuerungsrichtlinie hat diese Datei blockiert.",
+        )
+        .into();
+        assert_eq!(
+            classify_bootstrap_failure(&localized).as_str(),
+            "app_control_blocked"
+        );
+        assert_eq!(
+            crate::tool_manager::pip_failure_category(&crate::tool_manager::compact_pip_failure(
+                &err
+            )),
+            "app-control"
         );
     }
 

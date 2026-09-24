@@ -12303,6 +12303,7 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         "openssl-applink"
     } else if lower.contains("application control policy has blocked")
         || lower.contains("(os error 4551)")
+        || crate::is_blocked_runtime_dll_signal(&lower)
     {
         // Windows Application Control (Smart App Control / WDAC / AppLocker)
         // blocked a freshly-extracted file (RUST-8K, third cause). Windows
