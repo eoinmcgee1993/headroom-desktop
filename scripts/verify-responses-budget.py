@@ -178,9 +178,15 @@ def main():
             await task
         except asyncio.CancelledError:
             pass
-        await asyncio.sleep(0.15)
+        # Poll, not one fixed 150ms sleep (failed 0fe6042 CI on a loaded
+        # runner); "drained" is proven by the work stopping short of all 100.
+        for _ in range(100):
+            if cancelled_proxy._compression_in_flight == 0:
+                break
+            await asyncio.sleep(0.02)
         assert cancelled_proxy._compression_in_flight == 0
         assert cancelled_proxy._compression_timed_out_in_flight == 0
+        assert len(calls) < 100, "cancelled request ran every unit"
         cancelled_proxy._compression_executor.shutdown(wait=True)
         print("PASS: request cancellation drains remaining work")
 
