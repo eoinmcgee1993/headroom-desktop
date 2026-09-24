@@ -1395,7 +1395,7 @@ pub(crate) fn request_auth_code_with_base_url(
 
     Ok(HeadroomAuthCodeRequest {
         email: body.email,
-        expires_in_seconds: body.expires_in_seconds.max(1).min(AUTH_CODE_EXPIRY_SECONDS),
+        expires_in_seconds: body.expires_in_seconds.clamp(1, AUTH_CODE_EXPIRY_SECONDS),
     })
 }
 
@@ -2137,6 +2137,7 @@ fn parse_claude_usage_response(body: &serde_json::Value) -> Result<ClaudeUsage, 
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_pricing_status_with_mismatch(
     authenticated: bool,
     local_grace_started_at: DateTime<Utc>,
@@ -2458,9 +2459,7 @@ fn evaluate_weekly_gate(
         (policy.disable_threshold_percent + invite_bonus_percent)
             .min(policy.disable_threshold_percent + 50.0)
     });
-    let recommended_subscription_tier = policy
-        .as_ref()
-        .map(|policy| policy.recommended_tier.clone());
+    let recommended_subscription_tier = policy.as_ref().map(|policy| policy.recommended_tier);
 
     let mut optimization_allowed = true;
     let mut should_nudge = false;
@@ -2627,7 +2626,7 @@ fn sanitize_plan_claim(raw: &str) -> Option<String> {
 
 /// Build a [`CodexAccountProfile`] from `~/.codex/auth.json`. `plan_tier` and
 /// `account_uuid` are also available from live traffic (`state.codex_plan_tier`
-/// + the access-token bearer), so this prefers a live, classified plan tier
+/// and the access-token bearer), so this prefers a live, classified plan tier
 /// over the on-disk id_token when present. `email` and `organization_type` only
 /// exist in the id_token, so they require the file. Returns `None` only when
 /// nothing at all is known (no file and no live capture).
@@ -3249,7 +3248,7 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         subscription_pending_effective_at: value.subscription_pending_effective_at,
         invite_code: value.invite_code,
         accepted_invites_count: value.accepted_invites_count,
-        invite_bonus_percent: value.invite_bonus_percent.min(50.0).max(0.0),
+        invite_bonus_percent: value.invite_bonus_percent.clamp(0.0, 50.0),
         upgrade_action: value.upgrade_action,
         recommended_tier: value.recommended_tier,
         grandfathered: value.grandfathered,
@@ -4521,9 +4520,7 @@ mod tests {
             Some("user@example.com")
         );
         assert!(matches!(
-            account
-                .as_ref()
-                .and_then(|value| value.subscription_tier.clone()),
+            account.as_ref().and_then(|value| value.subscription_tier),
             Some(HeadroomSubscriptionTier::Pro)
         ));
     }
@@ -4564,18 +4561,6 @@ mod tests {
 
     fn pro_profile_with_weekly(weekly: f64) -> ClaudeAccountProfile {
         let mut p = empty_claude_profile(ClaudePlanTier::Pro);
-        p.weekly_utilization_pct = Some(weekly);
-        p
-    }
-
-    fn unknown_profile_with_weekly(weekly: f64) -> ClaudeAccountProfile {
-        let mut p = empty_claude_profile(ClaudePlanTier::Unknown);
-        p.weekly_utilization_pct = Some(weekly);
-        p
-    }
-
-    fn max5x_profile_with_weekly(weekly: f64) -> ClaudeAccountProfile {
-        let mut p = empty_claude_profile(ClaudePlanTier::Max5x);
         p.weekly_utilization_pct = Some(weekly);
         p
     }

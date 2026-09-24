@@ -2320,7 +2320,7 @@ fn learned_openai_ttl_seconds(obs_path: &Path) -> Option<u64> {
 }
 
 fn parse_major_minor_patch(s: &str) -> Option<(u32, u32, u32)> {
-    let head = s.split(|c: char| c == '-' || c == '+').next()?;
+    let head = s.split(['-', '+']).next()?;
     let mut parts = head.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
@@ -2849,13 +2849,18 @@ pub struct ManagedToolManifest {
     pub required: bool,
 }
 
+/// Serena call count and when the last call was seen.
+type SerenaLiveStats = (u64, Option<Instant>);
+/// When `serena_live_stats` last ran, and what it found.
+type SerenaLiveStatsCache = Arc<Mutex<Option<(Instant, Option<SerenaLiveStats>)>>>;
+
 #[derive(Debug, Clone)]
 pub struct ToolManager {
     runtime: ManagedRuntime,
     manifests: Vec<ManagedToolManifest>,
     log_marker_cache: Arc<Mutex<Option<ToolLogMarkerCache>>>,
     serena_calls_cache: Arc<Mutex<Option<SerenaCallsCache>>>,
-    serena_live_stats_cache: Arc<Mutex<Option<(Instant, Option<(u64, Option<Instant>)>)>>>,
+    serena_live_stats_cache: SerenaLiveStatsCache,
     /// False once this app process has tried to start the backend at least
     /// once. See its use in `start_headroom_background`.
     first_backend_start: Arc<std::sync::atomic::AtomicBool>,
@@ -3006,8 +3011,7 @@ fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
     let detail: String = tail
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .next_back()
+        .rfind(|line| !line.is_empty())
         .unwrap_or("(no output in kompress-prefetch.log)")
         .chars()
         .take(200)
@@ -3338,7 +3342,7 @@ impl ToolManager {
     /// Paired with the oldest matching MCP process's start (from `ps` etime),
     /// so the chip can say over what span those tokens accumulated.
     /// 60s cache; closed local ports refuse instantly, so a miss is cheap.
-    fn serena_live_stats(&self) -> Option<(u64, Option<Instant>)> {
+    fn serena_live_stats(&self) -> Option<SerenaLiveStats> {
         if !self.serena_installed() {
             return None;
         }
@@ -5003,7 +5007,7 @@ impl ToolManager {
         if installed == HEADROOM_PINNED_VERSION {
             return None;
         }
-        Some(pinned_headroom_release().ok()?)
+        pinned_headroom_release().ok()
     }
 
     /// Returns true if the compiled requirements lock differs from what was
@@ -5173,7 +5177,7 @@ impl ToolManager {
                 eta_seconds: 75,
                 percent: 18,
             });
-            self.install_python_distribution(|update| progress(update))?;
+            self.install_python_distribution(&mut progress)?;
         } else {
             progress(BootstrapStepUpdate {
                 step: "Python runtime",
@@ -9118,23 +9122,19 @@ fn diagnose_proxy_port(port: u16) -> PortState {
         Err(_) => {}
     }
 
-    // Port is held. Probe it: headroom's proxy speaks HTTP and, for an
-    // unrecognized path, responds with an HTTP status line. A foreign
-    // non-HTTP service (SSH, Redis, etc.) will not.
-    let headroom_like = probe_headroom_http(port, Duration::from_millis(400));
-    if headroom_like {
-        // "Speaks HTTP" alone is not identity. HeadroomRunning occupants get
-        // killed by the reclaim path, so verify the pid's argv actually looks
-        // like our managed backend — an unrelated local HTTP server (dev
-        // server, docker forward) squatting the port must route to the
-        // foreign fallback-port path instead of being SIGKILLed.
-        match listener_process(port) {
-            Some((_, pid)) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
-            Some((command, pid)) => PortState::ForeignOccupant(format!("{command} pid {pid}")),
-            None => PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into()),
-        }
-    } else {
-        PortState::ForeignOccupant(listener_detail(port).unwrap_or_else(|| UNKNOWN_OCCUPANT.into()))
+    // Port is held. Identity decides, not HTTP: HeadroomRunning occupants get
+    // killed by the reclaim path, so the pid's argv/exe must look like our
+    // managed backend -- an unrelated local HTTP server (dev server, docker
+    // forward) squatting the port must route to the foreign fallback-port
+    // path instead of being SIGKILLed. The identity check used to sit behind
+    // a 400ms HTTP probe, so our own orphan with a blocked event loop (or
+    // still importing) read as foreign: the new backend fell back to 6769 and
+    // the orphan kept 6768 forever, one more per relaunch (RUST-ED: the same
+    // python.exe pid on 6768 across two launches, the second landing on 6770).
+    match listener_process(port) {
+        Some((_, pid)) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
+        Some((command, pid)) => PortState::ForeignOccupant(format!("{command} pid {pid}")),
+        None => PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into()),
     }
 }
 
@@ -9280,27 +9280,6 @@ fn exe_path_is_under(exe_path: &str, runtime_dir: &Path) -> bool {
         prefix.push('\\');
     }
     exe.starts_with(&prefix)
-}
-
-fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
-    use std::io::{Read, Write};
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    if stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
-    let mut buf = [0u8; 16];
-    match stream.read(&mut buf) {
-        Ok(n) if n >= 5 => buf[..5].eq_ignore_ascii_case(b"HTTP/"),
-        _ => false,
-    }
 }
 
 /// The process listening on `port`, as `(command, pid)`.
@@ -9463,16 +9442,11 @@ fn parse_ss_listener(text: &str, port: u16) -> Option<(String, u32)> {
     Some((command, pid))
 }
 
-/// `listener_process` formatted as the `"cmd pid 1234"` detail string the
-/// port-conflict marker and its bail messages carry.
-fn listener_detail(port: u16) -> Option<String> {
-    listener_process(port).map(|(command, pid)| format!("{command} pid {pid}"))
-}
-
-/// Extract the numeric pid from a `"cmd pid 1234"` string returned by
-/// [`listener_detail`]. Returns None for the `"unknown process"` placeholder
-/// or any unparseable shape. Companion to `port_conflict::parse_occupant`,
-/// which works on the full bail string instead of the occupant detail.
+/// Extract the numeric pid from a `"cmd pid 1234"` occupant detail
+/// (`diagnose_proxy_port`'s foreign label). Returns None for the
+/// `"unknown process"` placeholder or any unparseable shape. Companion to
+/// `port_conflict::parse_occupant`, which works on the full bail string
+/// instead of the occupant detail.
 fn parse_pid_from_lsof_detail(detail: &str) -> Option<u32> {
     let idx = detail.rfind(" pid ")?;
     detail[idx + " pid ".len()..].trim().parse().ok()
@@ -10583,7 +10557,7 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
     if ret != 0 {
         return None;
     }
-    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+    Some(stat.f_bavail as u64 * stat.f_frsize)
 }
 
 #[cfg(windows)]
@@ -12079,7 +12053,7 @@ fn pip_line_to_progress(
     let (message, collected, resolved) = if let Some(rest) = trimmed.strip_prefix("Collecting ") {
         let spec = rest.split_whitespace().next().unwrap_or(rest);
         let pkg = spec
-            .split(|c: char| matches!(c, '=' | '<' | '>' | '!' | '~' | ';' | '['))
+            .split(['=', '<', '>', '!', '~', ';', '['])
             .next()
             .unwrap_or(spec);
         (format!("Fetching {}...", pkg), true, false)
@@ -16901,6 +16875,45 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// RUST-ED: our own orphan that holds the port but never answers HTTP (a
+    /// blocked event loop, or still importing) is ours, not foreign. Reading
+    /// it as foreign fell back to 6769 and left the orphan on 6768 for good.
+    #[test]
+    #[cfg(unix)] // exercises /usr/bin/python3; Windows cannot exec it
+    fn diagnose_proxy_port_identifies_silent_headroom_orphan() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // Listens, never accepts: connects succeed, nothing is ever read back.
+        let script = r#"
+import socket, sys, time
+s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(8)
+time.sleep(30)
+"#;
+        let mut child = crate::proc::command("/usr/bin/python3")
+            .arg("-c")
+            .arg(script)
+            .arg(port.to_string())
+            .arg("--headroom-proxy-test-standin")
+            .spawn()
+            .expect("spawn silent stand-in");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stand-in never bound port {port}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let state = diagnose_proxy_port(port);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(matches!(state, PortState::HeadroomRunning));
     }
 
     #[test]

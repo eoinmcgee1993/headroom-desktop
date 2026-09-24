@@ -1877,6 +1877,10 @@ export default function App() {
   // Staleness in the "became verified" direction is harmless: that only happens
   // once traffic flows, and the no-traffic branch requires zero requests.
   const connectorsRef = useRef<ClientConnectorStatus[] | undefined>(undefined);
+  // Latest dashboard for refreshPricingStatus, which the pricing poll and the
+  // pricing-refreshed listener call from closures made at mount, when
+  // `dashboard` was still mockDashboard (no daily savings, so no unsaved label).
+  const dashboardRef = useRef<DashboardState>(mockDashboard);
   // A forced setup-stall alert skips the day throttle, so this keeps it to one
   // showing per app run instead of resurrecting itself on every poll.
   const forcedSetupStallFiredRef = useRef(false);
@@ -1975,6 +1979,7 @@ export default function App() {
 
   useEffect(() => {
     dashboardSignatureRef.current = serializeState(dashboard);
+    dashboardRef.current = dashboard;
   }, [dashboard]);
 
   useEffect(() => {
@@ -2260,6 +2265,7 @@ export default function App() {
     return () => {
       active = false;
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, []);
 
   useEffect(() => {
@@ -2366,6 +2372,7 @@ export default function App() {
       active = false;
       detach();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- windowLabel is fixed for the life of the window
   }, [bootstrapping]);
 
   useEffect(() => {
@@ -2424,6 +2431,7 @@ export default function App() {
       return;
     }
     void refreshConnectors();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, launcherStage]);
 
   // Paywall stage: poll pricing status so the tier recommendation appears as
@@ -2463,6 +2471,7 @@ export default function App() {
       setLauncherStage("install");
       void handleBootstrap();
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- fires when subscriptionActive flips; the tier only labels the analytics event
   }, [windowLabel, launcherStage, pricingStatus?.account?.subscriptionActive]);
 
   useEffect(() => {
@@ -2602,6 +2611,7 @@ export default function App() {
     };
     // Deliberately not keyed on the rows themselves: this marks them, so
     // re-running on every change would loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see above
   }, [windowLabel, launcherStage]);
 
   // Warm the bootstrap download cache while the user is still signing up.
@@ -2693,15 +2703,22 @@ export default function App() {
 
   useEffect(() => {
     if (!isLastScreen || awaitingFirstPrompt) return;
+    // Deps change, so cleanup can run before onFocusChanged resolves; without
+    // `active` that late listener would leak and keep hiding the window on blur.
+    let active = true;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
         if (!focused) triggerHide();
       })
       .then((fn) => {
-        unlisten = fn;
+        if (active) unlisten = fn;
+        else fn();
       });
-    return () => unlisten?.();
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, [isLastScreen, awaitingFirstPrompt]);
 
   const optimizationBlocked = pricingStatus
@@ -2813,6 +2830,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, forcedSetupStall]);
 
   useEffect(() => {
@@ -2826,6 +2844,7 @@ export default function App() {
     }, 3000);
 
     return () => window.clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, trayWindowFocused]);
 
   // Poll runtime status while the install step is visible so the Continue
@@ -2848,6 +2867,7 @@ export default function App() {
     }, 1000);
 
     return () => window.clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, launcherStage, runtimeStatus?.running, runtimeStatus?.bypassed]);
 
   useEffect(() => {
@@ -2894,6 +2914,7 @@ export default function App() {
       });
 
     return () => unlisten?.();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel]);
 
   useEffect(() => {
@@ -2901,6 +2922,7 @@ export default function App() {
       return;
     }
     void refreshAppUpdateConfiguration();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [startupReady]);
 
   useEffect(() => {
@@ -2946,6 +2968,7 @@ export default function App() {
       window.clearTimeout(timer);
       window.clearInterval(interval);
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on appUpdateConfig, the state checkForAppUpdate reads
   }, [appUpdateConfig, startupReady, windowLabel]);
 
   useEffect(() => {
@@ -2976,6 +2999,7 @@ export default function App() {
     void invoke<boolean>("get_autostart_enabled")
       .then((enabled) => setAutostartEnabled(enabled))
       .catch(() => setAutostartEnabled(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- runs on entering settings; appUpdateConfig only skips a reload, refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [activeView]);
 
   useEffect(() => {
@@ -3146,6 +3170,7 @@ export default function App() {
       active = false;
       window.clearTimeout(timeout);
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, trayWindowFocused, heavyTabEverOpened, activeView]);
 
   useEffect(() => {
@@ -3186,6 +3211,7 @@ export default function App() {
       return;
     }
     void Promise.all([refreshConnectors(), refreshRuntimeStatus()]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [activeView, startupReady]);
 
   useEffect(() => {
@@ -3207,6 +3233,7 @@ export default function App() {
       return;
     }
     void Promise.all([refreshClaudeProjects(), refreshHeadroomLearnPrereq()]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [activeView]);
 
   useEffect(() => {
@@ -3280,6 +3307,7 @@ export default function App() {
     }
 
     void refreshClaudeProjects();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [
     headroomLearnStatus.finishedAt,
     headroomLearnStatus.lastRunAt,
@@ -3505,6 +3533,7 @@ export default function App() {
     autoDisabledByGateRef.current.add(target.clientId);
     persistAutoDisabledByGate();
     void toggleConnector(target, false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors/pricingStatus change, so toggleConnector is fresh when it acts
   }, [connectors, connectorsBusy, pricingStatus]);
 
   // Companion to the auto-disable effect above: when the pricing gate
@@ -3529,6 +3558,7 @@ export default function App() {
       return;
     }
     void toggleConnector(target, true);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors/pricingStatus change, so toggleConnector is fresh when it acts
   }, [connectors, connectorsBusy, pricingStatus]);
 
   useEffect(() => {
@@ -4064,7 +4094,7 @@ export default function App() {
       if (!status.optimizationAllowed || status.codex?.optimizationAllowed === false) {
         const bytes = await invoke<number>("get_gated_bypass_bytes").catch(() => 0);
         setGatedBypassBytes(bytes);
-        unsavedLabel = unsavedWhileBlockedLabel(bytes, dashboard.dailySavings);
+        unsavedLabel = unsavedWhileBlockedLabel(bytes, dashboardRef.current.dailySavings);
       }
       void maybeFireTrialNotifications(status);
       void maybeFireUrgentPricingNotifications(status, unsavedLabel);

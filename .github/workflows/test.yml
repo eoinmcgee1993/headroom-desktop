@@ -205,6 +205,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
@@ -216,6 +218,12 @@ jobs:
         with:
           workspaces: |
             src-tauri -> target
+
+      - name: Clippy (warnings are errors)
+        # The 2026-09-21 restart-marker writer was never called, and the only
+        # signal was a `never used` warning nobody saw. macOS only: that is
+        # where most cfg-gated code lives and where it can be reproduced locally.
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Install frontend dependencies
         run: npm ci

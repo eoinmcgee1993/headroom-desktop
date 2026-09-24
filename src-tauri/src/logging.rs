@@ -736,8 +736,7 @@ impl Log for FileLogger {
             || self
                 .records_since_rotate_check
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                % 64
-                == 0
+                .is_multiple_of(64)
         {
             self.rotate_if_needed();
         }

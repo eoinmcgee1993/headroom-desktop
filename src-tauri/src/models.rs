@@ -1035,6 +1035,7 @@ impl CodexPlanTier {
 ///   seats, and both halves of that name already price at Max x5.
 /// - Unknown -> Max x20: plan claim couldn't be decoded, so pitch the top plan
 ///   rather than under-recommend.
+///
 /// Free carries no recommendation (already on the no-cost tier).
 pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubscriptionTier> {
     match plan {

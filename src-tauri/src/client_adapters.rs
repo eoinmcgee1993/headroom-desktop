@@ -998,7 +998,7 @@ pub(crate) fn newest_claude_transcript_mtime(projects_root: &Path) -> Option<Sys
             if visited > LOCAL_ACTIVITY_WALK_CAP {
                 return newest;
             }
-            if !entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+            if entry.path().extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
             if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
@@ -1937,14 +1937,13 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
             current = mcp_table_name(line);
         }
         let Some(name) = current else { continue };
-        if name == "headroom" {
-            owned.insert(name.to_string());
-        } else if line
-            .split_once('=')
-            .is_some_and(|(key, _)| key.trim() == "command")
-            && toml_line_value(line)
-                .as_deref()
-                .is_some_and(mcp_command_in_headroom_footprint)
+        if name == "headroom"
+            || (line
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "command")
+                && toml_line_value(line)
+                    .as_deref()
+                    .is_some_and(mcp_command_in_headroom_footprint))
         {
             owned.insert(name.to_string());
         }
@@ -2661,7 +2660,7 @@ fn configure_shell_block(
     let mut backups = Vec::new();
 
     for file in shell_targets {
-        let (did_change, backup) = upsert_managed_block(&file, block_id, block_body)?;
+        let (did_change, backup) = upsert_managed_block(file, block_id, block_body)?;
         if did_change {
             changed.push(file.display().to_string());
             if let Some(path) = backup {
@@ -5395,6 +5394,20 @@ fn register_guard_hook_entries(
     status_message: &str,
     events: &[(&str, Option<&str>)],
 ) -> Result<(Vec<String>, Vec<String>)> {
+    let hooks: Vec<_> = events
+        .iter()
+        .map(|&(event, matcher)| (event, matcher, command, status_message))
+        .collect();
+    register_hook_entries(hooks_path, &hooks)
+}
+
+/// `register_guard_hook_entries` for hooks that differ per event, in one write
+/// and one backup. Each is `(event, matcher, command, status_message)`; an
+/// empty status message is omitted.
+fn register_hook_entries(
+    hooks_path: &Path,
+    hooks: &[(&str, Option<&str>, &str, &str)],
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut content = if hooks_path.exists() {
         let raw = std::fs::read_to_string(hooks_path)
             .with_context(|| format!("reading {}", hooks_path.display()))?;
@@ -5415,7 +5428,7 @@ fn register_guard_hook_entries(
         .ok_or_else(|| anyhow!("unable to write hooks settings"))?;
 
     let mut mutated = false;
-    for &(event, matcher) in events {
+    for &(event, matcher, command, status_message) in hooks {
         if !hooks_obj.get(event).map(Value::is_array).unwrap_or(false) {
             hooks_obj.insert(event.to_string(), Value::Array(Vec::new()));
         }
@@ -5429,12 +5442,14 @@ fn register_guard_hook_entries(
         {
             continue;
         }
-        let handler = serde_json::json!({
+        let mut handler = serde_json::json!({
             "type": "command",
             "command": command,
             "timeout": 10,
-            "statusMessage": status_message,
         });
+        if !status_message.is_empty() {
+            handler["statusMessage"] = status_message.into();
+        }
         let mut entry = serde_json::Map::new();
         if let Some(matcher) = matcher {
             entry.insert("matcher".into(), Value::String(matcher.to_string()));
@@ -5987,22 +6002,26 @@ fn build_claude_remote_control_script() -> String {
 # leaves a marker and asks the session to exit; the `claude` shell function
 # Headroom manages then resumes the SAME session by id with the base URL
 # overridden for that one process.
-# Two phases. Without arguments (run by the model's Bash tool after the user
+# Three phases. Without arguments (run by the model's Bash tool after the user
 # confirms): record the pending exit. With --stop (Claude Code's Stop hook,
 # fired once the model's turn has ended): perform it. Killing only after the
 # turn ends keeps the transcript clean, so the resumed session shows no
-# "interrupted" turn in the terminal or on the phone.
-if [ "${1:-}" = "--stop" ]; then
+# "interrupted" turn in the terminal or on the phone. With --cancel
+# (UserPromptSubmit): drop it. Esc skips the Stop hook, so without this a
+# restart the user interrupted would fire at the end of their NEXT turn. Must
+# print nothing: UserPromptSubmit stdout is added to the prompt.
+case "${1:-}" in --stop|--cancel)
   sid=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
   exit_file="$HOME/.headroom/remote-control/exit-$sid"
   [ -n "$sid" ] && [ -f "$exit_file" ] || exit 0
   pid=$(cat "$exit_file"); rm -f "$exit_file"
+  [ "$1" = "--stop" ] || exit 0
   # Never signal a pid without checking it is still the Claude Code process.
   case "$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)")" in
     claude|claude.exe) kill -TERM "$pid";;
   esac
-  exit 0
-fi
+  exit 0;;
+esac
 case "${ANTHROPIC_BASE_URL:-}" in
   ""|https://api.anthropic.com*)
     echo "Remote Control is already available in this session: type /rc."
@@ -6097,21 +6116,33 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
             }
         }
     }
-    // The Stop hook performs the exit the script recorded, once the turn ends.
-    let (mut hook_changed, mut hook_backups) = register_guard_hook_entries(
+    // The Stop hook performs the exit the script recorded, once the turn ends;
+    // the next prompt drops one an interrupted turn left behind. No status
+    // message on the prompt hook: it runs on every prompt and almost never acts.
+    let (stop, cancel) = (
+        claude_remote_control_hook_command("--stop"),
+        claude_remote_control_hook_command("--cancel"),
+    );
+    let (mut hook_changed, mut hook_backups) = register_hook_entries(
         &claude_settings_path(),
-        &claude_remote_control_stop_command(),
-        "Headroom: checking for a pending Remote Control restart",
-        &[("Stop", None)],
+        &[
+            (
+                "Stop",
+                None,
+                &stop,
+                "Headroom: checking for a pending Remote Control restart",
+            ),
+            ("UserPromptSubmit", None, &cancel, ""),
+        ],
     )?;
     changed.append(&mut hook_changed);
     backups.append(&mut hook_backups);
     Ok((changed, backups))
 }
 
-fn claude_remote_control_stop_command() -> String {
+fn claude_remote_control_hook_command(phase: &str) -> String {
     format!(
-        "{} --stop",
+        "{} {phase}",
         shell_double_quote(&claude_remote_control_script_path().to_string_lossy())
     )
 }
@@ -6123,7 +6154,12 @@ fn remove_claude_remote_control_command() -> Result<()> {
     // Match on the script path so any earlier command form is stripped too.
     let fragment = script.display().to_string();
     for settings_path in claude_settings_candidates() {
-        let _ = remove_guard_hook_entries(&settings_path, &fragment, false, Some(&["Stop"]));
+        let _ = remove_guard_hook_entries(
+            &settings_path,
+            &fragment,
+            false,
+            Some(&["Stop", "UserPromptSubmit"]),
+        );
     }
     if script.exists() {
         std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
@@ -6475,7 +6511,7 @@ fn write_file_if_changed(
 
 fn remove_shell_block(shell_targets: &[PathBuf], block_id: &str) -> Result<()> {
     for file in shell_targets {
-        remove_managed_block(&file, block_id)?;
+        remove_managed_block(file, block_id)?;
     }
     Ok(())
 }
@@ -8087,7 +8123,7 @@ mod tests {
     #[cfg(unix)]
     use super::{
         claude_code_shell_block, claude_remote_control_command_path,
-        claude_remote_control_script_path, claude_remote_control_stop_command,
+        claude_remote_control_hook_command, claude_remote_control_script_path,
         ensure_claude_remote_control_command, remove_claude_remote_control_command,
         CLAUDE_REMOTE_CONTROL_COMMAND_MARKER, CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE,
         HEADROOM_ANTHROPIC_BASE_URL,
@@ -8762,16 +8798,18 @@ mod tests {
         .expect("write shell file");
 
         assert!(shell_block_contains_in_files(
-            &[path.clone()],
+            std::slice::from_ref(&path),
             "claude_code",
             "ANTHROPIC_BASE_URL",
             "http://127.0.0.1:6767",
         )
         .expect("detect managed export"));
-        assert!(
-            shell_block_contains_text_in_files(&[path.clone()], "claude_code", "export PATH=",)
-                .expect("detect managed text")
-        );
+        assert!(shell_block_contains_text_in_files(
+            std::slice::from_ref(&path),
+            "claude_code",
+            "export PATH=",
+        )
+        .expect("detect managed text"));
         assert!(!shell_block_contains_in_files(
             &[path],
             "managed_rtk",
@@ -10532,7 +10570,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::clear_client_setups().expect("clear");
         let post = super::load_setup_state();
         assert!(
-            post.configured_clients.get("claude_code").is_none(),
+            !post.configured_clients.contains_key("claude_code"),
             "claude_code dropped from configured_clients, got: {:?}",
             post.configured_clients
         );
@@ -12535,11 +12573,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("--stop"));
         let settings = std::fs::read_to_string(claude_settings_path()).unwrap();
-        assert!(
-            settings.contains(&claude_remote_control_stop_command()),
-            "{settings}"
-        );
-        assert!(settings.contains("\"Stop\""), "{settings}");
+        let hooks: Value = serde_json::from_str(&settings).unwrap();
+        for (event, phase) in [("Stop", "--stop"), ("UserPromptSubmit", "--cancel")] {
+            assert_eq!(
+                hooks["hooks"][event][0]["hooks"][0]["command"],
+                claude_remote_control_hook_command(phase),
+                "{settings}"
+            );
+        }
+        // Runs on every prompt, so it must not flash a status line.
+        assert!(hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+            .get("statusMessage")
+            .is_none());
         let (changed, _) = ensure_claude_remote_control_command().expect("reinstall");
         assert!(changed.is_empty(), "idempotent: {changed:?}");
 
@@ -12595,26 +12640,27 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .expect("run script");
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
-        let stop = |session_id: &str| {
+        let hook = |phase: &str, session_id: &str| {
             use std::io::Write;
             let mut proc = crate::proc::command("sh")
                 .arg(&script)
-                .arg("--stop")
+                .arg(phase)
                 .env("HOME", home.path())
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .spawn()
-                .expect("run stop hook");
+                .expect("run hook");
             proc.stdin
                 .take()
                 .unwrap()
-                .write_all(
-                    format!(r#"{{"session_id": "{session_id}", "hook_event_name": "Stop", "stop_hook_active": false}}"#)
-                        .as_bytes(),
-                )
+                .write_all(format!(r#"{{"session_id": "{session_id}"}}"#).as_bytes())
                 .unwrap();
-            assert!(proc.wait().unwrap().success());
+            let out = proc.wait_with_output().unwrap();
+            assert!(out.status.success());
+            // UserPromptSubmit stdout would be injected into the prompt.
+            assert!(out.stdout.is_empty(), "{phase} printed output");
         };
+        let stop = |session_id: &str| hook("--stop", session_id);
         let marker_dir = home.path().join(".headroom/remote-control");
         let exit_file = marker_dir.join("exit-sid-123");
 
@@ -12653,6 +12699,19 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             child.try_wait().unwrap().is_none(),
             "no timed exit while the Stop hook is registered"
         );
+
+        // A new prompt means the user interrupted the confirming turn (Esc skips
+        // Stop): the pending exit is dropped and the next Stop kills nothing.
+        hook("--cancel", "sid-123");
+        assert!(!exit_file.exists());
+        stop("sid-123");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "cancelled restart fired"
+        );
+        run(HEADROOM_ANTHROPIC_BASE_URL, "ttys999");
+        assert!(exit_file.exists());
 
         // A Stop for some other session leaves it alone.
         stop("sid-other");
@@ -12719,6 +12778,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         }
         let status = status.unwrap_or_else(|| {
             let _ = child.kill();
+            let _ = child.wait();
             panic!("timed exit did not fire without the Stop hook")
         });
         assert_eq!(status.signal(), Some(libc::SIGTERM));
