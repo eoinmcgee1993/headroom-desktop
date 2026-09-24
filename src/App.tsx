@@ -7791,7 +7791,7 @@ export default function App() {
                             {plan.billingLines[1]}
                           </span>
                         </div>
-                        {plan.reversionLine && !activeHeadroomPlanId ? (
+                        {plan.reversionLine ? (
                           <p className="upgrade-plan-card__reversion">{plan.reversionLine}</p>
                         ) : null}
                       </div>

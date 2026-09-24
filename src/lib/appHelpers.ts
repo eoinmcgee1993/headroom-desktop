@@ -729,11 +729,29 @@ export function getUpgradePlans(
       max20x: "$199"
     };
     const withAppsumoPricing = (plan: UpgradePlan): UpgradePlan => {
-      if (upgradeAction !== "appsumo") {
+      if (upgradeAction !== "appsumo" && upgradeAction !== "checkout") {
         return plan;
       }
       if (plan.id === activeHeadroomPlanId) {
         return { ...plan, centeredPriceLabel: "lifetime plan • via AppSumo" };
+      }
+      if (upgradeAction === "checkout") {
+        // Deal over: a higher tier is a Polar subscription, and the server
+        // attaches a forever discount worth the lifetime tier they already own
+        // (Appsumo::UpgradeCredit in headroom-web), so they pay the difference.
+        const owned = activeHeadroomPlanId as "pro" | "max5x" | "max20x" | null;
+        const target = planPrice(plan.id as "pro" | "max5x" | "max20x", billingPeriod).fullCents;
+        const ownedCents = owned ? planPrice(owned, billingPeriod).fullCents : 0;
+        if (!owned || !(target > ownedCents) || !plan.ctaLabel.startsWith("Upgrade")) {
+          return plan;
+        }
+        return {
+          ...plan,
+          price: formatCents(target - ownedCents),
+          originalPrice: planPrice(plan.id as "pro" | "max5x" | "max20x", billingPeriod).full,
+          saleBadge: `${Math.round((ownedCents / target) * 100)}% off forever`,
+          reversionLine: `You own ${upgradePlanIntentLabel(owned)} for life, so you pay only the difference`
+        };
       }
       const oneTime = APPSUMO_LIFETIME_PRICES[plan.id as "pro" | "max5x" | "max20x"];
       return {
