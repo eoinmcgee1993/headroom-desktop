@@ -26,10 +26,10 @@ export default [
       // Hooks called conditionally or in a loop. Near-zero false positives and
       // the failure mode is a corrupted hook order, so this one blocks CI.
       "react-hooks/rules-of-hooks": "error",
-      // Missing/incorrect dependency arrays. Warn, not error: several effects
-      // here intentionally omit deps to run once, so a clean run is not the
-      // goal -- reading the new entries when one appears is.
-      "react-hooks/exhaustive-deps": "warn",
+      // Missing/incorrect dependency arrays. An error since the run went clean
+      // (2026-09-24): every intentional omission carries a disable comment with
+      // its reason, so a new warning is a stale closure until shown otherwise.
+      "react-hooks/exhaustive-deps": "error",
     },
   },
 ];

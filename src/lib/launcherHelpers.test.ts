@@ -312,7 +312,7 @@ describe("launcher helpers", () => {
 describe("idle marking and row order", () => {
   const row = (clientId: string, state: "processing" | "verified" | "idle" = "processing") => ({
     clientId,
-    name: clientId === "codex" ? "ChatGPT" : "Claude Code",
+    name: clientId === "codex" ? "ChatGPT Codex" : "Claude Code",
     state,
     message: ""
   });

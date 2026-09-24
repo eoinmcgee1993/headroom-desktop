@@ -31,6 +31,7 @@ import {
   hasEnabledConnector,
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
+  providerSpentTokens,
   percent1,
   savingsRate,
   sortClientConnectors
@@ -477,7 +478,7 @@ describe("mergeProviderSavingsForDisplay", () => {
         compressibleTokensSent: null
       },
       {
-        label: "ChatGPT",
+        label: "ChatGPT Codex",
         estimatedSavingsUsd: 0.04,
         estimatedTokensSaved: 40,
         actualCostUsd: 0.16,
@@ -675,6 +676,25 @@ describe("allTimeCacheHitPair", () => {
     expect(pair!.compressedPct).toBeCloseTo(66.67, 2);
   });
 
+  it("prices lifetime reads at the ratio of exactly priced buckets", () => {
+    // Buckets billed reads at 0.025x list: $0.25 read cost per $9.75 discount.
+    const priced = [
+      { cacheSavingsUsd: 9.75, cacheReadCostUsd: 0.25 },
+      { cacheSavingsUsd: 5, cacheReadCostUsd: null }
+    ];
+    const pair = allTimeCacheHitPair(breakdown, 4, priced);
+    const direct = cacheHitPair([
+      {
+        cacheSavingsUsd: breakdown.cacheSavingsUsd,
+        cacheReadCostUsd: (9 * 0.25) / 9.75,
+        actualCostUsd: breakdown.totalInputCostUsd,
+        estimatedSavingsUsd: 4
+      }
+    ]);
+    expect(pair).toEqual(direct);
+    expect(pair!.compressedPct).toBeLessThan(allTimeCacheHitPair(breakdown, 4)!.compressedPct);
+  });
+
   it("is null without cache coverage, whatever the dollars say", () => {
     // cacheReadTokens is the existence signal: no reads means no hit rate to
     // report, even though cacheSavingsUsd would divide fine.
@@ -748,5 +768,30 @@ describe("outputReductionForWindow", () => {
     expect(
       outputReductionForWindow([{ outputSampledTokensSaved: 0, outputBaselineTokens: 0 }])
     ).toBeNull();
+  });
+});
+
+describe("providerSpentTokens", () => {
+  it("splits the bar's new-input tokens by each connector's own estimate", () => {
+    // Sampled hour: the bar is exact new input (900), not the dollar-share sum (1200).
+    const rows = providerSpentTokens(
+      [
+        { totalTokensSent: 10_000, compressibleTokensSent: 800 },
+        { totalTokensSent: 2_000, compressibleTokensSent: 400 }
+      ],
+      { totalTokensSent: 12_000, compressibleTokensSent: 900 }
+    );
+    expect(rows).toEqual([600, 300]);
+  });
+
+  it("falls back to the bucket share when a connector has no per-provider reads", () => {
+    const rows = providerSpentTokens(
+      [
+        { totalTokensSent: 10_000, compressibleTokensSent: 800 },
+        { totalTokensSent: 2_000, compressibleTokensSent: null }
+      ],
+      { totalTokensSent: 12_000, compressibleTokensSent: 1_200 }
+    );
+    expect(rows).toEqual([1_000, 200]);
   });
 });

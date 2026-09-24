@@ -21,6 +21,7 @@ mod storage;
 mod tool_manager;
 mod upstream_override;
 mod usage_counters;
+mod vscode_statusbar;
 mod wsl_probe;
 
 /// Cross-module lock for tests that repoint $HOME / $CODEX_HOME. Env vars are
@@ -502,7 +503,7 @@ fn onboarding_recovery_copy(any_connector_enabled: bool) -> (&'static str, &'sta
     if any_connector_enabled {
         return (
             "Headroom isn't seeing any traffic",
-            "Setup finished, but no Claude Code or ChatGPT requests have come through yet. \
+            "Setup finished, but no Claude Code or ChatGPT Codex requests have come through yet. \
              Restart your terminal or editor so they pick up the new settings.",
         );
     }
@@ -1106,19 +1107,15 @@ async fn restart_app(app: AppHandle) {
     {
         match current_app_bundle_path() {
             Some(bundle) => {
-                let quoted = shell_quote_path(&bundle);
-                // The relauncher runs AFTER this process exits, so the Rust
-                // logger is gone by the time `open` runs. Have the script append
-                // its own outcome (open's exit code) to the desktop log so a
-                // field failure is diagnosable instead of silent. A non-zero rc
-                // points at the launch itself (Gatekeeper, App Translocation,
-                // a missing/stale bundle); rc=0 with no relaunch points at the
-                // freshly-installed build crashing on its own startup.
-                let log_quoted = shell_quote_path(&logging::log_path());
+                // Pending now; the helper marks attempted right before its
+                // `open`. The next launch's `report_unfinished_restart` reads both.
+                let base = storage::app_data_dir();
+                storage::mark_restart_pending(&base, env!("CARGO_PKG_VERSION"));
                 log::info!("restart_app: relaunching via `open -n` against bundle {bundle:?}");
-                spawn_relauncher(&format!(
-                    "/usr/bin/open -n {quoted}; rc=$?; \
-                     echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {quoted} exited rc=$rc (alive=$alive)\" >> {log_quoted}"
+                spawn_relauncher(&macos_relaunch_snippet(
+                    &bundle,
+                    &storage::restart_attempted_path(&base),
+                    &logging::log_path(),
                 ));
             }
             None => {
@@ -1150,7 +1147,6 @@ async fn restart_app(app: AppHandle) {
     #[cfg(target_os = "macos")]
     {
         app.exit(0);
-        return;
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1228,6 +1224,27 @@ fn shell_quote_path(path: &std::path::Path) -> String {
     // ', which we close-escape-open. Safe against spaces / special chars in
     // the bundle path (e.g. `/Applications/Headroom RC.app`).
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The relauncher runs AFTER this process exits, so the Rust logger is gone by
+/// the time `open` runs. The script appends its own outcome (open's exit code)
+/// to the desktop log so a field failure is diagnosable instead of silent. A
+/// non-zero rc points at the launch itself (Gatekeeper, App Translocation, a
+/// missing/stale bundle); rc=0 with no relaunch points at the freshly-installed
+/// build crashing on its own startup.
+#[cfg(target_os = "macos")]
+fn macos_relaunch_snippet(
+    bundle: &std::path::Path,
+    attempted: &std::path::Path,
+    log: &std::path::Path,
+) -> String {
+    let quoted = shell_quote_path(bundle);
+    let attempted = shell_quote_path(attempted);
+    let log_quoted = shell_quote_path(log);
+    format!(
+        "touch {attempted}; /usr/bin/open -n {quoted}; rc=$?; echo $rc > {attempted}; \
+         echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {quoted} exited rc=$rc (alive=$alive)\" >> {log_quoted}"
+    )
 }
 
 /// Spawns a detached shell that waits for THIS process to die (so the
@@ -1344,6 +1361,21 @@ fn relauncher_script(pid: u32, expect: &str, launch: &str) -> String {
     )
 }
 
+/// Moves `bundle` into `~/.Trash` (renamed if the name is taken) and logs the
+/// outcome, since it runs after the Rust logger is gone.
+#[cfg(target_os = "macos")]
+fn macos_trash_snippet(bundle: &std::path::Path, log: &std::path::Path) -> String {
+    let quoted = shell_quote_path(bundle);
+    let log_quoted = shell_quote_path(log);
+    format!(
+        "base=$(basename {quoted}); \
+         dest=\"$HOME/.Trash/$base\"; \
+         if [ -e \"$dest\" ]; then dest=\"$HOME/.Trash/${{base%.app}} $(date +%s).app\"; fi; \
+         mv -f {quoted} \"$dest\"; rc=$?; \
+         echo \"$(date '+%Y-%m-%d %H:%M:%S') uninstall: mv {quoted} -> $dest exited rc=$rc (alive=$alive)\" >> {log_quoted}"
+    )
+}
+
 /// Best-effort: schedule the running `.app` bundle to be moved to the user's
 /// Trash once this process exits. Returns the bundle path that was scheduled,
 /// or `None` if there is no enclosing bundle, it is App-Translocated, or the
@@ -1375,8 +1407,6 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
         return None;
     }
 
-    let quoted = shell_quote_path(&bundle);
-    let log_quoted = shell_quote_path(&logging::log_path());
     // The same wait-then-act helper the relaunch path uses, which buys the
     // uninstall the two things this hand-rolled copy was missing: a shell that
     // survives our exit (one killed with us leaves the bundle sitting there,
@@ -1385,15 +1415,7 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
     let cmd = relauncher_script(
         std::process::id(),
         &relauncher_expect_name(),
-        &format!(
-            "base=$(basename {quoted}); \
-         dest=\"$HOME/.Trash/$base\"; \
-         if [ -e \"$dest\" ]; then dest=\"$HOME/.Trash/${{base%.app}} $(date +%s).app\"; fi; \
-         mv -f {quoted} \"$dest\"; rc=$?; \
-             echo \"$(date '+%Y-%m-%d %H:%M:%S') uninstall: mv {quoted} -> $dest exited rc=$rc (alive=$alive)\" >> {log_quoted}",
-            quoted = quoted,
-            log_quoted = log_quoted,
-        ),
+        &macos_trash_snippet(&bundle, &logging::log_path()),
     );
     match spawn_detached(&cmd) {
         Ok(()) => {
@@ -2023,7 +2045,7 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
         BootstrapFailureKind::SslInterception
     } else if is_ssl_library_conflict_signal(&haystack) {
         BootstrapFailureKind::SslLibraryConflict
-    } else if is_app_control_signal(&haystack) {
+    } else if is_app_control_signal(&haystack) || is_blocked_runtime_dll_signal(&haystack) {
         BootstrapFailureKind::AppControlBlocked
     } else if haystack.contains("No usable temporary directory found") {
         BootstrapFailureKind::NoUsableTempDir
@@ -2121,6 +2143,14 @@ pub(crate) fn is_blocked_runtime_dll_signal(text: &str) -> bool {
     // specific, so tolerating the shorter phrasing costs no precision.
     const MARKER: &str = "dll load failed ";
     let lower = text.to_ascii_lowercase();
+    // A refused `_ctypes` that never says so: pip's vendored platformdirs takes
+    // its registry fallback only when `import ctypes` raised, and swallows that
+    // ImportError. The fallback then dies on a missing Shell Folders value, so
+    // this frame in a traceback IS the block (RUST-8K/GR: the retry on a host
+    // whose first attempt was refused `select`, told "check your internet").
+    if lower.contains("get_win_folder_from_registry") {
+        return true;
+    }
     let mut rest = lower.as_str();
     while let Some(idx) = rest.find(MARKER) {
         let after = &rest[idx + MARKER.len()..];
@@ -3201,6 +3231,7 @@ pub(crate) struct UpgradeBootDiagnostics {
 /// Report a runtime upgrade failure to Sentry. `phase` is "install" for
 /// pip/smoke-test failures, "boot_validation" for "installed but didn't boot".
 /// `outcome` is the BootValidationOutcome label when phase is boot_validation.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_upgrade_failure(
     err: &anyhow::Error,
     restored: bool,
@@ -4227,7 +4258,7 @@ async fn create_headroom_checkout_session(
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
 ) -> Result<String, String> {
-    let url = pricing::create_checkout_session(subscription_tier.clone(), billing_period)?;
+    let url = pricing::create_checkout_session(subscription_tier, billing_period)?;
     analytics::track_event(
         &app,
         "checkout_started",
@@ -4244,7 +4275,7 @@ async fn change_headroom_subscription_plan(
     subscription_tier: HeadroomSubscriptionTier,
     billing_period: BillingPeriod,
 ) -> Result<(), String> {
-    pricing::change_subscription_plan(subscription_tier.clone(), billing_period)?;
+    pricing::change_subscription_plan(subscription_tier, billing_period)?;
     analytics::track_event(
         &app,
         "subscription_plan_changed",
@@ -5192,8 +5223,8 @@ async fn apply_client_setup(
                             "proxy_reachable",
                             result.verification.proxy_reachable.into(),
                         );
-                        scope.set_extra("checks", json!(result.verification.checks).into());
-                        scope.set_extra("failures", json!(result.verification.failures).into());
+                        scope.set_extra("checks", json!(result.verification.checks));
+                        scope.set_extra("failures", json!(result.verification.failures));
                         scope.set_extra("already_configured", result.already_configured.into());
                     },
                     || {
@@ -6520,7 +6551,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .on_window_event(|window, event| handle_window_event(window, event))
+        .on_window_event(handle_window_event)
         .manage(state)
         .manage(PendingAppUpdate(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
@@ -6941,7 +6972,7 @@ fn parse_updater_endpoint_list(raw: &str) -> Result<Vec<reqwest::Url>, String> {
             Vec::new()
         }
     } else {
-        raw.split(|ch| ch == ',' || ch == '\n')
+        raw.split([',', '\n'])
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
@@ -7046,8 +7077,8 @@ fn check_headroom_learn_prereqs(
         // step still needs an LLM, which the desktop runs through the Claude
         // Code or Codex CLI (no API keys are available in the app env).
         LearnAgent::Opencode | LearnAgent::Grok => {
-            if !prereq.claude_cli_available
-                && !(prereq.codex_cli_available && prereq.codex_logged_in)
+            if !(prereq.claude_cli_available
+                || (prereq.codex_cli_available && prereq.codex_logged_in))
             {
                 return Err(
                     "Headroom Learn analyzes sessions with the Claude Code or a signed-in Codex CLI - install one to enable it for this agent.".into(),
@@ -7560,7 +7591,7 @@ fn learn_step_label(line: &str) -> Option<String> {
         let model = model.trim_end_matches('.');
         let backend = match model {
             "claude-cli" => "Claude Code",
-            "codex-cli" => "ChatGPT",
+            "codex-cli" => "ChatGPT Codex",
             "gemini-cli" => "Gemini",
             other => other,
         };
@@ -7656,7 +7687,7 @@ fn execute_headroom_learn_run(
                 .to_string();
             (path, name)
         }
-        LearnAgent::Codex => ("codex", "ChatGPT sessions".to_string()),
+        LearnAgent::Codex => ("codex", "ChatGPT Codex sessions".to_string()),
         LearnAgent::Opencode => ("opencode", "OpenCode sessions".to_string()),
         LearnAgent::Grok => ("grok", "Grok sessions".to_string()),
     };
@@ -8330,13 +8361,13 @@ fn debounced_tray_runtime_visual(
 
     if raw_visual == TrayRuntimeVisual::Unhealthy {
         *unhealthy_streak = unhealthy_streak.saturating_add(1);
-        if *unhealthy_streak < UNHEALTHY_DEBOUNCE_TICKS {
-            if matches!(
+        if *unhealthy_streak < UNHEALTHY_DEBOUNCE_TICKS
+            && matches!(
                 last_non_booting,
                 Some(TrayRuntimeVisual::Running) | Some(TrayRuntimeVisual::Disconnected)
-            ) {
-                return last_non_booting.expect("checked Some above");
-            }
+            )
+        {
+            return last_non_booting.expect("checked Some above");
         }
         return TrayRuntimeVisual::Unhealthy;
     }
@@ -8454,13 +8485,13 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     ),
                     TrayRuntimeVisual::Running => "Headroom — active".into(),
                     TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code or ChatGPT running normally)".into()
+                        "Headroom — paused (Claude Code or ChatGPT Codex running normally)".into()
                     }
                     TrayRuntimeVisual::Unhealthy => {
                         "Headroom — proxy unreachable, attempting restart".into()
                     }
                     TrayRuntimeVisual::Disconnected => {
-                        "Headroom — Claude Code or ChatGPT not connected".into()
+                        "Headroom — Claude Code or ChatGPT Codex not connected".into()
                     }
                     TrayRuntimeVisual::Off => "Headroom — off".into(),
                 };
@@ -8562,7 +8593,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
-                                    "Claude Code or ChatGPT is disconnected — open Headroom to re-enable.",
+                                    "Claude Code or ChatGPT Codex is disconnected — open Headroom to re-enable.",
                                     Some("connectors".into()),
                                 );
                             }
@@ -9042,7 +9073,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 // top of this tick, so the flip above does not change what is
                 // reported.
                 capture_watchdog_give_up(
-                    &*state,
+                    &state,
                     consecutive_failures,
                     bypass_active,
                     backend_readyz_outcome,
@@ -9161,7 +9192,7 @@ fn build_tray_runtime_icons() -> anyhow::Result<TrayRuntimeIcons> {
 fn to_grayscale_strength(rgba: &[u8], strength: f32) -> Vec<u8> {
     let s = strength.clamp(0.0, 1.0);
     let mut out = rgba.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0 {
         let r = pixel[0] as f32;
         let g = pixel[1] as f32;
         let b = pixel[2] as f32;
@@ -9182,7 +9213,7 @@ fn tint_toward_accent(rgba: &[u8], strength: f32) -> Vec<u8> {
     const ACCENT: [f32; 3] = [80.0, 210.0, 100.0];
     let s = strength.clamp(0.0, 1.0);
     let mut out = rgba.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0 {
         if pixel[3] == 0 {
             continue;
         }
@@ -11592,6 +11623,39 @@ mod tests {
     }
 
     #[test]
+    fn classify_bootstrap_failure_flags_a_silently_blocked_ctypes_as_app_control() {
+        // RUST-8K/GR verbatim tail: the retry on a host whose first attempt
+        // was refused `select`. `_ctypes` was refused too, but platformdirs
+        // swallows that ImportError, so only its registry fallback shows.
+        let err: anyhow::Error = make_command_failure(
+            "  File \"~\\AppData\\Local\\Temp\\tmpaqz25su7\\pip-25.0.1-py3-none-any.whl\\pip\\_vendor\\platformdirs\\windows.py\", line 209, in get_win_folder_from_registry\n\
+             FileNotFoundError: [WinError 2] The system cannot find the file specified",
+        )
+        .into();
+        assert_eq!(
+            classify_bootstrap_failure(&err).as_str(),
+            "app_control_blocked"
+        );
+        // Localized DLL verdict with no code: startup already read it as a
+        // block, bootstrap told the user to check their internet.
+        let localized: anyhow::Error = make_command_failure(
+            "ImportError: DLL load failed while importing select: \
+             Eine Anwendungssteuerungsrichtlinie hat diese Datei blockiert.",
+        )
+        .into();
+        assert_eq!(
+            classify_bootstrap_failure(&localized).as_str(),
+            "app_control_blocked"
+        );
+        assert_eq!(
+            crate::tool_manager::pip_failure_category(&crate::tool_manager::compact_pip_failure(
+                &err
+            )),
+            "app-control"
+        );
+    }
+
+    #[test]
     fn classify_bootstrap_failure_flags_a_source_build_as_source_build() {
         // Unreachable while every install passes `--only-binary=:all:`; if it
         // fires, a wheel we promised is missing for this machine.
@@ -11846,11 +11910,11 @@ Some unrelated content.
         let result = read_applied_patterns_for_project(tmp.path().to_str().unwrap());
         let titles: Vec<&str> = result.claude_md.iter().map(|s| s.title.as_str()).collect();
         assert!(
-            titles.iter().any(|t| *t == "First Section"),
+            titles.contains(&"First Section"),
             "first section parsed, got titles: {titles:?}"
         );
         assert!(
-            titles.iter().any(|t| *t == "Second Section"),
+            titles.contains(&"Second Section"),
             "second section parsed, got titles: {titles:?}"
         );
         let first = result
@@ -13667,22 +13731,16 @@ Some unrelated content.
     #[test]
     fn relauncher_script_is_valid_shell() {
         use std::path::Path;
-        let app = super::shell_quote_path(Path::new("/Applications/Headroom RC.app"));
-        let log = super::shell_quote_path(Path::new("/Users/a b/Library/Logs/Headroom/d.log"));
-        let marker = super::shell_quote_path(Path::new("/Users/a b/Headroom/restart-attempted"));
+        let app = Path::new("/Applications/Headroom RC.app");
+        let log = Path::new("/Users/a b/Library/Logs/Headroom/d.log");
+        // The production snippets themselves, so the test cannot drift from them.
         let launches = [
-            // macOS
-            format!(
-                "touch {marker}; /usr/bin/open -n {app}; rc=$?; \
-                 echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {app} exited rc=$rc (alive=$alive)\" >> {log}"
+            super::macos_relaunch_snippet(
+                app,
+                Path::new("/Users/a b/Headroom/restart-attempted"),
+                log,
             ),
-            // Linux
-            format!(
-                "{app} >/dev/null 2>&1 & \
-                 new=$!; sleep 1; \
-                 if kill -0 $new 2>/dev/null; then st=running; else st=DIED; fi; \
-                 echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: launched {app} pid $new ($st, alive=$alive)\" >> {log}"
-            ),
+            super::macos_trash_snippet(app, log),
         ];
         for launch in launches {
             let script = super::relauncher_script(4242, "headroom", &launch);

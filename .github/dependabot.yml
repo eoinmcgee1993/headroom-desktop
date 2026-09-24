@@ -1,0 +1,16 @@
+# Workflow actions are pinned to commit SHAs (release jobs hold the updater
+# signing key and Apple/Azure signing secrets, so a moved tag must not run
+# there). This keeps the pins current: one grouped PR a month, into staging.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: staging
+    schedule:
+      interval: monthly
+    # Minor/patch bumps share one PR; a major (checkout v4 -> v5) gets its own
+    # so a breaking change is reviewed on its own.
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]

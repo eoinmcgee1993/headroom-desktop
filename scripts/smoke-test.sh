@@ -427,14 +427,24 @@ snap=$(curl -s "http://127.0.0.1:6767/stats" | jq -c --arg ts "$(date +"%Y-%m-%d
   before: (.summary.compression.total_tokens_before // 0),
   claude: (.requests.by_model // {} | with_entries(select(.key|startswith("claude-"))) | to_entries | map(.value) | add // 0)
 }' 2>/dev/null)
-if [ -z "$snap" ] || [ "$snap" = "null" ]; then
-  row FAIL "7 optimizing" "/stats unreadable"
-elif [ -f "$BASELINE" ]; then
+stale=0
+if [ -n "$snap" ] && [ "$snap" != "null" ] && [ -f "$BASELINE" ]; then
   o=$(cat "$BASELINE")
   d() { echo "$1" | jq -r ".$2"; }
   dc=$(( $(d "$snap" claude) - $(d "$o" claude) ))
   db=$(( $(d "$snap" before) - $(d "$o" before) ))
   dr=$(( ($(d "$snap" frozen) + $(d "$snap" compressed)) - ($(d "$o" frozen) + $(d "$o" compressed)) ))
+  # /stats counters only grow within one backend boot, so a negative delta
+  # means the baseline predates a restart (a leftover file from an earlier pass
+  # scored -28 reqs / -3.1M tok_before on 0.9.22-rc.6). Re-baseline, not FAIL.
+  [ "$dc" -lt 0 ] || [ "$db" -lt 0 ] || [ "$dr" -lt 0 ] && stale=1
+fi
+if [ -z "$snap" ] || [ "$snap" = "null" ]; then
+  row FAIL "7 optimizing" "/stats unreadable"
+elif [ "$stale" = 1 ]; then
+  echo "$snap" > "$BASELINE"
+  row PENDING "7 optimizing" "baseline predates a backend restart; re-saved. Do a ~1400-line Read, then re-run with --quick"
+elif [ -f "$BASELINE" ]; then
   # Cache side of the trade, per request from the proxy log since the baseline.
   # cost.py's cache_savings_usd is net of the write premium over a window and
   # moves both ways by design, so it cannot be a gate (doc, check 7).

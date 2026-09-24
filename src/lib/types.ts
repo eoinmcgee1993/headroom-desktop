@@ -645,6 +645,9 @@ export interface HeadroomAccountProfile {
    * works: the AppSumo account page while the deal is live, a fresh
    * checkout afterwards. Absent for everyone else. */
   upgradeAction?: "appsumo" | "checkout" | null;
+  /** The AppSumo lifetime tier under a Polar subscription bought on top of
+   * it. Absent unless they hold both. */
+  appsumoLifetimeTier?: HeadroomSubscriptionTier | null;
   inviteCode?: string | null;
   acceptedInvitesCount: number;
   inviteBonusPercent: number;

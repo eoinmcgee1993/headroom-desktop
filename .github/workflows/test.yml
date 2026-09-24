@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Linux system dependencies
         run: |
@@ -32,7 +32,7 @@ jobs:
             wget
 
       - name: Set up Python 3.12 (runtime lock checks)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
@@ -59,10 +59,10 @@ jobs:
 
       - name: Injected sitecustomize.py is valid Python
         # SITECUSTOMIZE_PY is ~2,300 lines of Python held in a Rust raw string,
-        # carrying every vendored upstream patch. The Rust tests that run it all
-        # self-skip without a managed runtime, which is every CI runner, so a
-        # syntax error there is invisible to the entire suite and lands as
-        # eleven silently inert vendors on user machines.
+        # carrying every vendored upstream patch. The Rust tests that run it
+        # self-skip without a managed runtime, which this runner lacks (only
+        # test-macos builds one), so without this a syntax error is invisible
+        # here and lands as silently inert vendors on user machines.
         run: python scripts/check-sitecustomize-syntax.py
 
       - name: Linux runtime lock resolves to wheels only
@@ -81,21 +81,21 @@ jobs:
           -r src-tauri/python/headroom-linux-requirements.lock
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: nextest
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             src-tauri -> target
@@ -104,7 +104,7 @@ jobs:
         run: npm ci
 
       - name: React hook rules
-        # rules-of-hooks only (exhaustive-deps is a warning and does not fail):
+        # rules-of-hooks and exhaustive-deps, both errors (eslint.config.js):
         # a conditionally-called hook corrupts hook order for every hook after
         # it, and App.tsx has 78 useEffect calls with nothing else checking them.
         run: npm run lint
@@ -118,30 +118,30 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: nextest
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             src-tauri -> target
 
       - name: Set up Python 3.12 (runtime lock check)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
@@ -178,12 +178,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python 3.12 (runtime lock check)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+          # The wheel-test runtime below downloads ~2 GB of locked wheels.
+          cache: pip
+          cache-dependency-path: src-tauri/python/headroom-requirements.lock
 
       - name: macOS arm64 runtime lock resolves to wheels only
         # Same gate as the Linux and Windows jobs, for the primary platform.
@@ -198,24 +201,36 @@ jobs:
           -r src-tauri/python/headroom-requirements.lock
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          # Pinned: the clippy step below fails on warnings, and every new
+          # stable adds lints (1.98 turned rc3 and rc4 red on seven sites).
+          # Bump deliberately, after `cargo +<new> clippy --all-targets` is clean.
+          toolchain: 1.98.1
+          components: clippy
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: nextest
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             src-tauri -> target
+
+      - name: Clippy (warnings are errors)
+        # The 2026-09-21 restart-marker writer was never called, and the only
+        # signal was a `never used` warning nobody saw. macOS only: that is
+        # where most cfg-gated code lives and where it can be reproduced locally.
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Install frontend dependencies
         run: npm ci
@@ -225,6 +240,38 @@ jobs:
         # the release workflows, so a macOS-only regression reached staging
         # green and surfaced at release cut. Gate it on PR instead.
         run: ./scripts/verify-release.sh
+
+      - name: Vendored patches against the pinned wheel
+        # Every *_behaves_against_the_installed_wheel test self-skips without
+        # a managed runtime, which is every runner, so until this step CI had
+        # never executed a single vendor in SITECUSTOMIZE_PY. Build the runtime
+        # the app builds (this platform's lock, then the pinned wheel, both
+        # --no-deps) and run them for real. Any skip fails the step: under the
+        # exact pin every vendor must bind, and after a wheel bump a skip is
+        # the cue to drop or re-pin that vendor (Wheel Bump Rules, CLAUDE.md).
+        # macOS because the truststore vendor runs only here and on Windows.
+        # One test at a time: each spawns a Python probe with sub-second
+        # deadlines, and fourteen at once on a 3-vCPU runner starve the
+        # responses-budget probe into a false "fixed request still timed out".
+        shell: bash
+        env:
+          HEADROOM_DATA_DIR: ${{ runner.temp }}/headroom-wheel
+        run: |
+          pin=$(sed -n 's/^pub(crate) const HEADROOM_PINNED_VERSION: &str = "\(.*\)";/\1/p' src-tauri/src/tool_manager.rs)
+          test -n "$pin"
+          python -m venv "$HEADROOM_DATA_DIR/headroom/runtime/venv"
+          py="$HEADROOM_DATA_DIR/headroom/runtime/venv/bin/python"
+          "$py" -m pip install --quiet --no-deps --only-binary=:all: \
+            --find-links https://github.com/gglucass/headroom-desktop/releases/expanded_assets/vendor-wheels-v1 \
+            -r src-tauri/python/headroom-requirements.lock
+          "$py" -m pip install --quiet --no-deps --only-binary=:all: "headroom-ai==$pin"
+          cargo test --manifest-path src-tauri/Cargo.toml --lib against_the_installed_wheel \
+            -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/wheel-tests.log"
+          if grep 'skipping:' "$RUNNER_TEMP/wheel-tests.log"; then
+            echo "::error::a vendor test skipped against headroom-ai $pin"
+            exit 1
+          fi
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/wheel-tests.log"
 
   macos-intel-lock:
     # Intel Macs still receive the shipped app: the release builds
@@ -240,10 +287,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python 3.12 (runtime lock check)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
@@ -264,11 +311,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: cargo-audit
       - name: Rust dependency advisories
@@ -284,7 +331,7 @@ jobs:
           --ignore RUSTSEC-2026-0194
           --ignore RUSTSEC-2026-0195
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm

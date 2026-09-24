@@ -4,8 +4,9 @@
 `SITECUSTOMIZE_PY` in tool_manager.rs is ~2,300 lines of Python stored as a Rust
 raw string. Nothing in the Rust build looks inside it, and every functional test
 that exercises it (`*_behaves_against_the_installed_wheel`) opens with
-`if !python.exists() { return; }` -- true on every CI runner, so all of them
-report green without executing a line of it.
+`if !python.exists() { return; }` -- true on every CI runner except test-macos's
+wheel step, so everywhere else they report green without executing a line of it.
+This check is the fast, runtime-free half; the wheel step is the functional one.
 
 A syntax error therefore ships: the file writes fine, the interpreter fails the
 sitecustomize import, and all eleven vendored patches go inert with no error

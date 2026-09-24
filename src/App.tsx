@@ -95,6 +95,7 @@ import {
   type UpgradePlan,
   introSaleBadgeLabel,
   isTierDowngrade,
+  ownedForLife,
   matchesSubscriptionPeriod,
   forgoneSavingsLabel,
   paybackLabel,
@@ -149,6 +150,7 @@ import {
   hasNeverScanned,
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
+  providerSpentTokens,
   percent1,
   sortClientConnectors,
   startOfDay,
@@ -294,7 +296,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   serena: {
     whatItDoes:
-      "Installing sets up Serena in Headroom's managed runtime and registers it as an MCP server in Claude Code and ChatGPT (Codex). Your agent gets symbol-level code tools - find a definition, read just that function, edit in place - instead of reading whole files. Its tool definitions add some tokens to every request, so the net saving is largest in bigger codebases. A serena MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
+      "Installing sets up Serena in Headroom's managed runtime and registers it as an MCP server in Claude Code and ChatGPT Codex. Your agent gets symbol-level code tools - find a definition, read just that function, edit in place - instead of reading whole files. Its tool definitions add some tokens to every request, so the net saving is largest in bigger codebases. A serena MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
     installing: "Installing Serena and registering its MCP server...",
     installed: "Serena installed. Restart open agent sessions to pick up the new MCP server.",
     uninstalling: "Removing Serena and its MCP registrations...",
@@ -305,7 +307,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   "codebase-memory": {
     whatItDoes:
-      "Installing downloads the codebase-memory binary into Headroom's managed runtime, verifies it, and registers it as an MCP server in Claude Code and ChatGPT (Codex). It indexes a repo into a persistent knowledge graph - functions, classes, call chains - so your agent answers structure questions from the graph instead of re-reading files. Ask your agent to index a repo the first time you use it there. Indexes are stored inside Headroom's app data, a codebase-memory MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
+      "Installing downloads the codebase-memory binary into Headroom's managed runtime, verifies it, and registers it as an MCP server in Claude Code and ChatGPT Codex. It indexes a repo into a persistent knowledge graph - functions, classes, call chains - so your agent answers structure questions from the graph instead of re-reading files. Ask your agent to index a repo the first time you use it there. Indexes are stored inside Headroom's app data, a codebase-memory MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
     installing: "Downloading Codebase Memory and registering its MCP server...",
     installed: "Codebase Memory installed. Restart open agent sessions, then ask your agent to index the repo.",
     uninstalling: "Removing Codebase Memory, its indexes, and its MCP registrations...",
@@ -316,7 +318,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   context7: {
     whatItDoes:
-      "Installing verifies the Context7 MCP server runs via npx, then registers it in Claude Code and ChatGPT (Codex). Your agent can pull current, version-specific documentation for the libraries you use instead of guessing APIs from stale training data - docs are fetched only when it asks, so the idle cost is just its tool definitions. A context7 MCP entry you configured yourself is never touched, and the registration is removed cleanly when you uninstall it or Headroom. Requires Node.js on PATH.",
+      "Installing verifies the Context7 MCP server runs via npx, then registers it in Claude Code and ChatGPT Codex. Your agent can pull current, version-specific documentation for the libraries you use instead of guessing APIs from stale training data - docs are fetched only when it asks, so the idle cost is just its tool definitions. A context7 MCP entry you configured yourself is never touched, and the registration is removed cleanly when you uninstall it or Headroom. Requires Node.js on PATH.",
     installing: "Verifying Context7 with npx and registering its MCP server...",
     installed: "Context7 installed. Restart open agent sessions to pick up the new MCP server.",
     uninstalling: "Removing the Context7 MCP registrations...",
@@ -329,9 +331,9 @@ const addonCopy: Record<string, AddonCopy> = {
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
-    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Claude Code disables Remote Control behind any proxy, so Headroom also installs a /remote-control command that, after confirming, restarts the current session without Headroom.",
+    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Claude Code disables Remote Control behind any proxy, so Headroom also installs a /remote-control command that, after confirming, restarts the current session without Headroom. In the VS Code panel the command is /remote-control-headroom, and the restart happens in place.",
   codex:
-    "The ChatGPT app (previously Codex), its IDE extension, and the Codex CLI share ~/.codex/config.toml. Headroom adds a managed provider there and an OPENAI_BASE_URL shell export, plus a SessionStart guard that warns when routing breaks. In the Codex CLI, run /hooks once to review and trust the guard (and again after it changes).",
+    "Codex in the ChatGPT app, the Codex IDE extension, and the Codex CLI share ~/.codex/config.toml. Headroom adds a managed provider there and an OPENAI_BASE_URL shell export, plus a SessionStart guard that warns when routing breaks. In the Codex CLI, run /hooks once to review and trust the guard (and again after it changes).",
   grok_build:
     "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom.",
   opencode:
@@ -370,7 +372,7 @@ const connectorUnavailableReasons: Record<string, string> = {
   claude_code:
     "Claude Code was not detected. Install the Claude Code CLI and restart Headroom. Note that Claude Code inside the Claude desktop app cannot be optimized: Anthropic's desktop app does not use the CLI's configuration, so Headroom never sees its requests. That is their design decision, not something Headroom can configure around.",
   codex:
-    "The Codex CLI was not detected. Headroom can still configure the ChatGPT app (previously Codex) and its IDE extension; install the CLI only if you also want terminal use.",
+    "The Codex CLI was not detected. Headroom can still configure Codex in the ChatGPT app and the Codex IDE extension; install the CLI only if you also want terminal use.",
   grok_build:
     "Grok Build was not detected. Install Grok Build and restart Headroom.",
   opencode:
@@ -409,7 +411,7 @@ const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnecto
   },
   {
     clientId: "codex",
-    name: "ChatGPT",
+    name: "ChatGPT Codex",
     installed: false,
     enabled: false,
     verified: false
@@ -629,8 +631,7 @@ function SavingsChartTooltip({
   // cached Claude Code hour shrank a concurrent ChatGPT's spend to a fraction
   // and showed an 82% rate that was really ~25%).
   const costScale = point.actualCostUsd > 0 ? point.compressibleCostUsd / point.actualCostUsd : 1;
-  const tokenScale =
-    point.totalTokensSent > 0 ? point.compressibleTokensSent / point.totalTokensSent : 1;
+  const spentTokens = providerSpentTokens(providerSavings, point);
 
   return (
     <div className="savings-chart__tooltip">
@@ -638,7 +639,7 @@ function SavingsChartTooltip({
       {providerSavings.length > 0
         ? // Hourly buckets carry per-provider attribution: show Saved/Spent per
           // connector instead of the bucket total (which would be redundant).
-          providerSavings.map((provider) => (
+          providerSavings.map((provider, index) => (
             <div className="savings-chart__tooltip-group" key={provider.label}>
               <span className="savings-chart__tooltip-label">{provider.label}</span>
               <span className="savings-chart__tooltip-item">
@@ -669,9 +670,7 @@ function SavingsChartTooltip({
                   ? `Spent ${currencyExact(
                       provider.compressibleCostUsd ?? provider.actualCostUsd * costScale
                     )}`
-                  : `Spent ${compactNumber(
-                      provider.compressibleTokensSent ?? provider.totalTokensSent * tokenScale
-                    )} tokens`}
+                  : `Spent ${compactNumber(spentTokens[index])} tokens`}
               </span>
             </div>
           ))
@@ -1474,8 +1473,8 @@ function AddonCard({
           <p className="addon-card__notice">{unavailableReason}</p>
         ) : managedExternally ? (
           <p className="addon-card__notice">
-            You installed this yourself, so Headroom leaves it alone. Manage it with
-            /plugin in your agent.
+            You installed this yourself, so Headroom leaves it alone. Manage it with the
+            tool you installed it with.
           </p>
         ) : null}
         {busy && busyLabel ? (
@@ -1877,6 +1876,10 @@ export default function App() {
   // Staleness in the "became verified" direction is harmless: that only happens
   // once traffic flows, and the no-traffic branch requires zero requests.
   const connectorsRef = useRef<ClientConnectorStatus[] | undefined>(undefined);
+  // Latest dashboard for refreshPricingStatus, which the pricing poll and the
+  // pricing-refreshed listener call from closures made at mount, when
+  // `dashboard` was still mockDashboard (no daily savings, so no unsaved label).
+  const dashboardRef = useRef<DashboardState>(mockDashboard);
   // A forced setup-stall alert skips the day throttle, so this keeps it to one
   // showing per app run instead of resurrecting itself on every poll.
   const forcedSetupStallFiredRef = useRef(false);
@@ -1921,7 +1924,8 @@ export default function App() {
     pricingStatus?.introOffer ?? null,
     pricingStatus?.account?.subscriptionRenewalCents,
     pricingStatus?.account?.subscriptionRenewalEndsAt,
-    pricingStatus?.account?.upgradeAction
+    pricingStatus?.account?.upgradeAction,
+    pricingStatus?.account?.appsumoLifetimeTier
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -1975,6 +1979,7 @@ export default function App() {
 
   useEffect(() => {
     dashboardSignatureRef.current = serializeState(dashboard);
+    dashboardRef.current = dashboard;
   }, [dashboard]);
 
   useEffect(() => {
@@ -2260,6 +2265,7 @@ export default function App() {
     return () => {
       active = false;
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, []);
 
   useEffect(() => {
@@ -2366,6 +2372,7 @@ export default function App() {
       active = false;
       detach();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- windowLabel is fixed for the life of the window
   }, [bootstrapping]);
 
   useEffect(() => {
@@ -2424,6 +2431,7 @@ export default function App() {
       return;
     }
     void refreshConnectors();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, launcherStage]);
 
   // Paywall stage: poll pricing status so the tier recommendation appears as
@@ -2463,6 +2471,7 @@ export default function App() {
       setLauncherStage("install");
       void handleBootstrap();
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- fires when subscriptionActive flips; the tier only labels the analytics event
   }, [windowLabel, launcherStage, pricingStatus?.account?.subscriptionActive]);
 
   useEffect(() => {
@@ -2602,6 +2611,7 @@ export default function App() {
     };
     // Deliberately not keyed on the rows themselves: this marks them, so
     // re-running on every change would loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- see above
   }, [windowLabel, launcherStage]);
 
   // Warm the bootstrap download cache while the user is still signing up.
@@ -2693,15 +2703,22 @@ export default function App() {
 
   useEffect(() => {
     if (!isLastScreen || awaitingFirstPrompt) return;
+    // Deps change, so cleanup can run before onFocusChanged resolves; without
+    // `active` that late listener would leak and keep hiding the window on blur.
+    let active = true;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
         if (!focused) triggerHide();
       })
       .then((fn) => {
-        unlisten = fn;
+        if (active) unlisten = fn;
+        else fn();
       });
-    return () => unlisten?.();
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, [isLastScreen, awaitingFirstPrompt]);
 
   const optimizationBlocked = pricingStatus
@@ -2813,6 +2830,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, forcedSetupStall]);
 
   useEffect(() => {
@@ -2826,6 +2844,7 @@ export default function App() {
     }, 3000);
 
     return () => window.clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, trayWindowFocused]);
 
   // Poll runtime status while the install step is visible so the Continue
@@ -2848,6 +2867,7 @@ export default function App() {
     }, 1000);
 
     return () => window.clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, launcherStage, runtimeStatus?.running, runtimeStatus?.bypassed]);
 
   useEffect(() => {
@@ -2894,6 +2914,7 @@ export default function App() {
       });
 
     return () => unlisten?.();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel]);
 
   useEffect(() => {
@@ -2901,6 +2922,7 @@ export default function App() {
       return;
     }
     void refreshAppUpdateConfiguration();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [startupReady]);
 
   useEffect(() => {
@@ -2946,6 +2968,7 @@ export default function App() {
       window.clearTimeout(timer);
       window.clearInterval(interval);
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on appUpdateConfig, the state checkForAppUpdate reads
   }, [appUpdateConfig, startupReady, windowLabel]);
 
   useEffect(() => {
@@ -2976,6 +2999,7 @@ export default function App() {
     void invoke<boolean>("get_autostart_enabled")
       .then((enabled) => setAutostartEnabled(enabled))
       .catch(() => setAutostartEnabled(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- runs on entering settings; appUpdateConfig only skips a reload, refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [activeView]);
 
   useEffect(() => {
@@ -3146,6 +3170,7 @@ export default function App() {
       active = false;
       window.clearTimeout(timeout);
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, trayWindowFocused, heavyTabEverOpened, activeView]);
 
   useEffect(() => {
@@ -3186,6 +3211,7 @@ export default function App() {
       return;
     }
     void Promise.all([refreshConnectors(), refreshRuntimeStatus()]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [activeView, startupReady]);
 
   useEffect(() => {
@@ -3207,6 +3233,7 @@ export default function App() {
       return;
     }
     void Promise.all([refreshClaudeProjects(), refreshHeadroomLearnPrereq()]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [activeView]);
 
   useEffect(() => {
@@ -3280,6 +3307,7 @@ export default function App() {
     }
 
     void refreshClaudeProjects();
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [
     headroomLearnStatus.finishedAt,
     headroomLearnStatus.lastRunAt,
@@ -3349,7 +3377,7 @@ export default function App() {
     learnAgentCount > 1
       ? "Headroom learns from your coding agents' sessions. When an agent repeats a mistake, Headroom updates that agent's memory so it doesn't happen again."
       : codexLearnEnabled
-        ? "Headroom learns from your ChatGPT (Codex) sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
+        ? "Headroom learns from your ChatGPT Codex sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
         : opencodeLearnEnabled || grokLearnEnabled
           ? "Headroom learns from your agent's sessions. When it repeats a mistake, Headroom updates the agent's memory so it doesn't happen again."
           : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.local.md.";
@@ -3505,6 +3533,7 @@ export default function App() {
     autoDisabledByGateRef.current.add(target.clientId);
     persistAutoDisabledByGate();
     void toggleConnector(target, false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors/pricingStatus change, so toggleConnector is fresh when it acts
   }, [connectors, connectorsBusy, pricingStatus]);
 
   // Companion to the auto-disable effect above: when the pricing gate
@@ -3529,6 +3558,7 @@ export default function App() {
       return;
     }
     void toggleConnector(target, true);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors/pricingStatus change, so toggleConnector is fresh when it acts
   }, [connectors, connectorsBusy, pricingStatus]);
 
   useEffect(() => {
@@ -3898,6 +3928,13 @@ export default function App() {
           !appUpdateInstallBusyRef.current
         ) {
           void installAvailableUpdate(patch.availableUpdate, { quiet: true });
+          // A quiet install that fails every time (read-only or translocated
+          // bundle) would leave this build unannounced forever. The stale
+          // reminder is its fallback: the clock starts now, and a staged
+          // update stops the ticks that could fire it.
+          if (!(await getCurrentWindow().isVisible().catch(() => false))) {
+            await maybeFireStaleAppUpdateNotification(patch.availableUpdate);
+          }
           return;
         }
         const windowVisible = await getCurrentWindow().isVisible().catch(() => false);
@@ -4064,7 +4101,7 @@ export default function App() {
       if (!status.optimizationAllowed || status.codex?.optimizationAllowed === false) {
         const bytes = await invoke<number>("get_gated_bypass_bytes").catch(() => 0);
         setGatedBypassBytes(bytes);
-        unsavedLabel = unsavedWhileBlockedLabel(bytes, dashboard.dailySavings);
+        unsavedLabel = unsavedWhileBlockedLabel(bytes, dashboardRef.current.dailySavings);
       }
       void maybeFireTrialNotifications(status);
       void maybeFireUrgentPricingNotifications(status, unsavedLabel);
@@ -4241,7 +4278,7 @@ export default function App() {
     const runKey = agent === "claude" ? (projectPath ?? "") : agent;
     const displayName =
       agent === "codex"
-        ? "ChatGPT sessions"
+        ? "ChatGPT Codex sessions"
         : agent === "opencode"
           ? "OpenCode sessions"
           : agent === "grok"
@@ -4950,7 +4987,8 @@ export default function App() {
   // rows now, so the three are comparable.
   const cachePairAllTime = allTimeCacheHitPair(
     dashboard.savingsBreakdown,
-    dashboard.savingsBreakdown?.compressionSavingsUsd ?? 0
+    dashboard.savingsBreakdown?.compressionSavingsUsd ?? 0,
+    dashboard.dailySavings
   );
   // Same pair for the shorter windows, from the buckets that carry cache
   // coverage (backend history checkpoints; local-tracker buckets and days
@@ -5413,7 +5451,7 @@ export default function App() {
         <div className="intro-shell__agents" aria-label="Supported coding agents">
           {[
             ["claude_code", "Claude Code"],
-            ["codex", "ChatGPT"],
+            ["codex", "ChatGPT Codex"],
             ["grok_build", "Grok Build"],
             ["opencode", "OpenCode"]
           ].map(([clientId, label]) => (
@@ -6364,7 +6402,7 @@ export default function App() {
   const clampScopeLabel = tierMismatch
     ? [
         tierMismatch.claudeUndercovered ? "Claude" : null,
-        tierMismatch.codexUndercovered ? "ChatGPT" : null,
+        tierMismatch.codexUndercovered ? "ChatGPT Codex" : null,
       ]
         .filter(Boolean)
         .join(" and ") || tierRecommendationSourceLabel(tierMismatch.recommendedSource)
@@ -7337,7 +7375,7 @@ export default function App() {
                               >
                                 <div className="optimize-project-row__main">
                                   <span className="optimize-project-row__name">
-                                    <strong>ChatGPT sessions</strong>
+                                    <strong>ChatGPT Codex sessions</strong>
                                     <small>
                                       <span
                                         className="optimize-project-row__training"
@@ -7761,7 +7799,7 @@ export default function App() {
                             {plan.billingLines[1]}
                           </span>
                         </div>
-                        {plan.reversionLine && !activeHeadroomPlanId ? (
+                        {plan.reversionLine ? (
                           <p className="upgrade-plan-card__reversion">{plan.reversionLine}</p>
                         ) : null}
                       </div>
@@ -7769,7 +7807,9 @@ export default function App() {
                     {plan.purchaseInfo ? (
                       <p className="upgrade-plan-card__purchase-info">
                         {plan.purchaseInfo.cancelAtPeriodEnd && plan.purchaseInfo.endsOn
-                          ? `Ends on ${plan.purchaseInfo.endsOn}`
+                          ? pricingStatus?.account?.appsumoLifetimeTier
+                            ? `Back to lifetime ${upgradePlanIntentLabel(pricingStatus.account.appsumoLifetimeTier)} on ${plan.purchaseInfo.endsOn}`
+                            : `Ends on ${plan.purchaseInfo.endsOn}`
                           : isActivePlan && pendingPlanChangeInfo
                           ? // The stored renewal price is this plan's, and this
                             // plan is not the one that renews.
@@ -7999,7 +8039,7 @@ export default function App() {
                       connector.clientId === "claude_code"
                         ? "Claude Code connection"
                         : connector.clientId === "codex"
-                          ? "ChatGPT connection"
+                          ? "ChatGPT Codex connection"
                           : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
@@ -8283,7 +8323,8 @@ export default function App() {
                 <summary>Advanced</summary>
                 <div className="advanced-section__body">
                   <UpstreamPanel />
-                  <ClaudeStatuslinePanel />
+                  {/* The statusline is not installed on Windows (untested there). */}
+                  {!navigator.userAgent.includes("Windows") && <ClaudeStatuslinePanel />}
                 </div>
               </details>
 
@@ -8380,7 +8421,7 @@ export default function App() {
             >
               <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                 <h3>How savings are calculated</h3>
-                <p>Headroom intercepts and prunes all inputs before sending them to Claude or ChatGPT.</p>
+                <p>Headroom intercepts and prunes all inputs before sending them to Claude or ChatGPT Codex.</p>
                 <p>Savings = tokens removed &times; API token prices.</p>
                 {dashboard.savingsBreakdown ? (
                   <div className="savings-breakdown">
@@ -8525,7 +8566,7 @@ export default function App() {
                 <ul className="api-key-guide">
                   <li>
                     Restore the original routing config for every agent Headroom set
-                    up (Claude Code, ChatGPT, Grok Build, OpenCode) and remove the export
+                    up (Claude Code, ChatGPT Codex, Grok Build, OpenCode) and remove the export
                     block from your shell profile
                   </li>
                   <li>
@@ -8613,6 +8654,10 @@ export default function App() {
               (isPeriodSwitch &&
                 currentBillingPeriod === "annual" &&
                 pendingPlanChange.billingPeriod === "monthly");
+            // A tier their AppSumo lifetime license covers: the server ends the
+            // Polar subscription at period end instead of billing the tier.
+            const lifetimeTier = pricingStatus?.account?.appsumoLifetimeTier;
+            const backToLifetime = ownedForLife(lifetimeTier, pendingPlanChange.toTier);
             const renewsOnLabel = pricingStatus?.account?.subscriptionRenewsAt
               ? new Date(pricingStatus.account.subscriptionRenewsAt).toLocaleDateString(undefined, {
                   year: "numeric",
@@ -8629,6 +8674,15 @@ export default function App() {
               >
                 <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                   <h3>Confirm your {action}</h3>
+                  {backToLifetime ? (
+                    <p>
+                      Your <strong>{upgradePlanIntentLabel(pendingPlanChange.fromTier)}</strong> subscription
+                      ends{renewsOnLabel ? ` on ${renewsOnLabel}` : " at the end of the term"} and you go back to
+                      the lifetime <strong>{upgradePlanIntentLabel(lifetimeTier ?? null)}</strong> plan you own
+                      on AppSumo. No charge today, and nothing to pay after that.
+                    </p>
+                  ) : (
+                  <>
                   <p>
                     You'll {action} from your{" "}
                     <strong>{currentPriceLabel}</strong>{" "}
@@ -8648,6 +8702,8 @@ export default function App() {
                         }, and the new plan starts then. No charge and no credit today.`
                       : "You'll be charged a prorated amount today for the remaining time in your current billing period, with your existing discount applied."}
                   </p>
+                  </>
+                  )}
                   {/* A period switch moves the renewal date, so the stored one
                       would be stale here; a deferred change already named it. */}
                   {!isPeriodSwitch && !isDeferred && pricingStatus?.account?.subscriptionRenewsAt ? (

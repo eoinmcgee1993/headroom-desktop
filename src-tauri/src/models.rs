@@ -1035,6 +1035,7 @@ impl CodexPlanTier {
 ///   seats, and both halves of that name already price at Max x5.
 /// - Unknown -> Max x20: plan claim couldn't be decoded, so pitch the top plan
 ///   rather than under-recommend.
+///
 /// Free carries no recommendation (already on the no-cost tier).
 pub fn headroom_tier_for_codex_plan(plan: &CodexPlanTier) -> Option<HeadroomSubscriptionTier> {
     match plan {
@@ -1248,6 +1249,12 @@ pub struct HeadroomAccountProfile {
     /// None for everyone else, keeping normal routing.
     #[serde(default)]
     pub upgrade_action: Option<String>,
+    /// The AppSumo lifetime tier behind a Polar subscription they bought on
+    /// top of it. Every tier at or below it is theirs for free: switching to
+    /// one ends the Polar subscription at period end instead of billing it.
+    /// None without both.
+    #[serde(default)]
+    pub appsumo_lifetime_tier: Option<HeadroomSubscriptionTier>,
     /// Server-computed pitch tier for API-billed orgs: their usage band mapped
     /// onto subscriber plans (>=5:1 savings ROI clamp), from
     /// user_daily_savings. None for everyone else - local recommendation

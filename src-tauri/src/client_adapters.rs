@@ -66,7 +66,7 @@ const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
     },
     ManagedClientSpec {
         id: "codex",
-        name: "ChatGPT",
+        name: "ChatGPT Codex",
     },
     ManagedClientSpec {
         id: "grok_build",
@@ -211,12 +211,25 @@ pub fn is_statusline_disabled() -> bool {
 /// Code routes through Headroom, remove it otherwise.
 pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
     let mut state = load_setup_state();
+    let was_disabled = state.statusline_disabled;
     state.statusline_disabled = !enabled;
     write_setup_state(&state)?;
-    if enabled && is_claude_code_enabled() {
-        ensure_claude_statusline()?;
+    let applied = if enabled && is_claude_code_enabled() {
+        ensure_claude_statusline().map(|_| ())
     } else {
-        remove_claude_statusline()?;
+        remove_claude_statusline()
+    };
+    // A failed apply keeps the old flag: the toggle reverts in the UI, and the
+    // flag must not claim the opposite of what is installed after a restart.
+    if let Err(err) = applied {
+        state.statusline_disabled = was_disabled;
+        let _ = write_setup_state(&state);
+        return Err(err);
+    }
+    // The editor status bar extension goes with it, but only here and on
+    // Headroom's uninstall: remove_claude_statusline also runs on every quit.
+    if !enabled {
+        crate::vscode_statusbar::uninstall()?;
     }
     Ok(())
 }
@@ -541,7 +554,12 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
     }
 
     let configured_at = Utc::now().to_rfc3339();
-    state.configured_clients.insert(state_id, configured_at);
+    state
+        .configured_clients
+        .insert(state_id.clone(), configured_at);
+    state
+        .setup_versions
+        .insert(state_id, env!("CARGO_PKG_VERSION").to_string());
     write_setup_state(&state)?;
 
     let already_configured = changed_files.is_empty();
@@ -691,7 +709,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
 
             if shell_ok {
                 checks.push(
-                    "Found ChatGPT (Codex) OPENAI_BASE_URL export in managed shell block.".into(),
+                    "Found ChatGPT Codex OPENAI_BASE_URL export in managed shell block.".into(),
                 );
             }
             if toml_ok {
@@ -868,14 +886,40 @@ pub fn repair_codex_missing_bearer_now() -> bool {
     repair_client_setup_now("codex_cli")
 }
 
+/// The version that last wrote this client's managed files, when it is not
+/// the running one. Pre-stamp installs (no entry) count as stale: they are
+/// exactly the installs an update left behind.
+fn stale_setup_version(client_id: &str) -> Option<String> {
+    let state = load_setup_state();
+    let state_id = normalized_setup_id(client_id);
+    if !state.configured_clients.contains_key(state_id) {
+        return None;
+    }
+    let written_by = state
+        .setup_versions
+        .get(state_id)
+        .cloned()
+        .unwrap_or_else(|| "an earlier build".to_string());
+    (written_by != env!("CARGO_PKG_VERSION")).then_some(written_by)
+}
+
 /// One client's verify -> re-apply -> re-verify cycle, unthrottled. Returns
 /// true only when the re-verify comes back clean.
 fn repair_client_setup_now(client_id: &str) -> bool {
-    let broken = match verify_client_setup(client_id) {
+    let mut broken = match verify_client_setup(client_id) {
         Ok(verification) => verification.failures,
         // Ids verification doesn't support are ids repair can't help.
         Err(_) => Vec::new(),
     };
+    // Managed files written by another app version verify fine (the routing
+    // export is still there) but are a different generation from what this
+    // build's scripts and hooks expect. Re-apply so an update carries them.
+    if let Some(stale) = stale_setup_version(client_id) {
+        broken.push(format!(
+            "Managed files were written by Headroom {stale}; running {}.",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
     if broken.is_empty() {
         return false;
     }
@@ -998,7 +1042,7 @@ pub(crate) fn newest_claude_transcript_mtime(projects_root: &Path) -> Option<Sys
             if visited > LOCAL_ACTIVITY_WALK_CAP {
                 return newest;
             }
-            if !entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+            if entry.path().extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
             if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
@@ -1212,6 +1256,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
                 .get(normalized_setup_id(client_id))
                 .cloned();
             remove_vscode_connector_keys(preserved.as_deref())?;
+            let _ = remove_vscode_process_wrapper();
         }
         "grok_build" => disable_grok_build()?,
         "opencode" => disable_opencode(&state)?,
@@ -1239,6 +1284,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // Consumed: the provider is back in the user's config now. The next
             // apply re-captures it if Headroom is re-enabled.
             state.preserved_base_urls.remove("codex_cli");
+            state.setup_versions.remove("codex_cli");
         }
         "opencode" => {
             state.configured_clients.remove("opencode");
@@ -1249,6 +1295,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // apply re-captures them if Headroom is re-enabled.
             state.preserved_base_urls.remove("opencode_anthropic");
             state.preserved_base_urls.remove("opencode_openai");
+            state.setup_versions.remove("opencode");
         }
         _ => {
             let state_id = normalized_setup_id(client_id);
@@ -1256,6 +1303,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             state.remembered_clients.remove(state_id);
             state.managed_shell_files.remove(state_id);
             state.remembered_shell_files.remove(state_id);
+            state.setup_versions.remove(state_id);
             // Consumed: the URL is back in the user's config now. The next
             // apply re-captures it if Headroom is re-enabled.
             state.preserved_base_urls.remove(state_id);
@@ -1550,6 +1598,9 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     }
     if let Err(err) = remove_claude_statusline() {
         log::warn!("cleanup: removing Claude statusline failed: {err}");
+    }
+    if let Err(err) = crate::vscode_statusbar::uninstall() {
+        log::warn!("cleanup: removing the editor status bar extension failed: {err}");
     }
 
     // Restore the open-source Claude Code plugin hook if we neutralized it.
@@ -1937,14 +1988,13 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
             current = mcp_table_name(line);
         }
         let Some(name) = current else { continue };
-        if name == "headroom" {
-            owned.insert(name.to_string());
-        } else if line
-            .split_once('=')
-            .is_some_and(|(key, _)| key.trim() == "command")
-            && toml_line_value(line)
-                .as_deref()
-                .is_some_and(mcp_command_in_headroom_footprint)
+        if name == "headroom"
+            || (line
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "command")
+                && toml_line_value(line)
+                    .as_deref()
+                    .is_some_and(mcp_command_in_headroom_footprint))
         {
             owned.insert(name.to_string());
         }
@@ -2300,6 +2350,13 @@ struct ClientSetupState {
     /// true, client setup skips installing it.
     #[serde(default)]
     statusline_disabled: bool,
+    /// App version that last wrote each client's managed files (scripts,
+    /// hooks, shell blocks, commands), keyed by client state id. An update
+    /// changes what setup writes but nothing re-ran setup, so users kept
+    /// mismatched generations (0.9.22-rc.4 wrapper with an rc.5 script refused
+    /// every Remote Control restart). The self-heal re-applies on a mismatch.
+    #[serde(default)]
+    setup_versions: BTreeMap<String, String>,
 }
 
 fn is_configured(state: &ClientSetupState, client_id: &str) -> bool {
@@ -2469,8 +2526,24 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // metadata can reach disk ahead of the data, so a crash/power loss leaves a
     // zero-length file where valid state used to be -- which is what the
     // "corrupt (expected value at line 1 column 1)" reports are (RUST-8P).
+    // Keep the replaced file's mode. The tmp is created with the umask default
+    // (0644), so without this a rewrite silently widened a 0600 settings.json
+    // holding ANTHROPIC_AUTH_TOKEN to readable by every other local account.
+    #[cfg(unix)]
+    let keep_mode = std::fs::metadata(path).ok().map(|meta| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(meta.permissions().mode() & 0o777)
+    });
     let mut write_tmp = || -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp_path)?;
+        // Before any byte lands, so the contents never sit under a wider mode.
+        // Best effort: a filesystem without Unix modes (vfat, some network
+        // mounts) rejects fchmod, and there the mode meant nothing anyway;
+        // failing the write over it would break every caller.
+        #[cfg(unix)]
+        if let Some(perms) = &keep_mode {
+            let _ = f.set_permissions(perms.clone());
+        }
         std::io::Write::write_all(&mut f, contents)?;
         f.sync_all()
     };
@@ -2645,7 +2718,7 @@ fn configure_shell_block(
     let mut backups = Vec::new();
 
     for file in shell_targets {
-        let (did_change, backup) = upsert_managed_block(&file, block_id, block_body)?;
+        let (did_change, backup) = upsert_managed_block(file, block_id, block_body)?;
         if did_change {
             changed.push(file.display().to_string());
             if let Some(path) = backup {
@@ -3194,7 +3267,26 @@ fn ensure_claude_settings_hook(
 /// `None` removes the key -- used when the override is cleared, so a stale
 /// provider token cannot outlive the endpoint it belonged to.
 pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
-    set_or_clear_claude_settings_env("ANTHROPIC_AUTH_TOKEN", token)
+    set_or_clear_claude_settings_env("ANTHROPIC_AUTH_TOKEN", token)?;
+    // settings.json now holds a provider credential, and Claude Code creates it
+    // 0644 inside a home that other local accounts can traverse (macOS homes
+    // are 0750 group staff, and every user is in staff). Only the owner, who
+    // runs Claude Code, needs to read it. atomic_write keeps the mode after.
+    // Logged, not returned: the token is already written by now, and failing
+    // the save would leave it applied behind an error the user cannot act on.
+    #[cfg(unix)]
+    if token.is_some_and(|token| !token.is_empty()) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = claude_settings_path();
+        let narrowed = std::fs::metadata(&path).and_then(|meta| {
+            let mode = meta.permissions().mode() & 0o700;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+        });
+        if let Err(err) = narrowed {
+            log::warn!("could not make {} owner-only: {err}", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// Set one `env` key in the client's settings, or remove it when the value is
@@ -3929,10 +4021,7 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
     let mut out = content.to_string();
-    loop {
-        let Some(start_idx) = out.find(&start) else {
-            break;
-        };
+    while let Some(start_idx) = out.find(&start) {
         let Some(end_idx) = out[start_idx..].find(&end).map(|rel| start_idx + rel) else {
             break;
         };
@@ -5360,6 +5449,20 @@ fn register_guard_hook_entries(
     status_message: &str,
     events: &[(&str, Option<&str>)],
 ) -> Result<(Vec<String>, Vec<String>)> {
+    let hooks: Vec<_> = events
+        .iter()
+        .map(|&(event, matcher)| (event, matcher, command, status_message))
+        .collect();
+    register_hook_entries(hooks_path, &hooks)
+}
+
+/// `register_guard_hook_entries` for hooks that differ per event, in one write
+/// and one backup. Each is `(event, matcher, command, status_message)`; an
+/// empty status message is omitted.
+fn register_hook_entries(
+    hooks_path: &Path,
+    hooks: &[(&str, Option<&str>, &str, &str)],
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut content = if hooks_path.exists() {
         let raw = std::fs::read_to_string(hooks_path)
             .with_context(|| format!("reading {}", hooks_path.display()))?;
@@ -5380,7 +5483,7 @@ fn register_guard_hook_entries(
         .ok_or_else(|| anyhow!("unable to write hooks settings"))?;
 
     let mut mutated = false;
-    for &(event, matcher) in events {
+    for &(event, matcher, command, status_message) in hooks {
         if !hooks_obj.get(event).map(Value::is_array).unwrap_or(false) {
             hooks_obj.insert(event.to_string(), Value::Array(Vec::new()));
         }
@@ -5394,12 +5497,14 @@ fn register_guard_hook_entries(
         {
             continue;
         }
-        let handler = serde_json::json!({
+        let mut handler = serde_json::json!({
             "type": "command",
             "command": command,
             "timeout": 10,
-            "statusMessage": status_message,
         });
+        if !status_message.is_empty() {
+            handler["statusMessage"] = status_message.into();
+        }
         let mut entry = serde_json::Map::new();
         if let Some(matcher) = matcher {
             entry.insert("matcher".into(), Value::String(matcher.to_string()));
@@ -5905,7 +6010,10 @@ fn claude_remote_control_command_path() -> PathBuf {
 
 /// The managed `claude_code` shell block: the routing export plus a `claude`
 /// function that (a) adds the api.anthropic.com settings layer whenever the
-/// user passes `--remote-control`, and (b) after the wrapped session exits,
+/// user passes `--remote-control`, (b) tags the session with
+/// `HEADROOM_RC_RELAUNCHER=tty` so the script only ends sessions this function
+/// will bring back (an alias, `command claude` or a shell opened before setup
+/// skips it), and (c) after the wrapped session exits,
 /// resumes the session named in the relaunch marker for this tty. The marker
 /// is written by the /remote-control script (`build_claude_remote_control_script`),
 /// keyed by tty so two terminals never swap sessions, and ignored once stale so
@@ -5918,12 +6026,12 @@ fn claude_remote_control_command_path() -> PathBuf {
 /// installer writes one) is a parse error that aborts the rest of the rc file.
 fn claude_code_shell_block() -> String {
     let function = r#"claude() {
-  case " $* " in *" --remote-control "*) set -- --settings '__OVERRIDE__' "$@";; esac
-  command claude "$@"
+  local a; for a in "$@"; do [ "$a" = --remote-control ] && { set -- --settings '__OVERRIDE__' "$@"; break; }; done
+  HEADROOM_RC_RELAUNCHER=tty command claude "$@"
   local rc=$?
-  local m="$HOME/.headroom/remote-control/$(basename "$(tty 2>/dev/null)" 2>/dev/null)"
-  if [ -s "$m" ] && [ -n "$(find "$m" -mmin -2 2>/dev/null)" ]; then
-    local sid; sid=$(cat "$m"); rm -f "$m"
+  local m="$HOME/.headroom/remote-control/$(command basename "$(command tty 2>/dev/null)" 2>/dev/null)"
+  if [ -s "$m" ] && [ -n "$(command find "$m" -mmin -2 2>/dev/null)" ]; then
+    local sid; sid=$(command cat "$m"); command rm -f "$m"
     command claude --settings '__OVERRIDE__' -r "$sid" --remote-control
     return $?
   fi
@@ -5944,54 +6052,439 @@ fn claude_code_shell_block() -> String {
 /// panels: nothing would relaunch it), and otherwise writes the tty-keyed
 /// marker and asks the session to exit from a detached child so the command's
 /// own output lands first.
+fn claude_remote_control_wrapper_path() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("hooks")
+        .join("headroom-claude-wrapper.py")
+}
+
+/// The VS Code extension's Claude process wrapper setting: an executable it
+/// launches the CLI through as `<wrapper> <claude-binary> <args...>`.
+const VSCODE_PROCESS_WRAPPER_KEY: &str = "claudeCode.claudeProcessWrapper";
+
+/// A second command name for the VS Code panel. The panel's input box handles
+/// the exact strings `/remote-control` and `/rc` itself (its own toggle, which
+/// hits the same base-URL gate and fails), so the bare name can never reach a
+/// user command there. Any other name goes to the CLI, which prefers user
+/// commands. The terminal keeps the bare name.
+const CLAUDE_REMOTE_CONTROL_PANEL_COMMAND: &str = "remote-control-headroom";
+
+fn claude_remote_control_panel_command_path() -> PathBuf {
+    home_dir()
+        .join(".claude")
+        .join("commands")
+        .join(format!("{CLAUDE_REMOTE_CONTROL_PANEL_COMMAND}.md"))
+}
+
+fn vscode_user_settings_path() -> PathBuf {
+    home_dir()
+        .join("Library")
+        .join("Application Support")
+        .join("Code")
+        .join("User")
+        .join("settings.json")
+}
+
+/// Process wrapper the VS Code extension launches Claude through. It pipes the
+/// panel's stream-json traffic untouched; when the CLI exits and a fresh
+/// Remote Control relaunch marker exists for its session, it respawns the CLI
+/// on the SAME session with the api.anthropic.com settings layer, replays the
+/// handshake the extension sent at startup (swallowing the duplicate answers),
+/// and asks the new process to start Remote Control. The extension never sees
+/// an exit, so no error card, no manual reopen, no toggle.
+fn build_claude_remote_control_wrapper() -> String {
+    r#"#!/usr/bin/python3
+"""Headroom Claude process wrapper (managed by Headroom Desktop -- do not edit).
+
+The VS Code extension runs `<wrapper> <claude-binary> <args...>` and talks to
+the CLI over stdio (stream-json). This wrapper runs the CLI as a child and pipes
+both directions untouched. When the child exits and a fresh Remote Control
+relaunch marker exists for its session (written by headroom-remote-control.sh
+after the user confirmed), the wrapper respawns the CLI on the SAME session with
+the api.anthropic.com settings layer, replays the control requests that set
+session state (never one-shot actions such as rewind_files, which would undo
+work), asks the new child to start Remote Control, and keeps piping. The
+extension never sees a process exit. Headroom is off for the swapped session.
+The panel shows nothing for the swap, so the answer to that request becomes a
+line in the conversation: Remote Control is active, or it did not start.
+Once the extension closes stdin or signals the wrapper, nothing is respawned.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+HOME = os.path.expanduser("~")
+DIR = os.path.join(HOME, ".headroom", "remote-control")
+OVERRIDE = '{"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com"}}'
+MARKER_MAX_AGE = 60
+# Control requests that carry session state; replayed into a respawned child.
+REPLAYED = ("initialize", "mcp_set_servers", "update_settings")
+RC_REQUEST = "headroom-remote-control"
+
+if len(sys.argv) < 2:
+    sys.exit("usage: headroom-claude-wrapper.py <claude-binary> [args...]")
+binary, args = sys.argv[1], sys.argv[2:]
+
+state = {"child": None, "sid": None, "swallow": set(), "recorded": [], "terminating": False}
+lock = threading.Lock()
+out = sys.stdout.buffer
+inp = sys.stdin.buffer
+
+
+def spawn(extra):
+    return subprocess.Popen(
+        [binary] + args + extra,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        env=dict(os.environ, HEADROOM_RC_RELAUNCHER="wrapper"),
+    )
+
+
+def replayable(msg):
+    if msg.get("type") != "control_request":
+        return False
+    subtype = (msg.get("request") or {}).get("subtype") or ""
+    return subtype in REPLAYED or subtype.startswith("set_")
+
+
+def write_child(line):
+    with lock:
+        child = state["child"]
+    if child is not None and child.stdin is not None:
+        try:
+            child.stdin.write(line)
+            child.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+
+def pump_stdin():
+    while True:
+        line = inp.readline()
+        if not line:
+            break
+        try:
+            if replayable(json.loads(line)):
+                state["recorded"].append(line)
+        except (ValueError, AttributeError):
+            pass
+        write_child(line)
+    state["terminating"] = True
+    with lock:
+        child = state["child"]
+    if child is not None and child.stdin is not None:
+        try:
+            child.stdin.close()
+        except OSError:
+            pass
+
+
+def announce(response):
+    # The panel shows nothing for the swap, so say it in the conversation: the
+    # same system/informational line the CLI emits itself, which the webview
+    # renders as a meta line (display only, not part of the transcript).
+    if response.get("subtype") == "success":
+        url = (response.get("response") or {}).get("session_url")
+        text, level = "Remote Control is now active.", "notice"
+        if url:
+            text += " Continue here, on your phone, or at " + url
+    else:
+        text = "Remote Control did not start: " + (response.get("error") or "unknown error")
+        text, level = text + ". Run /remote-control-headroom to try again.", "warning"
+    line = {"type": "system", "subtype": "informational", "content": text, "level": level,
+            "uuid": str(uuid.uuid4()), "session_id": state["sid"]}
+    return (json.dumps(line) + "\n").encode()
+
+
+def pump_child(child):
+    while True:
+        line = child.stdout.readline()
+        if not line:
+            return
+        try:
+            parsed = json.loads(line)
+            sid = parsed.get("session_id")
+            if sid:
+                state["sid"] = sid
+            if parsed.get("type") == "control_response":
+                rid = (parsed.get("response") or {}).get("request_id")
+                if rid in state["swallow"]:
+                    state["swallow"].discard(rid)
+                    if rid != RC_REQUEST:
+                        continue
+                    line = announce(parsed["response"])
+        except ValueError:
+            pass
+        with lock:
+            try:
+                out.write(line)
+                out.flush()
+            except (BrokenPipeError, OSError):
+                return
+
+
+def resume_marker():
+    sid = state["sid"]
+    if not sid:
+        return None
+    marker = os.path.join(DIR, "resume-" + sid)
+    try:
+        if time.time() - os.stat(marker).st_mtime < MARKER_MAX_AGE:
+            return marker
+    except OSError:
+        pass
+    return None
+
+
+def forward_signal(signum, _frame):
+    state["terminating"] = True
+    with lock:
+        child = state["child"]
+    if child is not None:
+        try:
+            child.send_signal(signum)
+        except OSError:
+            pass
+
+
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, forward_signal)
+
+child = spawn([])
+state["child"] = child
+threading.Thread(target=pump_stdin, daemon=True).start()
+while True:
+    pump = threading.Thread(target=pump_child, args=(child,), daemon=True)
+    pump.start()
+    code = child.wait()
+    pump.join(timeout=5)
+    marker = None if state["terminating"] else resume_marker()
+    if marker is None:
+        # Daemon threads may still hold the stdio buffers; a normal interpreter
+        # shutdown then aborts ("could not acquire lock ... at interpreter
+        # shutdown") and on macOS the process can wedge unkillable.
+        try:
+            out.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        os._exit(code if code is not None else 1)
+    os.remove(marker)
+    child = spawn(["--resume", state["sid"], "--settings", OVERRIDE])
+    with lock:
+        state["child"] = child
+    for line in list(state["recorded"]):
+        try:
+            rid = json.loads(line).get("request_id")
+            if rid:
+                state["swallow"].add(rid)
+        except ValueError:
+            pass
+        write_child(line)
+    state["swallow"].add(RC_REQUEST)
+    request = {
+        "type": "control_request",
+        "request_id": RC_REQUEST,
+        "request": {"subtype": "remote_control", "enabled": True},
+    }
+    write_child((json.dumps(request) + "\n").encode())
+"#
+    .to_string()
+}
+
+/// Point the VS Code extension at the wrapper. macOS only, like every other
+/// VS Code settings write here: the wrapper needs the Unix relaunch script.
+/// Only with a working /usr/bin/python3 (the wrapper's interpreter): without
+/// the Command Line Tools it is a stub that fails, and every panel session
+/// would then fail to start.
+fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
+    if !cfg!(target_os = "macos") {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let settings_path = vscode_user_settings_path();
+    if !settings_path.exists() {
+        // No VS Code user settings at all: nothing launches through us yet, and
+        // creating the file would claim a config the user never made.
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let python_ok = crate::proc::command("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !python_ok {
+        remove_vscode_process_wrapper()?;
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let raw = std::fs::read_to_string(&settings_path)
+        .with_context(|| format!("reading {}", settings_path.display()))?;
+    let obj = parse_json_object(&raw, &settings_path)?;
+    // Already ours, or a wrapper the user configured themselves: never replace.
+    if obj.contains_key(VSCODE_PROCESS_WRAPPER_KEY) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let wrapper = claude_remote_control_wrapper_path().display().to_string();
+    let Some(edited) = edit_vscode_wrapper_key(&raw, &wrapper, true, &settings_path) else {
+        log::warn!(
+            "not setting {VSCODE_PROCESS_WRAPPER_KEY}: {} did not take a clean text edit",
+            settings_path.display()
+        );
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let backup = backup_if_exists(&settings_path)?;
+    atomic_write(&settings_path, edited.as_bytes())?;
+    Ok((
+        vec![settings_path.display().to_string()],
+        backup
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect(),
+    ))
+}
+
+fn remove_vscode_process_wrapper() -> Result<()> {
+    let settings_path = vscode_user_settings_path();
+    if !settings_path.exists() {
+        return Ok(());
+    }
+    let raw = std::fs::read_to_string(&settings_path)
+        .with_context(|| format!("reading {}", settings_path.display()))?;
+    let mut obj = parse_json_object(&raw, &settings_path)?;
+    let wrapper = claude_remote_control_wrapper_path().display().to_string();
+    // A text edit keeps the user's comments and key order; a full rewrite is
+    // the fallback, since a setting left pointing at a deleted wrapper would
+    // stop the panel from starting at all.
+    let edited = match edit_vscode_wrapper_key(&raw, &wrapper, false, &settings_path) {
+        Some(edited) => edited.into_bytes(),
+        None => {
+            if !remove_json_key_if_matches(&mut obj, VSCODE_PROCESS_WRAPPER_KEY, &wrapper) {
+                return Ok(());
+            }
+            serde_json::to_vec_pretty(&Value::Object(obj))
+                .context("serializing VS Code settings after removing the process wrapper")?
+        }
+    };
+    backup_if_exists(&settings_path)?;
+    atomic_write(&settings_path, &edited)
+}
+
+/// Add (or remove) our wrapper key in VS Code's settings.json as a text edit.
+/// The file is hand-maintained JSONC: a serde round trip would sort every key
+/// and strip every comment. The result is re-parsed and must equal the parsed
+/// original plus (minus) exactly that key, or None is returned.
+fn edit_vscode_wrapper_key(raw: &str, wrapper: &str, add: bool, path: &Path) -> Option<String> {
+    let mut expected = parse_json_object(raw, path).ok()?;
+    let value = Value::String(wrapper.to_string());
+    let key = format!("\"{VSCODE_PROCESS_WRAPPER_KEY}\"");
+    let edited = if add {
+        let comma = if expected.is_empty() { "\n" } else { "," };
+        expected.insert(VSCODE_PROCESS_WRAPPER_KEY.to_string(), value.clone());
+        let open = raw.find('{')? + 1;
+        format!(
+            "{}\n    {key}: {value}{comma}{}",
+            &raw[..open],
+            &raw[open..]
+        )
+    } else {
+        if expected.remove(VSCODE_PROCESS_WRAPPER_KEY)? != value {
+            return None;
+        }
+        let at = raw.find(&key)?;
+        let rest = raw[at + key.len()..]
+            .trim_start()
+            .strip_prefix(':')?
+            .trim_start()
+            .strip_prefix(value.to_string().as_str())?;
+        let before = raw[..at].trim_end();
+        match rest.trim_start().strip_prefix(',') {
+            Some(after) => format!("{before}{after}"),
+            None => format!("{}{rest}", before.strip_suffix(',').unwrap_or(before)),
+        }
+    };
+    (parse_json_object(&edited, path).ok()? == expected).then_some(edited)
+}
+
 fn build_claude_remote_control_script() -> String {
     r#"#!/bin/sh
 # Headroom Remote Control relaunch (managed by Headroom Desktop -- do not edit).
 # Claude Code hides /remote-control whenever ANTHROPIC_BASE_URL is not
 # api.anthropic.com, so a Headroom-routed session can never turn it on. This
-# leaves a marker and asks the session to exit; the `claude` shell function
-# Headroom manages then resumes the SAME session by id with the base URL
-# overridden for that one process.
-# Two phases. Without arguments (run by the model's Bash tool after the user
+# asks the session to exit; whatever launched it (the `claude` shell function
+# Headroom manages, or Headroom's VS Code process wrapper, named by
+# HEADROOM_RC_RELAUNCHER) then resumes the SAME session by id with the base URL
+# overridden for that one process. A session nothing will relaunch is never
+# ended: it gets the manual command instead.
+# Three phases. Without arguments (run by the model's Bash tool after the user
 # confirms): record the pending exit. With --stop (Claude Code's Stop hook,
-# fired once the model's turn has ended): perform it. Killing only after the
-# turn ends keeps the transcript clean, so the resumed session shows no
-# "interrupted" turn in the terminal or on the phone.
-if [ "${1:-}" = "--stop" ]; then
+# fired once the model's turn has ended): write the relaunch marker and perform
+# it. Killing only after the turn ends keeps the transcript clean, so the
+# resumed session shows no "interrupted" turn in the terminal or on the phone.
+# With --cancel (UserPromptSubmit): drop it. Esc skips the Stop hook, so
+# without this a restart the user interrupted would fire at the end of their
+# NEXT turn. The markers are only written by --stop, so a cancelled restart
+# leaves nothing that could relaunch a later exit. Must print nothing:
+# UserPromptSubmit stdout is added to the prompt.
+dir="$HOME/.headroom/remote-control"
+case "${1:-}" in --stop|--cancel)
   sid=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-  exit_file="$HOME/.headroom/remote-control/exit-$sid"
+  exit_file="$dir/exit-$sid"
   [ -n "$sid" ] && [ -f "$exit_file" ] || exit 0
-  pid=$(cat "$exit_file"); rm -f "$exit_file"
+  # "<pid> <relauncher>": a tty name, or "wrapper" for the VS Code panel.
+  read -r pid via < "$exit_file"
+  # A record the Stop hook never saw (terminal closed mid-turn) must not end a
+  # resumed session days later, when the pid may be some other claude.
+  fresh=$(find "$exit_file" -mmin -10 2>/dev/null)
+  rm -f "$exit_file"
+  [ "$1" = "--stop" ] && [ -n "$fresh" ] || exit 0
   # Never signal a pid without checking it is still the Claude Code process.
   case "$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)")" in
-    claude|claude.exe) kill -TERM "$pid";;
+    claude|claude.exe) ;;
+    *) exit 0;;
   esac
-  exit 0
-fi
+  case "$via" in
+    wrapper) : > "$dir/resume-$sid";;
+    ?*) printf '%s\n' "$sid" > "$dir/$via";;
+  esac
+  kill -TERM "$pid"
+  exit 0;;
+esac
 case "${ANTHROPIC_BASE_URL:-}" in
   ""|https://api.anthropic.com*)
     echo "Remote Control is already available in this session: type /rc."
     exit 0;;
 esac
+override='__OVERRIDE__'
 if [ -z "${CLAUDE_CODE_SESSION_ID:-}" ] || [ -z "${CLAUDE_PID:-}" ]; then
-  echo "Could not identify this session. Exit it, then run: claude -r <session-id> --remote-control"
+  echo "Could not identify this session. Exit it, then run: claude --settings '$override' -r <session-id> --remote-control"
   exit 0
 fi
-fallback="claude -r $CLAUDE_CODE_SESSION_ID --remote-control"
-tty_name=${HEADROOM_REMOTE_CONTROL_TTY:-$(ps -o tty= -p "$CLAUDE_PID" 2>/dev/null | tr -d ' ')}
-# Linux ps says "pts/3" where the shell function's `basename $(tty)` says "3".
-tty_name=${tty_name##*/}
-case "$tty_name" in ""|"??"|"-"|"?") 
-  echo "Remote Control needs a terminal session; this one has no terminal to relaunch into."
-  echo "Open a terminal and run: $fallback"
-  exit 0;;
+fallback="claude --settings '$override' -r $CLAUDE_CODE_SESSION_ID --remote-control"
+via=
+case "${HEADROOM_RC_RELAUNCHER:-}" in
+  wrapper) via=wrapper;;
+  tty)
+    tty_name=${HEADROOM_REMOTE_CONTROL_TTY:-$(ps -o tty= -p "$CLAUDE_PID" 2>/dev/null | tr -d ' ')}
+    # Linux ps says "pts/3" where the shell function's `basename $(tty)` says "3".
+    tty_name=${tty_name##*/}
+    case "$tty_name" in ""|"??"|"-"|"?") ;; *) via=$tty_name;; esac;;
 esac
-dir="$HOME/.headroom/remote-control"
-mkdir -p "$dir" && printf '%s\n' "$CLAUDE_CODE_SESSION_ID" > "$dir/$tty_name"
-exit_file="$dir/exit-$CLAUDE_CODE_SESSION_ID"
-printf '%s\n' "$CLAUDE_PID" > "$exit_file"
+if [ -z "$via" ]; then
+  echo "Headroom cannot restart this session by itself: it was not started through Headroom's claude launcher (an alias, a shell opened before Headroom was set up, or an editor panel without Headroom's wrapper)."
+  echo "Exit this session, then run: $fallback"
+  exit 0
+fi
+mkdir -p "$dir" && printf '%s %s\n' "$CLAUDE_PID" "$via" > "$dir/exit-$CLAUDE_CODE_SESSION_ID"
 echo "Restarting this session with Remote Control. Headroom is off for the restarted session."
-echo "If it does not come back by itself, run: $fallback"
+if [ "$via" = wrapper ]; then
+  echo "The restart takes up to 30 seconds; this panel stays open and picks up where it left off, and says so here once Remote Control is on."
+  exit 0
+fi
+echo "The restart takes up to 30 seconds. If it does not come back by itself, run: $fallback"
 # Only when the Stop hook is NOT registered (settings.json edited by hand):
 # a timed exit, at the cost of an interrupted turn. With the hook registered
 # there is no timer at all. A timer that raced a slow turn killed the session
@@ -5999,10 +6492,11 @@ echo "If it does not come back by itself, run: $fallback"
 # is what "No response requested." on the phone was.
 if ! grep -q 'headroom-remote-control\.sh[^"]* --stop' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" 2>/dev/null; then
   secs=${HEADROOM_REMOTE_CONTROL_FALLBACK_SECS:-15}
-  nohup sh -c "sleep $secs; [ -f '$exit_file' ] && rm -f '$exit_file' && kill -TERM $CLAUDE_PID" >/dev/null 2>&1 &
+  # Runs the --stop phase itself, so the marker and the pid check are shared.
+  nohup sh -c 'sleep "$1"; printf "{\"session_id\":\"%s\"}\n" "$2" | sh "$0" --stop' "$0" "$secs" "$CLAUDE_CODE_SESSION_ID" >/dev/null 2>&1 &
 fi
 "#
-    .to_string()
+    .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE)
 }
 
 /// User-level command that shadows Claude Code's hidden built-in. Every user
@@ -6011,10 +6505,22 @@ fi
 /// "type it again to confirm" was defeated in testing by the model invoking
 /// the skill itself. Only the script and the question tool are allowed.
 fn build_claude_remote_control_command() -> String {
+    build_claude_remote_control_command_with(
+        "Restart this session with Remote Control (Headroom off for that session)",
+    )
+}
+
+fn build_claude_remote_control_panel_command() -> String {
+    build_claude_remote_control_command_with(
+        "Restart this session with Remote Control from the VS Code panel (Headroom off for that session)",
+    )
+}
+
+fn build_claude_remote_control_command_with(description: &str) -> String {
     let script = claude_remote_control_script_path().display().to_string();
     format!(
         "---\n\
-description: Restart this session with Remote Control (Headroom off for that session)\n\
+description: {description}\n\
 allowed-tools: Bash({script}:*), AskUserQuestion, ToolSearch\n\
 disable-model-invocation: true\n\
 ---\n\
@@ -6029,7 +6535,7 @@ Headroom can restart this session with itself disabled so Remote Control does wo
 Offer exactly two options, in this order: \
 \"Restart with Remote Control\" (description: \"Exit and restart this session without Headroom. The restart replays the conversation uncached.\") and \
 \"Do nothing and keep this session routed through Headroom\" (description: \"Remote Control stays unavailable here.\"). \
-If the answer is \"Restart with Remote Control\", run `{script}` with the Bash tool, then reply with exactly one line: \"Restarting with Remote Control.\" \
+If the answer is \"Restart with Remote Control\", run `{script}` with the Bash tool, then reply with exactly one line: \"Restarting with Remote Control. This takes up to 30 seconds.\" \
 Otherwise reply only \"Staying in this session.\"\n"
     )
 }
@@ -6053,6 +6559,16 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
             build_claude_remote_control_command(),
             false,
         ),
+        (
+            claude_remote_control_panel_command_path(),
+            build_claude_remote_control_panel_command(),
+            false,
+        ),
+        (
+            claude_remote_control_wrapper_path(),
+            build_claude_remote_control_wrapper(),
+            true,
+        ),
     ] {
         let (did_change, backup) = write_file_if_changed(&path, &content, executable)?;
         if did_change {
@@ -6062,21 +6578,41 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
             }
         }
     }
-    // The Stop hook performs the exit the script recorded, once the turn ends.
-    let (mut hook_changed, mut hook_backups) = register_guard_hook_entries(
+    // Convenience for the VS Code panel; never a setup blocker.
+    match configure_vscode_process_wrapper() {
+        Ok((mut c, mut b)) => {
+            changed.append(&mut c);
+            backups.append(&mut b);
+        }
+        Err(err) => log::warn!("configuring the VS Code process wrapper failed: {err}"),
+    }
+    // The Stop hook performs the exit the script recorded, once the turn ends;
+    // the next prompt drops one an interrupted turn left behind. No status
+    // message on the prompt hook: it runs on every prompt and almost never acts.
+    let (stop, cancel) = (
+        claude_remote_control_hook_command("--stop"),
+        claude_remote_control_hook_command("--cancel"),
+    );
+    let (mut hook_changed, mut hook_backups) = register_hook_entries(
         &claude_settings_path(),
-        &claude_remote_control_stop_command(),
-        "Headroom: checking for a pending Remote Control restart",
-        &[("Stop", None)],
+        &[
+            (
+                "Stop",
+                None,
+                &stop,
+                "Headroom: checking for a pending Remote Control restart",
+            ),
+            ("UserPromptSubmit", None, &cancel, ""),
+        ],
     )?;
     changed.append(&mut hook_changed);
     backups.append(&mut hook_backups);
     Ok((changed, backups))
 }
 
-fn claude_remote_control_stop_command() -> String {
+fn claude_remote_control_hook_command(phase: &str) -> String {
     format!(
-        "{} --stop",
+        "{} {phase}",
         shell_double_quote(&claude_remote_control_script_path().to_string_lossy())
     )
 }
@@ -6087,18 +6623,47 @@ fn remove_claude_remote_control_command() -> Result<()> {
     let script = claude_remote_control_script_path();
     // Match on the script path so any earlier command form is stripped too.
     let fragment = script.display().to_string();
+    // A hook left registered against a deleted script errors on every prompt
+    // and every turn end, so the script stays until its hooks are gone.
+    let mut hooks_removed = true;
     for settings_path in claude_settings_candidates() {
-        let _ = remove_guard_hook_entries(&settings_path, &fragment, false, Some(&["Stop"]));
+        if let Err(err) = remove_guard_hook_entries(
+            &settings_path,
+            &fragment,
+            false,
+            Some(&["Stop", "UserPromptSubmit"]),
+        ) {
+            log::warn!("removing the Remote Control hooks failed: {err}");
+            hooks_removed = false;
+        }
     }
-    if script.exists() {
+    if hooks_removed && script.exists() {
         std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
     }
-    let command = claude_remote_control_command_path();
-    if let Ok(content) = std::fs::read_to_string(&command) {
-        if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER) {
-            std::fs::remove_file(&command)
-                .with_context(|| format!("removing {}", command.display()))?;
+    for command in [
+        claude_remote_control_command_path(),
+        claude_remote_control_panel_command_path(),
+    ] {
+        if let Ok(content) = std::fs::read_to_string(&command) {
+            if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER) {
+                std::fs::remove_file(&command)
+                    .with_context(|| format!("removing {}", command.display()))?;
+            }
         }
+    }
+    // The setting goes before the wrapper file, and the file stays when the
+    // setting could not be removed: the extension cannot launch a missing one.
+    let setting_removed = match remove_vscode_process_wrapper() {
+        Ok(()) => true,
+        Err(err) => {
+            log::warn!("removing the VS Code process wrapper setting failed: {err}");
+            false
+        }
+    };
+    let wrapper = claude_remote_control_wrapper_path();
+    if setting_removed && wrapper.exists() {
+        std::fs::remove_file(&wrapper)
+            .with_context(|| format!("removing {}", wrapper.display()))?;
     }
     Ok(())
 }
@@ -6165,11 +6730,20 @@ fi
     )
 }
 
+/// Ours only when the command is our script alone, however its path is
+/// quoted: a user's composed command that merely also runs ours is theirs, and
+/// must be neither replaced on setup nor deleted on removal.
 fn is_our_statusline(value: &Value) -> bool {
     value
         .get("command")
         .and_then(Value::as_str)
-        .is_some_and(|command| command.contains(CLAUDE_STATUSLINE_SCRIPT))
+        .map(|command| command.trim().trim_matches('"'))
+        .is_some_and(|path| {
+            !path.contains('"')
+                && Path::new(path)
+                    .file_name()
+                    .is_some_and(|name| name == CLAUDE_STATUSLINE_SCRIPT)
+        })
 }
 
 /// `statusLine` is a single slot in ~/.claude/settings.json. Ours goes in only
@@ -6253,6 +6827,9 @@ fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
     if set_claude_statusline_setting(Some(&command))? {
         changed.push(claude_settings_path().display().to_string());
     }
+    // The Claude Code panel in VS Code/Cursor shows no statusLine; its status
+    // bar gets the same numbers from a small extension (background thread).
+    crate::vscode_statusbar::ensure_installed();
     Ok((changed, backups))
 }
 
@@ -6440,7 +7017,7 @@ fn write_file_if_changed(
 
 fn remove_shell_block(shell_targets: &[PathBuf], block_id: &str) -> Result<()> {
     for file in shell_targets {
-        remove_managed_block(&file, block_id)?;
+        remove_managed_block(file, block_id)?;
     }
     Ok(())
 }
@@ -7703,18 +8280,14 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
                 .map(|path| format!("Detected the ChatGPT app at {}.", path.display()))
         })
         .or_else(|| {
-            codex_user_state_exists().then(|| {
-                format!(
-                    "Detected ChatGPT (Codex) data in {}.",
-                    codex_home().display()
-                )
-            })
+            codex_user_state_exists()
+                .then(|| format!("Detected ChatGPT Codex data in {}.", codex_home().display()))
         });
 
     if let Some(detected_note) = detected {
         return ClientStatus {
             id: "codex".into(),
-            name: "ChatGPT".into(),
+            name: "ChatGPT Codex".into(),
             installed: true,
             configured,
             health: if configured {
@@ -7727,7 +8300,8 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
             } else {
                 vec![
                     detected_note,
-                    "Route ChatGPT (previously Codex) through Headroom's localhost proxy so prompts stay lean.".into(),
+                    "Route ChatGPT Codex through Headroom's localhost proxy so prompts stay lean."
+                        .into(),
                 ]
             },
         };
@@ -7735,7 +8309,7 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
 
     ClientStatus {
         id: "codex".into(),
-        name: "ChatGPT".into(),
+        name: "ChatGPT Codex".into(),
         installed: false,
         configured: false,
         health: ClientHealth::NotDetected,
@@ -8034,14 +8608,15 @@ mod tests {
         build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
         claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
         codex_sqlite_store_expected, default_shell_targets_for_family, discover_codex_state_dbs,
-        entry_contains_hook, find_on_path_entries, is_no_space, is_permission_denied,
-        normalize_setup_state, normalized_setup_id, nvm_binary_candidates, oss_remnant_warnings,
-        parse_json_object, pin_codex_mcp_command, remove_managed_block,
+        edit_vscode_wrapper_key, entry_contains_hook, find_on_path_entries, is_no_space,
+        is_permission_denied, normalize_setup_state, normalized_setup_id, nvm_binary_candidates,
+        oss_remnant_warnings, parse_json_object, pin_codex_mcp_command, remove_managed_block,
         remove_pre_tool_use_markers, render_codex_config, retag_codex_thread_providers,
         retag_codex_threads_to_headroom, retag_one_codex_db, serialize_paths,
         shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
         ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
+        VSCODE_PROCESS_WRAPPER_KEY,
     };
     #[cfg(unix)]
     use super::{
@@ -8052,10 +8627,11 @@ mod tests {
     #[cfg(unix)]
     use super::{
         claude_code_shell_block, claude_remote_control_command_path,
-        claude_remote_control_script_path, claude_remote_control_stop_command,
+        claude_remote_control_hook_command, claude_remote_control_panel_command_path,
+        claude_remote_control_script_path, claude_remote_control_wrapper_path,
         ensure_claude_remote_control_command, remove_claude_remote_control_command,
-        CLAUDE_REMOTE_CONTROL_COMMAND_MARKER, CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE,
-        HEADROOM_ANTHROPIC_BASE_URL,
+        vscode_user_settings_path, CLAUDE_REMOTE_CONTROL_COMMAND_MARKER,
+        CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE, HEADROOM_ANTHROPIC_BASE_URL,
     };
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
@@ -8223,6 +8799,29 @@ mod tests {
         assert!(state.rtk_disabled);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn upstream_auth_token_makes_claude_settings_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = TestHome::new();
+        let path = super::claude_settings_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::apply_upstream_auth_token(Some("sk-provider")).expect("apply");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("sk-provider"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // A later rewrite (clearing it) must not widen it again.
+        super::apply_upstream_auth_token(None).expect("clear");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     /// RUST-5T: both load attempts failed in `read` (the machine was out of
     /// file descriptors), and the old code quarantined on that -- renaming the
     /// user's real setup away and handing every caller the empty default. An
@@ -8317,6 +8916,7 @@ mod tests {
             rtk_disabled: false,
             auto_learn_disabled: false,
             statusline_disabled: false,
+            setup_versions: BTreeMap::new(),
         };
 
         let normalized = normalize_setup_state(state);
@@ -8704,16 +9304,18 @@ mod tests {
         .expect("write shell file");
 
         assert!(shell_block_contains_in_files(
-            &[path.clone()],
+            std::slice::from_ref(&path),
             "claude_code",
             "ANTHROPIC_BASE_URL",
             "http://127.0.0.1:6767",
         )
         .expect("detect managed export"));
-        assert!(
-            shell_block_contains_text_in_files(&[path.clone()], "claude_code", "export PATH=",)
-                .expect("detect managed text")
-        );
+        assert!(shell_block_contains_text_in_files(
+            std::slice::from_ref(&path),
+            "claude_code",
+            "export PATH=",
+        )
+        .expect("detect managed text"));
         assert!(!shell_block_contains_in_files(
             &[path],
             "managed_rtk",
@@ -10474,7 +11076,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::clear_client_setups().expect("clear");
         let post = super::load_setup_state();
         assert!(
-            post.configured_clients.get("claude_code").is_none(),
+            !post.configured_clients.contains_key("claude_code"),
             "claude_code dropped from configured_clients, got: {:?}",
             post.configured_clients
         );
@@ -12354,6 +12956,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         remove_claude_statusline().expect("remove");
         assert_eq!(read()["statusLine"], own);
         assert_eq!(read()["model"], "opus");
+
+        // Nor is a composed line that merely also runs our script.
+        let composed = serde_json::json!({
+            "type": "command",
+            "command": format!("{}; ~/my-line.sh", claude_statusline_script_path().display()),
+        });
+        std::fs::write(
+            &settings,
+            serde_json::to_vec(&serde_json::json!({ "statusLine": composed })).unwrap(),
+        )
+        .unwrap();
+        ensure_claude_statusline().expect("setup over a composed line");
+        assert_eq!(read()["statusLine"], composed);
+        remove_claude_statusline().expect("remove");
+        assert_eq!(read()["statusLine"], composed);
     }
 
     #[cfg(unix)]
@@ -12449,12 +13066,35 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     #[test]
     fn remote_control_command_installs_and_removes_only_its_own_file() {
         let home = TestHome::new();
+        // A VS Code settings file exists, so the wrapper setting is written too.
+        let vscode = vscode_user_settings_path();
+        std::fs::create_dir_all(vscode.parent().unwrap()).unwrap();
+        // Hand-written JSONC: the comment and key order must survive.
+        let original = "{\n    // mine\n    \"zeta\": 1,\n    \"editor.fontSize\": 13\n}\n";
+        std::fs::write(&vscode, original).unwrap();
         let (changed, _) = ensure_claude_remote_control_command().expect("install");
         assert_eq!(
             changed.len(),
-            3,
-            "script + command + Stop hook written: {changed:?}"
+            if cfg!(target_os = "macos") { 6 } else { 5 },
+            "script + 2 commands + wrapper + hooks (+ vscode setting): {changed:?}"
         );
+        let panel = std::fs::read_to_string(claude_remote_control_panel_command_path()).unwrap();
+        assert!(panel.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER));
+        assert!(panel.contains("from the VS Code panel"));
+        let wrapper = std::fs::read_to_string(claude_remote_control_wrapper_path()).unwrap();
+        assert!(wrapper.starts_with("#!/usr/bin/python3\n"));
+        if cfg!(target_os = "macos") {
+            let raw = std::fs::read_to_string(&vscode).unwrap();
+            let v = parse_json_object(&raw, &vscode).unwrap();
+            assert_eq!(
+                v[VSCODE_PROCESS_WRAPPER_KEY],
+                Value::String(claude_remote_control_wrapper_path().display().to_string())
+            );
+            assert!(
+                raw.ends_with(&original[1..]),
+                "only the key is added: {raw}"
+            );
+        }
         let command = std::fs::read_to_string(claude_remote_control_command_path()).unwrap();
         let script_path = claude_remote_control_script_path();
         assert!(command.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER));
@@ -12465,7 +13105,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         )));
         assert!(command.contains("First write exactly this one line of plain text"));
         assert!(command
-            .contains("then reply with exactly one line: \"Restarting with Remote Control.\""));
+            .contains("then reply with exactly one line: \"Restarting with Remote Control. This takes up to 30 seconds.\""));
         assert!(command.contains("Then call the AskUserQuestion tool"));
         assert!(command
             .contains("load it first with ToolSearch using the query \"select:AskUserQuestion\""));
@@ -12477,11 +13117,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("--stop"));
         let settings = std::fs::read_to_string(claude_settings_path()).unwrap();
-        assert!(
-            settings.contains(&claude_remote_control_stop_command()),
-            "{settings}"
-        );
-        assert!(settings.contains("\"Stop\""), "{settings}");
+        let hooks: Value = serde_json::from_str(&settings).unwrap();
+        for (event, phase) in [("Stop", "--stop"), ("UserPromptSubmit", "--cancel")] {
+            assert_eq!(
+                hooks["hooks"][event][0]["hooks"][0]["command"],
+                claude_remote_control_hook_command(phase),
+                "{settings}"
+            );
+        }
+        // Runs on every prompt, so it must not flash a status line.
+        assert!(hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+            .get("statusMessage")
+            .is_none());
         let (changed, _) = ensure_claude_remote_control_command().expect("reinstall");
         assert!(changed.is_empty(), "idempotent: {changed:?}");
 
@@ -12489,6 +13136,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         std::fs::write(claude_remote_control_command_path(), "my own command\n").unwrap();
         remove_claude_remote_control_command().expect("remove");
         assert!(!script_path.exists());
+        assert!(!claude_remote_control_wrapper_path().exists());
+        assert!(!claude_remote_control_panel_command_path().exists());
+        if cfg!(target_os = "macos") {
+            assert_eq!(std::fs::read_to_string(&vscode).unwrap(), original);
+        }
         let settings = std::fs::read_to_string(claude_settings_path()).unwrap();
         assert!(!settings.contains("headroom-remote-control"), "{settings}");
         assert_eq!(
@@ -12498,6 +13150,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         ensure_claude_remote_control_command().expect("install again");
         remove_claude_remote_control_command().expect("remove again");
+
+        // A wrapper the user configured themselves is neither replaced nor removed.
+        if cfg!(target_os = "macos") {
+            std::fs::write(
+                &vscode,
+                format!("{{\"{VSCODE_PROCESS_WRAPPER_KEY}\": \"/opt/mine/wrap\"}}"),
+            )
+            .unwrap();
+            ensure_claude_remote_control_command().expect("install over user wrapper");
+            let v: Value =
+                serde_json::from_str(&std::fs::read_to_string(&vscode).unwrap()).unwrap();
+            assert_eq!(
+                v[VSCODE_PROCESS_WRAPPER_KEY],
+                Value::String("/opt/mine/wrap".into())
+            );
+            remove_claude_remote_control_command().expect("remove keeps user wrapper");
+            let v: Value =
+                serde_json::from_str(&std::fs::read_to_string(&vscode).unwrap()).unwrap();
+            assert_eq!(
+                v[VSCODE_PROCESS_WRAPPER_KEY],
+                Value::String("/opt/mine/wrap".into())
+            );
+        }
         assert!(!claude_remote_control_command_path().exists());
         assert!(!home
             .path()
@@ -12519,71 +13194,133 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // A symlink, not a copy: a copied platform binary wedges on macOS
         // (unkillable "UE" state) and hangs the test harness on its stdout pipe.
         std::os::unix::fs::symlink("/bin/sleep", bin.join("claude")).unwrap();
-        let mut child = crate::proc::command(bin.join("claude"))
-            .arg("30")
-            .spawn()
-            .expect("spawn fake claude");
+        let spawn_claude = || {
+            crate::proc::command(bin.join("claude"))
+                .arg("30")
+                .spawn()
+                .expect("spawn fake claude")
+        };
+        let wait_for_term = |child: &mut std::process::Child, what: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert_eq!(status.signal(), Some(libc::SIGTERM));
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what}")
+        };
+        let mut child = spawn_claude();
         let pid = child.id().to_string();
-        let run = |base_url: &str, tty: &str| -> String {
+        let run = |base_url: &str, relauncher: &str, tty: &str, sid: &str, pid: &str| -> String {
             let out = crate::proc::command("sh")
                 .arg(&script)
                 .env("HOME", home.path())
                 .env("ANTHROPIC_BASE_URL", base_url)
-                .env("CLAUDE_PID", &pid)
-                .env("CLAUDE_CODE_SESSION_ID", "sid-123")
+                .env("CLAUDE_PID", pid)
+                .env("CLAUDE_CODE_SESSION_ID", sid)
+                .env("HEADROOM_RC_RELAUNCHER", relauncher)
                 .env("HEADROOM_REMOTE_CONTROL_TTY", tty)
                 .env("HEADROOM_REMOTE_CONTROL_FALLBACK_SECS", "1")
                 .output()
                 .expect("run script");
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
-        let stop = |session_id: &str| {
+        let hook = |phase: &str, session_id: &str| {
             use std::io::Write;
             let mut proc = crate::proc::command("sh")
                 .arg(&script)
-                .arg("--stop")
+                .arg(phase)
                 .env("HOME", home.path())
                 .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .spawn()
-                .expect("run stop hook");
+                .expect("run hook");
             proc.stdin
                 .take()
                 .unwrap()
-                .write_all(
-                    format!(r#"{{"session_id": "{session_id}", "hook_event_name": "Stop", "stop_hook_active": false}}"#)
-                        .as_bytes(),
-                )
+                .write_all(format!(r#"{{"session_id": "{session_id}"}}"#).as_bytes())
                 .unwrap();
-            assert!(proc.wait().unwrap().success());
+            let out = proc.wait_with_output().unwrap();
+            assert!(out.status.success());
+            // UserPromptSubmit stdout would be injected into the prompt.
+            assert!(out.stdout.is_empty(), "{phase} printed output");
         };
+        let stop = |session_id: &str| hook("--stop", session_id);
         let marker_dir = home.path().join(".headroom/remote-control");
         let exit_file = marker_dir.join("exit-sid-123");
+        let tty_marker = marker_dir.join("ttys999");
+        let fallback = format!(
+            "claude --settings '{CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE}' -r sid-123 --remote-control"
+        );
 
-        let out = run("https://api.anthropic.com", "ttys999");
+        let out = run(
+            "https://api.anthropic.com",
+            "tty",
+            "ttys999",
+            "sid-123",
+            &pid,
+        );
         assert!(out.contains("already available"), "{out}");
         assert!(!marker_dir.exists());
 
-        // No tty (empty override falls back to ps, and the fake claude has none).
-        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "");
-        assert!(out.contains("needs a terminal session"), "{out}");
-        assert!(out.contains("claude -r sid-123 --remote-control"), "{out}");
-        assert!(!marker_dir.exists());
+        // Nothing will relaunch it: no tty, or a session not started through
+        // the shell function or the wrapper (alias, shell opened before
+        // setup). Never ended; the manual command carries the override.
+        for (relauncher, tty) in [("tty", ""), ("", "ttys999"), ("bogus", "ttys999")] {
+            let out = run(
+                HEADROOM_ANTHROPIC_BASE_URL,
+                relauncher,
+                tty,
+                "sid-123",
+                &pid,
+            );
+            assert!(
+                out.contains("cannot restart this session by itself"),
+                "{out}"
+            );
+            assert!(out.contains(&fallback), "{out}");
+            assert!(!marker_dir.exists(), "{relauncher}/{tty} recorded an exit");
+        }
 
-        // Confirmed: records the tty marker and the pending exit, kills nothing yet.
-        let out = run(HEADROOM_ANTHROPIC_BASE_URL, "ttys999");
+        // The VS Code panel through the wrapper: pending exit only; the resume
+        // marker is written by the Stop hook.
+        let out = run(
+            HEADROOM_ANTHROPIC_BASE_URL,
+            "wrapper",
+            "",
+            "sid-panel",
+            &pid,
+        );
+        assert!(out.contains("this panel stays open"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(marker_dir.join("exit-sid-panel")).unwrap(),
+            format!("{pid} wrapper\n")
+        );
+        assert!(!marker_dir.join("resume-sid-panel").exists());
+        std::fs::remove_file(marker_dir.join("exit-sid-panel")).unwrap();
+
+        // Confirmed in a terminal: records the pending exit, kills nothing yet.
+        let out = run(
+            HEADROOM_ANTHROPIC_BASE_URL,
+            "tty",
+            "ttys999",
+            "sid-123",
+            &pid,
+        );
         assert!(
             out.contains("Restarting this session with Remote Control"),
             "{out}"
         );
-        assert_eq!(
-            std::fs::read_to_string(marker_dir.join("ttys999")).unwrap(),
-            "sid-123\n"
-        );
+        assert!(out.contains(&fallback), "{out}");
         assert_eq!(
             std::fs::read_to_string(&exit_file).unwrap(),
-            format!("{pid}\n")
+            format!("{pid} ttys999\n")
         );
+        assert!(!tty_marker.exists(), "relaunch marker only at --stop");
         std::thread::sleep(std::time::Duration::from_millis(1500));
         assert!(
             child.try_wait().unwrap().is_none(),
@@ -12596,34 +13333,46 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "no timed exit while the Stop hook is registered"
         );
 
+        // A new prompt means the user interrupted the confirming turn (Esc skips
+        // Stop): the pending exit is dropped, no relaunch marker is left for a
+        // later exit, and the next Stop kills nothing.
+        hook("--cancel", "sid-123");
+        assert!(!exit_file.exists());
+        assert!(!tty_marker.exists());
+        stop("sid-123");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "cancelled restart fired"
+        );
+        run(
+            HEADROOM_ANTHROPIC_BASE_URL,
+            "tty",
+            "ttys999",
+            "sid-123",
+            &pid,
+        );
+        assert!(exit_file.exists());
+
         // A Stop for some other session leaves it alone.
         stop("sid-other");
         assert!(exit_file.exists());
         assert!(child.try_wait().unwrap().is_none());
 
-        // The Stop for this session performs the exit and consumes the record.
+        // The Stop for this session writes the relaunch marker, performs the
+        // exit and consumes the record.
         stop("sid-123");
         assert!(!exit_file.exists());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        let mut status = None;
-        while std::time::Instant::now() < deadline {
-            status = child.try_wait().unwrap();
-            if status.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let status = status.unwrap_or_else(|| {
-            let _ = child.kill();
-            panic!("session was not terminated by the stop hook")
-        });
-        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert_eq!(std::fs::read_to_string(&tty_marker).unwrap(), "sid-123\n");
+        std::fs::remove_file(&tty_marker).unwrap();
+        wait_for_term(&mut child, "session was not terminated by the stop hook");
 
         // The stop phase never signals a pid that is not Claude Code any more.
         let mut other = crate::proc::command("sleep").arg("30").spawn().unwrap();
-        std::fs::write(&exit_file, format!("{}\n", other.id())).unwrap();
+        std::fs::write(&exit_file, format!("{} ttys999\n", other.id())).unwrap();
         stop("sid-123");
         assert!(!exit_file.exists());
+        assert!(!tty_marker.exists());
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(
             other.try_wait().unwrap().is_none(),
@@ -12631,40 +13380,42 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         let _ = other.kill();
 
-        // Without the Stop hook (settings edited by hand) the timed exit still
-        // honours the pending restart.
+        // Nor a stale record (the terminal closed before the Stop hook ran):
+        // resumed days later, the pid may be another claude.
+        let mut stale = spawn_claude();
+        std::fs::write(&exit_file, format!("{} ttys999\n", stale.id())).unwrap();
+        assert!(crate::proc::command("touch")
+            .args(["-t", "202001010000"])
+            .arg(&exit_file)
+            .status()
+            .unwrap()
+            .success());
+        stop("sid-123");
+        assert!(!exit_file.exists());
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(stale.try_wait().unwrap().is_none(), "stale record fired");
+        let _ = stale.kill();
+        let _ = stale.wait();
+
+        // Without the Stop hook (settings edited by hand) the timed exit runs
+        // the same stop phase.
         std::fs::write(claude_settings_path(), "{}\n").unwrap();
-        let mut child = crate::proc::command(bin.join("claude"))
-            .arg("30")
-            .spawn()
-            .expect("spawn fake claude");
+        let mut child = spawn_claude();
         let pid = child.id().to_string();
-        let out = crate::proc::command("sh")
-            .arg(&script)
-            .env("HOME", home.path())
-            .env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)
-            .env("CLAUDE_PID", &pid)
-            .env("CLAUDE_CODE_SESSION_ID", "sid-456")
-            .env("HEADROOM_REMOTE_CONTROL_TTY", "ttys998")
-            .env("HEADROOM_REMOTE_CONTROL_FALLBACK_SECS", "1")
-            .output()
-            .expect("run script");
-        assert!(String::from_utf8_lossy(&out.stdout).contains("Restarting"));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        let mut status = None;
-        while std::time::Instant::now() < deadline {
-            status = child.try_wait().unwrap();
-            if status.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let status = status.unwrap_or_else(|| {
-            let _ = child.kill();
-            panic!("timed exit did not fire without the Stop hook")
-        });
-        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        let out = run(
+            HEADROOM_ANTHROPIC_BASE_URL,
+            "tty",
+            "ttys998",
+            "sid-456",
+            &pid,
+        );
+        assert!(out.contains("Restarting"), "{out}");
+        wait_for_term(&mut child, "timed exit did not fire without the Stop hook");
         assert!(!marker_dir.join("exit-sid-456").exists());
+        assert_eq!(
+            std::fs::read_to_string(marker_dir.join("ttys998")).unwrap(),
+            "sid-456\n"
+        );
     }
 
     #[cfg(unix)]
@@ -12680,7 +13431,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // Fake claude: logs its argv; on first launch leaves a relaunch marker
         // for this tty, exactly like the /remote-control script does.
         let fake_claude = format!(
-            "#!/bin/sh\necho \"$*\" >> '{log}'\nif [ ! -e '{first}' ]; then touch '{first}'; echo sid-123 > '{marker}'; fi\nexit 7\n",
+            "#!/bin/sh\necho \"${{HEADROOM_RC_RELAUNCHER:-none}} $*\" >> '{log}'\nif [ ! -e '{first}' ]; then touch '{first}'; echo sid-123 > '{marker}'; fi\nexit 7\n",
             log = log.display(),
             first = home.path().join("first").display(),
             marker = marker_dir.join("ttys999").display(),
@@ -12698,32 +13449,62 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let run = |cmd: &str| {
-            crate::proc::command("bash")
-                .arg("-c")
-                .arg(format!(". '{}'; {cmd}", block.display()))
-                .env("HOME", home.path())
-                .env("PATH", &path)
-                .status()
-                .expect("run bash")
-        };
-        let status = run("claude hello world");
-        let lines = std::fs::read_to_string(&log).unwrap();
-        let expected_resume = format!(
-            "--settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} -r sid-123 --remote-control"
-        );
-        assert_eq!(lines, format!("hello world\n{expected_resume}\n"));
-        assert!(!marker_dir.join("ttys999").exists(), "marker consumed");
-        assert_eq!(status.code(), Some(7), "relaunch exit code propagates");
+        let shells: Vec<&str> = ["bash", "zsh"]
+            .into_iter()
+            .filter(|sh| crate::proc::command(sh).arg("-c").arg(":").status().is_ok())
+            .collect();
+        for shell in shells {
+            // `relaunch`: the fake leaves a relaunch marker on its first launch.
+            let run = |cmd: &str, relaunch: bool| {
+                let _ = std::fs::remove_file(&log);
+                let first = home.path().join("first");
+                if relaunch {
+                    let _ = std::fs::remove_file(&first);
+                } else {
+                    std::fs::write(&first, "").unwrap();
+                }
+                crate::proc::command(shell)
+                    .arg("-c")
+                    .arg(format!(". '{}'; {cmd}", block.display()))
+                    .env("HOME", home.path())
+                    .env("PATH", &path)
+                    .env_remove("HEADROOM_RC_RELAUNCHER")
+                    .status()
+                    .expect("run shell")
+            };
+            let status = run("claude hello world", true);
+            let lines = std::fs::read_to_string(&log).unwrap();
+            let expected_resume = format!(
+                "none --settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} -r sid-123 --remote-control"
+            );
+            assert_eq!(
+                lines,
+                format!("tty hello world\n{expected_resume}\n"),
+                "{shell}"
+            );
+            assert!(!marker_dir.join("ttys999").exists(), "marker consumed");
+            assert_eq!(
+                status.code(),
+                Some(7),
+                "{shell}: relaunch exit code propagates"
+            );
 
-        // Manual fallback: the flag alone gets the override added.
-        std::fs::remove_file(&log).unwrap();
-        let status = run("claude -r sid-123 --remote-control");
-        assert_eq!(status.code(), Some(7));
-        assert_eq!(
-            std::fs::read_to_string(&log).unwrap(),
-            format!("--settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} -r sid-123 --remote-control\n")
-        );
+            // Manual fallback: the flag alone gets the override added, but
+            // only as a whole argument, never inside a prompt.
+            let status = run("claude -r sid-123 --remote-control", false);
+            assert_eq!(status.code(), Some(7));
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap(),
+                format!("tty --settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} -r sid-123 --remote-control\n"),
+                "{shell}"
+            );
+            run("claude -p 'what does --remote-control do'", false);
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap(),
+                "tty -p what does --remote-control do\n",
+                "{shell}"
+            );
+        }
 
         // A user's `alias claude=...` above the block (interactive shells
         // expand aliases) must not turn the block into a parse error that
@@ -12751,6 +13532,223 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
     }
 
+    /// settings.json is hand-maintained JSONC: the wrapper key goes in and out
+    /// as a text edit that keeps comments and key order, and anything that is
+    /// not exactly our key is refused rather than rewritten.
+    #[test]
+    fn vscode_wrapper_key_edit_keeps_user_settings_byte_for_byte() {
+        let path = Path::new("settings.json");
+        let w = "/Users/me/.headroom/claude-wrapper";
+        let user = "{\n  // font for the panel\n  \"editor.fontSize\": 13,\n  \"files.autoSave\": \"off\"\n}\n";
+
+        let added = edit_vscode_wrapper_key(user, w, true, path).expect("add");
+        assert!(added.contains("// font for the panel"));
+        let obj = parse_json_object(&added, path).unwrap();
+        assert_eq!(obj[VSCODE_PROCESS_WRAPPER_KEY], w);
+        assert_eq!(obj["editor.fontSize"], 13);
+        assert_eq!(
+            edit_vscode_wrapper_key(&added, w, false, path).as_deref(),
+            Some(user)
+        );
+
+        // Empty object, and the key as the last entry (no trailing comma left).
+        let added = edit_vscode_wrapper_key("{}", w, true, path).expect("add to empty");
+        let removed = edit_vscode_wrapper_key(&added, w, false, path).expect("remove");
+        assert!(parse_json_object(&removed, path).unwrap().is_empty());
+        let last = format!("{{\"a\": 1, \"{VSCODE_PROCESS_WRAPPER_KEY}\": \"{w}\"}}");
+        let removed = edit_vscode_wrapper_key(&last, w, false, path).expect("remove last");
+        assert_eq!(removed, "{\"a\": 1}");
+
+        // A wrapper the user set themselves, or no key at all, is not ours.
+        let theirs = format!("{{\"{VSCODE_PROCESS_WRAPPER_KEY}\": \"/opt/their-wrapper\"}}");
+        assert_eq!(edit_vscode_wrapper_key(&theirs, w, false, path), None);
+        assert_eq!(edit_vscode_wrapper_key(user, w, false, path), None);
+        // Unparseable settings are never touched.
+        assert_eq!(edit_vscode_wrapper_key("{\"a\": ", w, true, path), None);
+    }
+
+    /// Drives the wrapper the way the VS Code extension does, with a fake
+    /// "claude" that speaks just enough stream-json: it echoes control
+    /// requests as responses, reports a session id, and exits when told.
+    #[cfg(unix)]
+    #[test]
+    fn remote_control_wrapper_swaps_the_session_without_the_extension_noticing() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        ensure_claude_remote_control_command().expect("install");
+        let wrapper = claude_remote_control_wrapper_path();
+        let fake = home.path().join("fake-claude.py");
+        std::fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+resumed = "--resume" in args
+override = "--settings" in args and "api.anthropic.com" in " ".join(args)
+sid = args[args.index("--resume") + 1] if resumed else "sid-wrap"
+def emit(o):
+    sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+emit({"type": "system", "subtype": "init", "session_id": sid, "resumed": resumed, "override": override,
+      "relauncher": os.environ.get("HEADROOM_RC_RELAUNCHER")})
+for line in sys.stdin:
+    d = json.loads(line)
+    if d.get("type") == "control_request":
+        sub = d["request"].get("subtype")
+        emit({"type": "control_response", "response": {"subtype": "success", "request_id": d["request_id"],
+              "response": {"echo": sub, "override": override, "session_url": "https://claude.ai/code/session_x"}}})
+        if sub == "remote_control":
+            emit({"type": "system", "subtype": "bridge", "enabled": True, "override": override})
+        if sub == "rewind_files":
+            emit({"type": "system", "subtype": "rewound", "resumed": resumed})
+    elif d.get("type") == "user":
+        if d["message"]["content"] == "exit":
+            sys.exit(143)
+        emit({"type": "assistant", "text": "seen:" + d["message"]["content"], "resumed": resumed})
+sys.exit(3)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut proc = crate::proc::command(&wrapper)
+            .arg(&fake)
+            .arg("--output-format")
+            .arg("stream-json")
+            .env("HOME", home.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .expect("spawn wrapper");
+        let mut stdin = proc.stdin.take().unwrap();
+        let mut lines = BufReader::new(proc.stdout.take().unwrap()).lines();
+        let mut next = || -> Value {
+            serde_json::from_str(&lines.next().expect("line").expect("read")).expect("json")
+        };
+        let mut send = |s: &str| {
+            stdin.write_all(s.as_bytes()).unwrap();
+            stdin.write_all(b"\n").unwrap();
+            stdin.flush().unwrap();
+        };
+
+        let init = next();
+        assert_eq!(init["session_id"], "sid-wrap");
+        assert_eq!(init["resumed"], false);
+        assert_eq!(
+            init["relauncher"], "wrapper",
+            "tells the script it can relaunch"
+        );
+        send(
+            r#"{"type":"control_request","request_id":"init-1","request":{"subtype":"initialize"}}"#,
+        );
+        assert_eq!(next()["response"]["request_id"], "init-1");
+        send(r#"{"type":"user","message":{"role":"user","content":"hello"}}"#);
+        assert_eq!(next()["text"], "seen:hello");
+        // A one-shot action: replaying it into the respawned child would undo
+        // every edit made since that checkpoint.
+        send(
+            r#"{"type":"control_request","request_id":"rw-1","request":{"subtype":"rewind_files"}}"#,
+        );
+        assert_eq!(next()["response"]["request_id"], "rw-1");
+        assert_eq!(next()["subtype"], "rewound");
+
+        let marker_dir = home.path().join(".headroom/remote-control");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        std::fs::write(marker_dir.join("resume-sid-wrap"), "").unwrap();
+        send(r#"{"type":"user","message":{"role":"user","content":"exit"}}"#);
+
+        // The swap: the new child is resumed with the override, the replayed
+        // handshake answer is swallowed, Remote Control is requested, and the
+        // extension's next message lands in the resumed session.
+        let reinit = next();
+        assert_eq!(reinit["resumed"], true, "{reinit}");
+        assert_eq!(reinit["override"], true, "{reinit}");
+        assert_eq!(reinit["session_id"], "sid-wrap");
+        // The swallowed Remote Control answer becomes the panel's only sign
+        // that the swap finished: a meta line in the conversation.
+        let active = next();
+        assert_eq!(active["subtype"], "informational", "{active}");
+        assert_eq!(active["level"], "notice");
+        assert_eq!(active["session_id"], "sid-wrap");
+        assert_eq!(
+            active["content"],
+            "Remote Control is now active. Continue here, on your phone, or at https://claude.ai/code/session_x"
+        );
+        let bridge = next();
+        assert_eq!(
+            bridge["subtype"], "bridge",
+            "handshake answer must be swallowed, got {bridge}"
+        );
+        assert_eq!(bridge["override"], true);
+        assert!(
+            !marker_dir.join("resume-sid-wrap").exists(),
+            "marker consumed"
+        );
+        send(r#"{"type":"user","message":{"role":"user","content":"after"}}"#);
+        let after = next();
+        assert_eq!(after["text"], "seen:after");
+        assert_eq!(after["resumed"], true);
+
+        // The panel closing (stdin EOF) ends the wrapper with the child's code,
+        // even with a relaunch marker present: nothing may run on headless.
+        std::fs::write(marker_dir.join("resume-sid-wrap"), "").unwrap();
+        drop(stdin);
+        let status = proc.wait().unwrap();
+        assert_eq!(status.code(), Some(3));
+    }
+
+    #[test]
+    fn repair_reapplies_managed_files_written_by_another_app_version() {
+        let _home = TestHome::new();
+        super::apply_client_setup("claude_code").expect("first apply");
+        let state = super::load_setup_state();
+        assert_eq!(
+            state.setup_versions.get("claude_code").map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION")),
+            "apply stamps the running version: {state:?}"
+        );
+        assert!(super::stale_setup_version("claude_code").is_none());
+        assert!(!super::repair_client_setup_now("claude_code"));
+
+        // The stamp says an older build wrote the files. The routing export is
+        // intact, so verification alone would never trigger a re-apply.
+        let mut state = super::load_setup_state();
+        state
+            .setup_versions
+            .insert("claude_code".into(), "0.9.22-rc.4".into());
+        super::write_setup_state(&state).unwrap();
+        assert_eq!(
+            super::stale_setup_version("claude_code").as_deref(),
+            Some("0.9.22-rc.4")
+        );
+        assert!(
+            super::repair_client_setup_now("claude_code"),
+            "stale stamp re-applies"
+        );
+        assert_eq!(
+            super::load_setup_state()
+                .setup_versions
+                .get("claude_code")
+                .map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        // An install from before the stamp existed is stale too.
+        let mut state = super::load_setup_state();
+        state.setup_versions.clear();
+        super::write_setup_state(&state).unwrap();
+        assert_eq!(
+            super::stale_setup_version("claude_code").as_deref(),
+            Some("an earlier build")
+        );
+
+        // A client that is not configured is never stale.
+        super::disable_client_setup("claude_code").unwrap();
+        assert!(super::stale_setup_version("claude_code").is_none());
+        assert!(super::load_setup_state().setup_versions.is_empty());
+    }
+
     #[test]
     fn atomic_write_creates_missing_parent_dir() {
         // RUST-8M: callers that skip their own `create_dir_all` got ENOENT
@@ -12761,6 +13759,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::atomic_write(&path, b"{}").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_the_replaced_files_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [0o600, 0o755] {
+            let path = dir.path().join(format!("f{mode:o}"));
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            super::atomic_write(&path, b"new").unwrap();
+            let got = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(got, mode, "mode {mode:o} was not kept");
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        }
     }
 
     #[test]

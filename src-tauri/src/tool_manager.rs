@@ -1519,9 +1519,15 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # back to the literal's `cmd` property only when strict JSON fails; a template
 # literal with ${...} or a non-literal value still yields nothing, so that
 # output stays compressible exactly as before. The handler late-imports the
-# helper, so rebinding the module symbol reaches it. Copied verbatim from PR
-# #3737 (branch fix/codex-exec-js-object-args). Self-neutralizes once the
-# wheel parses the literal form. Exact-pin gated to wheel 0.38.0.
+# helper, so rebinding the module symbol reaches it. The parser of PR #3737
+# (branch fix/codex-exec-js-object-args) at f6318827: a literal counts only
+# when it is the WHOLE property value (the lookahead), so `{note: "cmd: 'cat
+# f'", cmd: "python x"}` and `{cmd: "cat f" + " | python x"}` are no longer
+# misread, and an escape it cannot decode yields nothing. That commit's
+# "None means maybe a read" half needs its handler change in openai.py, which
+# cannot be patched from here, so an unknown cmd is skipped instead: the
+# wheel's behavior for it. Self-neutralizes once the wheel parses the literal
+# form. Exact-pin gated to wheel 0.38.0.
 # Kill switch: HEADROOM_CODEX_EXEC_JS_ARGS=0.
 _hd_xj_flag = _hd_os.environ.get("HEADROOM_CODEX_EXEC_JS_ARGS", "1")
 if _hd_xj_flag.strip().lower() not in ("", "0", "false", "no", "off"):
@@ -1538,10 +1544,14 @@ if _hd_xj_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 _hd_xj_prop = _hd_xj_re.compile(
                     r"""\{[^{}]*?(?<![\w$])(?:cmd|"cmd"|'cmd')\s*:\s*"""
                     r"""(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\$]|\\.|\$(?!\{))*)`)"""
+                    r"""(?=\s*[,}])"""
                 )
-                _hd_xj_escapes = {"n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+                _hd_xj_escapes = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v"}
 
                 def _hd_xj_string(body):
+                    escaped = _hd_xj_re.findall(r"\\(.)", body, flags=_hd_xj_re.S)
+                    if any(c.isalnum() and c not in _hd_xj_escapes for c in escaped):
+                        return None
                     return _hd_xj_re.sub(
                         r"\\(.)",
                         lambda m: _hd_xj_escapes.get(m.group(1), m.group(1)),
@@ -1565,7 +1575,7 @@ if _hd_xj_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                             if literal is None:
                                 continue
                             body = next(g for g in literal.groups() if g is not None)
-                            args = {"cmd": _hd_xj_string(body)}
+                            args = {"cmd": _hd_xj_string(body) or ""}
                         command = _hd_xj_cr._tool_call_command_text(args)
                         if command:
                             commands.append(command)
@@ -1693,6 +1703,44 @@ if _hd_krd_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# Quarantine only a saturated pool (no upstream PR yet):
+# the timeout-debt quarantine refuses ALL compression while even one
+# timed-out worker is still running, on a pool of cpu_count workers. One
+# overrun -- often the cold-start fast pass missing its deliberately short
+# 10s budget, which is fail-open by design -- therefore forwards every other
+# session uncompressed for up to 60s while 7 of 8 workers sit idle. Fleet
+# canary RUST-HD, 2026-09-21..23: 9 hosts on macOS/Windows/Linux, 2.1-38.9%
+# of requests refused. Measured on this machine's proxy logs: 211 of 262
+# refusals happened with ONE stuck worker, none with more than 3 of 8.
+# The quarantine exists so timed-out work cannot saturate the pool (#2292,
+# #2360); that risk starts at saturation, not at the first straggler. So
+# stand the quarantine down while fewer than half the workers are stuck:
+# zeroing the deadline makes the wheel's own check read "not quarantined"
+# and skips its "released" branch, and a timeout that brings the debt to
+# half the pool re-arms it exactly as before. Pools of 1-3 workers keep
+# today's behaviour (half rounds down to 1). Exact-pin gated to wheel
+# 0.38.0. Kill switch: HEADROOM_QUARANTINE_SPARE_CAPACITY=0.
+_hd_cq_flag = _hd_os.environ.get("HEADROOM_QUARANTINE_SPARE_CAPACITY", "1")
+if _hd_cq_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_cq_meta
+
+        if _hd_cq_meta.version("headroom-ai") == "0.38.0":
+            from headroom.proxy import server as _hd_cq_server
+
+            _hd_cq_orig = _hd_cq_server.HeadroomProxy._run_compression_in_executor
+
+            async def _hd_cq_run(self, fn, *, timeout):
+                with self._compression_metrics_lock:
+                    debt = self._compression_timed_out_in_flight
+                    if 0 < debt < max(1, self.compression_max_workers // 2):
+                        self._compression_quarantine_deadline = 0.0
+                return await _hd_cq_orig(self, fn, timeout=timeout)
+
+            _hd_cq_server.HeadroomProxy._run_compression_in_executor = _hd_cq_run
+    except Exception:
+        pass
+
 # Transformations feed bodies (upstream PR #3672):
 # /transformations/feed returned request_messages / compressed_messages /
 # response_content for every entry and built them with asdict(), so the
@@ -1817,7 +1865,7 @@ if _hd_fm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         pass
 
 
-# Streaming metering headers (upstream PR owed):
+# Streaming metering headers (upstream PR #3769):
 # The buffered path stamps x-headroom-tokens-before/-after/-saved on its
 # response; the streaming path forwards only the upstream rate-limit and
 # request-id headers, so a streaming client (every real Claude Code and Codex
@@ -2282,7 +2330,7 @@ fn learned_openai_ttl_seconds(obs_path: &Path) -> Option<u64> {
 }
 
 fn parse_major_minor_patch(s: &str) -> Option<(u32, u32, u32)> {
-    let head = s.split(|c: char| c == '-' || c == '+').next()?;
+    let head = s.split(['-', '+']).next()?;
     let mut parts = head.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
@@ -2811,13 +2859,18 @@ pub struct ManagedToolManifest {
     pub required: bool,
 }
 
+/// Serena call count and when the last call was seen.
+type SerenaLiveStats = (u64, Option<Instant>);
+/// When `serena_live_stats` last ran, and what it found.
+type SerenaLiveStatsCache = Arc<Mutex<Option<(Instant, Option<SerenaLiveStats>)>>>;
+
 #[derive(Debug, Clone)]
 pub struct ToolManager {
     runtime: ManagedRuntime,
     manifests: Vec<ManagedToolManifest>,
     log_marker_cache: Arc<Mutex<Option<ToolLogMarkerCache>>>,
     serena_calls_cache: Arc<Mutex<Option<SerenaCallsCache>>>,
-    serena_live_stats_cache: Arc<Mutex<Option<(Instant, Option<(u64, Option<Instant>)>)>>>,
+    serena_live_stats_cache: SerenaLiveStatsCache,
     /// False once this app process has tried to start the backend at least
     /// once. See its use in `start_headroom_background`.
     first_backend_start: Arc<std::sync::atomic::AtomicBool>,
@@ -2968,8 +3021,7 @@ fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
     let detail: String = tail
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .next_back()
+        .rfind(|line| !line.is_empty())
         .unwrap_or("(no output in kompress-prefetch.log)")
         .chars()
         .take(200)
@@ -3300,7 +3352,7 @@ impl ToolManager {
     /// Paired with the oldest matching MCP process's start (from `ps` etime),
     /// so the chip can say over what span those tokens accumulated.
     /// 60s cache; closed local ports refuse instantly, so a miss is cheap.
-    fn serena_live_stats(&self) -> Option<(u64, Option<Instant>)> {
+    fn serena_live_stats(&self) -> Option<SerenaLiveStats> {
         if !self.serena_installed() {
             return None;
         }
@@ -4863,7 +4915,7 @@ impl ToolManager {
             .into_iter()
             .filter_map(|path| read_headroom_learn_metadata_from_path(&path))
             .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| right.sort_key.cmp(&left.sort_key));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.sort_key));
         candidates
             .into_iter()
             .next()
@@ -4965,7 +5017,7 @@ impl ToolManager {
         if installed == HEADROOM_PINNED_VERSION {
             return None;
         }
-        Some(pinned_headroom_release().ok()?)
+        pinned_headroom_release().ok()
     }
 
     /// Returns true if the compiled requirements lock differs from what was
@@ -5135,7 +5187,7 @@ impl ToolManager {
                 eta_seconds: 75,
                 percent: 18,
             });
-            self.install_python_distribution(|update| progress(update))?;
+            self.install_python_distribution(&mut progress)?;
         } else {
             progress(BootstrapStepUpdate {
                 step: "Python runtime",
@@ -7201,6 +7253,20 @@ impl ToolManager {
             return Ok(McpInstallMethod::FallbackJson);
         };
 
+        // An unwritable ~/.claude.json (EPERM: an immutable flag or security
+        // software; RUST-HW/HX) defeats `claude mcp add` too -- the CLI printed
+        // "registered" on two runs 30s apart and the entry never landed. That
+        // is the user's environment, not a registration we missed.
+        if let Err(err) = &direct_write {
+            if crate::client_adapters::is_permission_denied(err) {
+                log::warn!(
+                    "Headroom MCP install: ~/.claude.json is not writable, so Claude Code \
+                     cannot persist the server either: {err:#}"
+                );
+                return Ok(McpInstallMethod::FallbackJson);
+            }
+        }
+
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let claude_json_write_error = direct_write
@@ -7209,6 +7275,9 @@ impl ToolManager {
             .unwrap_or_default();
         sentry::with_scope(
             |scope| {
+                // The stack is unsymbolized, so default grouping split this one
+                // message into RUST-21/23/D1/HW/HX.
+                scope.set_fingerprint(Some(&["mcp_install_not_seen"]));
                 scope.set_extra("claude_cli_detected", detected.clone().into());
                 scope.set_extra(
                     "claude_json_write_error",
@@ -8195,10 +8264,28 @@ impl ToolManager {
         // Only a registry we can read may declare failure: when it is absent or
         // relocated we cannot tell, and failing a CLI that exited 0 turns a
         // working install into a hard error (RUST-DQ, same shape as RUST-EV).
-        if host.plugin_registration(plugin) == Some(false) {
+        // Codex's own listing breaks the tie before declaring failure: on
+        // Windows our config.toml read can disagree with the CLI's home
+        // (RUST-HT: every `plugin add` on one host exited 0 and still read as
+        // unregistered). A plugin Codex itself lists as not installed still fails.
+        if host.plugin_registration(plugin) == Some(false)
+            && !(matches!(host, PluginHost::Codex) && self.codex_lists_installed(plugin, cli))
+        {
             bail!("install completed but the plugin was not registered");
         }
         Ok(())
+    }
+
+    fn codex_lists_installed(&self, plugin: &PluginAddon, cli: &Path) -> bool {
+        let mut listed = false;
+        let _ = run_command_streaming(
+            cli,
+            &["plugin", "list", "-m", plugin.marketplace_name],
+            &self.runtime.root_dir,
+            None,
+            &mut |line: &str| listed |= codex_list_line_installed(line, plugin.plugin_ref),
+        );
+        listed
     }
 
     /// Installs a plugin addon into every host that has a CLI on PATH. Returns
@@ -8326,9 +8413,10 @@ impl ToolManager {
     fn plugin_managed_externally(&self, tool_id: &str) -> bool {
         plugin_addon(tool_id).is_some_and(|plugin| {
             !self.plugin_receipt_exists(plugin)
-                && PluginHost::ALL
-                    .iter()
-                    .any(|host| host.plugin_present(plugin))
+                && (claude_standalone_install(plugin)
+                    || PluginHost::ALL
+                        .iter()
+                        .any(|host| host.plugin_present(plugin)))
         })
     }
 
@@ -8491,6 +8579,23 @@ fn claude_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
     )
 }
 
+/// A copy installed without the plugin manager, so the registry never lists
+/// it: `npx skills add <repo> -g` drops `skills/<id>/`, and caveman's own
+/// installer wires `hooks/caveman-activate.js` into settings.json whenever its
+/// plugin install fails. Offering Install on top would fire every hook twice.
+fn claude_standalone_install(plugin: &PluginAddon) -> bool {
+    let claude = crate::client_adapters::home_dir().join(".claude");
+    claude
+        .join("skills")
+        .join(plugin.id)
+        .join("SKILL.md")
+        .exists()
+        || claude
+            .join("hooks")
+            .join(format!("{}-activate.js", plugin.id))
+            .exists()
+}
+
 /// Codex records installs in `$CODEX_HOME/config.toml` under a
 /// `[plugins."<plugin>@<marketplace>"]` table. Keys containing `@` are always
 /// quoted, so a header substring match is reliable and avoids a TOML parse
@@ -8503,6 +8608,13 @@ fn codex_plugin_registration(plugin: &PluginAddon) -> Option<bool> {
         std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml")).ok()?;
     let header = format!("[plugins.\"{}\"]", plugin.plugin_ref);
     Some(text.lines().any(|line| line.trim_start() == header))
+}
+
+/// One row of `codex plugin list`: `<ref>  installed, enabled  4.10.0  <src>`,
+/// or `<ref>  not installed ...` for an available one.
+fn codex_list_line_installed(line: &str, plugin_ref: &str) -> bool {
+    let mut words = line.split_whitespace();
+    words.next() == Some(plugin_ref) && words.next().is_some_and(|w| w.starts_with("installed"))
 }
 
 /// One serena tool application logs exactly one line containing this marker
@@ -9020,23 +9132,19 @@ fn diagnose_proxy_port(port: u16) -> PortState {
         Err(_) => {}
     }
 
-    // Port is held. Probe it: headroom's proxy speaks HTTP and, for an
-    // unrecognized path, responds with an HTTP status line. A foreign
-    // non-HTTP service (SSH, Redis, etc.) will not.
-    let headroom_like = probe_headroom_http(port, Duration::from_millis(400));
-    if headroom_like {
-        // "Speaks HTTP" alone is not identity. HeadroomRunning occupants get
-        // killed by the reclaim path, so verify the pid's argv actually looks
-        // like our managed backend — an unrelated local HTTP server (dev
-        // server, docker forward) squatting the port must route to the
-        // foreign fallback-port path instead of being SIGKILLed.
-        match listener_process(port) {
-            Some((_, pid)) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
-            Some((command, pid)) => PortState::ForeignOccupant(format!("{command} pid {pid}")),
-            None => PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into()),
-        }
-    } else {
-        PortState::ForeignOccupant(listener_detail(port).unwrap_or_else(|| UNKNOWN_OCCUPANT.into()))
+    // Port is held. Identity decides, not HTTP: HeadroomRunning occupants get
+    // killed by the reclaim path, so the pid's argv/exe must look like our
+    // managed backend -- an unrelated local HTTP server (dev server, docker
+    // forward) squatting the port must route to the foreign fallback-port
+    // path instead of being SIGKILLed. The identity check used to sit behind
+    // a 400ms HTTP probe, so our own orphan with a blocked event loop (or
+    // still importing) read as foreign: the new backend fell back to 6769 and
+    // the orphan kept 6768 forever, one more per relaunch (RUST-ED: the same
+    // python.exe pid on 6768 across two launches, the second landing on 6770).
+    match listener_process(port) {
+        Some((_, pid)) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
+        Some((command, pid)) => PortState::ForeignOccupant(format!("{command} pid {pid}")),
+        None => PortState::ForeignOccupant(UNKNOWN_OCCUPANT.into()),
     }
 }
 
@@ -9182,27 +9290,6 @@ fn exe_path_is_under(exe_path: &str, runtime_dir: &Path) -> bool {
         prefix.push('\\');
     }
     exe.starts_with(&prefix)
-}
-
-fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
-    use std::io::{Read, Write};
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    if stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
-    let mut buf = [0u8; 16];
-    match stream.read(&mut buf) {
-        Ok(n) if n >= 5 => buf[..5].eq_ignore_ascii_case(b"HTTP/"),
-        _ => false,
-    }
 }
 
 /// The process listening on `port`, as `(command, pid)`.
@@ -9365,16 +9452,11 @@ fn parse_ss_listener(text: &str, port: u16) -> Option<(String, u32)> {
     Some((command, pid))
 }
 
-/// `listener_process` formatted as the `"cmd pid 1234"` detail string the
-/// port-conflict marker and its bail messages carry.
-fn listener_detail(port: u16) -> Option<String> {
-    listener_process(port).map(|(command, pid)| format!("{command} pid {pid}"))
-}
-
-/// Extract the numeric pid from a `"cmd pid 1234"` string returned by
-/// [`listener_detail`]. Returns None for the `"unknown process"` placeholder
-/// or any unparseable shape. Companion to `port_conflict::parse_occupant`,
-/// which works on the full bail string instead of the occupant detail.
+/// Extract the numeric pid from a `"cmd pid 1234"` occupant detail
+/// (`diagnose_proxy_port`'s foreign label). Returns None for the
+/// `"unknown process"` placeholder or any unparseable shape. Companion to
+/// `port_conflict::parse_occupant`, which works on the full bail string
+/// instead of the occupant detail.
 fn parse_pid_from_lsof_detail(detail: &str) -> Option<u32> {
     let idx = detail.rfind(" pid ")?;
     detail[idx + " pid ".len()..].trim().parse().ok()
@@ -10485,7 +10567,7 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
     if ret != 0 {
         return None;
     }
-    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+    Some(stat.f_bavail as u64 * stat.f_frsize)
 }
 
 #[cfg(windows)]
@@ -11981,7 +12063,7 @@ fn pip_line_to_progress(
     let (message, collected, resolved) = if let Some(rest) = trimmed.strip_prefix("Collecting ") {
         let spec = rest.split_whitespace().next().unwrap_or(rest);
         let pkg = spec
-            .split(|c: char| matches!(c, '=' | '<' | '>' | '!' | '~' | ';' | '['))
+            .split(['=', '<', '>', '!', '~', ';', '['])
             .next()
             .unwrap_or(spec);
         (format!("Fetching {}...", pkg), true, false)
@@ -12002,11 +12084,10 @@ fn pip_line_to_progress(
         (message, false, false)
     } else if trimmed.starts_with("Installing collected packages") {
         ("Installing packages...".to_string(), false, true)
-    } else if let Some(rest) = trimmed.strip_prefix("Successfully installed ") {
+    } else {
+        let rest = trimmed.strip_prefix("Successfully installed ")?;
         let count = rest.split_whitespace().count();
         (format!("Installed {} packages.", count), false, true)
-    } else {
-        return None;
     };
 
     // Counts packages, not lines: pip prints a `Collecting` and a `Downloading`
@@ -12231,6 +12312,7 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         "openssl-applink"
     } else if lower.contains("application control policy has blocked")
         || lower.contains("(os error 4551)")
+        || crate::is_blocked_runtime_dll_signal(&lower)
     {
         // Windows Application Control (Smart App Control / WDAC / AppLocker)
         // blocked a freshly-extracted file (RUST-8K, third cause). Windows
@@ -13115,6 +13197,7 @@ mod tests {
 
     use chrono::Local;
 
+    use super::codex_list_line_installed;
     #[cfg(windows)]
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
@@ -13928,6 +14011,74 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_quarantine_spare_capacity() {
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains("HEADROOM_QUARANTINE_SPARE_CAPACITY"),
+            "kill switch missing"
+        );
+        assert!(
+            py.contains(r#"_hd_cq_meta.version("headroom-ai") == "0.38.0""#),
+            "exact-pin gate missing"
+        );
+    }
+
+    #[test]
+    fn quarantine_spare_capacity_vendor_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel's real
+        // _run_compression_in_executor (scripts/verify-quarantine-spare-capacity.py).
+        // Self-skips when the vendor does not bind, so green is NOT evidence
+        // after a wheel bump.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-quarantine-spare-capacity.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-cq-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .arg(&probe)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_QUARANTINE_SPARE_CAPACITY", flag)
+                .output()
+                .expect("run quarantine spare-capacity probe")
+        };
+
+        let out = run("1");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if stdout.contains("FAIL cq bound") {
+            eprintln!("skipping: quarantine spare-capacity vendor did not bind (wheel bumped?)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "quarantine spare-capacity probe failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        // With the switch off the wheel's own method refuses at 1 of 8 stuck,
+        // which is also what proves the probe can tell the two apart.
+        let off = run("0");
+        let off_stdout = String::from_utf8_lossy(&off.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            off_stdout.contains("FAIL cq bound")
+                && off_stdout.contains("FAIL 1 of 8 stuck: compression still runs"),
+            "HEADROOM_QUARANTINE_SPARE_CAPACITY=0 did not unbind the vendor\nstdout:\n{off_stdout}"
+        );
+    }
+
+    #[test]
     fn sitecustomize_vendors_feed_include_messages() {
         // Shape and gates only; behaviour is proven by
         // feed_include_messages_vendor_behaves_against_the_installed_wheel.
@@ -14193,6 +14344,13 @@ payload = {"model": "gpt-5", "input": [
 out = handler._compress_openai_responses_live_text_units_with_router(payload, model="gpt-5", request_id="xj")[0]
 print("READ " + ("verbatim" if out["input"][1] == read_out else "compressed"))
 print("OTHER " + ("verbatim" if out["input"][3] == other_out else "compressed"))
+# A literal counts only as the whole property value (upstream f6318827).
+for label, src in [
+    ("NOTE", "tools.exec_command({note: \"x, cmd: 'cat f'\", cmd: \"python run.py\"})"),
+    ("CONCAT", "tools.exec_command({cmd: \"cat f.py\" + \" | python x\"})"),
+    ("HEX", "tools.exec_command({cmd: \"c\\x61t f\"})"),
+]:
+    print(label + " " + repr(cr._custom_tool_call_commands(src)))
 "#;
         let run = |flag: &str| {
             crate::proc::command(&python)
@@ -14236,6 +14394,11 @@ print("OTHER " + ("verbatim" if out["input"][3] == other_out else "compressed"))
         );
         // A non-read exec output still compresses with the vendor bound.
         assert!(on_out.contains("OTHER compressed"), "{detail}");
+        // A cmd inside another property's string, a concatenation and an
+        // undecodable escape are never read as a command.
+        assert!(on_out.contains("NOTE ['python run.py']"), "{detail}");
+        assert!(on_out.contains("CONCAT []"), "{detail}");
+        assert!(on_out.contains("HEX []"), "{detail}");
     }
 
     #[test]
@@ -16736,6 +16899,45 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         let _ = child.wait();
     }
 
+    /// RUST-ED: our own orphan that holds the port but never answers HTTP (a
+    /// blocked event loop, or still importing) is ours, not foreign. Reading
+    /// it as foreign fell back to 6769 and left the orphan on 6768 for good.
+    #[test]
+    #[cfg(unix)] // exercises /usr/bin/python3; Windows cannot exec it
+    fn diagnose_proxy_port_identifies_silent_headroom_orphan() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // Listens, never accepts: connects succeed, nothing is ever read back.
+        let script = r#"
+import socket, sys, time
+s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(8)
+time.sleep(30)
+"#;
+        let mut child = crate::proc::command("/usr/bin/python3")
+            .arg("-c")
+            .arg(script)
+            .arg(port.to_string())
+            .arg("--headroom-proxy-test-standin")
+            .spawn()
+            .expect("spawn silent stand-in");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stand-in never bound port {port}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let state = diagnose_proxy_port(port);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(matches!(state, PortState::HeadroomRunning));
+    }
+
     #[test]
     fn probe_backend_readyz_ok_false_when_nothing_listening() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -19133,6 +19335,23 @@ after
     }
 
     #[test]
+    fn plugin_installed_standalone_reports_external() {
+        // caveman's own installer / `npx skills add`: no registry entry at all.
+        let (root, _runtime, manager) = seed_test_runtime("plugin-standalone");
+        let _home = HomeGuard::new(&root);
+        let hooks = root.join(".claude").join("hooks");
+        fs::create_dir_all(&hooks).expect("hooks dir");
+        assert!(!manager.plugin_managed_externally("caveman"));
+        fs::write(hooks.join("caveman-activate.js"), "").expect("hook");
+        assert!(manager.plugin_managed_externally("caveman"));
+        let skill = root.join(".claude").join("skills").join("ponytail");
+        fs::create_dir_all(&skill).expect("skill dir");
+        fs::write(skill.join("SKILL.md"), "").expect("skill");
+        assert!(manager.plugin_managed_externally("ponytail"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn uninstall_plugin_is_noop_without_receipt() {
         // Cleanup must not touch plugin/marketplace config Headroom never wrote.
         let (root, _runtime, manager) = seed_test_runtime("plugin-uninstall-noreceipt");
@@ -19830,6 +20049,32 @@ exit 0
         )
         .unwrap();
         assert_eq!(PluginHost::Codex.plugin_registration(plugin), Some(true));
+    }
+
+    #[test]
+    fn codex_list_line_installed_reads_the_status_column() {
+        // Rows as codex-cli 0.153.0 prints them.
+        let r = "ponytail@ponytail";
+        assert!(codex_list_line_installed(
+            "  ponytail@ponytail   installed, enabled   4.10.0   https://github.com/DietrichGebert/ponytail.git",
+            r
+        ));
+        assert!(codex_list_line_installed(
+            "ponytail@ponytail installed, disabled 4.10.0",
+            r
+        ));
+        assert!(!codex_list_line_installed(
+            "ponytail@ponytail not installed 4.10.0",
+            r
+        ));
+        assert!(!codex_list_line_installed(
+            "engineering-suite-ponytail@openai-curated-remote installed, enabled",
+            r
+        ));
+        assert!(!codex_list_line_installed(
+            "PLUGIN STATUS VERSION SOURCE",
+            r
+        ));
     }
 
     #[test]

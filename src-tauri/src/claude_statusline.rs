@@ -21,9 +21,12 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
-/// Conversations kept; the least recently updated is dropped first. Far above
-/// the number of Claude Code sessions anyone keeps open at once.
-const MAX_SESSIONS: usize = 64;
+/// Conversations kept; the least recently active is dropped first. Every
+/// Claude Code session is booked (VS Code panel chats, headless `claude -p`
+/// runs such as learn scans), and 64 filled in about a day, dropping idle
+/// conversations the user was still coming back to. At ~100 bytes an entry,
+/// 512 is ~50 KB, cheap for the statusline script to read every second.
+const MAX_SESSIONS: usize = 512;
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 const FILE_NAME: &str = "claude-statusline.json";
 
@@ -79,7 +82,14 @@ fn load(path: &Path) -> BTreeMap<String, Session> {
     };
     match serde_json::from_slice::<Persisted>(&bytes) {
         Ok(persisted) if persisted.schema_version == SCHEMA_VERSION => persisted.sessions,
-        Ok(_) => BTreeMap::new(),
+        Ok(persisted) => {
+            log::warn!(
+                "{FILE_NAME} has schema {} (expected {SCHEMA_VERSION}); backing up and starting fresh",
+                persisted.schema_version
+            );
+            let _ = std::fs::rename(path, path.with_extension("json.bak"));
+            BTreeMap::new()
+        }
         Err(err) => {
             log::warn!("{FILE_NAME} is corrupt ({err}); backing up and starting fresh");
             let _ = std::fs::rename(path, path.with_extension("json.bak"));

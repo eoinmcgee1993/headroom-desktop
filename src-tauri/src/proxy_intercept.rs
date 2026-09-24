@@ -1198,6 +1198,7 @@ async fn bind_intercept(addr: SocketAddr, reuse_addr: bool) -> std::io::Result<T
     TcpListener::bind(addr).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     bind_addr: SocketAddr,
     reuse_addr: bool,
@@ -5800,7 +5801,9 @@ mod tests {
 
         let mut response = Vec::new();
         let mut tmp = [0u8; 4096];
-        let read_completed = timeout(Duration::from_secs(2), async {
+        // Generous: the loop exits the moment the body parses, and 2s timed out
+        // with no response head at all under a loaded full-suite run.
+        let read_completed = timeout(Duration::from_secs(10), async {
             loop {
                 match client.read(&mut tmp).await {
                     Ok(0) | Err(_) => break,

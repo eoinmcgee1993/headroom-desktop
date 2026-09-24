@@ -7,6 +7,11 @@
 # for 0.28.0 (base of the current pin set) -> carried through 0.29.0-0.31.0
 # point-version churn -> 0.32.0 -> carried unchanged to 0.33.0 -> 0.34.0
 # CVE top-up -> 0.35.0 CVE top-up -> carried to 0.37.0 -> 0.38.0 CVE top-up.
+#   - 2026-09-23 desktop CVE top-up (no wheel bump): pillow 12.2.0 -> 12.3.0
+#     (25 advisories, several in decoders). The proxy's image optimizer
+#     (image_optimize, default on) runs Image.open on image bytes from agent
+#     traffic, so this parser sees untrusted input. Native wheel swap, no deps,
+#     cp312 wheels for every platform the locks cover.
 #   - 0.38.0: one transitive pin topped up to match upstream's #3662 CVE
 #     clearance: anyio 4.14.1 -> 4.14.2 (CVE-2026-63374, CVE-2026-64847),
 #     pure-Python, wheel swap only. requires_dist raised the litellm floor to
@@ -168,7 +173,7 @@ opentelemetry-semantic-conventions==0.64b0
 orjson==3.11.9
 packaging==26.2
 pandas==3.0.3
-pillow==12.2.0
+pillow==12.3.0
 propcache==0.5.2
 protobuf==7.35.1
 py-rust-stemmers==0.1.8

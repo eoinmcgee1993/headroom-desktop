@@ -3667,7 +3667,13 @@ impl AppState {
                 "stop_headroom: pkill -f {:?}",
                 format!("{} {args_pattern}", exe.display())
             );
-            if let Err(err) = kill_processes_by_command_pattern(exe, args_pattern, lock_held) {
+            if let Err(err) = kill_processes_by_command_pattern(
+                exe,
+                args_pattern,
+                SweepParents::Orphans {
+                    own_children: lock_held,
+                },
+            ) {
                 // `:#` prints the whole context chain: a spawn failure's io
                 // error (RUST-6H's 0.9.5 wave) is invisible without it.
                 let detail = format!("{err:#}");
@@ -5549,9 +5555,7 @@ impl SavingsTracker {
                 &current_session_hourly_buckets,
             );
         }
-        if first_observation || reset_detected {
-            self.session_hourly_buckets = current_session_hourly_buckets_map;
-        } else if session_buckets_changed {
+        if first_observation || reset_detected || session_buckets_changed {
             self.session_hourly_buckets = current_session_hourly_buckets_map;
         }
         if reset_detected && current_session_hourly_buckets.is_empty() {
@@ -5595,7 +5599,7 @@ impl SavingsTracker {
                 || (changed
                     && self
                         .last_written_at
-                        .map_or(true, |t| now.duration_since(t).as_secs() >= 60)));
+                        .is_none_or(|t| now.duration_since(t).as_secs() >= 60)));
         if should_write {
             self.last_written_at = Some(now);
             if first_observation || reset_detected {
@@ -8617,10 +8621,10 @@ fn escape_powershell_like(value: &str) -> String {
 /// lock, which is where that case surfaces today; count failed kills in the
 /// script if that ever stops being true.
 ///
-/// Parent filter (same rule as the unix sweep, see `sweep_should_kill`): a
-/// match is killed only when its parent is gone (Windows never reparents an
-/// orphan, so its ParentProcessId names a dead pid) or, when
-/// `include_own_children`, when its parent is this app (`self_pid`). A match
+/// Parent filter (same rule as the unix sweep, see `sweep_should_kill`): under
+/// `SweepParents::Orphans` a match is killed only when its parent is gone
+/// (Windows never reparents an orphan, so its ParentProcessId names a dead
+/// pid) or, with `own_children`, when its parent is this app (`self_pid`). A match
 /// whose parent is another live process is a relaunched instance's backend or
 /// a sibling thread's in-flight spawn. `Stop-Process` is `TerminateProcess(-1)`,
 /// so that victim reports `exit code: 0xffffffff before opening port` with the
@@ -8631,22 +8635,24 @@ fn windows_process_sweep_script(
     exe: &std::path::Path,
     args_pattern: &str,
     self_pid: u32,
-    include_own_children: bool,
+    parents: SweepParents,
 ) -> String {
     let exe_pattern = escape_powershell_like(&exe.display().to_string());
     let args_escaped = escape_powershell_like(args_pattern);
-    let own = if include_own_children {
-        "$true"
-    } else {
-        "$false"
+    let parent_rule = match parents {
+        SweepParents::Any => "$true".to_string(),
+        SweepParents::Orphans { own_children } => format!(
+            "(($_.ParentProcessId -eq $me -and {}) \
+             -or -not (Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue))",
+            if own_children { "$true" } else { "$false" }
+        ),
     };
     format!(
         "try {{ $me = {self_pid}; Get-CimInstance Win32_Process -ErrorAction Stop \
          | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
          -and $_.CommandLine -like '*{exe_pattern}*' \
          -and $_.CommandLine -like '*{args_escaped}*' \
-         -and (($_.ParentProcessId -eq $me -and {own}) \
-         -or -not (Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue)) }} \
+         -and {parent_rule} }} \
          | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
          catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
     )
@@ -8661,11 +8667,26 @@ fn windows_process_sweep_script(
 /// and a quitting instance's sweep was landing on the proxy the freshly
 /// relaunched instance was still bringing up - SIGTERM after the banner,
 /// before the port, on both spawn variants (RUST-CA/CB, RUST-1K: five macOS
-/// hosts). `include_own_children` is false when the caller could not take the
+/// hosts). `own_children` is false when the caller could not take the
 /// lifecycle lock: then a sibling transition in this process is mid-spawn and
 /// its child is likewise off limits.
-fn sweep_should_kill(ppid: u32, self_pid: u32, include_own_children: bool) -> bool {
-    ppid <= 1 || (include_own_children && ppid == self_pid)
+fn sweep_should_kill(ppid: u32, self_pid: u32, parents: SweepParents) -> bool {
+    match parents {
+        SweepParents::Any => true,
+        SweepParents::Orphans { own_children } => ppid <= 1 || (own_children && ppid == self_pid),
+    }
+}
+
+/// Which pattern matches a sweep may kill, by their parent.
+#[derive(Clone, Copy)]
+enum SweepParents {
+    /// Proxy sweeps: orphans, plus this app's own children when
+    /// `own_children` (see `sweep_should_kill`).
+    Orphans { own_children: bool },
+    /// Everything that matches. Only the venv-lock sweep: its targets are MCP
+    /// servers a live Claude Code / Codex spawned, so an orphans-only rule
+    /// spares exactly the processes it exists to kill (RUST-HY).
+    Any,
 }
 
 /// Parses `ps -o pid=,ppid=` output into `(pid, ppid)` pairs; junk lines skip.
@@ -8684,7 +8705,7 @@ fn parse_pid_ppid(output: &str) -> Vec<(u32, u32)> {
 fn kill_processes_by_command_pattern(
     exe: &std::path::Path,
     args_pattern: &str,
-    include_own_children: bool,
+    parents: SweepParents,
 ) -> Result<()> {
     // An unresolved runtime path degrades the pattern from "our backend at this
     // exact path" to a loose substring, and `pkill -f` applies it to every
@@ -8730,7 +8751,7 @@ fn kill_processes_by_command_pattern(
             if pid == self_pid {
                 continue;
             }
-            if !sweep_should_kill(ppid, self_pid, include_own_children) {
+            if !sweep_should_kill(ppid, self_pid, parents) {
                 log::info!(
                     "process sweep: leaving pid {pid} (parent {ppid} is alive and not us) for '{pattern}'"
                 );
@@ -8742,17 +8763,12 @@ fn kill_processes_by_command_pattern(
                 .args(["-TERM", &pid.to_string()])
                 .status();
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
-        let script = windows_process_sweep_script(
-            exe,
-            args_pattern,
-            std::process::id(),
-            include_own_children,
-        );
+        let script = windows_process_sweep_script(exe, args_pattern, std::process::id(), parents);
         let status = crate::proc::command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .status()
@@ -8824,7 +8840,7 @@ pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     }
     // Empty args pattern makes the exe-path clause the only real filter:
     // any process whose command line mentions the venv dir.
-    if let Err(err) = kill_processes_by_command_pattern(venv_dir, "", true) {
+    if let Err(err) = kill_processes_by_command_pattern(venv_dir, "", SweepParents::Any) {
         log::warn!("killing venv lock holders before venv mutation failed: {err:#}");
     }
 }
@@ -9029,7 +9045,7 @@ fn savings_rate_implausible(daily_savings: &[DailySavingsPoint]) -> Option<f64> 
 /// under its sample floor.
 fn top_models_by_requests(model_rates: &[crate::models::ModelSavingsRate]) -> String {
     let mut ranked: Vec<_> = model_rates.iter().collect();
-    ranked.sort_by(|a, b| b.requests.cmp(&a.requests));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.requests));
     let listed: Vec<_> = ranked
         .iter()
         .take(3)
@@ -11272,7 +11288,11 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
     }
 
-    fn write_headroom_receipt(base_dir: &PathBuf, version: &str, requirements_lock_sha256: &str) {
+    fn write_headroom_receipt(
+        base_dir: &std::path::Path,
+        version: &str,
+        requirements_lock_sha256: &str,
+    ) {
         let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(base_dir);
         fs::create_dir_all(&runtime.tools_dir).expect("create tools dir");
         fs::write(
@@ -11450,20 +11470,28 @@ mod tests {
 
     #[test]
     fn sweep_only_reaps_orphans_and_optionally_own_children() {
-        use super::sweep_should_kill;
+        use super::{sweep_should_kill, SweepParents};
         let me = 4242;
+        let held = SweepParents::Orphans { own_children: true };
+        let unheld = SweepParents::Orphans {
+            own_children: false,
+        };
         // Orphan of a previous instance (reparented to launchd/init).
-        assert!(sweep_should_kill(1, me, true));
-        assert!(sweep_should_kill(1, me, false));
-        assert!(sweep_should_kill(0, me, false));
+        assert!(sweep_should_kill(1, me, held));
+        assert!(sweep_should_kill(1, me, unheld));
+        assert!(sweep_should_kill(0, me, unheld));
         // Our own untracked child: ours to kill only when we hold the
         // lifecycle lock; otherwise a sibling transition is mid-spawn on it.
-        assert!(sweep_should_kill(me, me, true));
-        assert!(!sweep_should_kill(me, me, false));
+        assert!(sweep_should_kill(me, me, held));
+        assert!(!sweep_should_kill(me, me, unheld));
         // Another live process's child (a relaunched Headroom instance, or a
         // shell running the venv by hand): never ours.
-        assert!(!sweep_should_kill(777, me, true));
-        assert!(!sweep_should_kill(777, me, false));
+        assert!(!sweep_should_kill(777, me, held));
+        assert!(!sweep_should_kill(777, me, unheld));
+        // RUST-HY: the venv-lock sweep's targets are MCP servers a live
+        // Claude Code / Codex spawned. Sparing them left pip facing a locked
+        // Scripts\headroom.exe, so that sweep ignores the parent.
+        assert!(sweep_should_kill(777, me, SweepParents::Any));
     }
 
     #[test]
@@ -11565,7 +11593,8 @@ mod tests {
             cache_write_tokens: None,
         };
 
-        let first = state.observe_activity_from_transformations(&[transformation.clone()]);
+        let first =
+            state.observe_activity_from_transformations(std::slice::from_ref(&transformation));
         assert!(
             !first.fresh.is_empty(),
             "first observation should emit fresh events"
@@ -12790,7 +12819,7 @@ mod tests {
             std::path::Path::new(r"C:\Users\a\venv\Scripts\headroom.exe"),
             "proxy --port",
             4242,
-            true,
+            super::SweepParents::Orphans { own_children: true },
         );
 
         assert!(
@@ -12852,7 +12881,12 @@ mod tests {
     fn the_windows_sweep_script_filters_on_parent() {
         use super::windows_process_sweep_script;
         let exe = std::path::Path::new(r"C:\Users\a\venv\Scripts\headroom.exe");
-        let held = windows_process_sweep_script(exe, "proxy --port", 4242, true);
+        let held = windows_process_sweep_script(
+            exe,
+            "proxy --port",
+            4242,
+            super::SweepParents::Orphans { own_children: true },
+        );
         assert!(held.contains("$me = 4242;"), "{held}");
         assert!(held.contains("$_.ProcessId -ne $me"), "{held}");
         assert!(
@@ -12865,11 +12899,22 @@ mod tests {
             ),
             "orphans (dead parent) must still be reaped: {held}"
         );
-        let unheld = windows_process_sweep_script(exe, "proxy --port", 4242, false);
+        let unheld = windows_process_sweep_script(
+            exe,
+            "proxy --port",
+            4242,
+            super::SweepParents::Orphans {
+                own_children: false,
+            },
+        );
         assert!(
             unheld.contains("($_.ParentProcessId -eq $me -and $false)"),
             "{unheld}"
         );
+        // RUST-HY: the venv-lock sweep drops the parent rule entirely.
+        let any = windows_process_sweep_script(exe, "", 4242, super::SweepParents::Any);
+        assert!(!any.contains("ParentProcessId"), "{any}");
+        assert!(any.contains("-and $true }"), "{any}");
     }
 
     /// A `'` in a Windows username would close the single-quoted `-like`
@@ -12881,7 +12926,7 @@ mod tests {
             std::path::Path::new(r"C:\Users\O'Brien [dev]\venv\Scripts\headroom.exe"),
             "proxy --port",
             4242,
-            true,
+            super::SweepParents::Orphans { own_children: true },
         );
         assert!(script.contains("O''Brien"), "unescaped quote: {script}");
         assert!(script.contains("`[dev`]"), "unescaped wildcard: {script}");

@@ -207,6 +207,37 @@ describe("app helpers", () => {
     ]);
   });
 
+  it("prices a higher tier at the difference once the AppSumo deal is over", () => {
+    const result = getUpgradePlans(
+      "individual", "max20x", undefined, "max5x", true, false, "annual",
+      null, "lifetime", undefined, undefined, undefined, undefined, false,
+      undefined, 0, null, undefined, undefined, "checkout"
+    );
+
+    const [owned, lower, higher] = result.plans;
+    expect(owned.centeredPriceLabel).toBe("lifetime plan • via AppSumo");
+    expect(lower.id).toBe("pro");
+    expect(lower.saleBadge).toBeUndefined();
+    expect([higher.id, higher.price, higher.originalPrice, higher.saleBadge, higher.ctaLabel]).toEqual([
+      "max20x", "$15", "$30", "50% off forever", "Upgrade to Max x20",
+    ]);
+    expect(higher.reversionLine).toBe("You own Max x5 for life, so you pay only the difference");
+  });
+
+  it("shows tiers under an AppSumo lifetime license as already owned", () => {
+    const result = getUpgradePlans(
+      "individual", "max20x", undefined, "max20x", true, false, "annual",
+      18000, "annual", "2027-01-01T00:00:00Z", undefined, "forever", undefined, false,
+      undefined, 0, null, undefined, undefined, null, "max5x"
+    );
+
+    expect(result.plans.map((p) => [p.id, p.centeredPriceLabel, p.ctaLabel])).toEqual([
+      ["max20x", undefined, "Stay on Max x20 plan"],
+      ["pro", "included in your AppSumo lifetime plan", "Switch back to lifetime Max x5"],
+      ["max5x", "included in your AppSumo lifetime plan", "Switch back to lifetime Max x5"],
+    ]);
+  });
+
   describe("server-driven prices", () => {
     afterEach(() => setServerPlanPrices(null));
 

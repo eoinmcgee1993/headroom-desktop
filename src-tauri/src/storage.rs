@@ -168,14 +168,21 @@ pub fn report_unfinished_restart(base_dir: &Path) {
         return;
     };
     let attempted = restart_attempted_path(base_dir);
-    if attempted.exists() {
-        log::info!("restart: relaunch completed (requested by {})", note.trim());
-    } else {
-        log::warn!(
+    // The helper records `open`'s exit code in the marker. Empty is a helper
+    // from a build that only touched it (the OLD build runs the restart).
+    match std::fs::read_to_string(&attempted) {
+        Ok(rc) if !matches!(rc.trim(), "" | "0") => log::warn!(
+            "restart: the previous update-restart's `open` failed (rc={}); the app \
+             only came back when relaunched by hand (requested by {})",
+            rc.trim(),
+            note.trim()
+        ),
+        Ok(_) => log::info!("restart: relaunch completed (requested by {})", note.trim()),
+        Err(_) => log::warn!(
             "restart: the previous update-restart never relaunched the app; \
              its detached helper died before reaching `open` (requested by {})",
             note.trim()
-        );
+        ),
     }
     let _ = std::fs::remove_file(&pending);
     let _ = std::fs::remove_file(&attempted);
@@ -204,10 +211,12 @@ mod restart_marker_tests {
             "a reported restart must not be reported again on every later launch"
         );
 
-        // Helper tried: both markers, both cleared.
-        std::fs::write(restart_pending_path(base), "0.9.18 at now").unwrap();
-        std::fs::write(restart_attempted_path(base), "").unwrap();
-        report_unfinished_restart(base);
+        // Helper tried: both markers, both cleared, whatever `open` returned.
+        for rc in ["", "0\n", "1\n"] {
+            std::fs::write(restart_pending_path(base), "0.9.18 at now").unwrap();
+            std::fs::write(restart_attempted_path(base), rc).unwrap();
+            report_unfinished_restart(base);
+        }
         assert!(!restart_pending_path(base).exists());
         assert!(
             !restart_attempted_path(base).exists(),

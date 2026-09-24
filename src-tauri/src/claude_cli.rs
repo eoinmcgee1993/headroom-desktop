@@ -151,7 +151,7 @@ fn sort_versions_newest_first(versions: &mut [String]) {
         }
         nums
     }
-    versions.sort_by(|a, b| numeric_key(b).cmp(&numeric_key(a)));
+    versions.sort_by_key(|v| std::cmp::Reverse(numeric_key(v)));
 }
 
 fn first_runnable<I: Iterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {

@@ -345,7 +345,7 @@ Codex is billed per token, so unlike a Claude Code subscription it runs in `toke
 Expect: `mode` is `token`, `primary_model` is a `gpt-*` model (confirms Codex — not Claude — is the traffic being measured), `requests_compressed` increased by at least 1, and `total_tokens_removed` is strictly greater. If `primary_model` is a `claude-*` model, the proxy is dominated by Claude traffic — confirm the prompt actually ran through Codex before trusting this check.
 
 ### C3. Codex savings are attributed on the dashboard
-Open the dashboard and confirm a **ChatGPT** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the group labelled "ChatGPT" (the `codex` key in `mergeProviderSavingsForDisplay`, dashboardHelpers.ts; the display name follows OpenAI's 2026-07 rename, the internal id stays `codex`). A missing ChatGPT group after Codex traffic means per-provider attribution isn't tagging OpenAI requests.
+Open the dashboard and confirm a **ChatGPT Codex** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the group labelled "ChatGPT" (the `codex` key in `mergeProviderSavingsForDisplay`, dashboardHelpers.ts; the display name follows OpenAI's 2026-07 rename, the internal id stays `codex`). A missing ChatGPT group after Codex traffic means per-provider attribution isn't tagging OpenAI requests.
 
 ### C4. Pause / resume cleanly strips and restores Codex routing
 The Claude equivalent is check 6; Pause clears *all* client setups, so it must remove Codex's config too. Pause lives in the TRAY MENU ("Pause Headroom" / "Resume Headroom", see check 5), not on the Settings page. Toggle Pause then Resume (restore runs on a background thread, so give it a second), checking after each:

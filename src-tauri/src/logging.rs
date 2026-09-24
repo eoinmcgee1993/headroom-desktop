@@ -272,8 +272,12 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     // capture at the same emit site (capture_runtime_upgrade_failure, RUST-4A:
     // versions, boot diagnostics, pip tail); this bridged warn double-reports
     // the same incident as RUST-2N with none of that context.
+    // Its install-phase twin: `capture_upgrade_failure("install", ..)` files it
+    // tagged (RUST-29), and the bridged copy groups on a head that embeds
+    // `after {ms}ms`, so one host's three retries opened RUST-J1/J2/J3.
     if target.starts_with("headroom_desktop_lib::state")
-        && msg.starts_with("run_upgrade_with_ui: boot validation failed")
+        && (msg.starts_with("run_upgrade_with_ui: boot validation failed")
+            || msg.starts_with("run_upgrade_with_ui: install failed after"))
     {
         return true;
     }
@@ -736,8 +740,7 @@ impl Log for FileLogger {
             || self
                 .records_since_rotate_check
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                % 64
-                == 0
+                .is_multiple_of(64)
         {
             self.rotate_if_needed();
         }
@@ -1385,6 +1388,12 @@ mod tests {
         assert!(skip_sentry(
             "headroom_desktop_lib::state",
             "run_upgrade_with_ui: boot validation failed (timed_out); rolling back to Some(\"0.30.0\")"
+        ));
+        // RUST-J1 verbatim; RUST-29 is the tagged copy.
+        assert!(skip_sentry(
+            "headroom_desktop_lib::state",
+            "run_upgrade_with_ui: install failed after 804ms (restored=false): failed to move \
+             ~\\AppData\\Local\\Headroom\\headroom\\runtime\\venv aside: 拒绝访问。 (os error 5)"
         ));
     }
 
