@@ -21,9 +21,12 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
-/// Conversations kept; the least recently updated is dropped first. Far above
-/// the number of Claude Code sessions anyone keeps open at once.
-const MAX_SESSIONS: usize = 64;
+/// Conversations kept; the least recently active is dropped first. Every
+/// Claude Code session is booked (VS Code panel chats, headless `claude -p`
+/// runs such as learn scans), and 64 filled in about a day, dropping idle
+/// conversations the user was still coming back to. At ~100 bytes an entry,
+/// 512 is ~50 KB, cheap for the statusline script to read every second.
+const MAX_SESSIONS: usize = 512;
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 const FILE_NAME: &str = "claude-statusline.json";
 

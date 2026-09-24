@@ -1865,7 +1865,7 @@ if _hd_fm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         pass
 
 
-# Streaming metering headers (upstream PR owed):
+# Streaming metering headers (upstream PR #3769):
 # The buffered path stamps x-headroom-tokens-before/-after/-saved on its
 # response; the streaming path forwards only the upstream rate-limit and
 # request-id headers, so a streaming client (every real Claude Code and Codex
