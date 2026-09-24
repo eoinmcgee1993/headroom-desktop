@@ -1,3 +1,4 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 // The extension ships as plain CommonJS; its pure helpers are tested here and
@@ -24,9 +25,10 @@ describe("vscode status bar extension", () => {
     );
     const long = `/Users/garm/${"x".repeat(250)}`;
     const truncated = `${projectSlug(long).slice(0, 200)}-abc123`;
+    // path.join, like the extension: Windows separators are `\`.
     expect(projectDirs("/p", ["/a/b", long], () => [truncated, "other"])).toEqual([
-      "/p/-a-b",
-      `/p/${truncated}`
+      path.join("/p", "-a-b"),
+      path.join("/p", truncated)
     ]);
   });
 

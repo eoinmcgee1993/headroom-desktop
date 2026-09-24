@@ -107,8 +107,13 @@ def main():
             except asyncio.TimeoutError:
                 assert args.disabled, "fixed request still timed out"
                 assert proxy._compression_timed_out_in_flight > 0
+                # Poll, not one fixed 80ms sleep: on a loaded CI runner the
+                # worker thread can go unscheduled that long (failed rc.5 CI).
                 n = len(calls)
-                await asyncio.sleep(0.08)
+                for _ in range(100):
+                    await asyncio.sleep(0.02)
+                    if len(calls) > n:
+                        break
                 assert len(calls) > n, "control did not reproduce continuing work"
                 print(f"PASS control: parallelism={parallelism}, words={words}, "
                       "timeout with continuing worker")
