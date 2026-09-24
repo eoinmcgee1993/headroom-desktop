@@ -1519,9 +1519,15 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
 # back to the literal's `cmd` property only when strict JSON fails; a template
 # literal with ${...} or a non-literal value still yields nothing, so that
 # output stays compressible exactly as before. The handler late-imports the
-# helper, so rebinding the module symbol reaches it. Copied verbatim from PR
-# #3737 (branch fix/codex-exec-js-object-args). Self-neutralizes once the
-# wheel parses the literal form. Exact-pin gated to wheel 0.38.0.
+# helper, so rebinding the module symbol reaches it. The parser of PR #3737
+# (branch fix/codex-exec-js-object-args) at f6318827: a literal counts only
+# when it is the WHOLE property value (the lookahead), so `{note: "cmd: 'cat
+# f'", cmd: "python x"}` and `{cmd: "cat f" + " | python x"}` are no longer
+# misread, and an escape it cannot decode yields nothing. That commit's
+# "None means maybe a read" half needs its handler change in openai.py, which
+# cannot be patched from here, so an unknown cmd is skipped instead: the
+# wheel's behavior for it. Self-neutralizes once the wheel parses the literal
+# form. Exact-pin gated to wheel 0.38.0.
 # Kill switch: HEADROOM_CODEX_EXEC_JS_ARGS=0.
 _hd_xj_flag = _hd_os.environ.get("HEADROOM_CODEX_EXEC_JS_ARGS", "1")
 if _hd_xj_flag.strip().lower() not in ("", "0", "false", "no", "off"):
@@ -1538,10 +1544,14 @@ if _hd_xj_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 _hd_xj_prop = _hd_xj_re.compile(
                     r"""\{[^{}]*?(?<![\w$])(?:cmd|"cmd"|'cmd')\s*:\s*"""
                     r"""(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\$]|\\.|\$(?!\{))*)`)"""
+                    r"""(?=\s*[,}])"""
                 )
-                _hd_xj_escapes = {"n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+                _hd_xj_escapes = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v"}
 
                 def _hd_xj_string(body):
+                    escaped = _hd_xj_re.findall(r"\\(.)", body, flags=_hd_xj_re.S)
+                    if any(c.isalnum() and c not in _hd_xj_escapes for c in escaped):
+                        return None
                     return _hd_xj_re.sub(
                         r"\\(.)",
                         lambda m: _hd_xj_escapes.get(m.group(1), m.group(1)),
@@ -1565,7 +1575,7 @@ if _hd_xj_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                             if literal is None:
                                 continue
                             body = next(g for g in literal.groups() if g is not None)
-                            args = {"cmd": _hd_xj_string(body)}
+                            args = {"cmd": _hd_xj_string(body) or ""}
                         command = _hd_xj_cr._tool_call_command_text(args)
                         if command:
                             commands.append(command)
@@ -4905,7 +4915,7 @@ impl ToolManager {
             .into_iter()
             .filter_map(|path| read_headroom_learn_metadata_from_path(&path))
             .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| right.sort_key.cmp(&left.sort_key));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.sort_key));
         candidates
             .into_iter()
             .next()
@@ -12074,11 +12084,10 @@ fn pip_line_to_progress(
         (message, false, false)
     } else if trimmed.starts_with("Installing collected packages") {
         ("Installing packages...".to_string(), false, true)
-    } else if let Some(rest) = trimmed.strip_prefix("Successfully installed ") {
+    } else {
+        let rest = trimmed.strip_prefix("Successfully installed ")?;
         let count = rest.split_whitespace().count();
         (format!("Installed {} packages.", count), false, true)
-    } else {
-        return None;
     };
 
     // Counts packages, not lines: pip prints a `Collecting` and a `Downloading`
@@ -14335,6 +14344,13 @@ payload = {"model": "gpt-5", "input": [
 out = handler._compress_openai_responses_live_text_units_with_router(payload, model="gpt-5", request_id="xj")[0]
 print("READ " + ("verbatim" if out["input"][1] == read_out else "compressed"))
 print("OTHER " + ("verbatim" if out["input"][3] == other_out else "compressed"))
+# A literal counts only as the whole property value (upstream f6318827).
+for label, src in [
+    ("NOTE", "tools.exec_command({note: \"x, cmd: 'cat f'\", cmd: \"python run.py\"})"),
+    ("CONCAT", "tools.exec_command({cmd: \"cat f.py\" + \" | python x\"})"),
+    ("HEX", "tools.exec_command({cmd: \"c\\x61t f\"})"),
+]:
+    print(label + " " + repr(cr._custom_tool_call_commands(src)))
 "#;
         let run = |flag: &str| {
             crate::proc::command(&python)
@@ -14378,6 +14394,11 @@ print("OTHER " + ("verbatim" if out["input"][3] == other_out else "compressed"))
         );
         // A non-read exec output still compresses with the vendor bound.
         assert!(on_out.contains("OTHER compressed"), "{detail}");
+        // A cmd inside another property's string, a concatenation and an
+        // undecodable escape are never read as a command.
+        assert!(on_out.contains("NOTE ['python run.py']"), "{detail}");
+        assert!(on_out.contains("CONCAT []"), "{detail}");
+        assert!(on_out.contains("HEX []"), "{detail}");
     }
 
     #[test]

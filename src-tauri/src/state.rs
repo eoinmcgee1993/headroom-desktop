@@ -9045,7 +9045,7 @@ fn savings_rate_implausible(daily_savings: &[DailySavingsPoint]) -> Option<f64> 
 /// under its sample floor.
 fn top_models_by_requests(model_rates: &[crate::models::ModelSavingsRate]) -> String {
     let mut ranked: Vec<_> = model_rates.iter().collect();
-    ranked.sort_by(|a, b| b.requests.cmp(&a.requests));
+    ranked.sort_by_key(|r| std::cmp::Reverse(r.requests));
     let listed: Vec<_> = ranked
         .iter()
         .take(3)

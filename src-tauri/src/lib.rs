@@ -21,6 +21,7 @@ mod storage;
 mod tool_manager;
 mod upstream_override;
 mod usage_counters;
+mod vscode_statusbar;
 mod wsl_probe;
 
 /// Cross-module lock for tests that repoint $HOME / $CODEX_HOME. Env vars are
@@ -1241,7 +1242,7 @@ fn macos_relaunch_snippet(
     let attempted = shell_quote_path(attempted);
     let log_quoted = shell_quote_path(log);
     format!(
-        "touch {attempted}; /usr/bin/open -n {quoted}; rc=$?; \
+        "touch {attempted}; /usr/bin/open -n {quoted}; rc=$?; echo $rc > {attempted}; \
          echo \"$(date '+%Y-%m-%d %H:%M:%S') relauncher: open -n {quoted} exited rc=$rc (alive=$alive)\" >> {log_quoted}"
     )
 }
@@ -9191,7 +9192,7 @@ fn build_tray_runtime_icons() -> anyhow::Result<TrayRuntimeIcons> {
 fn to_grayscale_strength(rgba: &[u8], strength: f32) -> Vec<u8> {
     let s = strength.clamp(0.0, 1.0);
     let mut out = rgba.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0 {
         let r = pixel[0] as f32;
         let g = pixel[1] as f32;
         let b = pixel[2] as f32;
@@ -9212,7 +9213,7 @@ fn tint_toward_accent(rgba: &[u8], strength: f32) -> Vec<u8> {
     const ACCENT: [f32; 3] = [80.0, 210.0, 100.0];
     let s = strength.clamp(0.0, 1.0);
     let mut out = rgba.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+    for pixel in out.as_chunks_mut::<4>().0 {
         if pixel[3] == 0 {
             continue;
         }

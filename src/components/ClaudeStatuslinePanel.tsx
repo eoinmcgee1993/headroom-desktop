@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-/// On/off for the line Headroom adds under Claude Code's prompt in the terminal
-/// ("Headroom: saved 15k input tokens on the last request, ..."). On by
-/// default; Headroom never replaces a status line the user set up themselves.
+/// On/off for Headroom's per-conversation savings in Claude Code: the line under
+/// the terminal prompt, and the status bar item in VS Code and Cursor (whose
+/// Claude Code panel shows no status line). On by default; Headroom never
+/// replaces a terminal status line the user set up themselves.
 export function ClaudeStatuslinePanel() {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -37,8 +38,9 @@ export function ClaudeStatuslinePanel() {
         <div>
           <h3>Claude Code status line</h3>
           <p className="panel-card__subtitle">
-            Show what Headroom saved in each conversation under the prompt in the Claude Code
-            terminal. Not shown in the VS Code panel, or if you already use your own status line.
+            Show what Headroom saved in each Claude Code conversation: under the prompt in the
+            terminal, and in the status bar of VS Code and Cursor. The terminal line is skipped if
+            you already use your own status line.
           </p>
         </div>
         <button

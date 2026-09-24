@@ -150,6 +150,7 @@ import {
   hasNeverScanned,
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
+  providerSpentTokens,
   percent1,
   sortClientConnectors,
   startOfDay,
@@ -630,8 +631,7 @@ function SavingsChartTooltip({
   // cached Claude Code hour shrank a concurrent ChatGPT's spend to a fraction
   // and showed an 82% rate that was really ~25%).
   const costScale = point.actualCostUsd > 0 ? point.compressibleCostUsd / point.actualCostUsd : 1;
-  const tokenScale =
-    point.totalTokensSent > 0 ? point.compressibleTokensSent / point.totalTokensSent : 1;
+  const spentTokens = providerSpentTokens(providerSavings, point);
 
   return (
     <div className="savings-chart__tooltip">
@@ -639,7 +639,7 @@ function SavingsChartTooltip({
       {providerSavings.length > 0
         ? // Hourly buckets carry per-provider attribution: show Saved/Spent per
           // connector instead of the bucket total (which would be redundant).
-          providerSavings.map((provider) => (
+          providerSavings.map((provider, index) => (
             <div className="savings-chart__tooltip-group" key={provider.label}>
               <span className="savings-chart__tooltip-label">{provider.label}</span>
               <span className="savings-chart__tooltip-item">
@@ -670,9 +670,7 @@ function SavingsChartTooltip({
                   ? `Spent ${currencyExact(
                       provider.compressibleCostUsd ?? provider.actualCostUsd * costScale
                     )}`
-                  : `Spent ${compactNumber(
-                      provider.compressibleTokensSent ?? provider.totalTokensSent * tokenScale
-                    )} tokens`}
+                  : `Spent ${compactNumber(spentTokens[index])} tokens`}
               </span>
             </div>
           ))
@@ -3930,6 +3928,13 @@ export default function App() {
           !appUpdateInstallBusyRef.current
         ) {
           void installAvailableUpdate(patch.availableUpdate, { quiet: true });
+          // A quiet install that fails every time (read-only or translocated
+          // bundle) would leave this build unannounced forever. The stale
+          // reminder is its fallback: the clock starts now, and a staged
+          // update stops the ticks that could fire it.
+          if (!(await getCurrentWindow().isVisible().catch(() => false))) {
+            await maybeFireStaleAppUpdateNotification(patch.availableUpdate);
+          }
           return;
         }
         const windowVisible = await getCurrentWindow().isVisible().catch(() => false);
@@ -4982,7 +4987,8 @@ export default function App() {
   // rows now, so the three are comparable.
   const cachePairAllTime = allTimeCacheHitPair(
     dashboard.savingsBreakdown,
-    dashboard.savingsBreakdown?.compressionSavingsUsd ?? 0
+    dashboard.savingsBreakdown?.compressionSavingsUsd ?? 0,
+    dashboard.dailySavings
   );
   // Same pair for the shorter windows, from the buckets that carry cache
   // coverage (backend history checkpoints; local-tracker buckets and days
@@ -8317,7 +8323,8 @@ export default function App() {
                 <summary>Advanced</summary>
                 <div className="advanced-section__body">
                   <UpstreamPanel />
-                  <ClaudeStatuslinePanel />
+                  {/* The statusline is not installed on Windows (untested there). */}
+                  {!navigator.userAgent.includes("Windows") && <ClaudeStatuslinePanel />}
                 </div>
               </details>
 

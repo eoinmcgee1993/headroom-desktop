@@ -104,7 +104,7 @@ jobs:
         run: npm ci
 
       - name: React hook rules
-        # rules-of-hooks only (exhaustive-deps is a warning and does not fail):
+        # rules-of-hooks and exhaustive-deps, both errors (eslint.config.js):
         # a conditionally-called hook corrupts hook order for every hook after
         # it, and App.tsx has 78 useEffect calls with nothing else checking them.
         run: npm run lint
@@ -209,6 +209,10 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          # Pinned: the clippy step below fails on warnings, and every new
+          # stable adds lints (1.98 turned rc3 and rc4 red on seven sites).
+          # Bump deliberately, after `cargo +<new> clippy --all-targets` is clean.
+          toolchain: 1.98.1
           components: clippy
 
       - name: Install cargo-nextest
@@ -246,6 +250,9 @@ jobs:
         # exact pin every vendor must bind, and after a wheel bump a skip is
         # the cue to drop or re-pin that vendor (Wheel Bump Rules, CLAUDE.md).
         # macOS because the truststore vendor runs only here and on Windows.
+        # One test at a time: each spawns a Python probe with sub-second
+        # deadlines, and fourteen at once on a 3-vCPU runner starve the
+        # responses-budget probe into a false "fixed request still timed out".
         shell: bash
         env:
           HEADROOM_DATA_DIR: ${{ runner.temp }}/headroom-wheel
@@ -259,7 +266,7 @@ jobs:
             -r src-tauri/python/headroom-requirements.lock
           "$py" -m pip install --quiet --no-deps --only-binary=:all: "headroom-ai==$pin"
           cargo test --manifest-path src-tauri/Cargo.toml --lib against_the_installed_wheel \
-            -- --nocapture 2>&1 | tee "$RUNNER_TEMP/wheel-tests.log"
+            -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/wheel-tests.log"
           if grep 'skipping:' "$RUNNER_TEMP/wheel-tests.log"; then
             echo "::error::a vendor test skipped against headroom-ai $pin"
             exit 1

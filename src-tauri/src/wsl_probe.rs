@@ -78,7 +78,9 @@ fn decode_wsl_output(bytes: &[u8]) -> String {
         bytes.len() >= 2 && (bytes.starts_with(&[0xFF, 0xFE]) || (bytes[1] == 0 && bytes[0] != 0));
     if looks_utf16 {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         String::from_utf16_lossy(&units)

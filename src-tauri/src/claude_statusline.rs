@@ -79,7 +79,14 @@ fn load(path: &Path) -> BTreeMap<String, Session> {
     };
     match serde_json::from_slice::<Persisted>(&bytes) {
         Ok(persisted) if persisted.schema_version == SCHEMA_VERSION => persisted.sessions,
-        Ok(_) => BTreeMap::new(),
+        Ok(persisted) => {
+            log::warn!(
+                "{FILE_NAME} has schema {} (expected {SCHEMA_VERSION}); backing up and starting fresh",
+                persisted.schema_version
+            );
+            let _ = std::fs::rename(path, path.with_extension("json.bak"));
+            BTreeMap::new()
+        }
         Err(err) => {
             log::warn!("{FILE_NAME} is corrupt ({err}); backing up and starting fresh");
             let _ = std::fs::rename(path, path.with_extension("json.bak"));

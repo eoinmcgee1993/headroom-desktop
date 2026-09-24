@@ -166,15 +166,34 @@ export function readCostUsd(point: {
  * schema deferral, neither of which removes input) made the all-time row read
  * above the windowed rows beside it -- 17.0% against 11.6% on the same machine,
  * measured 2026-09-10. Named for the field, not for "lifetime savings", so the
- * broader figure cannot be passed back in by accident. */
+ * broader figure cannot be passed back in by accident.
+ *
+ * The lifetime breakdown carries no read cost, so it is priced at the
+ * read-cost-to-discount ratio of the `pricedBuckets` whose reads the rollup
+ * priced exactly; `discount / 9` only when none did. Without that the all-time
+ * row kept the /9 overstatement the windowed rows beside it dropped (4.3x on
+ * claude-fable-5-1 reads) and read above them again. */
 export function allTimeCacheHitPair(
   breakdown: SavingsBreakdown | null | undefined,
-  compressionSavingsUsd: number
+  compressionSavingsUsd: number,
+  pricedBuckets: ReadonlyArray<{
+    cacheSavingsUsd?: number | null;
+    cacheReadCostUsd?: number | null;
+  }> = []
 ) {
   if (!breakdown || breakdown.cacheReadTokens <= 0) return null;
+  let readCost = 0;
+  let discount = 0;
+  for (const bucket of pricedBuckets) {
+    if (bucket.cacheReadCostUsd == null || bucket.cacheSavingsUsd == null) continue;
+    readCost += Math.max(0, bucket.cacheReadCostUsd);
+    discount += Math.max(0, bucket.cacheSavingsUsd);
+  }
   return cacheHitPair([
     {
       cacheSavingsUsd: breakdown.cacheSavingsUsd,
+      cacheReadCostUsd:
+        discount > 0 ? (Math.max(0, breakdown.cacheSavingsUsd) * readCost) / discount : null,
       actualCostUsd: breakdown.totalInputCostUsd,
       estimatedSavingsUsd: compressionSavingsUsd
     }
@@ -597,6 +616,26 @@ export function mergeProviderSavingsForDisplay(
               )
       };
     });
+}
+
+/**
+ * Per-connector "Spent" tokens for the hourly hover. They must add up to the
+ * bar, which is the Input chip's new-input denominator (exact on sampled
+ * hours): each connector's own cache-stripped estimate only decides the split.
+ * When any connector lacks per-provider reads, every row falls back to the
+ * bucket's share, which adds up to the bar too.
+ */
+export function providerSpentTokens(
+  providers: ReadonlyArray<{ totalTokensSent: number; compressibleTokensSent: number | null }>,
+  bar: { totalTokensSent: number; compressibleTokensSent: number }
+): number[] {
+  const estimates = providers.map((provider) => provider.compressibleTokensSent);
+  const sum = estimates.reduce<number>((acc, tokens) => acc + (tokens ?? NaN), 0);
+  if (sum > 0) {
+    return estimates.map((tokens) => ((tokens ?? 0) / sum) * bar.compressibleTokensSent);
+  }
+  const share = bar.totalTokensSent > 0 ? bar.compressibleTokensSent / bar.totalTokensSent : 1;
+  return providers.map((provider) => provider.totalTokensSent * share);
 }
 
 export function buildHourlySavingsChartData(data: HourlySavingsPoint[]): SavingsChartDatum[] {
