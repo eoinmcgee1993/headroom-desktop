@@ -503,7 +503,7 @@ fn onboarding_recovery_copy(any_connector_enabled: bool) -> (&'static str, &'sta
     if any_connector_enabled {
         return (
             "Headroom isn't seeing any traffic",
-            "Setup finished, but no Claude Code or ChatGPT requests have come through yet. \
+            "Setup finished, but no Claude Code or ChatGPT Codex requests have come through yet. \
              Restart your terminal or editor so they pick up the new settings.",
         );
     }
@@ -7591,7 +7591,7 @@ fn learn_step_label(line: &str) -> Option<String> {
         let model = model.trim_end_matches('.');
         let backend = match model {
             "claude-cli" => "Claude Code",
-            "codex-cli" => "ChatGPT",
+            "codex-cli" => "ChatGPT Codex",
             "gemini-cli" => "Gemini",
             other => other,
         };
@@ -7687,7 +7687,7 @@ fn execute_headroom_learn_run(
                 .to_string();
             (path, name)
         }
-        LearnAgent::Codex => ("codex", "ChatGPT sessions".to_string()),
+        LearnAgent::Codex => ("codex", "ChatGPT Codex sessions".to_string()),
         LearnAgent::Opencode => ("opencode", "OpenCode sessions".to_string()),
         LearnAgent::Grok => ("grok", "Grok sessions".to_string()),
     };
@@ -8485,13 +8485,13 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     ),
                     TrayRuntimeVisual::Running => "Headroom — active".into(),
                     TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code or ChatGPT running normally)".into()
+                        "Headroom — paused (Claude Code or ChatGPT Codex running normally)".into()
                     }
                     TrayRuntimeVisual::Unhealthy => {
                         "Headroom — proxy unreachable, attempting restart".into()
                     }
                     TrayRuntimeVisual::Disconnected => {
-                        "Headroom — Claude Code or ChatGPT not connected".into()
+                        "Headroom — Claude Code or ChatGPT Codex not connected".into()
                     }
                     TrayRuntimeVisual::Off => "Headroom — off".into(),
                 };
@@ -8593,7 +8593,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
-                                    "Claude Code or ChatGPT is disconnected — open Headroom to re-enable.",
+                                    "Claude Code or ChatGPT Codex is disconnected — open Headroom to re-enable.",
                                     Some("connectors".into()),
                                 );
                             }

@@ -66,7 +66,7 @@ const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
     },
     ManagedClientSpec {
         id: "codex",
-        name: "ChatGPT",
+        name: "ChatGPT Codex",
     },
     ManagedClientSpec {
         id: "grok_build",
@@ -709,7 +709,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
 
             if shell_ok {
                 checks.push(
-                    "Found ChatGPT (Codex) OPENAI_BASE_URL export in managed shell block.".into(),
+                    "Found ChatGPT Codex OPENAI_BASE_URL export in managed shell block.".into(),
                 );
             }
             if toml_ok {
@@ -8280,18 +8280,14 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
                 .map(|path| format!("Detected the ChatGPT app at {}.", path.display()))
         })
         .or_else(|| {
-            codex_user_state_exists().then(|| {
-                format!(
-                    "Detected ChatGPT (Codex) data in {}.",
-                    codex_home().display()
-                )
-            })
+            codex_user_state_exists()
+                .then(|| format!("Detected ChatGPT Codex data in {}.", codex_home().display()))
         });
 
     if let Some(detected_note) = detected {
         return ClientStatus {
             id: "codex".into(),
-            name: "ChatGPT".into(),
+            name: "ChatGPT Codex".into(),
             installed: true,
             configured,
             health: if configured {
@@ -8304,7 +8300,8 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
             } else {
                 vec![
                     detected_note,
-                    "Route ChatGPT (previously Codex) through Headroom's localhost proxy so prompts stay lean.".into(),
+                    "Route ChatGPT Codex through Headroom's localhost proxy so prompts stay lean."
+                        .into(),
                 ]
             },
         };
@@ -8312,7 +8309,7 @@ fn detect_codex_client(configured: bool) -> ClientStatus {
 
     ClientStatus {
         id: "codex".into(),
-        name: "ChatGPT".into(),
+        name: "ChatGPT Codex".into(),
         installed: false,
         configured: false,
         health: ClientHealth::NotDetected,

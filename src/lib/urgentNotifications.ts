@@ -28,7 +28,7 @@ const NUDGE_PREFIXES: Record<number, string> = {
 // Max-like plans, 25/35/45 -> 50 for Pro-like) — hardcoded numbers here used
 // to tell Max users "25% of your weekly usage" when they were at 10%.
 function usageNudgeTitle(
-  product: "Claude" | "ChatGPT",
+  product: "Claude" | "ChatGPT Codex",
   level: number,
   thresholds: number[] | null | undefined,
   disableAt: number | null | undefined
@@ -78,7 +78,7 @@ export async function maybeFireUrgentPricingNotifications(
       CODEX_OPTIMIZATION_BLOCKED_KEY,
       "Headroom optimization is off",
       codex.gateMessage ||
-        "ChatGPT optimization is paused. Open Headroom to review.",
+        "ChatGPT Codex optimization is paused. Open Headroom to review.",
       "billing"
     );
     return;
@@ -118,14 +118,14 @@ function pickUsageNudge(
   if (codexLevel > claudeLevel) {
     return {
       title: usageNudgeTitle(
-        "ChatGPT",
+        "ChatGPT Codex",
         codexLevel,
         codex!.effectiveNudgeThresholdsPercent,
         codex!.effectiveDisableThresholdPercent
       ),
       body:
         codex!.gateMessage ||
-        "Headroom will pause ChatGPT optimization at your weekly cap. Upgrade to keep going.",
+        "Headroom will pause ChatGPT Codex optimization at your weekly cap. Upgrade to keep going.",
     };
   }
 

@@ -1,6 +1,6 @@
 # Headroom Desktop - cut Claude Code & Codex token costs by ~50%
 
-**Headroom is a desktop tray app for macOS, Windows, and Linux that cuts [Claude Code](https://www.anthropic.com/claude-code) and [ChatGPT / Codex](https://openai.com/codex/) token costs by ~50% - without changing how you code.** It also routes [OpenCode](https://opencode.ai) and Grok Build through the same pipeline. It runs a local-first optimization pipeline that reversibly compresses the tool output, logs, and boilerplate that bloat every prompt, so the AI plan you already pay for stretches about 2x further. Nothing the model needs is lost - it can pull the original content back on demand.
+**Headroom is a desktop tray app for macOS, Windows, and Linux that cuts [Claude Code](https://www.anthropic.com/claude-code) and [ChatGPT Codex](https://openai.com/codex/) token costs by ~50% - without changing how you code.** It also routes [OpenCode](https://opencode.ai) and Grok Build through the same pipeline. It runs a local-first optimization pipeline that reversibly compresses the tool output, logs, and boilerplate that bloat every prompt, so the AI plan you already pay for stretches about 2x further. Nothing the model needs is lost - it can pull the original content back on demand.
 
 > **Paid product.** Headroom is a paid subscription app (7-day free trial, no credit card required; plans from $4/mo, or $3/mo billed annually) - see [pricing](https://extraheadroom.com/pricing). The desktop shell in this repo is MIT-licensed and open source, but the app requires a Headroom account and an active plan to run.
 
@@ -48,7 +48,7 @@ If you are a coding agent installing or diagnosing Headroom for your user, follo
 
 ---
 
-> **Note:** Headroom supports **Claude Code**, **ChatGPT / Codex** (CLI and desktop app), **OpenCode**, and **Grok Build**. Support for additional clients is planned.
+> **Note:** Headroom supports **Claude Code**, **ChatGPT Codex** (CLI and desktop app), **OpenCode**, and **Grok Build**. Support for additional clients is planned.
 
 Headroom is a local-first desktop tray app that routes your coding clients through a local optimization pipeline. Stable builds ship for macOS, Windows, and Linux. It installs and manages a self-contained Python runtime, bundles proven token-saving tools, and surfaces savings analytics - all without touching your system environment.
 
@@ -67,7 +67,7 @@ The app ships as a slim Tauri shell (~a few MB). Heavy Python components are fet
 Headroom is a two-hop local proxy. Nothing leaves `127.0.0.1` except the final upstream call, which goes to the same API your client would have called directly.
 
 ```
-Claude Code / ChatGPT (Codex) / OpenCode / Grok Build
+Claude Code / ChatGPT Codex / OpenCode / Grok Build
     |  ANTHROPIC_BASE_URL = http://127.0.0.1:6767
     |  OPENAI_BASE_URL    = http://127.0.0.1:6767/v1
     v

@@ -558,7 +558,7 @@ export function mergeProviderSavingsForDisplay(
       compressibleCostUsd: 0 as number | null
     },
     codex: {
-      label: "ChatGPT",
+      label: "ChatGPT Codex",
       count: 0,
       estimatedSavingsUsd: 0,
       estimatedTokensSaved: 0,
