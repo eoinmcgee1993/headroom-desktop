@@ -1352,33 +1352,49 @@ fn codex_plan_gate(
 }
 
 pub fn request_auth_code(state: &AppState, email: &str) -> Result<HeadroomAuthCodeRequest, String> {
-    request_auth_code_with_base_url(state, email, &api_base_url())
+    request_auth_code_with_base_url(state, email, &api_base_url(), ACTIVATE_RETRY_BACKOFF)
 }
 
-/// Test-only seam: `request_auth_code` against a parameterized base URL so a
-/// canned-response test server can stand in for headroom-web.
+/// Test-only seam: `request_auth_code` against a parameterized base URL and
+/// retry backoff so a canned-response test server can stand in for headroom-web.
+///
+/// Retries once on a gateway-class status, like activation: a 502 is a
+/// headroom-web deploy switchover (Sentry RUST-J4). A 503 here can also come
+/// from the handler's own rescue, but that means the code email was never
+/// sent, so reissuing is still right. Transport errors are NOT retried: a
+/// timeout may mean the email went out, and a second code would invalidate it.
 pub(crate) fn request_auth_code_with_base_url(
     state: &AppState,
     email: &str,
     base_url: &str,
+    retry_backoff: std::time::Duration,
 ) -> Result<HeadroomAuthCodeRequest, String> {
     let trimmed = email.trim().to_ascii_lowercase();
     if trimmed.is_empty() || !trimmed.contains('@') {
         return Err("Enter a valid email address.".into());
     }
 
-    let response = http_client()?
-        .post(join_url(base_url, "desktop/auth/request_code"))
-        .json(&RequestCodePayload {
-            email: &trimmed,
-            identity: IdentityPayload::for_state(state),
-        })
-        .send()
-        .map_err(|err| {
-            let msg = transport_failure("request a sign-in code", &err);
-            capture_transport_failure("auth-request-code", &msg, &err);
-            msg
-        })?;
+    let mut retried = false;
+    let response = loop {
+        let response = http_client()?
+            .post(join_url(base_url, "desktop/auth/request_code"))
+            .json(&RequestCodePayload {
+                email: &trimmed,
+                identity: IdentityPayload::for_state(state),
+            })
+            .send()
+            .map_err(|err| {
+                let msg = transport_failure("request a sign-in code", &err);
+                capture_transport_failure("auth-request-code", &msg, &err);
+                msg
+            })?;
+        if is_retryable_gateway_status(response.status().as_u16()) && !retried {
+            retried = true;
+            std::thread::sleep(retry_backoff);
+            continue;
+        }
+        break response;
+    };
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -5939,6 +5955,7 @@ mod tests {
             &state,
             "user@example.com",
             &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::ZERO,
         )
         .expect("request_auth_code succeeds");
 
@@ -5961,6 +5978,7 @@ mod tests {
             &state,
             "user@example.com",
             &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::ZERO,
         )
         .expect("request_auth_code succeeds");
 
@@ -6049,12 +6067,34 @@ mod tests {
     }
 
     #[test]
+    fn request_auth_code_retries_once_past_a_gateway_error() {
+        // RUST-J4: a 502 during a headroom-web deploy switchover must not
+        // reach the sign-in screen; the replacement instance answers the retry.
+        let body = serde_json::json!({ "email": "user@example.com", "expiresInSeconds": 600 });
+        let (port, server) = spawn_flaky_server("HTTP/1.1 502 Bad Gateway", body.to_string());
+        let (state, dir) = temp_app_state();
+
+        let result = super::request_auth_code_with_base_url(
+            &state,
+            "user@example.com",
+            &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::from_millis(20),
+        )
+        .expect("second attempt lands after one 502");
+
+        server.join().unwrap();
+        assert_eq!(result.email, "user@example.com");
+        drop_state(dir);
+    }
+
+    #[test]
     fn request_auth_code_rejects_invalid_email_before_calling_server() {
         let (state, dir) = temp_app_state();
         let result = super::request_auth_code_with_base_url(
             &state,
             "  ",
-            "http://127.0.0.1:1", // would fail if reached
+            "http://127.0.0.1:1", // would fail if reached,
+            std::time::Duration::ZERO,
         );
         assert!(matches!(result, Err(msg) if msg.contains("valid email")));
         drop_state(dir);
@@ -6071,6 +6111,7 @@ mod tests {
             &state,
             "user@example.com",
             &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::ZERO,
         )
         .expect_err("5xx surfaces as error");
 
@@ -6321,10 +6362,11 @@ mod tests {
         drop_state(dir);
     }
 
-    /// Serves `first_status` once, then `sample_account_envelope_body()` with a
-    /// 200, so a test can assert the second attempt is the one that lands.
-    fn spawn_flaky_activation_server(
+    /// Serves `first_status` once, then `success_body` with a 200, so a test
+    /// can assert the second attempt is the one that lands.
+    fn spawn_flaky_server(
         first_status: &'static str,
+        success_body: String,
     ) -> (u16, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind flaky server");
@@ -6337,10 +6379,7 @@ mod tests {
                 let (status, body) = if attempt == 0 {
                     (first_status, "{}".to_string())
                 } else {
-                    (
-                        "HTTP/1.1 200 OK",
-                        sample_account_envelope_body().to_string(),
-                    )
+                    ("HTTP/1.1 200 OK", success_body.clone())
                 };
                 let response = format!(
                     "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -6359,7 +6398,10 @@ mod tests {
         // A 502 from the edge during a headroom-web deploy switchover must not
         // reach the user: the replacement instance answers the retry.
         let _env = AuthedTestEnv::new("session-xyz");
-        let (port, server) = spawn_flaky_activation_server("HTTP/1.1 502 Bad Gateway");
+        let (port, server) = spawn_flaky_server(
+            "HTTP/1.1 502 Bad Gateway",
+            sample_account_envelope_body().to_string(),
+        );
         let (state, dir) = temp_app_state();
 
         let result = super::activate_account_with_retry_backoff(
@@ -6385,7 +6427,10 @@ mod tests {
         // 500 means the handler ran and may already have written; only the
         // gateway-class statuses are safe to repeat. One attempt, then surface.
         let _env = AuthedTestEnv::new("session-xyz");
-        let (port, server) = spawn_flaky_activation_server("HTTP/1.1 500 Internal Server Error");
+        let (port, server) = spawn_flaky_server(
+            "HTTP/1.1 500 Internal Server Error",
+            sample_account_envelope_body().to_string(),
+        );
         let (state, dir) = temp_app_state();
 
         let err = super::activate_account_with_retry_backoff(
