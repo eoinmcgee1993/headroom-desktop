@@ -6106,6 +6106,8 @@ the api.anthropic.com settings layer, replays the control requests that set
 session state (never one-shot actions such as rewind_files, which would undo
 work), asks the new child to start Remote Control, and keeps piping. The
 extension never sees a process exit. Headroom is off for the swapped session.
+The panel shows nothing for the swap, so the answer to that request becomes a
+line in the conversation: Remote Control is active, or it did not start.
 Once the extension closes stdin or signals the wrapper, nothing is respawned.
 """
 import json
@@ -6115,6 +6117,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, ".headroom", "remote-control")
@@ -6122,6 +6125,7 @@ OVERRIDE = '{"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com"}}'
 MARKER_MAX_AGE = 60
 # Control requests that carry session state; replayed into a respawned child.
 REPLAYED = ("initialize", "mcp_set_servers", "update_settings")
+RC_REQUEST = "headroom-remote-control"
 
 if len(sys.argv) < 2:
     sys.exit("usage: headroom-claude-wrapper.py <claude-binary> [args...]")
@@ -6182,6 +6186,23 @@ def pump_stdin():
             pass
 
 
+def announce(response):
+    # The panel shows nothing for the swap, so say it in the conversation: the
+    # same system/informational line the CLI emits itself, which the webview
+    # renders as a meta line (display only, not part of the transcript).
+    if response.get("subtype") == "success":
+        url = (response.get("response") or {}).get("session_url")
+        text, level = "Remote Control is now active.", "notice"
+        if url:
+            text += " Continue here, on your phone, or at " + url
+    else:
+        text = "Remote Control did not start: " + (response.get("error") or "unknown error")
+        text, level = text + ". Run /remote-control-headroom to try again.", "warning"
+    line = {"type": "system", "subtype": "informational", "content": text, "level": level,
+            "uuid": str(uuid.uuid4()), "session_id": state["sid"]}
+    return (json.dumps(line) + "\n").encode()
+
+
 def pump_child(child):
     while True:
         line = child.stdout.readline()
@@ -6196,7 +6217,9 @@ def pump_child(child):
                 rid = (parsed.get("response") or {}).get("request_id")
                 if rid in state["swallow"]:
                     state["swallow"].discard(rid)
-                    continue
+                    if rid != RC_REQUEST:
+                        continue
+                    line = announce(parsed["response"])
         except ValueError:
             pass
         with lock:
@@ -6264,10 +6287,10 @@ while True:
         except ValueError:
             pass
         write_child(line)
-    state["swallow"].add("headroom-remote-control")
+    state["swallow"].add(RC_REQUEST)
     request = {
         "type": "control_request",
-        "request_id": "headroom-remote-control",
+        "request_id": RC_REQUEST,
         "request": {"subtype": "remote_control", "enabled": True},
     }
     write_child((json.dumps(request) + "\n").encode())
@@ -6458,7 +6481,7 @@ fi
 mkdir -p "$dir" && printf '%s %s\n' "$CLAUDE_PID" "$via" > "$dir/exit-$CLAUDE_CODE_SESSION_ID"
 echo "Restarting this session with Remote Control. Headroom is off for the restarted session."
 if [ "$via" = wrapper ]; then
-  echo "The restart takes up to 30 seconds; this panel stays open and picks up where it left off."
+  echo "The restart takes up to 30 seconds; this panel stays open and picks up where it left off, and says so here once Remote Control is on."
   exit 0
 fi
 echo "The restart takes up to 30 seconds. If it does not come back by itself, run: $fallback"
@@ -8596,6 +8619,7 @@ mod tests {
         shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
         ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
+        VSCODE_PROCESS_WRAPPER_KEY,
     };
     #[cfg(unix)]
     use super::{
@@ -8611,7 +8635,6 @@ mod tests {
         ensure_claude_remote_control_command, remove_claude_remote_control_command,
         vscode_user_settings_path, CLAUDE_REMOTE_CONTROL_COMMAND_MARKER,
         CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE, HEADROOM_ANTHROPIC_BASE_URL,
-        VSCODE_PROCESS_WRAPPER_KEY,
     };
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
@@ -13576,7 +13599,7 @@ for line in sys.stdin:
     if d.get("type") == "control_request":
         sub = d["request"].get("subtype")
         emit({"type": "control_response", "response": {"subtype": "success", "request_id": d["request_id"],
-              "response": {"echo": sub, "override": override}}})
+              "response": {"echo": sub, "override": override, "session_url": "https://claude.ai/code/session_x"}}})
         if sub == "remote_control":
             emit({"type": "system", "subtype": "bridge", "enabled": True, "override": override})
         if sub == "rewind_files":
@@ -13645,6 +13668,16 @@ sys.exit(3)
         assert_eq!(reinit["resumed"], true, "{reinit}");
         assert_eq!(reinit["override"], true, "{reinit}");
         assert_eq!(reinit["session_id"], "sid-wrap");
+        // The swallowed Remote Control answer becomes the panel's only sign
+        // that the swap finished: a meta line in the conversation.
+        let active = next();
+        assert_eq!(active["subtype"], "informational", "{active}");
+        assert_eq!(active["level"], "notice");
+        assert_eq!(active["session_id"], "sid-wrap");
+        assert_eq!(
+            active["content"],
+            "Remote Control is now active. Continue here, on your phone, or at https://claude.ai/code/session_x"
+        );
         let bridge = next();
         assert_eq!(
             bridge["subtype"], "bridge",
