@@ -3964,10 +3964,7 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
     let mut out = content.to_string();
-    loop {
-        let Some(start_idx) = out.find(&start) else {
-            break;
-        };
+    while let Some(start_idx) = out.find(&start) {
         let Some(end_idx) = out[start_idx..].find(&end).map(|rel| start_idx + rel) else {
             break;
         };
@@ -5956,7 +5953,10 @@ fn claude_remote_control_command_path() -> PathBuf {
 
 /// The managed `claude_code` shell block: the routing export plus a `claude`
 /// function that (a) adds the api.anthropic.com settings layer whenever the
-/// user passes `--remote-control`, and (b) after the wrapped session exits,
+/// user passes `--remote-control`, (b) tags the session with
+/// `HEADROOM_RC_RELAUNCHER=tty` so the script only ends sessions this function
+/// will bring back (an alias, `command claude` or a shell opened before setup
+/// skips it), and (c) after the wrapped session exits,
 /// resumes the session named in the relaunch marker for this tty. The marker
 /// is written by the /remote-control script (`build_claude_remote_control_script`),
 /// keyed by tty so two terminals never swap sessions, and ignored once stale so
@@ -5969,8 +5969,8 @@ fn claude_remote_control_command_path() -> PathBuf {
 /// installer writes one) is a parse error that aborts the rest of the rc file.
 fn claude_code_shell_block() -> String {
     let function = r#"claude() {
-  case " $* " in *" --remote-control "*) set -- --settings '__OVERRIDE__' "$@";; esac
-  command claude "$@"
+  local a; for a in "$@"; do [ "$a" = --remote-control ] && { set -- --settings '__OVERRIDE__' "$@"; break; }; done
+  HEADROOM_RC_RELAUNCHER=tty command claude "$@"
   local rc=$?
   local m="$HOME/.headroom/remote-control/$(basename "$(tty 2>/dev/null)" 2>/dev/null)"
   if [ -s "$m" ] && [ -n "$(find "$m" -mmin -2 2>/dev/null)" ]; then
@@ -6037,7 +6037,7 @@ fn vscode_user_settings_path() -> PathBuf {
 /// and asks the new process to start Remote Control. The extension never sees
 /// an exit, so no error card, no manual reopen, no toggle.
 fn build_claude_remote_control_wrapper() -> String {
-    r#"#!/usr/bin/env python3
+    r#"#!/usr/bin/python3
 """Headroom Claude process wrapper (managed by Headroom Desktop -- do not edit).
 
 The VS Code extension runs `<wrapper> <claude-binary> <args...>` and talks to
@@ -6045,9 +6045,11 @@ the CLI over stdio (stream-json). This wrapper runs the CLI as a child and pipes
 both directions untouched. When the child exits and a fresh Remote Control
 relaunch marker exists for its session (written by headroom-remote-control.sh
 after the user confirmed), the wrapper respawns the CLI on the SAME session with
-the api.anthropic.com settings layer, replays the control requests the extension
-sent at startup, asks the new child to start Remote Control, and keeps piping.
-The extension never sees a process exit. Headroom is off for the swapped session.
+the api.anthropic.com settings layer, replays the control requests that set
+session state (never one-shot actions such as rewind_files, which would undo
+work), asks the new child to start Remote Control, and keeps piping. The
+extension never sees a process exit. Headroom is off for the swapped session.
+Once the extension closes stdin or signals the wrapper, nothing is respawned.
 """
 import json
 import os
@@ -6060,13 +6062,15 @@ import time
 HOME = os.path.expanduser("~")
 DIR = os.path.join(HOME, ".headroom", "remote-control")
 OVERRIDE = '{"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com"}}'
-MARKER_MAX_AGE = 600
+MARKER_MAX_AGE = 60
+# Control requests that carry session state; replayed into a respawned child.
+REPLAYED = ("initialize", "mcp_set_servers", "update_settings")
 
 if len(sys.argv) < 2:
     sys.exit("usage: headroom-claude-wrapper.py <claude-binary> [args...]")
 binary, args = sys.argv[1], sys.argv[2:]
 
-state = {"child": None, "sid": None, "swallow": set(), "recorded": []}
+state = {"child": None, "sid": None, "swallow": set(), "recorded": [], "terminating": False}
 lock = threading.Lock()
 out = sys.stdout.buffer
 inp = sys.stdin.buffer
@@ -6074,8 +6078,19 @@ inp = sys.stdin.buffer
 
 def spawn(extra):
     return subprocess.Popen(
-        [binary] + args + extra, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr
+        [binary] + args + extra,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        env=dict(os.environ, HEADROOM_RC_RELAUNCHER="wrapper"),
     )
+
+
+def replayable(msg):
+    if msg.get("type") != "control_request":
+        return False
+    subtype = (msg.get("request") or {}).get("subtype") or ""
+    return subtype in REPLAYED or subtype.startswith("set_")
 
 
 def write_child(line):
@@ -6095,11 +6110,12 @@ def pump_stdin():
         if not line:
             break
         try:
-            if json.loads(line).get("type") == "control_request":
+            if replayable(json.loads(line)):
                 state["recorded"].append(line)
-        except ValueError:
+        except (ValueError, AttributeError):
             pass
         write_child(line)
+    state["terminating"] = True
     with lock:
         child = state["child"]
     if child is not None and child.stdin is not None:
@@ -6148,6 +6164,7 @@ def resume_marker():
 
 
 def forward_signal(signum, _frame):
+    state["terminating"] = True
     with lock:
         child = state["child"]
     if child is not None:
@@ -6168,7 +6185,7 @@ while True:
     pump.start()
     code = child.wait()
     pump.join(timeout=5)
-    marker = resume_marker()
+    marker = None if state["terminating"] else resume_marker()
     if marker is None:
         # Daemon threads may still hold the stdio buffers; a normal interpreter
         # shutdown then aborts ("could not acquire lock ... at interpreter
@@ -6266,27 +6283,43 @@ fn build_claude_remote_control_script() -> String {
 # Headroom Remote Control relaunch (managed by Headroom Desktop -- do not edit).
 # Claude Code hides /remote-control whenever ANTHROPIC_BASE_URL is not
 # api.anthropic.com, so a Headroom-routed session can never turn it on. This
-# leaves a marker and asks the session to exit; the `claude` shell function
-# Headroom manages then resumes the SAME session by id with the base URL
-# overridden for that one process.
+# asks the session to exit; whatever launched it (the `claude` shell function
+# Headroom manages, or Headroom's VS Code process wrapper, named by
+# HEADROOM_RC_RELAUNCHER) then resumes the SAME session by id with the base URL
+# overridden for that one process. A session nothing will relaunch is never
+# ended: it gets the manual command instead.
 # Three phases. Without arguments (run by the model's Bash tool after the user
 # confirms): record the pending exit. With --stop (Claude Code's Stop hook,
-# fired once the model's turn has ended): perform it. Killing only after the
-# turn ends keeps the transcript clean, so the resumed session shows no
-# "interrupted" turn in the terminal or on the phone. With --cancel
-# (UserPromptSubmit): drop it. Esc skips the Stop hook, so without this a
-# restart the user interrupted would fire at the end of their NEXT turn. Must
-# print nothing: UserPromptSubmit stdout is added to the prompt.
+# fired once the model's turn has ended): write the relaunch marker and perform
+# it. Killing only after the turn ends keeps the transcript clean, so the
+# resumed session shows no "interrupted" turn in the terminal or on the phone.
+# With --cancel (UserPromptSubmit): drop it. Esc skips the Stop hook, so
+# without this a restart the user interrupted would fire at the end of their
+# NEXT turn. The markers are only written by --stop, so a cancelled restart
+# leaves nothing that could relaunch a later exit. Must print nothing:
+# UserPromptSubmit stdout is added to the prompt.
+dir="$HOME/.headroom/remote-control"
 case "${1:-}" in --stop|--cancel)
   sid=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
-  exit_file="$HOME/.headroom/remote-control/exit-$sid"
+  exit_file="$dir/exit-$sid"
   [ -n "$sid" ] && [ -f "$exit_file" ] || exit 0
-  pid=$(cat "$exit_file"); rm -f "$exit_file"
-  [ "$1" = "--stop" ] || exit 0
+  # "<pid> <relauncher>": a tty name, or "wrapper" for the VS Code panel.
+  read -r pid via < "$exit_file"
+  # A record the Stop hook never saw (terminal closed mid-turn) must not end a
+  # resumed session days later, when the pid may be some other claude.
+  fresh=$(find "$exit_file" -mmin -10 2>/dev/null)
+  rm -f "$exit_file"
+  [ "$1" = "--stop" ] && [ -n "$fresh" ] || exit 0
   # Never signal a pid without checking it is still the Claude Code process.
   case "$(basename "$(ps -o comm= -p "$pid" 2>/dev/null)")" in
-    claude|claude.exe) kill -TERM "$pid";;
+    claude|claude.exe) ;;
+    *) exit 0;;
   esac
+  case "$via" in
+    wrapper) : > "$dir/resume-$sid";;
+    ?*) printf '%s\n' "$sid" > "$dir/$via";;
+  esac
+  kill -TERM "$pid"
   exit 0;;
 esac
 case "${ANTHROPIC_BASE_URL:-}" in
@@ -6294,35 +6327,33 @@ case "${ANTHROPIC_BASE_URL:-}" in
     echo "Remote Control is already available in this session: type /rc."
     exit 0;;
 esac
+override='__OVERRIDE__'
 if [ -z "${CLAUDE_CODE_SESSION_ID:-}" ] || [ -z "${CLAUDE_PID:-}" ]; then
-  echo "Could not identify this session. Exit it, then run: claude -r <session-id> --remote-control"
+  echo "Could not identify this session. Exit it, then run: claude --settings '$override' -r <session-id> --remote-control"
   exit 0
 fi
-fallback="claude -r $CLAUDE_CODE_SESSION_ID --remote-control"
-tty_name=${HEADROOM_REMOTE_CONTROL_TTY:-$(ps -o tty= -p "$CLAUDE_PID" 2>/dev/null | tr -d ' ')}
-# Linux ps says "pts/3" where the shell function's `basename $(tty)` says "3".
-tty_name=${tty_name##*/}
-case "$tty_name" in ""|"??"|"-"|"?")
-  # VS Code panel: no terminal, but when the extension launches Claude through
-  # Headroom's wrapper, the wrapper relaunches the session itself. Leave it the
-  # resume marker and the pending exit; the Stop hook does the rest.
-  wrapper="$HOME/.claude/hooks/headroom-claude-wrapper.py"
-  if [ "${CLAUDE_CODE_ENTRYPOINT:-}" = "claude-vscode" ] && grep -qs "$wrapper" "${HEADROOM_VSCODE_SETTINGS:-$HOME/Library/Application Support/Code/User/settings.json}"; then
-    dir="$HOME/.headroom/remote-control"
-    mkdir -p "$dir" && : > "$dir/resume-$CLAUDE_CODE_SESSION_ID" && printf '%s\n' "$CLAUDE_PID" > "$dir/exit-$CLAUDE_CODE_SESSION_ID"
-    echo "Restarting this session with Remote Control. Headroom is off for the restarted session."
-    exit 0
-  fi
-  echo "Remote Control needs a terminal session; this one has no terminal to relaunch into."
-  echo "Open the integrated terminal and run: $fallback"
-  exit 0;;
+fallback="claude --settings '$override' -r $CLAUDE_CODE_SESSION_ID --remote-control"
+via=
+case "${HEADROOM_RC_RELAUNCHER:-}" in
+  wrapper) via=wrapper;;
+  tty)
+    tty_name=${HEADROOM_REMOTE_CONTROL_TTY:-$(ps -o tty= -p "$CLAUDE_PID" 2>/dev/null | tr -d ' ')}
+    # Linux ps says "pts/3" where the shell function's `basename $(tty)` says "3".
+    tty_name=${tty_name##*/}
+    case "$tty_name" in ""|"??"|"-"|"?") ;; *) via=$tty_name;; esac;;
 esac
-dir="$HOME/.headroom/remote-control"
-mkdir -p "$dir" && printf '%s\n' "$CLAUDE_CODE_SESSION_ID" > "$dir/$tty_name"
-exit_file="$dir/exit-$CLAUDE_CODE_SESSION_ID"
-printf '%s\n' "$CLAUDE_PID" > "$exit_file"
+if [ -z "$via" ]; then
+  echo "Headroom cannot restart this session by itself: it was not started through Headroom's claude launcher (an alias, a shell opened before Headroom was set up, or an editor panel without Headroom's wrapper)."
+  echo "Exit this session, then run: $fallback"
+  exit 0
+fi
+mkdir -p "$dir" && printf '%s %s\n' "$CLAUDE_PID" "$via" > "$dir/exit-$CLAUDE_CODE_SESSION_ID"
 echo "Restarting this session with Remote Control. Headroom is off for the restarted session."
-echo "If it does not come back by itself, run: $fallback"
+if [ "$via" = wrapper ]; then
+  echo "The restart takes up to 30 seconds; this panel stays open and picks up where it left off."
+  exit 0
+fi
+echo "The restart takes up to 30 seconds. If it does not come back by itself, run: $fallback"
 # Only when the Stop hook is NOT registered (settings.json edited by hand):
 # a timed exit, at the cost of an interrupted turn. With the hook registered
 # there is no timer at all. A timer that raced a slow turn killed the session
@@ -6330,10 +6361,11 @@ echo "If it does not come back by itself, run: $fallback"
 # is what "No response requested." on the phone was.
 if ! grep -q 'headroom-remote-control\.sh[^"]* --stop' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" 2>/dev/null; then
   secs=${HEADROOM_REMOTE_CONTROL_FALLBACK_SECS:-15}
-  nohup sh -c "sleep $secs; [ -f '$exit_file' ] && rm -f '$exit_file' && kill -TERM $CLAUDE_PID" >/dev/null 2>&1 &
+  # Runs the --stop phase itself, so the marker and the pid check are shared.
+  nohup sh -c 'sleep "$1"; printf "{\"session_id\":\"%s\"}\n" "$2" | sh "$0" --stop' "$0" "$secs" "$CLAUDE_CODE_SESSION_ID" >/dev/null 2>&1 &
 fi
 "#
-    .to_string()
+    .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE)
 }
 
 /// User-level command that shadows Claude Code's hidden built-in. Every user
@@ -6372,7 +6404,7 @@ Headroom can restart this session with itself disabled so Remote Control does wo
 Offer exactly two options, in this order: \
 \"Restart with Remote Control\" (description: \"Exit and restart this session without Headroom. The restart replays the conversation uncached.\") and \
 \"Do nothing and keep this session routed through Headroom\" (description: \"Remote Control stays unavailable here.\"). \
-If the answer is \"Restart with Remote Control\", run `{script}` with the Bash tool, then reply with exactly one line: \"Restarting with Remote Control.\" \
+If the answer is \"Restart with Remote Control\", run `{script}` with the Bash tool, then reply with exactly one line: \"Restarting with Remote Control. This takes up to 30 seconds.\" \
 Otherwise reply only \"Staying in this session.\"\n"
     )
 }
@@ -12902,7 +12934,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         )));
         assert!(command.contains("First write exactly this one line of plain text"));
         assert!(command
-            .contains("then reply with exactly one line: \"Restarting with Remote Control.\""));
+            .contains("then reply with exactly one line: \"Restarting with Remote Control. This takes up to 30 seconds.\""));
         assert!(command.contains("Then call the AskUserQuestion tool"));
         assert!(command
             .contains("load it first with ToolSearch using the query \"select:AskUserQuestion\""));
