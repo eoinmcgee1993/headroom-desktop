@@ -62,7 +62,7 @@ Generate the payload with a real `Read` tool call. Dumping the file through Bash
 **Claude Code subscription/OAuth traffic** (classified `SUBSCRIPTION`):
 1. Capture the baseline:
    ```bash
-   "$LOCALAPPDATA/Headroom/headroom/runtime/venv/Scripts/python.exe" -c "import json,urllib.request; s=json.load(urllib.request.urlopen('http://127.0.0.1:6767/stats'))['summary']; print(json.dumps({'primary_model': s['primary_model'], 'prefix_frozen': s['uncompressed_requests']['prefix_frozen'], 'requests_compressed': s['compression']['requests_compressed'], 'cache_savings_usd': s['cost']['breakdown']['cache_savings_usd'], 'total_tokens_before': s['compression']['total_tokens_before']}, indent=2))"
+   "$LOCALAPPDATA/Headroom/headroom/runtime/venv/Scripts/python.exe" -c "import json,urllib.request; s=json.load(urllib.request.urlopen('http://127.0.0.1:6767/stats'))['summary']; print(json.dumps({'primary_model': s['primary_model'], 'prefix_frozen': s.get('uncompressed_requests', {}).get('prefix_frozen', 0), 'requests_compressed': s['compression']['requests_compressed'], 'cache_savings_usd': s['cost']['breakdown']['cache_savings_usd'], 'total_tokens_before': s['compression']['total_tokens_before']}, indent=2))"
    ```
 2. End the turn with a large Read in flight — ask Claude to read a long file (~1300-1500 lines).
 3. On the *next* turn, re-run the same command.
@@ -129,10 +129,10 @@ Expect: "saved today" in the same ballpark as this number (plus output dollars, 
 
 ### 13. Wire truth: computed transforms reached the wire, and nothing was billed for an unusable response
 
-Windows port of beta checks 11 and 13 - see `beta-smoke-test.md` for the full rationale. This class is invisible in `/stats`, on the dashboard, and in `activity-facts.json`; the proxy log is the only place the wire truth appears. The backend writes it to `%USERPROFILE%\.headroom\logs\proxy.log`. Git Bash:
+Windows port of beta checks 11 and 13 - see `beta-smoke-test.md` for the full rationale. This class is invisible in `/stats`, on the dashboard, and in `activity-facts.json`; the proxy log is the only place the wire truth appears. The backend writes it to `%USERPROFILE%\.headroom\logs\proxy-<port>.log` (wheel 0.38.0, #3204); an upgraded machine keeps a stale `proxy.log` that is never written again and would pass vacuously, so read the newest `proxy*.log`. Git Bash:
 
 ```bash
-L="$USERPROFILE/.headroom/logs/proxy.log"
+L=$(ls -t "$USERPROFILE"/.headroom/logs/proxy*.log | head -1)
 echo "empty-200 class: $(grep -c 'ccr_streaming_retrieve_buffered[^ ]* source=passthrough' "$L")"
 echo "discards: $(grep -c 'body_mutated=true.*source=passthrough' "$L")"
 grep 'body_mutated=true.*source=passthrough' "$L" | sed -n 's/.*mutation_reasons=\([^ ]*\).*/\1/p' | tr ',' '\n' | sort | uniq -c
@@ -242,7 +242,7 @@ Expect: `PASS`.
 Expect: `mode` is `token`, `primary_model` is a `gpt-*` model, `requests_compressed` increased by at least 1, and `total_tokens_removed` is strictly greater.
 
 ### C3. Codex savings are attributed on the dashboard
-Open the dashboard and confirm a **ChatGPT** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the group labelled "ChatGPT" (internal key `codex`; the display name follows OpenAI's 2026-07 rename).
+Open the dashboard and confirm a **ChatGPT Codex** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the group labelled "ChatGPT" (internal key `codex`; the display name follows OpenAI's 2026-07 rename).
 
 ### C4. Pause / resume cleanly strips and restores Codex routing
 From the tray menu ("Pause Headroom" / "Resume Headroom"), toggle Pause then Resume, checking after each:
@@ -264,7 +264,7 @@ If RTK *is* installed, its rewrite hook filters large `curl` output into a type-
 ## When something fails
 
 - Proxy log silent → check `%LOCALAPPDATA%\Headroom\headroom\logs\` for a newer log file or a crash file.
-- Two log locations, not one bug: `%LOCALAPPDATA%\Headroom\headroom\logs\` holds the desktop-managed per-launch logs (filenames embed the *backend* port - 6768 or a fallback, never 6767 - plus the launch flags), while the live rotating wire-truth log that check 13 reads is `%USERPROFILE%\.headroom\logs\proxy.log`. The proxy answers `/stats` on 6767 because that is the intercept; the Python backend behind it is what the filename names.
+- Two log locations, not one bug: `%LOCALAPPDATA%\Headroom\headroom\logs\` holds the desktop-managed per-launch logs (filenames embed the *backend* port - 6768 or a fallback, never 6767 - plus the launch flags), while the live rotating wire-truth log that check 13 reads is the newest `%USERPROFILE%\.headroom\logs\proxy*.log` (`proxy-<port>.log` since wheel 0.38.0). The proxy answers `/stats` on 6767 because that is the intercept; the Python backend behind it is what the filename names.
 - RTK missing → check `%LOCALAPPDATA%\Headroom\headroom\bin\rtk.exe` exists; the managed blocks in `%USERPROFILE%\.claude\settings.json` / `%USERPROFILE%\.codex\config.toml` are intact.
 - MCP tool missing → restart Claude Code; the MCP server registration happens at session start.
 - Credential Manager entries missing → re-run sign-in; verify the app is the release (non-debug) build, since the Windows keyring module is only compiled in release builds.
