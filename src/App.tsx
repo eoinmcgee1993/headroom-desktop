@@ -95,6 +95,7 @@ import {
   type UpgradePlan,
   introSaleBadgeLabel,
   isTierDowngrade,
+  ownedForLife,
   matchesSubscriptionPeriod,
   forgoneSavingsLabel,
   paybackLabel,
@@ -1925,7 +1926,8 @@ export default function App() {
     pricingStatus?.introOffer ?? null,
     pricingStatus?.account?.subscriptionRenewalCents,
     pricingStatus?.account?.subscriptionRenewalEndsAt,
-    pricingStatus?.account?.upgradeAction
+    pricingStatus?.account?.upgradeAction,
+    pricingStatus?.account?.appsumoLifetimeTier
   );
   const contactEmailValid = isValidEmailAddress(contactEmail);
   const authEmailValid = isValidEmailAddress(authEmail);
@@ -7799,7 +7801,9 @@ export default function App() {
                     {plan.purchaseInfo ? (
                       <p className="upgrade-plan-card__purchase-info">
                         {plan.purchaseInfo.cancelAtPeriodEnd && plan.purchaseInfo.endsOn
-                          ? `Ends on ${plan.purchaseInfo.endsOn}`
+                          ? pricingStatus?.account?.appsumoLifetimeTier
+                            ? `Back to lifetime ${upgradePlanIntentLabel(pricingStatus.account.appsumoLifetimeTier)} on ${plan.purchaseInfo.endsOn}`
+                            : `Ends on ${plan.purchaseInfo.endsOn}`
                           : isActivePlan && pendingPlanChangeInfo
                           ? // The stored renewal price is this plan's, and this
                             // plan is not the one that renews.
@@ -8643,6 +8647,10 @@ export default function App() {
               (isPeriodSwitch &&
                 currentBillingPeriod === "annual" &&
                 pendingPlanChange.billingPeriod === "monthly");
+            // A tier their AppSumo lifetime license covers: the server ends the
+            // Polar subscription at period end instead of billing the tier.
+            const lifetimeTier = pricingStatus?.account?.appsumoLifetimeTier;
+            const backToLifetime = ownedForLife(lifetimeTier, pendingPlanChange.toTier);
             const renewsOnLabel = pricingStatus?.account?.subscriptionRenewsAt
               ? new Date(pricingStatus.account.subscriptionRenewsAt).toLocaleDateString(undefined, {
                   year: "numeric",
@@ -8659,6 +8667,15 @@ export default function App() {
               >
                 <div className="modal-card" onClick={(e) => e.stopPropagation()}>
                   <h3>Confirm your {action}</h3>
+                  {backToLifetime ? (
+                    <p>
+                      Your <strong>{upgradePlanIntentLabel(pendingPlanChange.fromTier)}</strong> subscription
+                      ends{renewsOnLabel ? ` on ${renewsOnLabel}` : " at the end of the term"} and you go back to
+                      the lifetime <strong>{upgradePlanIntentLabel(lifetimeTier ?? null)}</strong> plan you own
+                      on AppSumo. No charge today, and nothing to pay after that.
+                    </p>
+                  ) : (
+                  <>
                   <p>
                     You'll {action} from your{" "}
                     <strong>{currentPriceLabel}</strong>{" "}
@@ -8678,6 +8695,8 @@ export default function App() {
                         }, and the new plan starts then. No charge and no credit today.`
                       : "You'll be charged a prorated amount today for the remaining time in your current billing period, with your existing discount applied."}
                   </p>
+                  </>
+                  )}
                   {/* A period switch moves the renewal date, so the stored one
                       would be stale here; a deferred change already named it. */}
                   {!isPeriodSwitch && !isDeferred && pricingStatus?.account?.subscriptionRenewsAt ? (

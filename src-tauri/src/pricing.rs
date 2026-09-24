@@ -755,6 +755,8 @@ struct RemoteAccountResponse {
     #[serde(default)]
     upgrade_action: Option<String>,
     #[serde(default)]
+    appsumo_lifetime_tier: Option<HeadroomSubscriptionTier>,
+    #[serde(default)]
     recommended_tier: Option<HeadroomSubscriptionTier>,
     #[serde(default)]
     grandfathered: bool,
@@ -3250,6 +3252,7 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
         accepted_invites_count: value.accepted_invites_count,
         invite_bonus_percent: value.invite_bonus_percent.clamp(0.0, 50.0),
         upgrade_action: value.upgrade_action,
+        appsumo_lifetime_tier: value.appsumo_lifetime_tier,
         recommended_tier: value.recommended_tier,
         grandfathered: value.grandfathered,
     }
@@ -4044,6 +4047,7 @@ mod tests {
             accepted_invites_count: 2,
             invite_bonus_percent: 10.0,
             upgrade_action: None,
+            appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
         }
@@ -4591,6 +4595,7 @@ mod tests {
             accepted_invites_count: 0,
             invite_bonus_percent: 0.0,
             upgrade_action: None,
+            appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
         }
@@ -4622,6 +4627,7 @@ mod tests {
             accepted_invites_count: 0,
             invite_bonus_percent: invite_bonus,
             upgrade_action: None,
+            appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
         }
@@ -4632,6 +4638,7 @@ mod tests {
     fn grandfathered_account() -> HeadroomAccountProfile {
         HeadroomAccountProfile {
             upgrade_action: None,
+            appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: true,
             ..expired_account(0.0)
@@ -5316,6 +5323,7 @@ mod tests {
             accepted_invites_count: 0,
             invite_bonus_percent: 999.0,
             upgrade_action: None,
+            appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
         };
@@ -5349,6 +5357,7 @@ mod tests {
             accepted_invites_count: 0,
             invite_bonus_percent: -10.0,
             upgrade_action: None,
+            appsumo_lifetime_tier: None,
             recommended_tier: None,
             grandfathered: false,
         };

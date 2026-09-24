@@ -1249,6 +1249,12 @@ pub struct HeadroomAccountProfile {
     /// None for everyone else, keeping normal routing.
     #[serde(default)]
     pub upgrade_action: Option<String>,
+    /// The AppSumo lifetime tier behind a Polar subscription they bought on
+    /// top of it. Every tier at or below it is theirs for free: switching to
+    /// one ends the Polar subscription at period end instead of billing it.
+    /// None without both.
+    #[serde(default)]
+    pub appsumo_lifetime_tier: Option<HeadroomSubscriptionTier>,
     /// Server-computed pitch tier for API-billed orgs: their usage band mapped
     /// onto subscriber plans (>=5:1 savings ROI clamp), from
     /// user_daily_savings. None for everyone else - local recommendation
