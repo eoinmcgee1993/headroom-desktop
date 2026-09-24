@@ -8588,9 +8588,9 @@ mod tests {
         build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
         claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
         codex_sqlite_store_expected, default_shell_targets_for_family, discover_codex_state_dbs,
-        entry_contains_hook, find_on_path_entries, is_no_space, is_permission_denied,
-        normalize_setup_state, normalized_setup_id, nvm_binary_candidates, oss_remnant_warnings,
-        parse_json_object, pin_codex_mcp_command, remove_managed_block,
+        edit_vscode_wrapper_key, entry_contains_hook, find_on_path_entries, is_no_space,
+        is_permission_denied, normalize_setup_state, normalized_setup_id, nvm_binary_candidates,
+        oss_remnant_warnings, parse_json_object, pin_codex_mcp_command, remove_managed_block,
         remove_pre_tool_use_markers, render_codex_config, retag_codex_thread_providers,
         retag_codex_threads_to_headroom, retag_one_codex_db, serialize_paths,
         shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
@@ -13510,6 +13510,41 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// settings.json is hand-maintained JSONC: the wrapper key goes in and out
+    /// as a text edit that keeps comments and key order, and anything that is
+    /// not exactly our key is refused rather than rewritten.
+    #[test]
+    fn vscode_wrapper_key_edit_keeps_user_settings_byte_for_byte() {
+        let path = Path::new("settings.json");
+        let w = "/Users/me/.headroom/claude-wrapper";
+        let user = "{\n  // font for the panel\n  \"editor.fontSize\": 13,\n  \"files.autoSave\": \"off\"\n}\n";
+
+        let added = edit_vscode_wrapper_key(user, w, true, path).expect("add");
+        assert!(added.contains("// font for the panel"));
+        let obj = parse_json_object(&added, path).unwrap();
+        assert_eq!(obj[VSCODE_PROCESS_WRAPPER_KEY], w);
+        assert_eq!(obj["editor.fontSize"], 13);
+        assert_eq!(
+            edit_vscode_wrapper_key(&added, w, false, path).as_deref(),
+            Some(user)
+        );
+
+        // Empty object, and the key as the last entry (no trailing comma left).
+        let added = edit_vscode_wrapper_key("{}", w, true, path).expect("add to empty");
+        let removed = edit_vscode_wrapper_key(&added, w, false, path).expect("remove");
+        assert!(parse_json_object(&removed, path).unwrap().is_empty());
+        let last = format!("{{\"a\": 1, \"{VSCODE_PROCESS_WRAPPER_KEY}\": \"{w}\"}}");
+        let removed = edit_vscode_wrapper_key(&last, w, false, path).expect("remove last");
+        assert_eq!(removed, "{\"a\": 1}");
+
+        // A wrapper the user set themselves, or no key at all, is not ours.
+        let theirs = format!("{{\"{VSCODE_PROCESS_WRAPPER_KEY}\": \"/opt/their-wrapper\"}}");
+        assert_eq!(edit_vscode_wrapper_key(&theirs, w, false, path), None);
+        assert_eq!(edit_vscode_wrapper_key(user, w, false, path), None);
+        // Unparseable settings are never touched.
+        assert_eq!(edit_vscode_wrapper_key("{\"a\": ", w, true, path), None);
     }
 
     /// Drives the wrapper the way the VS Code extension does, with a fake
