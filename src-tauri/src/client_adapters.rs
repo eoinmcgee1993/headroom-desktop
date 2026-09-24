@@ -554,7 +554,12 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
     }
 
     let configured_at = Utc::now().to_rfc3339();
-    state.configured_clients.insert(state_id, configured_at);
+    state
+        .configured_clients
+        .insert(state_id.clone(), configured_at);
+    state
+        .setup_versions
+        .insert(state_id, env!("CARGO_PKG_VERSION").to_string());
     write_setup_state(&state)?;
 
     let already_configured = changed_files.is_empty();
@@ -881,14 +886,40 @@ pub fn repair_codex_missing_bearer_now() -> bool {
     repair_client_setup_now("codex_cli")
 }
 
+/// The version that last wrote this client's managed files, when it is not
+/// the running one. Pre-stamp installs (no entry) count as stale: they are
+/// exactly the installs an update left behind.
+fn stale_setup_version(client_id: &str) -> Option<String> {
+    let state = load_setup_state();
+    let state_id = normalized_setup_id(client_id);
+    if !state.configured_clients.contains_key(state_id) {
+        return None;
+    }
+    let written_by = state
+        .setup_versions
+        .get(state_id)
+        .cloned()
+        .unwrap_or_else(|| "an earlier build".to_string());
+    (written_by != env!("CARGO_PKG_VERSION")).then_some(written_by)
+}
+
 /// One client's verify -> re-apply -> re-verify cycle, unthrottled. Returns
 /// true only when the re-verify comes back clean.
 fn repair_client_setup_now(client_id: &str) -> bool {
-    let broken = match verify_client_setup(client_id) {
+    let mut broken = match verify_client_setup(client_id) {
         Ok(verification) => verification.failures,
         // Ids verification doesn't support are ids repair can't help.
         Err(_) => Vec::new(),
     };
+    // Managed files written by another app version verify fine (the routing
+    // export is still there) but are a different generation from what this
+    // build's scripts and hooks expect. Re-apply so an update carries them.
+    if let Some(stale) = stale_setup_version(client_id) {
+        broken.push(format!(
+            "Managed files were written by Headroom {stale}; running {}.",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
     if broken.is_empty() {
         return false;
     }
@@ -1253,6 +1284,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // Consumed: the provider is back in the user's config now. The next
             // apply re-captures it if Headroom is re-enabled.
             state.preserved_base_urls.remove("codex_cli");
+            state.setup_versions.remove("codex_cli");
         }
         "opencode" => {
             state.configured_clients.remove("opencode");
@@ -1263,6 +1295,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // apply re-captures them if Headroom is re-enabled.
             state.preserved_base_urls.remove("opencode_anthropic");
             state.preserved_base_urls.remove("opencode_openai");
+            state.setup_versions.remove("opencode");
         }
         _ => {
             let state_id = normalized_setup_id(client_id);
@@ -1270,6 +1303,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             state.remembered_clients.remove(state_id);
             state.managed_shell_files.remove(state_id);
             state.remembered_shell_files.remove(state_id);
+            state.setup_versions.remove(state_id);
             // Consumed: the URL is back in the user's config now. The next
             // apply re-captures it if Headroom is re-enabled.
             state.preserved_base_urls.remove(state_id);
@@ -2316,6 +2350,13 @@ struct ClientSetupState {
     /// true, client setup skips installing it.
     #[serde(default)]
     statusline_disabled: bool,
+    /// App version that last wrote each client's managed files (scripts,
+    /// hooks, shell blocks, commands), keyed by client state id. An update
+    /// changes what setup writes but nothing re-ran setup, so users kept
+    /// mismatched generations (0.9.22-rc.4 wrapper with an rc.5 script refused
+    /// every Remote Control restart). The self-heal re-applies on a mismatch.
+    #[serde(default)]
+    setup_versions: BTreeMap<String, String>,
 }
 
 fn is_configured(state: &ClientSetupState, client_id: &str) -> bool {
@@ -8855,6 +8896,7 @@ mod tests {
             rtk_disabled: false,
             auto_learn_disabled: false,
             statusline_disabled: false,
+            setup_versions: BTreeMap::new(),
         };
 
         let normalized = normalize_setup_state(state);
@@ -13589,6 +13631,57 @@ sys.exit(3)
         drop(stdin);
         let status = proc.wait().unwrap();
         assert_eq!(status.code(), Some(3));
+    }
+
+    #[test]
+    fn repair_reapplies_managed_files_written_by_another_app_version() {
+        let _home = TestHome::new();
+        super::apply_client_setup("claude_code").expect("first apply");
+        let state = super::load_setup_state();
+        assert_eq!(
+            state.setup_versions.get("claude_code").map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION")),
+            "apply stamps the running version: {state:?}"
+        );
+        assert!(super::stale_setup_version("claude_code").is_none());
+        assert!(!super::repair_client_setup_now("claude_code"));
+
+        // The stamp says an older build wrote the files. The routing export is
+        // intact, so verification alone would never trigger a re-apply.
+        let mut state = super::load_setup_state();
+        state
+            .setup_versions
+            .insert("claude_code".into(), "0.9.22-rc.4".into());
+        super::write_setup_state(&state).unwrap();
+        assert_eq!(
+            super::stale_setup_version("claude_code").as_deref(),
+            Some("0.9.22-rc.4")
+        );
+        assert!(
+            super::repair_client_setup_now("claude_code"),
+            "stale stamp re-applies"
+        );
+        assert_eq!(
+            super::load_setup_state()
+                .setup_versions
+                .get("claude_code")
+                .map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        // An install from before the stamp existed is stale too.
+        let mut state = super::load_setup_state();
+        state.setup_versions.clear();
+        super::write_setup_state(&state).unwrap();
+        assert_eq!(
+            super::stale_setup_version("claude_code").as_deref(),
+            Some("an earlier build")
+        );
+
+        // A client that is not configured is never stale.
+        super::disable_client_setup("claude_code").unwrap();
+        assert!(super::stale_setup_version("claude_code").is_none());
+        assert!(super::load_setup_state().setup_versions.is_empty());
     }
 
     #[test]
