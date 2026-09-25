@@ -911,6 +911,10 @@ fn repair_client_setup_now(client_id: &str) -> bool {
         // Ids verification doesn't support are ids repair can't help.
         Err(_) => Vec::new(),
     };
+    // Only a failed check means a config broke silently. A version restamp
+    // is every client on every update, and its text carries the version, so
+    // reporting it opened four new issues per release (RUST-J5..J8).
+    let silently_broken = !broken.is_empty();
     // Managed files written by another app version verify fine (the routing
     // export is still there) but are a different generation from what this
     // build's scripts and hooks expect. Re-apply so an update carries them.
@@ -939,6 +943,9 @@ fn repair_client_setup_now(client_id: &str) -> bool {
             // RUST-DK, RUST-E5, RUST-EA and RUST-E0, and a resolve on any
             // of them meant nothing. One issue per client, from here.
             log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
+            if !silently_broken {
+                return true;
+            }
             // WHICH check failed, in the fingerprint and in full as an
             // extra. Grouping on the client alone said only "codex_cli
             // drifted again" (RUST-CF, RUST-F0) -- no way to tell a Codex

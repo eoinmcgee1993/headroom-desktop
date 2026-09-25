@@ -6061,13 +6061,49 @@ fn is_missing_webview_runtime(message: &str) -> bool {
     message.contains("webview runtime")
 }
 
+/// AppState::new only touches the data folder (creating it, loading state
+/// from it), and its old `.expect` panicked before any window existed, so
+/// the app just vanished (Sentry RUST-JA: three launches in 15s on a Windows
+/// host denied access to %LOCALAPPDATA%\Headroom right after an update, fine
+/// an hour later). Say why, then panic with the same message as before so the
+/// event still reaches Sentry and keeps its group.
+fn fatal_app_state_error(err: anyhow::Error) -> ! {
+    #[cfg(target_os = "windows")]
+    show_cannot_start_dialog(
+        &format!(
+            "Headroom could not open its data folder:\n\n{err:#}\n\n\
+             If security software is blocking Headroom, allow it, then start Headroom again."
+        ),
+        windows_sys::Win32::UI::WindowsAndMessaging::MB_OK,
+    );
+    panic!("failed to create app state: {err:?}");
+}
+
+#[cfg(target_os = "windows")]
+fn show_webview2_missing_dialog() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_YESNO};
+
+    let choice = show_cannot_start_dialog(
+        concat!(
+            "Headroom needs the Microsoft Edge WebView2 runtime, ",
+            "which is not installed on this PC.\n\n",
+            "Open the download page? Install the Evergreen Runtime, ",
+            "then start Headroom again."
+        ),
+        MB_YESNO,
+    );
+    if choice == IDYES {
+        let _ = open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
+    }
+}
+
 /// MessageBoxW rather than a Tauri dialog: there is no webview left to render
 /// one in, which is the whole problem.
 #[cfg(target_os = "windows")]
-fn show_webview2_missing_dialog() {
+fn show_cannot_start_dialog(text: &str, buttons: u32) -> i32 {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDYES, MB_ICONERROR, MB_SETFOREGROUND, MB_YESNO,
+        MessageBoxW, MB_ICONERROR, MB_SETFOREGROUND,
     };
 
     fn wide(text: &str) -> Vec<u16> {
@@ -6077,23 +6113,15 @@ fn show_webview2_missing_dialog() {
             .collect()
     }
 
-    let text = wide(concat!(
-        "Headroom needs the Microsoft Edge WebView2 runtime, ",
-        "which is not installed on this PC.\n\n",
-        "Open the download page? Install the Evergreen Runtime, ",
-        "then start Headroom again."
-    ));
+    let text = wide(text);
     let caption = wide("Headroom cannot start");
-    let choice = unsafe {
+    unsafe {
         MessageBoxW(
             std::ptr::null_mut(),
             text.as_ptr(),
             caption.as_ptr(),
-            MB_YESNO | MB_ICONERROR | MB_SETFOREGROUND,
+            buttons | MB_ICONERROR | MB_SETFOREGROUND,
         )
-    };
-    if choice == IDYES {
-        let _ = open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
     }
 }
 
@@ -6164,7 +6192,7 @@ pub fn run() {
     // to open the app themselves? Only this launch can tell.
     storage::report_unfinished_restart(&storage::app_data_dir());
 
-    let state = AppState::new().expect("failed to create app state");
+    let state = AppState::new().unwrap_or_else(|err| fatal_app_state_error(err));
 
     // A previous bootstrap attempt that never reached a verdict: the app was
     // quit, crashed, or killed mid-install, so neither bootstrap_completed nor

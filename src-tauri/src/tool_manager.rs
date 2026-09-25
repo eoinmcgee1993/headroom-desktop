@@ -9121,7 +9121,19 @@ fn bind_denied_by_os(err: &std::io::Error) -> bool {
 fn diagnose_proxy_port(port: u16) -> PortState {
     // If we can bind the port, nothing is there.
     match TcpListener::bind(("127.0.0.1", port)) {
-        Ok(_) => return PortState::Free,
+        Ok(listener) => {
+            drop(listener);
+            // Except on macOS, where std's SO_REUSEADDR lets this bind succeed
+            // over a WILDCARD listener on the same port. Orca's mobile server
+            // holds *:6768, so the pre-flight read Free, 127.0.0.1:6768 connects
+            // landed on Orca, and boot validation burned 75s before naming it
+            // (RUST-JC, RUST-2M, RUST-2N; Windows falls back fine, RUST-AB).
+            #[cfg(target_os = "macos")]
+            if let Some((command, pid)) = listener_process(port) {
+                return PortState::ForeignOccupant(format!("{command} pid {pid}"));
+            }
+            return PortState::Free;
+        }
         // Held and denied are different failures with the same errno slot:
         // this one has no occupant to probe, name, or wait out, and calling it
         // "held by unknown process" sent RUST-ED's reporter after a squatter
@@ -12292,6 +12304,8 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
     let evidence_lower = evidence.to_ascii_lowercase();
     if lower.contains("no module named pip") {
         "no-pip"
+    } else if pip_itself_broken(&evidence_lower) {
+        "pip-broken"
     } else if (lower.contains("no matching distribution found")
         || lower.contains("could not find a version that satisfies"))
         && !pip_index_fetch_failed(&lower)
@@ -12376,6 +12390,51 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
     } else {
         "other"
     }
+}
+
+/// pip died importing itself: its files are gone from under an intact
+/// dist-info (`cannot import name 'CacheControlAdapter' from
+/// 'pip._vendor.cachecontrol' (unknown location)`, `No module named
+/// 'pip._internal.cli'`), or pip is missing outright. Every install, rollback
+/// and repair through that pip fails the same way (RUST-29/RUST-JF, six hosts
+/// in RUST-6S's `other` since 0.9.7).
+fn pip_itself_broken(evidence: &str) -> bool {
+    let lower = evidence.to_ascii_lowercase();
+    lower.contains("no module named pip")
+        || lower.contains("no module named 'pip.")
+        || lower.contains("from 'pip.")
+}
+
+/// Puts a fresh pip into the venv `python` belongs to. ensurepip alone leaves
+/// a torn pip torn: it installs with `--upgrade`, which reads the surviving
+/// dist-info as "already satisfied". Without the dist-info it writes every
+/// file again (and it runs pip from its bundled wheel, not the broken one).
+fn reinstall_venv_pip(python: &Path, cwd: &Path) -> Result<()> {
+    let lib = python
+        .parent()
+        .and_then(Path::parent)
+        .context("managed python has no venv")?
+        .join("lib");
+    // lib/site-packages on Windows (case-insensitive `Lib`),
+    // lib/python3.X/site-packages elsewhere.
+    let site_dirs = std::iter::once(lib.clone())
+        .chain(std::fs::read_dir(&lib)?.flatten().map(|entry| entry.path()))
+        .map(|dir| dir.join("site-packages"));
+    for site in site_dirs {
+        for entry in std::fs::read_dir(&site).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("pip-") && name.ends_with(".dist-info") {
+                std::fs::remove_dir_all(entry.path())
+                    .with_context(|| format!("removing {}", entry.path().display()))?;
+            }
+        }
+    }
+    run_python_command(
+        python,
+        &["-m", "ensurepip", "--upgrade", "--default-pip"],
+        cwd,
+    )
+    .context("reinstalling pip into the Headroom-managed virtualenv")
 }
 
 /// Cause class for a direct-wheel download that fell back to the pip index.
@@ -12615,6 +12674,7 @@ where
     F: FnMut(&str),
 {
     let mut attempt: u32 = 0;
+    let mut pip_reinstalled = false;
     loop {
         attempt += 1;
         let err = match run_command_streaming(
@@ -12629,6 +12689,20 @@ where
         };
         let compact = compact_pip_failure(&err);
         let evidence = pip_failure_evidence(&err, &compact);
+        // A broken pip fails every retry identically, and nothing else
+        // replaces it: the rollback and the missing-module repair run the same
+        // pip, and bootstrap's `pip --version` probe exits before the import
+        // that dies. Replace it once, here, where every caller passes.
+        if !pip_reinstalled && pip_itself_broken(&evidence) {
+            pip_reinstalled = true;
+            match reinstall_venv_pip(python, cwd) {
+                Ok(()) => {
+                    log::warn!("pip could not import itself; reinstalled it, retrying");
+                    continue;
+                }
+                Err(repair_err) => log::warn!("reinstalling a broken pip failed: {repair_err:#}"),
+            }
+        }
         // The schedule depends on WHAT failed, so classify before deciding
         // whether this attempt was the last one (see `pip_retry_backoff`).
         if let Some(backoff) = pip_retry_backoff(attempt, &evidence) {
@@ -16899,6 +16973,25 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         let _ = child.wait();
     }
 
+    /// RUST-JC: a dual-stack wildcard listener (Node's default, Orca's shape)
+    /// does not stop a 127.0.0.1 bind on macOS, so the bind alone read Free.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn diagnose_proxy_port_sees_a_wildcard_listener() {
+        let wildcard = TcpListener::bind(("::", 0)).unwrap();
+        let port = wildcard.local_addr().unwrap().port();
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "precondition: macOS allows the loopback bind over the wildcard"
+        );
+        assert!(matches!(
+            diagnose_proxy_port(port),
+            PortState::ForeignOccupant(_)
+        ));
+        drop(wildcard);
+        assert!(matches!(diagnose_proxy_port(port), PortState::Free));
+    }
+
     /// RUST-ED: our own orphan that holds the port but never answers HTTP (a
     /// blocked event loop, or still importing) is ours, not foreign. Reading
     /// it as foreign fell back to 6769 and left the orphan on 6768 for good.
@@ -17724,6 +17817,44 @@ after
         fs::create_dir_all(landmark.parent().expect("parent")).expect("mkdir");
         fs::write(&landmark, b"").expect("landmark");
         landmark
+    }
+
+    /// RUST-29/RUST-JF: pip's files gone from under an intact dist-info. Every
+    /// retry, rollback and repair died on the same import, and ensurepip skips
+    /// a pip whose dist-info survives, so the dist-info has to go first.
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn pip_runner_replaces_a_pip_that_cannot_import_itself() {
+        let (root, runtime, _manager) = seed_test_runtime("torn-pip");
+        let dist_info = runtime
+            .venv_dir
+            .join("lib/python3.12/site-packages/pip-24.0.dist-info");
+        fs::create_dir_all(&dist_info).expect("dist-info");
+        let repaired = root.join("repaired");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$2\" = ensurepip ]; then [ -d {dist} ] && exit 1; touch {repaired}; exit 0; fi\n\
+                 [ -f {repaired} ] && exit 0\n\
+                 echo \"ImportError: cannot import name 'CacheControlAdapter' from \
+                 'pip._vendor.cachecontrol' (unknown location)\" >&2\n\
+                 exit 1\n",
+                dist = dist_info.display(),
+                repaired = repaired.display(),
+            ),
+        );
+
+        super::run_pip_install_with_retries(
+            &runtime.managed_python(),
+            &["-m", "pip", "install", "headroom-ai"],
+            &root,
+        )
+        .expect("pip is replaced, then the install goes through");
+        assert!(
+            !dist_info.exists(),
+            "ensurepip only rewrites a pip it cannot see"
+        );
     }
 
     /// RUST-82: `python -m venv` runs ensurepip through `check_output` and
@@ -19961,6 +20092,16 @@ exit 0
             // RUST-6S third shape: venv damaged in place, launcher stub can't
             // resolve the interpreter, pip never runs.
             ("exit=106; stderr tail: No pyvenv.cfg file", "venv-broken"),
+            // RUST-29/RUST-JF, verbatim tails: pip's own import died.
+            (
+                "exit=1; stderr tail: ImportError: cannot import name 'CacheControlAdapter' \
+                 from 'pip._vendor.cachecontrol' (unknown location)",
+                "pip-broken",
+            ),
+            (
+                "exit=1; stderr tail: ModuleNotFoundError: No module named 'pip._internal.cli'",
+                "pip-broken",
+            ),
             // RUST-8K, verbatim: Windows access-denied on a Korean install.
             // Only the numeric code survives translation.
             (
