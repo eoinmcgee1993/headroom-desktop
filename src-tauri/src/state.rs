@@ -8951,6 +8951,13 @@ impl BackfillSettle for HourlySavingsPoint {
             &mut self.cache_read_cost_usd,
             start,
         );
+        // The ring start carries no provider split, so each provider's read
+        // figures still hold everything since history began. Unknown, not
+        // exact: the hover falls back to the bucket's blended ratio.
+        for provider in &mut self.by_provider {
+            provider.cache_savings_usd = None;
+            provider.cache_read_cost_usd = None;
+        }
     }
     fn is_empty_after_settle(&self) -> bool {
         self.estimated_tokens_saved == 0 && self.total_tokens_sent == 0

@@ -9128,8 +9128,14 @@ fn diagnose_proxy_port(port: u16) -> PortState {
             // holds *:6768, so the pre-flight read Free, 127.0.0.1:6768 connects
             // landed on Orca, and boot validation burned 75s before naming it
             // (RUST-JC, RUST-2M, RUST-2N; Windows falls back fine, RUST-AB).
+            // Identity still decides: our own backend on a wildcard bind
+            // (HEADROOM_HOST=0.0.0.0) is an orphan to reclaim, not a squatter
+            // to fall back around (RUST-ED).
             #[cfg(target_os = "macos")]
             if let Some((command, pid)) = listener_process(port) {
+                if pid_is_headroom_backend(pid) {
+                    return PortState::HeadroomRunning;
+                }
                 return PortState::ForeignOccupant(format!("{command} pid {pid}"));
             }
             return PortState::Free;
@@ -16978,17 +16984,31 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     #[test]
     #[cfg(target_os = "macos")]
     fn diagnose_proxy_port_sees_a_wildcard_listener() {
-        let wildcard = TcpListener::bind(("::", 0)).unwrap();
-        let port = wildcard.local_addr().unwrap().port();
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // A child, not this test process: our own argv carries the test filter,
+        // which the backend identity check could read as ours.
+        let mut wildcard = crate::proc::command("/usr/bin/python3")
+            .arg("-c")
+            .arg("import socket, sys, time\ns = socket.socket(socket.AF_INET6); s.bind(('::', int(sys.argv[1]))); s.listen(8)\ntime.sleep(30)")
+            .arg(port.to_string())
+            .spawn()
+            .expect("spawn wildcard listener");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(std::time::Instant::now() < deadline, "listener never bound");
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(
             TcpListener::bind(("127.0.0.1", port)).is_ok(),
             "precondition: macOS allows the loopback bind over the wildcard"
         );
-        assert!(matches!(
-            diagnose_proxy_port(port),
-            PortState::ForeignOccupant(_)
-        ));
-        drop(wildcard);
+        let state = diagnose_proxy_port(port);
+        let _ = wildcard.kill();
+        let _ = wildcard.wait();
+        assert!(matches!(state, PortState::ForeignOccupant(_)));
         assert!(matches!(diagnose_proxy_port(port), PortState::Free));
     }
 
@@ -16998,37 +17018,43 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     #[test]
     #[cfg(unix)] // exercises /usr/bin/python3; Windows cannot exec it
     fn diagnose_proxy_port_identifies_silent_headroom_orphan() {
-        let port = {
-            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            l.local_addr().unwrap().port()
-        };
-        // Listens, never accepts: connects succeed, nothing is ever read back.
-        let script = r#"
+        // Loopback, and wildcard: a HEADROOM_HOST=0.0.0.0 orphan that macOS
+        // lets a 127.0.0.1 bind succeed over is still ours, never foreign.
+        for host in ["127.0.0.1", "0.0.0.0"] {
+            let port = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                l.local_addr().unwrap().port()
+            };
+            // Listens, never accepts: connects succeed, nothing is ever read back.
+            let script = r#"
 import socket, sys, time
-s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(8)
+s = socket.socket(); s.bind((sys.argv[1], int(sys.argv[2]))); s.listen(8)
 time.sleep(30)
 "#;
-        let mut child = crate::proc::command("/usr/bin/python3")
-            .arg("-c")
-            .arg(script)
-            .arg(port.to_string())
-            .arg("--headroom-proxy-test-standin")
-            .spawn()
-            .expect("spawn silent stand-in");
+            let mut child = crate::proc::command("/usr/bin/python3")
+                .arg("-c")
+                .arg(script)
+                .arg(host)
+                .arg(port.to_string())
+                .arg("--headroom-proxy-test-standin")
+                .spawn()
+                .expect("spawn silent stand-in");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "stand-in never bound port {port}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
+            // Generous: python startup on a loaded CI box has taken over 5s.
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stand-in never bound {host}:{port}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            let state = diagnose_proxy_port(port);
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(matches!(state, PortState::HeadroomRunning), "{host}");
         }
-
-        let state = diagnose_proxy_port(port);
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(matches!(state, PortState::HeadroomRunning));
     }
 
     #[test]

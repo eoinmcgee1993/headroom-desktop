@@ -1358,11 +1358,11 @@ pub fn request_auth_code(state: &AppState, email: &str) -> Result<HeadroomAuthCo
 /// Test-only seam: `request_auth_code` against a parameterized base URL and
 /// retry backoff so a canned-response test server can stand in for headroom-web.
 ///
-/// Retries once on a gateway-class status, like activation: a 502 is a
-/// headroom-web deploy switchover (Sentry RUST-J4). A 503 here can also come
-/// from the handler's own rescue, but that means the code email was never
-/// sent, so reissuing is still right. Transport errors are NOT retried: a
-/// timeout may mean the email went out, and a second code would invalidate it.
+/// Retries once on a 502, a headroom-web deploy switchover (Sentry RUST-J4).
+/// Not on 503, unlike activation: the handler's own rescue returns 503 around
+/// `deliver_now!` too, so a mail provider that accepted the email and then
+/// timed out would get a second code that invalidates the first. Transport
+/// errors are NOT retried for the same reason.
 pub(crate) fn request_auth_code_with_base_url(
     state: &AppState,
     email: &str,
@@ -1388,7 +1388,7 @@ pub(crate) fn request_auth_code_with_base_url(
                 capture_transport_failure("auth-request-code", &msg, &err);
                 msg
             })?;
-        if is_retryable_gateway_status(response.status().as_u16()) && !retried {
+        if response.status().as_u16() == 502 && !retried {
             retried = true;
             std::thread::sleep(retry_backoff);
             continue;
@@ -6084,6 +6084,30 @@ mod tests {
 
         server.join().unwrap();
         assert_eq!(result.email, "user@example.com");
+        drop_state(dir);
+    }
+
+    #[test]
+    fn request_auth_code_does_not_retry_a_503() {
+        // headroom-web's rescue returns 503 around deliver_now! too: the email
+        // may be out, and a retry would mint a code that invalidates it. The
+        // server answers once, so a retry would surface a transport error.
+        let (port, server) = spawn_canned_response_server(
+            serde_json::json!({ "error": "Something went wrong. Please try again." }),
+            "HTTP/1.1 503 Service Unavailable",
+        );
+        let (state, dir) = temp_app_state();
+
+        let err = super::request_auth_code_with_base_url(
+            &state,
+            "user@example.com",
+            &format!("http://127.0.0.1:{port}"),
+            std::time::Duration::from_millis(20),
+        )
+        .expect_err("503 surfaces");
+
+        server.join().unwrap();
+        assert!(err.contains("status 503"), "{err}");
         drop_state(dir);
     }
 

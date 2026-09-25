@@ -5372,7 +5372,7 @@ async fn detect_unrouted_clients(
         let now = SystemTime::now();
         let mut found = Vec::new();
         for (client_id, name, counter_key) in [
-            ("codex", "ChatGPT", "codex"),
+            ("codex", "ChatGPT Codex", "codex"),
             ("claude_code", "Claude Code", "claude-code"),
         ] {
             let activity = client_adapters::client_local_activity_at(client_id);

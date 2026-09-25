@@ -162,11 +162,21 @@ fn build_vsix(state_path: &Path) -> Result<Vec<u8>> {
     Ok(writer.finish()?.into_inner())
 }
 
+/// A CLI that hangs (a lock, a first-run prompt) would otherwise hold INSTALL
+/// forever, freezing the statusline toggle and Headroom's uninstall cleanup.
+const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn run_cli(editor: &Editor, args: &[&std::ffi::OsStr]) -> Result<()> {
-    let out = crate::proc::command(&editor.cli)
-        .args(args)
-        .output()
-        .with_context(|| format!("running {}", editor.cli.display()))?;
+    let mut command = crate::proc::command(&editor.cli);
+    command.args(args);
+    let out = crate::proc::output_with_timeout(command, CLI_TIMEOUT).map_err(|err| match err {
+        crate::proc::OutputError::Spawn(err) => {
+            anyhow!(err).context(format!("running {}", editor.cli.display()))
+        }
+        crate::proc::OutputError::TimedOut => {
+            anyhow!("{} timed out after {}s", editor.id, CLI_TIMEOUT.as_secs())
+        }
+    })?;
     if !out.status.success() {
         bail!(
             "{} exited {}: {}",

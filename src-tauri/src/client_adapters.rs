@@ -228,8 +228,12 @@ pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
     }
     // The editor status bar extension goes with it, but only here and on
     // Headroom's uninstall: remove_claude_statusline also runs on every quit.
+    // Not an error to the toggle: the flag and the statusline are already off,
+    // and failing here left the UI showing "on" over a disabled state.
     if !enabled {
-        crate::vscode_statusbar::uninstall()?;
+        if let Err(err) = crate::vscode_statusbar::uninstall() {
+            log::warn!("statusline disabled, but the editor status bar extension stayed: {err:#}");
+        }
     }
     Ok(())
 }
@@ -816,7 +820,8 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
 /// Silent self-heal for drifted client configs: for every client the user has
 /// enabled, if verification fails (another tool rewrote settings.json, a shell
 /// block vanished), re-run `apply_client_setup` and confirm with a re-verify.
-/// Returns the client ids that were actually repaired.
+/// Returns the client ids whose broken config was repaired; a version
+/// restamp re-applies without being listed.
 ///
 /// Scans at most once per hour per process: verification reads a handful of
 /// files (and the codex arm spawns a detached `codex doctor`), and a repair
@@ -904,7 +909,9 @@ fn stale_setup_version(client_id: &str) -> Option<String> {
 }
 
 /// One client's verify -> re-apply -> re-verify cycle, unthrottled. Returns
-/// true only when the re-verify comes back clean.
+/// true only when a silently broken config came back clean. A version restamp
+/// re-applies too but returns false: it is every client on every update, so
+/// counting it would bury the real repairs in the auto-repaired metric.
 fn repair_client_setup_now(client_id: &str) -> bool {
     let mut broken = match verify_client_setup(client_id) {
         Ok(verification) => verification.failures,
@@ -944,7 +951,7 @@ fn repair_client_setup_now(client_id: &str) -> bool {
             // of them meant nothing. One issue per client, from here.
             log::info!("repair_client_setups: repaired {client_id} ({broken:?})");
             if !silently_broken {
-                return true;
+                return false;
             }
             // WHICH check failed, in the fingerprint and in full as an
             // extra. Grouping on the client alone said only "codex_cli
@@ -6031,6 +6038,11 @@ fn claude_remote_control_command_path() -> PathBuf {
 /// alias: zsh and bash alias-expand a function name at parse time, so a bare
 /// `claude() {` below a user's `alias claude=...` (Claude Code's own local
 /// installer writes one) is a parse error that aborts the rest of the rc file.
+///
+/// The relaunch carries the user's session flags (model, permission mode, dirs)
+/// from an allowlist, because only a known arity tells a flag's value from a
+/// prompt, and replaying the prompt would submit it again. An unlisted flag is
+/// dropped, as every flag was before.
 fn claude_code_shell_block() -> String {
     let function = r#"claude() {
   local a; for a in "$@"; do [ "$a" = --remote-control ] && { set -- --settings '__OVERRIDE__' "$@"; break; }; done
@@ -6039,11 +6051,30 @@ fn claude_code_shell_block() -> String {
   local m="$HOME/.headroom/remote-control/$(command basename "$(command tty 2>/dev/null)" 2>/dev/null)"
   if [ -s "$m" ] && [ -n "$(command find "$m" -mmin -2 2>/dev/null)" ]; then
     local sid; sid=$(command cat "$m"); command rm -f "$m"
-    command claude --settings '__OVERRIDE__' -r "$sid" --remote-control
+    local n=$# v=0
+    while [ "$n" -gt 0 ]; do
+      a=$1; shift; n=$((n-1))
+      if [ "$v" = 1 ]; then v=0; set -- "$@" "$a"; continue; fi
+      case $a in
+        __VALUE_FLAGS__) v=1; set -- "$@" "$a" ;;
+        __FLAGS__) set -- "$@" "$a" ;;
+      esac
+    done
+    command claude --settings '__OVERRIDE__' "$@" -r "$sid" --remote-control
     return $?
   fi
   return $rc
 }"#
+    .replace("__VALUE_FLAGS__", &RELAUNCH_VALUE_FLAGS.join("|"))
+    .replace(
+        "__FLAGS__",
+        &RELAUNCH_VALUE_FLAGS
+            .iter()
+            .map(|flag| format!("{flag}=*"))
+            .chain(RELAUNCH_SWITCHES.iter().map(|flag| flag.to_string()))
+            .collect::<Vec<_>>()
+            .join("|"),
+    )
     .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE);
     format!(
         "export ANTHROPIC_BASE_URL={HEADROOM_ANTHROPIC_BASE_URL}\n\
@@ -6487,21 +6518,28 @@ if [ -z "$via" ]; then
 fi
 mkdir -p "$dir" && printf '%s %s\n' "$CLAUDE_PID" "$via" > "$dir/exit-$CLAUDE_CODE_SESSION_ID"
 echo "Restarting this session with Remote Control. Headroom is off for the restarted session."
+# Only when the Stop hook will NOT run: a timed exit, at the cost of an
+# interrupted turn. With the hook live there is no timer at all. A timer that
+# raced a slow turn killed the session mid-turn and the CLI lost every
+# transcript entry after the confirmation, which is what "No response
+# requested." on the phone was. The hook is live when it is registered and no
+# settings layer switches hooks off: disableAllHooks anywhere, or a managed
+# allowManagedHooksOnly, which ignores user hooks.
+settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+managed="/Library/Application Support/ClaudeCode/managed-settings.json"
+[ -f "$managed" ] || managed=/etc/claude-code/managed-settings.json
+if ! grep -q 'headroom-remote-control\.sh[^"]* --stop' "$settings" 2>/dev/null \
+  || grep -qs '"disableAllHooks"[[:space:]]*:[[:space:]]*true' "$settings" .claude/settings.json .claude/settings.local.json "$managed" \
+  || grep -qs '"allowManagedHooksOnly"[[:space:]]*:[[:space:]]*true' "$managed"; then
+  secs=${HEADROOM_REMOTE_CONTROL_FALLBACK_SECS:-15}
+  # Runs the --stop phase itself, so the marker and the pid check are shared.
+  nohup sh -c 'sleep "$1"; printf "{\"session_id\":\"%s\"}\n" "$2" | sh "$0" --stop' "$0" "$secs" "$CLAUDE_CODE_SESSION_ID" >/dev/null 2>&1 &
+fi
 if [ "$via" = wrapper ]; then
   echo "The restart takes up to 30 seconds; this panel stays open and picks up where it left off, and says so here once Remote Control is on."
   exit 0
 fi
 echo "The restart takes up to 30 seconds. If it does not come back by itself, run: $fallback"
-# Only when the Stop hook is NOT registered (settings.json edited by hand):
-# a timed exit, at the cost of an interrupted turn. With the hook registered
-# there is no timer at all. A timer that raced a slow turn killed the session
-# mid-turn and the CLI lost every transcript entry after the confirmation, which
-# is what "No response requested." on the phone was.
-if ! grep -q 'headroom-remote-control\.sh[^"]* --stop' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" 2>/dev/null; then
-  secs=${HEADROOM_REMOTE_CONTROL_FALLBACK_SECS:-15}
-  # Runs the --stop phase itself, so the marker and the pid check are shared.
-  nohup sh -c 'sleep "$1"; printf "{\"session_id\":\"%s\"}\n" "$2" | sh "$0" --stop' "$0" "$secs" "$CLAUDE_CODE_SESSION_ID" >/dev/null 2>&1 &
-fi
 "#
     .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE)
 }
@@ -6737,6 +6775,30 @@ fi
     )
 }
 
+/// Session flags the /remote-control relaunch keeps: each takes exactly one
+/// value (`--add-dir a b` keeps only `a`).
+const RELAUNCH_VALUE_FLAGS: &[&str] = &[
+    "--model",
+    "--permission-mode",
+    "--add-dir",
+    "--agent",
+    "--effort",
+    "--fallback-model",
+    "--append-system-prompt",
+    "--mcp-config",
+    "--plugin-dir",
+];
+/// Valueless session flags the relaunch keeps.
+const RELAUNCH_SWITCHES: &[&str] = &[
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--strict-mcp-config",
+    "--verbose",
+    "--ide",
+    "--chrome",
+    "--no-chrome",
+];
+
 /// Ours only when the command is our script alone, however its path is
 /// quoted: a user's composed command that merely also runs ours is theirs, and
 /// must be neither replaced on setup nor deleted on removal.
@@ -6744,9 +6806,14 @@ fn is_our_statusline(value: &Value) -> bool {
     value
         .get("command")
         .and_then(Value::as_str)
-        .map(|command| command.trim().trim_matches('"'))
+        .map(str::trim)
+        .and_then(|command| match command.strip_prefix('"') {
+            Some(rest) => rest.strip_suffix('"'),
+            // Unquoted, whitespace separates commands: `~/mine.sh; <ours>`.
+            None => (!command.contains(char::is_whitespace)).then_some(command),
+        })
         .is_some_and(|path| {
-            !path.contains('"')
+            !path.contains(['"', ';', '&', '|', '`', '\n'])
                 && Path::new(path)
                     .file_name()
                     .is_some_and(|name| name == CLAUDE_STATUSLINE_SCRIPT)
@@ -12978,6 +13045,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(read()["statusLine"], composed);
         remove_claude_statusline().expect("remove");
         assert_eq!(read()["statusLine"], composed);
+
+        // Ours last is still theirs, quoted or not: only the text after the
+        // final `/` names our script.
+        let ours = claude_statusline_script_path().display().to_string();
+        for command in [
+            format!("~/my-line.sh; {ours}"),
+            format!("~/my-line.sh;{ours}"),
+            format!("\"~/my-line.sh\" && \"{ours}\""),
+        ] {
+            let line = serde_json::json!({ "type": "command", "command": command });
+            assert!(!is_our_statusline(&line), "{command}");
+        }
+        assert!(is_our_statusline(
+            &serde_json::json!({ "type": "command", "command": ours })
+        ));
     }
 
     #[cfg(unix)]
@@ -13423,6 +13505,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             std::fs::read_to_string(marker_dir.join("ttys998")).unwrap(),
             "sid-456\n"
         );
+
+        // Registered but switched off by disableAllHooks: the hook never runs,
+        // so the timed exit must, for the VS Code panel too.
+        std::fs::write(
+            claude_settings_path(),
+            format!(
+                "{{\"disableAllHooks\": true, \"hooks\": {{\"Stop\": [{{\"hooks\": [{{\"type\": \"command\", \"command\": \"{} --stop\"}}]}}]}}}}\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        let mut child = spawn_claude();
+        let pid = child.id().to_string();
+        run(HEADROOM_ANTHROPIC_BASE_URL, "wrapper", "", "sid-789", &pid);
+        wait_for_term(&mut child, "timed exit did not fire with hooks disabled");
+        assert!(marker_dir.join("resume-sid-789").exists());
     }
 
     #[cfg(unix)]
@@ -13494,6 +13592,23 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 status.code(),
                 Some(7),
                 "{shell}: relaunch exit code propagates"
+            );
+
+            // Session flags survive the relaunch; the prompt, a resume target
+            // and unknown flags do not.
+            run(
+                "claude --model opus 'fix it' --dangerously-skip-permissions --add-dir '../a b' --effort=high -c --unknown x",
+                true,
+            );
+            assert_eq!(
+                std::fs::read_to_string(&log).unwrap().lines().nth(1),
+                Some(
+                    format!(
+                        "none --settings {CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE} --model opus --dangerously-skip-permissions --add-dir ../a b --effort=high -r sid-123 --remote-control"
+                    )
+                    .as_str()
+                ),
+                "{shell}"
             );
 
             // Manual fallback: the flag alone gets the override added, but
@@ -13730,8 +13845,8 @@ sys.exit(3)
             Some("0.9.22-rc.4")
         );
         assert!(
-            super::repair_client_setup_now("claude_code"),
-            "stale stamp re-applies"
+            !super::repair_client_setup_now("claude_code"),
+            "a restamp is not a repair of a broken config"
         );
         assert_eq!(
             super::load_setup_state()
