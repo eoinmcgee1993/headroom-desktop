@@ -3702,13 +3702,19 @@ impl ToolManager {
                                         #[cfg(not(windows))]
                                         {
                                             if let Some(cmd) = ps_field(p, "command=") {
-                                                scope.set_extra("occupant_command", cmd.into());
+                                                scope.set_extra(
+                                                    "occupant_command",
+                                                    redact_command_line(&cmd).into(),
+                                                );
                                             }
                                             let parent = ps_field(p, "ppid=")
                                                 .and_then(|pp| pp.parse::<u32>().ok())
                                                 .and_then(|pp| ps_field(pp, "command="));
                                             if let Some(parent) = parent {
-                                                scope.set_extra("occupant_parent", parent.into());
+                                                scope.set_extra(
+                                                    "occupant_parent",
+                                                    redact_command_line(&parent).into(),
+                                                );
                                             }
                                         }
                                     }
@@ -9289,6 +9295,58 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
         // exact port being reclaimed, so the blast radius is one port either way.
         argv.contains("headroom") && argv.contains("proxy")
     }
+}
+
+/// A foreign process's command line, reduced to what tells a dev server from
+/// our backend's offspring: the executable, flag names, `-m` modules, script
+/// and path arguments, bare subcommands and port numbers. Every other value
+/// becomes `<arg>`, because it is some other program's argv and may carry its
+/// secrets (`serve.py --api-key sk-...`, a `sh -c` script body). The home
+/// directory is scrubbed later, in `logging::scrub_event`.
+fn redact_command_line(command: &str) -> String {
+    let mut tokens = command.split_whitespace();
+    let mut out: Vec<String> = tokens.next().map(str::to_owned).into_iter().collect();
+    let mut value_of: Option<&str> = None;
+    for token in tokens {
+        let keep = match value_of.take() {
+            Some("-m") => true,
+            Some(_) => is_port_like(token),
+            None if token.starts_with('-') => {
+                let (flag, value) = token.split_once('=').unwrap_or((token, ""));
+                out.push(if value.is_empty() || is_port_like(value) {
+                    token.to_owned()
+                } else {
+                    format!("{flag}=<arg>")
+                });
+                if !token.contains('=') && token.len() > 1 {
+                    value_of = Some(if token == "-m" { "-m" } else { "flag" });
+                }
+                continue;
+            }
+            None => {
+                is_port_like(token)
+                    || token.contains('/')
+                    || [".py", ".js", ".mjs", ".cjs", ".ts", ".sh"]
+                        .iter()
+                        .any(|ext| token.ends_with(ext))
+                    || (token.len() <= 24
+                        && token.starts_with(|c: char| c.is_ascii_lowercase())
+                        && token
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c == '-' || c == '_'))
+            }
+        };
+        out.push(if keep {
+            token.to_owned()
+        } else {
+            "<arg>".into()
+        });
+    }
+    out.join(" ")
+}
+
+fn is_port_like(token: &str) -> bool {
+    (1..=5).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// One `ps -o <field> -p <pid>` column, trimmed; `None` when ps failed or the
@@ -17002,6 +17060,27 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn port_occupant_command_lines_keep_identity_and_drop_values() {
+        let r = super::redact_command_line;
+        assert_eq!(
+            r("/venv/bin/python3 -m headroom.proxy.server --port 6768 --host 127.0.0.1"),
+            "/venv/bin/python3 -m headroom.proxy.server --port 6768 --host <arg>"
+        );
+        assert_eq!(
+            r("headroom proxy --port 6768"),
+            "headroom proxy --port 6768"
+        );
+        assert_eq!(
+            r("python serve.py --api-key sk-ant-XYZ123 --token=abc123 SECRETVALUE"),
+            "python serve.py --api-key <arg> --token=<arg> <arg>"
+        );
+        assert_eq!(
+            r("/bin/zsh -c source ~/.claude/snapshot.sh && python x.py"),
+            "/bin/zsh -c <arg> ~/.claude/snapshot.sh <arg> python x.py"
+        );
     }
 
     /// RUST-JC: a dual-stack wildcard listener (Node's default, Orca's shape)

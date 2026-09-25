@@ -1610,6 +1610,9 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     if let Err(err) = remove_claude_remote_control_command() {
         log::warn!("cleanup: removing /remote-control command failed: {err}");
     }
+    // Disabling keeps the wrapper file for VS Code's settings-reload window;
+    // uninstall removes it, but only once no settings file still points at it.
+    remove_vscode_wrapper_file_if_unreferenced();
     if let Err(err) = remove_claude_statusline() {
         log::warn!("cleanup: removing Claude statusline failed: {err}");
     }
@@ -6411,6 +6414,27 @@ fn remove_vscode_process_wrapper() -> Result<()> {
     atomic_write(&settings_path, &edited)
 }
 
+/// Delete the wrapper script once VS Code's settings no longer name it. An
+/// unreadable settings file counts as naming it: a panel pointed at a missing
+/// wrapper does not start at all.
+fn remove_vscode_wrapper_file_if_unreferenced() {
+    let wrapper = claude_remote_control_wrapper_path();
+    if !wrapper.exists() {
+        return;
+    }
+    let settings = vscode_user_settings_path();
+    let referenced = match std::fs::read_to_string(&settings) {
+        Ok(raw) => raw.contains(&wrapper.display().to_string()),
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    };
+    if referenced {
+        return;
+    }
+    if let Err(err) = std::fs::remove_file(&wrapper) {
+        log::warn!("cleanup: removing {} failed: {err}", wrapper.display());
+    }
+}
+
 /// Add (or remove) our wrapper key in VS Code's settings.json as a text edit.
 /// The file is hand-maintained JSONC: a serde round trip would sort every key
 /// and strip every comment. The result is re-parsed and must equal the parsed
@@ -8697,8 +8721,9 @@ mod tests {
         claude_remote_control_hook_command, claude_remote_control_panel_command_path,
         claude_remote_control_script_path, claude_remote_control_wrapper_path,
         ensure_claude_remote_control_command, remove_claude_remote_control_command,
-        vscode_user_settings_path, CLAUDE_REMOTE_CONTROL_COMMAND_MARKER,
-        CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE, HEADROOM_ANTHROPIC_BASE_URL,
+        remove_vscode_wrapper_file_if_unreferenced, vscode_user_settings_path,
+        CLAUDE_REMOTE_CONTROL_COMMAND_MARKER, CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE,
+        HEADROOM_ANTHROPIC_BASE_URL,
     };
     #[cfg(target_os = "windows")]
     use super::{claude_guard_command, codex_guard_command};
@@ -13220,6 +13245,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(!script_path.exists());
         // Kept: VS Code can still launch it until it notices the setting is gone.
         assert!(claude_remote_control_wrapper_path().exists());
+        // Uninstall removes it, once the setting no longer names it.
+        remove_vscode_wrapper_file_if_unreferenced();
+        assert!(!claude_remote_control_wrapper_path().exists());
         assert!(!claude_remote_control_panel_command_path().exists());
         if cfg!(target_os = "macos") {
             assert_eq!(std::fs::read_to_string(&vscode).unwrap(), original);

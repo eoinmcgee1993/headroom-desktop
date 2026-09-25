@@ -72,12 +72,16 @@ fn extension_version() -> String {
 /// registry (`extensions.json`) decides: `--uninstall-extension` drops the
 /// entry but can leave the folder behind unmarked, and reading the folder then
 /// made re-enabling skip the install, so the item stayed gone. Folders are
-/// only the fallback for an editor without a registry, skipping ones marked
-/// obsolete (uninstalled, awaiting deletion on its next start).
+/// only the fallback for an editor without a registry.
 fn installed_versions(extensions_dir: &Path) -> Vec<String> {
-    if let Ok(bytes) = std::fs::read(extensions_dir.join("extensions.json")) {
-        let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
-        return entries
+    registry_versions(extensions_dir).unwrap_or_else(|| folder_versions(extensions_dir))
+}
+
+fn registry_versions(extensions_dir: &Path) -> Option<Vec<String>> {
+    let bytes = std::fs::read(extensions_dir.join("extensions.json")).ok()?;
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+    Some(
+        entries
             .iter()
             .filter(|e| {
                 e["identifier"]["id"]
@@ -85,8 +89,13 @@ fn installed_versions(extensions_dir: &Path) -> Vec<String> {
                     .is_some_and(|id| id.eq_ignore_ascii_case(EXTENSION_ID))
             })
             .filter_map(|e| e["version"].as_str().map(str::to_owned))
-            .collect();
-    }
+            .collect(),
+    )
+}
+
+/// Our extension's folders, skipping ones the editor marked obsolete
+/// (uninstalled, awaiting deletion on its next start).
+fn folder_versions(extensions_dir: &Path) -> Vec<String> {
     let obsolete: BTreeMap<String, serde_json::Value> =
         std::fs::read(extensions_dir.join(".obsolete"))
             .ok()
@@ -102,6 +111,14 @@ fn installed_versions(extensions_dir: &Path) -> Vec<String> {
         .filter(|name| !obsolete.contains_key(name))
         .filter_map(|name| name.strip_prefix(&prefix).map(str::to_owned))
         .collect()
+}
+
+/// A live folder the registry does not list: the trace of our own uninstall
+/// under 0.9.22, whose re-enable then skipped the install. A user's uninstall
+/// marks the folder obsolete or deletes it, so this never reads as theirs.
+fn orphaned_by_our_uninstall(extensions_dir: &Path) -> bool {
+    registry_versions(extensions_dir).is_some_and(|listed| listed.is_empty())
+        && !folder_versions(extensions_dir).is_empty()
 }
 
 /// Install when the editor has never had it, or has an older build of it.
@@ -244,7 +261,9 @@ pub fn ensure_installed() {
                 tracking.installed.insert(editor.id.to_string());
                 continue;
             }
-            if !should_install(&current, &present, tracking.installed.contains(editor.id)) {
+            let removed_by_user = tracking.installed.contains(editor.id)
+                && !orphaned_by_our_uninstall(&editor.extensions_dir);
+            if !should_install(&current, &present, removed_by_user) {
                 continue;
             }
             match install(editor, &state_path) {
@@ -336,6 +355,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(installed_versions(dir.path()), vec!["0.1.0".to_string()]);
+        assert!(!orphaned_by_our_uninstall(dir.path()));
+
+        // Folder alive but unlisted: 0.9.22's own uninstall, not the user's.
+        std::fs::write(dir.path().join("extensions.json"), "[]").unwrap();
+        assert!(orphaned_by_our_uninstall(dir.path()));
+        // A user's uninstall marks every folder obsolete.
+        std::fs::write(
+            dir.path().join(".obsolete"),
+            r#"{"headroom.headroom-status-0.1.0":true,"headroom.headroom-status-0.2.0":true}"#,
+        )
+        .unwrap();
+        assert!(!orphaned_by_our_uninstall(dir.path()));
     }
 
     #[test]
