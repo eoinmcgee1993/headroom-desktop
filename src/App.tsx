@@ -113,7 +113,6 @@ import {
 } from "./lib/appHelpers";
 import {
   bootstrapFailureSignature,
-  buildBootstrapFailureReport,
   buildBootstrapInvokeFailureReport,
   reportBootstrapFailure
 } from "./lib/bootstrapSentry";
@@ -2318,12 +2317,7 @@ export default function App() {
       setBootstrapProgress(progress);
 
       if (progress.failed) {
-        const failureReport = buildBootstrapFailureReport(progress);
-        const failureSignature = bootstrapFailureSignature(failureReport);
-        if (bootstrapFailureSignatureRef.current !== failureSignature) {
-          bootstrapFailureSignatureRef.current = failureSignature;
-          reportBootstrapFailure(failureReport);
-        }
+        // Rust already captured this failure (capture_bootstrap_failure).
         setBootstrapError(progress.message);
         setBootstrapping(false);
         completionHandled = true;
@@ -3931,8 +3925,12 @@ export default function App() {
           // A quiet install that fails every time (read-only or translocated
           // bundle) would leave this build unannounced forever. The stale
           // reminder is its fallback: the clock starts now, and a staged
-          // update stops the ticks that could fire it.
-          if (!(await getCurrentWindow().isVisible().catch(() => false))) {
+          // update proves quiet installs work, so a newer release re-staging
+          // on top of it must not nag "install" for what only needs a restart.
+          if (
+            !appUpdateStagedVersionRef.current &&
+            !(await getCurrentWindow().isVisible().catch(() => false))
+          ) {
             await maybeFireStaleAppUpdateNotification(patch.availableUpdate);
           }
           return;

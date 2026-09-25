@@ -68,9 +68,34 @@ fn extension_version() -> String {
         .unwrap_or_default()
 }
 
-/// Versions of our extension an editor has installed, skipping folders it has
-/// marked obsolete (uninstalled, awaiting deletion on its next start).
+/// Versions of our extension an editor has installed. The editor's own
+/// registry (`extensions.json`) decides: `--uninstall-extension` drops the
+/// entry but can leave the folder behind unmarked, and reading the folder then
+/// made re-enabling skip the install, so the item stayed gone. Folders are
+/// only the fallback for an editor without a registry.
 fn installed_versions(extensions_dir: &Path) -> Vec<String> {
+    registry_versions(extensions_dir).unwrap_or_else(|| folder_versions(extensions_dir))
+}
+
+fn registry_versions(extensions_dir: &Path) -> Option<Vec<String>> {
+    let bytes = std::fs::read(extensions_dir.join("extensions.json")).ok()?;
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+    Some(
+        entries
+            .iter()
+            .filter(|e| {
+                e["identifier"]["id"]
+                    .as_str()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(EXTENSION_ID))
+            })
+            .filter_map(|e| e["version"].as_str().map(str::to_owned))
+            .collect(),
+    )
+}
+
+/// Our extension's folders, skipping ones the editor marked obsolete
+/// (uninstalled, awaiting deletion on its next start).
+fn folder_versions(extensions_dir: &Path) -> Vec<String> {
     let obsolete: BTreeMap<String, serde_json::Value> =
         std::fs::read(extensions_dir.join(".obsolete"))
             .ok()
@@ -86,6 +111,14 @@ fn installed_versions(extensions_dir: &Path) -> Vec<String> {
         .filter(|name| !obsolete.contains_key(name))
         .filter_map(|name| name.strip_prefix(&prefix).map(str::to_owned))
         .collect()
+}
+
+/// A live folder the registry does not list: the trace of our own uninstall
+/// under 0.9.22, whose re-enable then skipped the install. A user's uninstall
+/// marks the folder obsolete or deletes it, so this never reads as theirs.
+fn orphaned_by_our_uninstall(extensions_dir: &Path) -> bool {
+    registry_versions(extensions_dir).is_some_and(|listed| listed.is_empty())
+        && !folder_versions(extensions_dir).is_empty()
 }
 
 /// Install when the editor has never had it, or has an older build of it.
@@ -162,11 +195,21 @@ fn build_vsix(state_path: &Path) -> Result<Vec<u8>> {
     Ok(writer.finish()?.into_inner())
 }
 
+/// A CLI that hangs (a lock, a first-run prompt) would otherwise hold INSTALL
+/// forever, freezing the statusline toggle and Headroom's uninstall cleanup.
+const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn run_cli(editor: &Editor, args: &[&std::ffi::OsStr]) -> Result<()> {
-    let out = crate::proc::command(&editor.cli)
-        .args(args)
-        .output()
-        .with_context(|| format!("running {}", editor.cli.display()))?;
+    let mut command = crate::proc::command(&editor.cli);
+    command.args(args);
+    let out = crate::proc::output_with_timeout(command, CLI_TIMEOUT).map_err(|err| match err {
+        crate::proc::OutputError::Spawn(err) => {
+            anyhow!(err).context(format!("running {}", editor.cli.display()))
+        }
+        crate::proc::OutputError::TimedOut => {
+            anyhow!("{} timed out after {}s", editor.id, CLI_TIMEOUT.as_secs())
+        }
+    })?;
     if !out.status.success() {
         bail!(
             "{} exited {}: {}",
@@ -218,7 +261,9 @@ pub fn ensure_installed() {
                 tracking.installed.insert(editor.id.to_string());
                 continue;
             }
-            if !should_install(&current, &present, tracking.installed.contains(editor.id)) {
+            let removed_by_user = tracking.installed.contains(editor.id)
+                && !orphaned_by_our_uninstall(&editor.extensions_dir);
+            if !should_install(&current, &present, removed_by_user) {
                 continue;
             }
             match install(editor, &state_path) {
@@ -295,6 +340,33 @@ mod tests {
         .unwrap();
         assert_eq!(installed_versions(dir.path()), vec!["0.2.0".to_string()]);
         assert!(installed_versions(&dir.path().join("missing")).is_empty());
+
+        // With a registry, it decides: an uninstall that left its folder
+        // behind is not installed, so re-enabling installs again.
+        std::fs::write(
+            dir.path().join("extensions.json"),
+            r#"[{"identifier":{"id":"anthropic.claude-code"},"version":"2.1.281"}]"#,
+        )
+        .unwrap();
+        assert!(installed_versions(dir.path()).is_empty());
+        std::fs::write(
+            dir.path().join("extensions.json"),
+            r#"[{"identifier":{"id":"Headroom.headroom-status"},"version":"0.1.0"}]"#,
+        )
+        .unwrap();
+        assert_eq!(installed_versions(dir.path()), vec!["0.1.0".to_string()]);
+        assert!(!orphaned_by_our_uninstall(dir.path()));
+
+        // Folder alive but unlisted: 0.9.22's own uninstall, not the user's.
+        std::fs::write(dir.path().join("extensions.json"), "[]").unwrap();
+        assert!(orphaned_by_our_uninstall(dir.path()));
+        // A user's uninstall marks every folder obsolete.
+        std::fs::write(
+            dir.path().join(".obsolete"),
+            r#"{"headroom.headroom-status-0.1.0":true,"headroom.headroom-status-0.2.0":true}"#,
+        )
+        .unwrap();
+        assert!(!orphaned_by_our_uninstall(dir.path()));
     }
 
     #[test]

@@ -242,7 +242,7 @@ Expect: `PASS`.
 Expect: `mode` is `token`, `primary_model` is a `gpt-*` model, `requests_compressed` increased by at least 1, and `total_tokens_removed` is strictly greater.
 
 ### C3. Codex savings are attributed on the dashboard
-Open the dashboard and confirm a **ChatGPT Codex** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the group labelled "ChatGPT" (internal key `codex`; the display name follows OpenAI's 2026-07 rename).
+Open the dashboard and confirm a **ChatGPT Codex** group appears in the per-provider savings with non-zero values. Provider `openai` maps to that group (internal key `codex`).
 
 ### C4. Pause / resume cleanly strips and restores Codex routing
 From the tray menu ("Pause Headroom" / "Resume Headroom"), toggle Pause then Resume, checking after each:

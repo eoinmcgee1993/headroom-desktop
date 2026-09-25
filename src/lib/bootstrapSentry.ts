@@ -1,15 +1,16 @@
 import * as Sentry from "@sentry/react";
 
 import { describeInvokeError } from "./appHelpers";
-import type { BootstrapProgress } from "./types";
 
-export type BootstrapFailurePhase =
-  | "install_runtime"
-  | "start_runtime"
-  | "command_dispatch"
-  | "unknown";
+// Only a failed `start_bootstrap` invoke is reported from here. A failure the
+// backend reaches (progress.failed) is captured by Rust's
+// `capture_bootstrap_failure`, which carries the pip stderr, a per-cause
+// fingerprint, the 24h per-machine dedupe and the ENOSPC filter. Re-reporting
+// it here filed every cause under one fingerprint that bypassed both filters,
+// so RUST-GR regressed on any new cause and could never stay resolved.
+export type BootstrapFailurePhase = "command_dispatch";
 
-export type BootstrapFailureSource = "progress_poll" | "invoke_error";
+export type BootstrapFailureSource = "invoke_error";
 
 export interface BootstrapFailureReport {
   source: BootstrapFailureSource;
@@ -18,37 +19,6 @@ export interface BootstrapFailureReport {
   currentStep: string;
   overallPercent: number;
   currentStepEtaSeconds: number;
-}
-
-export function inferBootstrapFailurePhase(message: string): BootstrapFailurePhase {
-  const normalized = message.trim();
-
-  if (normalized.startsWith("Installation failed:")) {
-    return "install_runtime";
-  }
-
-  if (normalized.startsWith("Install completed but Headroom failed to start:")) {
-    return "start_runtime";
-  }
-
-  return "unknown";
-}
-
-export function buildBootstrapFailureReport(
-  progress: BootstrapProgress,
-  source: BootstrapFailureSource = "progress_poll"
-): BootstrapFailureReport {
-  const message = progress.message.trim() || "Headroom bootstrap failed.";
-  const currentStep = progress.currentStep.trim() || "Install failed";
-
-  return {
-    source,
-    phase: inferBootstrapFailurePhase(message),
-    message,
-    currentStep,
-    overallPercent: Math.max(0, Math.round(progress.overallPercent || 0)),
-    currentStepEtaSeconds: Math.max(0, Math.round(progress.currentStepEtaSeconds || 0)),
-  };
 }
 
 export function buildBootstrapInvokeFailureReport(error: unknown): BootstrapFailureReport {

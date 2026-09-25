@@ -3695,6 +3695,28 @@ impl ToolManager {
                                     scope.set_extra("chosen_port", port.into());
                                     if let Some(p) = original_pid {
                                         scope.set_extra("occupant_pid", p.into());
+                                        // The name alone ("Python") cannot tell
+                                        // a dev server from our own backend's
+                                        // offspring; RUST-ED regressed four times
+                                        // on one Mac with nothing more to go on.
+                                        #[cfg(not(windows))]
+                                        {
+                                            if let Some(cmd) = ps_field(p, "command=") {
+                                                scope.set_extra(
+                                                    "occupant_command",
+                                                    redact_command_line(&cmd).into(),
+                                                );
+                                            }
+                                            let parent = ps_field(p, "ppid=")
+                                                .and_then(|pp| pp.parse::<u32>().ok())
+                                                .and_then(|pp| ps_field(pp, "command="));
+                                            if let Some(parent) = parent {
+                                                scope.set_extra(
+                                                    "occupant_parent",
+                                                    redact_command_line(&parent).into(),
+                                                );
+                                            }
+                                        }
                                     }
                                     // Fixed fingerprint: the occupant name,
                                     // its pid and the chosen port are all in
@@ -9121,7 +9143,25 @@ fn bind_denied_by_os(err: &std::io::Error) -> bool {
 fn diagnose_proxy_port(port: u16) -> PortState {
     // If we can bind the port, nothing is there.
     match TcpListener::bind(("127.0.0.1", port)) {
-        Ok(_) => return PortState::Free,
+        Ok(listener) => {
+            drop(listener);
+            // Except on macOS, where std's SO_REUSEADDR lets this bind succeed
+            // over a WILDCARD listener on the same port. Orca's mobile server
+            // holds *:6768, so the pre-flight read Free, 127.0.0.1:6768 connects
+            // landed on Orca, and boot validation burned 75s before naming it
+            // (RUST-JC, RUST-2M, RUST-2N; Windows falls back fine, RUST-AB).
+            // Identity still decides: our own backend on a wildcard bind
+            // (HEADROOM_HOST=0.0.0.0) is an orphan to reclaim, not a squatter
+            // to fall back around (RUST-ED).
+            #[cfg(target_os = "macos")]
+            if let Some((command, pid)) = listener_process(port) {
+                if pid_is_headroom_backend(pid) {
+                    return PortState::HeadroomRunning;
+                }
+                return PortState::ForeignOccupant(format!("{command} pid {pid}"));
+            }
+            return PortState::Free;
+        }
         // Held and denied are different failures with the same errno slot:
         // this one has no occupant to probe, name, or wait out, and calling it
         // "held by unknown process" sent RUST-ED's reporter after a squatter
@@ -9242,13 +9282,10 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let Ok(output) = crate::proc::command("/bin/ps")
-            .args(["-o", "command=", "-p", &pid.to_string()])
-            .output()
-        else {
+        let Some(argv) = ps_field(pid, "command=") else {
             return false;
         };
-        let argv = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        let argv = argv.to_lowercase();
         // A bare "headroom" substring also matches unrelated dev processes whose
         // path merely contains it (e.g. `python /Users/x/headroom/serve.py 6768`).
         // Require the `proxy` subcommand as well: every version of the managed
@@ -9258,6 +9295,70 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
         // exact port being reclaimed, so the blast radius is one port either way.
         argv.contains("headroom") && argv.contains("proxy")
     }
+}
+
+/// A foreign process's command line, reduced to what tells a dev server from
+/// our backend's offspring: the executable, flag names, `-m` modules, script
+/// and path arguments, bare subcommands and port numbers. Every other value
+/// becomes `<arg>`, because it is some other program's argv and may carry its
+/// secrets (`serve.py --api-key sk-...`, a `sh -c` script body). The home
+/// directory is scrubbed later, in `logging::scrub_event`.
+fn redact_command_line(command: &str) -> String {
+    let mut tokens = command.split_whitespace();
+    let mut out: Vec<String> = tokens.next().map(str::to_owned).into_iter().collect();
+    let mut value_of: Option<&str> = None;
+    for token in tokens {
+        let keep = match value_of.take() {
+            Some("-m") => true,
+            Some(_) => is_port_like(token),
+            None if token.starts_with('-') => {
+                let (flag, value) = token.split_once('=').unwrap_or((token, ""));
+                out.push(if value.is_empty() || is_port_like(value) {
+                    token.to_owned()
+                } else {
+                    format!("{flag}=<arg>")
+                });
+                if !token.contains('=') && token.len() > 1 {
+                    value_of = Some(if token == "-m" { "-m" } else { "flag" });
+                }
+                continue;
+            }
+            None => {
+                is_port_like(token)
+                    || token.contains('/')
+                    || [".py", ".js", ".mjs", ".cjs", ".ts", ".sh"]
+                        .iter()
+                        .any(|ext| token.ends_with(ext))
+                    || (token.len() <= 24
+                        && token.starts_with(|c: char| c.is_ascii_lowercase())
+                        && token
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c == '-' || c == '_'))
+            }
+        };
+        out.push(if keep {
+            token.to_owned()
+        } else {
+            "<arg>".into()
+        });
+    }
+    out.join(" ")
+}
+
+fn is_port_like(token: &str) -> bool {
+    (1..=5).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// One `ps -o <field> -p <pid>` column, trimmed; `None` when ps failed or the
+/// pid is gone.
+#[cfg(not(windows))]
+fn ps_field(pid: u32, field: &str) -> Option<String> {
+    let output = crate::proc::command("/bin/ps")
+        .args(["-o", field, "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 /// True when `exe_path` sits inside `runtime_dir`.
@@ -12292,6 +12393,8 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
     let evidence_lower = evidence.to_ascii_lowercase();
     if lower.contains("no module named pip") {
         "no-pip"
+    } else if pip_itself_broken(&evidence_lower) {
+        "pip-broken"
     } else if (lower.contains("no matching distribution found")
         || lower.contains("could not find a version that satisfies"))
         && !pip_index_fetch_failed(&lower)
@@ -12376,6 +12479,51 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
     } else {
         "other"
     }
+}
+
+/// pip died importing itself: its files are gone from under an intact
+/// dist-info (`cannot import name 'CacheControlAdapter' from
+/// 'pip._vendor.cachecontrol' (unknown location)`, `No module named
+/// 'pip._internal.cli'`), or pip is missing outright. Every install, rollback
+/// and repair through that pip fails the same way (RUST-29/RUST-JF, six hosts
+/// in RUST-6S's `other` since 0.9.7).
+fn pip_itself_broken(evidence: &str) -> bool {
+    let lower = evidence.to_ascii_lowercase();
+    lower.contains("no module named pip")
+        || lower.contains("no module named 'pip.")
+        || lower.contains("from 'pip.")
+}
+
+/// Puts a fresh pip into the venv `python` belongs to. ensurepip alone leaves
+/// a torn pip torn: it installs with `--upgrade`, which reads the surviving
+/// dist-info as "already satisfied". Without the dist-info it writes every
+/// file again (and it runs pip from its bundled wheel, not the broken one).
+fn reinstall_venv_pip(python: &Path, cwd: &Path) -> Result<()> {
+    let lib = python
+        .parent()
+        .and_then(Path::parent)
+        .context("managed python has no venv")?
+        .join("lib");
+    // lib/site-packages on Windows (case-insensitive `Lib`),
+    // lib/python3.X/site-packages elsewhere.
+    let site_dirs = std::iter::once(lib.clone())
+        .chain(std::fs::read_dir(&lib)?.flatten().map(|entry| entry.path()))
+        .map(|dir| dir.join("site-packages"));
+    for site in site_dirs {
+        for entry in std::fs::read_dir(&site).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("pip-") && name.ends_with(".dist-info") {
+                std::fs::remove_dir_all(entry.path())
+                    .with_context(|| format!("removing {}", entry.path().display()))?;
+            }
+        }
+    }
+    run_python_command(
+        python,
+        &["-m", "ensurepip", "--upgrade", "--default-pip"],
+        cwd,
+    )
+    .context("reinstalling pip into the Headroom-managed virtualenv")
 }
 
 /// Cause class for a direct-wheel download that fell back to the pip index.
@@ -12615,6 +12763,7 @@ where
     F: FnMut(&str),
 {
     let mut attempt: u32 = 0;
+    let mut pip_reinstalled = false;
     loop {
         attempt += 1;
         let err = match run_command_streaming(
@@ -12629,6 +12778,20 @@ where
         };
         let compact = compact_pip_failure(&err);
         let evidence = pip_failure_evidence(&err, &compact);
+        // A broken pip fails every retry identically, and nothing else
+        // replaces it: the rollback and the missing-module repair run the same
+        // pip, and bootstrap's `pip --version` probe exits before the import
+        // that dies. Replace it once, here, where every caller passes.
+        if !pip_reinstalled && pip_itself_broken(&evidence) {
+            pip_reinstalled = true;
+            match reinstall_venv_pip(python, cwd) {
+                Ok(()) => {
+                    log::warn!("pip could not import itself; reinstalled it, retrying");
+                    continue;
+                }
+                Err(repair_err) => log::warn!("reinstalling a broken pip failed: {repair_err:#}"),
+            }
+        }
         // The schedule depends on WHAT failed, so classify before deciding
         // whether this attempt was the last one (see `pip_retry_backoff`).
         if let Some(backoff) = pip_retry_backoff(attempt, &evidence) {
@@ -16899,43 +17062,103 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         let _ = child.wait();
     }
 
+    #[test]
+    fn port_occupant_command_lines_keep_identity_and_drop_values() {
+        let r = super::redact_command_line;
+        assert_eq!(
+            r("/venv/bin/python3 -m headroom.proxy.server --port 6768 --host 127.0.0.1"),
+            "/venv/bin/python3 -m headroom.proxy.server --port 6768 --host <arg>"
+        );
+        assert_eq!(
+            r("headroom proxy --port 6768"),
+            "headroom proxy --port 6768"
+        );
+        assert_eq!(
+            r("python serve.py --api-key sk-ant-XYZ123 --token=abc123 SECRETVALUE"),
+            "python serve.py --api-key <arg> --token=<arg> <arg>"
+        );
+        assert_eq!(
+            r("/bin/zsh -c source ~/.claude/snapshot.sh && python x.py"),
+            "/bin/zsh -c <arg> ~/.claude/snapshot.sh <arg> python x.py"
+        );
+    }
+
+    /// RUST-JC: a dual-stack wildcard listener (Node's default, Orca's shape)
+    /// does not stop a 127.0.0.1 bind on macOS, so the bind alone read Free.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn diagnose_proxy_port_sees_a_wildcard_listener() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // A child, not this test process: our own argv carries the test filter,
+        // which the backend identity check could read as ours.
+        let mut wildcard = crate::proc::command("/usr/bin/python3")
+            .arg("-c")
+            .arg("import socket, sys, time\ns = socket.socket(socket.AF_INET6); s.bind(('::', int(sys.argv[1]))); s.listen(8)\ntime.sleep(30)")
+            .arg(port.to_string())
+            .spawn()
+            .expect("spawn wildcard listener");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(std::time::Instant::now() < deadline, "listener never bound");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "precondition: macOS allows the loopback bind over the wildcard"
+        );
+        let state = diagnose_proxy_port(port);
+        let _ = wildcard.kill();
+        let _ = wildcard.wait();
+        assert!(matches!(state, PortState::ForeignOccupant(_)));
+        assert!(matches!(diagnose_proxy_port(port), PortState::Free));
+    }
+
     /// RUST-ED: our own orphan that holds the port but never answers HTTP (a
     /// blocked event loop, or still importing) is ours, not foreign. Reading
     /// it as foreign fell back to 6769 and left the orphan on 6768 for good.
     #[test]
     #[cfg(unix)] // exercises /usr/bin/python3; Windows cannot exec it
     fn diagnose_proxy_port_identifies_silent_headroom_orphan() {
-        let port = {
-            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            l.local_addr().unwrap().port()
-        };
-        // Listens, never accepts: connects succeed, nothing is ever read back.
-        let script = r#"
+        // Loopback, and wildcard: a HEADROOM_HOST=0.0.0.0 orphan that macOS
+        // lets a 127.0.0.1 bind succeed over is still ours, never foreign.
+        for host in ["127.0.0.1", "0.0.0.0"] {
+            let port = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                l.local_addr().unwrap().port()
+            };
+            // Listens, never accepts: connects succeed, nothing is ever read back.
+            let script = r#"
 import socket, sys, time
-s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(8)
+s = socket.socket(); s.bind((sys.argv[1], int(sys.argv[2]))); s.listen(8)
 time.sleep(30)
 "#;
-        let mut child = crate::proc::command("/usr/bin/python3")
-            .arg("-c")
-            .arg(script)
-            .arg(port.to_string())
-            .arg("--headroom-proxy-test-standin")
-            .spawn()
-            .expect("spawn silent stand-in");
+            let mut child = crate::proc::command("/usr/bin/python3")
+                .arg("-c")
+                .arg(script)
+                .arg(host)
+                .arg(port.to_string())
+                .arg("--headroom-proxy-test-standin")
+                .spawn()
+                .expect("spawn silent stand-in");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "stand-in never bound port {port}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
+            // Generous: python startup on a loaded CI box has taken over 5s.
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stand-in never bound {host}:{port}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            let state = diagnose_proxy_port(port);
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(matches!(state, PortState::HeadroomRunning), "{host}");
         }
-
-        let state = diagnose_proxy_port(port);
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(matches!(state, PortState::HeadroomRunning));
     }
 
     #[test]
@@ -17724,6 +17947,44 @@ after
         fs::create_dir_all(landmark.parent().expect("parent")).expect("mkdir");
         fs::write(&landmark, b"").expect("landmark");
         landmark
+    }
+
+    /// RUST-29/RUST-JF: pip's files gone from under an intact dist-info. Every
+    /// retry, rollback and repair died on the same import, and ensurepip skips
+    /// a pip whose dist-info survives, so the dist-info has to go first.
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn pip_runner_replaces_a_pip_that_cannot_import_itself() {
+        let (root, runtime, _manager) = seed_test_runtime("torn-pip");
+        let dist_info = runtime
+            .venv_dir
+            .join("lib/python3.12/site-packages/pip-24.0.dist-info");
+        fs::create_dir_all(&dist_info).expect("dist-info");
+        let repaired = root.join("repaired");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$2\" = ensurepip ]; then [ -d {dist} ] && exit 1; touch {repaired}; exit 0; fi\n\
+                 [ -f {repaired} ] && exit 0\n\
+                 echo \"ImportError: cannot import name 'CacheControlAdapter' from \
+                 'pip._vendor.cachecontrol' (unknown location)\" >&2\n\
+                 exit 1\n",
+                dist = dist_info.display(),
+                repaired = repaired.display(),
+            ),
+        );
+
+        super::run_pip_install_with_retries(
+            &runtime.managed_python(),
+            &["-m", "pip", "install", "headroom-ai"],
+            &root,
+        )
+        .expect("pip is replaced, then the install goes through");
+        assert!(
+            !dist_info.exists(),
+            "ensurepip only rewrites a pip it cannot see"
+        );
     }
 
     /// RUST-82: `python -m venv` runs ensurepip through `check_output` and
@@ -19961,6 +20222,16 @@ exit 0
             // RUST-6S third shape: venv damaged in place, launcher stub can't
             // resolve the interpreter, pip never runs.
             ("exit=106; stderr tail: No pyvenv.cfg file", "venv-broken"),
+            // RUST-29/RUST-JF, verbatim tails: pip's own import died.
+            (
+                "exit=1; stderr tail: ImportError: cannot import name 'CacheControlAdapter' \
+                 from 'pip._vendor.cachecontrol' (unknown location)",
+                "pip-broken",
+            ),
+            (
+                "exit=1; stderr tail: ModuleNotFoundError: No module named 'pip._internal.cli'",
+                "pip-broken",
+            ),
             // RUST-8K, verbatim: Windows access-denied on a Korean install.
             // Only the numeric code survives translation.
             (
