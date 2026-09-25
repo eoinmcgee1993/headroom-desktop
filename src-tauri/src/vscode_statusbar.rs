@@ -68,9 +68,25 @@ fn extension_version() -> String {
         .unwrap_or_default()
 }
 
-/// Versions of our extension an editor has installed, skipping folders it has
-/// marked obsolete (uninstalled, awaiting deletion on its next start).
+/// Versions of our extension an editor has installed. The editor's own
+/// registry (`extensions.json`) decides: `--uninstall-extension` drops the
+/// entry but can leave the folder behind unmarked, and reading the folder then
+/// made re-enabling skip the install, so the item stayed gone. Folders are
+/// only the fallback for an editor without a registry, skipping ones marked
+/// obsolete (uninstalled, awaiting deletion on its next start).
 fn installed_versions(extensions_dir: &Path) -> Vec<String> {
+    if let Ok(bytes) = std::fs::read(extensions_dir.join("extensions.json")) {
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+        return entries
+            .iter()
+            .filter(|e| {
+                e["identifier"]["id"]
+                    .as_str()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(EXTENSION_ID))
+            })
+            .filter_map(|e| e["version"].as_str().map(str::to_owned))
+            .collect();
+    }
     let obsolete: BTreeMap<String, serde_json::Value> =
         std::fs::read(extensions_dir.join(".obsolete"))
             .ok()
@@ -305,6 +321,21 @@ mod tests {
         .unwrap();
         assert_eq!(installed_versions(dir.path()), vec!["0.2.0".to_string()]);
         assert!(installed_versions(&dir.path().join("missing")).is_empty());
+
+        // With a registry, it decides: an uninstall that left its folder
+        // behind is not installed, so re-enabling installs again.
+        std::fs::write(
+            dir.path().join("extensions.json"),
+            r#"[{"identifier":{"id":"anthropic.claude-code"},"version":"2.1.281"}]"#,
+        )
+        .unwrap();
+        assert!(installed_versions(dir.path()).is_empty());
+        std::fs::write(
+            dir.path().join("extensions.json"),
+            r#"[{"identifier":{"id":"Headroom.headroom-status"},"version":"0.1.0"}]"#,
+        )
+        .unwrap();
+        assert_eq!(installed_versions(dir.path()), vec!["0.1.0".to_string()]);
     }
 
     #[test]

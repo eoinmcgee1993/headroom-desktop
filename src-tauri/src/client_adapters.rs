@@ -6696,19 +6696,12 @@ fn remove_claude_remote_control_command() -> Result<()> {
             }
         }
     }
-    // The setting goes before the wrapper file, and the file stays when the
-    // setting could not be removed: the extension cannot launch a missing one.
-    let setting_removed = match remove_vscode_process_wrapper() {
-        Ok(()) => true,
-        Err(err) => {
-            log::warn!("removing the VS Code process wrapper setting failed: {err}");
-            false
-        }
-    };
-    let wrapper = claude_remote_control_wrapper_path();
-    if setting_removed && wrapper.exists() {
-        std::fs::remove_file(&wrapper)
-            .with_context(|| format!("removing {}", wrapper.display()))?;
+    // The wrapper file is never deleted, only the setting. VS Code picks up a
+    // settings.json edit seconds later (8s observed), and a panel spawn in that
+    // window still launches the old path: deleting the file failed it with
+    // "native binary not found". A leftover wrapper is an inert passthrough.
+    if let Err(err) = remove_vscode_process_wrapper() {
+        log::warn!("removing the VS Code process wrapper setting failed: {err}");
     }
     Ok(())
 }
@@ -13225,7 +13218,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         std::fs::write(claude_remote_control_command_path(), "my own command\n").unwrap();
         remove_claude_remote_control_command().expect("remove");
         assert!(!script_path.exists());
-        assert!(!claude_remote_control_wrapper_path().exists());
+        // Kept: VS Code can still launch it until it notices the setting is gone.
+        assert!(claude_remote_control_wrapper_path().exists());
         assert!(!claude_remote_control_panel_command_path().exists());
         if cfg!(target_os = "macos") {
             assert_eq!(std::fs::read_to_string(&vscode).unwrap(), original);

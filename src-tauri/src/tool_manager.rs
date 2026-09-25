@@ -3695,6 +3695,22 @@ impl ToolManager {
                                     scope.set_extra("chosen_port", port.into());
                                     if let Some(p) = original_pid {
                                         scope.set_extra("occupant_pid", p.into());
+                                        // The name alone ("Python") cannot tell
+                                        // a dev server from our own backend's
+                                        // offspring; RUST-ED regressed four times
+                                        // on one Mac with nothing more to go on.
+                                        #[cfg(not(windows))]
+                                        {
+                                            if let Some(cmd) = ps_field(p, "command=") {
+                                                scope.set_extra("occupant_command", cmd.into());
+                                            }
+                                            let parent = ps_field(p, "ppid=")
+                                                .and_then(|pp| pp.parse::<u32>().ok())
+                                                .and_then(|pp| ps_field(pp, "command="));
+                                            if let Some(parent) = parent {
+                                                scope.set_extra("occupant_parent", parent.into());
+                                            }
+                                        }
                                     }
                                     // Fixed fingerprint: the occupant name,
                                     // its pid and the chosen port are all in
@@ -9260,13 +9276,10 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
     }
     #[cfg(not(windows))]
     {
-        let Ok(output) = crate::proc::command("/bin/ps")
-            .args(["-o", "command=", "-p", &pid.to_string()])
-            .output()
-        else {
+        let Some(argv) = ps_field(pid, "command=") else {
             return false;
         };
-        let argv = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        let argv = argv.to_lowercase();
         // A bare "headroom" substring also matches unrelated dev processes whose
         // path merely contains it (e.g. `python /Users/x/headroom/serve.py 6768`).
         // Require the `proxy` subcommand as well: every version of the managed
@@ -9276,6 +9289,18 @@ fn pid_is_headroom_backend(pid: u32) -> bool {
         // exact port being reclaimed, so the blast radius is one port either way.
         argv.contains("headroom") && argv.contains("proxy")
     }
+}
+
+/// One `ps -o <field> -p <pid>` column, trimmed; `None` when ps failed or the
+/// pid is gone.
+#[cfg(not(windows))]
+fn ps_field(pid: u32, field: &str) -> Option<String> {
+    let output = crate::proc::command("/bin/ps")
+        .args(["-o", field, "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 /// True when `exe_path` sits inside `runtime_dir`.

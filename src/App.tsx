@@ -113,7 +113,6 @@ import {
 } from "./lib/appHelpers";
 import {
   bootstrapFailureSignature,
-  buildBootstrapFailureReport,
   buildBootstrapInvokeFailureReport,
   reportBootstrapFailure
 } from "./lib/bootstrapSentry";
@@ -2318,12 +2317,7 @@ export default function App() {
       setBootstrapProgress(progress);
 
       if (progress.failed) {
-        const failureReport = buildBootstrapFailureReport(progress);
-        const failureSignature = bootstrapFailureSignature(failureReport);
-        if (bootstrapFailureSignatureRef.current !== failureSignature) {
-          bootstrapFailureSignatureRef.current = failureSignature;
-          reportBootstrapFailure(failureReport);
-        }
+        // Rust already captured this failure (capture_bootstrap_failure).
         setBootstrapError(progress.message);
         setBootstrapping(false);
         completionHandled = true;
