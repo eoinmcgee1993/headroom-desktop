@@ -2006,7 +2006,7 @@ select {
   border: 0;
   padding: 0;
   background: transparent;
-  color: #b0a89e;
+  color: var(--text-muted);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -5630,6 +5630,11 @@ html.window-hiding {
 
   .install-prompt__notice {
     color: #6cbf9b;
+  }
+
+  /* The light #2a8d63 is ~3:1 on the dark card. */
+  .install-prompt__link {
+    color: var(--success);
   }
 
   /* Activity feed empty + skeleton */

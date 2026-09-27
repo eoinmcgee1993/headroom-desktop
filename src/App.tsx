@@ -5785,17 +5785,12 @@ export default function App() {
                         {detectionWarning ?? unavailableReason}
                       </p>
                     ) : null}
+                    {/* No CTA here: `connectorGateCta` switches the main
+                        window's view, which the launcher never renders, and
+                        `show_dashboard_window` refuses before onboarding
+                        completes. The main window carries the upgrade path. */}
                     {gated ? (
-                      <p className="connector-item__reason">
-                        {pricingStatus?.gateMessage}{" "}
-                        <button
-                          className="addon-card__link"
-                          type="button"
-                          onClick={connectorGateCta}
-                        >
-                          {pricingStatus?.authenticated ? "Upgrade" : "Sign in"}
-                        </button>
-                      </p>
+                      <p className="connector-item__reason">{pricingStatus?.gateMessage}</p>
                     ) : null}
                   </div>
                   <div className="connector-item__controls">
@@ -8075,7 +8070,8 @@ export default function App() {
                                           × {failure}
                                         </li>
                                       ))}
-                                      {!connector.verification.proxyReachable ? (
+                                      {/* Gated: the backend is down on purpose. */}
+                                      {!connector.verification.proxyReachable && !gated ? (
                                         <li className="is-waiting">
                                           … Headroom proxy is not answering on 127.0.0.1:6767.
                                         </li>
