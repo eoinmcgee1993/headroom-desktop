@@ -1156,9 +1156,17 @@ pub fn is_codex_enabled() -> bool {
 /// snapshot; `ensure_headroom_running` still declines the spawn while paused.
 pub fn any_gate_exempt_client_enabled() -> bool {
     let state = load_setup_state();
-    ["codex_cli", "opencode", "grok_build"]
+    GATE_EXEMPT_CLIENTS
         .iter()
         .any(|id| is_configured(&state, id) || state.remembered_clients.contains_key(*id))
+}
+
+const GATE_EXEMPT_CLIENTS: [&str; 3] = ["codex_cli", "opencode", "grok_build"];
+
+/// Whether `client_id` is one of the connectors the Claude pricing gate keeps
+/// the backend up for (see `any_gate_exempt_client_enabled`).
+pub fn is_gate_exempt_client(client_id: &str) -> bool {
+    GATE_EXEMPT_CLIENTS.contains(&normalized_setup_id(client_id))
 }
 
 pub fn list_client_connectors(
@@ -11395,6 +11403,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // A user disable drops it from both sets, so the exemption ends.
         super::disable_client_setup("codex").expect("disable");
         assert!(!super::any_gate_exempt_client_enabled());
+
+        for id in ["codex", "codex_gui", "codex_cli", "opencode", "grok_build"] {
+            assert!(super::is_gate_exempt_client(id), "{id}");
+        }
+        assert!(!super::is_gate_exempt_client("claude_code"));
+        assert!(!super::is_gate_exempt_client("vscode"));
     }
 
     #[test]

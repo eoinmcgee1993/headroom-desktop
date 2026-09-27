@@ -12445,7 +12445,9 @@ where
             pip_reinstalled = true;
             match reinstall_venv_pip(python, cwd) {
                 Ok(()) => {
-                    log::warn!("pip could not import itself; reinstalled it, retrying");
+                    // Info: a repaired pip is a self-heal, not an incident.
+                    // The failure path below still warns (RUST-JZ).
+                    log::info!("pip could not import itself; reinstalled it, retrying");
                     continue;
                 }
                 Err(repair_err) => log::warn!("reinstalling a broken pip failed: {repair_err:#}"),

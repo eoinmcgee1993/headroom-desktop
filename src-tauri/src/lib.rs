@@ -5240,30 +5240,33 @@ async fn apply_client_setup(
     // stays down and Claude Code traffic flows unoptimized until the next
     // pricing poll (or, in the watchdog case, until restart).
     // On the blocking pool: resume_runtime can wait out a cold boot.
-    run_lifecycle_command(app.clone(), |app| {
-        let state: tauri::State<'_, AppState> = app.state();
-        let bypassed = state
-            .proxy_bypass
-            .load(std::sync::atomic::Ordering::Acquire);
-        if state.runtime_is_paused() || bypassed {
-            resume_for_client_setup(&state);
-        }
-        Ok(())
-    })
-    .await?;
+    //
+    // Codex, OpenCode and Grok resume AFTER their config is written. Resumed
+    // first, the gate still read them as off, re-entered FULL bypass, stopped
+    // the backend again, and the watchdog restarted it into the Claude-only
+    // bypass 15-30s later (B4, both platforms). Written first, the one resume
+    // lands on the Claude-only bypass directly.
+    let resume_after_write = client_adapters::is_gate_exempt_client(&client_id);
+    let needs_resume = |state: &AppState| {
+        state.runtime_is_paused()
+            || state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire)
+    };
+    if !resume_after_write {
+        run_lifecycle_command(app.clone(), move |app| {
+            let state: tauri::State<'_, AppState> = app.state();
+            if needs_resume(&state) {
+                resume_for_client_setup(&state);
+            }
+            Ok(())
+        })
+        .await?;
+    }
     let state: tauri::State<'_, AppState> = app.state();
     match client_adapters::apply_client_setup(&client_id) {
         Ok(result) => {
-            // Enabling Codex, OpenCode or Grok from full bypass: the resume
-            // above ran before this client was written, so the gate re-entered
-            // FULL bypass and the backend stayed down until the next pricing
-            // poll. Configured now, the client is exempt, so a second resume
-            // lands on the Claude-only bypass with the backend up.
-            if state
-                .proxy_bypass
-                .load(std::sync::atomic::Ordering::Acquire)
-                && client_adapters::any_gate_exempt_client_enabled()
-            {
+            if resume_after_write && needs_resume(&state) {
                 run_lifecycle_command(app.clone(), |app| {
                     resume_for_client_setup(&app.state::<AppState>());
                     Ok(())
