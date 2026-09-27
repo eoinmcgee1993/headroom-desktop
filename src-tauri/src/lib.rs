@@ -5215,6 +5215,17 @@ pub(crate) fn client_setup_error_kind(err: &anyhow::Error) -> &'static str {
     "other"
 }
 
+fn resume_for_client_setup(state: &AppState) {
+    if let Err(err) = state.resume_runtime() {
+        // Local log keeps the full chain; the capture below is the Sentry
+        // path (fingerprinted, and silent for a machine-policy block).
+        // Bridging this warn instead grouped on a message that embeds the
+        // port and the user's home path -- RUST-AD.
+        log::info!("apply_client_setup: resume_runtime failed: {err:#}");
+        capture_headroom_start_failure("apply_client_setup: resume_runtime failed", &err);
+    }
+}
+
 #[tauri::command]
 async fn apply_client_setup(
     app: AppHandle,
@@ -5235,14 +5246,7 @@ async fn apply_client_setup(
             .proxy_bypass
             .load(std::sync::atomic::Ordering::Acquire);
         if state.runtime_is_paused() || bypassed {
-            if let Err(err) = state.resume_runtime() {
-                // Local log keeps the full chain; the capture below is the Sentry
-                // path (fingerprinted, and silent for a machine-policy block).
-                // Bridging this warn instead grouped on a message that embeds the
-                // port and the user's home path -- RUST-AD.
-                log::info!("apply_client_setup: resume_runtime failed: {err:#}");
-                capture_headroom_start_failure("apply_client_setup: resume_runtime failed", &err);
-            }
+            resume_for_client_setup(&state);
         }
         Ok(())
     })
@@ -5250,6 +5254,22 @@ async fn apply_client_setup(
     let state: tauri::State<'_, AppState> = app.state();
     match client_adapters::apply_client_setup(&client_id) {
         Ok(result) => {
+            // Enabling Codex, OpenCode or Grok from full bypass: the resume
+            // above ran before this client was written, so the gate re-entered
+            // FULL bypass and the backend stayed down until the next pricing
+            // poll. Configured now, the client is exempt, so a second resume
+            // lands on the Claude-only bypass with the backend up.
+            if state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire)
+                && client_adapters::any_gate_exempt_client_enabled()
+            {
+                run_lifecycle_command(app.clone(), |app| {
+                    resume_for_client_setup(&app.state::<AppState>());
+                    Ok(())
+                })
+                .await?;
+            }
             // Funnel beacon lives here (not the launcher UI) so every apply
             // path counts: launcher auto-configure, the manual client-setup
             // screen, and the dashboard connector toggle. First-write-wins

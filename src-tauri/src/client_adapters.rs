@@ -1144,19 +1144,21 @@ pub fn is_codex_enabled() -> bool {
     is_configured(&load_setup_state(), "codex_cli")
 }
 
-pub fn is_grok_build_enabled() -> bool {
-    is_configured(&load_setup_state(), "grok_build")
-}
-
-pub fn is_opencode_enabled() -> bool {
-    is_configured(&load_setup_state(), "opencode")
-}
-
 /// True when an enabled connector bills against the user's own provider keys
 /// (or ChatGPT plan), so the Claude pricing gate must neither stop the Python
 /// backend nor bypass the proxy for it.
+///
+/// Counts the remembered snapshot too, as `list_client_connectors` does: quit
+/// empties `configured_clients`, and on relaunch the gate is enforced before
+/// `restore_client_setups` re-applies them, so reading only the configured set
+/// picked FULL bypass for a gated Codex user and tore the backend down until
+/// the watchdog brought it back ~35s later. A deliberate pause holds the same
+/// snapshot; `ensure_headroom_running` still declines the spawn while paused.
 pub fn any_gate_exempt_client_enabled() -> bool {
-    is_codex_enabled() || is_opencode_enabled() || is_grok_build_enabled()
+    let state = load_setup_state();
+    ["codex_cli", "opencode", "grok_build"]
+        .iter()
+        .any(|id| is_configured(&state, id) || state.remembered_clients.contains_key(*id))
 }
 
 pub fn list_client_connectors(
@@ -11374,6 +11376,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn gate_exemption_holds_across_the_quit_to_restore_window() {
+        // Quit clears configured_clients into the remembered snapshot, and the
+        // launch-time gate runs before restore_client_setups re-applies it.
+        // Reading configured alone chose full bypass for a Codex user (W4).
+        let _home = TestHome::new();
+        assert!(!super::any_gate_exempt_client_enabled());
+        super::apply_client_setup("codex").expect("apply");
+        assert!(super::any_gate_exempt_client_enabled());
+
+        super::clear_client_setups().expect("quit-time clear");
+        assert!(super::load_setup_state().configured_clients.is_empty());
+        assert!(
+            super::any_gate_exempt_client_enabled(),
+            "restore still pending"
+        );
+
+        // A user disable drops it from both sets, so the exemption ends.
+        super::disable_client_setup("codex").expect("disable");
+        assert!(!super::any_gate_exempt_client_enabled());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn list_client_connectors_carries_verification_only_for_enabled_clients() {
         // The connector panel keys its status line off these two fields: an
         // enabled client must arrive with its checks attached (the panel has
@@ -11544,7 +11569,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             after.get("provider").is_none(),
             "provider husk removed on disable, got:\n{after:#}"
         );
-        assert!(!super::is_opencode_enabled());
+        assert!(!super::is_configured(
+            &super::load_setup_state(),
+            "opencode"
+        ));
     }
 
     #[test]

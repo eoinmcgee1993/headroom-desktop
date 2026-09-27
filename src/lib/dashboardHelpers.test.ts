@@ -16,6 +16,8 @@ import {
   outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
+  connectorGateBlocksEnable,
+  connectorGateMessage,
   connectorStatusLine,
   clientSetupNotice,
   currency,
@@ -37,6 +39,7 @@ import {
   sortClientConnectors
 } from "./dashboardHelpers";
 import type {
+  HeadroomPricingStatus,
   ClientConnectorStatus,
   ClientSetupResult,
   DailySavingsPoint,
@@ -374,6 +377,47 @@ describe("dashboard helpers", () => {
     ).toBeNull();
     expect(connectorStatusLine(base, now, true)).toBeNull();
     expect(connectorStatusLine({ ...base, verified: false }, now, true)?.tone).toBe("reason");
+  });
+
+  it("puts the gate message on every connector the gate bypasses", () => {
+    const row = (clientId: string, enabled = true) =>
+      ({ clientId, name: clientId, installed: true, enabled, verified: true }) as ClientConnectorStatus;
+    const open = {
+      authenticated: true,
+      optimizationAllowed: true,
+      gateReason: null,
+      gateMessage: "Headroom is active.",
+      codex: { optimizationAllowed: true, gateMessage: "Codex is active." }
+    } as unknown as HeadroomPricingStatus;
+    const weekly = { ...open, optimizationAllowed: false, gateReason: "weekly_usage_limit_reached", gateMessage: "Weekly limit reached." } as HeadroomPricingStatus;
+    const wall = { ...open, optimizationAllowed: false, gateReason: "trial_ended", gateMessage: "Trial ended." } as HeadroomPricingStatus;
+
+    expect(connectorGateMessage(row("claude_code"), null)).toBeNull();
+    expect(connectorGateMessage(row("codex"), open)).toBeNull();
+    // Claude's weekly meter: only Claude Code is bypassed, and only it is blocked.
+    expect(connectorGateMessage(row("claude_code"), weekly)).toBe("Weekly limit reached.");
+    expect(connectorGateMessage(row("codex"), weekly)).toBeNull();
+    expect(connectorGateBlocksEnable(row("claude_code", false), weekly)).toBe(true);
+    expect(connectorGateBlocksEnable(row("codex", false), weekly)).toBe(false);
+    // W5: behind the trial wall the intercept bypasses Codex, OpenCode and Grok
+    // too, on or off, so their rows say so. They can still be enabled.
+    for (const id of ["claude_code", "codex", "opencode", "grok_build"]) {
+      expect(connectorGateMessage(row(id), wall)).toBe("Trial ended.");
+      expect(connectorGateMessage(row(id, false), wall)).toBe("Trial ended.");
+    }
+    expect(connectorGateBlocksEnable(row("codex", false), wall)).toBe(false);
+    expect(connectorGateBlocksEnable(row("claude_code", false), wall)).toBe(true);
+    // Codex's own meter closes independently of Claude's.
+    const codexPaused = {
+      ...open,
+      codex: { optimizationAllowed: false, gateMessage: "Codex paused." }
+    } as unknown as HeadroomPricingStatus;
+    expect(connectorGateMessage(row("codex"), codexPaused)).toBe("Codex paused.");
+    expect(connectorGateMessage(row("claude_code"), codexPaused)).toBeNull();
+    // Signed out: everything is covered and blocked.
+    const signedOut = { ...weekly, authenticated: false } as HeadroomPricingStatus;
+    expect(connectorGateMessage(row("opencode"), signedOut)).toBe("Weekly limit reached.");
+    expect(connectorGateBlocksEnable(row("opencode", false), signedOut)).toBe(true);
   });
 
   it("keeps codex, grok_build and opencode alongside claude_code as supported connectors", () => {

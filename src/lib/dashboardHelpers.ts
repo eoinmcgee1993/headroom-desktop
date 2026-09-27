@@ -2,6 +2,7 @@ import type {
   ClientConnectorStatus,
   ClientSetupResult,
   DailySavingsPoint,
+  HeadroomPricingStatus,
   HourlySavingsPoint,
   ProviderSavingsPoint,
   SavingsBreakdown
@@ -821,6 +822,57 @@ export type ConnectorStatusLine = {
 // whether the user did. Rather than nag forever, the hint rides the configure
 // timestamp: relevant right after enabling, gone by the next day.
 const RESTART_HINT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// Connectors the Claude pricing gate does not cover while the user is
+// authenticated: Codex has its own proxy-side gate (codex_bypass); OpenCode and
+// Grok bill against the user's own provider keys, so the Claude gate has
+// nothing to meter. Plan-usage metering only, see `connectorGateMessage`.
+const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode", "grok_build"]);
+
+function claudeGateCovers(
+  connector: ClientConnectorStatus,
+  pricing: HeadroomPricingStatus | null
+): boolean {
+  return (
+    pricing != null &&
+    !pricing.optimizationAllowed &&
+    (!pricing.authenticated || !GATE_EXEMPT_CONNECTOR_IDS.has(connector.clientId))
+  );
+}
+
+// Why this connector's traffic is not optimized right now, or null. An
+// already-on connector stays on and the intercept keeps it unoptimized; its row
+// shows this message with the upgrade/sign-in CTA. The exemption above does not
+// reach the account wall (trial ended / sign-in required), which bypasses every
+// connector's traffic (`account_gate` in proxy_intercept.rs), and Codex's own
+// gate can close while Claude's is open.
+export function connectorGateMessage(
+  connector: ClientConnectorStatus,
+  pricing: HeadroomPricingStatus | null
+): string | null {
+  if (pricing == null) {
+    return null;
+  }
+  const accountWall =
+    !pricing.optimizationAllowed &&
+    (pricing.gateReason === "trial_ended" || pricing.gateReason === "sign_in_required");
+  if (claudeGateCovers(connector, pricing) || accountWall) {
+    return pricing.gateMessage;
+  }
+  if (connector.clientId === "codex" && pricing.codex?.optimizationAllowed === false) {
+    return pricing.codex.gateMessage;
+  }
+  return null;
+}
+
+// Only blocks *enabling*, which is steered to the CTA instead. Behind the
+// account wall the exempt connectors can still be enabled.
+export function connectorGateBlocksEnable(
+  connector: ClientConnectorStatus,
+  pricing: HeadroomPricingStatus | null
+): boolean {
+  return claudeGateCovers(connector, pricing) && !connector.enabled;
+}
 
 // `gated`: the pricing gate covers this connector. A full bypass stops the
 // backend on purpose, so an unanswering proxy is expected, not a fault; the
