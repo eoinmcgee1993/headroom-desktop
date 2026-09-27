@@ -8976,6 +8976,13 @@ fn occupant_image(tasklist_stdout: Option<&str>) -> Option<String> {
 ///
 /// Matches the port exactly rather than by suffix: `:16768` ends with `6768`,
 /// and picking that row would point a kill at an unrelated process.
+///
+/// The State column is localized ("ABHÖREN", and Italian's two-word "IN
+/// ASCOLTO" also shifts the PID column), so matching "LISTENING" read every
+/// live listener on a non-English Windows as "nothing listening" - which
+/// `classify_held_port` turns into a `SO_REUSEADDR` bind alongside it. A
+/// listener is the only TCP row netstat prints with foreign port 0, in every
+/// locale, and the PID is always the last field.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn parse_netstat_listener(text: &str, port: u16) -> Option<u32> {
     text.lines().find_map(|line| {
@@ -8984,14 +8991,53 @@ fn parse_netstat_listener(text: &str, port: u16) -> Option<u32> {
         if fields.len() < 5 || !fields[0].eq_ignore_ascii_case("TCP") {
             return None;
         }
-        if !fields[3].eq_ignore_ascii_case("LISTENING") {
+        if socket_port(fields[2]) != Some(0) || socket_port(fields[1]) != Some(port) {
             return None;
         }
-        // rsplit: IPv6 rows are `[::1]:6768`, so only the last colon separates
-        // the port.
-        let (_, found) = fields[1].rsplit_once(':')?;
-        (found.parse::<u16>().ok()? == port).then(|| fields[4].parse().ok())?
+        fields.last()?.parse().ok()
     })
+}
+
+/// Port of a netstat address. rsplit: IPv6 rows are `[::1]:6768`, so only the
+/// last colon separates the port.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn socket_port(addr: &str) -> Option<u16> {
+    addr.rsplit_once(':')?.1.parse().ok()
+}
+
+/// Every `netstat -ano` TCP row on local `port`, any state, whitespace
+/// collapsed. A port held with nothing LISTENING past the drain window is
+/// otherwise a blind report (RUST-JY: 10048 through `SO_REUSEADDR` for 305s,
+/// and nothing said what held it); the states and pids left on the port are
+/// what tell a leaked accepted socket from a holder netstat cannot see.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn netstat_rows_on_port(text: &str, port: u16) -> Vec<String> {
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|fields| {
+            fields.len() >= 4
+                && fields[0].eq_ignore_ascii_case("TCP")
+                && socket_port(fields[1]) == Some(port)
+        })
+        .take(20)
+        .map(|fields| fields.join(" "))
+        .collect()
+}
+
+/// `netstat_rows_on_port` for the live machine, as one Sentry-extra string.
+#[cfg(windows)]
+pub(crate) fn port_socket_rows(port: u16) -> String {
+    match crate::proc::command("netstat").args(["-ano"]).output() {
+        Ok(out) => {
+            let rows = netstat_rows_on_port(&String::from_utf8_lossy(&out.stdout), port);
+            if rows.is_empty() {
+                "none".to_string()
+            } else {
+                rows.join("\n")
+            }
+        }
+        Err(e) => format!("netstat failed: {e}"),
+    }
 }
 
 /// The image name from one `tasklist /NH /FO CSV` row (`"python.exe","123",...`).
@@ -12996,7 +13042,7 @@ mod tests {
         format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
-        looks_like_corrupt_venv_error, occupant_image, parse_lsof_listener,
+        looks_like_corrupt_venv_error, netstat_rows_on_port, occupant_image, parse_lsof_listener,
         parse_major_minor_patch, parse_netstat_listener, parse_pid_from_lsof_detail,
         parse_ss_listener, parse_tasklist_image, path_with_binary_dir, pending_addon_update,
         pinned_headroom_release, pip_failure_category, pip_line_to_progress, plugin_addon,
@@ -15911,6 +15957,31 @@ mod tests {
     fn parse_netstat_listener_ignores_non_listening_rows() {
         let out = "  TCP    127.0.0.1:6768         127.0.0.1:52100        ESTABLISHED     7777\r\n";
         assert_eq!(parse_netstat_listener(out, 6768), None);
+    }
+
+    /// The State column is localized, and Italian's is two words. Matching
+    /// "LISTENING" read these live listeners as nothing listening, which
+    /// armed a `SO_REUSEADDR` bind next to them.
+    #[test]
+    fn parse_netstat_listener_is_locale_invariant() {
+        let german =
+            "  TCP    127.0.0.1:6767         0.0.0.0:0              ABHÖREN         4242\r\n";
+        let italian =
+            "  TCP    127.0.0.1:6767         0.0.0.0:0              IN ASCOLTO      4343\r\n";
+        let draining =
+            "  TCP    127.0.0.1:6767         127.0.0.1:52100        TIME_WAIT       0\r\n";
+        assert_eq!(parse_netstat_listener(german, 6767), Some(4242));
+        assert_eq!(parse_netstat_listener(italian, 6767), Some(4343));
+        assert_eq!(parse_netstat_listener(draining, 6767), None);
+    }
+
+    #[test]
+    fn netstat_rows_on_port_keeps_every_state_on_that_local_port_only() {
+        let out = "  Proto  Local Address          Foreign Address        State           PID\r\n  TCP    127.0.0.1:6767         127.0.0.1:52100        CLOSE_WAIT      5380\r\n  TCP    127.0.0.1:52100        127.0.0.1:6767         FIN_WAIT_2      9000\r\n  TCP    127.0.0.1:16767        0.0.0.0:0              LISTENING       1\r\n  UDP    127.0.0.1:6767         *:*                                    2\r\n";
+        assert_eq!(
+            netstat_rows_on_port(out, 6767),
+            vec!["TCP 127.0.0.1:6767 127.0.0.1:52100 CLOSE_WAIT 5380".to_string()]
+        );
     }
 
     #[test]

@@ -362,6 +362,18 @@ describe("dashboard helpers", () => {
       text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6767 yet.",
       tone: "reason"
     });
+    // Gated: the backend is down on purpose and the row carries the gate
+    // message, so neither the proxy warning nor the restart hint shows.
+    // A setup failure still does.
+    expect(
+      connectorStatusLine(
+        { ...base, verification: { ...base.verification!, proxyReachable: false } },
+        now,
+        true
+      )
+    ).toBeNull();
+    expect(connectorStatusLine(base, now, true)).toBeNull();
+    expect(connectorStatusLine({ ...base, verified: false }, now, true)?.tone).toBe("reason");
   });
 
   it("keeps codex, grok_build and opencode alongside claude_code as supported connectors", () => {

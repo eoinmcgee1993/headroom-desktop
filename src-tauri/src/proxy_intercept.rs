@@ -1030,8 +1030,23 @@ pub fn spawn(
                                             launched_at.elapsed().as_secs()
                                         );
                                         if reported_errors.insert(format!("stuck:{key}")) {
+                                            // What is left on the port, since
+                                            // nothing is listening: RUST-JY
+                                            // arrived with no way to tell a
+                                            // leaked socket from a holder
+                                            // netstat cannot see.
+                                            #[cfg(windows)]
+                                            let port_sockets =
+                                                crate::tool_manager::port_socket_rows(
+                                                    INTERCEPT_PORT,
+                                                );
                                             sentry::with_scope(
                                                 |scope| {
+                                                    #[cfg(windows)]
+                                                    scope.set_extra(
+                                                        "port_sockets",
+                                                        port_sockets.into(),
+                                                    );
                                                     scope.set_extra(
                                                         "os_error", e.to_string().into());
                                                     scope.set_extra(

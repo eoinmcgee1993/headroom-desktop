@@ -386,13 +386,37 @@ describe("app update helpers", () => {
   });
 
   it("replaces a dropped-download error with copy the user can act on", async () => {
-    const invokeFn = vi.fn().mockRejectedValueOnce("error decoding response body");
+    // The automatic re-download drops too.
+    const invokeFn = vi
+      .fn()
+      .mockRejectedValueOnce("error decoding response body")
+      .mockResolvedValueOnce(availableUpdate)
+      .mockRejectedValueOnce("error decoding response body");
 
     const result = await runAppUpdateInstall({ availableUpdate, invokeFn });
 
     expect(result).toEqual({
       statusCopy: "Could not download the update: the connection dropped. Try again.",
     });
+  });
+
+  it("re-downloads once after a dropped download instead of reporting it (RUST-HS)", async () => {
+    vi.mocked(Sentry.captureException).mockClear();
+    const invokeFn = vi
+      .fn()
+      .mockRejectedValueOnce("error decoding response body")
+      .mockResolvedValueOnce(availableUpdate)
+      .mockResolvedValueOnce(undefined);
+
+    const result = await runAppUpdateInstall({ availableUpdate, quiet: true, invokeFn });
+
+    expect(invokeFn.mock.calls.map((call) => call[0])).toEqual([
+      "install_app_update",
+      "check_for_app_update",
+      "install_app_update",
+    ]);
+    expect(result.stagedVersion).toBe("0.3.0");
+    expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 
   it("shows the read-only-bundle refusal without reporting it (RUST-JK)", async () => {

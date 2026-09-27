@@ -1238,14 +1238,14 @@ function DailySavingsChart({
                   <stop offset="100%" stopColor="#aa9314" />
                 </linearGradient>
               </defs>
-              <CartesianGrid stroke="rgba(36, 31, 29, 0.06)" strokeDasharray="2 8" vertical={false} />
+              <CartesianGrid stroke="var(--border-subtle)" strokeDasharray="2 8" vertical={false} />
               <XAxis
                 axisLine={false}
                 dataKey="bucketKey"
                 interval={0}
                 minTickGap={view === "month" ? 8 : 8}
                 tickFormatter={view === "month" ? dayOfMonthTickFormatter : hourOfDayTickFormatter}
-                tick={{ fill: "#7a7169", fontSize: 10 }}
+                tick={{ fill: "var(--text-muted)", fontSize: 10 }}
                 tickLine={false}
               />
               {/* Both axes are hidden, so recharts' default "nice" rounding
@@ -1253,7 +1253,7 @@ function DailySavingsChart({
                   domain to the data so the peak bucket fills the plot. */}
               <YAxis domain={[0, "dataMax"]} hide yAxisId="usd" />
               <YAxis domain={[0, "dataMax"]} hide yAxisId="tokens" />
-              <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
+              <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} />} cursor={{ fill: "var(--fill-hover)" }} />
               {chartMode === "usd" && (
                 <>
                   <Bar
@@ -3802,17 +3802,21 @@ export default function App() {
     return connectorSupportWarnings[connector.clientId] ?? null;
   }
 
-  // Pricing gate: enabling a connector while optimization is disallowed is
-  // steered to the upgrade/sign-in CTA instead. Codex is exempt while
-  // authenticated (its own proxy-side gate). Only blocks *enabling*; an
-  // already-on connector stays on and the intercept keeps it unoptimized.
-  function connectorGateBlocksEnable(connector: ClientConnectorStatus) {
+  // Pricing gate: the connector's traffic is not optimized while optimization
+  // is disallowed. Codex is exempt while authenticated (its own proxy-side
+  // gate). An already-on connector stays on and the intercept keeps it
+  // unoptimized; its row shows the gate message with the upgrade/sign-in CTA.
+  function connectorGated(connector: ClientConnectorStatus) {
     return (
       pricingStatus != null &&
       !pricingStatus.optimizationAllowed &&
-      !connector.enabled &&
       (!pricingStatus.authenticated || !GATE_EXEMPT_CONNECTOR_IDS.has(connector.clientId))
     );
+  }
+
+  // Only blocks *enabling*: that is steered to the CTA instead.
+  function connectorGateBlocksEnable(connector: ClientConnectorStatus) {
+    return connectorGated(connector) && !connector.enabled;
   }
 
   function connectorGateCta() {
@@ -5722,7 +5726,8 @@ export default function App() {
               const unavailableReason = getConnectorUnavailableReason(connector);
               const detectionWarning = getConnectorDetectionWarning(connector);
               const supportWarning = getConnectorSupportWarning(connector);
-              const statusLine = connectorStatusLine(connector);
+              const gated = connectorGated(connector);
+              const statusLine = connectorStatusLine(connector, Date.now(), gated);
               const gateBlocksEnable = connectorGateBlocksEnable(connector);
               return (
                 <article className="connector-item" key={connector.clientId}>
@@ -5780,7 +5785,7 @@ export default function App() {
                         {detectionWarning ?? unavailableReason}
                       </p>
                     ) : null}
-                    {gateBlocksEnable ? (
+                    {gated ? (
                       <p className="connector-item__reason">
                         {pricingStatus?.gateMessage}{" "}
                         <button
@@ -8020,8 +8025,9 @@ export default function App() {
                           : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
+                    const gated = connectorGated(connector);
                     const gateBlocksEnable = connectorGateBlocksEnable(connector);
-                    const statusLine = connectorStatusLine(connector);
+                    const statusLine = connectorStatusLine(connector, Date.now(), gated);
                     const toggleDisabled =
                       connectorsBusy ||
                       !canConfigureConnectorWithoutDetection(connector) ||
@@ -8100,7 +8106,7 @@ export default function App() {
                               {detectionWarning ?? unavailableReason}
                             </p>
                           ) : null}
-                          {gateBlocksEnable ? (
+                          {gated ? (
                             <p className="connector-item__reason">
                               {pricingStatus?.gateMessage}{" "}
                               <button

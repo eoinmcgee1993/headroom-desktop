@@ -822,9 +822,13 @@ export type ConnectorStatusLine = {
 // timestamp: relevant right after enabling, gone by the next day.
 const RESTART_HINT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+// `gated`: the pricing gate covers this connector. A full bypass stops the
+// backend on purpose, so an unanswering proxy is expected, not a fault; the
+// row shows the gate message instead.
 export function connectorStatusLine(
   connector: ClientConnectorStatus,
-  now: number = Date.now()
+  now: number = Date.now(),
+  gated = false
 ): ConnectorStatusLine | null {
   if (!connector.enabled) {
     return null;
@@ -838,6 +842,9 @@ export function connectorStatusLine(
         : "Setup could not be verified - open the info panel and re-check.",
       tone: "reason"
     };
+  }
+  if (gated) {
+    return null;
   }
   if (connector.verification && !connector.verification.proxyReachable) {
     return {

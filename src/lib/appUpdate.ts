@@ -330,7 +330,12 @@ export async function runAppUpdateInstall({
       // still offers the exact version this call was asked to install - a
       // mismatch means the slot moved on and re-installing would be a
       // different build than the one the UI named.
-      if (!STALE_STAGED_UPDATE.test(describeInvokeError(error, ""))) {
+      //
+      // A dropped download (RUST-HS) consumes the handle the same way, and a
+      // quiet background install has nobody to click "Try again", so it takes
+      // the same one retry instead of leaving the update stranded.
+      const detail = describeInvokeError(error, "");
+      if (!STALE_STAGED_UPDATE.test(detail) && !TRANSPORT_FAILURE.test(detail)) {
         throw error;
       }
       const rechecked = await invokeFn<AvailableAppUpdate | null>("check_for_app_update").catch(
