@@ -2897,7 +2897,15 @@ fn ensure_managed_rtk_on_path(
             rtk_path.display()
         )
     })?;
-    let path_value = shell_double_quote(&managed_bin_dir.to_string_lossy());
+    let bin_dir = managed_bin_dir.to_string_lossy();
+    // The block is sourced by Git Bash on Windows, where `C:\...` in a
+    // colon-separated PATH splits at the drive colon into `C` and `\...`.
+    let bin_dir = if cfg!(target_os = "windows") {
+        msys_path(&bin_dir)
+    } else {
+        bin_dir.into_owned()
+    };
+    let path_value = shell_double_quote(&bin_dir);
     configure_shell_block(
         shell_targets,
         "managed_rtk",
@@ -8211,6 +8219,25 @@ fn shell_double_quote(value: &str) -> String {
         .replace('`', "\\`")
 }
 
+/// `C:\Users\x\bin` -> `/c/Users/x/bin`, the form Git Bash (MSYS) takes
+/// in PATH. Anything that isn't a drive-letter path is returned unchanged.
+fn msys_path(value: &str) -> String {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (Some(drive), Some(':')) if drive.is_ascii_alphabetic() => {
+            let rest = chars.as_str().replace('\\', "/");
+            let rest = rest.trim_matches('/');
+            let drive = drive.to_ascii_lowercase();
+            if rest.is_empty() {
+                format!("/{drive}")
+            } else {
+                format!("/{drive}/{rest}")
+            }
+        }
+        _ => value.to_string(),
+    }
+}
+
 fn build_headroom_rtk_hook(managed_rtk_path: &Path, managed_python_path: &Path) -> String {
     let rtk = shell_double_quote(&managed_rtk_path.to_string_lossy());
     let python = shell_double_quote(&managed_python_path.to_string_lossy());
@@ -8252,23 +8279,38 @@ fi
 # (VSCode, terminals) launched before rtk was enabled inherit a stale PATH, so
 # `rtk` is missing and the rewrite would fail with "command not found". Pin the
 # leading token to the managed binary's absolute path so it works regardless.
-if [ "${{REWRITTEN%% *}}" = "rtk" ]; then
-  REWRITTEN="$HEADROOM_RTK${{REWRITTEN#rtk}}"
+#
+# The path is spliced into a command the shell re-parses, so it must be quoted
+# and in the shell's own form. On Windows the managed path is `C:\...\rtk.exe`:
+# unquoted, Git Bash eats every backslash ("C:Users...rtk.exe: command not
+# found"), and in a PATH entry the drive colon splits it in two. `cygpath -u`
+# turns it into `/c/...`; `printf %q` quotes spaces and other metacharacters.
+HEADROOM_RTK_SH="$HEADROOM_RTK"
+if command -v cygpath >/dev/null 2>&1; then
+  HEADROOM_RTK_SH="$(cygpath -u "$HEADROOM_RTK" 2>/dev/null || printf '%s' "$HEADROOM_RTK")"
 fi
+HEADROOM_RTK_Q="$(printf '%q' "$HEADROOM_RTK_SH")"
+HEADROOM_RTK_DIR_Q="$(printf '%q' "$(dirname "$HEADROOM_RTK_SH")")"
 
-# Defense-in-depth: if the rewritten command's first token isn't resolvable
-# (e.g. a partial uninstall left `rtk` missing from PATH), fall through to the
-# original command instead of handing Claude Code a command that will fail with
-# "command not found".
-FIRST_TOKEN="${{REWRITTEN%% *}}"
-case "$FIRST_TOKEN" in
-  /*)
-    [ -x "$FIRST_TOKEN" ] || exit 0
-    ;;
-  *)
-    command -v "$FIRST_TOKEN" >/dev/null 2>&1 || exit 0
-    ;;
-esac
+if [ "${{REWRITTEN%% *}}" = "rtk" ]; then
+  # Already checked executable above; the quoted token can't be re-tested by
+  # splitting on spaces, so skip the first-token guard below.
+  REWRITTEN="$HEADROOM_RTK_Q${{REWRITTEN#rtk}}"
+else
+  # Defense-in-depth: if the rewritten command's first token isn't resolvable
+  # (e.g. a partial uninstall left `rtk` missing from PATH), fall through to the
+  # original command instead of handing Claude Code a command that will fail
+  # with "command not found".
+  FIRST_TOKEN="${{REWRITTEN%% *}}"
+  case "$FIRST_TOKEN" in
+    /*)
+      [ -x "$FIRST_TOKEN" ] || exit 0
+      ;;
+    *)
+      command -v "$FIRST_TOKEN" >/dev/null 2>&1 || exit 0
+      ;;
+  esac
+fi
 
 # The pin above only fixes the LEADING token. `rtk rewrite` also emits `rtk`
 # embedded after a `&&`, `;`, or `|` (e.g. `cd web && rtk npx ...`), and those
@@ -8277,7 +8319,7 @@ esac
 # (never the .zprofile/.zshrc where the managed PATH export lands). Prepend the
 # managed bin dir to PATH for this one invocation so every `rtk`, at any
 # position, resolves regardless of which profile files the shell sourced.
-REWRITTEN="export PATH=\"$(dirname "$HEADROOM_RTK"):\$PATH\"; $REWRITTEN"
+REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\"; $REWRITTEN"
 
 HEADROOM_RTK_REWRITTEN="$REWRITTEN" "$HEADROOM_PYTHON" -c 'import json, os, sys; data = json.load(sys.stdin); tool_input = data.get("tool_input"); 
 if not isinstance(tool_input, dict):
@@ -8868,14 +8910,14 @@ mod tests {
         claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
         codex_sqlite_store_expected, default_shell_targets_for_family, discover_codex_state_dbs,
         edit_vscode_wrapper_key, entry_contains_hook, find_on_path_entries, is_no_space,
-        is_permission_denied, normalize_setup_state, normalized_setup_id, nvm_binary_candidates,
-        oss_remnant_warnings, parse_json_object, pin_codex_mcp_command, remove_managed_block,
-        remove_pre_tool_use_markers, render_codex_config, retag_codex_thread_providers,
-        retag_codex_threads_to_headroom, retag_one_codex_db, serialize_paths,
-        shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
-        strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
-        ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
-        VSCODE_PROCESS_WRAPPER_KEY,
+        is_permission_denied, msys_path, normalize_setup_state, normalized_setup_id,
+        nvm_binary_candidates, oss_remnant_warnings, parse_json_object, pin_codex_mcp_command,
+        remove_managed_block, remove_pre_tool_use_markers, render_codex_config,
+        retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
+        serialize_paths, shell_block_contains_in_files, shell_block_contains_text_in_files,
+        shell_double_quote, strip_headroom_hook_from_settings, upsert_managed_block,
+        write_file_if_changed, ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS,
+        PERMISSION_DENIED_OS_ERRORS, VSCODE_PROCESS_WRAPPER_KEY,
     };
     #[cfg(unix)]
     use super::{
@@ -10172,6 +10214,124 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_script_rewrite_runs_with_windows_style_managed_path() {
+        // Regression for #120: on Windows the managed path is `C:\...\rtk.exe`
+        // and was spliced into the rewritten command unquoted, so Git Bash
+        // stripped the backslashes ("C:Users...rtk.exe: command not found").
+        // Simulate it on Unix: the hook is handed a Windows-style path (a
+        // file of that literal name exists, so the `-x` check passes) and a fake `cygpath` maps it to a real directory
+        // containing a space. The emitted command must then actually run.
+        let root = unique_temp_dir("headroom-hook-windows-path");
+        let bin_dir = root.join("Program Files").join("bin");
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&fake_bin).expect("create fakebin");
+        let exec = |path: &Path, body: &str| {
+            fs::write(path, body).expect("write script");
+            fs::set_permissions(
+                path,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .expect("chmod script");
+        };
+
+        let rtk_body = "#!/usr/bin/env bash\nif [ \"$1\" = rewrite ]; then shift; echo \"rtk $* && rtk git log\"; else echo \"rtk-ran $*\"; fi\n";
+        let windows_rtk = r"C:\Program Files\bin\rtk.exe";
+        // In fakebin, which is both the hook's cwd (for `-x`) and on PATH (a
+        // name without `/` is executed via a PATH lookup, not from cwd).
+        exec(&fake_bin.join(windows_rtk), rtk_body);
+        exec(&bin_dir.join("rtk.exe"), rtk_body);
+        exec(&bin_dir.join("rtk"), rtk_body);
+        exec(
+            &fake_bin.join("cygpath"),
+            &format!(
+                "#!/usr/bin/env bash\n[ \"$1\" = -u ] && shift\nif [ \"$1\" = '{windows_rtk}' ]; then printf '%s\\n' '{}'; else printf '%s\\n' \"$1\"; fi\n",
+                bin_dir.join("rtk.exe").display()
+            ),
+        );
+
+        let system_python = PathBuf::from("/usr/bin/python3");
+        let hook_body = build_headroom_rtk_hook(Path::new(windows_rtk), &system_python);
+        let hook_path = fake_bin.join("hook.sh");
+        exec(&hook_path, &hook_body);
+
+        let run = |cmd: &mut std::process::Command, stdin: &str| {
+            cmd.stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    child
+                        .stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(stdin.as_bytes())
+                        .unwrap();
+                    child.wait_with_output()
+                })
+                .expect("run")
+        };
+
+        let output = run(
+            crate::proc::command("bash")
+                .arg(&hook_path)
+                .current_dir(&fake_bin)
+                .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display())),
+            r#"{"tool_input":{"command":"git status"}}"#,
+        );
+        assert!(output.status.success(), "hook should exit 0");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "hook must emit a rewrite ({e}), stdout: {:?}, stderr: {:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let rewritten = payload["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .expect("rewritten command")
+            .to_string();
+        assert!(
+            !rewritten.contains("C:"),
+            "the Windows path must reach the shell in MSYS form: {rewritten:?}"
+        );
+
+        // Execute it the way Claude Code does: from elsewhere, rtk not on PATH.
+        let executed = run(
+            crate::proc::command("bash")
+                .arg("-c")
+                .arg(&rewritten)
+                .current_dir(std::env::temp_dir())
+                .env("PATH", "/usr/bin:/bin"),
+            "",
+        );
+        let stdout = String::from_utf8_lossy(&executed.stdout);
+        assert!(
+            executed.status.success(),
+            "rewritten command {rewritten:?} failed: stdout {stdout:?}, stderr {:?}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(stdout, "rtk-ran git status\nrtk-ran git log\n");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn msys_path_converts_drive_letter_paths_only() {
+        assert_eq!(
+            msys_path(r"C:\Users\me\AppData\Local\Headroom\headroom\bin"),
+            "/c/Users/me/AppData/Local/Headroom/headroom/bin"
+        );
+        assert_eq!(msys_path(r"d:\Program Files\x\"), "/d/Program Files/x");
+        assert_eq!(msys_path("E:"), "/e");
+        assert_eq!(msys_path("/usr/local/bin"), "/usr/local/bin");
+        assert_eq!(msys_path("relative/C:/x"), "relative/C:/x");
     }
 
     #[test]
