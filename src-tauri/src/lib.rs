@@ -22,6 +22,8 @@ mod tool_manager;
 mod upstream_override;
 mod usage_counters;
 mod vscode_statusbar;
+#[cfg(windows)]
+mod winproc;
 mod wsl_probe;
 
 /// Cross-module lock for tests that repoint $HOME / $CODEX_HOME. Env vars are
@@ -998,9 +1000,12 @@ async fn install_app_update(
     // bundle transfer for nothing.
     #[cfg(target_os = "macos")]
     if bundle_is_read_only() {
-        log::warn!("update: refusing in-place install; the bundle folder is read-only");
+        // Info, not warn: running off the DMG / translocated is the user's
+        // setup, not a defect, and the returned message already tells them
+        // the fix. Every quiet background install re-hit this and the bridge
+        // filed it as an escalating error (RUST-9J, RUST-JM).
         log::info!(
-            "update: read-only bundle path {:?}",
+            "update: refusing in-place install; read-only bundle path {:?}",
             current_app_bundle_path()
         );
         return Err(READ_ONLY_BUNDLE_MESSAGE.to_string());
@@ -1184,6 +1189,7 @@ const READ_ONLY_BUNDLE_MESSAGE: &str =
 #[cfg(target_os = "macos")]
 fn dir_is_read_only(dir: &std::path::Path) -> bool {
     let probe = dir.join(format!(".headroom-write-probe-{}", std::process::id()));
+    // direct-write: throwaway write probe, removed right after
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
@@ -1550,6 +1556,9 @@ async fn install_addon(
 ) -> Result<DashboardState, String> {
     match id.as_str() {
         "markitdown" => {
+            // markitdown[all] shares the runtime venv; a pip run beside the
+            // upgrade's replaces the same files twice.
+            refuse_venv_cli_during_upgrade(&state)?;
             state
                 .tool_manager
                 .install_markitdown()
@@ -1684,6 +1693,7 @@ async fn uninstall_addon(
 ) -> Result<DashboardState, String> {
     match id.as_str() {
         "markitdown" => {
+            refuse_venv_cli_during_upgrade(&state)?;
             let _ = client_adapters::disable_markitdown_integration(
                 &state.tool_manager.markitdown_shim_path(),
             );
@@ -3848,7 +3858,9 @@ fn claude_desktop_installed() -> bool {
     client_adapters::claude_desktop_installed()
 }
 
-#[tauri::command]
+// async: polled every 5s from the post-install screen, and a sync command
+// runs `tasklist` / `ps` on the main thread (Tauri 2), stuttering the UI.
+#[tauri::command(async)]
 fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize> {
     #[cfg(windows)]
     {
@@ -3887,16 +3899,19 @@ fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize
 /// can offer one click instead of a copy-paste terminal round-trip. Exactly
 /// the script the panel shows for manual use; nothing is decided here, the
 /// panel re-probes connectors afterwards and the installer's own output comes
-/// back on failure. Blocking for its ~30-60s is fine: Tauri runs sync
-/// commands off the UI thread and the button holds a busy state. No timeout —
-/// a hung download leaves the button busy, which the user can abandon for the
-/// manual command sitting right under it.
-#[tauri::command]
+/// back on failure. Blocking for its ~30-60s is fine only off the UI thread:
+/// Tauri 2 runs a plain sync command ON the main thread, so it takes
+/// `command(async)` to keep the window responsive while the button holds a
+/// busy state. No timeout - a hung download leaves the button busy, which the
+/// user can abandon for the manual command sitting right under it.
+#[tauri::command(async)]
 fn install_claude_code_cli() -> Result<(), String> {
     #[cfg(windows)]
     let output = crate::proc::command("powershell")
         .args([
             "-NoProfile",
+            // No console to answer a prompt on: fail instead of waiting.
+            "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-Command",
@@ -4417,7 +4432,7 @@ fn spawn_claude_projects_warmer(app: AppHandle) {
 /// `limit=100` returned ~44 MB because every event carried `request_messages`
 /// plus a byte-identical `compressed_messages` (~160 KB per event) while the
 /// observer and the canary between them read ~403 bytes of each; the fetch now
-/// asks for `include_messages=0` (upstream #3672, vendored), and this guard
+/// asks for `include_messages=0` (upstream #3672, native since wheel 0.39.0), and this guard
 /// still bounds how often even the slim pull runs. The backend serializes all of it on
 /// its event loop, and `/stats` -- which the dashboard polls on its own cadence
 /// -- queues behind it: 45 ms idle against 1.3 s with three pulls in flight, on
@@ -4702,10 +4717,31 @@ fn aggregate_live_learnings(
     Ok(out)
 }
 
+/// No `headroom.exe` CLI runs while a runtime upgrade is in flight. The
+/// activity observer's memory export fires every ~60s, so across a
+/// multi-minute upgrade it was all but certain to hold Scripts\headroom.exe
+/// (and half-installed .pyd files) against the wheel reinstall, the
+/// requirements repair and the venv swap renames on Windows (RUST-29 /
+/// RUST-6S), and to import a package mid-replacement. The install guard
+/// covers the pip runs outside an upgrade (launch recovery of an interrupted
+/// one, the MCP self-heal's requirements repair), which mutate the same venv.
+fn refuse_venv_cli_during_upgrade(state: &AppState) -> Result<(), String> {
+    if state.runtime_upgrade_in_progress()
+        || state
+            .runtime_upgrade_installing
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    {
+        return Err("Headroom is updating its runtime; try again in a minute.".into());
+    }
+    Ok(())
+}
+
 fn memory_export_cached(state: &State<'_, AppState>, memory_path: &Path) -> Result<String, String> {
     if let Some(cached) = state.cached_memory_export() {
         return Ok(cached);
     }
+    refuse_venv_cli_during_upgrade(state)?;
     let entrypoint = state.tool_manager.headroom_entrypoint();
     let stdout = run_memory_export(&entrypoint, memory_path)?;
     state.store_memory_export(stdout.clone());
@@ -4718,17 +4754,17 @@ async fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> 
     if !memory_path.exists() {
         return Err("Memory database does not exist.".into());
     }
+    refuse_venv_cli_during_upgrade(&state)?;
     let entrypoint = state.tool_manager.headroom_entrypoint();
-    let output = crate::proc::command(&entrypoint)
+    let mut command = crate::proc::command(&entrypoint);
+    command
         .arg("memory")
         .arg("delete")
         .arg(&memory_id)
         .arg("--force")
         .arg("--db-path")
-        .arg(&memory_path)
-        .env("PYTHONNOUSERSITE", "1")
-        .output()
-        .map_err(|err| err.to_string())?;
+        .arg(&memory_path);
+    let output = memory_cli_output(command)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -4822,15 +4858,30 @@ fn read_applied_block(path: &std::path::Path) -> Vec<crate::models::AppliedSecti
 }
 
 /// Shells `headroom memory export --db-path <db>` and returns raw JSON stdout.
+/// Ceiling for one `headroom memory` CLI call. The activity observer runs the
+/// export on a timer; an unbounded one that stalled (AV scan of the venv, a
+/// locked memory db) tied up an async worker for good.
+const MEMORY_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn memory_cli_output(mut command: std::process::Command) -> Result<std::process::Output, String> {
+    command.env("PYTHONNOUSERSITE", "1");
+    crate::proc::output_with_timeout(command, MEMORY_CLI_TIMEOUT).map_err(|err| match err {
+        crate::proc::OutputError::TimedOut => format!(
+            "headroom memory command timed out after {}s",
+            MEMORY_CLI_TIMEOUT.as_secs()
+        ),
+        crate::proc::OutputError::Spawn(err) => err.to_string(),
+    })
+}
+
 fn run_memory_export(entrypoint: &Path, db_path: &Path) -> Result<String, String> {
-    let output = crate::proc::command(entrypoint)
+    let mut command = crate::proc::command(entrypoint);
+    command
         .arg("memory")
         .arg("export")
         .arg("--db-path")
-        .arg(db_path)
-        .env("PYTHONNOUSERSITE", "1")
-        .output()
-        .map_err(|err| err.to_string())?;
+        .arg(db_path);
+    let output = memory_cli_output(command)?;
     if !output.status.success() {
         return Err(format!("headroom memory export exited {}", output.status));
     }
@@ -5164,6 +5215,17 @@ pub(crate) fn client_setup_error_kind(err: &anyhow::Error) -> &'static str {
     "other"
 }
 
+fn resume_for_client_setup(state: &AppState) {
+    if let Err(err) = state.resume_runtime() {
+        // Local log keeps the full chain; the capture below is the Sentry
+        // path (fingerprinted, and silent for a machine-policy block).
+        // Bridging this warn instead grouped on a message that embeds the
+        // port and the user's home path -- RUST-AD.
+        log::info!("apply_client_setup: resume_runtime failed: {err:#}");
+        capture_headroom_start_failure("apply_client_setup: resume_runtime failed", &err);
+    }
+}
+
 #[tauri::command]
 async fn apply_client_setup(
     app: AppHandle,
@@ -5177,22 +5239,37 @@ async fn apply_client_setup(
     // the runtime back. Without this, env vars get rewritten but the proxy
     // stays down and Claude Code traffic flows unoptimized until the next
     // pricing poll (or, in the watchdog case, until restart).
-    let state: tauri::State<'_, AppState> = app.state();
-    let bypassed = state
-        .proxy_bypass
-        .load(std::sync::atomic::Ordering::Acquire);
-    if state.runtime_is_paused() || bypassed {
-        if let Err(err) = state.resume_runtime() {
-            // Local log keeps the full chain; the capture below is the Sentry
-            // path (fingerprinted, and silent for a machine-policy block).
-            // Bridging this warn instead grouped on a message that embeds the
-            // port and the user's home path -- RUST-AD.
-            log::info!("apply_client_setup: resume_runtime failed: {err:#}");
-            capture_headroom_start_failure("apply_client_setup: resume_runtime failed", &err);
+    // On the blocking pool: resume_runtime can wait out a cold boot.
+    run_lifecycle_command(app.clone(), |app| {
+        let state: tauri::State<'_, AppState> = app.state();
+        let bypassed = state
+            .proxy_bypass
+            .load(std::sync::atomic::Ordering::Acquire);
+        if state.runtime_is_paused() || bypassed {
+            resume_for_client_setup(&state);
         }
-    }
+        Ok(())
+    })
+    .await?;
+    let state: tauri::State<'_, AppState> = app.state();
     match client_adapters::apply_client_setup(&client_id) {
         Ok(result) => {
+            // Enabling Codex, OpenCode or Grok from full bypass: the resume
+            // above ran before this client was written, so the gate re-entered
+            // FULL bypass and the backend stayed down until the next pricing
+            // poll. Configured now, the client is exempt, so a second resume
+            // lands on the Claude-only bypass with the backend up.
+            if state
+                .proxy_bypass
+                .load(std::sync::atomic::Ordering::Acquire)
+                && client_adapters::any_gate_exempt_client_enabled()
+            {
+                run_lifecycle_command(app.clone(), |app| {
+                    resume_for_client_setup(&app.state::<AppState>());
+                    Ok(())
+                })
+                .await?;
+            }
             // Funnel beacon lives here (not the launcher UI) so every apply
             // path counts: launcher auto-configure, the manual client-setup
             // screen, and the dashboard connector toggle. First-write-wins
@@ -5680,9 +5757,13 @@ async fn save_upstream_override(
     // pointed at the old upstream until it is replaced. Same hard restart the
     // paused-banner button uses: stop_headroom kills the group so a wedged
     // process cannot survive the change.
-    state.stop_headroom();
-    state.set_runtime_auto_paused(false);
-    state.resume_runtime().map_err(|err| err.to_string())?;
+    run_lifecycle_command(app.clone(), |app| {
+        let state: tauri::State<'_, AppState> = app.state();
+        state.stop_headroom();
+        state.set_runtime_auto_paused(false);
+        state.resume_runtime().map_err(|err| err.to_string())
+    })
+    .await?;
     std::thread::spawn(|| {
         client_adapters::restore_client_setups();
     });
@@ -5712,8 +5793,25 @@ async fn clear_client_setups() -> Result<(), String> {
     client_adapters::clear_client_setups().map_err(|err| err.to_string())
 }
 
+/// Lifecycle commands run their stop/start on the blocking pool: stop waits up
+/// to seconds on the child and the process sweep, and a start can wait out a
+/// cold boot (minutes), which parked an async-runtime worker for that long.
+/// On a 2-core machine two clicks starved every other async command.
+async fn run_lifecycle_command<T: Send + 'static>(
+    app: AppHandle,
+    body: impl FnOnce(AppHandle) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || body(app))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
 #[tauri::command]
 async fn pause_headroom(app: AppHandle) -> Result<(), String> {
+    run_lifecycle_command(app, pause_headroom_blocking).await
+}
+
+fn pause_headroom_blocking(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
     state.set_runtime_paused(true);
     // A deliberate user pause is not an auto-pause; clear the flag so the
@@ -5735,6 +5833,10 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn start_headroom(app: AppHandle) -> Result<(), String> {
+    run_lifecycle_command(app, start_headroom_blocking).await
+}
+
+fn start_headroom_blocking(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
     state.resume_runtime().map_err(|err| err.to_string())?;
     std::thread::spawn(|| {
@@ -5752,6 +5854,10 @@ async fn start_headroom(app: AppHandle) -> Result<(), String> {
 /// equivalent of the manual quit-and-relaunch users do today.
 #[tauri::command]
 async fn force_restart_headroom(app: AppHandle) -> Result<(), String> {
+    run_lifecycle_command(app, force_restart_headroom_blocking).await
+}
+
+fn force_restart_headroom_blocking(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
     state.stop_headroom();
     state.set_runtime_auto_paused(false);
@@ -5860,6 +5966,13 @@ fn get_auto_learn_enabled() -> bool {
 /// Manual Learn scans are unaffected either way.
 #[tauri::command]
 async fn set_auto_learn_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+    run_lifecycle_command(app, move |app| {
+        set_auto_learn_enabled_blocking(app, enabled)
+    })
+    .await
+}
+
+fn set_auto_learn_enabled_blocking(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let state: tauri::State<'_, AppState> = app.state();
     client_adapters::set_auto_learn_enabled(enabled).map_err(|err| err.to_string())?;
     state.stop_headroom();
@@ -7193,8 +7306,8 @@ fn fetch_transformations_feed_from(
         .map_err(|err| err.to_string())?;
     // include_messages=0: the observer and the canary read ~400 B of numbers
     // per event; the bodies were ~44 MB per limit=100 pull, serialized on the
-    // backend's event loop (RUST-86). Served by the #3672 vendor on the pinned
-    // wheel; a wheel without it ignores the parameter and sends bodies as
+    // backend's event loop (RUST-86). Native since wheel 0.39.0 (#3672); a
+    // wheel without it ignores the parameter and sends bodies as
     // before, which the deserializer already tolerates.
     let url = format!("{base_url}/transformations/feed?limit={limit}&include_messages=0");
     let response = client.get(url).send().map_err(|err| err.to_string())?;
@@ -7719,6 +7832,17 @@ fn execute_headroom_learn_run(
         LearnAgent::Opencode => ("opencode", "OpenCode sessions".to_string()),
         LearnAgent::Grok => ("grok", "Grok sessions".to_string()),
     };
+    // A learn run lasts up to 15 minutes off Scripts\headroom.exe; mid-upgrade
+    // it would hold the files pip replaces and then be killed by the venv
+    // sweep with nothing to show for it.
+    if let Err(message) = refuse_venv_cli_during_upgrade(state) {
+        return HeadroomLearnRunResult {
+            success: false,
+            summary: format!("headroom learn skipped for {project_name}."),
+            error: Some(message),
+            output_tail: Vec::new(),
+        };
+    }
     let entrypoint = state.tool_manager.headroom_entrypoint();
     if !entrypoint.exists() {
         return HeadroomLearnRunResult {
@@ -8259,6 +8383,7 @@ fn execute_headroom_learn_run(
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // direct-write: Headroom's own per-run learn log, overwritten each run
     let _ = std::fs::write(log_path, log_content);
 
     HeadroomLearnRunResult {
@@ -8755,11 +8880,20 @@ fn spawn_proxy_watchdog(app: AppHandle) {
         // backend boot is wedged on a stalled vocab download (RUST-5D) and
         // would never reach the healthy branch.
         let mut tiktoken_prefetch_spawned = false;
+        // The proxy's stdout/stderr logs were capped only at spawn, and a proxy
+        // runs for days or weeks. Checked every ~5 minutes of ticks.
+        let mut ticks_since_log_cap: u32 = 0;
 
         loop {
             std::thread::sleep(POLL);
             if SHUTTING_DOWN.load(Ordering::Acquire) {
                 return;
+            }
+            ticks_since_log_cap += 1;
+            if ticks_since_log_cap * POLL.as_secs().max(1) as u32 >= 300 {
+                ticks_since_log_cap = 0;
+                let state: tauri::State<'_, AppState> = app.state();
+                state.tool_manager.cap_live_proxy_logs();
             }
             let now_wall = std::time::SystemTime::now();
             let elapsed = now_wall
@@ -8779,9 +8913,14 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             // it either observes the proxy recover or re-gives-up, which
             // reschedules the next retry with a longer backoff.
             if runtime.auto_paused {
-                let due = auto_pause_next_retry
-                    .map(|t| std::time::Instant::now() >= t)
-                    .unwrap_or(true);
+                // Not mid-upgrade: its stop_headroom would kill the proxy boot
+                // validation is waiting on and roll back a good upgrade ("Retry
+                // update" from the auto-paused state is exactly this). The
+                // upgrade owns the lifecycle until it ends; retry after.
+                let due = !state.runtime_upgrade_in_progress()
+                    && auto_pause_next_retry
+                        .map(|t| std::time::Instant::now() >= t)
+                        .unwrap_or(true);
                 if due {
                     log::info!(
                         "watchdog: auto-resume attempt (failed_attempts={auto_pause_failed}); killing wedged proxy and restarting"
@@ -8820,6 +8959,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         if marker.exists() {
                             log::info!("tiktoken prefetch failed (repeat): {err:#}");
                         } else {
+                            // direct-write: Headroom's own marker; only its existence matters
                             let _ = std::fs::write(&marker, b"1");
                             log::warn!("tiktoken prefetch failed: {err:#}");
                         }
@@ -13075,6 +13215,21 @@ Some unrelated content.
         ] {
             assert_eq!(learn_step_label(line), None, "line leaked: {line:?}");
         }
+    }
+
+    #[test]
+    fn venv_cli_is_refused_while_an_install_guard_holds_the_venv() {
+        // Launch recovery and the MCP self-heal pip into the live venv under the
+        // install guard without setting runtime_upgrade_in_progress.
+        let base_dir =
+            std::env::temp_dir().join(format!("headroom-venv-cli-guard-{}", uuid::Uuid::new_v4()));
+        let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
+        assert!(super::refuse_venv_cli_during_upgrade(&state).is_ok());
+        state
+            .runtime_upgrade_installing
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(super::refuse_venv_cli_during_upgrade(&state).is_err());
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]

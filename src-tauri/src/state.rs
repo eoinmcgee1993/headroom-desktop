@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -193,7 +193,9 @@ fn total_dir_size_bytes(path: &std::path::Path, max_entries: usize) -> u64 {
             if file_type.is_dir() {
                 stack.push(entry.path());
             } else if file_type.is_file() {
-                if let Ok(meta) = entry.metadata() {
+                // fs::metadata: see newest_proxy_log_mtime (a blob being
+                // downloaded kept its directory-entry size on Windows).
+                if let Ok(meta) = std::fs::metadata(entry.path()) {
                     total = total.saturating_add(meta.len());
                 }
             }
@@ -252,6 +254,7 @@ pub(crate) fn proxy_port_accepts_connection() -> bool {
 /// depending on duration. Returns whole seconds; sub-second precision
 /// is dropped (we only care about per-tick advancement, which is
 /// always >=1s of CPU work to register).
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_ps_cpu_time(raw: &str) -> Option<u64> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -277,14 +280,25 @@ fn parse_ps_cpu_time(raw: &str) -> Option<u64> {
 /// to call on a 500ms boot-validation tick — fork+exec of a tiny
 /// system binary, no I/O beyond the kernel proc table.
 pub(crate) fn tracked_process_cpu_time_secs(pid: u32) -> Option<u64> {
-    let output = crate::proc::command("ps")
-        .args(["-p", &pid.to_string(), "-o", "time="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    // Windows has no `ps`, and the tracked pid is the idle `headroom.exe`
+    // launcher rather than the python doing the work. The proxy job's CPU
+    // total covers the whole tree; callers only ever ask whether it grew.
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        crate::winproc::proxy_job_cpu_time_secs()
     }
-    parse_ps_cpu_time(&String::from_utf8_lossy(&output.stdout))
+    #[cfg(not(windows))]
+    {
+        let output = crate::proc::command("ps")
+            .args(["-p", &pid.to_string(), "-o", "time="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_ps_cpu_time(&String::from_utf8_lossy(&output.stdout))
+    }
 }
 
 /// Whether the tracked process's accumulated CPU time advanced since
@@ -347,7 +361,11 @@ pub(crate) fn newest_proxy_log_mtime(logs_dir: &std::path::Path) -> Option<std::
         if !name_str.starts_with("headroom-proxy") || !name_str.ends_with(".log") {
             continue;
         }
-        if let Ok(meta) = entry.metadata() {
+        // fs::metadata, not DirEntry::metadata: on Windows the latter is
+        // the directory entry's cached copy, which NTFS updates lazily
+        // for a file still held open for writing, so a live log (or a
+        // model download in progress) looked frozen to this signal.
+        if let Ok(meta) = std::fs::metadata(entry.path()) {
             if let Ok(mtime) = meta.modified() {
                 newest = Some(match newest {
                     Some(prev) if prev > mtime => prev,
@@ -477,6 +495,15 @@ pub struct AppState {
     /// True while an atomic runtime upgrade is running (install + boot validation).
     /// Gates the watchdog from auto-pausing during the ~minutes-long upgrade.
     pub runtime_upgrade_in_progress: Mutex<bool>,
+    /// True only while an upgrade's pip install / rollback mutates the live
+    /// venv (the proxy is down on purpose). Unlike `runtime_upgrade_in_progress`,
+    /// which relaxes the gates so boot validation can spawn, this refuses every
+    /// spawn: a tray open or gate flip mid-install started a proxy off the
+    /// half-replaced venv, which locked Scripts\headroom.exe against pip and
+    /// served /stats 500s (RUST-29, RUST-JP). A count, not a flag: guards
+    /// from different threads (launch recovery, a "Retry update" click) can
+    /// overlap, and the first to finish must not clear the other's.
+    pub runtime_upgrade_installing: std::sync::atomic::AtomicUsize,
     pub runtime_upgrade_progress: Mutex<RuntimeUpgradeProgress>,
     pub last_startup_error: Mutex<Option<String>>,
     /// Exit status of the last tracked child that died on its own (not via
@@ -533,15 +560,15 @@ pub struct AppState {
     /// overage from pausing Codex optimization for mixed users, the symmetric
     /// counterpart to `codex_bypass`.
     pub claude_only_bypass: Arc<AtomicBool>,
-    /// Debounce streak for `codex_bypass`, mirroring `pricing_gate_violation_streak`.
-    codex_gate_violation_streak: Arc<AtomicU32>,
-    /// Number of consecutive `apply_pricing_gate_status` calls that reported
-    /// `optimization_allowed=false` while bypass was off. Acts as a debounce:
-    /// the ungated→gated transition only fires once this hits
-    /// `PRICING_GATE_DEBOUNCE_POLLS`. Reset to 0 on any ungated poll. Prevents
-    /// a single bad pricing read (network blip, brief utilization spike) from
+    /// Debounce window for `codex_bypass`, mirroring `pricing_gate_first_gated_at`.
+    codex_gate_first_gated_at: Arc<Mutex<Option<Instant>>>,
+    /// When the current run of gated `apply_pricing_gate_status` readings
+    /// began while bypass was off. The ungated->gated flip only fires once a
+    /// gated reading lands `PRICING_GATE_DEBOUNCE_MIN_SPAN` after it (see
+    /// `gated_reading_confirms`); any ungated reading clears it. Prevents a
+    /// single bad pricing read (network blip, brief utilization spike) from
     /// flipping the gate off and back on within minutes.
-    pricing_gate_violation_streak: Arc<AtomicU32>,
+    pricing_gate_first_gated_at: Arc<Mutex<Option<Instant>>>,
     /// Per-session rising-edge latches so the weekly-limit nudge is reported to
     /// the server at most once per condition while it holds, instead of on every
     /// 60s pricing poll. They reset to `false` on any non-gated poll and on app
@@ -673,6 +700,7 @@ impl AppState {
             runtime_auto_paused: AtomicBool::new(false),
             runtime_starting: Mutex::new(false),
             runtime_upgrade_in_progress: Mutex::new(false),
+            runtime_upgrade_installing: std::sync::atomic::AtomicUsize::new(0),
             runtime_upgrade_progress: Mutex::new(RuntimeUpgradeProgress {
                 running: false,
                 complete: false,
@@ -703,8 +731,8 @@ impl AppState {
             proxy_bypass: Arc::new(AtomicBool::new(false)),
             claude_only_bypass: Arc::new(AtomicBool::new(false)),
             codex_bypass: Arc::new(AtomicBool::new(false)),
-            codex_gate_violation_streak: Arc::new(AtomicU32::new(0)),
-            pricing_gate_violation_streak: Arc::new(AtomicU32::new(0)),
+            codex_gate_first_gated_at: Arc::new(Mutex::new(None)),
+            pricing_gate_first_gated_at: Arc::new(Mutex::new(None)),
             weekly_limit_reached_reported: Arc::new(AtomicBool::new(false)),
             weekly_limit_approaching_reported: Arc::new(AtomicBool::new(false)),
             headroom_learn_state: Mutex::new(HeadroomLearnRuntimeState {
@@ -752,7 +780,19 @@ impl AppState {
         // run was killed between move-aside and commit, the venv.backup/
         // dir holds the real working environment and the live venv is a
         // partial install. Restore before doing anything else.
-        let _ = self.tool_manager.recover_from_interrupted_upgrade();
+        if self.tool_manager.upgrade_interrupted() {
+            // Recovery pip-reinstalls or renames the live venv, so it gets the
+            // upgrade's protection: no spawn may start mid-recovery, a start
+            // already in flight is waited out, and whatever runs from the venv
+            // (the updater's orphan proxy, Claude Code's MCP servers) is
+            // cleared first. Only when a marker exists: this sweep on every
+            // launch would kill the user's MCP servers for nothing.
+            let _recovery_guard = UpgradeInstallGuard::engage(self);
+            drop(self.lifecycle_lock.lock());
+            self.stop_headroom();
+            kill_venv_lock_holders(&self.tool_manager.venv_dir());
+            let _ = self.tool_manager.recover_from_interrupted_upgrade();
+        }
 
         if !self.tool_manager.python_runtime_installed() {
             // First-run; start_bootstrap (wizard) handles install.
@@ -830,7 +870,14 @@ impl AppState {
 
         // Independent of the upgrade: if MCP is not configured (e.g. it failed
         // during a prior install), retry it now.
-        if let Err(err) = self.tool_manager.ensure_mcp_configured() {
+        // Under the install guard: when the MCP install hits a corrupt venv it
+        // self-heals with a requirements repair (pip into the live venv), and
+        // a tray open racing that must not start a proxy off it.
+        let mcp_result = {
+            let _mcp_guard = UpgradeInstallGuard::engage(self);
+            self.tool_manager.ensure_mcp_configured()
+        };
+        if let Err(err) = mcp_result {
             // install_headroom_mcp captures rich structured data to Sentry
             // at the failure site; log to file only to avoid a duplicate
             // (and stripped) Sentry event from the FileLogger forwarder.
@@ -1040,6 +1087,15 @@ impl AppState {
         });
         emit_runtime_upgrade_progress(app, self);
 
+        // Before the stop, so a spawn already queued on the lifecycle lock
+        // re-reads it after the stop and stands down.
+        let install_guard = UpgradeInstallGuard::engage(self);
+        // Barrier: wait out a start already inside ensure_headroom_running
+        // (tray click, watchdog restart). stop_headroom gives up on the lock
+        // after 2s and spares that start's child as a sibling's, and the
+        // start's own repair branch then ran a second pip into this venv
+        // beside ours. Every start after this sees the flag and stands down.
+        drop(self.lifecycle_lock.lock());
         self.stop_headroom();
 
         analytics::track_event(
@@ -1094,6 +1150,9 @@ impl AppState {
                 .map(|()| String::new())
                 .map_err(|error| (false, error)),
         };
+        // pip is done (and any install-phase rollback with it): from here the
+        // upgrade itself restarts the proxy, on either branch below.
+        drop(install_guard);
         let install_pip_output_tail: String = match install_result {
             Err((restored, error)) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -1376,12 +1435,15 @@ impl AppState {
             None
         };
 
+        let rollback_guard = UpgradeInstallGuard::engage(self);
+        drop(self.lifecycle_lock.lock());
         self.stop_headroom();
         let rollback_result = if needs_commit_or_rollback {
             self.tool_manager.rollback_headroom_upgrade()
         } else {
             Ok(())
         };
+        drop(rollback_guard);
         let rollback_restored = needs_commit_or_rollback && rollback_result.is_ok();
         if let Err(err) = rollback_result {
             log::error!("run_upgrade_with_ui: rollback failed: {err:#}");
@@ -3157,6 +3219,21 @@ impl AppState {
         *progress = bootstrap_failed_state(&progress, message.into());
     }
 
+    /// See `runtime_upgrade_installing`. Ok-and-skip, like the gate short-
+    /// circuits: the upgrade restarts the proxy itself once pip is done.
+    fn upgrade_install_blocks_spawn(&self) -> bool {
+        let installing = self
+            .runtime_upgrade_installing
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0;
+        if installing {
+            log::info!(
+                "ensure_headroom_running: runtime upgrade is installing; not starting proxy"
+            );
+        }
+        installing
+    }
+
     pub fn ensure_headroom_running(&self) -> Result<()> {
         // Exit teardown is in progress: stop_headroom has run (or is about
         // to), and a proxy spawned now would be orphaned when the process
@@ -3164,6 +3241,9 @@ impl AppState {
         // Unconditional — even mid-upgrade-validation, quit wins.
         if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
             log::info!("ensure_headroom_running: app is shutting down; not starting proxy");
+            return Ok(());
+        }
+        if self.upgrade_install_blocks_spawn() {
             return Ok(());
         }
         if !self.tool_manager.python_runtime_installed() {
@@ -3234,6 +3314,11 @@ impl AppState {
         // port is reachable and `headroom_process` has been recorded.
         let _lifecycle_guard = self.lifecycle_lock.lock();
 
+        // Re-read: a caller that passed the check above can wait here on the
+        // upgrade's own stop_headroom, then must not spawn into its install.
+        if self.upgrade_install_blocks_spawn() {
+            return Ok(());
+        }
         // Another caller may have brought the runtime up while we waited.
         if !self.tool_manager.python_runtime_installed() {
             return Ok(());
@@ -3349,6 +3434,19 @@ impl AppState {
                 // Fresh child: a death recorded for its predecessor is no
                 // longer diagnostic of the current episode.
                 *self.last_child_natural_exit.lock() = None;
+                // A full-bypass gate flip that raced this spawn timed out on
+                // the lifecycle lock we hold and, lock-less, reaped only
+                // orphans, so the child just recorded would otherwise run for
+                // the whole gated period. Its teardown is owed here.
+                if self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
+                    && !*self.runtime_upgrade_in_progress.lock()
+                {
+                    drop(_lifecycle_guard);
+                    log::info!(
+                        "ensure_headroom_running: proxy_bypass set during spawn; stopping the new backend"
+                    );
+                    self.stop_headroom();
+                }
                 Ok(())
             }
             Err(err) => {
@@ -3556,6 +3654,11 @@ impl AppState {
     /// loop was stuck. Blocking sleep is fine: only the watchdog thread calls
     /// this, once per down episode.
     pub fn dump_backend_stacks(&self) {
+        // No SIGUSR1 on Windows: the call did nothing there and still cost
+        // the watchdog a 1.5s sleep per wedge.
+        if !cfg!(unix) {
+            return;
+        }
         let Some(pid) = self.headroom_process.lock().as_ref().map(|c| c.id()) else {
             return;
         };
@@ -3697,6 +3800,23 @@ impl AppState {
                         || {
                             sentry::capture_message(
                                 "stop_headroom: powershell could not enumerate processes (Win32_Process query failed); sweep skipped",
+                                sentry::Level::Warning,
+                            );
+                        },
+                    );
+                    break;
+                }
+                // A wedged WMI wedges every pattern's query alike: stop after
+                // the first timeout instead of paying it once per pattern on
+                // the quit path.
+                if detail.contains("powershell sweep timed out") {
+                    sentry::with_scope(
+                        |scope| {
+                            scope.set_fingerprint(Some(&["proxy_sweep_timed_out"]));
+                        },
+                        || {
+                            sentry::capture_message(
+                                "stop_headroom: powershell process sweep timed out; sweep skipped",
                                 sentry::Level::Warning,
                             );
                         },
@@ -3854,8 +3974,22 @@ impl AppState {
                 // bypass, so a Claude overage doesn't pause Codex. Mirrors
                 // `apply_pricing_gate_status`. Python lifecycle is handled by
                 // `stop_python_if_gated` / `ensure_headroom_running` — this
-                // only flips the flags (lock-safe).
-                if crate::client_adapters::any_gate_exempt_client_enabled() {
+                // only flips the flags (lock-safe). Not debounced: this runs at
+                // launch and before a spawn, where it keeps a gated user from
+                // getting a free poll interval of optimization per relaunch.
+                let keep_alive = crate::client_adapters::any_gate_exempt_client_enabled();
+                if !self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
+                    && !self
+                        .claude_only_bypass
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    log::info!(
+                        "enforce_pricing_gate: entering {} bypass (gate_reason={:?})",
+                        if keep_alive { "claude-only" } else { "full" },
+                        status.gate_reason
+                    );
+                }
+                if keep_alive {
                     self.claude_only_bypass.store(true, Release);
                     self.proxy_bypass.store(false, Release);
                 } else {
@@ -3900,8 +4034,8 @@ impl AppState {
     /// poll.
     ///
     /// The ungated→gated transition is debounced: the bypass flip only
-    /// fires once `optimization_allowed=false` has been observed for
-    /// `PRICING_GATE_DEBOUNCE_POLLS` consecutive polls. The gated→ungated
+    /// fires once `optimization_allowed=false` has been observed on readings
+    /// `PRICING_GATE_DEBOUNCE_MIN_SPAN` apart. The gated→ungated
     /// direction has no debounce — recovery should be immediate.
     ///
     /// Acquires `lifecycle_lock` (via `stop_headroom` / `ensure_headroom_running`),
@@ -3945,7 +4079,7 @@ impl AppState {
         status: &crate::models::HeadroomPricingStatus,
         codex_keep_alive: bool,
     ) {
-        use std::sync::atomic::Ordering::{Acquire, Release};
+        use std::sync::atomic::Ordering::Acquire;
         let was_bypassed = self.proxy_bypass.load(Acquire) || self.claude_only_bypass.load(Acquire);
         let should_bypass = !status.optimization_allowed;
         // Account wall (trial ended / sign-in required) vs plan-usage metering:
@@ -3961,18 +4095,15 @@ impl AppState {
 
         if should_bypass {
             if !was_bypassed {
-                // Debounce the ungated → gated transition: only flip once we've
-                // seen `PRICING_GATE_DEBOUNCE_POLLS` consecutive gated readings.
-                let prev = self
-                    .pricing_gate_violation_streak
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let streak = prev.saturating_add(1);
-                if streak < PRICING_GATE_DEBOUNCE_POLLS {
-                    log::info!(
-                        "pricing_gate: gated reading {streak}/{PRICING_GATE_DEBOUNCE_POLLS} — debouncing before bypass flip"
-                    );
+                // Debounce the ungated → gated transition.
+                if !gated_reading_confirms(&self.pricing_gate_first_gated_at, "pricing_gate") {
                     return;
                 }
+                log::info!(
+                    "pricing_gate: entering {} bypass (gate_reason={:?}, account_wall={account_wall})",
+                    if codex_keep_alive { "claude-only" } else { "full" },
+                    status.gate_reason
+                );
             }
             // Enter (or re-sync) the Claude gate. Idempotent: the swap guards
             // below only fire stop_headroom/ensure_headroom_running on a real
@@ -3982,11 +4113,12 @@ impl AppState {
             self.enter_claude_gate(codex_keep_alive);
             crate::proxy_intercept::set_account_gate(account_wall);
         } else {
-            // Any ungated reading clears the violation streak so a later
-            // gated reading starts the debounce window over.
-            self.pricing_gate_violation_streak.store(0, Release);
+            // Any ungated reading clears the debounce window so a later
+            // gated reading starts it over.
+            *self.pricing_gate_first_gated_at.lock() = None;
             crate::proxy_intercept::set_account_gate(false);
             if was_bypassed {
+                log::info!("pricing_gate: leaving bypass (optimization allowed)");
                 self.exit_claude_gate();
             }
         }
@@ -4096,36 +4228,68 @@ impl AppState {
             if was_bypassed {
                 return;
             }
-            let prev = self
-                .codex_gate_violation_streak
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            let streak = prev.saturating_add(1);
-            if streak < PRICING_GATE_DEBOUNCE_POLLS {
-                log::info!(
-                    "codex_gate: gated reading {streak}/{PRICING_GATE_DEBOUNCE_POLLS} — debouncing before bypass flip"
-                );
+            if !gated_reading_confirms(&self.codex_gate_first_gated_at, "codex_gate") {
                 return;
             }
+            log::info!(
+                "codex_gate: entering bypass (gate_reason={:?})",
+                codex.gate_reason
+            );
             self.codex_bypass
                 .store(true, std::sync::atomic::Ordering::Release);
         } else {
-            self.codex_gate_violation_streak
-                .store(0, std::sync::atomic::Ordering::Release);
+            *self.codex_gate_first_gated_at.lock() = None;
             if was_bypassed {
+                log::info!("codex_gate: leaving bypass (optimization allowed)");
                 self.codex_bypass
                     .store(false, std::sync::atomic::Ordering::Release);
             }
         }
     }
+
+    /// Test hook: pretend the pending debounce windows opened long enough ago
+    /// for the next gated reading to confirm them.
+    #[cfg(test)]
+    fn age_gate_debounce(&self) {
+        for first in [
+            &self.pricing_gate_first_gated_at,
+            &self.codex_gate_first_gated_at,
+        ] {
+            if let Some(at) = first.lock().as_mut() {
+                *at -= PRICING_GATE_DEBOUNCE_MIN_SPAN;
+            }
+        }
+    }
 }
 
-/// Number of consecutive gated pricing polls required before flipping
-/// `proxy_bypass` on. With the React UI's 60s focused / 600s blurred poll
-/// cadence, 2 polls = 1–10 minutes minimum before a gated state takes effect.
-/// Tuned to ride out single-poll spikes (Anthropic returning a stale or
-/// momentary high utilization, transient network failures clearing auth
-/// state) without delaying real threshold crossings meaningfully.
-const PRICING_GATE_DEBOUNCE_POLLS: u32 = 2;
+/// How far apart the first and the confirming gated reading must be before
+/// the gate flips on. It counts time, not calls: every trigger (frontend
+/// poll, deep link, sign-in, the background loop) evaluates the same cached
+/// status, so two of them milliseconds apart are one observation, and a call
+/// counter let that pair flip the gate on a single reading. At or under the
+/// 60s focused poll, so a real gate still engages on the second poll; the
+/// blurred (600s) cadence and the background loop are slower anyway.
+const PRICING_GATE_DEBOUNCE_MIN_SPAN: Duration = Duration::from_secs(45);
+
+/// Debounce step for one gated reading taken while its gate is off. True once
+/// a gated reading lands `PRICING_GATE_DEBOUNCE_MIN_SPAN` after the first one
+/// (the window then resets, so a gate cleared behind our back re-debounces);
+/// callers clear `first_gated_at` on every ungated reading.
+fn gated_reading_confirms(first_gated_at: &Mutex<Option<Instant>>, gate: &str) -> bool {
+    let mut first = first_gated_at.lock();
+    match *first {
+        None => {
+            *first = Some(Instant::now());
+            log::info!("{gate}: gated reading 1/2 - debouncing before bypass flip");
+            false
+        }
+        Some(at) if at.elapsed() < PRICING_GATE_DEBOUNCE_MIN_SPAN => false,
+        Some(_) => {
+            *first = None;
+            true
+        }
+    }
+}
 
 pub(crate) fn current_platform() -> &'static str {
     std::env::consts::OS
@@ -4155,15 +4319,24 @@ impl Drop for AppState {
         if let Some(mut child) = process.take() {
             let pid = child.id() as i32;
             terminate_process_tree(pid, false);
-            let _ = child.wait();
+            // Bounded like stop_headroom: an unbounded wait on a child that
+            // ignores the stop hung teardown forever.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while matches!(child.try_wait(), Ok(None)) {
+                if std::time::Instant::now() >= deadline {
+                    terminate_process_tree(pid, true);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     }
 }
 
 fn user_home_dir() -> PathBuf {
-    dirs::home_dir()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
+    crate::client_adapters::home_dir()
 }
 
 fn claude_projects_dir() -> PathBuf {
@@ -4570,7 +4743,7 @@ impl LaunchProfile {
                         "launch profile at {} unreadable ({err}); backing up and starting fresh",
                         path.display()
                     );
-                    let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
+                    let _ = crate::client_adapters::move_aside(&path, &path.with_extension("json.corrupt"));
                     Self::fresh()
                 })
         } else {
@@ -4948,7 +5121,7 @@ impl SavingsTracker {
             Ok(state) => state,
             Err(err) => {
                 log::warn!("savings-state.json unreadable ({err}); backing up");
-                let _ = std::fs::rename(&state_path, state_path.with_extension("json.corrupt"));
+                let _ = crate::client_adapters::move_aside(&state_path, &state_path.with_extension("json.corrupt"));
                 None
             }
         }
@@ -5808,6 +5981,7 @@ impl SavingsTracker {
             .unwrap_or(false)
         {
             let rotated = self.records_path.with_extension("jsonl.1");
+            // direct-write: rotates Headroom's own log; a rename, not a rewrite
             let _ = std::fs::rename(&self.records_path, rotated);
         }
         let mut file = std::fs::OpenOptions::new()
@@ -6155,7 +6329,8 @@ fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsSt
             path.display(),
             persisted.schema_version
         );
-        let _ = std::fs::rename(path, path.with_extension("json.schema-mismatch"));
+        let _ =
+            crate::client_adapters::move_aside(path, &path.with_extension("json.schema-mismatch"));
         Ok(None)
     }
 }
@@ -6400,6 +6575,23 @@ static STATS_FETCH_RECOVERED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// `get_recent`) from one starved by traffic (RUST-86 residual on 0.9.16).
 /// Never nested with the two locks above.
 static STATS_FETCH_LAST_OK: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+/// When the previous `/stats` failure happened. Never nested with the locks above.
+static STATS_FETCH_LAST_FAILED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Whether a `/stats` failure is a lone stall that is not worth a Sentry event.
+///
+/// The stall context above answered it: every RUST-86 event after the 0.9.17
+/// feed fix was the FIRST poll to fail after a good one (27-39s since the last
+/// success), 8 of 10 with zero proxied requests in between, spread across
+/// eight hosts. The dashboard serves the last good payload across one miss, so
+/// the user sees nothing, and nothing in the report can say what blocked the
+/// backend loop. What still reports is a timeout
+/// that recurs inside `STATS_FETCH_RECOVERY_WINDOW`: a stall that persists
+/// or comes back is the one the dashboard actually shows.
+fn lone_stats_stall(category: &str, since_previous_failure: Option<Duration>) -> bool {
+    category == "timeout"
+        && since_previous_failure.is_none_or(|gap| gap >= STATS_FETCH_RECOVERY_WINDOW)
+}
 
 fn total_intercept_requests() -> u64 {
     crate::proxy_intercept::intercept_request_counts()
@@ -6453,6 +6645,15 @@ fn stats_fetch_failure_category(reason: &str) -> String {
 }
 
 fn warn_stats_fetch_failed(reason: &str) {
+    let category = stats_fetch_failure_category(reason);
+    let previous_failure = STATS_FETCH_LAST_FAILED_AT.lock().replace(Instant::now());
+    if lone_stats_stall(&category, previous_failure.map(|at| at.elapsed())) {
+        // Still breaks a recovery run, but does not arm the backoff, so the
+        // repeat that makes it reportable is not throttled for 15 minutes.
+        *STATS_FETCH_RECOVERED_AT.lock() = None;
+        log::warn!("headroom /stats fetch failed ({reason}); lone stall, not reported");
+        return;
+    }
     let mut last = STATS_FETCH_WARNED_AT.lock();
     // Any failure breaks the recovery run -- including one this window
     // throttles, which is still evidence the condition has not healed.
@@ -6468,7 +6669,6 @@ fn warn_stats_fetch_failed(reason: &str) {
     };
     *last = Some((Instant::now(), streak));
     drop(last);
-    let category = stats_fetch_failure_category(reason);
     // A 4xx means SOMETHING answered 6767 without the backend's routes, and
     // the readyz gate cannot tell it from an ancient-but-ours proxy (a 404
     // there deliberately counts as reachable). The listener's identity is the
@@ -8508,14 +8708,18 @@ pub(crate) fn recent_app_kills_summary() -> Vec<String> {
         .collect()
 }
 
-fn terminate_process_tree(pid: i32, force: bool) {
+pub(crate) fn terminate_process_tree(pid: i32, force: bool) {
     if cfg!(target_os = "windows") {
+        // Always /F: without it taskkill only posts WM_CLOSE, which a
+        // windowless python never reads, so the "graceful" stage did nothing
+        // and every stop sat out its full 2s wait before the forced one
+        // (several times over on quit). The proxy has no shutdown hook that a
+        // gentler stop would have run. Bounded like the sweep: taskkill
+        // enumerates the tree through the same machinery a wedged WMI stalls.
+        let _ = force;
         let mut command = crate::proc::command("taskkill");
-        command.args(["/PID", &pid.to_string(), "/T"]);
-        if force {
-            command.arg("/F");
-        }
-        let _ = command.status();
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        let _ = crate::proc::output_with_timeout(command, Duration::from_secs(15));
     } else {
         let Some(target) = group_kill_target(pid) else {
             log::error!("refusing to signal process group for pid {pid}: not a pid we spawned");
@@ -8575,6 +8779,13 @@ pub(crate) fn is_session_teardown_exit(code: i32) -> bool {
 /// exit codes.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const PS_SWEEP_ENUMERATION_FAILED: i32 = 3;
+
+/// Deadline for one process-sweep powershell. A healthy run is ~1s warm and a
+/// few seconds cold; this only has to be long enough never to cut a slow but
+/// working WMI short, and short enough that quit and upgrade stay usable when
+/// WMI is wedged.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const PS_SWEEP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Escape a value for use inside a single-quoted PowerShell `-like` pattern.
 /// `[`/`]` are wildcard metacharacters to `-like`, and an embedded `'` would
@@ -8647,12 +8858,22 @@ fn windows_process_sweep_script(
             if own_children { "$true" } else { "$false" }
         ),
     };
+    // The exe can match on the image path as well as the command line: a
+    // client that launches `headroom mcp serve` by bare name off PATH leaves
+    // no venv path in CommandLine, yet that process is exactly the one holding
+    // Scripts\headroom.exe against a wheel reinstall (RUST-29). An empty args
+    // pattern adds no clause, so such a process is not then dropped by a
+    // `$null -like '**'` on a CommandLine WMI would not show us.
+    let args_rule = if args_pattern.is_empty() {
+        String::new()
+    } else {
+        format!("-and $_.CommandLine -like '*{args_escaped}*' ")
+    };
     format!(
         "try {{ $me = {self_pid}; Get-CimInstance Win32_Process -ErrorAction Stop \
          | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
-         -and $_.CommandLine -like '*{exe_pattern}*' \
-         -and $_.CommandLine -like '*{args_escaped}*' \
-         -and {parent_rule} }} \
+         -and ($_.CommandLine -like '*{exe_pattern}*' -or $_.ExecutablePath -like '*{exe_pattern}*') \
+         {args_rule}-and {parent_rule} }} \
          | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
          catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
     )
@@ -8769,15 +8990,30 @@ fn kill_processes_by_command_pattern(
     #[cfg(target_os = "windows")]
     {
         let script = windows_process_sweep_script(exe, args_pattern, std::process::id(), parents);
-        let status = crate::proc::command("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .status()
-            .with_context(|| {
-                format!(
-                    "running powershell kill for exe '{}' args '{args_pattern}'",
+        let mut command = crate::proc::command("powershell");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        // Bounded: this runs on quit (UI thread via restart_app), in the
+        // updater's before-exit hook and ahead of every upgrade. A wedged WMI
+        // (winmgmt stuck, corrupt repository) or an AMSI/AV stall left
+        // `.status()` waiting forever: "Not responding" on quit, the update
+        // installer never launched, the upgrade stuck on "Preparing update".
+        let status = match crate::proc::output_with_timeout(command, PS_SWEEP_TIMEOUT) {
+            Ok(output) => output.status,
+            Err(crate::proc::OutputError::TimedOut) => {
+                return Err(anyhow!(
+                    "powershell sweep timed out after {}s for exe '{}' args '{}'",
+                    PS_SWEEP_TIMEOUT.as_secs(),
+                    exe.display(),
+                    args_pattern
+                ));
+            }
+            Err(crate::proc::OutputError::Spawn(err)) => {
+                return Err(anyhow!(
+                    "running powershell kill for exe '{}' args '{args_pattern}': {err}",
                     exe.display()
-                )
-            })?;
+                ));
+            }
+        };
 
         if status.success() {
             return Ok(());
@@ -8842,6 +9078,61 @@ pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     // any process whose command line mentions the venv dir.
     if let Err(err) = kill_processes_by_command_pattern(venv_dir, "", SweepParents::Any) {
         log::warn!("killing venv lock holders before venv mutation failed: {err:#}");
+    }
+}
+
+/// Kills every process running from the venv whose parent app is gone.
+/// Windows only: mio < 1.2.1 created every socket inheritable, so any child
+/// of an app that exited without stopping it (an update clicked mid-boot
+/// before the kill-on-close job existed, or a learn run or model prefetch,
+/// which never join the job) kept that app's 6767 listener open. Nothing else
+/// released it: the listener's pid is gone, so the intercept read the port
+/// as draining and its SO_REUSEADDR rebind got 10013 until the holder exited,
+/// which for a proxy is never. Anything with a live parent (this app's
+/// children, a relaunching instance's, MCP servers a running client started)
+/// is spared by the orphan rule.
+pub(crate) fn reap_orphaned_venv_processes(venv_dir: &std::path::Path) {
+    if !cfg!(target_os = "windows") {
+        return;
+    }
+    // ponytail: one pass per tree level (headroom.exe -> venv python -> base
+    // python); each pass orphans the next level. A per-pid tree kill would
+    // do it in one, if a deeper tree ever shows up.
+    for _ in 0..3 {
+        // Empty args: the venv path is the whole filter, as in
+        // `kill_venv_lock_holders`.
+        if let Err(err) = kill_processes_by_command_pattern(
+            venv_dir,
+            "",
+            SweepParents::Orphans {
+                own_children: false,
+            },
+        ) {
+            log::info!("reaping orphaned venv processes failed: {err:#}");
+            return;
+        }
+    }
+}
+
+/// Holds `runtime_upgrade_installing` for its lifetime, released on every exit
+/// including a panic (the upgrade runs on a bare thread; a stuck flag would
+/// refuse every proxy start until relaunch).
+struct UpgradeInstallGuard<'a>(&'a AppState);
+
+impl<'a> UpgradeInstallGuard<'a> {
+    fn engage(state: &'a AppState) -> Self {
+        state
+            .runtime_upgrade_installing
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(state)
+    }
+}
+
+impl Drop for UpgradeInstallGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .runtime_upgrade_installing
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -9569,8 +9860,8 @@ mod tests {
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
         hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
-        lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
-        merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
+        lifetime_token_milestones_crossed, log_mtime_advanced, lone_stats_stall,
+        merge_daily_savings, merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
         pick_cache_fields, proxy_readyz_503_body_is_upstream_only,
         proxy_readyz_status_is_reachable, rebuild_persisted_savings_from_records,
@@ -9581,8 +9872,9 @@ mod tests {
         ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
         HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
         RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW,
-        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
+        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_RECOVERED_AT,
+        STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
+        STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -11512,6 +11804,35 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_install_guard_blocks_spawns_until_dropped_even_on_panic() {
+        let base_dir = temp_test_dir("headroom-upgrade-install-guard");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        assert!(!state.upgrade_install_blocks_spawn());
+
+        let guard = super::UpgradeInstallGuard::engage(&state);
+        assert!(state.upgrade_install_blocks_spawn());
+        drop(guard);
+        assert!(!state.upgrade_install_blocks_spawn());
+
+        // Overlapping guards: the first to finish leaves the other in force.
+        let first = super::UpgradeInstallGuard::engage(&state);
+        let second = super::UpgradeInstallGuard::engage(&state);
+        drop(first);
+        assert!(state.upgrade_install_blocks_spawn());
+        drop(second);
+        assert!(!state.upgrade_install_blocks_spawn());
+
+        // A panic mid-install must not leave every later proxy start refused.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = super::UpgradeInstallGuard::engage(&state);
+            panic!("pip wrapper panicked");
+        }));
+        assert!(panicked.is_err());
+        assert!(!state.upgrade_install_blocks_spawn());
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
     fn stop_headroom_gives_up_on_a_held_lifecycle_lock() {
         let base_dir = temp_test_dir("headroom-stop-lifecycle-lock");
         let state = std::sync::Arc::new(AppState::new_in(base_dir.clone()).expect("app state"));
@@ -11782,6 +12103,7 @@ mod tests {
         let state = AppState::new_in(base_dir.clone()).expect("app state");
         // Gated after the debounce.
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(state
             .proxy_bypass
@@ -11819,6 +12141,7 @@ mod tests {
         let mut wall = pricing_status_with_optimization(false);
         wall.gate_reason = Some(PricingGateReason::TrialEnded);
         state.apply_pricing_gate_status(&wall, true);
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&wall, true);
         assert!(
             crate::proxy_intercept::account_gate(),
@@ -11854,6 +12177,7 @@ mod tests {
         );
 
         // Second consecutive gated reading crosses the debounce threshold.
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(
             state
@@ -11873,6 +12197,7 @@ mod tests {
         // codex_keep_alive=true the gate must use the Claude-only bypass so the
         // Python backend stays up for Codex.
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), true);
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), true);
         assert!(
             state
@@ -11938,6 +12263,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Second consecutive gated reading crosses the debounce threshold.
+        state.age_gate_debounce();
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
         assert!(state
             .codex_bypass
@@ -11962,6 +12288,7 @@ mod tests {
         let state = AppState::new_in(base_dir.clone()).expect("app state");
         // Flip it on first.
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
+        state.age_gate_debounce();
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
         assert!(state
             .codex_bypass
@@ -11986,6 +12313,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Ungated reading resets the streak — a single-poll spike clears.
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(true), false);
 
         // Now another gated reading is the first of a new window, not the
@@ -11997,6 +12325,38 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             "an intervening ungated reading must reset the debounce streak"
         );
+        fs::remove_dir_all(base_dir).ok();
+    }
+
+    #[test]
+    fn gate_debounce_counts_time_not_concurrent_callers() {
+        use std::sync::atomic::Ordering::Acquire;
+        let base_dir = temp_test_dir("headroom-bypass-debounce-span");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let gated = pricing_status_with_optimization(false);
+        let codex_gated = codex_usage_with_optimization(false);
+
+        // Several triggers evaluating the same reading in the same instant
+        // (frontend poll + background loop + deep link) are one observation.
+        for _ in 0..3 {
+            state.apply_pricing_gate_status(&gated, false);
+            state.apply_codex_pricing_gate_status(Some(&codex_gated));
+        }
+        assert!(
+            !state.proxy_bypass.load(Acquire),
+            "back-to-back readings must not flip"
+        );
+        assert!(
+            !state.codex_bypass.load(Acquire),
+            "back-to-back readings must not flip"
+        );
+
+        // A gated reading a full span after the first confirms both gates.
+        state.age_gate_debounce();
+        state.apply_pricing_gate_status(&gated, false);
+        state.apply_codex_pricing_gate_status(Some(&codex_gated));
+        assert!(state.proxy_bypass.load(Acquire));
+        assert!(state.codex_bypass.load(Acquire));
         fs::remove_dir_all(base_dir).ok();
     }
 
@@ -12033,6 +12393,7 @@ mod tests {
 
         // Two consecutive gated readings cross the debounce threshold and flip.
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
+        state.age_gate_debounce();
         state.apply_pricing_gate_status(&pricing_status_with_optimization(false), false);
         assert!(state
             .proxy_bypass
@@ -12922,6 +13283,33 @@ mod tests {
         let any = windows_process_sweep_script(exe, "", 4242, super::SweepParents::Any);
         assert!(!any.contains("ParentProcessId"), "{any}");
         assert!(any.contains("-and $true }"), "{any}");
+        // RUST-29: a holder launched by bare name off PATH shows the venv only
+        // in its image path, and an empty args pattern adds no clause that a
+        // hidden CommandLine would fail.
+        assert!(
+            any.contains(r"-or $_.ExecutablePath -like '*C:\Users\a\venv\Scripts\headroom.exe*')"),
+            "{any}"
+        );
+        assert!(!any.contains("-like '**'"), "{any}");
+        assert!(
+            held.contains("-and $_.CommandLine -like '*proxy --port*' -and ("),
+            "{held}"
+        );
+        // reap_orphaned_venv_processes: empty args must still carry the orphan
+        // rule, or the reap kills every MCP server a live client started.
+        let reap = windows_process_sweep_script(
+            exe,
+            "",
+            4242,
+            super::SweepParents::Orphans {
+                own_children: false,
+            },
+        );
+        assert!(!reap.contains("CommandLine -like '**'"), "{reap}");
+        assert!(
+            reap.contains("*') -and (($_.ParentProcessId -eq $me -and $false)"),
+            "{reap}"
+        );
     }
 
     /// A `'` in a Windows username would close the single-quoted `-like`
@@ -12951,6 +13339,8 @@ mod tests {
         // The dashboard retries /stats every 12s and this warn bridges to
         // Sentry, so only the first failure in a window may speak.
         *STATS_FETCH_WARNED_AT.lock() = None;
+        // A repeat, so the lone-stall gate does not swallow the first call.
+        *STATS_FETCH_LAST_FAILED_AT.lock() = Some(Instant::now());
 
         warn_stats_fetch_failed("timed out after 5s");
         let (first, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
@@ -13002,6 +13392,7 @@ mod tests {
         // decay never applied: 97 events in 2 days from one host.
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;
+        *STATS_FETCH_LAST_FAILED_AT.lock() = Some(Instant::now());
 
         warn_stats_fetch_failed("timed out after 15s");
         let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("first failure warns");
@@ -13043,6 +13434,35 @@ mod tests {
             let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("loud again");
             assert_eq!(streak, 1, "a healed-then-broken cause warns immediately");
         }
+
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_RECOVERED_AT.lock() = None;
+    }
+
+    #[test]
+    #[serial_test::serial(stats_fetch_warn)]
+    fn a_lone_stats_stall_stays_local_and_its_repeat_reports() {
+        assert!(lone_stats_stall("timeout", None));
+        assert!(lone_stats_stall(
+            "timeout",
+            Some(STATS_FETCH_RECOVERY_WINDOW)
+        ));
+        assert!(!lone_stats_stall("timeout", Some(Duration::from_secs(27))));
+        // Only timeouts: a 500 or 404 is a fault on its first occurrence.
+        assert!(!lone_stats_stall("http-500", None));
+
+        *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_LAST_FAILED_AT.lock() = None;
+        warn_stats_fetch_failed("timed out after 15s");
+        assert!(
+            (*STATS_FETCH_WARNED_AT.lock()).is_none(),
+            "a lone stall must not report or arm the backoff"
+        );
+        warn_stats_fetch_failed("timed out after 15s");
+        assert!(
+            (*STATS_FETCH_WARNED_AT.lock()).is_some(),
+            "a repeat inside the recovery window reports"
+        );
 
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;

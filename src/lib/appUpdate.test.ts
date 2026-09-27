@@ -1,4 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import * as Sentry from "@sentry/react";
+
+vi.mock("@sentry/react", () => ({
+  captureException: vi.fn(),
+}));
 
 import type { AppUpdateConfiguration, AvailableAppUpdate } from "./types";
 import {
@@ -381,13 +386,60 @@ describe("app update helpers", () => {
   });
 
   it("replaces a dropped-download error with copy the user can act on", async () => {
-    const invokeFn = vi.fn().mockRejectedValueOnce("error decoding response body");
+    // The automatic re-download drops too.
+    const invokeFn = vi
+      .fn()
+      .mockRejectedValueOnce("error decoding response body")
+      .mockResolvedValueOnce(availableUpdate)
+      .mockRejectedValueOnce("error decoding response body");
 
     const result = await runAppUpdateInstall({ availableUpdate, invokeFn });
 
     expect(result).toEqual({
       statusCopy: "Could not download the update: the connection dropped. Try again.",
     });
+  });
+
+  it("re-downloads once after a dropped download instead of reporting it (RUST-HS)", async () => {
+    vi.mocked(Sentry.captureException).mockClear();
+    const invokeFn = vi
+      .fn()
+      .mockRejectedValueOnce("error decoding response body")
+      .mockResolvedValueOnce(availableUpdate)
+      .mockResolvedValueOnce(undefined);
+
+    const result = await runAppUpdateInstall({ availableUpdate, quiet: true, invokeFn });
+
+    expect(invokeFn.mock.calls.map((call) => call[0])).toEqual([
+      "install_app_update",
+      "check_for_app_update",
+      "install_app_update",
+    ]);
+    expect(result.stagedVersion).toBe("0.3.0");
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it("shows the read-only-bundle refusal without reporting it (RUST-JK)", async () => {
+    const readOnly =
+      "Headroom cannot update itself because it is running from a read-only folder. " +
+      "If you opened it straight from the disk image, drag Headroom to your " +
+      "Applications folder and open it from there, then check for updates again.";
+    vi.mocked(Sentry.captureException).mockClear();
+
+    const result = await runAppUpdateInstall({
+      availableUpdate,
+      quiet: true,
+      invokeFn: vi.fn().mockRejectedValueOnce(readOnly),
+    });
+
+    expect(result).toEqual({ statusCopy: readOnly });
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+
+    await runAppUpdateInstall({
+      availableUpdate,
+      invokeFn: vi.fn().mockRejectedValueOnce("permission denied"),
+    });
+    expect(Sentry.captureException).toHaveBeenCalledTimes(1);
   });
 
   it("re-checks and retries once when the staged update was already consumed", async () => {

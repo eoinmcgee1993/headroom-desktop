@@ -748,6 +748,7 @@ pub fn spawn(
                 // Headroom desktop instance (updater relaunch), which nothing
                 // else ever clears -- see reclaim_stranded_intercept_holder.
                 let mut reclaim_attempted = false;
+                let mut orphans_reaped = false;
                 // A restart -- the updater relaunch, or the "Restart now"
                 // button -- starts the new process while the old one still
                 // holds the port, so the first bind after launch routinely
@@ -908,6 +909,15 @@ pub fn spawn(
                                     "[proxy_intercept] port {INTERCEPT_PORT} still held {}s after launch (a restart overlapping the previous instance looks exactly like this); retrying ({e})",
                                     launched_at.elapsed().as_secs()
                                 );
+                                // Orphans only, so safe while the previous
+                                // instance is still on its way out; no need to
+                                // sit out the rest of the grace first.
+                                if launched_at.elapsed() >= HINT_GRACE && !orphans_reaped {
+                                    orphans_reaped = true;
+                                    if reap_orphans_holding_intercept() {
+                                        continue;
+                                    }
+                                }
                             } else {
                                 // Nothing answered /health, so the port is
                                 // held without being served: bind says in-use
@@ -948,6 +958,12 @@ pub fn spawn(
                                             "[proxy_intercept] reclaimed stranded instance on port {INTERCEPT_PORT}; retrying bind"
                                         );
                                         continue;
+                                    }
+                                    if !orphans_reaped {
+                                        orphans_reaped = true;
+                                        if reap_orphans_holding_intercept() {
+                                            continue;
+                                        }
                                     }
                                 }
                                 // Who actually holds it decides whether this
@@ -1014,8 +1030,23 @@ pub fn spawn(
                                             launched_at.elapsed().as_secs()
                                         );
                                         if reported_errors.insert(format!("stuck:{key}")) {
+                                            // What is left on the port, since
+                                            // nothing is listening: RUST-JY
+                                            // arrived with no way to tell a
+                                            // leaked socket from a holder
+                                            // netstat cannot see.
+                                            #[cfg(windows)]
+                                            let port_sockets =
+                                                crate::tool_manager::port_socket_rows(
+                                                    INTERCEPT_PORT,
+                                                );
                                             sentry::with_scope(
                                                 |scope| {
+                                                    #[cfg(windows)]
+                                                    scope.set_extra(
+                                                        "port_sockets",
+                                                        port_sockets.into(),
+                                                    );
                                                     scope.set_extra(
                                                         "os_error", e.to_string().into());
                                                     scope.set_extra(
@@ -1150,6 +1181,22 @@ pub fn spawn(
             });
         })
         .expect("spawn proxy intercept thread");
+}
+
+/// A dead app's listener can outlive it in an orphaned child: see
+/// `state::reap_orphaned_venv_processes`. Returns whether a reap ran (Windows
+/// only), so the caller retries the plain bind before any SO_REUSEADDR one.
+fn reap_orphans_holding_intercept() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let runtime =
+        crate::tool_manager::ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir());
+    crate::state::reap_orphaned_venv_processes(&runtime.venv_dir);
+    log::info!(
+        "[proxy_intercept] reaped orphaned venv processes that could hold port {INTERCEPT_PORT}; retrying bind"
+    );
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1506,8 +1553,14 @@ async fn handle(
 
     // Codex-only gate: keep Codex routed through the Python backend so it can
     // preserve the correct upstream for either ChatGPT OAuth or an API key,
-    // but tell it to skip optimization for this request.
-    if is_codex && !is_opencode && !is_grok && codex_bypass.load(Ordering::Acquire) {
+    // but tell it to skip optimization for this request. The account wall
+    // counts too: the Codex gate reads a signed-out user as ungated (no
+    // account), which the frontend used to cover by disconnecting Codex.
+    if is_codex
+        && !is_opencode
+        && !is_grok
+        && (codex_bypass.load(Ordering::Acquire) || account_gate())
+    {
         record_gated_bypass(&buf);
         stamp_headroom_bypass_header(&mut buf);
     }
@@ -2273,6 +2326,17 @@ fn codex_error_summary(body: &[u8]) -> String {
                 if let Some(detail) = safe_detail_text(&json) {
                     summary.push_str(" detail=");
                     summary.push_str(&detail);
+                }
+                // `{success, error, errorType}` gateways (RUST-FD, opencode)
+                // put the class in `errorType` beside a free-text `error`.
+                // An identifier-shaped value is schema, like a key name.
+                if let Some(kind) = json
+                    .get("errorType")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| is_safe_shape_key(v))
+                {
+                    summary.push_str(" errorType=");
+                    summary.push_str(kind);
                 }
                 return summary;
             }
@@ -5886,6 +5950,15 @@ mod tests {
             codex_error_summary(br#"{"detail":"bad input: {\"x\": 1}"}"#),
             "no structural error fields; shape=object{detail} (34 bytes)"
         );
+        // RUST-FD: the class rides in `errorType`; the free-text `error` never does.
+        assert_eq!(
+            codex_error_summary(
+                br#"{"success":false,"error":"SECRET prompt","errorType":"invalid_request"}"#
+            ),
+            "no structural error fields; shape=object{error,errorType,success} (71 bytes) \
+             errorType=invalid_request"
+        );
+        assert!(!codex_error_summary(br#"{"errorType":"has spaces SECRET"}"#).contains("SECRET"));
         let long = format!(r#"{{"detail":"{}"}}"#, "a".repeat(121));
         assert!(!codex_error_summary(long.as_bytes()).contains("detail="));
         // An auth error naming the rejected account is the likeliest way a

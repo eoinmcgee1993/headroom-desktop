@@ -1144,19 +1144,21 @@ pub fn is_codex_enabled() -> bool {
     is_configured(&load_setup_state(), "codex_cli")
 }
 
-pub fn is_grok_build_enabled() -> bool {
-    is_configured(&load_setup_state(), "grok_build")
-}
-
-pub fn is_opencode_enabled() -> bool {
-    is_configured(&load_setup_state(), "opencode")
-}
-
 /// True when an enabled connector bills against the user's own provider keys
 /// (or ChatGPT plan), so the Claude pricing gate must neither stop the Python
 /// backend nor bypass the proxy for it.
+///
+/// Counts the remembered snapshot too, as `list_client_connectors` does: quit
+/// empties `configured_clients`, and on relaunch the gate is enforced before
+/// `restore_client_setups` re-applies them, so reading only the configured set
+/// picked FULL bypass for a gated Codex user and tore the backend down until
+/// the watchdog brought it back ~35s later. A deliberate pause holds the same
+/// snapshot; `ensure_headroom_running` still declines the spawn while paused.
 pub fn any_gate_exempt_client_enabled() -> bool {
-    is_codex_enabled() || is_opencode_enabled() || is_grok_build_enabled()
+    let state = load_setup_state();
+    ["codex_cli", "opencode", "grok_build"]
+        .iter()
+        .any(|id| is_configured(&state, id) || state.remembered_clients.contains_key(*id))
 }
 
 pub fn list_client_connectors(
@@ -1461,13 +1463,19 @@ fn kill_processes_under(dir: &Path) {
     let script = format!(
         "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne {me} -and $_.Name -ne 'uninstall.exe' -and $_.ExecutablePath -like '{escaped}\\*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
     );
-    match crate::proc::command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => log::warn!("cleanup: process sweep exited {:?}", status.code()),
-        Err(err) => log::warn!("cleanup: process sweep failed to run: {err}"),
+    let mut command = crate::proc::command("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    // Bounded: uninstall must finish even when WMI is wedged; the removal
+    // below retries past whatever this sweep could not stop.
+    match crate::proc::output_with_timeout(command, Duration::from_secs(20)) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => log::warn!("cleanup: process sweep exited {:?}", output.status.code()),
+        Err(crate::proc::OutputError::TimedOut) => {
+            log::warn!("cleanup: process sweep timed out after 20s")
+        }
+        Err(crate::proc::OutputError::Spawn(err)) => {
+            log::warn!("cleanup: process sweep failed to run: {err}")
+        }
     }
     // Handles are released asynchronously after the process dies.
     std::thread::sleep(Duration::from_millis(300));
@@ -1689,7 +1697,11 @@ pub fn perform_full_cleanup() -> Vec<String> {
     // Also wipe the per-client setup-state file so a reinstall starts clean.
     let setup_state = setup_state_path();
     if setup_state.exists() {
-        let _ = std::fs::remove_file(&setup_state);
+        // Retried and reported: a stale setup state left by one scanner hold
+        // made the reinstall think every client was already configured.
+        if let Err(err) = retry_transient_denied(|| std::fs::remove_file(&setup_state)) {
+            log::warn!("cleanup: removing {} failed: {err}", setup_state.display());
+        }
     }
 
     let app_dir = app_data_dir();
@@ -1713,7 +1725,9 @@ pub fn perform_full_cleanup() -> Vec<String> {
 
     let dot_headroom = home_dir().join(".headroom");
     if dot_headroom.exists() {
-        match std::fs::remove_dir_all(&dot_headroom) {
+        // Tolerant, like the app dir: one file a scanner (or a proxy that has
+        // not let go yet) still holds used to abort the whole removal.
+        match purge_dir_tolerantly(&dot_headroom) {
             Ok(_) => removed.push(dot_headroom.display().to_string()),
             Err(err) => log::warn!("cleanup: removing {} failed: {err}", dot_headroom.display()),
         }
@@ -1752,7 +1766,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
                 continue;
             }
             let dir = entry.path();
-            match std::fs::remove_dir_all(&dir) {
+            match remove_dir_all_retry(&dir) {
                 Ok(_) => removed.push(dir.display().to_string()),
                 Err(err) => log::warn!("cleanup: removing {} failed: {err}", dir.display()),
             }
@@ -1867,9 +1881,32 @@ fn sweep_managed_backups(target: &Path) -> Vec<String> {
 /// footprint (the app-support dir or `~/.headroom`). Uninstall deletes both,
 /// so a surviving entry could only ever spawn a failing server.
 fn mcp_command_in_headroom_footprint(command: &str) -> bool {
-    let app_dir = format!("{}/", app_data_dir().display());
-    let dot_headroom = format!("{}/", home_dir().join(".headroom").display());
-    command.starts_with(&app_dir) || command.starts_with(&dot_headroom)
+    command_under_dir(command, &app_data_dir())
+        || command_under_dir(command, &home_dir().join(".headroom"))
+}
+
+/// Is `command` a path inside `dir`? A literal `format!("{dir}/")` prefix never
+/// matched on Windows, where the configs hold `C:\Users\...\serena.exe` with
+/// backslashes and any drive-letter/user casing, so uninstall left entries
+/// pointing at deleted executables in every Claude session.
+fn command_under_dir(command: &str, dir: &Path) -> bool {
+    command_under_dir_for(command, &dir.display().to_string(), cfg!(windows))
+}
+
+fn command_under_dir_for(command: &str, dir: &str, windows: bool) -> bool {
+    let norm = |s: &str| {
+        if windows {
+            s.replace('/', "\\").to_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    let sep = if windows { '\\' } else { '/' };
+    let mut prefix = norm(dir);
+    if !prefix.ends_with(sep) {
+        prefix.push(sep);
+    }
+    norm(command).starts_with(&prefix)
 }
 
 /// Headroom-owned MCP entry: the `headroom` server itself (desktop owns that
@@ -2512,6 +2549,29 @@ fn write_setup_state(state: &ClientSetupState) -> Result<()> {
 /// user-owned configs (settings.json, config.toml, shell rc files) breaks the
 /// user's shell or client startup.
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    // Write through a symlink, not over it. Renaming the tmp onto the link
+    // replaces the link itself with a regular file, so a dotfiles-managed
+    // `~/.zprofile -> ~/dotfiles/zprofile` silently forked into a copy and the
+    // repo never saw the edit. Resolving first also keeps the tmp beside the
+    // real file, so the rename stays on one filesystem.
+    let resolved = resolve_symlink_chain(path);
+    if resolved == path {
+        return atomic_write_at(path, contents);
+    }
+    atomic_write_at(&resolved, contents).or_else(|err| {
+        // A link into a tree we cannot write (Nix home-manager points
+        // ~/.claude/settings.json into the read-only /nix/store) can't be
+        // written through. Replacing the link is what every write did before,
+        // and it beats failing a routing write outright.
+        log::info!(
+            "writing through symlink {} failed ({err}); replacing the link",
+            path.display()
+        );
+        atomic_write_at(path, contents)
+    })
+}
+
+fn atomic_write_at(path: &Path, contents: &[u8]) -> Result<()> {
     // Per-writer unique tmp name. A fixed `<path>.tmp` is shared by concurrent
     // writers to the same file: A renames tmp->path, then B's rename finds its
     // tmp already consumed and fails ENOENT (Sentry RUST-3W / RUST-4W). pid +
@@ -2552,6 +2612,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         std::fs::Permissions::from_mode(meta.permissions().mode() & 0o777)
     });
     let mut write_tmp = || -> std::io::Result<()> {
+        // direct-write: this is atomic_write
         let mut f = std::fs::File::create(&tmp_path)?;
         // Before any byte lands, so the contents never sit under a wider mode.
         // Best effort: a filesystem without Unix modes (vfat, some network
@@ -2576,6 +2637,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     // (os error 5) even though nothing is wrong with the state (RUST-9M,
     // pricing-state on 0.8.9). Transient by nature -- retry briefly before
     // reporting.
+    // direct-write: this is atomic_write
     rename_recovering_lost_tmp(&mut || std::fs::rename(&tmp_path, path), &mut write_tmp).map_err(
         |err| {
             let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
@@ -2586,6 +2648,59 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
             )
         },
     )
+}
+
+/// Follows `path` through any symlinks to the file a write should land in.
+///
+/// Hand-rolled rather than `canonicalize` so a dangling link resolves to its
+/// (missing) target instead of failing: writing through it creates the target,
+/// as `echo >> link` would. Relative targets resolve against the link's own
+/// directory. Gives up after 40 hops (the kernel's ELOOP limit) and returns the
+/// last path reached, so a link cycle degrades to the old replace-the-link
+/// behaviour instead of an error.
+pub(crate) fn resolve_symlink_chain(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let is_link = std::fs::symlink_metadata(&current)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            break;
+        }
+        let Ok(target) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .map(|dir| dir.join(&target))
+                .unwrap_or(target)
+        };
+    }
+    current
+}
+
+/// Test helper: creates a file symlink, or returns false where the OS refuses.
+/// Windows needs Developer Mode or an elevated shell to create one, so a local
+/// Windows run skips; CI must not, since a silent skip there would hide the
+/// only Windows coverage of `resolve_symlink_chain` (the runners can create
+/// links, so a refusal on CI is a failure).
+#[cfg(test)]
+pub(crate) fn symlink_file_or_skip(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    let result = std::os::windows::fs::symlink_file(target, link);
+    match result {
+        Ok(()) => true,
+        Err(err) if cfg!(windows) && std::env::var_os("CI").is_none() => {
+            eprintln!("skipping: cannot create symlinks here ({err})");
+            false
+        }
+        Err(err) => panic!("creating symlink {}: {err}", link.display()),
+    }
 }
 
 /// Renames a freshly written tmp into place, rewriting it once if it vanished.
@@ -2611,13 +2726,17 @@ fn rename_recovering_lost_tmp(
 /// Retries `op` while it fails `PermissionDenied` (or, on Windows, a sharing
 /// violation: os error 32, which std maps to `Uncategorized`, raised when the
 /// client itself holds its config open mid-write - RUST-5X), sleeping
-/// 50/100/200ms between attempts (4 tries total). Any other error, or the
-/// final denial, is returned as-is.
+/// 50/100/200ms between attempts (4 tries total), and on Windows also 400 and
+/// 800ms (6 tries, ~1.5s): Defender and the search indexer hold a freshly
+/// written file for a second or more, longer than the old 350ms window, and
+/// every persisted write goes through here. On Unix a denial is nearly always
+/// a real permission problem, so it keeps the short window. Any other error,
+/// or the final denial, is returned as-is.
 pub(crate) fn retry_transient_denied<T>(
     mut op: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     let mut delay = std::time::Duration::from_millis(50);
-    for _ in 0..3 {
+    for _ in 0..TRANSIENT_DENIED_RETRIES {
         match op() {
             Err(err) if is_transient_denied(&err) => {
                 std::thread::sleep(delay);
@@ -2629,9 +2748,30 @@ pub(crate) fn retry_transient_denied<T>(
     op()
 }
 
+/// Retries after the first attempt (see `retry_transient_denied`).
+const TRANSIENT_DENIED_RETRIES: u32 = if cfg!(windows) { 5 } else { 3 };
+
 fn is_transient_denied(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::PermissionDenied
         || (cfg!(windows) && err.raw_os_error() == Some(32))
+}
+
+/// Move `path` to `dest` so the next write cannot destroy it. The rename is
+/// retried through the transient Windows denials a scanner causes, and when
+/// it still fails the file is COPIED instead: a bare rename failing on
+/// Windows let the fresh default state persist over the only copy of a user's
+/// savings history, which is exactly what the backup exists to prevent.
+pub(crate) fn move_aside(path: &Path, dest: &Path) -> std::io::Result<()> {
+    // direct-write: moves Headroom's own unparsable state aside, never a user file
+    match retry_transient_denied(|| std::fs::rename(path, dest)) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => std::fs::copy(path, dest).map(|_| ()).map_err(|copy_err| {
+            std::io::Error::new(
+                copy_err.kind(),
+                format!("rename failed ({rename_err}); copy failed ({copy_err})"),
+            )
+        }),
+    }
 }
 
 /// Move an unparsable state file aside instead of letting the next write
@@ -2645,7 +2785,7 @@ pub(crate) fn quarantine_unparsable(path: &Path, reason: &str) {
     let mut s = path.as_os_str().to_os_string();
     s.push(".corrupt");
     let dest = PathBuf::from(s);
-    match std::fs::rename(path, &dest) {
+    match move_aside(path, &dest) {
         Ok(()) => log::warn!(
             "quarantined unparsable {} -> {} ({reason})",
             path.display(),
@@ -6707,7 +6847,7 @@ fn remove_claude_remote_control_command() -> Result<()> {
         }
     }
     if hooks_removed && script.exists() {
-        std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
+        remove_owned_script(&script);
     }
     for command in [
         claude_remote_control_command_path(),
@@ -6715,8 +6855,7 @@ fn remove_claude_remote_control_command() -> Result<()> {
     ] {
         if let Ok(content) = std::fs::read_to_string(&command) {
             if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER) {
-                std::fs::remove_file(&command)
-                    .with_context(|| format!("removing {}", command.display()))?;
+                remove_owned_script(&command);
             }
         }
     }
@@ -6924,12 +7063,24 @@ fn ensure_claude_statusline() -> Result<(Vec<String>, Vec<String>)> {
     Ok((changed, backups))
 }
 
+/// Remove a script we own once its settings entry is already gone. Claude Code
+/// may be executing it at that moment, which Windows refuses to delete; the
+/// entry is what mattered, so a file that survives the retries is logged and
+/// left for next time rather than failing a disable the user already got.
+fn remove_owned_script(path: &Path) {
+    match retry_transient_denied(|| std::fs::remove_file(path)) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => log::warn!("removing {} failed: {err}", path.display()),
+    }
+}
+
 /// Remove our `statusLine` entry (never a user's own) and the script.
 fn remove_claude_statusline() -> Result<()> {
     set_claude_statusline_setting(None)?;
     let script = claude_statusline_script_path();
     if script.exists() {
-        std::fs::remove_file(&script).with_context(|| format!("removing {}", script.display()))?;
+        remove_owned_script(&script);
     }
     Ok(())
 }
@@ -8138,17 +8289,34 @@ json.dump({{"hookSpecificOutput": {{"hookEventName": "PreToolUse", "permissionDe
     )
 }
 
-/// `HOME` is checked before `dirs::home_dir()`: on Windows the dirs crate
-/// resolves the profile via the known-folder API and ignores `HOME`, so an
-/// env override (TestHome in tests, Git Bash parity in production) would be
-/// silently bypassed and writes would land in the real profile. On Unix the
-/// two sources agree, so the order change is a no-op there.
+/// The user's home, as the tools we configure see it. The one resolver every
+/// module goes through.
+///
+/// On Windows that is the profile folder (`dirs::home_dir`, the known-folder
+/// API), NOT `HOME`: Claude Code (Node's `os.homedir()`), Codex and the Python
+/// proxy (`Path.home()`) all ignore `HOME` there. A machine with a persistent
+/// `HOME` (a corporate `H:\`, some Git setups) had the desktop writing
+/// `~/.claude` settings and reading `~/.headroom` ledgers and logs in one
+/// place while every tool it configures used another.
+///
+/// `HOME` still comes first on Unix, where the two agree, and in test builds
+/// on every platform: TestHome redirects through it, and without that the
+/// Windows test job would write into the runner's real profile.
 pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .unwrap_or_else(std::env::temp_dir)
+    let from_env = || {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    if cfg!(windows) && !cfg!(test) {
+        dirs::home_dir()
+            .or_else(from_env)
+            .unwrap_or_else(std::env::temp_dir)
+    } else {
+        from_env()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(std::env::temp_dir)
+    }
 }
 
 /// Codex's home directory. Mirrors the Codex CLI and the upstream Headroom
@@ -11208,6 +11376,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn gate_exemption_holds_across_the_quit_to_restore_window() {
+        // Quit clears configured_clients into the remembered snapshot, and the
+        // launch-time gate runs before restore_client_setups re-applies it.
+        // Reading configured alone chose full bypass for a Codex user (W4).
+        let _home = TestHome::new();
+        assert!(!super::any_gate_exempt_client_enabled());
+        super::apply_client_setup("codex").expect("apply");
+        assert!(super::any_gate_exempt_client_enabled());
+
+        super::clear_client_setups().expect("quit-time clear");
+        assert!(super::load_setup_state().configured_clients.is_empty());
+        assert!(
+            super::any_gate_exempt_client_enabled(),
+            "restore still pending"
+        );
+
+        // A user disable drops it from both sets, so the exemption ends.
+        super::disable_client_setup("codex").expect("disable");
+        assert!(!super::any_gate_exempt_client_enabled());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn list_client_connectors_carries_verification_only_for_enabled_clients() {
         // The connector panel keys its status line off these two fields: an
         // enabled client must arrive with its checks attached (the panel has
@@ -11378,7 +11569,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             after.get("provider").is_none(),
             "provider husk removed on disable, got:\n{after:#}"
         );
-        assert!(!super::is_opencode_enabled());
+        assert!(!super::is_configured(
+            &super::load_setup_state(),
+            "opencode"
+        ));
     }
 
     #[test]
@@ -12973,7 +13167,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     fn retry_transient_denied_gives_up_and_passes_other_errors_through() {
-        // Persistent denial: 4 attempts total, then the error surfaces.
+        // Persistent denial: every attempt used (4, or 6 on Windows), then
+        // the error surfaces.
         let mut calls = 0;
         let out = super::retry_transient_denied(|| -> std::io::Result<()> {
             calls += 1;
@@ -12983,7 +13178,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             out.unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
-        assert_eq!(calls, 4);
+        assert_eq!(calls, super::TRANSIENT_DENIED_RETRIES + 1);
         // A non-denied error is never retried.
         let mut calls = 0;
         let out = super::retry_transient_denied(|| -> std::io::Result<()> {
@@ -12992,6 +13187,54 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         });
         assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::NotFound);
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn command_under_dir_matches_windows_paths_by_separator_and_case() {
+        let dir = r"C:\Users\Jo\AppData\Local\Headroom";
+        // What Claude's config actually holds on Windows: backslashes, and
+        // whatever casing the writer used. The old `format!("{dir}/")` prefix
+        // matched none of these, so uninstall left them behind.
+        assert!(super::command_under_dir_for(
+            r"C:\Users\Jo\AppData\Local\Headroom\tools\serena\serena.exe",
+            dir,
+            true
+        ));
+        assert!(super::command_under_dir_for(
+            "c:/users/jo/appdata/local/headroom/tools/serena/serena.exe",
+            dir,
+            true
+        ));
+        // A sibling that merely shares the prefix is not inside the footprint.
+        assert!(!super::command_under_dir_for(
+            r"C:\Users\Jo\AppData\Local\HeadroomOther\x.exe",
+            dir,
+            true
+        ));
+        // Unix stays exact: case matters there.
+        assert!(super::command_under_dir_for(
+            "/Users/jo/.headroom/bin/x",
+            "/Users/jo/.headroom",
+            false
+        ));
+        assert!(!super::command_under_dir_for(
+            "/Users/jo/.HEADROOM/bin/x",
+            "/Users/jo/.headroom",
+            false
+        ));
+    }
+
+    #[test]
+    fn move_aside_moves_the_file_and_keeps_its_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("savings-state.json");
+        let dest = dir.path().join("savings-state.json.corrupt");
+        std::fs::write(&path, b"{history}").expect("seed");
+        super::move_aside(&path, &dest).expect("move aside");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&dest).expect("backup"), b"{history}");
+        // A missing source is an error, not a silent success.
+        assert!(super::move_aside(&path, &dest).is_err());
     }
 
     #[cfg(windows)]
@@ -13919,6 +14162,179 @@ sys.exit(3)
             assert_eq!(got, mode, "mode {mode:o} was not kept");
             assert_eq!(std::fs::read(&path).unwrap(), b"new");
         }
+    }
+
+    #[test]
+    fn managed_block_writes_through_a_symlinked_profile() {
+        // A dotfiles-managed `~/.zprofile -> dotfiles/zprofile` must stay a
+        // link: the rename used to replace the link with a regular file, so the
+        // block landed in a fork the dotfiles repo never saw. Relative target
+        // plus a second hop covers the stow-style `../dotfiles/...` chains.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles").join("zprofile");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "export FOO=1\n").unwrap();
+        let hop = dir.path().join("hop");
+        if !super::symlink_file_or_skip(&Path::new("dotfiles").join("zprofile"), &hop) {
+            return;
+        }
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let link = home.join(".zprofile");
+        assert!(super::symlink_file_or_skip(
+            &Path::new("..").join("hop"),
+            &link
+        ));
+
+        let (changed, _) = super::upsert_managed_block(&link, "test", "export BAR=2").unwrap();
+        assert!(changed);
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&hop)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let body = std::fs::read_to_string(&real).unwrap();
+        assert!(body.starts_with("export FOO=1\n"), "{body}");
+        assert!(body.contains("export BAR=2"), "{body}");
+
+        // Backups stay beside the link, never inside the dotfiles repo.
+        let repo: Vec<_> = std::fs::read_dir(real.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(repo, vec![std::ffi::OsString::from("zprofile")]);
+
+        assert!(super::remove_managed_block(&link, "test").unwrap());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "export FOO=1\n");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn connector_round_trip_keeps_every_symlinked_config_a_symlink() {
+        // A dotfiles repo owning every file the Claude Code and Codex connectors
+        // write. Apply, pause (clear) and resume (restore) must each land in the
+        // repo's files and leave every link in place.
+        let home = TestHome::new();
+        let repo = home.path().join("dotfiles");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let files = [
+            (".zshrc", "# user zshrc\n"),
+            (".zshenv", "# user zshenv\n"),
+            (".zprofile", "# user zprofile\n"),
+            (".claude/settings.json", "{}"),
+            (".claude.json", "{}"),
+            (".codex/config.toml", "# user codex\n"),
+        ];
+        for (name, body) in files {
+            let real = repo.join(name.replace('/', "_"));
+            fs::write(&real, body).unwrap();
+            if !super::symlink_file_or_skip(&real, &home.path().join(name)) {
+                return;
+            }
+        }
+        seed_installed_rtk();
+        let links_intact = || {
+            for (name, _) in files {
+                let meta = fs::symlink_metadata(home.path().join(name)).unwrap();
+                assert!(meta.file_type().is_symlink(), "{name} replaced by a file");
+            }
+        };
+        let repo_has = |needle: &str| {
+            files.iter().any(|(name, _)| {
+                fs::read_to_string(repo.join(name.replace('/', "_")))
+                    .unwrap()
+                    .contains(needle)
+            })
+        };
+
+        super::apply_client_setup("claude_code").expect("apply claude");
+        super::apply_client_setup("codex").expect("apply codex");
+        links_intact();
+        assert!(
+            repo_has("127.0.0.1:6767"),
+            "routing landed in the repo files"
+        );
+
+        super::clear_client_setups().expect("pause");
+        links_intact();
+        assert!(!repo_has("127.0.0.1:6767"), "pause stripped the repo files");
+
+        super::restore_client_setups();
+        links_intact();
+        assert!(repo_has("127.0.0.1:6767"), "resume restored the repo files");
+
+        // Every backup stays beside its link, never inside the repo.
+        let mut in_repo: Vec<_> = fs::read_dir(&repo)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        in_repo.sort();
+        assert_eq!(in_repo.len(), files.len(), "{in_repo:?}");
+    }
+
+    #[test]
+    fn atomic_write_through_a_dangling_symlink_creates_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("missing");
+        let link = dir.path().join("link");
+        if !super::symlink_file_or_skip(&target, &link) {
+            return;
+        }
+        super::atomic_write(&link, b"x").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_a_read_only_target_replaces_the_link() {
+        // home-manager links into the read-only /nix/store: writing through
+        // cannot work, so the write falls back to replacing the link.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let target = store.join("settings.json");
+        std::fs::write(&target, b"{}").unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let result = super::atomic_write(&link, b"new");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        assert!(!std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&link).unwrap(), b"new");
+        assert_eq!(std::fs::read(&target).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn atomic_write_on_a_symlink_cycle_still_writes() {
+        // A cycle cannot be followed; fall back to replacing the link rather
+        // than failing the write.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        if !super::symlink_file_or_skip(&b, &a) {
+            return;
+        }
+        assert!(super::symlink_file_or_skip(&a, &b));
+        super::atomic_write(&a, b"x").unwrap();
     }
 
     #[test]

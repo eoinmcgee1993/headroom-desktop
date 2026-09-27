@@ -132,6 +132,8 @@ import {
   outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
+  connectorGateBlocksEnable,
+  connectorGateMessage,
   connectorStatusLine,
   clientSetupNotice,
   currency,
@@ -144,7 +146,6 @@ import {
   formatLearnStatus,
   formatMonthLabel,
   formatSelectedDayLabel,
-  getEnabledSupportedConnectors,
   hasEnabledConnector,
   hasNeverScanned,
   hourOfDayTickFormatter,
@@ -173,7 +174,8 @@ import {
   recommendedHeadroomTier,
   type LauncherStage,
   type MagicLinkState,
-  type InstallWizardStep
+  type InstallWizardStep,
+  type FunnelStep
 } from "./lib/launcherHelpers";
 import { mockDashboard } from "./lib/mockData";
 import {
@@ -394,11 +396,6 @@ function withoutHiddenConnectors(list: ClientConnectorStatus[]) {
   );
 }
 
-// Connectors the Claude pricing gate neither auto-disables nor blocks
-// enabling while the user is authenticated: Codex has its own proxy-side
-// gate (codex_bypass); OpenCode bills against the user's own provider API
-// keys, so the Claude gate has nothing to meter (no dedicated bypass).
-const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode", "grok_build"]);
 
 const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnectors([
   {
@@ -489,7 +486,7 @@ function setConnectorTrafficVerified(verified: boolean): void {
 // Fire-and-forget install-wizard funnel beacon. Errors (offline/mid-install)
 // are swallowed so tracking never affects the wizard. Dedup is server-side
 // (first-write-wins), so re-emitting a step on back-nav is harmless.
-function reportFunnelStep(step: InstallWizardStep): void {
+function reportFunnelStep(step: FunnelStep): void {
   void invoke("report_funnel_step", { step }).catch(() => {});
 }
 
@@ -1239,14 +1236,14 @@ function DailySavingsChart({
                   <stop offset="100%" stopColor="#aa9314" />
                 </linearGradient>
               </defs>
-              <CartesianGrid stroke="rgba(36, 31, 29, 0.06)" strokeDasharray="2 8" vertical={false} />
+              <CartesianGrid stroke="var(--border-subtle)" strokeDasharray="2 8" vertical={false} />
               <XAxis
                 axisLine={false}
                 dataKey="bucketKey"
                 interval={0}
                 minTickGap={view === "month" ? 8 : 8}
                 tickFormatter={view === "month" ? dayOfMonthTickFormatter : hourOfDayTickFormatter}
-                tick={{ fill: "#7a7169", fontSize: 10 }}
+                tick={{ fill: "var(--text-muted)", fontSize: 10 }}
                 tickLine={false}
               />
               {/* Both axes are hidden, so recharts' default "nice" rounding
@@ -1254,7 +1251,7 @@ function DailySavingsChart({
                   domain to the data so the peak bucket fills the plot. */}
               <YAxis domain={[0, "dataMax"]} hide yAxisId="usd" />
               <YAxis domain={[0, "dataMax"]} hide yAxisId="tokens" />
-              <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} />} cursor={{ fill: "rgba(36, 31, 29, 0.05)" }} />
+              <Tooltip content={(props) => <SavingsChartTooltip {...props} chartMode={chartMode} />} cursor={{ fill: "var(--fill-hover)" }} />
               {chartMode === "usd" && (
                 <>
                   <Bar
@@ -3270,6 +3267,8 @@ export default function App() {
   useEffect(() => {
     if (activeView !== "upgrade") {
       setUpgradeActionError(null);
+    } else {
+      reportFunnelStep("upgrade_view_opened");
     }
   }, [activeView]);
 
@@ -3507,39 +3506,18 @@ export default function App() {
     }
   }, [checkoutPollingDeadline, pricingStatus?.account?.subscriptionActive]);
 
-  // When the pricing gate closes, pause optimization on enabled connectors
-  // one at a time. Each disable refreshes `connectors`, re-running this
-  // effect until none remain. Codex is exempt while authenticated:
-  // `optimizationAllowed` reflects the *Claude* paid-plan gate, and Codex has
-  // its own independent gate enforced proxy-side (codex_bypass) — a Claude
-  // weekly cap must not switch off a Codex-heavy user's optimization.
+  // The pricing gate is enforced in the Rust intercept (proxy_bypass,
+  // claude_only_bypass, codex_bypass, the account wall), which forwards gated
+  // traffic direct and counts it for the "unsaved while blocked" nudge. Builds
+  // before 0.9.24-rc.11 ALSO disconnected connectors here on the first gated
+  // reading, with no debounce, and only this webview could reconnect them once
+  // the gate opened: a user who upgraded while it was not running, or whose
+  // localStorage was lost, stayed disconnected and saved nothing. Drain what
+  // those builds left behind, gated or not; the intercept keeps a gated
+  // connector unoptimized. One attempt per connector, so a failing re-enable
+  // cannot loop.
   useEffect(() => {
-    if (!pricingStatus || pricingStatus.optimizationAllowed || connectorsBusy) {
-      return;
-    }
-    const target = getEnabledSupportedConnectors(connectors).find(
-      (connector) =>
-        !pricingStatus.authenticated || !GATE_EXEMPT_CONNECTOR_IDS.has(connector.clientId)
-    );
-    if (!target) {
-      return;
-    }
-    autoDisabledByGateRef.current.add(target.clientId);
-    persistAutoDisabledByGate();
-    void toggleConnector(target, false);
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors/pricingStatus change, so toggleConnector is fresh when it acts
-  }, [connectors, connectorsBusy, pricingStatus]);
-
-  // Companion to the auto-disable effect above: when the pricing gate
-  // releases (e.g., user just signed up post-grace, or weekly usage
-  // rolled over), bring back every connector we auto-disabled without forcing
-  // a manual re-enable click. Scoped to our own prior auto-disables so a
-  // user's manual disable during an ungated period is preserved.
-  useEffect(() => {
-    if (!pricingStatus?.optimizationAllowed || autoDisabledByGateRef.current.size === 0) {
-      return;
-    }
-    if (connectorsBusy) {
+    if (autoDisabledByGateRef.current.size === 0 || connectorsBusy || !connectorsRef.current) {
       return;
     }
     const target = aggregateClientConnectors(connectors).find(
@@ -3551,9 +3529,11 @@ export default function App() {
       persistAutoDisabledByGate();
       return;
     }
+    autoDisabledByGateRef.current.delete(target.clientId);
+    persistAutoDisabledByGate();
     void toggleConnector(target, true);
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors/pricingStatus change, so toggleConnector is fresh when it acts
-  }, [connectors, connectorsBusy, pricingStatus]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- re-runs on every connectors change, so toggleConnector is fresh when it acts
+  }, [connectors, connectorsBusy]);
 
   useEffect(() => {
     const runtimeHealthyNow =
@@ -3818,20 +3798,6 @@ export default function App() {
 
   function getConnectorSupportWarning(connector: ClientConnectorStatus) {
     return connectorSupportWarnings[connector.clientId] ?? null;
-  }
-
-  // Pricing gate: enabling a connector while optimization is disallowed just
-  // triggers the auto-disable effect (the ON->OFF flash). Mirror that effect's
-  // exemption exactly -- Codex is exempt while authenticated (its own
-  // proxy-side gate). Only blocks *enabling*; an already-on connector is left
-  // to the auto-disable effect.
-  function connectorGateBlocksEnable(connector: ClientConnectorStatus) {
-    return (
-      pricingStatus != null &&
-      !pricingStatus.optimizationAllowed &&
-      !connector.enabled &&
-      (!pricingStatus.authenticated || !GATE_EXEMPT_CONNECTOR_IDS.has(connector.clientId))
-    );
   }
 
   function connectorGateCta() {
@@ -4663,11 +4629,9 @@ export default function App() {
       return;
     }
 
-    trackAnalyticsEvent("upgrade_button_clicked", {
-      plan_id: planId,
-      action_kind: action.kind,
-      email: pricingStatus?.account?.email ?? pricingStatus?.claude?.email ?? undefined,
-    });
+    if (action.kind === "checkout") {
+      reportFunnelStep("checkout_clicked");
+    }
 
     if (action.kind === "internal") {
       setUpgradeActionError(null);
@@ -5743,8 +5707,10 @@ export default function App() {
               const unavailableReason = getConnectorUnavailableReason(connector);
               const detectionWarning = getConnectorDetectionWarning(connector);
               const supportWarning = getConnectorSupportWarning(connector);
-              const statusLine = connectorStatusLine(connector);
-              const gateBlocksEnable = connectorGateBlocksEnable(connector);
+              const gateMessage = connectorGateMessage(connector, pricingStatus);
+              const gated = gateMessage != null;
+              const statusLine = connectorStatusLine(connector, Date.now(), gated);
+              const gateBlocksEnable = connectorGateBlocksEnable(connector, pricingStatus);
               return (
                 <article className="connector-item" key={connector.clientId}>
                   <div>
@@ -5801,17 +5767,12 @@ export default function App() {
                         {detectionWarning ?? unavailableReason}
                       </p>
                     ) : null}
-                    {gateBlocksEnable ? (
-                      <p className="connector-item__reason">
-                        {pricingStatus?.gateMessage}{" "}
-                        <button
-                          className="addon-card__link"
-                          type="button"
-                          onClick={connectorGateCta}
-                        >
-                          {pricingStatus?.authenticated ? "Upgrade" : "Sign in"}
-                        </button>
-                      </p>
+                    {/* No CTA here: `connectorGateCta` switches the main
+                        window's view, which the launcher never renders, and
+                        `show_dashboard_window` refuses before onboarding
+                        completes. The main window carries the upgrade path. */}
+                    {gated ? (
+                      <p className="connector-item__reason">{gateMessage}</p>
                     ) : null}
                   </div>
                   <div className="connector-item__controls">
@@ -8041,8 +8002,10 @@ export default function App() {
                           : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
-                    const gateBlocksEnable = connectorGateBlocksEnable(connector);
-                    const statusLine = connectorStatusLine(connector);
+                    const gateMessage = connectorGateMessage(connector, pricingStatus);
+                    const gated = gateMessage != null;
+                    const gateBlocksEnable = connectorGateBlocksEnable(connector, pricingStatus);
+                    const statusLine = connectorStatusLine(connector, Date.now(), gated);
                     const toggleDisabled =
                       connectorsBusy ||
                       !canConfigureConnectorWithoutDetection(connector) ||
@@ -8090,7 +8053,8 @@ export default function App() {
                                           × {failure}
                                         </li>
                                       ))}
-                                      {!connector.verification.proxyReachable ? (
+                                      {/* Gated: the backend is down on purpose. */}
+                                      {!connector.verification.proxyReachable && !gated ? (
                                         <li className="is-waiting">
                                           … Headroom proxy is not answering on 127.0.0.1:6767.
                                         </li>
@@ -8121,9 +8085,9 @@ export default function App() {
                               {detectionWarning ?? unavailableReason}
                             </p>
                           ) : null}
-                          {gateBlocksEnable ? (
+                          {gated ? (
                             <p className="connector-item__reason">
-                              {pricingStatus?.gateMessage}{" "}
+                              {gateMessage}{" "}
                               <button
                                 className="addon-card__link"
                                 type="button"
@@ -8209,14 +8173,17 @@ export default function App() {
                   </div>
                   <div className="runtime-status__grid runtime-status__grid--4">
                     {([
+                      // Full pricing-gate bypass stops the backend on purpose
+                      // and 6767 forwards direct, so neither is a fault.
                       {
                         name: "Runtime",
-                        ok: runtimeStatus?.running === true,
+                        ok: runtimeStatus?.bypassed ? null : runtimeStatus?.running === true,
+                        suffix: runtimeStatus?.bypassed ? "paused by the plan gate" : undefined,
                       },
                       {
                         name: "Proxy",
-                        ok: runtimeStatus?.proxyReachable === true,
-                        suffix: "6767",
+                        ok: runtimeStatus?.bypassed ? null : runtimeStatus?.proxyReachable === true,
+                        suffix: runtimeStatus?.bypassed ? "6767, forwarding direct" : "6767",
                         onClick: () => void invoke("open_headroom_dashboard"),
                       },
                       {
