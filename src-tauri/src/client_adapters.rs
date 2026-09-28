@@ -2986,10 +2986,39 @@ fn markitdown_codex_agents_path() -> PathBuf {
     codex_home().join("AGENTS.md")
 }
 
+/// The shim as a shell word: quoted only when a path with whitespace (a home
+/// dir with a space) would otherwise split. Such a path gets no Bash rule.
+fn markitdown_shim_word(shim_path: &Path) -> String {
+    let bin = shim_path.display().to_string();
+    if bin.contains(char::is_whitespace) {
+        format!("'{bin}'")
+    } else {
+        bin
+    }
+}
+
+/// Whether a `Bash(<shim> *)` rule can be trusted and can match. The Windows
+/// `.cmd` shim cannot vet its arguments (cmd.exe re-parses them); a path with
+/// whitespace never matched in Claude Code, quoted or not (0.9.26-rc.3 on
+/// macOS, where the shim then sat under "Application Support").
+fn markitdown_rule_allowed(shim_path: &Path) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    let spaced = shim_path.to_string_lossy().contains(char::is_whitespace);
+    if spaced {
+        log::warn!(
+            "markitdown shim path {} has whitespace; no Bash rule can match it, Office reads will prompt",
+            shim_path.display()
+        );
+    }
+    !spaced
+}
+
 /// Office-only nudge for Claude Code, where PDFs are already handled by the
 /// PreToolUse(Read) hook.
 fn build_markitdown_office_nudge(shim_path: &Path) -> String {
-    let bin = shim_path.display();
+    let bin = markitdown_shim_word(shim_path);
     format!(
         "## Reading Office documents (Headroom MarkItDown)\n\
          The Read tool cannot open .docx, .doc, .pptx, .ppt, .xlsx, or .xls files.\n\
@@ -3001,7 +3030,7 @@ fn build_markitdown_office_nudge(shim_path: &Path) -> String {
 /// Codex nudge: Codex has no PreToolUse-style hook, so it covers PDF *and*
 /// Office formats through the `markitdown` CLI.
 fn build_markitdown_codex_nudge(shim_path: &Path) -> String {
-    let bin = shim_path.display();
+    let bin = markitdown_shim_word(shim_path);
     format!(
         "## Reading documents (Headroom MarkItDown)\n\
          To read a .pdf, .docx, .doc, .pptx, .ppt, .xlsx, or .xls file, run\n\
@@ -3052,9 +3081,8 @@ pub fn enable_markitdown_integration(
             backup_files.push(path.display().to_string());
         }
 
-        // The Windows `.cmd` shim cannot vet its arguments (cmd.exe re-parses
-        // them), so it gets no prompt-free rule there; see the unix shim.
-        if set_markitdown_bash_permission(markitdown_shim, !cfg!(windows))? {
+        let allowed = markitdown_rule_allowed(markitdown_shim);
+        if set_markitdown_bash_permission(markitdown_shim, &[], |_| Some(allowed))? {
             changed_files.push(claude_settings_path().display().to_string());
         }
     }
@@ -3089,7 +3117,7 @@ pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
         let _ = std::fs::remove_file(&hook_path);
     }
     changed |= remove_managed_block(&markitdown_claude_md_path(), "markitdown_office")?;
-    changed |= set_markitdown_bash_permission(markitdown_shim, false)?;
+    changed |= set_markitdown_bash_permission(markitdown_shim, &[], |_| Some(false))?;
     changed |= remove_managed_block(&markitdown_codex_agents_path(), "markitdown")?;
     // Converted document text must not outlive the integration.
     let _ = std::fs::remove_dir_all(markitdown_cache_dir());
@@ -3107,13 +3135,14 @@ fn markitdown_cache_dir() -> PathBuf {
 
 /// Launch-time heal: rewrites an installed MarkItDown Read hook with the
 /// current body so hook fixes reach existing installs on app update, points
-/// installed nudges and the Bash rule at the current shim (it moved off PATH,
-/// from `legacy_shim`), and drops the rule where the shim cannot be trusted
-/// with it (Windows). Adds nothing the integration did not already have.
+/// installed nudges and the Bash rule at the current shim (it moved, from
+/// `legacy_shims`), and drops the rule where it cannot be trusted or cannot
+/// match (see `markitdown_rule_allowed`). Adds nothing the integration did not
+/// already have.
 pub fn refresh_markitdown_integration(
     markitdown_entrypoint: &Path,
     markitdown_shim: &Path,
-    legacy_shim: &Path,
+    legacy_shims: &[PathBuf],
     python_path: &Path,
 ) -> Result<()> {
     let hook_path = headroom_markitdown_hook_path();
@@ -3126,12 +3155,17 @@ pub fn refresh_markitdown_integration(
         let nudge = build_markitdown_office_nudge(markitdown_shim);
         upsert_managed_block(&claude_md, "markitdown_office", &nudge)?;
     }
-    // The Bash rule follows the shim it names; it is never added here.
-    let moved =
-        legacy_shim != markitdown_shim && set_markitdown_bash_permission(legacy_shim, false)?;
-    if cfg!(windows) || moved {
-        set_markitdown_bash_permission(markitdown_shim, !cfg!(windows))?;
-    }
+    // The Bash rule follows the shim it names, in one write, and only while the
+    // Claude integration (its hook) is on: a disable that raced this launch
+    // removed the current rule but not a legacy one.
+    let allowed = markitdown_rule_allowed(markitdown_shim);
+    set_markitdown_bash_permission(markitdown_shim, legacy_shims, |moved| {
+        if !allowed {
+            Some(false)
+        } else {
+            (moved && hook_path.exists()).then_some(true)
+        }
+    })?;
     let agents = markitdown_codex_agents_path();
     if file_has_managed_block(&agents, "markitdown")? {
         let nudge = build_markitdown_codex_nudge(markitdown_shim);
@@ -3141,10 +3175,22 @@ pub fn refresh_markitdown_integration(
 }
 
 /// Adds or removes a `Bash(<shim> *)` entry in `permissions.allow` so the Office
-/// nudge can run `markitdown` without prompting. Returns whether settings changed.
-fn set_markitdown_bash_permission(shim_path: &Path, present: bool) -> Result<bool> {
+/// nudge can run `markitdown` without prompting, dropping the entry of every
+/// `legacy` shim in the same write. `present` is told whether one was dropped
+/// (the rule moved) and returns the wanted state, None to leave it. Returns
+/// whether settings changed.
+fn set_markitdown_bash_permission(
+    shim_path: &Path,
+    legacy: &[PathBuf],
+    present: impl FnOnce(bool) -> Option<bool>,
+) -> Result<bool> {
     let settings_path = claude_settings_path();
     let entry = format!("Bash({} *)", shim_path.display());
+    let legacy: Vec<String> = legacy
+        .iter()
+        .filter(|p| p.as_path() != shim_path)
+        .map(|p| format!("Bash({} *)", p.display()))
+        .collect();
 
     let mut content = if settings_path.exists() {
         let raw = std::fs::read_to_string(&settings_path)
@@ -3154,10 +3200,8 @@ fn set_markitdown_bash_permission(shim_path: &Path, present: bool) -> Result<boo
         } else {
             Value::Object(parse_json_object(&raw, &settings_path)?)
         }
-    } else if present {
-        Value::Object(Default::default())
     } else {
-        return Ok(false);
+        Value::Object(Default::default())
     };
 
     let root = content
@@ -3173,13 +3217,17 @@ fn set_markitdown_bash_permission(shim_path: &Path, present: bool) -> Result<boo
         .as_array_mut()
         .ok_or_else(|| anyhow!("permissions.allow is not an array"))?;
 
+    let before = allow.len();
+    allow.retain(|v| !v.as_str().is_some_and(|s| legacy.iter().any(|l| l == s)));
+    let moved = allow.len() != before;
     let already = allow.iter().any(|v| v.as_str() == Some(entry.as_str()));
-    if present == already {
+    let present = present(moved).unwrap_or(already);
+    if present == already && !moved {
         return Ok(false);
     }
-    if present {
+    if present && !already {
         allow.push(Value::String(entry));
-    } else {
+    } else if !present {
         allow.retain(|v| v.as_str() != Some(entry.as_str()));
     }
 
@@ -8254,7 +8302,12 @@ pub(crate) fn fake_markitdown_pythonpath(root: &Path) -> PathBuf {
 /// posts any audio it is handed (a `.wav`, or audio named `.pdf`) to Google's
 /// speech API over plain HTTP. Both callers run with no prompt. Holds no `'`,
 /// since the shim and the Read hook embed it in single quotes.
-pub(crate) const MARKITDOWN_MAIN_NO_AUDIO: &str = r#"import sys; sys.modules["speech_recognition"] = None; from markitdown.__main__ import main; sys.argv[0] = "markitdown"; sys.exit(main())"#;
+///
+/// It opens, like every `python -c` Headroom runs in a project dir, by dropping
+/// the `""` (cwd) that `-c` puts first on sys.path: otherwise a cloned repo's
+/// `markitdown/` or `json.py` runs with no prompt. Not `-P`, which needs 3.11:
+/// the tests run these snippets under a 3.9 system python.
+pub(crate) const MARKITDOWN_MAIN_NO_AUDIO: &str = r#"import sys; sys.path[:] = [p for p in sys.path if p]; sys.modules["speech_recognition"] = None; from markitdown.__main__ import main; sys.argv[0] = "markitdown"; sys.exit(main())"#;
 
 /// PreToolUse(Read) hook: when Claude reads a PDF, convert it to Markdown via
 /// the managed `markitdown` and redirect the read at the converted file through
@@ -8286,7 +8339,8 @@ if [ -z "$INPUT" ]; then
   exit 0
 fi
 
-"$HEADROOM_PYTHON" -c 'import json, os, sys, subprocess, hashlib, stat, tempfile, time
+"$HEADROOM_PYTHON" -c 'import sys; sys.path[:] = [p for p in sys.path if p] # cwd off sys.path: a project json.py must not run
+import json, os, subprocess, hashlib, stat, tempfile, time
 ALLOWED = {{".pdf"}}
 MAX_BYTES = 25 * 1024 * 1024
 try:
@@ -8379,8 +8433,10 @@ fn msys_path(value: &str) -> String {
 }
 
 /// The rtk hook's last step: prints allow-with-the-rewrite, or nothing. It runs
-/// as `python -c '...'`, so it must never contain a single quote.
-const RTK_HOOK_VERDICT_PY: &str = r##"import glob, json, os, re, shlex, subprocess, sys
+/// as `python -c '...'`, so it must never contain a single quote. First line:
+/// see MARKITDOWN_MAIN_NO_AUDIO.
+const RTK_HOOK_VERDICT_PY: &str = r##"import sys; sys.path[:] = [p for p in sys.path if p]
+import glob, json, os, re, shlex, subprocess
 
 data = json.load(sys.stdin)
 tool_input = data.get("tool_input")
@@ -8587,7 +8643,7 @@ if [ -z "$INPUT" ]; then
   exit 0
 fi
 
-CMD="$("$HEADROOM_PYTHON" -c 'import json, sys; data = json.load(sys.stdin); cmd = data.get("tool_input", {{}}).get("command", ""); print(cmd if isinstance(cmd, str) else "")' <<<"$INPUT" 2>/dev/null || true)"
+CMD="$("$HEADROOM_PYTHON" -c 'import sys; sys.path[:] = [p for p in sys.path if p]; import json; data = json.load(sys.stdin); cmd = data.get("tool_input", {{}}).get("command", ""); print(cmd if isinstance(cmd, str) else "")' <<<"$INPUT" 2>/dev/null || true)"
 if [ -z "$CMD" ]; then
   exit 0
 fi
@@ -9799,21 +9855,55 @@ mod tests {
     #[test]
     fn refresh_markitdown_integration_rewrites_only_an_installed_hook() {
         // Hook fixes reach existing installs only if launch rewrites the
-        // installed body; a disabled integration (no hook file) stays off.
-        let _home = TestHome::new();
-        let (md, shim, legacy, py) = (
+        // installed body; a disabled integration (no hook, no nudge, no rule)
+        // stays off.
+        let home = TestHome::new();
+        let shim = home
+            .path()
+            .join(".headroom")
+            .join("bin")
+            .join("headroom-markitdown");
+        let (md, py) = (
             Path::new("/h/venv/bin/markitdown"),
-            Path::new("/h/tools/markitdown"),
-            Path::new("/h/bin/markitdown"),
             Path::new("/h/venv/bin/python3"),
         );
+        // Stable ran the shim from bin/ (on PATH), rc.2-rc.3 from tools/; both
+        // under Application Support, whose space no Bash rule ever matched.
+        let legacy = [
+            PathBuf::from("/h/App Support/bin/markitdown"),
+            PathBuf::from("/h/App Support/tools/markitdown"),
+        ];
+        let settings_path = super::claude_settings_path();
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{"permissions":{"allow":["Bash(ls *)"]}}"#,
+        )
+        .unwrap();
         let hook = super::headroom_markitdown_hook_path();
-        super::refresh_markitdown_integration(md, shim, legacy, py).expect("refresh");
+        super::refresh_markitdown_integration(md, &shim, &legacy, py).expect("refresh");
         assert!(!hook.exists());
         assert!(!super::markitdown_claude_md_path().exists());
+        assert_eq!(
+            fs::read_to_string(&settings_path).unwrap(),
+            r#"{"permissions":{"allow":["Bash(ls *)"]}}"#
+        );
+        let rules = || -> Vec<String> {
+            let settings = fs::read_to_string(&settings_path).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+            parsed["permissions"]["allow"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        // A disable that raced the first launch left a legacy rule behind but
+        // took the hook: the rule goes, and moves nowhere.
+        super::set_markitdown_bash_permission(&legacy[0], &[], |_| Some(true)).unwrap();
+        super::refresh_markitdown_integration(md, &shim, &legacy, py).expect("refresh");
+        assert_eq!(rules(), ["Bash(ls *)"]);
 
-        // Until the shim moved off PATH (where its one-path-only guard broke
-        // an RTK user's own `markitdown`), the nudges and rule named bin/.
         fs::create_dir_all(hook.parent().unwrap()).unwrap();
         fs::write(
             &hook,
@@ -9827,31 +9917,87 @@ mod tests {
         upsert_managed_block(
             &claude_md,
             "markitdown_office",
-            &build_markitdown_office_nudge(legacy),
+            &build_markitdown_office_nudge(&legacy[1]),
         )
         .unwrap();
-        upsert_managed_block(&agents, "markitdown", &build_markitdown_codex_nudge(legacy)).unwrap();
-        super::set_markitdown_bash_permission(legacy, true).unwrap();
+        upsert_managed_block(
+            &agents,
+            "markitdown",
+            &build_markitdown_codex_nudge(&legacy[1]),
+        )
+        .unwrap();
+        for old in &legacy {
+            super::set_markitdown_bash_permission(old, &[], |_| Some(true)).unwrap();
+        }
+        let pre_migration = fs::read_to_string(&settings_path).unwrap();
 
-        super::refresh_markitdown_integration(md, shim, legacy, py).expect("refresh");
+        super::refresh_markitdown_integration(md, &shim, &legacy, py).expect("refresh");
+        // One write, so its backup is the settings from before the move (two
+        // writes a second apart kept only the half-migrated copy).
+        let settings_dir = settings_path.parent().unwrap();
+        let newest_backup = fs::read_dir(settings_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("settings.json.headroom-backup-"))
+            })
+            .max()
+            .expect("backup");
+        assert_eq!(fs::read_to_string(newest_backup).unwrap(), pre_migration);
         assert_eq!(
             fs::read_to_string(&hook).unwrap(),
             build_headroom_markitdown_hook(md, py)
         );
+        let new_path = shim.display().to_string();
         for file in [&claude_md, &agents] {
             let body = fs::read_to_string(file).unwrap();
             assert!(
-                body.contains("/h/tools/markitdown <path>") && !body.contains("/h/bin/"),
+                body.contains(&format!("`{new_path} <path>`")) && !body.contains("/h/"),
                 "{body}"
             );
         }
-        let settings = fs::read_to_string(super::claude_settings_path()).unwrap();
-        assert!(!settings.contains("/h/bin/"), "{settings}");
+        let mut expected = vec!["Bash(ls *)".to_string()];
+        if !cfg!(windows) {
+            expected.push(format!("Bash({new_path} *)"));
+        }
+        assert_eq!(rules(), expected);
+
+        // One launch converges; the next changes nothing.
+        let snapshot = |paths: &[&PathBuf]| -> Vec<String> {
+            paths
+                .iter()
+                .map(|p| fs::read_to_string(p).unwrap())
+                .collect()
+        };
+        let before = snapshot(&[&settings_path, &claude_md, &agents, &hook]);
+        super::refresh_markitdown_integration(md, &shim, &legacy, py).expect("refresh");
         assert_eq!(
-            settings.contains("Bash(/h/tools/markitdown *)"),
-            !cfg!(windows),
-            "{settings}"
+            snapshot(&[&settings_path, &claude_md, &agents, &hook]),
+            before
         );
+    }
+
+    #[test]
+    fn markitdown_shim_path_with_whitespace_gets_a_quoted_nudge_and_no_rule() {
+        // A home dir with a space: no rule form matches, so none is written,
+        // and the nudge quotes the path so the shell does not split it.
+        let _home = TestHome::new();
+        let (md, py) = (
+            Path::new("/h/venv/bin/markitdown"),
+            Path::new("/h/venv/bin/python3"),
+        );
+        let shim = Path::new("/Users/Jane Doe/.headroom/bin/headroom-markitdown");
+        let legacy = [PathBuf::from("/h/tools/markitdown")];
+        super::set_markitdown_bash_permission(&legacy[0], &[], |_| Some(true)).unwrap();
+        super::set_markitdown_bash_permission(shim, &[], |_| Some(true)).unwrap();
+        super::refresh_markitdown_integration(md, shim, &legacy, py).expect("refresh");
+        let settings = fs::read_to_string(super::claude_settings_path()).unwrap();
+        assert!(!settings.contains("markitdown"), "{settings}");
+        assert!(build_markitdown_office_nudge(shim)
+            .contains("`'/Users/Jane Doe/.headroom/bin/headroom-markitdown' <path>`"));
     }
 
     #[test]
@@ -10542,6 +10688,78 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             String::from_utf8_lossy(&output.stdout)
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hooks_never_import_a_projects_own_modules() {
+        use std::os::unix::fs::PermissionsExt;
+        // Hooks run in the project dir, before any permission decision, and
+        // `python -c` puts that dir first on sys.path: a cloned repo's
+        // `json.py` ran on every Bash call and PDF Read.
+        let root = unique_temp_dir("headroom-hook-cwd");
+        let (home, project) = (root.join("home"), root.join("project"));
+        fs::create_dir_all(project.join("markitdown")).expect("project");
+        fs::create_dir_all(&home).expect("home");
+        let marker = |name: &str| format!("open({:?}, 'w').close()\n", root.join(name));
+        fs::write(project.join("json.py"), marker("ran-json")).expect("json.py");
+        fs::write(
+            project.join("markitdown").join("__init__.py"),
+            marker("ran-markitdown"),
+        )
+        .expect("markitdown");
+        let pdf = project.join("doc.pdf");
+        fs::write(&pdf, "%PDF-1.4").expect("pdf");
+        let exe = |name: &str, body: &str| {
+            let path = root.join(name);
+            fs::write(&path, body).expect("write");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+            path
+        };
+        let rtk = exe("rtk", "#!/usr/bin/env bash\nshift\necho \"/bin/echo $*\"\n");
+        let md = exe("markitdown", "#!/bin/sh\n");
+        let python = Path::new("/usr/bin/python3");
+        let run = |hook: String, input: Value| {
+            let hook_path = exe("hook.sh", &hook);
+            let mut child = crate::proc::command("bash")
+                .arg(&hook_path)
+                .current_dir(&project)
+                .env("HOME", &home)
+                .env("PYTHONPATH", super::fake_markitdown_pythonpath(&root))
+                .env_remove("XDG_CACHE_HOME")
+                .env_remove("CLAUDE_PROJECT_DIR")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn hook");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.to_string().as_bytes())
+                .unwrap();
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).to_string()
+        };
+
+        // Both got as far as their verdict, so every `python -c` ran.
+        let out = run(
+            build_headroom_rtk_hook(&rtk, python),
+            json!({ "tool_input": { "command": "git status" } }),
+        );
+        assert!(out.contains("\"allow\""), "{out}");
+        let out = run(
+            build_headroom_markitdown_hook(&md, python),
+            json!({ "tool_input": { "file_path": pdf } }),
+        );
+        assert!(out.contains("updatedInput"), "{out}");
+        for name in ["ran-json", "ran-markitdown"] {
+            assert!(
+                !root.join(name).exists(),
+                "the project's module ran: {name}"
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 

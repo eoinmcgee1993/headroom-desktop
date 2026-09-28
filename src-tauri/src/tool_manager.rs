@@ -7083,21 +7083,30 @@ impl ToolManager {
     }
 
     /// The shim the Office nudge and the Bash permission reference by absolute
-    /// path. On unix it sits off PATH: the bin dir is on PATH for RTK users,
-    /// where a one-path-only `markitdown` would shadow their own (`--help`,
-    /// `-o`, stdin all refused).
+    /// path. On unix it sits in `~/.headroom` (uninstall and the cask's zap
+    /// both remove it): off Application Support, whose space no
+    /// `Bash(<shim> *)` rule ever matched, so every Office read prompted, and
+    /// off our bin dir, which RTK users have on PATH. `~/.headroom/bin` is the
+    /// open-source CLI's (rtk, lean-ctx), which users put on PATH too, hence
+    /// the name: a bare `markitdown` would shadow theirs with a one-path one.
     pub fn markitdown_shim_path(&self) -> PathBuf {
         if cfg!(target_os = "windows") {
             self.runtime.bin_dir.join("markitdown.cmd")
         } else {
-            self.runtime.tools_dir.join("markitdown")
+            crate::client_adapters::home_dir()
+                .join(".headroom")
+                .join("bin")
+                .join("headroom-markitdown")
         }
     }
 
-    /// Where the unix shim lived until it moved off PATH. Launch removes it
-    /// and the Bash rule that names it.
-    pub fn legacy_markitdown_shim_path(&self) -> PathBuf {
-        self.runtime.bin_dir.join("markitdown")
+    /// Where the unix shim lived before: bin/ (on PATH, until 0.9.26-rc.2) and
+    /// tools/ (rc.2-rc.3). Launch removes them and the Bash rules naming them.
+    pub fn legacy_markitdown_shim_paths(&self) -> [PathBuf; 2] {
+        [
+            self.runtime.bin_dir.join("markitdown"),
+            self.runtime.tools_dir.join("markitdown"),
+        ]
     }
 
     fn markitdown_conversion_counter_path(&self) -> PathBuf {
@@ -7115,38 +7124,51 @@ impl ToolManager {
     /// installs pick up changes.
     ///
     /// On unix Claude Code runs `Bash(<shim> *)` without a prompt, so the shim
-    /// takes exactly one local path and nothing else: markitdown's `-o` writes
-    /// anywhere, URL sources fetch over the network, and `-d`/`-e` send content
-    /// to an arbitrary endpoint. The Windows `.cmd` cannot vet its arguments
-    /// and gets no such rule (see `enable_markitdown_integration`).
+    /// takes exactly one path inside the session's project and nothing else:
+    /// markitdown's `-o` writes anywhere, URL sources fetch over the network,
+    /// `-d`/`-e` send content to an arbitrary endpoint, and a file outside the
+    /// project is one Claude Code's own Read tool would prompt for. The Windows
+    /// `.cmd` cannot vet its arguments and gets no such rule (see
+    /// `enable_markitdown_integration`).
     pub fn ensure_markitdown_shim(&self) -> Result<()> {
         let shim = self.markitdown_shim_path();
-        for stale in [&shim, &self.legacy_markitdown_shim_path()] {
+        for stale in std::iter::once(&shim).chain(&self.legacy_markitdown_shim_paths()) {
             if stale.symlink_metadata().is_ok() {
                 let _ = std::fs::remove_file(stale);
             }
         }
         #[cfg(unix)]
         {
-            std::fs::create_dir_all(&self.runtime.tools_dir)?;
-            // ponytail: single-quoting is enough - both paths live under
-            // Application Support (spaces, no quotes).
+            if let Some(dir) = shim.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            // ponytail: single-quoting is enough - every embedded path is ours
+            // (Application Support or ~/.headroom: spaces, no quotes).
             let script = format!(
                 "#!/bin/sh\n\
-                 # Headroom-managed markitdown shim. Converts one local file, counts it, runs the real binary.\n\
-                 # Claude Code may run this without a prompt: no options, no URLs, one path only.\n\
-                 refuse() {{ echo \"markitdown (Headroom): $1. Usage: markitdown <local file path>\" >&2; exit 2; }}\n\
+                 # Headroom-managed markitdown shim. Converts one project file, counts it, runs the real binary.\n\
+                 # Claude Code may run this without a prompt: no options, no URLs, one path inside $PWD only.\n\
+                 refuse() {{ echo \"markitdown (Headroom): $1. Usage: headroom-markitdown <file path inside this project>\" >&2; exit 2; }}\n\
                  [ \"$#\" -eq 1 ] || refuse 'expected exactly one file path'\n\
                  case \"$1\" in \"\"|-*) refuse 'options are not supported';; esac\n\
                  # A 2+ letter scheme (http:, file:, data:) is a URL; a single letter is a drive.\n\
                  case \"${{1%%:*}}\" in \"$1\"|?|*[!A-Za-z0-9+.-]*) ;; [A-Za-z]*) refuse 'URLs are not supported';; esac\n\
+                 # No more than the Read tool allows unprompted: the file, symlinks resolved, under the project.\n\
+                 # $(...) strips trailing newlines, which would name another file: the \".\" keeps them.\n\
+                 d=$(pwd -P && echo .) && [ \"${{d#/}}\" != \"$d\" ] || refuse 'cannot resolve the current directory'\n\
+                 f=$(realpath \"$1\" 2>/dev/null && echo .) || refuse \"no such file: $1\"\n\
+                 d=${{d%?.}} f=${{f%?.}}\n\
+                 case \"$d$f\" in *'\n'*) refuse 'paths with newlines are not supported';; esac\n\
+                 case \"$f\" in \"$d\"/*) ;; *) refuse \"$1 is outside this project (for files outside it, run '{real}' <path>)\";; esac\n\
+                 '{python}' -c '{main}' \"$f\" || exit\n\
                  C='{counter}'\n\
                  n=$(cat \"$C\" 2>/dev/null)\n\
                  case \"$n\" in ''|*[!0-9]*) n=0;; esac\n\
                  printf '%s' $((n+1)) > \"$C.tmp\" 2>/dev/null && mv -f \"$C.tmp\" \"$C\" 2>/dev/null\n\
-                 exec '{python}' -c '{main}' \"$1\"\n",
+                 exit 0\n",
                 counter = self.markitdown_conversion_counter_path().display(),
                 python = self.runtime.managed_python().display(),
+                real = self.markitdown_entrypoint().display(),
                 main = crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO,
             );
             crate::client_adapters::atomic_write(&shim, script.as_bytes())
@@ -7162,17 +7184,18 @@ impl ToolManager {
             let script = format!(
                 "@echo off\r\n\
                  setlocal\r\n\
-                 rem Headroom-managed markitdown shim. Counts conversions, then runs the real binary.\r\n\
-                 if \"%~1\"==\"\" goto :run\r\n\
-                 if \"%~1\"==\"--help\" goto :run\r\n\
+                 rem Headroom-managed markitdown shim. Runs the real binary, then counts a conversion that succeeded.\r\n\
+                 \"{real}\" %*\r\n\
+                 if %errorlevel% neq 0 exit /b %errorlevel%\r\n\
+                 if \"%~1\"==\"\" exit /b 0\r\n\
+                 if \"%~1\"==\"--help\" exit /b 0\r\n\
                  set \"C={counter}\"\r\n\
                  set /p n=<\"%C%\" 2>nul\r\n\
                  if not defined n set n=0\r\n\
                  set /a n+=1 >nul 2>nul\r\n\
                  >\"%C%.tmp\" echo %n%\r\n\
                  move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
-                 :run\r\n\
-                 \"{real}\" %*\r\n",
+                 exit /b 0\r\n",
                 counter = self.markitdown_conversion_counter_path().display(),
                 real = self.markitdown_entrypoint().display(),
             );
@@ -17876,45 +17899,90 @@ after
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn markitdown_shim_counts_file_conversions_and_refuses_everything_else() {
         let (root, runtime, manager) = seed_test_runtime("markitdown-shim");
+        let home = root.join("home");
+        let _home = HomeGuard::new(&home);
+        // A `.bad` file stands in for one markitdown fails to convert.
         write_executable(
             &runtime.managed_python(),
-            "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n",
+            "#!/bin/sh\ncase \"$3\" in *.bad) exit 1;; esac\nexec /usr/bin/python3 \"$@\"\n",
         );
         let pythonpath = crate::client_adapters::fake_markitdown_pythonpath(&root);
-        // The bin dir is on PATH for RTK users; the shim must not be there.
-        write_executable(&manager.legacy_markitdown_shim_path(), "#!/bin/sh\n");
+        // The bin dir is on PATH for RTK users; tools/ sits under Application
+        // Support, whose space no Bash rule matches. Launch clears both.
+        for legacy in manager.legacy_markitdown_shim_paths() {
+            write_executable(&legacy, "#!/bin/sh\n");
+        }
         manager.ensure_markitdown_shim().expect("shim");
-        assert!(!manager.legacy_markitdown_shim_path().exists());
-        assert_ne!(
-            manager.markitdown_shim_path().parent(),
-            Some(runtime.bin_dir.as_path())
+        for legacy in manager.legacy_markitdown_shim_paths() {
+            assert!(!legacy.exists(), "{} survived", legacy.display());
+        }
+        let shim = manager.markitdown_shim_path();
+        assert_eq!(
+            shim,
+            home.join(".headroom")
+                .join("bin")
+                .join("headroom-markitdown")
         );
 
+        let project = root.join("project");
+        let outside = root.join("outside.docx");
+        for file in [
+            project.join("a.docx"),
+            project.join("docs").join("q3:final.xlsx"),
+            project.join("C:").join("Users").join("b.pptx"),
+            project.join("broken.bad"),
+            outside.clone(),
+            home.join("secret.docx"),
+        ] {
+            fs::create_dir_all(file.parent().unwrap()).expect("dir");
+            fs::write(&file, b"x").expect("file");
+        }
+        std::os::unix::fs::symlink(&outside, project.join("link.docx")).expect("file link");
+        std::os::unix::fs::symlink(&root, project.join("up")).expect("dir link");
+        // `python -c` puts the cwd first on sys.path: a cloned repo's own
+        // `markitdown` package must not be what runs.
+        fs::create_dir_all(project.join("markitdown")).expect("pkg");
+        fs::write(project.join("markitdown").join("__init__.py"), "").expect("init");
+        fs::write(
+            project.join("markitdown").join("__main__.py"),
+            "def main():\n    print('project code ran')\n",
+        )
+        .expect("main");
+        // $(...) strips a trailing newline: `notes.docx\n` (or a link to it)
+        // must not come out as `notes.docx`, which links outside.
+        std::os::unix::fs::symlink(&outside, project.join("notes.docx")).expect("link");
+        fs::write(project.join("notes.docx\n"), b"x").expect("newline file");
+        std::os::unix::fs::symlink("notes.docx\n", project.join("b.docx")).expect("link");
+
         let run = |args: &[&str]| {
-            crate::proc::command(manager.markitdown_shim_path())
+            crate::proc::command(&shim)
                 .args(args)
+                .current_dir(&project)
                 .env("PYTHONPATH", &pythonpath)
                 .output()
                 .expect("run shim")
         };
 
         // "converted", not "transcribed": audio is never sent off to Google.
-        let out = run(&["/tmp/a.docx"]);
+        let out = run(&["a.docx"]);
+        let real_project = fs::canonicalize(&project).expect("canonical project");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "converted:1:/tmp/a.docx\n"
+            format!("converted:1:{}\n", real_project.join("a.docx").display())
         );
         // A colon later in the path, or a one-letter drive prefix, is still a path.
         assert!(run(&["docs/q3:final.xlsx"]).status.success());
-        assert!(run(&["C:/Users/x/b.pptx"]).status.success());
+        assert!(run(&["C:/Users/b.pptx"]).status.success());
+        // A conversion that fails is not counted.
+        assert_eq!(run(&["broken.bad"]).status.code(), Some(1));
 
         // Claude Code runs the shim without a prompt, so anything beyond one
         // local path (-o writes anywhere, URLs hit the network) is refused
         // before the real binary runs.
         for args in [
             &["--help"][..],
-            &["-o", "/tmp/x", "/tmp/a.docx"],
-            &["/tmp/a.docx", "-o", "/tmp/x"],
+            &["-o", "/tmp/x", "a.docx"],
+            &["a.docx", "-o", "/tmp/x"],
             &["https://example.com/x.docx"],
             &["file:///etc/passwd"],
             &["data:text/plain,hi"],
@@ -17924,6 +17992,47 @@ after
             assert!(!out.status.success(), "shim must refuse {args:?}");
             assert!(out.stdout.is_empty(), "real binary ran for {args:?}");
         }
+
+        // Nor anything outside the project, which the Read tool would prompt
+        // for: those name the real CLI, which prompts too.
+        let secret = home.join("secret.docx").display().to_string();
+        let outside_abs = outside.display().to_string();
+        for arg in [
+            outside_abs.as_str(),
+            "../outside.docx",
+            "link.docx",
+            "up/outside.docx",
+            secret.as_str(),
+        ] {
+            let out = run(&[arg]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "shim must refuse {arg}");
+            assert!(out.stdout.is_empty(), "real binary ran for {arg}");
+            assert!(
+                stderr.contains("outside this project")
+                    && stderr.contains(&manager.markitdown_entrypoint().display().to_string()),
+                "{arg}: {stderr}"
+            );
+        }
+        // A literal `~` is not expanded, so it names no file in the project.
+        assert_eq!(run(&["~/secret.docx"]).status.code(), Some(2));
+        for arg in ["notes.docx\n", "b.docx"] {
+            let out = run(&[arg]);
+            assert_eq!(out.status.code(), Some(2), "shim must refuse {arg:?}");
+            assert!(out.stdout.is_empty(), "real binary ran for {arg:?}");
+        }
+        // A deleted cwd has no `pwd -P`; that must not widen the project to `/`.
+        let gone = project.join("gone");
+        fs::create_dir_all(&gone).expect("gone");
+        let out = crate::proc::command("sh")
+            .args(["-c", "cd \"$1\" && rmdir \"$1\" && exec \"$2\" \"$3\""])
+            .arg("sh")
+            .args([&gone, &shim, &outside])
+            .env("PYTHONPATH", &pythonpath)
+            .output()
+            .expect("run shim in a deleted dir");
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        assert!(out.stdout.is_empty(), "real binary ran from a deleted cwd");
         assert_eq!(manager.markitdown_conversion_count(), Some(3));
     }
 

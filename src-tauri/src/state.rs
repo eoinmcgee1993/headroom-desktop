@@ -863,7 +863,7 @@ impl AppState {
             if let Err(err) = crate::client_adapters::refresh_markitdown_integration(
                 &self.tool_manager.markitdown_entrypoint(),
                 &self.tool_manager.markitdown_shim_path(),
-                &self.tool_manager.legacy_markitdown_shim_path(),
+                &self.tool_manager.legacy_markitdown_shim_paths(),
                 &self.tool_manager.managed_python(),
             ) {
                 log::warn!("markitdown hook refresh failed during warm_runtime_on_launch: {err:#}");

@@ -42,7 +42,7 @@ row() { # status, check, detail
 }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-AX() { osascript -e "tell application \"System Events\" to tell process \"Headroom\" $1" 2>&1; }
+AX() { osascript -e "tell application \"System Events\" to tell process \"headroom-desktop\" $1" 2>&1; }
 
 # The backend listens on 6768 by default but scans up to 6790 (check 9). 6767 is
 # the desktop's own intercept listener, never the backend, so start the window
@@ -161,11 +161,37 @@ else
   row FAIL "8 runtime" "$ver / $mod"
 fi
 rec=$(jq -r .version "$HR/tools/markitdown.json" 2>/dev/null)
-art=$("$HR/bin/markitdown" --version 2>&1 | awk '{print $NF}')
+art=$("$venv/bin/markitdown" --version 2>&1 | awk '{print $NF}')
 if [ -n "$rec" ] && [ "$rec" = "$art" ]; then
   row PASS "8 addon receipts" "markitdown $rec == $art"
 else
   row FAIL "8 addon receipts" "markitdown receipt $rec != artifact $art"
+fi
+# The Office nudge and the Bash rule name this shim; a path with a space never
+# matched the rule (every Office read prompted until 0.9.26-rc.4), so launch
+# moves both off Application Support. Full $HR paths: a bare
+# "headroom/bin/markitdown" also matches the new ".headroom/bin/...".
+if [ -n "$rec" ]; then
+  shim="$HOME/.headroom/bin/headroom-markitdown"
+  settings="$HOME/.claude/settings.json"
+  stale=$(grep -oF -e "Bash($HR/bin/markitdown *)" -e "Bash($HR/tools/markitdown *)" "$settings" 2>/dev/null
+    ls -d "$HR/bin/markitdown" "$HR/tools/markitdown" 2>/dev/null)
+  rules=$(grep -cF "Bash($shim *)" "$settings" 2>/dev/null)
+  if [ -n "$stale" ]; then
+    row FAIL "8 markitdown shim" "migration left: $(echo $stale)"
+  elif [ ! -x "$shim" ]; then
+    row FAIL "8 markitdown shim" "$shim missing or not executable"
+  elif [ "$(jq -r '.enabled' "$HR/tools/markitdown.json" 2>/dev/null)" = "false" ]; then
+    if [ "${rules:-0}" -eq 0 ]; then
+      row PASS "8 markitdown shim" "$shim (addon disabled, no rule)"
+    else
+      row FAIL "8 markitdown shim" "addon disabled but Bash($shim *) is allowed"
+    fi
+  elif [ "${rules:-0}" -gt 0 ]; then
+    row PASS "8 markitdown shim" "$shim + allow rule"
+  else
+    row FAIL "8 markitdown shim" "no Bash($shim *) rule in $settings"
+  fi
 fi
 # Plugin addons track a marketplace, so a receipt lagging is expected; they only
 # have to resolve to a version string at all.
@@ -443,7 +469,7 @@ if [ -z "$snap" ] || [ "$snap" = "null" ]; then
   row FAIL "7 optimizing" "/stats unreadable"
 elif [ "$stale" = 1 ]; then
   echo "$snap" > "$BASELINE"
-  row PENDING "7 optimizing" "baseline predates a backend restart; re-saved. Do a ~1400-line Read, then re-run with --quick"
+  row PENDING "7 optimizing" "baseline predates a backend restart; re-saved. Do a ~1350-line Read, then re-run with --quick"
 elif [ -f "$BASELINE" ]; then
   # Cache side of the trade, per request from the proxy log since the baseline.
   # cost.py's cache_savings_usd is net of the write premium over a window and
@@ -465,7 +491,7 @@ elif [ -f "$BASELINE" ]; then
   rm -f "$BASELINE"
 else
   echo "$snap" > "$BASELINE"
-  row PENDING "7 optimizing" "baseline saved; do a ~1400-line Read (the tool, not cat), then re-run with --quick"
+  row PENDING "7 optimizing" "baseline saved; do a ~1350-line Read (the tool, not cat), then re-run with --quick"
 fi
 
 echo
