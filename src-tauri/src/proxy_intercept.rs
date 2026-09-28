@@ -615,6 +615,10 @@ pub type BindErrorSlot = Arc<Mutex<Option<String>>>;
 pub type FreshBearerNotifier = mpsc::Sender<()>;
 
 pub const ANTHROPIC_DIRECT_BASE: &str = "https://api.anthropic.com";
+/// Every credential Anthropic issues starts with this (API keys
+/// `sk-ant-api03-`, Claude OAuth `sk-ant-oat01-`); a third-party provider's
+/// key (GLM, Kimi, DeepSeek) never does.
+const ANTHROPIC_CREDENTIAL_PREFIX: &str = "sk-ant-";
 pub const OPENAI_DIRECT_BASE: &str = "https://api.openai.com";
 /// Where a ChatGPT-subscription Codex request really goes. Its OAuth token is
 /// scoped to this backend and rejected by api.openai.com with a misleading
@@ -1466,13 +1470,19 @@ async fn handle(
             if let Some(tier) = decode_codex_plan_tier(&token) {
                 *codex_plan_slot.lock() = Some(tier);
             }
-        } else if !is_codex && !is_opencode && !is_grok {
+        } else if !is_codex
+            && !is_opencode
+            && !is_grok
+            && token.starts_with(ANTHROPIC_CREDENTIAL_PREFIX)
+        {
             // OpenCode/Grok bearers are the user's own provider keys (or
             // OAuth tokens for a possibly different account); landing them in
             // the Claude identity slot would transmit them to Anthropic's
             // OAuth endpoints and flap pricing/identity. Grok matters here
             // because its non-completion endpoints (/v1/api-key, ...) are not
-            // path-classified as Codex.
+            // path-classified as Codex. The prefix check does the same for
+            // Claude Code on a configured upstream or cc-switch relay, whose
+            // bearer is that provider's key.
             let changed = bearer_value_changed(&token_slot, &token);
             *token_slot.lock() = Some(BearerToken::new(token));
             if changed {
@@ -1502,9 +1512,10 @@ async fn handle(
     // When the pricing gate has bypassed Headroom, the Python proxy on
     // `backend_addr` is intentionally stopped. Forward direct to the provider
     // so already-running sessions stay alive while optimization is off. The
-    // forwarder picks the upstream from the credential: Claude Code to
-    // Anthropic, API-key Codex to api.openai.com, ChatGPT-subscription Codex
-    // to chatgpt.com's Codex backend (the only place its OAuth token is valid).
+    // forwarder picks the upstream from the credential: Claude Code to its
+    // configured upstream (Anthropic by default), API-key Codex to
+    // api.openai.com, ChatGPT-subscription Codex to chatgpt.com's Codex
+    // backend (the only place its OAuth token is valid).
     // OpenCode's transport plugin routes third-party providers (Google, custom
     // gateways) here with the real upstream in `x-headroom-base-url`. The
     // direct forwarder only knows the Anthropic/OpenAI bases, so forwarding
@@ -2802,6 +2813,39 @@ fn upstream_client() -> &'static reqwest::Client {
     })
 }
 
+/// Where direct-forwarded Claude traffic goes: the user's configured upstream
+/// when there is one, else `default` (Anthropic). Read per request, because
+/// the override changes without restarting this thread. The backend boots on
+/// the same URL (ANTHROPIC_TARGET_API_URL) and trims a trailing `/v1` off it
+/// (`_normalize_api_url`) before appending the request path, so this does too.
+///
+/// None when, with no override, the request carries a key Anthropic never
+/// issued: the backend's cc-switch reconciler captured some relay this
+/// process cannot see, and forwarding would hand that relay's key and the
+/// prompt to api.anthropic.com. Such a key would only earn a 401 there anyway.
+///
+/// The reverse holds too: with a provider token stored, a request keyed only
+/// with Anthropic credentials is not the override's traffic (OpenCode's native
+/// anthropic provider also points here) and goes to `default`, not to GLM/Kimi.
+fn claude_direct_base(default: &str, header_buf: &[u8]) -> Option<String> {
+    let keys: Vec<String> = extract_bearer(header_buf)
+        .into_iter()
+        .chain(extract_header_value(header_buf, "x-api-key"))
+        .filter(|key| !key.is_empty())
+        .collect();
+    let foreign_key = keys
+        .iter()
+        .any(|key| !key.starts_with(ANTHROPIC_CREDENTIAL_PREFIX));
+    let upstream = crate::upstream_override::get();
+    if let Some(url) = upstream.configured_upstream() {
+        if foreign_key || keys.is_empty() || !upstream.has_token {
+            let url = url.trim_end_matches('/');
+            return Some(url.strip_suffix("/v1").unwrap_or(url).to_string());
+        }
+    }
+    (!foreign_key).then(|| default.to_string())
+}
+
 async fn write_retryable_service_unavailable(client: &mut TcpStream) {
     let _ = client
         .write_all(
@@ -2810,7 +2854,9 @@ async fn write_retryable_service_unavailable(client: &mut TcpStream) {
         .await;
 }
 
-/// Forward the request that produced `header_buf` directly to api.anthropic.com.
+/// Forward the request that produced `header_buf` directly to the provider:
+/// the Claude upstream from `claude_direct_base`, or OpenAI/chatgpt.com for
+/// Codex.
 ///
 /// Used when the pricing gate has stopped the local Python proxy. The CC
 /// session keeps speaking HTTP/1.1 to 127.0.0.1:6767; we re-issue the same
@@ -2865,8 +2911,11 @@ async fn forward_direct_to_anthropic(
         chatgpt_codex_direct_base()
     } else if is_codex_request_head(&parsed) {
         OPENAI_DIRECT_BASE.to_string()
+    } else if let Some(base) = claude_direct_base(upstream_base, &header_buf) {
+        base
     } else {
-        upstream_base.to_string()
+        write_retryable_service_unavailable(&mut client).await;
+        return;
     };
     let effective_path: &str = if chatgpt_codex {
         chatgpt_codex_direct_path(&parsed.path)
@@ -4174,7 +4223,7 @@ mod tests {
         let mut client = client.expect("intercept reachable");
 
         let request = format!(
-            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer test-token-123\r\nContent-Length: 0\r\n\r\n",
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer sk-ant-oat01-test-token-123\r\nContent-Length: 0\r\n\r\n",
             intercept_addr.port()
         );
         client
@@ -4194,7 +4243,7 @@ mod tests {
             "request line forwarded: {received_str:?}"
         );
         assert!(
-            received_str.contains("Authorization: Bearer test-token-123"),
+            received_str.contains("Authorization: Bearer sk-ant-oat01-test-token-123"),
             "bearer header forwarded: {received_str:?}"
         );
 
@@ -4207,7 +4256,7 @@ mod tests {
             bearer
                 .value_if_fresh(Duration::from_secs(60))
                 .map(|s| s.to_string()),
-            Some("test-token-123".to_string())
+            Some("sk-ant-oat01-test-token-123".to_string())
         );
 
         run_task.abort();
@@ -5169,7 +5218,7 @@ mod tests {
 
         let req_body = br#"{"model":"claude"}"#;
         let request_head = format!(
-            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer test-bypass-token\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer sk-ant-oat01-test-bypass-token\r\nContent-Type: application/json\r\nAccept-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
             intercept_addr.port(),
             req_body.len()
         );
@@ -5191,7 +5240,7 @@ mod tests {
         );
         let received_lower = received_str.to_ascii_lowercase();
         assert!(
-            received_lower.contains("authorization: bearer test-bypass-token"),
+            received_lower.contains("authorization: bearer sk-ant-oat01-test-bypass-token"),
             "Authorization forwarded: {received_str:?}"
         );
         assert!(
@@ -5343,6 +5392,136 @@ mod tests {
         );
 
         run_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn claude_direct_base_follows_the_configured_upstream() {
+        use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+        let glm = b"POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer glm.key\r\n\r\n";
+        let kimi = b"POST /v1/messages HTTP/1.1\r\nx-api-key: sk-kimi\r\n\r\n";
+        let oauth = b"POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer sk-ant-oat01-x\r\n\r\n";
+        let base = |buf: &[u8]| super::claude_direct_base("https://api.anthropic.com", buf);
+
+        crate::upstream_override::publish(UpstreamOverride::default());
+        assert_eq!(base(oauth).as_deref(), Some("https://api.anthropic.com"));
+        // A relay only the backend knows (cc-switch capture): no direct target.
+        assert_eq!(base(glm), None);
+        assert_eq!(base(kimi), None);
+
+        // The backend's `_normalize_api_url` drops a trailing `/v1`.
+        crate::upstream_override::publish(UpstreamOverride {
+            mode: UpstreamOverrideMode::Fallback,
+            base_url: "http://open.bigmodel.cn/api/anthropic/v1".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            base(glm).as_deref(),
+            Some("http://open.bigmodel.cn/api/anthropic")
+        );
+
+        // With the provider's token stored, an Anthropic-keyed request (e.g.
+        // OpenCode's native anthropic provider) is not the override's traffic:
+        // its sk-ant- key must not reach the provider.
+        crate::upstream_override::publish(UpstreamOverride {
+            mode: UpstreamOverrideMode::Override,
+            base_url: "https://api.z.ai/api/anthropic".into(),
+            has_token: true,
+            ..Default::default()
+        });
+        assert_eq!(base(oauth).as_deref(), Some("https://api.anthropic.com"));
+        assert_eq!(base(glm).as_deref(), Some("https://api.z.ai/api/anthropic"));
+        crate::upstream_override::publish(UpstreamOverride::default());
+    }
+
+    /// Every direct-forward branch sends Claude traffic to the configured
+    /// upstream (path prefix kept), answers 503-retry for a third-party key it
+    /// has no upstream for, and never captures that key as the Claude bearer.
+    #[tokio::test]
+    #[serial]
+    async fn direct_forward_never_sends_a_third_party_key_to_anthropic() {
+        use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+        // Dead backend: the third branch falls back direct because of it.
+        backend_port::set(1);
+        for (branch, bypass, claude_only) in [
+            ("bypass", true, false),
+            ("claude-only bypass", false, true),
+            ("backend unreachable", false, false),
+        ] {
+            let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+            let upstream_task = tokio::spawn(async move {
+                let (mut sock, _) = upstream_listener.accept().await.expect("upstream accept");
+                let received = read_until_header_end(&mut sock).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                received
+            });
+            let (probe, intercept_addr) = bind_ephemeral().await;
+            drop(probe);
+            let token_slot: SharedToken = Arc::new(Mutex::new(None));
+            let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+            let run_task = tokio::spawn(run(
+                intercept_addr,
+                false,
+                token_slot.clone(),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(bypass)),
+                Arc::new(AtomicBool::new(claude_only)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                // Stands in for api.anthropic.com; refuses instantly.
+                Arc::new("http://127.0.0.1:1".to_string()),
+                Arc::new(Mutex::new(None)),
+            ));
+            let request = b"POST /v1/messages?beta=true HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer glm.key\r\nContent-Length: 0\r\n\r\n";
+            let send = || async {
+                for _ in 0..50 {
+                    if let Ok(mut c) = TcpStream::connect(intercept_addr).await {
+                        c.write_all(request).await.expect("write request");
+                        return read_until_header_end(&mut c).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                panic!("intercept unreachable");
+            };
+
+            crate::upstream_override::publish(UpstreamOverride {
+                mode: UpstreamOverrideMode::Override,
+                base_url: format!("http://127.0.0.1:{}/api/anthropic", upstream_addr.port()),
+                ..Default::default()
+            });
+            let response = send().await;
+            let received = timeout(Duration::from_secs(5), upstream_task)
+                .await
+                .expect("upstream got request in time")
+                .expect("upstream task ok");
+            let received = String::from_utf8_lossy(&received);
+            assert!(
+                received.starts_with("POST /api/anthropic/v1/messages?beta=true HTTP/1.1"),
+                "{branch}: {received:?}"
+            );
+            assert!(
+                response.starts_with(b"HTTP/1.1 200"),
+                "{branch}: {:?}",
+                String::from_utf8_lossy(&response)
+            );
+
+            crate::upstream_override::publish(UpstreamOverride::default());
+            let response = send().await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 503"),
+                "{branch}: {:?}",
+                String::from_utf8_lossy(&response)
+            );
+            assert!(
+                token_slot.lock().is_none(),
+                "{branch}: a provider key landed in the Claude bearer slot"
+            );
+            run_task.abort();
+        }
         backend_port::reset_for_tests();
     }
 

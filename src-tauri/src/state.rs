@@ -683,7 +683,10 @@ impl AppState {
         // The proxy spawn reads the override through the module-level cache
         // (no AppState in hand there, same as the backend port), so a launch
         // has to publish what it just loaded or the first spawn of the session
-        // would boot at the default upstream.
+        // would boot at the default upstream. Not under test: the slot is
+        // process-global, and dozens of parallel `new_in` calls would reset
+        // it under the serial tests that route by it.
+        #[cfg(not(test))]
         crate::upstream_override::publish(launch_profile.upstream_override.clone());
         let (last_known_good_plan, last_known_good_plan_path) = LastKnownGoodPlan::load(&base_dir);
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
@@ -856,6 +859,14 @@ impl AppState {
         if self.tool_manager.markitdown_installed() {
             if let Err(err) = self.tool_manager.ensure_markitdown_shim() {
                 log::warn!("markitdown shim refresh failed during warm_runtime_on_launch: {err:#}");
+            }
+            if let Err(err) = crate::client_adapters::refresh_markitdown_integration(
+                &self.tool_manager.markitdown_entrypoint(),
+                &self.tool_manager.markitdown_shim_path(),
+                &self.tool_manager.legacy_markitdown_shim_path(),
+                &self.tool_manager.managed_python(),
+            ) {
+                log::warn!("markitdown hook refresh failed during warm_runtime_on_launch: {err:#}");
             }
         }
 
