@@ -19,20 +19,19 @@ export interface SetupStallModalProps {
 // the user to go check whether anything is connected.
 const LEAD: Record<SetupStallKind, string> = {
   no_traffic:
-    "Your coding agent is connected to Headroom, but {minutes} minutes on, not one request has come back through it. That almost always means the agent is still running with the settings it had before Headroom was installed.",
+    "Your coding agent is connected, but no requests have come through in {minutes} minutes. It's most likely still running with its old settings.",
   no_savings:
-    "Requests are reaching Headroom, but none of them have been optimized. That usually means your coding agent connected before Headroom was ready, or optimization is paused.",
+    "Requests are reaching Headroom, but none of them have been optimized. Your agent probably connected before Headroom was ready, or Headroom is paused.",
   // Fires only on installs that saved before (see savingsDrifted), so the
   // copy can say "stopped" as fact rather than hedging about a fresh setup.
   drift:
-    "Headroom was saving you tokens, but requests from the last few days have all passed through without any optimization. That usually means your coding agent reconnected outside Headroom, or optimization is paused.",
+    "Headroom was saving tokens, but nothing has been optimized for a few days. Your agent probably reconnected outside Headroom, or Headroom is paused.",
 };
 
 const STEPS: Record<SetupStallKind, string[]> = {
   no_traffic: [
-    "Quit your terminal, editor, or coding agent completely, then reopen it. A new tab or window often reuses the old environment.",
-    "Run your agent from a freshly opened terminal so it picks up Headroom's settings.",
-    "Confirm Headroom itself is running. The menu bar icon is solid when it is.",
+    "Quit your terminal, editor, or coding agent completely, then reopen it. A new tab or window may keep the old settings.",
+    "Check that Headroom is running: its menu bar icon is solid when it is.",
   ],
   // Reconnecting first: an agent that started before Headroom was ready is the
   // common cause, and it is the cheapest thing to try.
@@ -43,14 +42,14 @@ const STEPS: Record<SetupStallKind, string[]> = {
   // people to verify the one thing already ruled out.
   no_savings: [
     "Restart your coding agent so it reconnects through Headroom.",
-    "Check that Headroom is not paused. The Home screen shows its current state.",
+    "Check on the Home screen that Headroom is not paused.",
   ],
   // Same cheapest-first recovery as no_savings; a broken hookup is also being
   // re-applied automatically in the background (repair_client_setups), so the
   // restart is usually all that is left to do by the time this shows.
   drift: [
     "Restart your coding agent so it reconnects through Headroom.",
-    "Check that Headroom is not paused. The Home screen shows its current state.",
+    "Check on the Home screen that Headroom is not paused.",
   ],
 };
 
@@ -65,9 +64,8 @@ const STEPS: Record<SetupStallKind, string[]> = {
 // actionable isn't buried at the end of a paragraph.
 const CLAUDE_DESKTOP_NOTE = {
   title: "Running Claude Code in the Claude desktop app?",
-  why: "That unfortunately doesn't work due to a design decision by Anthropic. The desktop app doesn't allow setting a proxy URL, so we can't pass requests through Headroom.",
-  action:
-    "Run Claude Code from a terminal, or use the VS Code extension, and Headroom picks it up automatically.",
+  why: "The desktop app doesn't allow setting a proxy URL, a design decision by Anthropic, so its requests can't go through Headroom.",
+  action: "Run Claude Code from a terminal or the VS Code extension instead.",
 };
 
 /// Shown when the app has been up for a while with zero savings recorded. Fires
@@ -113,7 +111,7 @@ export function SetupStallModal({
           </aside>
         ) : null}
         <p className="setup-stall__contact">
-          Still stuck after all that?{" "}
+          Still stuck?{" "}
           <button className="link-button" onClick={onContact} type="button">
             Email us
           </button>{" "}

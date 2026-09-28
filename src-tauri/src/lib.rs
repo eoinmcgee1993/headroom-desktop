@@ -5240,33 +5240,39 @@ async fn apply_client_setup(
     // stays down and Claude Code traffic flows unoptimized until the next
     // pricing poll (or, in the watchdog case, until restart).
     // On the blocking pool: resume_runtime can wait out a cold boot.
-    run_lifecycle_command(app.clone(), |app| {
-        let state: tauri::State<'_, AppState> = app.state();
-        let bypassed = state
-            .proxy_bypass
-            .load(std::sync::atomic::Ordering::Acquire);
-        if state.runtime_is_paused() || bypassed {
-            resume_for_client_setup(&state);
-        }
-        Ok(())
-    })
-    .await?;
-    let state: tauri::State<'_, AppState> = app.state();
-    match client_adapters::apply_client_setup(&client_id) {
-        Ok(result) => {
-            // Enabling Codex, OpenCode or Grok from full bypass: the resume
-            // above ran before this client was written, so the gate re-entered
-            // FULL bypass and the backend stayed down until the next pricing
-            // poll. Configured now, the client is exempt, so a second resume
-            // lands on the Claude-only bypass with the backend up.
-            if state
+    //
+    // Codex, OpenCode and Grok resume AFTER their config is written. Resumed
+    // first, the gate still read them as off, re-entered FULL bypass, stopped
+    // the backend again, and the watchdog restarted it into the Claude-only
+    // bypass 15-30s later (B4, both platforms). Written first, the one resume
+    // lands on the Claude-only bypass directly.
+    let resume_after_write = client_adapters::is_gate_exempt_client(&client_id);
+    let needs_resume = |state: &AppState| {
+        state.runtime_is_paused()
+            || state
                 .proxy_bypass
                 .load(std::sync::atomic::Ordering::Acquire)
-                && client_adapters::any_gate_exempt_client_enabled()
-            {
-                run_lifecycle_command(app.clone(), |app| {
+    };
+    if !resume_after_write {
+        run_lifecycle_command(app.clone(), move |app| {
+            let state: tauri::State<'_, AppState> = app.state();
+            if needs_resume(&state) {
+                resume_for_client_setup(&state);
+            }
+            Ok(())
+        })
+        .await?;
+    }
+    let state: tauri::State<'_, AppState> = app.state();
+    match client_adapters::apply_client_setup(&client_id) {
+        Ok(mut result) => {
+            if resume_after_write && needs_resume(&state) {
+                // Verification probed the proxy before this resume brought it
+                // up; re-probe so the funnel event doesn't record every
+                // paused enable as unreachable.
+                result.verification.proxy_reachable = run_lifecycle_command(app.clone(), |app| {
                     resume_for_client_setup(&app.state::<AppState>());
-                    Ok(())
+                    Ok(state::headroom_proxy_reachable())
                 })
                 .await?;
             }
@@ -7973,6 +7979,9 @@ fn execute_headroom_learn_run(
                 .unwrap_or_else(|| std::path::PathBuf::from("/")),
         )
         .env("PYTHONNOUSERSITE", "1")
+        // Loads the backend's sitecustomize vendors, among them the learn
+        // rule-field coercion (RUST-K5).
+        .env("PYTHONPATH", state.tool_manager.sitecustomize_dir())
         // The live step line depends on stage output arriving as it happens.
         // click.echo already flushes per call, but a plain print() anywhere in
         // the CLI would sit in an 8KB pipe buffer until exit.
@@ -8631,22 +8640,22 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     today
                 };
                 let tooltip: String = match visual {
-                    TrayRuntimeVisual::Booting => "Headroom — starting".into(),
+                    TrayRuntimeVisual::Booting => "Headroom: starting".into(),
                     TrayRuntimeVisual::Running if pulse_enabled => format!(
-                        "Headroom — active, {} tokens saved today",
+                        "Headroom: active, {} tokens saved today",
                         tool_manager::compact_token_count(today.tokens)
                     ),
-                    TrayRuntimeVisual::Running => "Headroom — active".into(),
+                    TrayRuntimeVisual::Running => "Headroom: active".into(),
                     TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code or ChatGPT Codex running normally)".into()
+                        "Headroom: paused, your coding tools connect directly".into()
                     }
                     TrayRuntimeVisual::Unhealthy => {
-                        "Headroom — proxy unreachable, attempting restart".into()
+                        "Headroom: proxy not responding, restarting".into()
                     }
-                    TrayRuntimeVisual::Disconnected => {
-                        "Headroom — Claude Code or ChatGPT Codex not connected".into()
-                    }
-                    TrayRuntimeVisual::Off => "Headroom — off".into(),
+                    // No connector enabled at all (any_gate_exempt_client_enabled
+                    // covers Codex, OpenCode and Grok), not just Claude/Codex.
+                    TrayRuntimeVisual::Disconnected => "Headroom: no coding tools connected".into(),
+                    TrayRuntimeVisual::Off => "Headroom: off".into(),
                 };
 
                 let pause_label = if visual == TrayRuntimeVisual::Paused {
@@ -8746,7 +8755,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
-                                    "Claude Code or ChatGPT Codex is disconnected — open Headroom to re-enable.",
+                                    "Your coding tools were disconnected. Open Headroom to reconnect them.",
                                     Some("connectors".into()),
                                 );
                             }
@@ -9258,7 +9267,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 let _ = show_notification_impl(
                     &app,
                     "Headroom paused",
-                    "Headroom couldn't restart its proxy. Requests are passing through unmodified — it'll keep retrying automatically, or open Headroom and hit Resume.",
+                    "Headroom couldn't restart its proxy, so requests pass through unoptimized. It keeps retrying, or open Headroom and click Resume.",
                     Some("connectors".into()),
                 );
                 // Arm the self-heal: first retry after 30s, backing off on

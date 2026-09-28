@@ -801,16 +801,17 @@ const SUPPORTED_CONNECTOR_IDS = new Set([
 ]);
 
 export function baseUrlTakeoverNotice(replaced: string): string {
-  return `This client was routed through ${replaced}. Headroom now handles routing while enabled and restores this address when you disable the connector.`;
+  return `This client was routed through ${replaced}. Headroom puts it back when you turn the connector off.`;
 }
 
-export function clientSetupNotice(clientName: string, result: ClientSetupResult): string {
-  return [
-    result.replacedBaseUrl
-      ? baseUrlTakeoverNotice(result.replacedBaseUrl)
-      : `${clientName} is configured through Headroom.`,
+// Null when there is nothing beyond the switch itself: the row's status line
+// already carries the restart hint.
+export function clientSetupNotice(result: ClientSetupResult): string | null {
+  const parts = [
+    ...(result.replacedBaseUrl ? [baseUrlTakeoverNotice(result.replacedBaseUrl)] : []),
     ...result.nextSteps
-  ].join(" ");
+  ];
+  return parts.length > 0 ? parts.join(" ") : null;
 }
 
 export type ConnectorStatusLine = {
@@ -890,8 +891,8 @@ export function connectorStatusLine(
   if (!connector.verified) {
     return {
       text: connector.verification
-        ? "Setup is incomplete - open the info panel for the exact checks."
-        : "Setup could not be verified - open the info panel and re-check.",
+        ? "Setup incomplete. The info button lists what failed."
+        : "Couldn't verify setup. Re-check from the info button.",
       tone: "reason"
     };
   }
@@ -900,7 +901,7 @@ export function connectorStatusLine(
   }
   if (connector.verification && !connector.verification.proxyReachable) {
     return {
-      text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6767 yet.",
+      text: "Headroom's proxy isn't answering yet.",
       tone: "reason"
     };
   }
@@ -909,7 +910,7 @@ export function connectorStatusLine(
     : Number.NaN;
   if (Number.isFinite(configuredAt) && now - configuredAt < RESTART_HINT_WINDOW_MS) {
     return {
-      text: `Quit and reopen ${connector.name} if it was running when you enabled this.`,
+      text: `Restart ${connector.name} if it's already open.`,
       tone: "restart"
     };
   }

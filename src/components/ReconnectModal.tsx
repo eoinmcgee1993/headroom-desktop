@@ -46,7 +46,7 @@ export function ReconnectModal({
                 onClick={() => onReconnect(client)}
                 type="button"
               >
-                Turn {client.name} connection back on
+                Reconnect {client.name}
               </button>
             ))
           ) : (

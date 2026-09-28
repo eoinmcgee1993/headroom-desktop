@@ -309,9 +309,8 @@ describe("dashboard helpers", () => {
       }
     };
 
-    expect(clientSetupNotice("Codex", result)).toBe(
-      "Codex is configured through Headroom. Restart Codex. Run /hooks."
-    );
+    expect(clientSetupNotice(result)).toBe("Restart Codex. Run /hooks.");
+    expect(clientSetupNotice({ ...result, nextSteps: [] })).toBeNull();
     expect(baseUrlTakeoverNotice("https://gateway.example")).toContain(
       "https://gateway.example"
     );
@@ -337,7 +336,7 @@ describe("dashboard helpers", () => {
 
     // Just configured: the one thing Headroom cannot do for the user.
     expect(connectorStatusLine(base, now)).toEqual({
-      text: "Quit and reopen Codex if it was running when you enabled this.",
+      text: "Restart Codex if it's already open.",
       tone: "restart"
     });
     // ...and it stops nagging a working setup the next day.
@@ -347,13 +346,13 @@ describe("dashboard helpers", () => {
     expect(connectorStatusLine({ ...base, enabled: false }, now)).toBeNull();
 
     expect(connectorStatusLine({ ...base, verified: false }, now)).toEqual({
-      text: "Setup is incomplete - open the info panel for the exact checks.",
+      text: "Setup incomplete. The info button lists what failed.",
       tone: "reason"
     });
     expect(
       connectorStatusLine({ ...base, verified: false, verification: null }, now)
     ).toEqual({
-      text: "Setup could not be verified - open the info panel and re-check.",
+      text: "Couldn't verify setup. Re-check from the info button.",
       tone: "reason"
     });
     expect(
@@ -362,7 +361,7 @@ describe("dashboard helpers", () => {
         now
       )
     ).toEqual({
-      text: "Configured. Headroom's proxy is not answering on 127.0.0.1:6767 yet.",
+      text: "Headroom's proxy isn't answering yet.",
       tone: "reason"
     });
     // Gated: the backend is down on purpose and the row carries the gate

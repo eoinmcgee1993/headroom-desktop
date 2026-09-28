@@ -557,7 +557,24 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
         other => return Err(anyhow!("Automatic setup is not supported yet for {other}.",)),
     }
 
-    let configured_at = Utc::now().to_rfc3339();
+    // Keep the original enable time across re-applies (launch restore, resume,
+    // hourly repair). It drives the "Restart X" hint, which is meant for the
+    // user's own enable, not for every app launch. A different build restamps
+    // it: an update may write different config, which an already-open client
+    // only picks up on restart.
+    // ponytail: every update counts, config-changing or not; fingerprint the
+    // managed output if the post-update hint proves noisy.
+    let same_build = state
+        .setup_versions
+        .get(&state_id)
+        .is_none_or(|version| version == env!("CARGO_PKG_VERSION"));
+    let configured_at = state
+        .configured_clients
+        .get(&state_id)
+        .or_else(|| state.remembered_clients.get(&state_id))
+        .filter(|_| same_build)
+        .cloned()
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
     state
         .configured_clients
         .insert(state_id.clone(), configured_at);
@@ -586,32 +603,17 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             let mut steps = Vec::new();
             if shell_unwritable {
                 steps.push(
-                    "Your shell profile (e.g. ~/.zshrc) couldn't be updated - it isn't writable, or it isn't valid UTF-8 text. Core routing still works via the client's own config; to launch the client from a terminal, fix the file and re-run setup, or add the export manually."
+                    "Couldn't update your shell profile (e.g. ~/.zshrc): it isn't writable or isn't UTF-8 text. The client's own config still routes through Headroom. For terminal use, fix the file and turn the connector off and on."
                         .into(),
                 );
             }
-            steps.push(
-                "Restart your terminal/editor session to pick up environment changes.".into(),
-            );
+            // The restart hint lives on the connector row, not here.
             if normalized_setup_id(client_id) == "codex_cli" {
                 steps.push(
-                    "Quit and reopen any ChatGPT app, Codex CLI, or IDE sessions to load the managed provider."
-                        .into(),
-                );
-                steps.push(
-                    "In the Codex CLI, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard)."
+                    "In the Codex CLI, run /hooks and trust the Headroom guard so it can warn you if routing breaks."
                         .into(),
                 );
             }
-            steps.push(format!(
-                "Run one {} prompt and verify activity appears in Headroom.",
-                match normalized_setup_id(client_id) {
-                    "codex_cli" => "Codex",
-                    "grok_build" => "Grok Build",
-                    "opencode" => "OpenCode",
-                    _ => "Claude Code",
-                }
-            ));
             steps
         },
         verification,
@@ -1156,9 +1158,17 @@ pub fn is_codex_enabled() -> bool {
 /// snapshot; `ensure_headroom_running` still declines the spawn while paused.
 pub fn any_gate_exempt_client_enabled() -> bool {
     let state = load_setup_state();
-    ["codex_cli", "opencode", "grok_build"]
+    GATE_EXEMPT_CLIENTS
         .iter()
         .any(|id| is_configured(&state, id) || state.remembered_clients.contains_key(*id))
+}
+
+const GATE_EXEMPT_CLIENTS: [&str; 3] = ["codex_cli", "opencode", "grok_build"];
+
+/// Whether `client_id` is one of the connectors the Claude pricing gate keeps
+/// the backend up for (see `any_gate_exempt_client_enabled`).
+pub fn is_gate_exempt_client(client_id: &str) -> bool {
+    GATE_EXEMPT_CLIENTS.contains(&normalized_setup_id(client_id))
 }
 
 pub fn list_client_connectors(
@@ -1342,6 +1352,9 @@ pub fn clear_client_setups() -> Result<()> {
     snapshot_clients.extend(pre.configured_clients.clone());
     let mut snapshot_shell_files = pre.remembered_shell_files.clone();
     snapshot_shell_files.extend(pre.managed_shell_files.clone());
+    // Kept so the next launch's restore can tell an update from a relaunch
+    // (see configured_at in apply_client_setup).
+    let snapshot_versions = pre.setup_versions.clone();
 
     for spec in MANAGED_CLIENT_SPECS {
         let _ = disable_client_setup(spec.id);
@@ -1353,6 +1366,7 @@ pub fn clear_client_setups() -> Result<()> {
         let mut state = load_setup_state();
         state.remembered_clients = snapshot_clients;
         state.remembered_shell_files = snapshot_shell_files;
+        state.setup_versions = snapshot_versions;
         write_setup_state(&state)?;
     }
 
@@ -2897,7 +2911,15 @@ fn ensure_managed_rtk_on_path(
             rtk_path.display()
         )
     })?;
-    let path_value = shell_double_quote(&managed_bin_dir.to_string_lossy());
+    let bin_dir = managed_bin_dir.to_string_lossy();
+    // The block is sourced by Git Bash on Windows, where `C:\...` in a
+    // colon-separated PATH splits at the drive colon into `C` and `\...`.
+    let bin_dir = if cfg!(target_os = "windows") {
+        msys_path(&bin_dir)
+    } else {
+        bin_dir.into_owned()
+    };
+    let path_value = shell_double_quote(&bin_dir);
     configure_shell_block(
         shell_targets,
         "managed_rtk",
@@ -4716,13 +4738,11 @@ fn disable_grok_build() -> Result<()> {
 const HEADROOM_OPENCODE_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const OPENCODE_MANAGED_PROVIDERS: [&str; 2] = ["anthropic", "openai"];
 
+/// OpenCode resolves its dirs with `xdg-basedir`, which has no Windows branch:
+/// `%USERPROFILE%\.config\opencode` there too, never `%APPDATA%`. An
+/// `%APPDATA%` config (0.7.x-0.9.25) was one OpenCode never read, so Windows
+/// OpenCode was never routed (RUST-K2).
 fn opencode_config_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home_dir().join(".config"))
-            .join("opencode");
-    }
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -4746,12 +4766,6 @@ fn opencode_config_path() -> PathBuf {
 }
 
 fn opencode_data_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home_dir().join(".local").join("share"))
-            .join("opencode");
-    }
     std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -8211,6 +8225,25 @@ fn shell_double_quote(value: &str) -> String {
         .replace('`', "\\`")
 }
 
+/// `C:\Users\x\bin` -> `/c/Users/x/bin`, the form Git Bash (MSYS) takes
+/// in PATH. Anything that isn't a drive-letter path is returned unchanged.
+fn msys_path(value: &str) -> String {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (Some(drive), Some(':')) if drive.is_ascii_alphabetic() => {
+            let rest = chars.as_str().replace('\\', "/");
+            let rest = rest.trim_matches('/');
+            let drive = drive.to_ascii_lowercase();
+            if rest.is_empty() {
+                format!("/{drive}")
+            } else {
+                format!("/{drive}/{rest}")
+            }
+        }
+        _ => value.to_string(),
+    }
+}
+
 fn build_headroom_rtk_hook(managed_rtk_path: &Path, managed_python_path: &Path) -> String {
     let rtk = shell_double_quote(&managed_rtk_path.to_string_lossy());
     let python = shell_double_quote(&managed_python_path.to_string_lossy());
@@ -8252,23 +8285,38 @@ fi
 # (VSCode, terminals) launched before rtk was enabled inherit a stale PATH, so
 # `rtk` is missing and the rewrite would fail with "command not found". Pin the
 # leading token to the managed binary's absolute path so it works regardless.
-if [ "${{REWRITTEN%% *}}" = "rtk" ]; then
-  REWRITTEN="$HEADROOM_RTK${{REWRITTEN#rtk}}"
+#
+# The path is spliced into a command the shell re-parses, so it must be quoted
+# and in the shell's own form. On Windows the managed path is `C:\...\rtk.exe`:
+# unquoted, Git Bash eats every backslash ("C:Users...rtk.exe: command not
+# found"), and in a PATH entry the drive colon splits it in two. `cygpath -u`
+# turns it into `/c/...`; `printf %q` quotes spaces and other metacharacters.
+HEADROOM_RTK_SH="$HEADROOM_RTK"
+if command -v cygpath >/dev/null 2>&1; then
+  HEADROOM_RTK_SH="$(cygpath -u "$HEADROOM_RTK" 2>/dev/null || printf '%s' "$HEADROOM_RTK")"
 fi
+HEADROOM_RTK_Q="$(printf '%q' "$HEADROOM_RTK_SH")"
+HEADROOM_RTK_DIR_Q="$(printf '%q' "$(dirname "$HEADROOM_RTK_SH")")"
 
-# Defense-in-depth: if the rewritten command's first token isn't resolvable
-# (e.g. a partial uninstall left `rtk` missing from PATH), fall through to the
-# original command instead of handing Claude Code a command that will fail with
-# "command not found".
-FIRST_TOKEN="${{REWRITTEN%% *}}"
-case "$FIRST_TOKEN" in
-  /*)
-    [ -x "$FIRST_TOKEN" ] || exit 0
-    ;;
-  *)
-    command -v "$FIRST_TOKEN" >/dev/null 2>&1 || exit 0
-    ;;
-esac
+if [ "${{REWRITTEN%% *}}" = "rtk" ]; then
+  # Already checked executable above; the quoted token can't be re-tested by
+  # splitting on spaces, so skip the first-token guard below.
+  REWRITTEN="$HEADROOM_RTK_Q${{REWRITTEN#rtk}}"
+else
+  # Defense-in-depth: if the rewritten command's first token isn't resolvable
+  # (e.g. a partial uninstall left `rtk` missing from PATH), fall through to the
+  # original command instead of handing Claude Code a command that will fail
+  # with "command not found".
+  FIRST_TOKEN="${{REWRITTEN%% *}}"
+  case "$FIRST_TOKEN" in
+    /*)
+      [ -x "$FIRST_TOKEN" ] || exit 0
+      ;;
+    *)
+      command -v "$FIRST_TOKEN" >/dev/null 2>&1 || exit 0
+      ;;
+  esac
+fi
 
 # The pin above only fixes the LEADING token. `rtk rewrite` also emits `rtk`
 # embedded after a `&&`, `;`, or `|` (e.g. `cd web && rtk npx ...`), and those
@@ -8277,7 +8325,7 @@ esac
 # (never the .zprofile/.zshrc where the managed PATH export lands). Prepend the
 # managed bin dir to PATH for this one invocation so every `rtk`, at any
 # position, resolves regardless of which profile files the shell sourced.
-REWRITTEN="export PATH=\"$(dirname "$HEADROOM_RTK"):\$PATH\"; $REWRITTEN"
+REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\"; $REWRITTEN"
 
 HEADROOM_RTK_REWRITTEN="$REWRITTEN" "$HEADROOM_PYTHON" -c 'import json, os, sys; data = json.load(sys.stdin); tool_input = data.get("tool_input"); 
 if not isinstance(tool_input, dict):
@@ -8868,14 +8916,14 @@ mod tests {
         claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
         codex_sqlite_store_expected, default_shell_targets_for_family, discover_codex_state_dbs,
         edit_vscode_wrapper_key, entry_contains_hook, find_on_path_entries, is_no_space,
-        is_permission_denied, normalize_setup_state, normalized_setup_id, nvm_binary_candidates,
-        oss_remnant_warnings, parse_json_object, pin_codex_mcp_command, remove_managed_block,
-        remove_pre_tool_use_markers, render_codex_config, retag_codex_thread_providers,
-        retag_codex_threads_to_headroom, retag_one_codex_db, serialize_paths,
-        shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
-        strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
-        ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS, PERMISSION_DENIED_OS_ERRORS,
-        VSCODE_PROCESS_WRAPPER_KEY,
+        is_permission_denied, msys_path, normalize_setup_state, normalized_setup_id,
+        nvm_binary_candidates, oss_remnant_warnings, parse_json_object, pin_codex_mcp_command,
+        remove_managed_block, remove_pre_tool_use_markers, render_codex_config,
+        retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
+        serialize_paths, shell_block_contains_in_files, shell_block_contains_text_in_files,
+        shell_double_quote, strip_headroom_hook_from_settings, upsert_managed_block,
+        write_file_if_changed, ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS,
+        PERMISSION_DENIED_OS_ERRORS, VSCODE_PROCESS_WRAPPER_KEY,
     };
     #[cfg(unix)]
     use super::{
@@ -10176,6 +10224,124 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[cfg(unix)]
+    fn hook_script_rewrite_runs_with_windows_style_managed_path() {
+        // Regression for #120: on Windows the managed path is `C:\...\rtk.exe`
+        // and was spliced into the rewritten command unquoted, so Git Bash
+        // stripped the backslashes ("C:Users...rtk.exe: command not found").
+        // Simulate it on Unix: the hook is handed a Windows-style path (a
+        // file of that literal name exists, so the `-x` check passes) and a fake `cygpath` maps it to a real directory
+        // containing a space. The emitted command must then actually run.
+        let root = unique_temp_dir("headroom-hook-windows-path");
+        let bin_dir = root.join("Program Files").join("bin");
+        let fake_bin = root.join("fakebin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        fs::create_dir_all(&fake_bin).expect("create fakebin");
+        let exec = |path: &Path, body: &str| {
+            fs::write(path, body).expect("write script");
+            fs::set_permissions(
+                path,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .expect("chmod script");
+        };
+
+        let rtk_body = "#!/usr/bin/env bash\nif [ \"$1\" = rewrite ]; then shift; echo \"rtk $* && rtk git log\"; else echo \"rtk-ran $*\"; fi\n";
+        let windows_rtk = r"C:\Program Files\bin\rtk.exe";
+        // In fakebin, which is both the hook's cwd (for `-x`) and on PATH (a
+        // name without `/` is executed via a PATH lookup, not from cwd).
+        exec(&fake_bin.join(windows_rtk), rtk_body);
+        exec(&bin_dir.join("rtk.exe"), rtk_body);
+        exec(&bin_dir.join("rtk"), rtk_body);
+        exec(
+            &fake_bin.join("cygpath"),
+            &format!(
+                "#!/usr/bin/env bash\n[ \"$1\" = -u ] && shift\nif [ \"$1\" = '{windows_rtk}' ]; then printf '%s\\n' '{}'; else printf '%s\\n' \"$1\"; fi\n",
+                bin_dir.join("rtk.exe").display()
+            ),
+        );
+
+        let system_python = PathBuf::from("/usr/bin/python3");
+        let hook_body = build_headroom_rtk_hook(Path::new(windows_rtk), &system_python);
+        let hook_path = fake_bin.join("hook.sh");
+        exec(&hook_path, &hook_body);
+
+        let run = |cmd: &mut std::process::Command, stdin: &str| {
+            cmd.stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    child
+                        .stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(stdin.as_bytes())
+                        .unwrap();
+                    child.wait_with_output()
+                })
+                .expect("run")
+        };
+
+        let output = run(
+            crate::proc::command("bash")
+                .arg(&hook_path)
+                .current_dir(&fake_bin)
+                .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display())),
+            r#"{"tool_input":{"command":"git status"}}"#,
+        );
+        assert!(output.status.success(), "hook should exit 0");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "hook must emit a rewrite ({e}), stdout: {:?}, stderr: {:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let rewritten = payload["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .expect("rewritten command")
+            .to_string();
+        assert!(
+            !rewritten.contains("C:"),
+            "the Windows path must reach the shell in MSYS form: {rewritten:?}"
+        );
+
+        // Execute it the way Claude Code does: from elsewhere, rtk not on PATH.
+        let executed = run(
+            crate::proc::command("bash")
+                .arg("-c")
+                .arg(&rewritten)
+                .current_dir(std::env::temp_dir())
+                .env("PATH", "/usr/bin:/bin"),
+            "",
+        );
+        let stdout = String::from_utf8_lossy(&executed.stdout);
+        assert!(
+            executed.status.success(),
+            "rewritten command {rewritten:?} failed: stdout {stdout:?}, stderr {:?}",
+            String::from_utf8_lossy(&executed.stderr)
+        );
+        assert_eq!(stdout, "rtk-ran git status\nrtk-ran git log\n");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn msys_path_converts_drive_letter_paths_only() {
+        assert_eq!(
+            msys_path(r"C:\Users\me\AppData\Local\Headroom\headroom\bin"),
+            "/c/Users/me/AppData/Local/Headroom/headroom/bin"
+        );
+        assert_eq!(msys_path(r"d:\Program Files\x\"), "/d/Program Files/x");
+        assert_eq!(msys_path("E:"), "/e");
+        assert_eq!(msys_path("/usr/local/bin"), "/usr/local/bin");
+        assert_eq!(msys_path("relative/C:/x"), "relative/C:/x");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn hook_script_prepends_managed_path_so_embedded_rtk_resolves() {
         // Regression for compound commands: `rtk rewrite` embeds a bare `rtk`
         // after `&&`/`;`/`|`, which the leading-token pin never touches. The
@@ -10370,8 +10536,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let prev_appdata = std::env::var_os("APPDATA");
             let prev_localappdata = std::env::var_os("LOCALAPPDATA");
             std::env::set_var("HOME", &home);
-            // Pin the Windows profile dirs into the temp home: opencode_config_dir
-            // and perform_full_cleanup read these on Windows, and the runner's
+            // Pin the Windows profile dirs into the temp home: perform_full_cleanup
+            // reads these on Windows, and the runner's
             // real AppData is otherwise shared across all parallel test
             // processes. No-ops on Unix (only read under cfg windows).
             std::env::set_var("APPDATA", home.join("AppData").join("Roaming"));
@@ -11395,6 +11561,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         // A user disable drops it from both sets, so the exemption ends.
         super::disable_client_setup("codex").expect("disable");
         assert!(!super::any_gate_exempt_client_enabled());
+
+        for id in ["codex", "codex_gui", "codex_cli", "opencode", "grok_build"] {
+            assert!(super::is_gate_exempt_client(id), "{id}");
+        }
+        assert!(!super::is_gate_exempt_client("claude_code"));
+        assert!(!super::is_gate_exempt_client("vscode"));
     }
 
     #[test]
@@ -11540,8 +11712,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(result.applied);
         assert_eq!(result.client_id, "opencode");
 
-        // Resolve via the same function the apply path uses: the config lands
-        // under XDG_CONFIG_HOME on Unix but %APPDATA% on Windows.
+        // Resolve via the same function the apply path uses (XDG_CONFIG_HOME,
+        // else ~/.config, on every platform).
         let config_path = super::opencode_config_path();
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).expect("config written"))
@@ -12091,19 +12263,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
     }
 
-    #[cfg(target_os = "windows")]
+    /// OpenCode's `xdg-basedir` ignores `%APPDATA%` on Windows (RUST-K2).
     #[test]
-    fn opencode_dirs_resolve_under_appdata_on_windows() {
-        let config = super::opencode_config_dir();
-        let data = super::opencode_data_dir();
-        assert!(config.ends_with("opencode"));
-        assert!(data.ends_with("opencode"));
-        // XDG vars are unset in a clean cmd.exe session; APPDATA must be used.
-        let appdata = std::env::var("APPDATA").expect("APPDATA should be set on Windows");
-        let local_appdata =
-            std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA should be set on Windows");
-        assert!(config.starts_with(PathBuf::from(appdata)));
-        assert!(data.starts_with(PathBuf::from(local_appdata)));
+    #[serial_test::serial]
+    fn opencode_dirs_follow_xdg_basedir_on_every_platform() {
+        let home = TestHome::new(); // restores both XDG vars on drop
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_DATA_HOME");
+        assert_eq!(
+            super::opencode_config_dir(),
+            home.path().join(".config").join("opencode")
+        );
+        assert_eq!(
+            super::opencode_data_dir(),
+            home.path().join(".local").join("share").join("opencode")
+        );
     }
 
     #[test]
@@ -12887,6 +13061,51 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(repaired, vec!["codex_cli".to_string()]);
         let healed = super::verify_client_setup("codex").expect("verify runs");
         assert!(healed.failures.is_empty(), "healed: {:?}", healed.failures);
+    }
+
+    // The configure time drives the frontend's "Quit and reopen" hint. A
+    // quit + relaunch restore must not reset it, or the hint shows for a day
+    // after every launch.
+    #[test]
+    #[serial_test::serial]
+    fn restore_keeps_the_original_configured_at() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+
+        super::apply_client_setup("opencode").expect("apply succeeds");
+        let original = super::configured_timestamp(&super::load_setup_state(), "opencode")
+            .expect("configured");
+
+        super::clear_client_setups().expect("clear succeeds");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        super::restore_client_setups();
+        assert_eq!(
+            super::configured_timestamp(&super::load_setup_state(), "opencode"),
+            Some(original.clone())
+        );
+
+        // Relaunch into a different build: the new config needs a restart.
+        super::clear_client_setups().expect("clear succeeds");
+        let mut state = super::load_setup_state();
+        state
+            .setup_versions
+            .insert("opencode".into(), "0.0.1".into());
+        super::write_setup_state(&state).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        super::restore_client_setups();
+        let updated = super::configured_timestamp(&super::load_setup_state(), "opencode")
+            .expect("configured");
+        assert_ne!(updated, original, "an update is a new configure");
+        let original = updated;
+
+        super::disable_client_setup("opencode").expect("disable succeeds");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        super::apply_client_setup("opencode").expect("re-enable succeeds");
+        assert_ne!(
+            super::configured_timestamp(&super::load_setup_state(), "opencode"),
+            Some(original),
+            "a user re-enable is a new configure"
+        );
     }
 
     #[test]

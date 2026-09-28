@@ -255,7 +255,7 @@ interface AddonCopy {
 const addonCopy: Record<string, AddonCopy> = {
   rtk: {
     whatItDoes:
-      "Installing downloads the RTK binary into Headroom's managed runtime, adds it to your shell PATH, and turns on the bash auto-rewrite hook. Shell commands your agent runs are routed through RTK, which compacts their output so it costs far fewer tokens. Removed cleanly when you uninstall it or Headroom.",
+      "Filters and compresses command outputs before they reach your LLM context, cutting 60-90% of tokens on common dev commands.",
     installing: "Downloading RTK and registering the bash hook...",
     uninstalling: "Removing RTK, its PATH entry, and the bash hook...",
     uninstalled: "RTK removed. Shell commands run normally, without output rewriting.",
@@ -265,7 +265,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   markitdown: {
     whatItDoes:
-      "Installing adds the MarkItDown converter to Headroom's managed Python runtime and registers a document Read hook. Nothing is installed system-wide - it all lives under Headroom's app data and is removed when you uninstall Headroom.",
+      "Converts files and Office documents to Markdown, so your agent can read Word, Excel and PowerPoint files.",
     installing: "Installing MarkItDown and registering the Read hook...",
     uninstalling: "Removing MarkItDown and its Read hook...",
     uninstalled: "MarkItDown removed. Your agent reads documents in their original format again.",
@@ -275,7 +275,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   ponytail: {
     whatItDoes:
-      "Installing registers the Ponytail marketplace and plugin in Claude Code and/or Codex (whichever CLIs are on your PATH). It nudges the agent to write the least code possible. Removed from the plugin registry when you uninstall it or Headroom.",
+      "Makes your AI agent think like the laziest senior dev in the room. The best code is the code you never wrote.",
     installing: "Registering the Ponytail plugin with your agent...",
     uninstalling: "Removing the Ponytail plugin...",
     uninstalled: "Ponytail removed. Your agent writes code without the Ponytail nudge.",
@@ -286,7 +286,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   caveman: {
     whatItDoes:
-      "Installing registers the Caveman marketplace and plugin in Claude Code and/or Codex (whichever CLIs are on your PATH). It makes the agent reply in terse caveman-speak, cutting output tokens while keeping code, commands, and errors exact. Removed from the plugin registry when you uninstall it or Headroom.",
+      "Why use many token when few token do trick. Makes your agent talk like a caveman, while code, commands and errors stay exact.",
     installing: "Registering the Caveman plugin with your agent...",
     uninstalling: "Removing the Caveman plugin...",
     uninstalled: "Caveman removed. Your agent speaks in full sentences again.",
@@ -297,7 +297,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   serena: {
     whatItDoes:
-      "Installing sets up Serena in Headroom's managed runtime and registers it as an MCP server in Claude Code and ChatGPT Codex. Your agent gets symbol-level code tools - find a definition, read just that function, edit in place - instead of reading whole files. Its tool definitions add some tokens to every request, so the net saving is largest in bigger codebases. A serena MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
+      "The IDE for your agent: semantic code retrieval and editing, so it reads the symbol it needs instead of whole files.",
     installing: "Installing Serena and registering its MCP server...",
     installed: "Serena installed. Restart open agent sessions to pick up the new MCP server.",
     uninstalling: "Removing Serena and its MCP registrations...",
@@ -308,7 +308,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   "codebase-memory": {
     whatItDoes:
-      "Installing downloads the codebase-memory binary into Headroom's managed runtime, verifies it, and registers it as an MCP server in Claude Code and ChatGPT Codex. It indexes a repo into a persistent knowledge graph - functions, classes, call chains - so your agent answers structure questions from the graph instead of re-reading files. Ask your agent to index a repo the first time you use it there. Indexes are stored inside Headroom's app data, a codebase-memory MCP entry you configured yourself is never touched, and everything is removed cleanly when you uninstall it or Headroom.",
+      "Indexes your codebase into a persistent knowledge graph your agent queries instead of re-reading files. Ask your agent to index a repo the first time you use it there.",
     installing: "Downloading Codebase Memory and registering its MCP server...",
     installed: "Codebase Memory installed. Restart open agent sessions, then ask your agent to index the repo.",
     uninstalling: "Removing Codebase Memory, its indexes, and its MCP registrations...",
@@ -319,7 +319,7 @@ const addonCopy: Record<string, AddonCopy> = {
   },
   context7: {
     whatItDoes:
-      "Installing verifies the Context7 MCP server runs via npx, then registers it in Claude Code and ChatGPT Codex. Your agent can pull current, version-specific documentation for the libraries you use instead of guessing APIs from stale training data - docs are fetched only when it asks, so the idle cost is just its tool definitions. A context7 MCP entry you configured yourself is never touched, and the registration is removed cleanly when you uninstall it or Headroom. Requires Node.js on PATH.",
+      "Up-to-date code documentation for LLMs, so your agent stops guessing APIs from stale training data.",
     installing: "Verifying Context7 with npx and registering its MCP server...",
     installed: "Context7 installed. Restart open agent sessions to pick up the new MCP server.",
     uninstalling: "Removing the Context7 MCP registrations...",
@@ -332,13 +332,13 @@ const addonCopy: Record<string, AddonCopy> = {
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
-    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Claude Code disables Remote Control behind any proxy, so Headroom also installs a /remote-control command that, after confirming, restarts the current session without Headroom. In the VS Code panel the command is /remote-control-headroom, and the restart happens in place.",
+    "Sets ANTHROPIC_BASE_URL in your shell profile and ~/.claude/settings.json. Claude Code turns off Remote Control behind a proxy, so Headroom adds a /remote-control command (/remote-control-headroom in VS Code) that restarts the session without Headroom.",
   codex:
-    "Codex in the ChatGPT app, the Codex IDE extension, and the Codex CLI share ~/.codex/config.toml. Headroom adds a managed provider there and an OPENAI_BASE_URL shell export, plus a SessionStart guard that warns when routing breaks. In the Codex CLI, run /hooks once to review and trust the guard (and again after it changes).",
+    "Adds a Headroom provider to ~/.codex/config.toml, which the ChatGPT app, the IDE extension and the CLI share, plus an OPENAI_BASE_URL shell export and a guard that warns if routing breaks. In the Codex CLI, run /hooks once to trust the guard.",
   grok_build:
-    "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom.",
+    "Adds a proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profile.",
   opencode:
-    "Headroom points the anthropic and openai provider base URLs in OpenCode's config file (usually ~/.config/opencode/opencode.json) at its localhost proxy and registers a transport plugin that routes every other provider through it too. Anthropic and OpenAI traffic is optimized; other providers pass through for visibility. A project-level opencode.json can override this for that project."
+    "Points the anthropic and openai providers in OpenCode's global config (usually ~/.config/opencode/opencode.json) at Headroom and adds a plugin that routes the other providers through it too. Anthropic and OpenAI traffic is optimized; the rest passes through unchanged. A project's own opencode.json can override this."
 };
 
 // Claude Code run inside the Claude desktop app is the one Claude Code surface
@@ -351,7 +351,7 @@ const connectorSetupDetails: Record<string, string> = {
 // It stops at attributing the decision and does not speculate about why they
 // made it, which we do not know.
 const CLAUDE_DESKTOP_LIMITATION =
-  "Claude Code inside the Claude desktop app cannot be optimized. Headroom routes Claude Code by pointing it at a local proxy via your shell profile and ~/.claude/settings.json, and Anthropic's desktop app uses neither, so its requests never reach Headroom. That is a design decision on Anthropic's side and nothing Headroom can work around. Run Claude Code from a terminal, or use the VS Code or JetBrains extension, and Headroom picks it up automatically.";
+  "Claude Code inside the Claude desktop app can't be optimized. Anthropic's app ignores your shell profile and ~/.claude/settings.json, so its requests never reach Headroom. Run Claude Code from a terminal or the VS Code or JetBrains extension instead.";
 
 const connectorSupportWarnings: Record<string, string> = {
   claude_code: CLAUDE_DESKTOP_LIMITATION
@@ -371,13 +371,13 @@ const connectorUnavailableReasons: Record<string, string> = {
   // lands here, because the CLI genuinely isn't installed. Say so, or they
   // reasonably conclude Headroom is broken rather than inapplicable.
   claude_code:
-    "Claude Code was not detected. Install the Claude Code CLI and restart Headroom. Note that Claude Code inside the Claude desktop app cannot be optimized: Anthropic's desktop app does not use the CLI's configuration, so Headroom never sees its requests. That is their design decision, not something Headroom can configure around.",
+    "Claude Code not found. Install the CLI and restart Headroom. Claude Code inside the Claude desktop app can't be optimized: Anthropic's app ignores the CLI's configuration.",
   codex:
-    "The Codex CLI was not detected. Headroom can still configure Codex in the ChatGPT app and the Codex IDE extension; install the CLI only if you also want terminal use.",
+    "Codex CLI not found. Codex in the ChatGPT app and the IDE extension still works.",
   grok_build:
-    "Grok Build was not detected. Install Grok Build and restart Headroom.",
+    "Grok Build not found. Install it and restart Headroom.",
   opencode:
-    "OpenCode was not detected. Install OpenCode and restart Headroom."
+    "OpenCode not found. Install it and restart Headroom."
 };
 
 // Grok routing: UA-classified in the intercept, forwarded to api.x.ai via
@@ -909,10 +909,10 @@ function OutputReductionChip({
             </div>
           </dl>
           <p className="output-chip__pop-note">
-            {allTimeFallback ? "No output samples landed in this window, so this is the all-time figure, not this period's. " : ""}
+            {allTimeFallback ? "No output samples in this period, so this is the all-time figure. " : ""}
             {isMeasured
-              ? "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down — measured against an unshaped A/B holdout."
-              : "Output tokens the model didn't emit because the shaper steered verbosity / routed effort down. Output savings are counterfactual, so this is an estimate vs a learned baseline."}
+              ? "Output tokens the model skipped because Headroom asked for shorter replies or less effort, measured against a control group of unshaped conversations."
+              : "Output tokens the model skipped because Headroom asked for shorter replies or less effort. An estimate against a baseline learned from your past replies."}
           </p>
         </div>
       ) : null}
@@ -1145,7 +1145,7 @@ function DailySavingsChart({
                         )
                       }
                     ]}
-                    note="Baseline = new input that reached the provider (uncached + cache writes) plus the tokens Headroom removed. The re-sent cached prefix is excluded from both sides. Sampled while the app runs."
+                    note="Baseline is the new input sent to the provider (uncached or written to cache) plus what Headroom removed. Re-sent cached context is left out of both. Sampled while the app runs."
                   />
                 ) : windowBillable !== null ? (
                   // No sampled new-input coverage in this window: show the
@@ -2504,7 +2504,7 @@ export default function App() {
                 : startupError
                 ? { text: `Headroom could not finish starting: ${startupError}`, tone: "error" }
                 : {
-                    text: "Finishing setup - first launch downloads models and can take a minute. Wait for this message to clear before sending your test message, or the test will not register.",
+                    text: "Finishing setup. The first launch downloads models and can take a minute. Send your test message once this clears.",
                     tone: "info"
                   }
             );
@@ -3368,12 +3368,12 @@ export default function App() {
     Number(grokLearnEnabled);
   const learnBlurb =
     learnAgentCount > 1
-      ? "Headroom learns from your coding agents' sessions. When an agent repeats a mistake, Headroom updates that agent's memory so it doesn't happen again."
+      ? "When an agent repeats a mistake, Headroom updates that agent's memory so it doesn't happen again."
       : codexLearnEnabled
-        ? "Headroom learns from your ChatGPT Codex sessions. When Codex repeats a mistake, Headroom updates your ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
+        ? "When Codex repeats a mistake, Headroom updates ~/.codex/AGENTS.md and instructions.md so it doesn't happen again."
         : opencodeLearnEnabled || grokLearnEnabled
-          ? "Headroom learns from your agent's sessions. When it repeats a mistake, Headroom updates the agent's memory so it doesn't happen again."
-          : "Headroom helps Claude Code learn from experience. When Claude makes mistakes, Headroom automatically updates the project's MEMORY.md so they don't happen again. You can also ask Headroom to scan past sessions & add token-saving learnings to CLAUDE.local.md.";
+          ? "When your agent repeats a mistake, Headroom updates its memory so it doesn't happen again."
+          : "When Claude makes a mistake, Headroom updates the project's MEMORY.md so it doesn't happen again. It can also scan past sessions and add token-saving lessons to CLAUDE.local.md.";
   useEffect(() => {
     // connectors === [] means get_client_connectors hasn't returned yet (the
     // Rust side always lists every managed client). Don't treat that launch
@@ -3777,7 +3777,7 @@ export default function App() {
     }
     return (
       connectorUnavailableReasons[connector.clientId] ??
-      "Connector is unavailable because this client is not detected on this machine."
+      "Not found on this machine."
     );
   }
 
@@ -4867,7 +4867,7 @@ export default function App() {
         const result = await invoke<ClientSetupResult>("apply_client_setup", {
           clientId: connector.clientId,
         });
-        setConnectorsNotice(clientSetupNotice(connector.name, result));
+        setConnectorsNotice(clientSetupNotice(result));
       } else {
         await invoke("disable_client_setup", { clientId: connector.clientId });
         setConnectorsNotice(null);
@@ -5312,7 +5312,7 @@ export default function App() {
                   ? "Running the previous version while we wait for you to retry."
                   : "Running the previous version.")}
               {upgradeExhausted
-                ? " We won't auto-retry on launch — click Retry to try again."
+                ? " Click Retry to try again."
                 : ""}
             </p>
             <div className="launcher-install-buttons">
@@ -6304,7 +6304,7 @@ export default function App() {
       if (connectorPhase === "disabled") {
         return {
           tone: "disabled",
-          title: "No coding tools connected — Headroom isn't reducing costs."
+          title: "No coding tools connected, so Headroom isn't saving anything."
         } as const;
       }
       if (connectorPhase === "verifying") {
@@ -6586,8 +6586,8 @@ export default function App() {
       if (!pricingStatus.localGraceActive) {
         return {
           tone: "expired" as const,
-          message: "Your 72-hour Headroom access expired. Create an account to extend to 7 days.",
-          actionLabel: "Sign up",
+          message: "Sign in to keep using Headroom.",
+          actionLabel: "Sign in",
           onAction: openUpgradeAuthView
         };
       }
@@ -6597,8 +6597,8 @@ export default function App() {
           : "72 hours";
       return {
         tone: "warning" as const,
-        message: `${hoursLabel} left in your 72-hour trial. Create an account to extend trial to 7 days.`,
-        actionLabel: "Sign up",
+        message: `Sign in within ${hoursLabel} to keep using Headroom.`,
+        actionLabel: "Sign in",
         onAction: openUpgradeAuthView
       };
     }
@@ -6820,8 +6820,8 @@ export default function App() {
               </h2>
               <p className="tier-mismatch-banner__message">
                 {tierMismatch.clamped
-                  ? `Your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan, above your current Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan, so weekly usage limits ${meteredSinceLabel ? `have applied to ${clampScopeLabel} since ${meteredSinceLabel}` : `now apply to ${clampScopeLabel}`}. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to restore unlimited optimization.`
-                  : `You're on the Headroom ${upgradePlanIntentLabel(tierMismatch.paidTier)} plan but your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs the Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)} plan. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to match.`}
+                  ? `Your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}, but you're on ${upgradePlanIntentLabel(tierMismatch.paidTier)}, so weekly limits ${meteredSinceLabel ? `have applied to ${clampScopeLabel} since ${meteredSinceLabel}` : `now apply to ${clampScopeLabel}`}. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to remove them.`
+                  : `Your ${tierRecommendationSourceLabel(tierMismatch.recommendedSource)} usage needs Headroom ${upgradePlanIntentLabel(tierMismatch.recommendedTier)}, but you're on ${upgradePlanIntentLabel(tierMismatch.paidTier)}. Upgrade${pricingStatus?.account?.upgradeAction === "appsumo" ? " on AppSumo" : ""} to match.`}
               </p>
               {upgradeActionError && upgradeActionBusy === null ? (
                 <p className="tier-mismatch-banner__error" role="status">
@@ -7049,7 +7049,7 @@ export default function App() {
                       </span>
                       <span className="optimize-card__auto-learn-meta">
                         {autoLearnEnabled === false
-                          ? "Off — only manual scans add learnings."
+                          ? "Off. Only manual scans add learnings."
                           : autoLearnMeta}
                       </span>
                     </div>
@@ -7994,12 +7994,6 @@ export default function App() {
                 </div>
                 <div className="connector-list">
                   {sortClientConnectors(aggregateClientConnectors(connectors)).map((connector) => {
-                    const connectorLabel =
-                      connector.clientId === "claude_code"
-                        ? "Claude Code connection"
-                        : connector.clientId === "codex"
-                          ? "ChatGPT Codex connection"
-                          : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
                     const gateMessage = connectorGateMessage(connector, pricingStatus);
@@ -8017,7 +8011,7 @@ export default function App() {
                             <span className="client-logo" aria-hidden="true">
                               {renderConnectorLogo(connector.clientId)}
                             </span>
-                            {connectorLabel}
+                            {connector.name}
                             <button
                               className="connector-help"
                               onClick={() =>
@@ -8036,7 +8030,7 @@ export default function App() {
                             <div className="connector-tooltip">
                               <p>
                                 {connectorSetupDetails[connector.clientId] ??
-                                  "Headroom applies local connector configuration."}
+                                  "Headroom writes this tool's local configuration."}
                               </p>
                               {connector.enabled ? (
                                 <div className="connector-diagnostics">
@@ -8061,7 +8055,7 @@ export default function App() {
                                       ) : null}
                                     </ul>
                                   ) : (
-                                    <p>Verification details are not available yet.</p>
+                                    <p>No checks yet.</p>
                                   )}
                                   <button
                                     className="addon-card__link connector-diagnostics__refresh"
@@ -8178,7 +8172,7 @@ export default function App() {
                       {
                         name: "Runtime",
                         ok: runtimeStatus?.bypassed ? null : runtimeStatus?.running === true,
-                        suffix: runtimeStatus?.bypassed ? "paused by the plan gate" : undefined,
+                        suffix: runtimeStatus?.bypassed ? "paused by your plan" : undefined,
                       },
                       {
                         name: "Proxy",
@@ -8240,13 +8234,13 @@ export default function App() {
                           const lines = await invoke<string[]>("get_headroom_logs", { maxLines: 80 });
                           setHeadroomLogLines(lines);
                         } catch {
-                          setHeadroomLogLines(["Failed to load headroom logs."]);
+                          setHeadroomLogLines(["Couldn't load logs."]);
                         }
                       }
                     }}
                     type="button"
                   >
-                    {showHeadroomDetails ? "Hide headroom logs" : "Show headroom logs"}
+                    {showHeadroomDetails ? "Hide logs" : "Show logs"}
                   </button>
                   {showHeadroomDetails ? (
                     <pre className="runtime-log" ref={headroomLogRef}>
@@ -8262,7 +8256,7 @@ export default function App() {
                   </div>
                   <div>
                     <p>
-                      Automatically launch Headroom whenever you login or restart.
+                      Start Headroom when you log in.
                     </p>
                   </div>
                   <div className="connector-item__controls">
@@ -8300,8 +8294,8 @@ export default function App() {
                   </div>
                 </div>
                 <p>
-                  Removes Headroom and everything it changed: the runtime, its addons, your
-                  coding agent configs, and the app itself. You will see the full list first.
+                  Removes the app, its runtime and addons, and undoes its changes to your
+                  coding tools. You'll see the full list first.
                 </p>
                 <button
                   className="secondary-button secondary-button--small"
@@ -8367,8 +8361,8 @@ export default function App() {
                   (item) => item.clientId === client.clientId
                 );
                 // Land on Settings either way: once the toggle lands, the
-                // connector row shows "Quit and reopen X if it was running
-                // when you enabled this" - the one step the button can't do.
+                // connector row shows "Restart X if it's already open" - the
+                // one step the button can't do.
                 setActiveView("settings");
                 if (connector) {
                   void toggleConnector(connector, true);
@@ -8409,8 +8403,8 @@ export default function App() {
                             than scored against a global mean. */}
                         <p className="savings-breakdown__note">
                           {dashboard.outputReduction?.method === "measured"
-                            ? `Output savings are measured: a small share of conversations run unshaped as a control group, and Headroom compares your shaped replies against them across ${compactNumber(dashboard.outputReduction.requests)} requests.`
-                            : `Output savings are counterfactual: Headroom compares each reply against a baseline learned from your past replies${
+                            ? `Measured: a small share of conversations run unshaped as a control group, compared with your other replies over ${compactNumber(dashboard.outputReduction.requests)} requests.`
+                            : `Estimated: each reply is compared with a baseline learned from your past replies${
                                 dashboard.outputReduction
                                   ? `, over the ${compactNumber(dashboard.outputReduction.requests)} requests that baseline covers`
                                   : ""
