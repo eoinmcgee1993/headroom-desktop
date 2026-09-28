@@ -338,7 +338,7 @@ const connectorSetupDetails: Record<string, string> = {
   grok_build:
     "Adds a proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profile.",
   opencode:
-    "Points the anthropic and openai providers in ~/.config/opencode/opencode.json at Headroom and adds a plugin that routes the other providers through it too. Anthropic and OpenAI traffic is optimized; the rest passes through unchanged. A project's own opencode.json can override this."
+    "Points the anthropic and openai providers in OpenCode's global config (usually ~/.config/opencode/opencode.json) at Headroom and adds a plugin that routes the other providers through it too. Anthropic and OpenAI traffic is optimized; the rest passes through unchanged. A project's own opencode.json can override this."
 };
 
 // Claude Code run inside the Claude desktop app is the one Claude Code surface
@@ -5312,7 +5312,7 @@ export default function App() {
                   ? "Running the previous version while we wait for you to retry."
                   : "Running the previous version.")}
               {upgradeExhausted
-                ? " We won't auto-retry on launch — click Retry to try again."
+                ? " Click Retry to try again."
                 : ""}
             </p>
             <div className="launcher-install-buttons">
@@ -6304,7 +6304,7 @@ export default function App() {
       if (connectorPhase === "disabled") {
         return {
           tone: "disabled",
-          title: "No coding tools connected — Headroom isn't reducing costs."
+          title: "No coding tools connected, so Headroom isn't saving anything."
         } as const;
       }
       if (connectorPhase === "verifying") {
@@ -6586,8 +6586,8 @@ export default function App() {
       if (!pricingStatus.localGraceActive) {
         return {
           tone: "expired" as const,
-          message: "Your 72-hour Headroom access expired. Create an account to extend to 7 days.",
-          actionLabel: "Sign up",
+          message: "Sign in to keep using Headroom.",
+          actionLabel: "Sign in",
           onAction: openUpgradeAuthView
         };
       }
@@ -6597,8 +6597,8 @@ export default function App() {
           : "72 hours";
       return {
         tone: "warning" as const,
-        message: `${hoursLabel} left in your 72-hour trial. Create an account to extend trial to 7 days.`,
-        actionLabel: "Sign up",
+        message: `Sign in within ${hoursLabel} to keep using Headroom.`,
+        actionLabel: "Sign in",
         onAction: openUpgradeAuthView
       };
     }
@@ -7049,7 +7049,7 @@ export default function App() {
                       </span>
                       <span className="optimize-card__auto-learn-meta">
                         {autoLearnEnabled === false
-                          ? "Off — only manual scans add learnings."
+                          ? "Off. Only manual scans add learnings."
                           : autoLearnMeta}
                       </span>
                     </div>
@@ -8361,8 +8361,8 @@ export default function App() {
                   (item) => item.clientId === client.clientId
                 );
                 // Land on Settings either way: once the toggle lands, the
-                // connector row shows "Quit and reopen X if it was running
-                // when you enabled this" - the one step the button can't do.
+                // connector row shows "Restart X if it's already open" - the
+                // one step the button can't do.
                 setActiveView("settings");
                 if (connector) {
                   void toggleConnector(connector, true);

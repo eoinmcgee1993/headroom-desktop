@@ -5265,11 +5265,14 @@ async fn apply_client_setup(
     }
     let state: tauri::State<'_, AppState> = app.state();
     match client_adapters::apply_client_setup(&client_id) {
-        Ok(result) => {
+        Ok(mut result) => {
             if resume_after_write && needs_resume(&state) {
-                run_lifecycle_command(app.clone(), |app| {
+                // Verification probed the proxy before this resume brought it
+                // up; re-probe so the funnel event doesn't record every
+                // paused enable as unreachable.
+                result.verification.proxy_reachable = run_lifecycle_command(app.clone(), |app| {
                     resume_for_client_setup(&app.state::<AppState>());
-                    Ok(())
+                    Ok(state::headroom_proxy_reachable())
                 })
                 .await?;
             }
@@ -8634,22 +8637,22 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     today
                 };
                 let tooltip: String = match visual {
-                    TrayRuntimeVisual::Booting => "Headroom — starting".into(),
+                    TrayRuntimeVisual::Booting => "Headroom: starting".into(),
                     TrayRuntimeVisual::Running if pulse_enabled => format!(
-                        "Headroom — active, {} tokens saved today",
+                        "Headroom: active, {} tokens saved today",
                         tool_manager::compact_token_count(today.tokens)
                     ),
-                    TrayRuntimeVisual::Running => "Headroom — active".into(),
+                    TrayRuntimeVisual::Running => "Headroom: active".into(),
                     TrayRuntimeVisual::Paused => {
-                        "Headroom — paused (Claude Code or ChatGPT Codex running normally)".into()
+                        "Headroom: paused, your coding tools connect directly".into()
                     }
                     TrayRuntimeVisual::Unhealthy => {
-                        "Headroom — proxy unreachable, attempting restart".into()
+                        "Headroom: proxy not responding, restarting".into()
                     }
-                    TrayRuntimeVisual::Disconnected => {
-                        "Headroom — Claude Code or ChatGPT Codex not connected".into()
-                    }
-                    TrayRuntimeVisual::Off => "Headroom — off".into(),
+                    // No connector enabled at all (any_gate_exempt_client_enabled
+                    // covers Codex, OpenCode and Grok), not just Claude/Codex.
+                    TrayRuntimeVisual::Disconnected => "Headroom: no coding tools connected".into(),
+                    TrayRuntimeVisual::Off => "Headroom: off".into(),
                 };
 
                 let pause_label = if visual == TrayRuntimeVisual::Paused {
@@ -8749,7 +8752,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
-                                    "Claude Code or ChatGPT Codex is disconnected — open Headroom to re-enable.",
+                                    "Your coding tools were disconnected. Open Headroom to reconnect them.",
                                     Some("connectors".into()),
                                 );
                             }
@@ -9261,7 +9264,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 let _ = show_notification_impl(
                     &app,
                     "Headroom paused",
-                    "Headroom couldn't restart its proxy. Requests are passing through unmodified — it'll keep retrying automatically, or open Headroom and hit Resume.",
+                    "Headroom couldn't restart its proxy, so requests pass through unoptimized. It keeps retrying, or open Headroom and click Resume.",
                     Some("connectors".into()),
                 );
                 // Arm the self-heal: first retry after 30s, backing off on

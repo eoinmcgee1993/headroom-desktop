@@ -407,8 +407,7 @@ fn boot_validation_message(elapsed_secs: u64, active: bool) -> String {
             _ => "Preparing model caches for first-time use".to_string(),
         }
     } else {
-        "Finishing up the first-run download — slower connections may take several more minutes"
-            .to_string()
+        "Finishing the first-run download. Slow connections can take a few more minutes".to_string()
     };
 
     let hint = if active {
@@ -1251,7 +1250,7 @@ impl AppState {
         self.set_upgrade_progress(|p| {
             p.current_step = "Verifying update".into();
             p.message =
-                "Launching updated Headroom. This can take a minute — Headroom may need to download new ML models.".into();
+                "Launching the updated Headroom. This can take a minute if it needs to download new models.".into();
             p.overall_percent = 97;
         });
         emit_runtime_upgrade_progress(app, self);
@@ -2458,13 +2457,7 @@ impl AppState {
 
     /// Local day keys (ascending) of every day with savings activity.
     pub fn active_day_keys(&self) -> Vec<String> {
-        let tracker = self.savings_tracker.lock();
-        tracker
-            .daily_savings
-            .iter()
-            .filter(|(_, bucket)| bucket.is_active())
-            .map(|(day, _)| day.clone())
-            .collect()
+        self.savings_tracker.lock().active_day_keys()
     }
 
     /// Emit a weekly recap rolling up the 7 days ending last Sunday.
@@ -5351,6 +5344,21 @@ impl SavingsTracker {
                 output_baseline_tokens: None,
             })
             .collect()
+    }
+
+    /// From the hourly map, not `daily_savings`: that one also holds the
+    /// backend's UTC-dated rollups, so an evening crossing UTC midnight would
+    /// count the next (idle) local day as active. Hourly keys are local on
+    /// every path and kept 30 days, past the 14-day tier-mismatch cap.
+    fn active_day_keys(&self) -> Vec<String> {
+        let mut days: Vec<String> = self
+            .hourly_savings
+            .iter()
+            .filter(|(_, bucket)| bucket.is_active())
+            .map(|(hour, _)| day_key_from_hour_key(hour))
+            .collect();
+        days.dedup(); // BTreeMap order: sorted, so dedup is enough
+        days
     }
 
     fn hourly_savings(&self) -> Vec<HourlySavingsPoint> {
@@ -11648,6 +11656,37 @@ mod tests {
             tracker.note_lifetime_token_total(21_000_000),
             vec![10_000_000, 20_000_000]
         );
+    }
+
+    #[test]
+    fn active_day_keys_ignore_utc_dated_daily_rollups() {
+        let mut tracker = make_tracker();
+        let saved = |tokens| DailySavingsBucket {
+            estimated_tokens_saved: tokens,
+            ..Default::default()
+        };
+        tracker
+            .hourly_savings
+            .insert("2026-09-25T10:00".into(), saved(10));
+        tracker
+            .hourly_savings
+            .insert("2026-09-25T17:00".into(), saved(5));
+        // Traffic but nothing saved: not an active day.
+        tracker.hourly_savings.insert(
+            "2026-09-27T12:00".into(),
+            DailySavingsBucket {
+                total_tokens_sent: 100,
+                ..Default::default()
+            },
+        );
+        tracker
+            .hourly_savings
+            .insert("2026-09-28T09:00".into(), saved(7));
+        // Friday 17:00 PDT is Saturday in UTC: the backend's UTC-dated daily
+        // rollup must not turn the idle local Saturday active.
+        tracker.daily_savings.insert("2026-09-26".into(), saved(5));
+
+        assert_eq!(tracker.active_day_keys(), ["2026-09-25", "2026-09-28"]);
     }
 
     #[test]

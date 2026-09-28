@@ -124,7 +124,7 @@ describe("OptimizePanel", () => {
     render(<OptimizePanel projectPath="/proj" />);
     const user = userEvent.setup();
 
-    const pill = await screen.findByRole("button", { name: /could not load learnings.*retry/i });
+    const pill = await screen.findByRole("button", { name: /couldn.t load learnings.*retry/i });
     expect(pill).toHaveAttribute("title", "list_applied_patterns: no such project");
     expect(pill).toBeEnabled();
 

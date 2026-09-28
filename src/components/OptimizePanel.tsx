@@ -138,7 +138,7 @@ export function OptimizePanel({
           }}
           title={loadError}
         >
-          could not load learnings — retry
+          Couldn't load learnings. Retry
         </button>
       </span>
     );
@@ -172,8 +172,7 @@ export function OptimizePanel({
             <p className="optimize-panel__empty">Loading…</p>
           ) : claudeCount === 0 ? (
             <p className="optimize-panel__empty">
-              No learnings in CLAUDE.local.md yet — run Learn or let live traffic
-              accumulate.
+              No learnings in CLAUDE.local.md yet. Run Learn, or they build up as you work.
             </p>
           ) : (
             <AppliedSections
@@ -193,8 +192,7 @@ export function OptimizePanel({
             <p className="optimize-panel__empty">Loading…</p>
           ) : memoryCount === 0 ? (
             <p className="optimize-panel__empty">
-              No reminders in MEMORY.md yet — run Learn or let live traffic
-              accumulate.
+              No reminders in MEMORY.md yet. Run Learn, or they build up as you work.
             </p>
           ) : (
             <AppliedSections

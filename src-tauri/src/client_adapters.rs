@@ -4725,13 +4725,11 @@ fn disable_grok_build() -> Result<()> {
 const HEADROOM_OPENCODE_BASE_URL: &str = "http://127.0.0.1:6767/v1";
 const OPENCODE_MANAGED_PROVIDERS: [&str; 2] = ["anthropic", "openai"];
 
+/// OpenCode resolves its dirs with `xdg-basedir`, which has no Windows branch:
+/// `%USERPROFILE%\.config\opencode` there too, never `%APPDATA%`. An
+/// `%APPDATA%` config (0.7.x-0.9.25) was one OpenCode never read, so Windows
+/// OpenCode was never routed (RUST-K2).
 fn opencode_config_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home_dir().join(".config"))
-            .join("opencode");
-    }
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -4755,12 +4753,6 @@ fn opencode_config_path() -> PathBuf {
 }
 
 fn opencode_data_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        return std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home_dir().join(".local").join("share"))
-            .join("opencode");
-    }
     std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -10531,8 +10523,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let prev_appdata = std::env::var_os("APPDATA");
             let prev_localappdata = std::env::var_os("LOCALAPPDATA");
             std::env::set_var("HOME", &home);
-            // Pin the Windows profile dirs into the temp home: opencode_config_dir
-            // and perform_full_cleanup read these on Windows, and the runner's
+            // Pin the Windows profile dirs into the temp home: perform_full_cleanup
+            // reads these on Windows, and the runner's
             // real AppData is otherwise shared across all parallel test
             // processes. No-ops on Unix (only read under cfg windows).
             std::env::set_var("APPDATA", home.join("AppData").join("Roaming"));
@@ -11707,8 +11699,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(result.applied);
         assert_eq!(result.client_id, "opencode");
 
-        // Resolve via the same function the apply path uses: the config lands
-        // under XDG_CONFIG_HOME on Unix but %APPDATA% on Windows.
+        // Resolve via the same function the apply path uses (XDG_CONFIG_HOME,
+        // else ~/.config, on every platform).
         let config_path = super::opencode_config_path();
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).expect("config written"))
@@ -12258,19 +12250,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
     }
 
-    #[cfg(target_os = "windows")]
+    /// OpenCode's `xdg-basedir` ignores `%APPDATA%` on Windows (RUST-K2).
     #[test]
-    fn opencode_dirs_resolve_under_appdata_on_windows() {
-        let config = super::opencode_config_dir();
-        let data = super::opencode_data_dir();
-        assert!(config.ends_with("opencode"));
-        assert!(data.ends_with("opencode"));
-        // XDG vars are unset in a clean cmd.exe session; APPDATA must be used.
-        let appdata = std::env::var("APPDATA").expect("APPDATA should be set on Windows");
-        let local_appdata =
-            std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA should be set on Windows");
-        assert!(config.starts_with(PathBuf::from(appdata)));
-        assert!(data.starts_with(PathBuf::from(local_appdata)));
+    #[serial_test::serial]
+    fn opencode_dirs_follow_xdg_basedir_on_every_platform() {
+        let home = TestHome::new(); // restores both XDG vars on drop
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_DATA_HOME");
+        assert_eq!(
+            super::opencode_config_dir(),
+            home.path().join(".config").join("opencode")
+        );
+        assert_eq!(
+            super::opencode_data_dir(),
+            home.path().join(".local").join("share").join("opencode")
+        );
     }
 
     #[test]

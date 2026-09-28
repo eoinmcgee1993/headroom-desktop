@@ -2128,7 +2128,7 @@ pub(crate) fn submit_cancellation_intent_with_base_url(
 
 pub fn fetch_claude_usage(state: &AppState) -> Result<ClaudeUsage, String> {
     let access_token = state.current_bearer_token().ok_or_else(|| {
-        "No Claude AI token captured yet — make sure Claude Code is running and authenticated via Claude AI (not an API key), then try again after the first request passes through the proxy.".to_string()
+        "No Claude sign-in seen yet. Make sure Claude Code is signed in with a Claude account (not an API key), then try again after its first request goes through Headroom.".to_string()
     })?;
 
     let resp = http_client()?
@@ -2221,9 +2221,7 @@ fn evaluate_pricing_status_with_mismatch(
     if needs_authentication {
         optimization_allowed = false;
         gate_reason = Some(PricingGateReason::SignInRequired);
-        gate_message =
-            "Create a Headroom account to unlock your 7-day trial and keep optimization enabled."
-                .into();
+        gate_message = "Sign in to keep using Headroom.".into();
     } else if let Some(account) = account.as_ref() {
         if account.subscription_active {
             // Clamp Claude only when the Claude-implied tier itself exceeds the
@@ -2295,9 +2293,7 @@ fn evaluate_pricing_status_with_mismatch(
             "Headroom account connected, but pricing status could not be synced right now. Optimization stays enabled for now."
                 .into();
     } else {
-        gate_message =
-            "Headroom is active during your first 72 hours. Create an account to unlock the 7-day trial before this grace period ends."
-                .into();
+        gate_message = "Sign in within 72 hours of first launch to keep using Headroom.".into();
     }
 
     // Server-computed usage-band pitch for API-billed orgs: the server fills
@@ -2422,13 +2418,19 @@ fn resolve_tier_mismatch(
 
     // `upgrade_action` is set only for AppSumo-entitled accounts.
     let appsumo = account.is_some_and(|a| a.upgrade_action.is_some());
-    let grace_ends_at = tier_mismatch_grace_ends_at(since, appsumo, active_day_keys);
-    let clamped = Utc::now() > grace_ends_at;
-    let clamped_at = clamped.then_some(grace_ends_at);
+    let computed = tier_mismatch_grace_ends_at(since, appsumo, active_day_keys);
+    let clamped_at = latch_clamp_start(
+        local.mismatch_clamped_at,
+        computed,
+        since + Duration::days(TIER_MISMATCH_GRACE_DAYS),
+        Utc::now(),
+    );
     if local.mismatch_clamped_at != clamped_at {
         local.mismatch_clamped_at = clamped_at;
         let _ = write_local_state(&local);
     }
+    let clamped = clamped_at.is_some();
+    let grace_ends_at = clamped_at.unwrap_or(computed);
     // Per-product scope for the clamp. `recommended_source` names the higher
     // recommendation, which is not the same thing: paid Pro with Claude->Max20x
     // and Codex->Max5x reports source Claude, yet both products are
@@ -2469,13 +2471,33 @@ fn tier_mismatch_grace_ends_at(
         .nth(APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS)
         .and_then(|key| NaiveDate::parse_from_str(key, "%Y-%m-%d").ok())
         .and_then(|day| {
-            day.and_hms_opt(0, 0, 0)?
-                .and_local_timezone(Local)
-                .earliest()
+            // Midnight falls in the DST gap where clocks jump at 00:00
+            // (Chile, Cuba, Paraguay); 01:00 exists on those days.
+            let at = |hour| {
+                day.and_hms_opt(hour, 0, 0)?
+                    .and_local_timezone(Local)
+                    .earliest()
+            };
+            at(0).or_else(|| at(1))
         })
         .map_or(calendar, |metered_from| {
             metered_from.with_timezone(&Utc).min(calendar)
         })
+}
+
+/// When the open mismatch's clamp began: latched the first time it is seen,
+/// so it neither un-clamps nor moves while the mismatch stays open. A first
+/// sighting dates it now rather than to a computed start already in the past
+/// (a mismatch opened before the AppSumo active-day rule shipped would
+/// otherwise read "limits applied since" a day nothing was limited), but never
+/// later than the calendar cap, whose clamp was enforced all along.
+fn latch_clamp_start(
+    stored: Option<DateTime<Utc>>,
+    computed: DateTime<Utc>,
+    calendar: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    stored.or_else(|| (now > computed).then(|| calendar.min(computed.max(now))))
 }
 
 struct PaidPlanGate {
@@ -2645,15 +2667,15 @@ fn paid_plan_gate(
 fn format_nudge_message(product: &str, weekly_usage: f64, disable: f64, level: u8) -> String {
     match level {
         1 => format!(
-            "You're at {:.1}% of weekly {product} usage. Upgrade Headroom to keep optimization through {:.1}%.",
+            "You're at {:.1}% of weekly {product} usage. Upgrade to keep Headroom optimizing past {:.1}%.",
             weekly_usage, disable
         ),
         2 => format!(
-            "You're at {:.1}% of weekly {product} usage. Headroom pauses at {:.1}% on the free plan — upgrade now to keep going.",
+            "You're at {:.1}% of weekly {product} usage. Headroom pauses at {:.1}% on your plan. Upgrade to keep going.",
             weekly_usage, disable
         ),
         _ => format!(
-            "You're at {:.1}% of weekly {product} usage. Headroom will pause at {:.1}% — upgrade now to avoid losing optimization.",
+            "You're at {:.1}% of weekly {product} usage. Headroom will pause at {:.1}%. Upgrade now to keep it running.",
             weekly_usage, disable
         ),
     }
@@ -3933,12 +3955,12 @@ mod tests {
     use super::{
         codex_billing_type, decode_jwt_payload, detect_plan_tier_from_profile,
         detect_tier_mismatch, evaluate_pricing_status_with_mismatch, is_identity_complete,
-        merge_background_account_sync, parse_oauth_profile_value, plan_tier_header_value,
-        remote_account_to_profile, resolve_account_api_base_url, tier_mismatch_grace_ends_at,
-        ClaudeOauthProfile, ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization,
-        HeadroomSubscriptionTier, IdentityFingerprint, IdentityPayload, LocalPricingState,
-        PricingPromo, RemoteAccountResponse, RemoteAccountSyncError,
-        CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
+        latch_clamp_start, merge_background_account_sync, parse_oauth_profile_value,
+        plan_tier_header_value, remote_account_to_profile, resolve_account_api_base_url,
+        tier_mismatch_grace_ends_at, ClaudeOauthProfile, ClaudeOauthProfileAccount,
+        ClaudeOauthProfileOrganization, HeadroomSubscriptionTier, IdentityFingerprint,
+        IdentityPayload, LocalPricingState, PricingPromo, RemoteAccountResponse,
+        RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
         MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
     };
     use crate::models::{
@@ -4860,7 +4882,7 @@ mod tests {
         let l1 = super::format_nudge_message("Claude", 34.2, 50.0, 1);
         assert!(l1.contains("34.2% of weekly Claude usage"), "{l1}");
         assert!(
-            l1.contains("through 50.0%"),
+            l1.contains("past 50.0%"),
             "level 1 keeps-through copy: {l1}"
         );
 
@@ -7047,6 +7069,37 @@ mod tests {
         // A 4th active day past the calendar cap never extends it.
         let late = keys(&["2026-09-25", "2026-10-20", "2026-10-21", "2026-10-22"]);
         assert_eq!(tier_mismatch_grace_ends_at(since, true, &late), calendar);
+    }
+
+    #[test]
+    fn clamp_start_latches_and_never_backdates() {
+        let since = DateTime::parse_from_rfc3339("2026-09-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let calendar = since + Duration::days(TIER_MISMATCH_GRACE_DAYS);
+        let day4 = since + Duration::days(3);
+        let now = since + Duration::days(8);
+
+        // Still in grace.
+        assert_eq!(latch_clamp_start(None, calendar, calendar, now), None);
+        // Active-day start already past on first sighting (a mismatch opened
+        // before the rule shipped): the clamp starts now, not on day 4.
+        assert_eq!(latch_clamp_start(None, day4, calendar, now), Some(now));
+        // Past the calendar cap on first sighting: that clamp was enforced all along.
+        let late = calendar + Duration::days(2);
+        assert_eq!(
+            latch_clamp_start(None, day4, calendar, late),
+            Some(calendar)
+        );
+        assert_eq!(
+            latch_clamp_start(None, calendar, calendar, late),
+            Some(calendar)
+        );
+        // Once latched it holds, even if the computed start moves.
+        assert_eq!(
+            latch_clamp_start(Some(day4), calendar, calendar, now),
+            Some(day4)
+        );
     }
 
     #[test]

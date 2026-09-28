@@ -50,8 +50,8 @@ const EMPTY_TILE_COPY: Record<
   },
   transformation: {
     badgeClass: "activity-feed__badge--transformation",
-    badgeLabel: "Recent Large Compression",
-    copy: "No large compressions yet — send more messages through a connected coding agent.",
+    badgeLabel: "Large compression",
+    copy: "No large compressions yet.",
     itemModifier: "activity-feed__item--transformation"
   },
   rtkToday: {
@@ -75,13 +75,13 @@ const EMPTY_TILE_COPY: Record<
   learningsMilestone: {
     badgeClass: "activity-feed__badge--learnings-milestone",
     badgeLabel: "Learnings",
-    copy: "0 patterns identified today, 0 reminders and 0 learnings written to memory.",
+    copy: "Nothing learned yet today.",
     itemModifier: "activity-feed__item--learnings-milestone"
   },
   weeklyRecap: {
     badgeClass: "activity-feed__badge--weekly-recap",
     badgeLabel: "Weekly recap",
-    copy: "No recap yet — posts at the end of the week.",
+    copy: "No recap yet. It posts at the end of the week.",
     itemModifier: "activity-feed__item--weekly-recap"
   }
 };
@@ -111,7 +111,7 @@ export function ActivityFeed({
             <h1>Activity (beta)</h1>
           </div>
           <p className="activity-card__blurb">
-            Large Compressions, learnings, and daily records.
+            Large compressions, learnings and daily records.
           </p>
         </header>
       </article>
@@ -413,7 +413,7 @@ function chipTitle(grp: TransformGroup): string {
   const preview = grp.targets.slice(0, 3).join(", ");
   const suffix =
     grp.targets.length > 3 ? `${preview}, +${grp.targets.length - 3} more` : preview;
-  return `${base} — ${suffix}`;
+  return `${base}: ${suffix}`;
 }
 
 /**
