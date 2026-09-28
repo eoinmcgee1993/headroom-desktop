@@ -62,6 +62,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -89,6 +90,8 @@ jobs:
       - name: Validate staging version state
         id: release_guard
         shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           package_version="$(node -p "require('./package.json').version")"
@@ -106,7 +109,7 @@ jobs:
           fi
 
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            before_sha="${{ github.event.before }}"
+            before_sha="${BEFORE_SHA:-}"
             if [[ -n "${before_sha}" ]] && [[ "${before_sha}" != "0000000000000000000000000000000000000000" ]] && git cat-file -e "${before_sha}^{commit}" 2>/dev/null; then
               previous_package_version="$(
                 git show "${before_sha}:package.json" \
@@ -210,8 +213,8 @@ jobs:
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: true
-          assetNamePattern: '[name]_[version]_mac[ext]'
-          includeUpdaterJson: true
+          releaseAssetNamePattern: '[name]_[version]_mac[ext]'
+          uploadUpdaterJson: true
           args: --target universal-apple-darwin
 
   windows:
@@ -246,6 +249,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -266,7 +271,9 @@ jobs:
         run: npm ci
 
       - name: Install Azure Artifact Signing CLI
-        run: cargo install artifact-signing-cli --locked
+        # Pinned on purpose: this binary runs with the signing secrets in env.
+        # crates.io versions are immutable; bump by hand after reviewing the diff.
+        run: cargo install artifact-signing-cli --version =0.11.0 --locked
 
       - name: Build NSIS installer
         shell: bash
@@ -320,6 +327,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux system dependencies
         run: |
@@ -428,7 +437,10 @@ jobs:
           # permanent, staging-rolling's are pruned by the next rc, so one
           # manifest is valid on both releases. Darwin is rewritten too because
           # tauri-action v1 emits api.github.com asset URLs, which are rate
-          # limited to 60/hour per IP when unauthenticated.
+          # limited to 60/hour per IP when unauthenticated. The platform map
+          # starts empty: v1 also writes darwin-<arch>-app keys, which the macOS
+          # updater reads before darwin-<arch>, so keeping them would keep its
+          # api.github.com URLs live. Stable's scope filter drops them too.
           mac_sig="$(ls "$workdir"/*_mac.app.tar.gz.sig)"
           win_sig="$(ls "$workdir"/*-setup.exe.sig)"
           linux_sig="$(ls "$workdir"/*.AppImage.sig "$workdir"/*.AppImage.tar.gz.sig 2>/dev/null | head -1 || true)"
@@ -445,7 +457,8 @@ jobs:
             --arg linux_url "${base}/$(basename "${linux_sig%.sig}")" \
             --arg deb_sig "$(cat "$deb_sig")" \
             --arg deb_url "${base}/$(basename "${deb_sig%.sig}")" \
-            '.platforms["darwin-aarch64"] = {signature: $mac_sig, url: $mac_url}
+            '.platforms = {}
+             | .platforms["darwin-aarch64"] = {signature: $mac_sig, url: $mac_url}
              | .platforms["darwin-x86_64"] = {signature: $mac_sig, url: $mac_url}
              | .platforms["windows-x86_64"] = {signature: $win_sig, url: $win_url}
              | .platforms["linux-x86_64"] = {signature: $linux_sig, url: $linux_url}

@@ -6167,7 +6167,12 @@ fn fatal_build_error(err: tauri::Error) -> ! {
     let message = err.to_string();
     #[cfg(target_os = "windows")]
     if is_missing_webview_runtime(&message) {
-        show_webview2_missing_dialog();
+        show_webview2_dialog(concat!(
+            "Headroom needs the Microsoft Edge WebView2 runtime, ",
+            "which is not installed on this PC.\n\n",
+            "Open the download page? Install the Evergreen Runtime, ",
+            "then start Headroom again."
+        ));
     }
     panic!("error while building tauri application: {message}");
 }
@@ -6199,19 +6204,10 @@ fn fatal_app_state_error(err: anyhow::Error) -> ! {
 }
 
 #[cfg(target_os = "windows")]
-fn show_webview2_missing_dialog() {
+fn show_webview2_dialog(text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_YESNO};
 
-    let choice = show_cannot_start_dialog(
-        concat!(
-            "Headroom needs the Microsoft Edge WebView2 runtime, ",
-            "which is not installed on this PC.\n\n",
-            "Open the download page? Install the Evergreen Runtime, ",
-            "then start Headroom again."
-        ),
-        MB_YESNO,
-    );
-    if choice == IDYES {
+    if show_cannot_start_dialog(text, MB_YESNO) == IDYES {
         let _ = open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
     }
 }
@@ -6402,6 +6398,25 @@ pub fn run() {
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
             ));
+            // A WebView2 runtime that is registered but broken passes Tauri's
+            // "installed" check, then fails to create the config windows, and
+            // Tauri only logs that: the app ran with a tray icon and no window
+            // at all (Sentry RUST-K7, HRESULT 0x80070002 file not found). A
+            // getter is the probe: it errors on a window the runtime never
+            // created. Keep running afterwards so configured clients keep
+            // their proxy.
+            #[cfg(target_os = "windows")]
+            if app
+                .get_webview_window("main")
+                .is_some_and(|window| window.is_visible().is_err())
+            {
+                show_webview2_dialog(concat!(
+                    "Headroom could not open its window because the Microsoft ",
+                    "Edge WebView2 runtime on this PC failed to start.\n\n",
+                    "Open the download page? Reinstall the Evergreen Runtime, ",
+                    "then quit Headroom from its tray icon and start it again."
+                ));
+            }
             #[cfg(target_os = "macos")]
             {
                 // Accessory policy makes this a menu-bar-only app (no dock icon).

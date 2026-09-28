@@ -2932,7 +2932,13 @@ fn ensure_claude_code_rtk_hook(
     managed_python_path: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let hook_path = headroom_rtk_hook_path();
-    let hook_body = build_headroom_rtk_hook(managed_rtk_path, managed_python_path);
+    let hook_body = if rtk_rewrite_exit_is_a_verdict(managed_rtk_path) {
+        build_headroom_rtk_hook(managed_rtk_path, managed_python_path)
+    } else {
+        // Its exit 0 is no verdict, so the hook could only auto-allow every
+        // rewrite. Stand down until launch's ensure_rtk_current upgrades it.
+        "#!/usr/bin/env bash\nexit 0\n".to_string()
+    };
     let (hook_changed, hook_backup) = write_file_if_changed(&hook_path, &hook_body, true)?;
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
@@ -2950,6 +2956,26 @@ fn ensure_claude_code_rtk_hook(
     backup_files.extend(settings_backups);
 
     Ok((changed_files, backup_files))
+}
+
+/// Whether `rtk rewrite`'s exit code is a permission verdict (0 only when every
+/// segment is allowed). rtk before 0.37 exits 0 on every rewrite: 0.33.1 passes
+/// `git status; rm -rf ~/x` as 0. Only a version read off the binary as older
+/// says no; one whose `--version` cannot be read cannot rewrite either.
+fn rtk_rewrite_exit_is_a_verdict(rtk: &Path) -> bool {
+    let Ok(out) = crate::proc::command(rtk).arg("--version").output() else {
+        return true;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version: Vec<u32> = text
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .split('.')
+        .map_while(|part| part.parse().ok())
+        .collect();
+    // 0.37.2 is the oldest release verified to answer 3 for an unruled command.
+    version.len() < 3 || version[..3] >= [0, 37, 2][..]
 }
 
 fn markitdown_claude_md_path() -> PathBuf {
@@ -3026,7 +3052,9 @@ pub fn enable_markitdown_integration(
             backup_files.push(path.display().to_string());
         }
 
-        if set_markitdown_bash_permission(markitdown_shim, true)? {
+        // The Windows `.cmd` shim cannot vet its arguments (cmd.exe re-parses
+        // them), so it gets no prompt-free rule there; see the unix shim.
+        if set_markitdown_bash_permission(markitdown_shim, !cfg!(windows))? {
             changed_files.push(claude_settings_path().display().to_string());
         }
     }
@@ -3063,7 +3091,53 @@ pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
     changed |= remove_managed_block(&markitdown_claude_md_path(), "markitdown_office")?;
     changed |= set_markitdown_bash_permission(markitdown_shim, false)?;
     changed |= remove_managed_block(&markitdown_codex_agents_path(), "markitdown")?;
+    // Converted document text must not outlive the integration.
+    let _ = std::fs::remove_dir_all(markitdown_cache_dir());
     Ok(changed)
+}
+
+/// The Read hook's conversion cache; mirrors the path the hook computes.
+fn markitdown_cache_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".cache"))
+        .join("headroom-markitdown")
+}
+
+/// Launch-time heal: rewrites an installed MarkItDown Read hook with the
+/// current body so hook fixes reach existing installs on app update, points
+/// installed nudges and the Bash rule at the current shim (it moved off PATH,
+/// from `legacy_shim`), and drops the rule where the shim cannot be trusted
+/// with it (Windows). Adds nothing the integration did not already have.
+pub fn refresh_markitdown_integration(
+    markitdown_entrypoint: &Path,
+    markitdown_shim: &Path,
+    legacy_shim: &Path,
+    python_path: &Path,
+) -> Result<()> {
+    let hook_path = headroom_markitdown_hook_path();
+    if hook_path.exists() {
+        let hook_body = build_headroom_markitdown_hook(markitdown_entrypoint, python_path);
+        write_file_if_changed(&hook_path, &hook_body, true)?;
+    }
+    let claude_md = markitdown_claude_md_path();
+    if file_has_managed_block(&claude_md, "markitdown_office")? {
+        let nudge = build_markitdown_office_nudge(markitdown_shim);
+        upsert_managed_block(&claude_md, "markitdown_office", &nudge)?;
+    }
+    // The Bash rule follows the shim it names; it is never added here.
+    let moved =
+        legacy_shim != markitdown_shim && set_markitdown_bash_permission(legacy_shim, false)?;
+    if cfg!(windows) || moved {
+        set_markitdown_bash_permission(markitdown_shim, !cfg!(windows))?;
+    }
+    let agents = markitdown_codex_agents_path();
+    if file_has_managed_block(&agents, "markitdown")? {
+        let nudge = build_markitdown_codex_nudge(markitdown_shim);
+        upsert_managed_block(&agents, "markitdown", &nudge)?;
+    }
+    Ok(())
 }
 
 /// Adds or removes a `Bash(<shim> *)` entry in `permissions.allow` so the Office
@@ -8146,6 +8220,42 @@ fn headroom_markitdown_hook_path() -> PathBuf {
         .join("headroom-markitdown-read.sh")
 }
 
+/// A PYTHONPATH dir holding a stand-in `markitdown` CLI and an importable
+/// `speech_recognition`, so only MARKITDOWN_MAIN_NO_AUDIO's block keeps the
+/// CLI from reporting "transcribed". It writes to `-o` or prints
+/// `converted:<argc>:<first arg>`.
+#[cfg(test)]
+pub(crate) fn fake_markitdown_pythonpath(root: &Path) -> PathBuf {
+    let dir = root.join("pylib");
+    std::fs::create_dir_all(dir.join("markitdown")).unwrap();
+    std::fs::write(dir.join("speech_recognition.py"), "").unwrap();
+    std::fs::write(dir.join("markitdown").join("__init__.py"), "").unwrap();
+    std::fs::write(
+        dir.join("markitdown").join("__main__.py"),
+        "import sys\n\
+         def main():\n\
+         \x20   try:\n\
+         \x20       import speech_recognition\n\
+         \x20       text = 'transcribed'\n\
+         \x20   except ImportError:\n\
+         \x20       text = 'converted'\n\
+         \x20   args = sys.argv[1:]\n\
+         \x20   if '-o' in args:\n\
+         \x20       open(args[args.index('-o') + 1], 'w').write(text)\n\
+         \x20   else:\n\
+         \x20       print(f'{text}:{len(args)}:{args[0]}')\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// `python -c` body that runs the markitdown CLI with speech transcription
+/// disabled. `markitdown[all]` ships SpeechRecognition, and its audio converter
+/// posts any audio it is handed (a `.wav`, or audio named `.pdf`) to Google's
+/// speech API over plain HTTP. Both callers run with no prompt. Holds no `'`,
+/// since the shim and the Read hook embed it in single quotes.
+pub(crate) const MARKITDOWN_MAIN_NO_AUDIO: &str = r#"import sys; sys.modules["speech_recognition"] = None; from markitdown.__main__ import main; sys.argv[0] = "markitdown"; sys.exit(main())"#;
+
 /// PreToolUse(Read) hook: when Claude reads a PDF, convert it to Markdown via
 /// the managed `markitdown` and redirect the read at the converted file through
 /// `updatedInput.file_path`. Fails open at every step so a missing binary,
@@ -8158,6 +8268,7 @@ fn headroom_markitdown_hook_path() -> PathBuf {
 fn build_headroom_markitdown_hook(markitdown_path: &Path, python_path: &Path) -> String {
     let markitdown = shell_double_quote(&markitdown_path.to_string_lossy());
     let python = shell_double_quote(&python_path.to_string_lossy());
+    let no_audio = MARKITDOWN_MAIN_NO_AUDIO;
 
     format!(
         r#"#!/usr/bin/env bash
@@ -8175,10 +8286,7 @@ if [ -z "$INPUT" ]; then
   exit 0
 fi
 
-HEADROOM_MD_CACHE="${{TMPDIR:-/tmp}}/headroom-markitdown"
-mkdir -p "$HEADROOM_MD_CACHE" 2>/dev/null || exit 0
-
-HEADROOM_MARKITDOWN_BIN="$HEADROOM_MARKITDOWN" HEADROOM_MD_CACHE="$HEADROOM_MD_CACHE" "$HEADROOM_PYTHON" -c 'import json, os, sys, subprocess, hashlib
+"$HEADROOM_PYTHON" -c 'import json, os, sys, subprocess, hashlib, stat, tempfile, time
 ALLOWED = {{".pdf"}}
 MAX_BYTES = 25 * 1024 * 1024
 try:
@@ -8199,15 +8307,41 @@ except OSError:
     sys.exit(0)
 if st.st_size > MAX_BYTES:
     sys.exit(0)
-binpath = os.environ["HEADROOM_MARKITDOWN_BIN"]
-cache = os.environ["HEADROOM_MD_CACHE"]
+# Per-user cache, never a shared /tmp: another local user could pre-create a
+# shared dir and plant content or symlinks the conversion would write through.
+cache = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "headroom-markitdown")
+try:
+    os.makedirs(cache, mode=0o700, exist_ok=True)
+    cst = os.lstat(cache)
+    if not stat.S_ISDIR(cst.st_mode) or (hasattr(os, "getuid") and cst.st_uid != os.getuid()):
+        sys.exit(0)
+    if cst.st_mode & 0o077:
+        os.chmod(cache, 0o700)
+except OSError:
+    sys.exit(0)
 key = hashlib.sha256((os.path.abspath(fp) + ":" + str(st.st_mtime_ns)).encode()).hexdigest()[:16]
 out = os.path.join(cache, key + ".md")
-if not (os.path.exists(out) and os.path.getsize(out) > 0):
+if not (os.path.isfile(out) and not os.path.islink(out) and os.path.getsize(out) > 0):
+    # Convert into a fresh private file, then rename over the target, so a
+    # symlink already sitting at `out` is replaced instead of written through.
+    tmp = None
     try:
-        subprocess.run([binpath, fp, "-o", out], check=True, capture_output=True, timeout=120)
+        fd, tmp = tempfile.mkstemp(dir=cache, suffix=".tmp")
+        os.close(fd)
+        subprocess.run([sys.executable, "-c", {no_audio:?}, fp, "-o", tmp], check=True, capture_output=True, timeout=120)
+        os.replace(tmp, out)
     except Exception:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
         sys.exit(0)
+    # Each (path, mtime) adds a file holding a whole document: drop week-old ones.
+    try:
+        for name in os.listdir(cache):
+            old = os.path.join(cache, name)
+            if os.lstat(old).st_mtime < time.time() - 7 * 86400:
+                os.unlink(old)
+    except OSError:
+        pass
 if not (os.path.exists(out) and os.path.getsize(out) > 0):
     sys.exit(0)
 updated = dict(tool_input)
@@ -8244,6 +8378,195 @@ fn msys_path(value: &str) -> String {
     }
 }
 
+/// The rtk hook's last step: prints allow-with-the-rewrite, or nothing. It runs
+/// as `python -c '...'`, so it must never contain a single quote.
+const RTK_HOOK_VERDICT_PY: &str = r##"import glob, json, os, re, shlex, subprocess, sys
+
+data = json.load(sys.stdin)
+tool_input = data.get("tool_input")
+if not isinstance(tool_input, dict):
+    sys.exit(0)
+
+# Modes that run the built-in read-only set unasked. Not auto (a read-only
+# command can wait for server-side classifier review, which an allow skips) and
+# not plan (with auto mode available the classifier reviews planning commands).
+QUIET_MODES = ("default", "acceptEdits", "dontAsk", "bypassPermissions")
+# Read-only commands from the Claude Code built-in set that rtk 0.48 rewrites.
+READ_ONLY = ("git", "ls", "cat", "head", "tail", "wc", "du", "stat", "diff", "tree", "find", "grep", "rg")
+GIT_READ_ONLY = ("status", "diff", "log", "show", "branch")
+# Flags that write or execute: long names (an abbreviation matches too), short letters.
+SEARCH_DENY = (("--pre", "--pre-glob", "--search-zip", "--hostname-bin"), "z")
+FLAG_DENY = {
+    "git": (("--output", "--ext-diff", "--exec", "--exec-path", "--upload-pack"), "co"),
+    "rg": SEARCH_DENY,
+    "grep": SEARCH_DENY,
+    "tree": ((), "oR"),
+}
+FIND_DENY = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls", "-files0-from"}
+BRANCH_LIST = {"-a", "-r", "-v", "-vv", "-l", "--list", "--show-current", "--all", "--remotes", "--verbose", "--no-color"}
+BRANCH_VALUE = ("--contains", "--merged", "--no-merged")
+SHELL = re.compile(r"[;&|<>`$(){}\x00-\x08\x0a-\x1f\x7f]")
+
+
+def lists_branches(args):
+    i = 0
+    while i < len(args):
+        if args[i] in BRANCH_VALUE:
+            i += 1
+            if i == len(args) or args[i].startswith("-"):
+                return False
+        elif args[i] not in BRANCH_LIST and args[i].split("=", 1)[0] not in BRANCH_VALUE:
+            return False
+        i += 1
+    return True
+
+
+def inside(arg, roots):
+    # Claude Code prompts for reads outside the working directories, so must we.
+    if arg.startswith("-") and "=" not in arg:
+        return True
+    path = arg.split("=", 1)[1] if arg.startswith("-") else arg
+    if path.startswith("~"):
+        return False
+    base = roots[0] if roots else os.getcwd()
+    full = os.path.realpath(os.path.join(base, path))
+    return any(full == r or full.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def read_only(cmd, out):
+    # One plain read-only command, rewritten to one plain rtk call.
+    if len(cmd) > 10000 or SHELL.search(cmd) or SHELL.search(out) or not out.startswith("rtk "):
+        return False
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not argv or argv[0] not in READ_ONLY:
+        return False
+    roots = [os.path.realpath(d) for d in (data.get("cwd"), os.environ.get("CLAUDE_PROJECT_DIR")) if isinstance(d, str) and d]
+    if not roots or not all(inside(a, roots) for a in argv[1:]):
+        return False
+    name, args = argv[0], argv[1:]
+    # An unquoted glob can expand to a file named -delete or --pre=sh.
+    if name in FLAG_DENY or name == "find":
+        if "\\" in cmd or re.search(r"[*?\[]", re.sub(r"\x27[^\x27]*\x27|\"[^\"]*\"", "", cmd)):
+            return False
+    if name == "find":
+        return not FIND_DENY.intersection(args)
+    if name == "git":
+        if not args or args[0] not in GIT_READ_ONLY or args[0] == "branch" and not lists_branches(args[1:]):
+            return False
+        args = args[1:]
+    longs, shorts = FLAG_DENY.get(name, ((), ""))
+    for a in args:
+        flag = a.split("=", 1)[0]
+        if flag.startswith("--"):
+            if flag != "--" and any(x.startswith(flag) for x in longs):
+                return False
+        elif flag.startswith("-") and set(a[1:]) & set(shorts):
+            return False
+    return True
+
+
+def cli_rules():
+    # Rules on an ancestor command line: --settings, --disallowedTools.
+    try:
+        rows = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="], capture_output=True, text=True, timeout=5).stdout.splitlines()
+    except Exception:
+        return True
+    procs = {}
+    for row in rows:
+        parts = row.split(None, 2)
+        if len(parts) > 1 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    pid = os.getppid()
+    for _ in range(64):
+        if pid == 0:
+            return False
+        if pid not in procs:
+            return True
+        pid, command = procs[pid]
+        if re.search(r"--(managed-)?settings|--disallowed", command):
+            return True
+    return True
+
+
+def settings():
+    # (ask rules, deny rules, reads outside blocked) across what Claude Code loads,
+    # or None when a source cannot be read here: registry and MDM policies,
+    # managed files (a policyHelper hides their rules), the server-managed cache.
+    if sys.platform == "win32":
+        return None
+    conf = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    opaque = [os.path.join(d, n) for d in ("/Library/Application Support/ClaudeCode", "/etc/claude-code") for n in ("managed-settings.json", "managed-settings.d")]
+    opaque.append(os.path.join(conf, "remote-settings.json"))
+    if os.environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH") or os.environ.get("CLAUDE_CODE_REMOTE_SETTINGS_PATH"):
+        return None
+    if any(os.path.exists(p) for p in opaque) or glob.glob("/Library/Managed Preferences/**/com.anthropic.claudecode.plist", recursive=True):
+        return None
+    files = [os.path.join(conf, "settings.json"), os.path.join(conf, "settings.local.json")]
+    bases = [os.environ.get("CLAUDE_PROJECT_DIR"), data.get("cwd")]
+    for base in bases[:2]:
+        if isinstance(base, str) and base:
+            try:
+                common = subprocess.run(["git", "-C", base, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=5).stdout.strip()
+            except Exception:
+                return None
+            if common:
+                bases.append(os.path.dirname(common))
+    for base in bases:
+        d = os.path.abspath(base) if isinstance(base, str) and base else ""
+        while d:
+            files += [os.path.join(d, ".claude", n) for n in ("settings.json", "settings.local.json")]
+            d = "" if os.path.dirname(d) == d else os.path.dirname(d)
+    ask, deny, blocks = [], [], False
+    for path in files:
+        try:
+            with open(path) as f:
+                perms = json.load(f).get("permissions") or {}
+            more_ask, more_deny = perms.get("ask") or [], perms.get("deny") or []
+            if not isinstance(more_ask, list) or not isinstance(more_deny, list):
+                return None
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except Exception:
+            return None
+        ask, deny = ask + more_ask, deny + more_deny
+        blocks = blocks or bool(perms.get("blockReadsOutsideWorkingDirectories"))
+    return None if cli_rules() else (ask, deny, blocks)
+
+
+def hides(rule, name, asking):
+    # Could the rewrite hide `name ...` from this rule? Read rules reach cat, head
+    # and tail, and an ask rule naming the command stops matching `rtk ...`. rtk
+    # itself answers 2 for a Bash deny rule.
+    if not isinstance(rule, str):
+        return True
+    tool, _, arg = rule.partition("(")
+    if tool.strip() == "Read":
+        return True
+    if not asking or tool.strip() != "Bash":
+        return False
+    word = (arg.rstrip(") ").split() or ["*"])[0].split(":")[0]
+    return "*" in word or word == name
+
+
+mode, cmd = data.get("permission_mode"), tool_input.get("command")
+if os.environ.get("HEADROOM_RTK_RC") != "0":
+    ro = mode in QUIET_MODES and isinstance(cmd, str) and read_only(cmd, os.environ.get("HEADROOM_RTK_OUT", ""))
+    rules = settings() if ro or mode == "bypassPermissions" else None
+    if rules is None:
+        sys.exit(0)
+    ask, deny, blocks = rules
+    name = shlex.split(cmd)[0] if ro else ""
+    bypass = mode == "bypassPermissions" and not (ask or deny or blocks)
+    if not bypass and not (ro and not blocks and not any(hides(r, name, True) for r in ask) and not any(hides(r, name, True) for r in deny)):
+        sys.exit(0)
+updated = dict(tool_input)
+updated["command"] = os.environ["HEADROOM_RTK_REWRITTEN"]
+json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "Headroom RTK auto-rewrite", "updatedInput": updated}}, sys.stdout)
+"##;
+
 fn build_headroom_rtk_hook(managed_rtk_path: &Path, managed_python_path: &Path) -> String {
     let rtk = shell_double_quote(&managed_rtk_path.to_string_lossy());
     let python = shell_double_quote(&managed_python_path.to_string_lossy());
@@ -8275,10 +8598,39 @@ case " $CMD " in
   *" --check "*) exit 0 ;;
 esac
 
-REWRITTEN="$("$HEADROOM_RTK" rewrite "$CMD" 2>/dev/null || true)"
+# The exit code is rtk's permission verdict against the user's Claude Code
+# rules: 0 = every segment is allowed, 3 = rewrite but the user must still be
+# asked, 1 = no rtk equivalent, 2 = a deny rule matched. rtk knows only explicit
+# rules, so it answers 3 even for `git status`. Three outcomes:
+#   0: rewrite and allow.
+#   3: rewrite and allow only where Claude Code would not ask either (the
+#      verdict script): one plain read-only command in a mode that runs those
+#      unasked, or anything in bypassPermissions, and in both cases only when
+#      no rule could be dodged, since rules match the rewritten command.
+#   anything else: no output, the ORIGINAL command goes to Claude Code. A
+#      rewrite handed back undecided would be judged as `export PATH=...; rtk
+#      ...`, which misses Claude Code's read-only allowlist and every CLI/skill
+#      `Bash(...)` rule, so `git status` would prompt (or be denied headless).
+#
+# rtk takes project rules from the nearest `.claude/` at or above its cwd,
+# while Claude Code loads only the project root's, so a `.claude/` planted in
+# a parent or a vendored subdir could grant rtk an allow Claude Code never
+# loaded. Run it where those rules really come from: the project root when
+# it has one, else the user's own ~/.claude.
+RTK_CWD="${{CLAUDE_PROJECT_DIR:-}}"
+if [ -z "$RTK_CWD" ] || [ ! -d "$RTK_CWD/.claude" ]; then
+  RTK_CWD="$HOME"
+fi
+RTK_RC=0
+REWRITTEN="$(cd "$RTK_CWD" && "$HEADROOM_RTK" rewrite "$CMD" 2>/dev/null)" || RTK_RC=$?
+case "$RTK_RC" in
+  0|3) ;;
+  *) exit 0 ;;
+esac
 if [ -z "$REWRITTEN" ] || [ "$CMD" = "$REWRITTEN" ]; then
   exit 0
 fi
+RTK_OUT="$REWRITTEN"
 
 # `rtk rewrite` emits a bare `rtk` leading token, which only resolves if the
 # managed PATH export has propagated into this session's environment. GUI apps
@@ -8327,13 +8679,10 @@ fi
 # position, resolves regardless of which profile files the shell sourced.
 REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\"; $REWRITTEN"
 
-HEADROOM_RTK_REWRITTEN="$REWRITTEN" "$HEADROOM_PYTHON" -c 'import json, os, sys; data = json.load(sys.stdin); tool_input = data.get("tool_input"); 
-if not isinstance(tool_input, dict):
-    sys.exit(0)
-updated = dict(tool_input)
-updated["command"] = os.environ["HEADROOM_RTK_REWRITTEN"]
-json.dump({{"hookSpecificOutput": {{"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "Headroom RTK auto-rewrite", "updatedInput": updated}}}}, sys.stdout)' <<<"$INPUT" 2>/dev/null || exit 0
-"#
+HEADROOM_RTK_RC="$RTK_RC" HEADROOM_RTK_OUT="$RTK_OUT" HEADROOM_RTK_REWRITTEN="$REWRITTEN" \
+  "$HEADROOM_PYTHON" -c '{verdict}' <<<"$INPUT" 2>/dev/null || exit 0
+"#,
+        verdict = RTK_HOOK_VERDICT_PY
     )
 }
 
@@ -9349,6 +9698,171 @@ mod tests {
         assert!(hook.contains("\"updatedInput\": updated"));
         assert!(hook.contains("Headroom MarkItDown conversion"));
         assert!(hook.contains("sys.exit(0)"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn markitdown_hook_caches_in_a_private_home_dir_and_replaces_planted_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        // The cache used to live in a shared `${TMPDIR:-/tmp}` dir another
+        // local user could pre-create and fill with symlinks the conversion
+        // wrote through (e.g. into ~/.ssh/authorized_keys).
+        let root = unique_temp_dir("headroom-md-hook");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("home");
+        // Only checked for; the hook converts through the python's markitdown.
+        let fake_md = root.join("markitdown");
+        fs::write(&fake_md, "#!/bin/sh\n").expect("fake md");
+        fs::set_permissions(&fake_md, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let pythonpath = super::fake_markitdown_pythonpath(&root);
+        let pdf = root.join("doc.pdf");
+        fs::write(&pdf, "%PDF-1.4").expect("pdf");
+        let hook_path = root.join("hook.sh");
+        fs::write(
+            &hook_path,
+            build_headroom_markitdown_hook(&fake_md, Path::new("/usr/bin/python3")),
+        )
+        .expect("hook");
+
+        let run = || {
+            let output = crate::proc::command("bash")
+                .arg(&hook_path)
+                .env("HOME", &home)
+                .env("PYTHONPATH", &pythonpath)
+                .env_remove("XDG_CACHE_HOME")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    let input = json!({ "tool_input": { "file_path": pdf } }).to_string();
+                    child
+                        .stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(input.as_bytes())
+                        .unwrap();
+                    child.wait_with_output()
+                })
+                .expect("run hook");
+            assert!(output.status.success());
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            serde_json::from_str::<Value>(&stdout).ok().and_then(|v| {
+                v["hookSpecificOutput"]["updatedInput"]["file_path"]
+                    .as_str()
+                    .map(PathBuf::from)
+            })
+        };
+
+        // A week-old entry goes on the next conversion: nothing else ever
+        // deletes these copies of the user's documents.
+        let cache = home.join(".cache").join("headroom-markitdown");
+        fs::create_dir_all(&cache).expect("cache");
+        let stale = cache.join("stale.md");
+        fs::write(&stale, "old contract").expect("stale");
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|f| f.set_modified(SystemTime::now() - super::Duration::from_secs(8 * 86400)))
+            .expect("age stale");
+
+        let out = run().expect("hook should redirect the read");
+        assert_eq!(out.parent(), Some(cache.as_path()));
+        assert!(!stale.exists(), "week-old cache entry survived");
+        // Audio transcription (an unprompted upload) stays off.
+        assert_eq!(fs::read_to_string(&out).unwrap(), "converted");
+        assert_eq!(
+            fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // A symlink planted at the cache target is replaced, never followed.
+        let victim = root.join("authorized_keys");
+        fs::write(&victim, "ssh-ed25519 original").expect("victim");
+        fs::remove_file(&out).unwrap();
+        std::os::unix::fs::symlink(&victim, &out).unwrap();
+        assert_eq!(run().as_deref(), Some(out.as_path()));
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "ssh-ed25519 original");
+        assert!(!fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&out).unwrap(), "converted");
+
+        // A cache dir that is itself a symlink is refused outright.
+        fs::remove_dir_all(&cache).unwrap();
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &cache).unwrap();
+        assert_eq!(run(), None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_markitdown_integration_rewrites_only_an_installed_hook() {
+        // Hook fixes reach existing installs only if launch rewrites the
+        // installed body; a disabled integration (no hook file) stays off.
+        let _home = TestHome::new();
+        let (md, shim, legacy, py) = (
+            Path::new("/h/venv/bin/markitdown"),
+            Path::new("/h/tools/markitdown"),
+            Path::new("/h/bin/markitdown"),
+            Path::new("/h/venv/bin/python3"),
+        );
+        let hook = super::headroom_markitdown_hook_path();
+        super::refresh_markitdown_integration(md, shim, legacy, py).expect("refresh");
+        assert!(!hook.exists());
+        assert!(!super::markitdown_claude_md_path().exists());
+
+        // Until the shim moved off PATH (where its one-path-only guard broke
+        // an RTK user's own `markitdown`), the nudges and rule named bin/.
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(
+            &hook,
+            "HEADROOM_MD_CACHE=\"${TMPDIR:-/tmp}/headroom-markitdown\"\n",
+        )
+        .unwrap();
+        let (claude_md, agents) = (
+            super::markitdown_claude_md_path(),
+            super::markitdown_codex_agents_path(),
+        );
+        upsert_managed_block(
+            &claude_md,
+            "markitdown_office",
+            &build_markitdown_office_nudge(legacy),
+        )
+        .unwrap();
+        upsert_managed_block(&agents, "markitdown", &build_markitdown_codex_nudge(legacy)).unwrap();
+        super::set_markitdown_bash_permission(legacy, true).unwrap();
+
+        super::refresh_markitdown_integration(md, shim, legacy, py).expect("refresh");
+        assert_eq!(
+            fs::read_to_string(&hook).unwrap(),
+            build_headroom_markitdown_hook(md, py)
+        );
+        for file in [&claude_md, &agents] {
+            let body = fs::read_to_string(file).unwrap();
+            assert!(
+                body.contains("/h/tools/markitdown <path>") && !body.contains("/h/bin/"),
+                "{body}"
+            );
+        }
+        let settings = fs::read_to_string(super::claude_settings_path()).unwrap();
+        assert!(!settings.contains("/h/bin/"), "{settings}");
+        assert_eq!(
+            settings.contains("Bash(/h/tools/markitdown *)"),
+            !cfg!(windows),
+            "{settings}"
+        );
+    }
+
+    #[test]
+    fn disabling_markitdown_deletes_the_conversion_cache() {
+        // Each cached file is a whole converted document.
+        let home = TestHome::new();
+        let cache = home.path().join(".cache").join("headroom-markitdown");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("0123456789abcdef.md"), "contract text").unwrap();
+        super::disable_markitdown_integration(Path::new("/h/tools/markitdown")).expect("disable");
+        assert!(!cache.exists());
     }
 
     #[test]
@@ -10421,68 +10935,177 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[cfg(unix)]
-    fn hook_script_emits_rewrite_even_when_rtk_rewrite_exits_nonzero() {
-        let root = unique_temp_dir("headroom-hook-bash-nonzero");
-        fs::create_dir_all(&root).expect("create root");
-
-        let real_binary = "/bin/echo";
-        assert!(Path::new(real_binary).exists());
-
-        // Match the real rtk behavior we observed during smoke testing:
-        // emit a rewrite, then exit non-zero. The hook's `|| true` should
-        // still preserve the rewritten command.
-        let fake_rtk = root.join("fake-rtk");
-        fs::write(
-            &fake_rtk,
-            format!("#!/usr/bin/env bash\nshift\necho \"{real_binary} $*\"\nexit 3\n"),
-        )
-        .expect("write fake rtk");
-        fs::set_permissions(
-            &fake_rtk,
-            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-        )
-        .expect("chmod rtk");
-
+    fn hook_script_auto_allows_only_what_claude_code_would_not_ask() {
+        // `rtk rewrite`'s exit code is its verdict against the user's Claude
+        // Code permission rules. Exit 3 ("rewrite, but ask") used to be turned
+        // into "allow", so `git status; rm -rf ~` ran with no prompt. rtk also
+        // answers 3 for every unruled command, so 3 may allow only a plain
+        // read-only command, or anything in bypassPermissions, and only while no
+        // ask/deny rule could be dodged by the rewrite. 1, 2 and the rest never
+        // emit anything. (Assumes no ancestor of the test runner passes
+        // `--settings` or `--disallowedTools`, which also turns 3 off.)
+        //
+        // rtk reads project rules from the nearest `.claude/` above its cwd,
+        // so it must run from the project root Claude Code loaded (or HOME),
+        // never from a subdir under a planted parent `.claude/`.
+        let root = unique_temp_dir("headroom-hook-bash-verdict");
+        let home = root.join("home");
+        let shared = root.join("shared");
+        let victim = shared.join("victim");
+        let project = root.join("project");
+        for dir in [home.join(".claude"), shared.join(".claude"), victim.clone()] {
+            fs::create_dir_all(dir).expect("create dirs");
+        }
+        fs::create_dir_all(project.join(".claude")).expect("create project");
         let system_python = PathBuf::from("/usr/bin/python3");
-        let hook_body = build_headroom_rtk_hook(&fake_rtk, &system_python);
-        let hook_path = root.join("hook.sh");
-        fs::write(&hook_path, &hook_body).expect("write hook");
-        fs::set_permissions(
-            &hook_path,
-            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+
+        // The updated command when the hook allowed, None when it stayed silent.
+        let run = |code: i32, project_dir: &Path, command: &str, mode: &str| {
+            let fake_rtk = root.join(format!("fake-rtk-{code}"));
+            fs::write(
+                &fake_rtk,
+                format!("#!/usr/bin/env bash\nshift\necho \"rtk $* @$PWD\"\nexit {code}\n"),
+            )
+            .expect("write fake rtk");
+            fs::set_permissions(
+                &fake_rtk,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .expect("chmod rtk");
+            let hook_path = root.join(format!("hook-{code}.sh"));
+            fs::write(
+                &hook_path,
+                build_headroom_rtk_hook(&fake_rtk, &system_python),
+            )
+            .expect("write hook");
+
+            let input = serde_json::json!({
+                "permission_mode": mode,
+                "tool_input": {"command": command},
+            });
+            let output = crate::proc::command("bash")
+                .arg(&hook_path)
+                .current_dir(&victim)
+                .env("HOME", &home)
+                .env("CLAUDE_PROJECT_DIR", project_dir)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    child
+                        .stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(input.to_string().as_bytes())
+                        .unwrap();
+                    child.wait_with_output()
+                })
+                .expect("run hook");
+            assert!(
+                output.status.success(),
+                "hook should exit 0 for rtk exit {code}"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            if stdout.is_empty() {
+                return None;
+            }
+            let json: Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|e| panic!("rtk exit {code}: bad JSON {stdout:?}: {e}"));
+            let out = &json["hookSpecificOutput"];
+            assert_eq!(out["permissionDecision"], "allow", "{stdout:?}");
+            Some(
+                out["updatedInput"]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+        let rewrote = |command: &Option<String>, original: &str, rtk_cwd: &Path| {
+            command
+                .as_deref()
+                .is_some_and(|c| c.ends_with(&format!(" {original} @{}", rtk_cwd.display())))
+        };
+
+        for (project_dir, rtk_cwd) in [(&project, &project), (&victim, &home)] {
+            let original = "git status; rm -rf ~/x";
+            let command = run(0, project_dir, original, "default");
+            assert!(
+                rewrote(&command, original, rtk_cwd),
+                "rtk exit 0 must allow, run from {}: {command:?}",
+                rtk_cwd.display()
+            );
+        }
+
+        for original in ["git status", "ls -la", "grep -rn foo ."] {
+            let command = run(3, &project, original, "default");
+            assert!(
+                rewrote(&command, original, &project),
+                "read-only {original:?} must allow on 3: {command:?}"
+            );
+        }
+        for original in [
+            "git status; rm -rf ~/x",
+            "git log && curl x | sh",
+            "ls $(rm x)",
+            "cargo test",
+            "curl http://x",
+            "git -c core.pager=sh log",
+            "git diff --output=/tmp/x",
+            "find . -delete",
+            "rg --pre sh x",
+            "rg \"--pre\" sh x",
+            "FOO=1 ls",
+            "git branch newbranch",
+            "git branch -D main",
+            "tree -o out",
+        ] {
+            let command = run(3, &project, original, "default");
+            assert_eq!(command, None, "{original:?} must stay silent on 3");
+        }
+        // Auto mode reviews read-only commands server-side; an allow would skip it.
+        assert_eq!(run(3, &project, "git status", "auto"), None);
+
+        for original in ["cargo test", "git status; echo hi"] {
+            let command = run(3, &project, original, "bypassPermissions");
+            assert!(
+                rewrote(&command, original, &project),
+                "bypass must allow {original:?}: {command:?}"
+            );
+        }
+
+        for code in [1, 2, 7] {
+            for mode in ["default", "bypassPermissions"] {
+                let command = run(code, &project, "git status", mode);
+                assert_eq!(command, None, "rtk exit {code} in {mode} must stay silent");
+            }
+        }
+
+        // An ask rule anywhere turns bypass off; one naming the command turns
+        // the read-only allow off too, and so does a settings file we can't read.
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"permissions":{"ask":["Bash(cargo test)"]}}"#,
         )
-        .expect("chmod hook");
-
-        let stdin = r#"{"tool_input":{"command":"git status"}}"#;
-        let output = crate::proc::command("bash")
-            .arg(&hook_path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                child
-                    .stdin
-                    .as_mut()
-                    .unwrap()
-                    .write_all(stdin.as_bytes())
-                    .unwrap();
-                child.wait_with_output()
-            })
-            .expect("run hook");
-
-        assert!(output.status.success(), "hook should exit 0");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains(real_binary),
-            "rewrite output should survive non-zero RTK exit, got stdout: {stdout:?}, stderr: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            stdout.contains("Headroom RTK auto-rewrite"),
-            "should still emit a rewrite hookSpecificOutput payload"
-        );
+        .expect("write user settings");
+        assert_eq!(run(3, &project, "cargo test", "bypassPermissions"), None);
+        for mode in ["default", "bypassPermissions"] {
+            let command = run(3, &project, "git status", mode);
+            assert!(
+                rewrote(&command, "git status", &project),
+                "read-only must still allow in {mode}: {command:?}"
+            );
+        }
+        let local = project.join(".claude").join("settings.local.json");
+        for body in [
+            r#"{"permissions":{"ask":["Bash(git log:*)"]}}"#,
+            "{not json",
+        ] {
+            fs::write(&local, body).expect("write project settings");
+            assert_eq!(run(3, &project, "git status", "default"), None, "{body}");
+        }
 
         let _ = fs::remove_dir_all(root);
     }
@@ -11342,6 +11965,36 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "no RTK failures reported when RTK isn't installed, got: {:?}",
             verification.failures
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn rtk_hook_stands_down_for_an_rtk_whose_exit_code_is_no_verdict() {
+        // rtk 0.33.1 exits 0 on every rewrite, so a hook that trusts exit 0
+        // auto-allowed `git status; rm -rf ~/x` for anyone whose upgrade failed.
+        let home = TestHome::new();
+        let bin_dir = home.path().join("managed-bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let rtk = bin_dir.join("rtk");
+        let python = bin_dir.join("python3");
+        fs::write(&python, "#!/bin/sh\n").unwrap();
+        let hook = home.path().join(".claude/hooks/headroom-rtk-rewrite.sh");
+        for (version, rewrites) in [("0.33.1", false), ("0.37.2", true), ("0.48.0", true)] {
+            fs::write(&rtk, format!("#!/bin/sh\necho 'rtk {version}'\n")).unwrap();
+            fs::set_permissions(
+                &rtk,
+                <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .unwrap();
+            super::ensure_claude_code_rtk_hook(&rtk, &python).expect("write hook");
+            let body = fs::read_to_string(&hook).expect("hook written");
+            assert_eq!(
+                body.contains(" rewrite "),
+                rewrites,
+                "rtk {version}: {body}"
+            );
+        }
     }
 
     #[test]

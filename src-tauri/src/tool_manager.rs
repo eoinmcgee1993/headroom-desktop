@@ -7082,16 +7082,22 @@ impl ToolManager {
         self.runtime.venv_dir.join(bin_subdir()).join(name)
     }
 
-    /// Shim in the Headroom-managed bin dir. The Office nudge and the Bash
-    /// permission both reference this absolute path, so it works whether or not
-    /// the bin dir is on PATH (RTK, which exports it, is now opt-in).
+    /// The shim the Office nudge and the Bash permission reference by absolute
+    /// path. On unix it sits off PATH: the bin dir is on PATH for RTK users,
+    /// where a one-path-only `markitdown` would shadow their own (`--help`,
+    /// `-o`, stdin all refused).
     pub fn markitdown_shim_path(&self) -> PathBuf {
-        let name = if cfg!(target_os = "windows") {
-            "markitdown.cmd"
+        if cfg!(target_os = "windows") {
+            self.runtime.bin_dir.join("markitdown.cmd")
         } else {
-            "markitdown"
-        };
-        self.runtime.bin_dir.join(name)
+            self.runtime.tools_dir.join("markitdown")
+        }
+    }
+
+    /// Where the unix shim lived until it moved off PATH. Launch removes it
+    /// and the Bash rule that names it.
+    pub fn legacy_markitdown_shim_path(&self) -> PathBuf {
+        self.runtime.bin_dir.join("markitdown")
     }
 
     fn markitdown_conversion_counter_path(&self) -> PathBuf {
@@ -7105,32 +7111,43 @@ impl ToolManager {
     }
 
     /// Wrapper script (previously a bare symlink) so each real conversion bumps
-    /// a counter the Addons tab can show. Flag-only invocations (--help) are
-    /// not counted. Re-run on every launch so pre-wrapper installs pick it up.
+    /// a counter the Addons tab can show. Re-run on every launch so existing
+    /// installs pick up changes.
+    ///
+    /// On unix Claude Code runs `Bash(<shim> *)` without a prompt, so the shim
+    /// takes exactly one local path and nothing else: markitdown's `-o` writes
+    /// anywhere, URL sources fetch over the network, and `-d`/`-e` send content
+    /// to an arbitrary endpoint. The Windows `.cmd` cannot vet its arguments
+    /// and gets no such rule (see `enable_markitdown_integration`).
     pub fn ensure_markitdown_shim(&self) -> Result<()> {
         let shim = self.markitdown_shim_path();
-        if shim.exists() || shim.symlink_metadata().is_ok() {
-            let _ = std::fs::remove_file(&shim);
+        for stale in [&shim, &self.legacy_markitdown_shim_path()] {
+            if stale.symlink_metadata().is_ok() {
+                let _ = std::fs::remove_file(stale);
+            }
         }
         #[cfg(unix)]
         {
+            std::fs::create_dir_all(&self.runtime.tools_dir)?;
             // ponytail: single-quoting is enough - both paths live under
             // Application Support (spaces, no quotes).
             let script = format!(
                 "#!/bin/sh\n\
-                 # Headroom-managed markitdown shim. Counts conversions, then runs the real binary.\n\
-                 case \"$1\" in\n\
-                   \"\"|-*) ;;\n\
-                   *)\n\
-                     C='{counter}'\n\
-                     n=$(cat \"$C\" 2>/dev/null)\n\
-                     case \"$n\" in ''|*[!0-9]*) n=0;; esac\n\
-                     printf '%s' $((n+1)) > \"$C.tmp\" 2>/dev/null && mv -f \"$C.tmp\" \"$C\" 2>/dev/null\n\
-                     ;;\n\
-                 esac\n\
-                 exec '{real}' \"$@\"\n",
+                 # Headroom-managed markitdown shim. Converts one local file, counts it, runs the real binary.\n\
+                 # Claude Code may run this without a prompt: no options, no URLs, one path only.\n\
+                 refuse() {{ echo \"markitdown (Headroom): $1. Usage: markitdown <local file path>\" >&2; exit 2; }}\n\
+                 [ \"$#\" -eq 1 ] || refuse 'expected exactly one file path'\n\
+                 case \"$1\" in \"\"|-*) refuse 'options are not supported';; esac\n\
+                 # A 2+ letter scheme (http:, file:, data:) is a URL; a single letter is a drive.\n\
+                 case \"${{1%%:*}}\" in \"$1\"|?|*[!A-Za-z0-9+.-]*) ;; [A-Za-z]*) refuse 'URLs are not supported';; esac\n\
+                 C='{counter}'\n\
+                 n=$(cat \"$C\" 2>/dev/null)\n\
+                 case \"$n\" in ''|*[!0-9]*) n=0;; esac\n\
+                 printf '%s' $((n+1)) > \"$C.tmp\" 2>/dev/null && mv -f \"$C.tmp\" \"$C\" 2>/dev/null\n\
+                 exec '{python}' -c '{main}' \"$1\"\n",
                 counter = self.markitdown_conversion_counter_path().display(),
-                real = self.markitdown_entrypoint().display(),
+                python = self.runtime.managed_python().display(),
+                main = crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO,
             );
             crate::client_adapters::atomic_write(&shim, script.as_bytes())
                 .with_context(|| format!("writing markitdown shim {}", shim.display()))?;
@@ -8867,10 +8884,18 @@ fn redact_command_line(command: &str) -> String {
             Some(_) => is_port_like(token),
             None if token.starts_with('-') => {
                 let (flag, value) = token.split_once('=').unwrap_or((token, ""));
-                out.push(if value.is_empty() || is_port_like(value) {
-                    token.to_owned()
-                } else {
+                // A short flag takes its value attached, no `=`: `-pS3cret`.
+                let short = token.char_indices().nth(2).map(|(at, _)| at);
+                out.push(if !value.is_empty() && !is_port_like(value) {
                     format!("{flag}=<arg>")
+                } else if let Some(at) = short.filter(|_| !token.starts_with("--")) {
+                    if is_port_like(&token[at..]) {
+                        token.to_owned()
+                    } else {
+                        format!("{}<arg>", &token[..at])
+                    }
+                } else {
+                    redact_sensitive(token)
                 });
                 if !token.contains('=') && token.len() > 1 {
                     value_of = Some(if token == "-m" { "-m" } else { "flag" });
@@ -8891,12 +8916,30 @@ fn redact_command_line(command: &str) -> String {
             }
         };
         out.push(if keep {
-            token.to_owned()
+            scrub_kept_arg(token)
         } else {
             "<arg>".into()
         });
     }
     out.join(" ")
+}
+
+/// A kept argument can still carry a credential: a URL's or DSN's userinfo
+/// (`postgres://user:pw@db/x`, `root:pw@tcp(db)/app`), query or fragment
+/// (`?token=...`), or a named assignment (`API_TOKEN=a/b`). What is kept is
+/// scheme, host and path. Userinfo may hold an unencoded `/`, `?`, `#` or
+/// `@`, so everything through the LAST `@` goes before anything is cut.
+fn scrub_kept_arg(token: &str) -> String {
+    let (scheme, rest) = token
+        .split_once("://")
+        .map_or((None, token), |(scheme, rest)| (Some(scheme), rest));
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let rest = rest.split(['?', '#', '&']).next().unwrap_or_default();
+    let token = match scheme {
+        Some(scheme) => format!("{scheme}://{rest}"),
+        None => rest.to_owned(),
+    };
+    redact_sensitive(&token)
 }
 
 fn is_port_like(token: &str) -> bool {
@@ -16388,6 +16431,16 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             r("/bin/zsh -c source ~/.claude/snapshot.sh && python x.py"),
             "/bin/zsh -c <arg> ~/.claude/snapshot.sh <arg> python x.py"
         );
+        assert_eq!(
+            r("node srv.js postgres://user:pw@db:5432/x https://h/cb?sig=abc#t API_TOKEN=a/b"),
+            "node srv.js postgres://db:5432/x https://h/cb API_TOKEN=[REDACTED]"
+        );
+        // Attached short-flag values, scheme-less DSNs, and `#`/`/` inside a
+        // password all used to pass through.
+        assert_eq!(
+            r("sshpass -pS3cretPw ssh root:S3cret@tcp(db:3306)/app mysql://root:pa#s/s@db/app -p8787"),
+            "sshpass -p<arg> <arg> tcp(db:3306)/app mysql://db/app -p8787"
+        );
     }
 
     /// RUST-JC: a dual-stack wildcard listener (Node's default, Orca's shape)
@@ -17821,27 +17874,57 @@ after
 
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
-    fn markitdown_shim_counts_file_conversions_but_not_flag_calls() {
-        let (_root, _runtime, manager) = seed_test_runtime("markitdown-shim");
+    fn markitdown_shim_counts_file_conversions_and_refuses_everything_else() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-shim");
         write_executable(
-            &manager.markitdown_entrypoint(),
-            "#!/bin/sh\necho converted:$1\n",
+            &runtime.managed_python(),
+            "#!/bin/sh\nexec /usr/bin/python3 \"$@\"\n",
         );
+        let pythonpath = crate::client_adapters::fake_markitdown_pythonpath(&root);
+        // The bin dir is on PATH for RTK users; the shim must not be there.
+        write_executable(&manager.legacy_markitdown_shim_path(), "#!/bin/sh\n");
         manager.ensure_markitdown_shim().expect("shim");
+        assert!(!manager.legacy_markitdown_shim_path().exists());
+        assert_ne!(
+            manager.markitdown_shim_path().parent(),
+            Some(runtime.bin_dir.as_path())
+        );
 
-        let run = |arg: &str| {
-            let out = crate::proc::command(manager.markitdown_shim_path())
-                .arg(arg)
+        let run = |args: &[&str]| {
+            crate::proc::command(manager.markitdown_shim_path())
+                .args(args)
+                .env("PYTHONPATH", &pythonpath)
                 .output()
-                .expect("run shim");
-            assert!(out.status.success(), "shim exited non-zero for {arg}");
-            String::from_utf8_lossy(&out.stdout).to_string()
+                .expect("run shim")
         };
 
-        assert!(run("/tmp/a.docx").contains("converted:/tmp/a.docx"));
-        run("/tmp/b.xlsx");
-        run("--help"); // flag-only invocation must not count
-        assert_eq!(manager.markitdown_conversion_count(), Some(2));
+        // "converted", not "transcribed": audio is never sent off to Google.
+        let out = run(&["/tmp/a.docx"]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "converted:1:/tmp/a.docx\n"
+        );
+        // A colon later in the path, or a one-letter drive prefix, is still a path.
+        assert!(run(&["docs/q3:final.xlsx"]).status.success());
+        assert!(run(&["C:/Users/x/b.pptx"]).status.success());
+
+        // Claude Code runs the shim without a prompt, so anything beyond one
+        // local path (-o writes anywhere, URLs hit the network) is refused
+        // before the real binary runs.
+        for args in [
+            &["--help"][..],
+            &["-o", "/tmp/x", "/tmp/a.docx"],
+            &["/tmp/a.docx", "-o", "/tmp/x"],
+            &["https://example.com/x.docx"],
+            &["file:///etc/passwd"],
+            &["data:text/plain,hi"],
+            &[],
+        ] {
+            let out = run(args);
+            assert!(!out.status.success(), "shim must refuse {args:?}");
+            assert!(out.stdout.is_empty(), "real binary ran for {args:?}");
+        }
+        assert_eq!(manager.markitdown_conversion_count(), Some(3));
     }
 
     #[test]
