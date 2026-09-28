@@ -104,7 +104,7 @@ describe("UpstreamPanel", () => {
     await waitFor(() => {
       expect(screen.getByLabelText("Provider auth token")).toHaveAttribute(
         "placeholder",
-        "Stored — type to replace"
+        "Stored. Type to replace"
       );
     });
     await user.click(screen.getByRole("button", { name: "Save and restart" }));

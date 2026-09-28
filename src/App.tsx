@@ -332,13 +332,13 @@ const addonCopy: Record<string, AddonCopy> = {
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
-    "Headroom injects ANTHROPIC_BASE_URL into shell profiles and ~/.claude/settings.json so Claude Code connects through Headroom. Claude Code disables Remote Control behind any proxy, so Headroom also installs a /remote-control command that, after confirming, restarts the current session without Headroom. In the VS Code panel the command is /remote-control-headroom, and the restart happens in place.",
+    "Sets ANTHROPIC_BASE_URL in your shell profile and ~/.claude/settings.json. Claude Code turns off Remote Control behind a proxy, so Headroom adds a /remote-control command (/remote-control-headroom in VS Code) that restarts the session without Headroom.",
   codex:
-    "Codex in the ChatGPT app, the Codex IDE extension, and the Codex CLI share ~/.codex/config.toml. Headroom adds a managed provider there and an OPENAI_BASE_URL shell export, plus a SessionStart guard that warns when routing breaks. In the Codex CLI, run /hooks once to review and trust the guard (and again after it changes).",
+    "Adds a Headroom provider to ~/.codex/config.toml, which the ChatGPT app, the IDE extension and the CLI share, plus an OPENAI_BASE_URL shell export and a guard that warns if routing breaks. In the Codex CLI, run /hooks once to trust the guard.",
   grok_build:
-    "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom.",
+    "Adds a proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profile.",
   opencode:
-    "Headroom points the anthropic and openai provider base URLs in OpenCode's config file (usually ~/.config/opencode/opencode.json) at its localhost proxy and registers a transport plugin that routes every other provider through it too. Anthropic and OpenAI traffic is optimized; other providers pass through for visibility. A project-level opencode.json can override this for that project."
+    "Points the anthropic and openai providers in ~/.config/opencode/opencode.json at Headroom and adds a plugin that routes the other providers through it too. Anthropic and OpenAI traffic is optimized; the rest passes through unchanged. A project's own opencode.json can override this."
 };
 
 // Claude Code run inside the Claude desktop app is the one Claude Code surface
@@ -371,13 +371,13 @@ const connectorUnavailableReasons: Record<string, string> = {
   // lands here, because the CLI genuinely isn't installed. Say so, or they
   // reasonably conclude Headroom is broken rather than inapplicable.
   claude_code:
-    "Claude Code was not detected. Install the Claude Code CLI and restart Headroom. Note that Claude Code inside the Claude desktop app cannot be optimized: Anthropic's desktop app does not use the CLI's configuration, so Headroom never sees its requests. That is their design decision, not something Headroom can configure around.",
+    "Claude Code not found. Install the CLI and restart Headroom. Claude Code inside the Claude desktop app can't be optimized: Anthropic's app ignores the CLI's configuration.",
   codex:
-    "The Codex CLI was not detected. Headroom can still configure Codex in the ChatGPT app and the Codex IDE extension; install the CLI only if you also want terminal use.",
+    "Codex CLI not found. Codex in the ChatGPT app and the IDE extension still works.",
   grok_build:
-    "Grok Build was not detected. Install Grok Build and restart Headroom.",
+    "Grok Build not found. Install it and restart Headroom.",
   opencode:
-    "OpenCode was not detected. Install OpenCode and restart Headroom."
+    "OpenCode not found. Install it and restart Headroom."
 };
 
 // Grok routing: UA-classified in the intercept, forwarded to api.x.ai via
@@ -3777,7 +3777,7 @@ export default function App() {
     }
     return (
       connectorUnavailableReasons[connector.clientId] ??
-      "Connector is unavailable because this client is not detected on this machine."
+      "Not found on this machine."
     );
   }
 
@@ -4867,7 +4867,7 @@ export default function App() {
         const result = await invoke<ClientSetupResult>("apply_client_setup", {
           clientId: connector.clientId,
         });
-        setConnectorsNotice(clientSetupNotice(connector.name, result));
+        setConnectorsNotice(clientSetupNotice(result));
       } else {
         await invoke("disable_client_setup", { clientId: connector.clientId });
         setConnectorsNotice(null);
@@ -7994,12 +7994,6 @@ export default function App() {
                 </div>
                 <div className="connector-list">
                   {sortClientConnectors(aggregateClientConnectors(connectors)).map((connector) => {
-                    const connectorLabel =
-                      connector.clientId === "claude_code"
-                        ? "Claude Code connection"
-                        : connector.clientId === "codex"
-                          ? "ChatGPT Codex connection"
-                          : connector.name;
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
                     const gateMessage = connectorGateMessage(connector, pricingStatus);
@@ -8017,7 +8011,7 @@ export default function App() {
                             <span className="client-logo" aria-hidden="true">
                               {renderConnectorLogo(connector.clientId)}
                             </span>
-                            {connectorLabel}
+                            {connector.name}
                             <button
                               className="connector-help"
                               onClick={() =>
@@ -8036,7 +8030,7 @@ export default function App() {
                             <div className="connector-tooltip">
                               <p>
                                 {connectorSetupDetails[connector.clientId] ??
-                                  "Headroom applies local connector configuration."}
+                                  "Headroom writes this tool's local configuration."}
                               </p>
                               {connector.enabled ? (
                                 <div className="connector-diagnostics">
@@ -8061,7 +8055,7 @@ export default function App() {
                                       ) : null}
                                     </ul>
                                   ) : (
-                                    <p>Verification details are not available yet.</p>
+                                    <p>No checks yet.</p>
                                   )}
                                   <button
                                     className="addon-card__link connector-diagnostics__refresh"
@@ -8178,7 +8172,7 @@ export default function App() {
                       {
                         name: "Runtime",
                         ok: runtimeStatus?.bypassed ? null : runtimeStatus?.running === true,
-                        suffix: runtimeStatus?.bypassed ? "paused by the plan gate" : undefined,
+                        suffix: runtimeStatus?.bypassed ? "paused by your plan" : undefined,
                       },
                       {
                         name: "Proxy",
@@ -8240,13 +8234,13 @@ export default function App() {
                           const lines = await invoke<string[]>("get_headroom_logs", { maxLines: 80 });
                           setHeadroomLogLines(lines);
                         } catch {
-                          setHeadroomLogLines(["Failed to load headroom logs."]);
+                          setHeadroomLogLines(["Couldn't load logs."]);
                         }
                       }
                     }}
                     type="button"
                   >
-                    {showHeadroomDetails ? "Hide headroom logs" : "Show headroom logs"}
+                    {showHeadroomDetails ? "Hide logs" : "Show logs"}
                   </button>
                   {showHeadroomDetails ? (
                     <pre className="runtime-log" ref={headroomLogRef}>
@@ -8262,7 +8256,7 @@ export default function App() {
                   </div>
                   <div>
                     <p>
-                      Automatically launch Headroom whenever you login or restart.
+                      Start Headroom when you log in.
                     </p>
                   </div>
                   <div className="connector-item__controls">
@@ -8300,8 +8294,8 @@ export default function App() {
                   </div>
                 </div>
                 <p>
-                  Removes Headroom and everything it changed: the runtime, its addons, your
-                  coding agent configs, and the app itself. You will see the full list first.
+                  Removes the app, its runtime and addons, and undoes its changes to your
+                  coding tools. You'll see the full list first.
                 </p>
                 <button
                   className="secondary-button secondary-button--small"

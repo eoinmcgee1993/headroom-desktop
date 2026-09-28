@@ -104,9 +104,9 @@ export function UpstreamPanel() {
     <article className="soft-card panel-card">
       <div className="panel-card__header">
         <div>
-          <h3>Claude Code Provider</h3>
+          <h3>Claude Code provider</h3>
           <p className="panel-card__subtitle">
-            Route Headroom to an alternative model that is Anthropic-compatible.
+            Send Claude Code to another Anthropic-compatible provider.
           </p>
         </div>
       </div>
@@ -204,7 +204,7 @@ export function UpstreamPanel() {
                     setToken(event.target.value);
                     setTokenTouched(true);
                   }}
-                  placeholder={hasToken ? "Stored — type to replace" : "Paste the provider token"}
+                  placeholder={hasToken ? "Stored. Type to replace" : "Paste the provider token"}
                   spellCheck={false}
                   type="password"
                   value={token}

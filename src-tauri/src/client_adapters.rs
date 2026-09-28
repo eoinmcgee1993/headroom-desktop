@@ -557,7 +557,15 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
         other => return Err(anyhow!("Automatic setup is not supported yet for {other}.",)),
     }
 
-    let configured_at = Utc::now().to_rfc3339();
+    // Keep the original enable time across re-applies (launch restore, resume,
+    // hourly repair). It drives the "Quit and reopen" hint, which is meant for
+    // the user's own enable, not for every app launch.
+    let configured_at = state
+        .configured_clients
+        .get(&state_id)
+        .or_else(|| state.remembered_clients.get(&state_id))
+        .cloned()
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
     state
         .configured_clients
         .insert(state_id.clone(), configured_at);
@@ -586,32 +594,17 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             let mut steps = Vec::new();
             if shell_unwritable {
                 steps.push(
-                    "Your shell profile (e.g. ~/.zshrc) couldn't be updated - it isn't writable, or it isn't valid UTF-8 text. Core routing still works via the client's own config; to launch the client from a terminal, fix the file and re-run setup, or add the export manually."
+                    "Couldn't update your shell profile (e.g. ~/.zshrc): it isn't writable or isn't UTF-8 text. The client's own config still routes through Headroom. For terminal use, fix the file and turn the connector off and on."
                         .into(),
                 );
             }
-            steps.push(
-                "Restart your terminal/editor session to pick up environment changes.".into(),
-            );
+            // The restart hint lives on the connector row, not here.
             if normalized_setup_id(client_id) == "codex_cli" {
                 steps.push(
-                    "Quit and reopen any ChatGPT app, Codex CLI, or IDE sessions to load the managed provider."
-                        .into(),
-                );
-                steps.push(
-                    "In the Codex CLI, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard)."
+                    "In the Codex CLI, run /hooks and trust the Headroom guard so it can warn you if routing breaks."
                         .into(),
                 );
             }
-            steps.push(format!(
-                "Run one {} prompt and verify activity appears in Headroom.",
-                match normalized_setup_id(client_id) {
-                    "codex_cli" => "Codex",
-                    "grok_build" => "Grok Build",
-                    "opencode" => "OpenCode",
-                    _ => "Claude Code",
-                }
-            ));
             steps
         },
         verification,
@@ -13061,6 +13054,37 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(repaired, vec!["codex_cli".to_string()]);
         let healed = super::verify_client_setup("codex").expect("verify runs");
         assert!(healed.failures.is_empty(), "healed: {:?}", healed.failures);
+    }
+
+    // The configure time drives the frontend's "Quit and reopen" hint. A
+    // quit + relaunch restore must not reset it, or the hint shows for a day
+    // after every launch.
+    #[test]
+    #[serial_test::serial]
+    fn restore_keeps_the_original_configured_at() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+
+        super::apply_client_setup("opencode").expect("apply succeeds");
+        let original = super::configured_timestamp(&super::load_setup_state(), "opencode")
+            .expect("configured");
+
+        super::clear_client_setups().expect("clear succeeds");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        super::restore_client_setups();
+        assert_eq!(
+            super::configured_timestamp(&super::load_setup_state(), "opencode"),
+            Some(original.clone())
+        );
+
+        super::disable_client_setup("opencode").expect("disable succeeds");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        super::apply_client_setup("opencode").expect("re-enable succeeds");
+        assert_ne!(
+            super::configured_timestamp(&super::load_setup_state(), "opencode"),
+            Some(original),
+            "a user re-enable is a new configure"
+        );
     }
 
     #[test]
