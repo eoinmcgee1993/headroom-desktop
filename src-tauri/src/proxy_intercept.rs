@@ -2195,6 +2195,17 @@ fn report_upstream_error(
     if status == 401 && !is_missing_auth_error(&body) {
         return;
     }
+    // 413 is a size cap refusing the body the CLIENT built (a provider gateway's
+    // limit, or the backend's own content-length check): the conversation
+    // outgrew it. The backend only ever forwards the same or a smaller body, so
+    // no release of ours changes the outcome, and the client already shows the
+    // error. RUST-55 (codex), RUST-F7 (claude-code) and RUST-K6 (opencode, a
+    // gateway's `gateway_error`) were all this, one hand-archived issue per
+    // client. Except the backend's fail-closed refusal after its OWN compression
+    // failed: that one is ours.
+    if status == 413 && !is_compression_refused_error(&body) {
+        return;
+    }
     // Codex sent no bearer: the flagless provider block. Repair it now (own
     // thread: this runs on the forwarding task) rather than within the hour;
     // the user is failing every prompt until it lands. Before the Sentry
@@ -2291,6 +2302,14 @@ fn is_geo_blocked_codex_error(body: &[u8]) -> bool {
     };
     let err = json.get("error").unwrap_or(&json);
     err.get("code").and_then(|v| v.as_str()) == Some("unsupported_country_region_territory")
+}
+
+/// True when a 413 is the backend refusing to forward after its own compression
+/// failed (`compression_refused`, handlers/openai.py) rather than a size cap on
+/// the client's body. Substring match: FastAPI nests it under `detail`.
+fn is_compression_refused_error(body: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"\"compression_refused\"";
+    body.windows(NEEDLE.len()).any(|w| w == NEEDLE)
 }
 
 /// The response's media type with any parameters (`; charset=...`) stripped, so
@@ -3671,9 +3690,9 @@ mod tests {
         codex_error_summary, codex_snapshot_from_usage_payload, codex_window_label,
         decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
         grok_upstream_header, intercept_request_counts, is_claude_session_id, is_client_probe_path,
-        is_codex_request_head, is_codex_sse_response, is_geo_blocked_codex_error,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_missing_auth_error, is_openai_path, is_prompt_request_head,
+        is_codex_request_head, is_codex_sse_response, is_compression_refused_error,
+        is_geo_blocked_codex_error, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
+        is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
         is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
@@ -6082,6 +6101,25 @@ mod tests {
         assert!(!is_geo_blocked_codex_error(b""));
         // A null code must not panic or match.
         assert!(!is_geo_blocked_codex_error(br#"{"error":{"code":null}}"#));
+    }
+
+    #[test]
+    fn compression_refused_splits_our_413_from_size_caps() {
+        // The backend's fail-closed refusal after its own compression failed.
+        assert!(is_compression_refused_error(
+            br#"{"detail":{"error":{"type":"compression_refused","message":"headroom: compression timeout on a 9000000-byte request"}}}"#
+        ));
+        // RUST-K6 (opencode gateway), RUST-55 (codex), RUST-F7 (claude-code).
+        assert!(!is_compression_refused_error(
+            br#"{"error":{"type":"gateway_error","message":"payload too large"}}"#
+        ));
+        assert!(!is_compression_refused_error(
+            br#"{"error":{"type":"invalid_request_error","code":"request_too_large"}}"#
+        ));
+        assert!(!is_compression_refused_error(
+            br#"{"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#
+        ));
+        assert!(!is_compression_refused_error(b""));
     }
 
     #[test]
