@@ -398,7 +398,7 @@ describe("setupStallBannerLine", () => {
   });
 
   it("names the pre-Headroom environment when no request has ever arrived", () => {
-    expect(setupStallBannerLine(returning(), PAST_WINDOW)).toContain("pre-Headroom settings");
+    expect(setupStallBannerLine(returning(), PAST_WINDOW)).toContain("picks up Headroom's settings");
   });
 
   // The modal requires an unverified connector, which keeps it silent when a
@@ -609,7 +609,7 @@ describe("unroutedBody", () => {
 
   it("asks a switched-off connector to be turned back on", () => {
     expect(unroutedBody({ ...base, enabled: false, reapplied: false })).toContain(
-      "Turn the connection back on"
+      "Turn it back on"
     );
   });
 });

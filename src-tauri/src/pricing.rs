@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,11 @@ const DEFAULT_ACCOUNT_API_BASE_URL: &str = "http://127.0.0.1:3000/api/v1";
 const DEFAULT_ACCOUNT_API_BASE_URL: &str = "https://extraheadroom.com/api/v1";
 const LOCAL_GRACE_PERIOD_HOURS: i64 = 72;
 const TIER_MISMATCH_GRACE_DAYS: i64 = 14;
+/// AppSumo accounts are pushed to upgrade faster: the clamp fires on their 4th
+/// active day (a local day with savings), capped by the calendar grace above.
+/// Active rather than calendar days so a Friday purchase isn't clamped by an
+/// idle weekend.
+const APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS: usize = 3;
 // Set to true in dev builds to skip sign-in requirement (indefinite trial)
 #[cfg(debug_assertions)]
 const INDEFINITE_TRIAL: bool = true;
@@ -40,6 +45,10 @@ struct LocalPricingState {
     reconcile_with_server: bool,
     #[serde(default)]
     mismatch_since: Option<DateTime<Utc>>,
+    /// When the open mismatch's clamp began (its `grace_ends_at`), once it has.
+    /// Reported so the server need not re-derive the per-account grace.
+    #[serde(default)]
+    mismatch_clamped_at: Option<DateTime<Utc>>,
     /// Server-bucketed paywall-first experiment flag. `None` = never fetched.
     /// Refreshed only by the launch-time config fetch so a mid-onboarding
     /// server flip can't strand a user halfway through the gated flow.
@@ -116,10 +125,14 @@ struct IdentityPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_usage_windows: Option<String>,
     /// When the local tier-mismatch clock started, if a mismatch is currently
-    /// open. The clamp fires `TIER_MISMATCH_GRACE_DAYS` after this, so the
-    /// server can derive both the mismatch cohort and who is actually clamped.
+    /// open. The clamp fires `TIER_MISMATCH_GRACE_DAYS` after this (sooner for
+    /// AppSumo accounts, see `APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS`), so the
+    /// server can derive the mismatch cohort and most of who is clamped.
     #[serde(skip_serializing_if = "Option::is_none")]
     tier_mismatch_since: Option<String>,
+    /// When that mismatch's clamp began, once it has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tier_mismatch_clamped_at: Option<String>,
     /// Highest Terms-of-Service version the user has accepted locally. Rides
     /// along on every grace/start so the server's device-keyed trial record
     /// captures acceptance. `None` (omitted) when nothing accepted yet.
@@ -316,10 +329,10 @@ impl IdentityPayload {
             .as_ref()
             .map(codex_usage_windows_summary);
         payload.claude_usage_windows = state.claude_usage_windows.lock().clone();
-        payload.tier_mismatch_since = load_or_initialize_local_state()
-            .ok()
-            .and_then(|local| local.mismatch_since)
-            .map(|since| since.to_rfc3339());
+        if let Ok(local) = load_or_initialize_local_state() {
+            payload.tier_mismatch_since = local.mismatch_since.map(|at| at.to_rfc3339());
+            payload.tier_mismatch_clamped_at = local.mismatch_clamped_at.map(|at| at.to_rfc3339());
+        }
         payload
     }
 
@@ -350,6 +363,7 @@ impl IdentityPayload {
             codex_usage_windows: None,
             claude_usage_windows: None,
             tier_mismatch_since: None,
+            tier_mismatch_clamped_at: None,
             accepted_terms_version: None,
             wsl_agents: crate::wsl_probe::result(),
             claude_desktop: Some(crate::client_adapters::claude_desktop_verdict()),
@@ -422,6 +436,9 @@ impl IdentityPayload {
         }
         if let Some(value) = self.tier_mismatch_since.as_deref() {
             builder = builder.header("X-Headroom-Tier-Mismatch-Since", value);
+        }
+        if let Some(value) = self.tier_mismatch_clamped_at.as_deref() {
+            builder = builder.header("X-Headroom-Tier-Mismatch-Clamped-At", value);
         }
         if let Some(version) = self.accepted_terms_version {
             builder = builder.header("X-Headroom-Terms-Version", version.to_string());
@@ -954,7 +971,12 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     let codex_plan = crate::client_adapters::is_codex_enabled()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
-    let tier_mismatch = resolve_tier_mismatch(account.as_ref(), &claude, codex_plan);
+    let tier_mismatch = resolve_tier_mismatch(
+        account.as_ref(),
+        &claude,
+        codex_plan,
+        &state.active_day_keys(),
+    );
     // Captured before the mismatch is moved into the Claude evaluator. The clamp
     // is scoped per product: Codex is metered only when the Codex-implied tier
     // exceeds the paid one, and the Claude evaluator gates only on
@@ -1484,7 +1506,12 @@ pub(crate) fn verify_auth_code_with_base_url(
     let codex_plan = crate::client_adapters::is_codex_enabled()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
-    let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude, codex_plan);
+    let tier_mismatch = resolve_tier_mismatch(
+        Some(&account),
+        &claude,
+        codex_plan,
+        &state.active_day_keys(),
+    );
 
     Ok(evaluate_pricing_status_with_mismatch(
         true,
@@ -1663,7 +1690,12 @@ pub(crate) fn activate_account_with_retry_backoff(
     let codex_plan = crate::client_adapters::is_codex_enabled()
         .then(|| state.cached_codex_profile().and_then(|p| p.plan_tier))
         .flatten();
-    let tier_mismatch = resolve_tier_mismatch(Some(&account), &claude, codex_plan);
+    let tier_mismatch = resolve_tier_mismatch(
+        Some(&account),
+        &claude,
+        codex_plan,
+        &state.active_day_keys(),
+    );
 
     Ok(evaluate_pricing_status_with_mismatch(
         true,
@@ -2353,6 +2385,7 @@ fn resolve_tier_mismatch(
     account: Option<&HeadroomAccountProfile>,
     claude: &ClaudeAccountProfile,
     codex_plan: Option<CodexPlanTier>,
+    active_day_keys: &[String],
 ) -> Option<TierMismatch> {
     let (paid_tier, recommended_tier, recommended_source) =
         match account.and_then(|a| detect_tier_mismatch(a, claude, codex_plan)) {
@@ -2365,8 +2398,9 @@ fn resolve_tier_mismatch(
                 // weeks meant under-subscribed users were never clamped.
                 if account.is_some() {
                     if let Ok(mut local) = load_or_initialize_local_state() {
-                        if local.mismatch_since.is_some() {
+                        if local.mismatch_since.is_some() || local.mismatch_clamped_at.is_some() {
                             local.mismatch_since = None;
+                            local.mismatch_clamped_at = None;
                             let _ = write_local_state(&local);
                         }
                     }
@@ -2386,7 +2420,15 @@ fn resolve_tier_mismatch(
         }
     };
 
-    let grace_ends_at = since + Duration::days(TIER_MISMATCH_GRACE_DAYS);
+    // `upgrade_action` is set only for AppSumo-entitled accounts.
+    let appsumo = account.is_some_and(|a| a.upgrade_action.is_some());
+    let grace_ends_at = tier_mismatch_grace_ends_at(since, appsumo, active_day_keys);
+    let clamped = Utc::now() > grace_ends_at;
+    let clamped_at = clamped.then_some(grace_ends_at);
+    if local.mismatch_clamped_at != clamped_at {
+        local.mismatch_clamped_at = clamped_at;
+        let _ = write_local_state(&local);
+    }
     // Per-product scope for the clamp. `recommended_source` names the higher
     // recommendation, which is not the same thing: paid Pro with Claude->Max20x
     // and Codex->Max5x reports source Claude, yet both products are
@@ -2401,10 +2443,39 @@ fn resolve_tier_mismatch(
         recommended_tier,
         recommended_source,
         grace_ends_at,
-        clamped: Utc::now() > grace_ends_at,
+        clamped,
         claude_undercovered,
         codex_undercovered,
     })
+}
+
+/// When the tier-mismatch grace ends (or ended: the UI shows it as the day
+/// metering started). AppSumo: local midnight of the first active day past the
+/// allowance, if that comes before the calendar cap. `active_day_keys` must be
+/// ascending `YYYY-MM-DD` local day keys.
+fn tier_mismatch_grace_ends_at(
+    since: DateTime<Utc>,
+    appsumo: bool,
+    active_day_keys: &[String],
+) -> DateTime<Utc> {
+    let calendar = since + Duration::days(TIER_MISMATCH_GRACE_DAYS);
+    if !appsumo {
+        return calendar;
+    }
+    let since_key = crate::storage::user_day_key(since);
+    active_day_keys
+        .iter()
+        .filter(|key| **key >= since_key)
+        .nth(APPSUMO_TIER_MISMATCH_GRACE_ACTIVE_DAYS)
+        .and_then(|key| NaiveDate::parse_from_str(key, "%Y-%m-%d").ok())
+        .and_then(|day| {
+            day.and_hms_opt(0, 0, 0)?
+                .and_local_timezone(Local)
+                .earliest()
+        })
+        .map_or(calendar, |metered_from| {
+            metered_from.with_timezone(&Utc).min(calendar)
+        })
 }
 
 struct PaidPlanGate {
@@ -3507,6 +3578,7 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
         first_seen_at: Utc::now(),
         reconcile_with_server: true,
         mismatch_since: None,
+        mismatch_clamped_at: None,
         paywall_first: None,
         last_server_contact_at: None,
         last_account_sync_ok_at: None,
@@ -3856,17 +3928,18 @@ fn pricing_policy_for_codex_plan(plan: &CodexPlanTier) -> Option<PricingPolicy> 
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 
     use super::{
         codex_billing_type, decode_jwt_payload, detect_plan_tier_from_profile,
         detect_tier_mismatch, evaluate_pricing_status_with_mismatch, is_identity_complete,
         merge_background_account_sync, parse_oauth_profile_value, plan_tier_header_value,
-        remote_account_to_profile, resolve_account_api_base_url, ClaudeOauthProfile,
-        ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
-        IdentityFingerprint, IdentityPayload, LocalPricingState, PricingPromo,
-        RemoteAccountResponse, RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS,
-        DEFAULT_ACCOUNT_API_BASE_URL, MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS,
+        remote_account_to_profile, resolve_account_api_base_url, tier_mismatch_grace_ends_at,
+        ClaudeOauthProfile, ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization,
+        HeadroomSubscriptionTier, IdentityFingerprint, IdentityPayload, LocalPricingState,
+        PricingPromo, RemoteAccountResponse, RemoteAccountSyncError,
+        CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
+        MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, CodexPlanTier,
@@ -3913,6 +3986,7 @@ mod tests {
             first_seen_at: now - Duration::days(30),
             reconcile_with_server: false,
             mismatch_since: None,
+            mismatch_clamped_at: None,
             paywall_first: None,
             last_server_contact_at: stale,
             last_account_sync_ok_at: stale,
@@ -6934,6 +7008,45 @@ mod tests {
         account.subscription_active = false;
         let claude = empty_claude_profile(ClaudePlanTier::Max20x);
         assert!(detect_tier_mismatch(&account, &claude, None).is_none());
+    }
+
+    #[test]
+    fn appsumo_tier_mismatch_grace_counts_active_days() {
+        let local_noon = |day: &str| {
+            NaiveDate::parse_from_str(day, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_local_timezone(Local)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let local_midnight = |day: &str| local_noon(day) - Duration::hours(12);
+        let keys = |days: &[&str]| days.iter().map(|d| d.to_string()).collect::<Vec<_>>();
+        // Bought Friday; the weekend is idle, and days before the clock don't count.
+        let since = local_noon("2026-09-25");
+        let calendar = since + Duration::days(TIER_MISMATCH_GRACE_DAYS);
+        let active = keys(&[
+            "2026-09-20",
+            "2026-09-25",
+            "2026-09-28",
+            "2026-09-29",
+            "2026-09-30",
+        ]);
+
+        assert_eq!(tier_mismatch_grace_ends_at(since, false, &active), calendar);
+        assert_eq!(
+            tier_mismatch_grace_ends_at(since, true, &active),
+            local_midnight("2026-09-30")
+        );
+        // Three active days used: still in grace, bounded by the calendar cap.
+        assert_eq!(
+            tier_mismatch_grace_ends_at(since, true, &active[..4]),
+            calendar
+        );
+        // A 4th active day past the calendar cap never extends it.
+        let late = keys(&["2026-09-25", "2026-10-20", "2026-10-21", "2026-10-22"]);
+        assert_eq!(tier_mismatch_grace_ends_at(since, true, &late), calendar);
     }
 
     #[test]

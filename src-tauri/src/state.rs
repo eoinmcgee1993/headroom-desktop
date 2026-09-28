@@ -2456,6 +2456,17 @@ impl AppState {
         snapshot
     }
 
+    /// Local day keys (ascending) of every day with savings activity.
+    pub fn active_day_keys(&self) -> Vec<String> {
+        let tracker = self.savings_tracker.lock();
+        tracker
+            .daily_savings
+            .iter()
+            .filter(|(_, bucket)| bucket.is_active())
+            .map(|(day, _)| day.clone())
+            .collect()
+    }
+
     /// Emit a weekly recap rolling up the 7 days ending last Sunday.
     /// Previously Monday-only; now runs on any day whose check is due so the
     /// first launch after an upgrade catches up on last week's recap if it
@@ -4931,6 +4942,14 @@ struct DailySavingsBucket {
     cache_read_cost_usd: Option<f64>,
 }
 
+impl DailySavingsBucket {
+    /// The "active day" definition shared by the weekly recap and the AppSumo
+    /// tier-mismatch grace.
+    fn is_active(&self) -> bool {
+        self.estimated_tokens_saved > 0 || self.estimated_savings_usd > 0.0
+    }
+}
+
 /// A bucket's cache reads, read discount and read cost. The three always come
 /// from ONE source: a rollup-priced read cost is only meaningful against the
 /// reads and discount that rollup produced, never against a discount
@@ -6208,8 +6227,7 @@ fn aggregate_weekly_totals(
     let mut total_savings_usd: f64 = 0.0;
     let mut active_days: u32 = 0;
     for (day_key, bucket) in daily_savings.range(start_key..=end_key) {
-        let has_activity = bucket.estimated_tokens_saved > 0 || bucket.estimated_savings_usd > 0.0;
-        if has_activity {
+        if bucket.is_active() {
             active_days += 1;
         }
         total_tokens_saved = total_tokens_saved.saturating_add(bucket.estimated_tokens_saved);

@@ -77,12 +77,12 @@ function stallTitle(kind: SetupStallKind): string {
 
 function stallBody(kind: SetupStallKind): string {
   if (kind === "drift") {
-    return "Headroom is running, but days of requests have passed through with nothing optimized. Your coding agent has probably disconnected from Headroom. Open Headroom to check.";
+    return "Nothing has been optimized for days. Your coding agent has probably disconnected. Open Headroom to check.";
   }
   if (kind === "no_traffic") {
-    return `Your coding agent is connected, but ${setupStallNoTrafficMinutes()} minutes on not one request has come back through Headroom. It is probably still running with its pre-Headroom settings. Open Headroom to check.`;
+    return `Your coding agent is connected, but no requests have come through in ${setupStallNoTrafficMinutes()} minutes. Open Headroom to check.`;
   }
-  return "Requests are reaching Headroom but none are being optimized. Something is likely misconfigured. Open Headroom to check.";
+  return "Requests are reaching Headroom, but none are being optimized. Open Headroom to check.";
 }
 
 /// In-app phrasing of the same two failures. `stallBody` above is written for a
@@ -90,12 +90,12 @@ function stallBody(kind: SetupStallKind): string {
 /// nonsense on a banner inside Headroom.
 function stallBannerBody(kind: SetupStallKind): string {
   if (kind === "drift") {
-    return "Requests are passing through, but nothing has been optimized for days. Your coding agent has likely reconnected outside Headroom - restart it so it picks Headroom's settings back up.";
+    return "Requests are passing through, but nothing has been optimized for days. Restart your coding agent so it reconnects through Headroom.";
   }
   if (kind === "no_traffic") {
-    return "No request has come through Headroom yet. Your terminal or editor is probably still running with its pre-Headroom settings - restart it and they should pick the new settings up.";
+    return "No requests have come through Headroom yet. Restart your terminal or editor so it picks up Headroom's settings.";
   }
-  return "Requests are reaching Headroom but none are being optimized, so nothing is being saved yet. Check that your coding tool is still connected below.";
+  return "Requests are reaching Headroom, but none are being optimized. Check below that your coding tool is still connected.";
 }
 
 export interface SetupStallContext {
@@ -401,11 +401,11 @@ export function unroutedBody(client: UnroutedClient): string {
   // and telling 434-of-436 re-applied hosts to restart is what left them
   // unrouted for weeks.
   if (client.diagnosis) {
-    return `${client.name} was used on this machine, but none of its requests reached Headroom. ${client.diagnosis}`;
+    return `${client.name}: ${client.diagnosis}`;
   }
   return client.enabled
-    ? `${client.name} was used on this machine, but none of its requests reached Headroom. Its connection was just re-applied. Quit and reopen ${client.name} so it picks the settings up.`
-    : `${client.name} was used on this machine, but its Headroom connection is switched off, so nothing was optimized. Turn the connection back on to resume saving.`;
+    ? `Headroom has reconnected ${client.name}. Quit and reopen it to pick that up.`
+    : `${client.name}'s connector is off, so nothing was optimized. Turn it back on to resume saving.`;
 }
 
 /// Once per local day, on its own slot so this and the stall alert cannot

@@ -2421,7 +2421,7 @@ impl ToolManager {
                 id: "codebase-memory".into(),
                 name: "Codebase Memory".into(),
                 description:
-                    "MCP server that indexes your codebase into a persistent knowledge graph - call chains, classes, routes - so your agent answers structure questions from the graph instead of re-reading files. Complements Serena: pre-built map vs live symbol tools."
+                    "MCP server that indexes your codebase into a knowledge graph, so your agent answers structure questions from the graph instead of re-reading files."
                         .into(),
                 runtime: "binary".into(),
                 source_url: "https://github.com/DeusData/codebase-memory-mcp".into(),
