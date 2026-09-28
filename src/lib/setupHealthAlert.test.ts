@@ -609,7 +609,7 @@ describe("unroutedBody", () => {
 
   it("asks a switched-off connector to be turned back on", () => {
     expect(unroutedBody({ ...base, enabled: false, reapplied: false })).toContain(
-      "Turn it back on"
+      "Reconnect it"
     );
   });
 });

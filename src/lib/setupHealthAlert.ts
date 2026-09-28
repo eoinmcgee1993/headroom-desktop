@@ -405,7 +405,7 @@ export function unroutedBody(client: UnroutedClient): string {
   }
   return client.enabled
     ? `Headroom has reconnected ${client.name}. Quit and reopen it to pick that up.`
-    : `${client.name}'s connector is off, so nothing was optimized. Turn it back on to resume saving.`;
+    : `${client.name}'s connector is off, so nothing was optimized. Reconnect it to resume saving.`;
 }
 
 /// Once per local day, on its own slot so this and the stall alert cannot

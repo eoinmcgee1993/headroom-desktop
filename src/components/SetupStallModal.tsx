@@ -30,7 +30,7 @@ const LEAD: Record<SetupStallKind, string> = {
 
 const STEPS: Record<SetupStallKind, string[]> = {
   no_traffic: [
-    "Quit your terminal, editor, or coding agent completely, then reopen it. A new tab or window isn't enough.",
+    "Quit your terminal, editor, or coding agent completely, then reopen it. A new tab or window may keep the old settings.",
     "Check that Headroom is running: its menu bar icon is solid when it is.",
   ],
   // Reconnecting first: an agent that started before Headroom was ready is the

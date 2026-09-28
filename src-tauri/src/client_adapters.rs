@@ -558,12 +558,21 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
     }
 
     // Keep the original enable time across re-applies (launch restore, resume,
-    // hourly repair). It drives the "Quit and reopen" hint, which is meant for
-    // the user's own enable, not for every app launch.
+    // hourly repair). It drives the "Restart X" hint, which is meant for the
+    // user's own enable, not for every app launch. A different build restamps
+    // it: an update may write different config, which an already-open client
+    // only picks up on restart.
+    // ponytail: every update counts, config-changing or not; fingerprint the
+    // managed output if the post-update hint proves noisy.
+    let same_build = state
+        .setup_versions
+        .get(&state_id)
+        .is_none_or(|version| version == env!("CARGO_PKG_VERSION"));
     let configured_at = state
         .configured_clients
         .get(&state_id)
         .or_else(|| state.remembered_clients.get(&state_id))
+        .filter(|_| same_build)
         .cloned()
         .unwrap_or_else(|| Utc::now().to_rfc3339());
     state
@@ -1343,6 +1352,9 @@ pub fn clear_client_setups() -> Result<()> {
     snapshot_clients.extend(pre.configured_clients.clone());
     let mut snapshot_shell_files = pre.remembered_shell_files.clone();
     snapshot_shell_files.extend(pre.managed_shell_files.clone());
+    // Kept so the next launch's restore can tell an update from a relaunch
+    // (see configured_at in apply_client_setup).
+    let snapshot_versions = pre.setup_versions.clone();
 
     for spec in MANAGED_CLIENT_SPECS {
         let _ = disable_client_setup(spec.id);
@@ -1354,6 +1366,7 @@ pub fn clear_client_setups() -> Result<()> {
         let mut state = load_setup_state();
         state.remembered_clients = snapshot_clients;
         state.remembered_shell_files = snapshot_shell_files;
+        state.setup_versions = snapshot_versions;
         write_setup_state(&state)?;
     }
 
@@ -13070,6 +13083,20 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             super::configured_timestamp(&super::load_setup_state(), "opencode"),
             Some(original.clone())
         );
+
+        // Relaunch into a different build: the new config needs a restart.
+        super::clear_client_setups().expect("clear succeeds");
+        let mut state = super::load_setup_state();
+        state
+            .setup_versions
+            .insert("opencode".into(), "0.0.1".into());
+        super::write_setup_state(&state).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        super::restore_client_setups();
+        let updated = super::configured_timestamp(&super::load_setup_state(), "opencode")
+            .expect("configured");
+        assert_ne!(updated, original, "an update is a new configure");
+        let original = updated;
 
         super::disable_client_setup("opencode").expect("disable succeeds");
         std::thread::sleep(std::time::Duration::from_millis(5));
