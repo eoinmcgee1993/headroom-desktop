@@ -7673,6 +7673,26 @@ fn learn_failure_is_agent_unparseable_output(text: &str) -> bool {
     text.contains("returned unparseable output")
 }
 
+/// The agent CLI is older than a flag upstream's analyzer passes it (RUST-K9:
+/// ``error: unknown option '--include-partial-messages'`` from a stale
+/// `/usr/local/bin/claude`). Same class as RUST-DE's too-old-for-the-model
+/// line: the user's install, fixed by updating it, not by a release of ours.
+fn learn_failure_is_agent_cli_outdated(text: &str) -> bool {
+    text.contains("error: unknown option '--")
+}
+
+/// The user-facing remedy for [`learn_failure_is_agent_cli_outdated`].
+fn learn_agent_cli_outdated_hint(agent: LearnAgent) -> String {
+    let (cli, update) = match agent {
+        LearnAgent::Codex => ("Codex", "Update the Codex CLI"),
+        _ => ("Claude Code", "Run `claude update`"),
+    };
+    format!(
+        "The {cli} CLI on this machine is too old for headroom learn. {update}, then start \
+         the scan again."
+    )
+}
+
 /// The user-facing remedy for [`learn_failure_is_agent_unparseable_output`].
 fn learn_agent_unparseable_output_hint(agent: LearnAgent) -> String {
     let cli = match agent {
@@ -8074,10 +8094,13 @@ fn execute_headroom_learn_run(
                     // credit balance).
                     let agent_api_error_line =
                         learn_failure_agent_api_error_line(&stderr).map(str::to_string);
+                    // Sixth: the CLI is too old for upstream's flags (RUST-K9).
+                    let agent_cli_outdated = learn_failure_is_agent_cli_outdated(&stderr);
                     if !agent_not_signed_in
                         && agent_limit_line.is_none()
                         && !agent_api_unreachable
                         && !agent_unparseable
+                        && !agent_cli_outdated
                         && agent_api_error_line.is_none()
                     {
                         sentry::with_scope(
@@ -8149,6 +8172,11 @@ fn execute_headroom_learn_run(
                         (
                             format!("headroom learn could not reach the agent's API for {project_name}."),
                             learn_agent_api_error_hint(agent, line),
+                        )
+                    } else if agent_cli_outdated {
+                        (
+                            format!("headroom learn needs a newer agent CLI for {project_name}."),
+                            learn_agent_cli_outdated_hint(agent),
                         )
                     } else {
                         (
@@ -8289,7 +8317,9 @@ fn execute_headroom_learn_run(
                 // stderr, like the three siblings below.
                 let path_unreadable = stderr.contains("is not readable");
                 let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
+                let agent_cli_outdated = learn_failure_is_agent_cli_outdated(&stderr);
                 let user_env_condition = path_unreadable
+                    || agent_cli_outdated
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
                     || agent_api_error_line.is_some()
@@ -8344,6 +8374,8 @@ fn execute_headroom_learn_run(
                     learn_agent_api_unreachable_hint(agent)
                 } else if agent_unparseable {
                     learn_agent_unparseable_output_hint(agent)
+                } else if agent_cli_outdated {
+                    learn_agent_cli_outdated_hint(agent)
                 } else {
                     format!(
                         "headroom learn exited with {}.\n{}",
@@ -8358,6 +8390,8 @@ fn execute_headroom_learn_run(
                     format!("headroom learn could not reach the agent's API for {project_name}.")
                 } else if agent_unparseable {
                     format!("headroom learn could not read the analysis for {project_name}.")
+                } else if agent_cli_outdated {
+                    format!("headroom learn needs a newer agent CLI for {project_name}.")
                 } else {
                     format!("headroom learn failed for {project_name}.")
                 };
@@ -9985,21 +10019,22 @@ mod tests {
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
         learn_agent_auth_hint, learn_agent_limit_hint, learn_failure_agent_api_error_line,
         learn_failure_agent_limit_line, learn_failure_is_agent_api_unreachable,
-        learn_failure_is_agent_auth, learn_failure_is_agent_model_rejected,
-        learn_failure_is_agent_unparseable_output, learn_failure_signature_source,
-        learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
-        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
-        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
-        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
-        resolve_release_updater_config, savings_report, select_updater_endpoints,
-        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
-        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
+        learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
+        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, normalize_learn_failure_signature,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
+        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
+        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
+        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
+        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
+        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
+        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
     #[cfg(target_os = "macos")]
@@ -13036,6 +13071,24 @@ Some unrelated content.
         ] {
             assert!(
                 !learn_failure_is_agent_api_unreachable(stderr),
+                "for: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn learn_failure_is_agent_cli_outdated_matches_an_unknown_flag_only() {
+        // RUST-K9 verbatim: a stale CLI that predates upstream's stream flag.
+        assert!(learn_failure_is_agent_cli_outdated(
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose --include-partial-messages` failed (exit 1):\nerror: unknown option '--include-partial-messages'\n"
+        ));
+        for stderr in [
+            "Error: No such option: --foo",
+            "API Error: 400 status code (no body)",
+            "",
+        ] {
+            assert!(
+                !learn_failure_is_agent_cli_outdated(stderr),
                 "for: {stderr}"
             );
         }
