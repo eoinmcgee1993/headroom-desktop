@@ -8378,6 +8378,169 @@ fn msys_path(value: &str) -> String {
     }
 }
 
+/// The rtk hook's last step: prints allow-with-the-rewrite, or nothing. It runs
+/// as `python -c '...'`, so it must never contain a single quote.
+const RTK_HOOK_VERDICT_PY: &str = r##"import glob, json, os, re, shlex, subprocess, sys
+
+data = json.load(sys.stdin)
+tool_input = data.get("tool_input")
+if not isinstance(tool_input, dict):
+    sys.exit(0)
+
+# Modes that run the built-in read-only set unasked. Not auto (a read-only
+# command can wait for server-side classifier review, which an allow skips) and
+# not plan (with auto mode available the classifier reviews planning commands).
+QUIET_MODES = ("default", "acceptEdits", "dontAsk", "bypassPermissions")
+# Read-only commands from the Claude Code built-in set that rtk 0.48 rewrites.
+READ_ONLY = ("git", "ls", "cat", "head", "tail", "wc", "du", "stat", "diff", "tree", "find", "grep", "rg")
+GIT_READ_ONLY = ("status", "diff", "log", "show", "branch")
+# Flags that write or execute: long names (an abbreviation matches too), short letters.
+SEARCH_DENY = (("--pre", "--pre-glob", "--search-zip", "--hostname-bin"), "z")
+FLAG_DENY = {
+    "git": (("--output", "--ext-diff", "--exec", "--exec-path", "--upload-pack"), "co"),
+    "rg": SEARCH_DENY,
+    "grep": SEARCH_DENY,
+    "tree": ((), "oR"),
+}
+FIND_DENY = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls", "-files0-from"}
+BRANCH_LIST = {"-a", "-r", "-v", "-vv", "-l", "--list", "--show-current", "--all", "--remotes", "--verbose", "--no-color"}
+BRANCH_VALUE = ("--contains", "--merged", "--no-merged")
+SHELL = re.compile(r"[;&|<>`$(){}\n\r]")
+
+
+def lists_branches(args):
+    i = 0
+    while i < len(args):
+        if args[i] in BRANCH_VALUE:
+            i += 1
+            if i == len(args) or args[i].startswith("-"):
+                return False
+        elif args[i] not in BRANCH_LIST and args[i].split("=", 1)[0] not in BRANCH_VALUE:
+            return False
+        i += 1
+    return True
+
+
+def read_only(cmd, out):
+    # One plain read-only command, rewritten to one plain rtk call.
+    if len(cmd) > 10000 or SHELL.search(cmd) or SHELL.search(out) or not out.startswith("rtk "):
+        return False
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not argv or argv[0] not in READ_ONLY:
+        return False
+    name, args = argv[0], argv[1:]
+    # An unquoted glob can expand to a file named -delete or --pre=sh.
+    if name in FLAG_DENY or name == "find":
+        if "\\" in cmd or re.search(r"[*?\[]", re.sub(r"\x27[^\x27]*\x27|\"[^\"]*\"", "", cmd)):
+            return False
+    if name == "find":
+        return not FIND_DENY.intersection(args)
+    if name == "git":
+        if not args or args[0] not in GIT_READ_ONLY or args[0] == "branch" and not lists_branches(args[1:]):
+            return False
+        args = args[1:]
+    longs, shorts = FLAG_DENY.get(name, ((), ""))
+    for a in args:
+        flag = a.split("=", 1)[0]
+        if flag.startswith("--"):
+            if flag != "--" and any(x.startswith(flag) for x in longs):
+                return False
+        elif flag.startswith("-") and set(a[1:]) & set(shorts):
+            return False
+    return True
+
+
+def cli_rules():
+    # Rules on an ancestor command line: --settings, --disallowedTools.
+    try:
+        rows = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="], capture_output=True, text=True, timeout=5).stdout.splitlines()
+    except Exception:
+        return True
+    procs = {}
+    for row in rows:
+        parts = row.split(None, 2)
+        if len(parts) > 1 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    pid = os.getppid()
+    for _ in range(64):
+        if pid == 0:
+            return False
+        if pid not in procs:
+            return True
+        pid, command = procs[pid]
+        if "--settings" in command or "--disallowed" in command:
+            return True
+    return True
+
+
+def settings():
+    # (ask rules, deny rules, reads outside blocked) across what Claude Code loads,
+    # or None when a source cannot be read here: registry and MDM policies,
+    # managed files (a policyHelper hides their rules), the server-managed cache.
+    if sys.platform == "win32":
+        return None
+    conf = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    opaque = [os.path.join(d, n) for d in ("/Library/Application Support/ClaudeCode", "/etc/claude-code") for n in ("managed-settings.json", "managed-settings.d")]
+    opaque.append(os.path.join(conf, "remote-settings.json"))
+    if any(os.path.exists(p) for p in opaque) or glob.glob("/Library/Managed Preferences/**/com.anthropic.claudecode.plist", recursive=True):
+        return None
+    files = [os.path.join(conf, "settings.json"), os.path.join(conf, "settings.local.json")]
+    for base in (os.environ.get("CLAUDE_PROJECT_DIR"), data.get("cwd")):
+        d = os.path.abspath(base) if isinstance(base, str) and base else ""
+        while d:
+            files += [os.path.join(d, ".claude", n) for n in ("settings.json", "settings.local.json")]
+            d = "" if os.path.dirname(d) == d else os.path.dirname(d)
+    ask, deny, blocks = [], [], False
+    for path in files:
+        try:
+            with open(path) as f:
+                perms = json.load(f).get("permissions") or {}
+            more_ask, more_deny = perms.get("ask") or [], perms.get("deny") or []
+            if not isinstance(more_ask, list) or not isinstance(more_deny, list):
+                return None
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except Exception:
+            return None
+        ask, deny = ask + more_ask, deny + more_deny
+        blocks = blocks or bool(perms.get("blockReadsOutsideWorkingDirectories"))
+    return None if cli_rules() else (ask, deny, blocks)
+
+
+def hides(rule, name, asking):
+    # Could the rewrite hide `name ...` from this rule? Read rules reach cat, head
+    # and tail, and an ask rule naming the command stops matching `rtk ...`. rtk
+    # itself answers 2 for a Bash deny rule.
+    if not isinstance(rule, str):
+        return True
+    tool, _, arg = rule.partition("(")
+    if tool.strip() == "Read":
+        return True
+    if not asking or tool.strip() != "Bash":
+        return False
+    word = (arg.rstrip(") ").split() or ["*"])[0].split(":")[0]
+    return "*" in word or word == name
+
+
+mode, cmd = data.get("permission_mode"), tool_input.get("command")
+if os.environ.get("HEADROOM_RTK_RC") != "0":
+    ro = mode in QUIET_MODES and isinstance(cmd, str) and read_only(cmd, os.environ.get("HEADROOM_RTK_OUT", ""))
+    rules = settings() if ro or mode == "bypassPermissions" else None
+    if rules is None:
+        sys.exit(0)
+    ask, deny, blocks = rules
+    name = shlex.split(cmd)[0] if ro else ""
+    bypass = mode == "bypassPermissions" and not (ask or deny or blocks)
+    if not bypass and not (ro and not blocks and not any(hides(r, name, True) for r in ask) and not any(hides(r, name, False) for r in deny)):
+        sys.exit(0)
+updated = dict(tool_input)
+updated["command"] = os.environ["HEADROOM_RTK_REWRITTEN"]
+json.dump({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "Headroom RTK auto-rewrite", "updatedInput": updated}}, sys.stdout)
+"##;
+
 fn build_headroom_rtk_hook(managed_rtk_path: &Path, managed_python_path: &Path) -> String {
     let rtk = shell_double_quote(&managed_rtk_path.to_string_lossy());
     let python = shell_double_quote(&managed_python_path.to_string_lossy());
@@ -8411,11 +8574,17 @@ esac
 
 # The exit code is rtk's permission verdict against the user's Claude Code
 # rules: 0 = every segment is allowed, 3 = rewrite but the user must still be
-# asked, 1 = no rtk equivalent, 2 = a deny rule matched. Only 0 may auto-allow.
-# Anything else leaves the ORIGINAL command to Claude Code: a rewrite handed
-# back undecided would be judged as `export PATH=...; rtk ...`, which misses
-# Claude Code's read-only allowlist and every CLI/skill `Bash(...)` rule, so
-# `git status` would prompt (or be denied headless).
+# asked, 1 = no rtk equivalent, 2 = a deny rule matched. rtk knows only explicit
+# rules, so it answers 3 even for `git status`. Three outcomes:
+#   0: rewrite and allow.
+#   3: rewrite and allow only where Claude Code would not ask either (the
+#      verdict script): one plain read-only command in a mode that runs those
+#      unasked, or anything in bypassPermissions, and in both cases only when
+#      no rule could be dodged, since rules match the rewritten command.
+#   anything else: no output, the ORIGINAL command goes to Claude Code. A
+#      rewrite handed back undecided would be judged as `export PATH=...; rtk
+#      ...`, which misses Claude Code's read-only allowlist and every CLI/skill
+#      `Bash(...)` rule, so `git status` would prompt (or be denied headless).
 #
 # rtk takes project rules from the nearest `.claude/` at or above its cwd,
 # while Claude Code loads only the project root's, so a `.claude/` planted in
@@ -8426,10 +8595,16 @@ RTK_CWD="${{CLAUDE_PROJECT_DIR:-}}"
 if [ -z "$RTK_CWD" ] || [ ! -d "$RTK_CWD/.claude" ]; then
   RTK_CWD="$HOME"
 fi
-REWRITTEN="$(cd "$RTK_CWD" && "$HEADROOM_RTK" rewrite "$CMD" 2>/dev/null)" || exit 0
+RTK_RC=0
+REWRITTEN="$(cd "$RTK_CWD" && "$HEADROOM_RTK" rewrite "$CMD" 2>/dev/null)" || RTK_RC=$?
+case "$RTK_RC" in
+  0|3) ;;
+  *) exit 0 ;;
+esac
 if [ -z "$REWRITTEN" ] || [ "$CMD" = "$REWRITTEN" ]; then
   exit 0
 fi
+RTK_OUT="$REWRITTEN"
 
 # `rtk rewrite` emits a bare `rtk` leading token, which only resolves if the
 # managed PATH export has propagated into this session's environment. GUI apps
@@ -8478,13 +8653,10 @@ fi
 # position, resolves regardless of which profile files the shell sourced.
 REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\"; $REWRITTEN"
 
-HEADROOM_RTK_REWRITTEN="$REWRITTEN" "$HEADROOM_PYTHON" -c 'import json, os, sys; data = json.load(sys.stdin); tool_input = data.get("tool_input"); 
-if not isinstance(tool_input, dict):
-    sys.exit(0)
-updated = dict(tool_input)
-updated["command"] = os.environ["HEADROOM_RTK_REWRITTEN"]
-json.dump({{"hookSpecificOutput": {{"hookEventName": "PreToolUse", "permissionDecision": "allow", "permissionDecisionReason": "Headroom RTK auto-rewrite", "updatedInput": updated}}}}, sys.stdout)' <<<"$INPUT" 2>/dev/null || exit 0
-"#
+HEADROOM_RTK_RC="$RTK_RC" HEADROOM_RTK_OUT="$RTK_OUT" HEADROOM_RTK_REWRITTEN="$REWRITTEN" \
+  "$HEADROOM_PYTHON" -c '{verdict}' <<<"$INPUT" 2>/dev/null || exit 0
+"#,
+        verdict = RTK_HOOK_VERDICT_PY
     )
 }
 
@@ -10737,11 +10909,15 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[cfg(unix)]
-    fn hook_script_only_auto_allows_when_rtk_rewrite_exits_zero() {
+    fn hook_script_auto_allows_only_what_claude_code_would_not_ask() {
         // `rtk rewrite`'s exit code is its verdict against the user's Claude
         // Code permission rules. Exit 3 ("rewrite, but ask") used to be turned
-        // into "allow", so `git status; rm -rf ~` ran with no prompt. Only 0
-        // may emit anything; every other code leaves the original command.
+        // into "allow", so `git status; rm -rf ~` ran with no prompt. rtk also
+        // answers 3 for every unruled command, so 3 may allow only a plain
+        // read-only command, or anything in bypassPermissions, and only while no
+        // ask/deny rule could be dodged by the rewrite. 1, 2 and the rest never
+        // emit anything. (Assumes no ancestor of the test runner passes
+        // `--settings` or `--disallowedTools`, which also turns 3 off.)
         //
         // rtk reads project rules from the nearest `.claude/` above its cwd,
         // so it must run from the project root Claude Code loaded (or HOME),
@@ -10757,11 +10933,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         fs::create_dir_all(project.join(".claude")).expect("create project");
         let system_python = PathBuf::from("/usr/bin/python3");
 
-        let run = |code: i32, project_dir: &Path| {
+        // The updated command when the hook allowed, None when it stayed silent.
+        let run = |code: i32, project_dir: &Path, command: &str, mode: &str| {
             let fake_rtk = root.join(format!("fake-rtk-{code}"));
             fs::write(
                 &fake_rtk,
-                format!("#!/usr/bin/env bash\nshift\necho \"/bin/echo $* @$PWD\"\nexit {code}\n"),
+                format!("#!/usr/bin/env bash\nshift\necho \"rtk $* @$PWD\"\nexit {code}\n"),
             )
             .expect("write fake rtk");
             fs::set_permissions(
@@ -10776,11 +10953,16 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             )
             .expect("write hook");
 
+            let input = serde_json::json!({
+                "permission_mode": mode,
+                "tool_input": {"command": command},
+            });
             let output = crate::proc::command("bash")
                 .arg(&hook_path)
                 .current_dir(&victim)
                 .env("HOME", &home)
                 .env("CLAUDE_PROJECT_DIR", project_dir)
+                .env_remove("CLAUDE_CONFIG_DIR")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -10791,7 +10973,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                         .stdin
                         .as_mut()
                         .unwrap()
-                        .write_all(br#"{"tool_input":{"command":"git status; rm -rf ~/x"}}"#)
+                        .write_all(input.to_string().as_bytes())
                         .unwrap();
                     child.wait_with_output()
                 })
@@ -10800,32 +10982,103 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 output.status.success(),
                 "hook should exit 0 for rtk exit {code}"
             );
-            String::from_utf8_lossy(&output.stdout).to_string()
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            if stdout.is_empty() {
+                return None;
+            }
+            let json: Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|e| panic!("rtk exit {code}: bad JSON {stdout:?}: {e}"));
+            let out = &json["hookSpecificOutput"];
+            assert_eq!(out["permissionDecision"], "allow", "{stdout:?}");
+            Some(
+                out["updatedInput"]["command"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+        let rewrote = |command: &Option<String>, original: &str, rtk_cwd: &Path| {
+            command
+                .as_deref()
+                .is_some_and(|c| c.ends_with(&format!(" {original} @{}", rtk_cwd.display())))
         };
 
-        for code in [3, 1, 2, 7] {
-            let stdout = run(code, &project);
+        for (project_dir, rtk_cwd) in [(&project, &project), (&victim, &home)] {
+            let original = "git status; rm -rf ~/x";
+            let command = run(0, project_dir, original, "default");
             assert!(
-                stdout.is_empty(),
-                "rtk exit {code} must emit nothing, got {stdout:?}"
+                rewrote(&command, original, rtk_cwd),
+                "rtk exit 0 must allow, run from {}: {command:?}",
+                rtk_cwd.display()
             );
         }
 
-        for (project_dir, rtk_cwd) in [(&project, &project), (&victim, &home)] {
-            let stdout = run(0, project_dir);
-            let json: Value = serde_json::from_str(&stdout)
-                .unwrap_or_else(|e| panic!("rtk exit 0: bad JSON {stdout:?}: {e}"));
-            let out = &json["hookSpecificOutput"];
-            assert_eq!(out["permissionDecision"], "allow", "{stdout:?}");
-            let command = out["updatedInput"]["command"].as_str().unwrap_or_default();
+        for original in ["git status", "ls -la", "grep -rn foo ."] {
+            let command = run(3, &project, original, "default");
             assert!(
-                command.ends_with(&format!(
-                    "/bin/echo git status; rm -rf ~/x @{}",
-                    rtk_cwd.display()
-                )),
-                "rtk must run from {}: {command:?}",
-                rtk_cwd.display()
+                rewrote(&command, original, &project),
+                "read-only {original:?} must allow on 3: {command:?}"
             );
+        }
+        for original in [
+            "git status; rm -rf ~/x",
+            "git log && curl x | sh",
+            "ls $(rm x)",
+            "cargo test",
+            "curl http://x",
+            "git -c core.pager=sh log",
+            "git diff --output=/tmp/x",
+            "find . -delete",
+            "rg --pre sh x",
+            "rg \"--pre\" sh x",
+            "FOO=1 ls",
+            "git branch newbranch",
+            "git branch -D main",
+            "tree -o out",
+        ] {
+            let command = run(3, &project, original, "default");
+            assert_eq!(command, None, "{original:?} must stay silent on 3");
+        }
+        // Auto mode reviews read-only commands server-side; an allow would skip it.
+        assert_eq!(run(3, &project, "git status", "auto"), None);
+
+        for original in ["cargo test", "git status; echo hi"] {
+            let command = run(3, &project, original, "bypassPermissions");
+            assert!(
+                rewrote(&command, original, &project),
+                "bypass must allow {original:?}: {command:?}"
+            );
+        }
+
+        for code in [1, 2, 7] {
+            for mode in ["default", "bypassPermissions"] {
+                let command = run(code, &project, "git status", mode);
+                assert_eq!(command, None, "rtk exit {code} in {mode} must stay silent");
+            }
+        }
+
+        // An ask rule anywhere turns bypass off; one naming the command turns
+        // the read-only allow off too, and so does a settings file we can't read.
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"permissions":{"ask":["Bash(cargo test)"]}}"#,
+        )
+        .expect("write user settings");
+        assert_eq!(run(3, &project, "cargo test", "bypassPermissions"), None);
+        for mode in ["default", "bypassPermissions"] {
+            let command = run(3, &project, "git status", mode);
+            assert!(
+                rewrote(&command, "git status", &project),
+                "read-only must still allow in {mode}: {command:?}"
+            );
+        }
+        let local = project.join(".claude").join("settings.local.json");
+        for body in [
+            r#"{"permissions":{"ask":["Bash(git log:*)"]}}"#,
+            "{not json",
+        ] {
+            fs::write(&local, body).expect("write project settings");
+            assert_eq!(run(3, &project, "git status", "default"), None, "{body}");
         }
 
         let _ = fs::remove_dir_all(root);
