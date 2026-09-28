@@ -6601,6 +6601,8 @@ const STATS_FETCH_WARN_MAX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// enough that a busy-proxy flap cannot span it, short enough that a genuine
 /// fix is loud again within one sitting.
 const STATS_FETCH_RECOVERY_WINDOW: Duration = Duration::from_secs(300);
+/// Per-request `/stats` timeout; see `fetch_headroom_dashboard_stats` for why 15s.
+const STATS_FETCH_TIMEOUT_SECS: u64 = 15;
 static STATS_FETCH_WARNED_AT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
 /// When the current unbroken run of successful fetches began; `None` when the
 /// last fetch failed or nothing has failed yet.
@@ -6628,6 +6630,16 @@ static STATS_FETCH_LAST_FAILED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 fn lone_stats_stall(category: &str, since_previous_failure: Option<Duration>) -> bool {
     category == "timeout"
         && since_previous_failure.is_none_or(|gap| gap >= STATS_FETCH_RECOVERY_WINDOW)
+}
+
+/// Whether a `/stats` timeout was overtaken by a fetch that succeeded while it
+/// was still waiting. Callers fetch independently, so
+/// a slow request can time out after a newer one already refreshed the
+/// dashboard: RUST-86's only 0.9.25 event carried `secs_since_last_ok: 0`.
+/// The user saw fresh data, so there is nothing to report.
+fn stats_timeout_overtaken(category: &str, since_last_ok: Option<Duration>) -> bool {
+    category == "timeout"
+        && since_last_ok.is_some_and(|age| age < Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
 }
 
 fn total_intercept_requests() -> u64 {
@@ -6683,6 +6695,13 @@ fn stats_fetch_failure_category(reason: &str) -> String {
 
 fn warn_stats_fetch_failed(reason: &str) {
     let category = stats_fetch_failure_category(reason);
+    let last_ok_age = (*STATS_FETCH_LAST_OK.lock()).map(|(at, _)| at.elapsed());
+    if stats_timeout_overtaken(&category, last_ok_age) {
+        // Not a failure the dashboard shows: leave the stall and recovery
+        // state exactly as the newer success left it.
+        log::info!("headroom /stats fetch failed ({reason}); a newer fetch already succeeded");
+        return;
+    }
     let previous_failure = STATS_FETCH_LAST_FAILED_AT.lock().replace(Instant::now());
     if lone_stats_stall(&category, previous_failure.map(|at| at.elapsed())) {
         // Still breaks a recovery run, but does not arm the backoff, so the
@@ -6922,7 +6941,6 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     // fetch is a cold rebuild: ~3s idle, past 5s while the proxy is busy
     // serving a session (RUST-6V). 15s turns those into slow successes; a
     // fetch that still times out means the backend is genuinely starved.
-    const STATS_FETCH_TIMEOUT_SECS: u64 = 15;
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
@@ -9903,15 +9921,15 @@ mod tests {
         pick_cache_fields, proxy_readyz_503_body_is_upstream_only,
         proxy_readyz_status_is_reachable, rebuild_persisted_savings_from_records,
         savings_rate_implausible, settle_rollup_backfill, stats_fetch_stall_context,
-        stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
-        tool_schema_savings_usd, top_models_by_requests, total_dir_size_bytes,
-        warn_stats_fetch_failed, AppState, BackfillSettle, BootValidationOutcome,
-        ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
-        HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
-        RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_RECOVERED_AT,
-        STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
-        STATS_FETCH_WARN_MAX_INTERVAL,
+        stats_fetch_warn_interval, stats_timeout_overtaken, support_tier_for_platform,
+        tcp_port_accepts_connection, tool_schema_savings_usd, top_models_by_requests,
+        total_dir_size_bytes, warn_stats_fetch_failed, AppState, BackfillSettle,
+        BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
+        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
+        PersistedSavingsState, RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
+        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_LAST_OK,
+        STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_TIMEOUT_SECS,
+        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -13401,12 +13419,25 @@ mod tests {
         );
     }
 
+    /// A sequential poll never fails within `STATS_FETCH_TIMEOUT_SECS` of a
+    /// success (12s cache TTL, then a 15s timeout), so age the last success
+    /// past that; a fresher one would read as an overtaken timeout.
+    fn age_last_stats_ok() {
+        let mut last_ok = STATS_FETCH_LAST_OK.lock();
+        if let Some((at, requests)) = *last_ok {
+            *last_ok = at
+                .checked_sub(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
+                .map(|aged| (aged, requests));
+        }
+    }
+
     #[test]
     #[serial_test::serial(stats_fetch_warn)]
     fn stats_fetch_warn_is_throttled_within_the_window() {
         // The dashboard retries /stats every 12s and this warn bridges to
         // Sentry, so only the first failure in a window may speak.
         *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_LAST_OK.lock() = None;
         // A repeat, so the lone-stall gate does not swallow the first call.
         *STATS_FETCH_LAST_FAILED_AT.lock() = Some(Instant::now());
 
@@ -13460,6 +13491,7 @@ mod tests {
         // decay never applied: 97 events in 2 days from one host.
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;
+        *STATS_FETCH_LAST_OK.lock() = None;
         *STATS_FETCH_LAST_FAILED_AT.lock() = Some(Instant::now());
 
         warn_stats_fetch_failed("timed out after 15s");
@@ -13477,6 +13509,7 @@ mod tests {
 
         // The next failure warns only when the window has elapsed, and it
         // breaks the recovery run.
+        age_last_stats_ok();
         warn_stats_fetch_failed("timed out after 15s");
         assert_eq!(
             (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped").0,
@@ -13498,6 +13531,7 @@ mod tests {
                 "a sustained recovery clears the backoff"
             );
 
+            age_last_stats_ok();
             warn_stats_fetch_failed("timed out after 15s");
             let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("loud again");
             assert_eq!(streak, 1, "a healed-then-broken cause warns immediately");
@@ -13505,6 +13539,24 @@ mod tests {
 
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;
+    }
+
+    #[test]
+    fn a_stats_timeout_overtaken_by_a_newer_success_is_not_a_failure() {
+        // RUST-86 on 0.9.25: secs_since_last_ok was 0 -- a concurrent fetch
+        // had just refreshed the dashboard when this one gave up.
+        assert!(stats_timeout_overtaken("timeout", Some(Duration::ZERO)));
+        assert!(stats_timeout_overtaken(
+            "timeout",
+            Some(Duration::from_secs(14))
+        ));
+        assert!(!stats_timeout_overtaken(
+            "timeout",
+            Some(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
+        ));
+        assert!(!stats_timeout_overtaken("timeout", None));
+        // A 500 is our backend misbehaving whatever a sibling fetch saw.
+        assert!(!stats_timeout_overtaken("http-500", Some(Duration::ZERO)));
     }
 
     #[test]

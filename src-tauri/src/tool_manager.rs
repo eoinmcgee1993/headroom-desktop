@@ -4865,16 +4865,37 @@ impl ToolManager {
             })
             .with_context(|| format!("removing partial {}", self.runtime.python_dir.display()))?;
         }
-        Self::retry_fs("publishing extracted python", || {
+        let published = Self::retry_fs("publishing extracted python", || {
             // direct-write: directory swap inside Headroom's managed runtime
             std::fs::rename(&extracted_root, &self.runtime.python_dir)
-        })
-        .with_context(|| {
-            format!(
-                "publishing extracted python into {}",
-                self.runtime.python_dir.display()
-            )
-        })?;
+        });
+        match published {
+            Ok(()) => {}
+            // RUST-A8: Windows refuses to rename a directory while any file
+            // inside it is open without share-delete, and real-time AV scans
+            // every freshly unpacked file, outlasting the retry window on
+            // slow machines. Reading the files is still allowed, so copy.
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                log::info!("publishing extracted python by rename denied ({err}); copying instead");
+                let interpreter = expected_python
+                    .strip_prefix(&extracted_root)
+                    .expect("interpreter lives under the extracted root")
+                    .to_path_buf();
+                copy_tree_interpreter_last(&extracted_root, &self.runtime.python_dir, &interpreter)
+                    .with_context(|| {
+                        format!(
+                            "publishing extracted python into {} (rename denied: {err}; copy)",
+                            self.runtime.python_dir.display()
+                        )
+                    })?;
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "publishing extracted python into {}",
+                    self.runtime.python_dir.display()
+                )));
+            }
+        }
         let _ = std::fs::remove_dir_all(&staging_dir);
 
         if !self.runtime.standalone_python().exists() {
@@ -10456,6 +10477,47 @@ fn pinned_headroom_release() -> Result<HeadroomRelease> {
     })
 }
 
+/// Copies `src` into `dst` (created if missing), writing the file at
+/// `interpreter` (relative to `src`) after everything else. The runtime's
+/// "installed" gate needs that interpreter, so a copy cut short by a crash
+/// leaves a base the next bootstrap discards and re-extracts, never one it
+/// trusts with a missing stdlib file.
+fn copy_tree_interpreter_last(src: &Path, dst: &Path, interpreter: &Path) -> Result<()> {
+    fn walk(src: &Path, dst: &Path, skip: &Path) -> Result<()> {
+        std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+        for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+            let entry = entry?;
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if from == skip {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                walk(&from, &to, skip)?;
+                continue;
+            }
+            #[cfg(unix)]
+            if file_type.is_symlink() {
+                let target = std::fs::read_link(&from)?;
+                std::os::unix::fs::symlink(&target, &to)
+                    .with_context(|| format!("linking {}", to.display()))?;
+                continue;
+            }
+            ToolManager::retry_fs("copying python file", || std::fs::copy(&from, &to))
+                .with_context(|| format!("copying {}", from.display()))?;
+        }
+        Ok(())
+    }
+
+    let skip = src.join(interpreter);
+    walk(src, dst, &skip)?;
+    let to = dst.join(interpreter);
+    ToolManager::retry_fs("copying python interpreter", || std::fs::copy(&skip, &to))
+        .with_context(|| format!("copying {}", skip.display()))?;
+    Ok(())
+}
+
 fn python_distribution_artifact() -> Result<DownloadArtifact> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok(DownloadArtifact {
@@ -12780,32 +12842,14 @@ fn run_command_with_timeout(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<()> {
-    use std::io::Read;
-    use std::sync::mpsc;
-
     let mut cmd = build_command(binary, args, cwd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting {} {}", binary.display(), args.join(" ")))?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-
-    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
-    let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        let _ = stdout_tx.send(buf);
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stderr);
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        let _ = stderr_tx.send(buf);
-    });
+    let stdout_drain = crate::proc::PipeDrain::spawn(child.stdout.take());
+    let stderr_drain = crate::proc::PipeDrain::spawn(child.stderr.take());
 
     let started = Instant::now();
     let mut timed_out = false;
@@ -12832,10 +12876,10 @@ fn run_command_with_timeout(
         }
     };
 
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
-    let stdout = String::from_utf8_lossy(&stdout_rx.recv().unwrap_or_default()).into_owned();
-    let mut stderr = String::from_utf8_lossy(&stderr_rx.recv().unwrap_or_default()).into_owned();
+    // Bounded: a killed Windows launcher leaves its python holding the pipes.
+    let drained_by = Instant::now() + crate::proc::PIPE_DRAIN_GRACE;
+    let stdout = String::from_utf8_lossy(&stdout_drain.finish(drained_by)).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr_drain.finish(drained_by)).into_owned();
 
     if timed_out {
         if !stderr.is_empty() && !stderr.ends_with('\n') {
@@ -20241,5 +20285,45 @@ exit 0
             std::io::ErrorKind::PermissionDenied
         );
         assert_eq!(attempts.get(), 5, "bounded at ATTEMPTS");
+    }
+
+    #[test]
+    fn copy_tree_interpreter_last_publishes_the_whole_runtime() {
+        // RUST-A8: the copy fallback for a denied rename must land the same
+        // tree the rename would have, interpreter included.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("python");
+        std::fs::create_dir_all(src.join("Lib").join("encodings")).unwrap();
+        std::fs::write(src.join("python.exe"), b"exe").unwrap();
+        std::fs::write(src.join("Lib").join("os.py"), b"os").unwrap();
+        std::fs::write(src.join("Lib").join("encodings").join("utf_8.py"), b"u8").unwrap();
+        let dst = dir.path().join("runtime").join("python");
+
+        super::copy_tree_interpreter_last(&src, &dst, Path::new("python.exe")).expect("copy");
+
+        assert_eq!(std::fs::read(dst.join("python.exe")).unwrap(), b"exe");
+        assert_eq!(std::fs::read(dst.join("Lib").join("os.py")).unwrap(), b"os");
+        assert_eq!(
+            std::fs::read(dst.join("Lib").join("encodings").join("utf_8.py")).unwrap(),
+            b"u8"
+        );
+    }
+
+    #[test]
+    fn copy_tree_interpreter_last_leaves_no_interpreter_when_the_tree_fails() {
+        // A copy cut short must not leave a base the "installed" gate trusts:
+        // the interpreter is written only after everything else landed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("python");
+        std::fs::create_dir_all(src.join("Lib")).unwrap();
+        std::fs::write(src.join("python.exe"), b"exe").unwrap();
+        std::fs::write(src.join("Lib").join("os.py"), b"os").unwrap();
+        let dst = dir.path().join("runtime").join("python");
+        // A regular file where the Lib directory must go fails the tree copy.
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("Lib"), b"not a dir").unwrap();
+
+        assert!(super::copy_tree_interpreter_last(&src, &dst, Path::new("python.exe")).is_err());
+        assert!(!dst.join("python.exe").exists());
     }
 }

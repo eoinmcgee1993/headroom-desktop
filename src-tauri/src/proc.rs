@@ -46,6 +46,56 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+/// How long a pipe may stay open after its child exited. A grandchild that
+/// inherited the write end (a Windows `.exe` launcher's python, an agent
+/// CLI's background updater) keeps it open for as long as it lives, so
+/// reading to EOF would block the caller forever (RUST-BH: bootstrap sat at
+/// "Configuring integrations" for 20+ minutes with the 120s timeout never
+/// firing). What the child itself wrote is already in the pipe by then.
+pub const PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reads a child pipe on its own thread and hands back what arrived, without
+/// ever waiting on EOF past a deadline. See [`PIPE_DRAIN_GRACE`].
+pub struct PipeDrain {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl PipeDrain {
+    pub fn spawn<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Self {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, done) = std::sync::mpsc::channel();
+        let sink = buf.clone();
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => sink
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .extend_from_slice(&chunk[..n]),
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            let _ = tx.send(());
+        });
+        Self { buf, done }
+    }
+
+    /// Everything read by EOF or by `deadline`, whichever comes first. A
+    /// reader still blocked at the deadline is left behind; it ends when the
+    /// last writer closes.
+    pub fn finish(self, deadline: std::time::Instant) -> Vec<u8> {
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        let _ = self.done.recv_timeout(wait);
+        std::mem::take(&mut *self.buf.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
 /// Why a spawned child did not produce an `Output`.
 #[derive(Debug)]
 pub enum OutputError {
@@ -64,7 +114,6 @@ pub fn output_with_timeout(
     mut command: Command,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, OutputError> {
-    use std::io::Read;
     use std::process::Stdio;
 
     command
@@ -72,24 +121,10 @@ pub fn output_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(OutputError::Spawn)?;
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
     // Drain both pipes off-thread: a child that fills one while we wait on
     // the other deadlocks against the pipe buffer.
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(pipe) = stdout.as_mut() {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(pipe) = stderr.as_mut() {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    });
+    let stdout = PipeDrain::spawn(child.stdout.take());
+    let stderr = PipeDrain::spawn(child.stderr.take());
 
     let started = std::time::Instant::now();
     let status = loop {
@@ -108,10 +143,11 @@ pub fn output_with_timeout(
             }
         }
     };
+    let drained_by = std::time::Instant::now() + PIPE_DRAIN_GRACE;
     Ok(std::process::Output {
         status,
-        stdout: stdout_handle.join().unwrap_or_default(),
-        stderr: stderr_handle.join().unwrap_or_default(),
+        stdout: stdout.finish(drained_by),
+        stderr: stderr.finish(drained_by),
     })
 }
 
@@ -177,6 +213,25 @@ pub fn path_with_dir_prepended_to(dir: &Path, existing: &OsStr) -> OsString {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_returns_when_a_grandchild_holds_the_pipe() {
+        // RUST-BH: the child exits, a background grandchild keeps stdout
+        // open. Reading to EOF used to block until the grandchild died.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & echo done"]);
+        let started = std::time::Instant::now();
+        let output = super::output_with_timeout(cmd, std::time::Duration::from_secs(20))
+            .expect("child exits");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "waited on the grandchild: {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn path_with_dir_prepended_puts_dir_first_with_platform_separator() {
         let dir = std::env::temp_dir();
