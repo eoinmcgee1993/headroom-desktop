@@ -7979,6 +7979,9 @@ fn execute_headroom_learn_run(
                 .unwrap_or_else(|| std::path::PathBuf::from("/")),
         )
         .env("PYTHONNOUSERSITE", "1")
+        // Loads the backend's sitecustomize vendors, among them the learn
+        // rule-field coercion (RUST-K5).
+        .env("PYTHONPATH", state.tool_manager.sitecustomize_dir())
         // The live step line depends on stage output arriving as it happens.
         // click.echo already flushes per call, but a plain print() anywhere in
         // the CLI would sit in an 8KB pipe buffer until exit.

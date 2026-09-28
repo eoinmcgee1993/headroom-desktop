@@ -1465,6 +1465,57 @@ if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
         # Fail-closed: on any binding failure the wheel keeps refusing.
         pass
 
+# --- Learn: non-string rule fields from the model (vendor, upstream PR #2471) --
+# The learn prompt asks for each rule's content as "1-3 bullet points", and a
+# model that returns them as a JSON array killed the whole analysis: 0.39.0's
+# _parse_llm_response calls .strip() on section/content unchecked ("'list'
+# object has no attribute 'strip'", RUST-K5). Normalize first: a list of strings
+# becomes bullet lines (kept, where #2471 drops it), any other non-string
+# becomes "" so the parser skips that rule, and a null rules list reads as
+# empty. The desktop puts this file on the learn subprocess's PYTHONPATH too.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes once the wheel carries
+# #2471's `_as_str`. Kill switch: HEADROOM_LEARN_RULE_COERCE=0.
+_hd_lrc_flag = _hd_os.environ.get("HEADROOM_LEARN_RULE_COERCE", "1")
+if _hd_lrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_lrc_meta
+
+        if _hd_lrc_meta.version("headroom-ai") == "0.39.0":
+            from headroom.learn import analyzer as _hd_lrc_mod
+
+            if not hasattr(_hd_lrc_mod, "_as_str"):
+                _hd_lrc_orig = _hd_lrc_mod._parse_llm_response
+
+                def _hd_lrc_text(val):
+                    if isinstance(val, list) and all(isinstance(v, str) for v in val):
+                        return "\n".join(
+                            v if v.lstrip().startswith(("-", "*")) else f"- {v}"
+                            for v in val
+                        )
+                    return val if isinstance(val, str) else ""
+
+                def _hd_lrc_parse(raw):
+                    if isinstance(raw, dict):
+                        raw = dict(raw)
+                        for key in ("context_file_rules", "memory_file_rules"):
+                            raw[key] = [
+                                {
+                                    **r,
+                                    "section": r.get("section")
+                                    if isinstance(r.get("section"), str)
+                                    else "",
+                                    "content": _hd_lrc_text(r.get("content")),
+                                }
+                                if isinstance(r, dict)
+                                else r
+                                for r in (raw.get(key) or [])
+                            ]
+                    return _hd_lrc_orig(raw)
+
+                _hd_lrc_mod._parse_llm_response = _hd_lrc_parse
+    except Exception:
+        pass
+
 # --- Traffic learner: no error-recovery section in MEMORY.md (posture) ---------
 # The recommendation builder skips any category missing from this routing table,
 # so dropping ERROR_RECOVERY stops the section at the source. Not version-gated:
@@ -2717,6 +2768,12 @@ impl ToolManager {
         self.runtime.venv_dir.join(bin_subdir()).join(name)
     }
 
+    /// Holds only the SITECUSTOMIZE_PY the backend spawn writes; put it on
+    /// PYTHONPATH to load the vendors in another headroom process.
+    pub fn sitecustomize_dir(&self) -> PathBuf {
+        self.runtime.root_dir.join("pyinject")
+    }
+
     pub fn managed_python(&self) -> PathBuf {
         self.runtime.managed_python()
     }
@@ -3049,7 +3106,7 @@ impl ToolManager {
                 // A failed write used to cost only the wedge diagnostics; it
                 // now also costs the cc-switch Official-branch reset, so the
                 // outcome gates HEADROOM_CC_SWITCH_RECONCILE below.
-                let inject_dir = self.runtime.root_dir.join("pyinject");
+                let inject_dir = self.sitecustomize_dir();
                 // Read once per spawn: the env below has to see one consistent
                 // override, not three separate reads of a cache another thread
                 // could republish in between.
@@ -13958,6 +14015,47 @@ mod tests {
         }
         assert_eq!(on, "False memory_file", "stderr:\n{on_err}");
         assert_eq!(off, "True memory_file", "stderr:\n{off_err}");
+    }
+
+    #[test]
+    fn learn_rule_coercion_behaves_against_the_installed_wheel() {
+        // RUST-K5: list content becomes bullets, a non-string section drops
+        // its rule, a null rules list reads as empty; the kill switch restores
+        // the wheel's crash.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-rc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "from headroom.learn.analyzer import _parse_llm_response as p\n\
+                     r = p({'context_file_rules': [{'section': 'Env', 'content': ['a', '- b']},\n\
+                     {'section': ['x'], 'content': 'y'}], 'memory_file_rules': None})\n\
+                     print(repr([x.content for x in r]))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_RULE_COERCE", kill)
+                .output()
+                .expect("run learn probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (_, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(on, r"['- a\n- b']", "stderr:\n{on_err}");
+        assert!(
+            off_err.contains("has no attribute 'strip'"),
+            "kill switch did not unbind:\n{off_err}"
+        );
     }
 
     #[test]
