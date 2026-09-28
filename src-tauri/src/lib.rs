@@ -1585,20 +1585,25 @@ async fn install_addon(
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
         }
         "ponytail" | "caveman" => {
-            let codex_outdated = state
+            let outdated = state
                 .tool_manager
                 .install_plugin(&id)
                 .map_err(|err| err.to_string())?;
-            if codex_outdated {
+            if let Some(host) = outdated {
                 let name = if id == "caveman" {
                     "Caveman"
                 } else {
                     "Ponytail"
                 };
+                let other = if host == "Codex" {
+                    "Claude Code"
+                } else {
+                    "Codex"
+                };
                 let _ = show_notification_impl(
                     &app,
-                    &format!("Update the Codex CLI to finish {name} setup"),
-                    &format!("{name} is installed for Claude Code. Your Codex CLI is too old to add it -- update the Codex CLI, then re-install {name} to enable it there too."),
+                    &format!("Update the {host} CLI to finish {name} setup"),
+                    &format!("{name} is installed for {other}. Your {host} CLI is too old to add it -- update the {host} CLI, then re-install {name} to enable it there too."),
                     None,
                 );
             }

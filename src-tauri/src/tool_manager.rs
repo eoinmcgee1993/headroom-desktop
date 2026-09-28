@@ -7679,6 +7679,13 @@ impl ToolManager {
         host: PluginHost,
         args: &[&str],
     ) -> Result<()> {
+        // Every `claude plugin` call routes through here, so this one check
+        // keeps a too-old CLI from ever receiving our args as a prompt.
+        if matches!(host, PluginHost::ClaudeCode)
+            && claude_cli_too_old_for_plugins(cli, &self.runtime.root_dir)
+        {
+            return Err(OutdatedClaudeCli.into());
+        }
         let id = plugin.id;
         let label = host.label();
         run_command_streaming(
@@ -7841,11 +7848,11 @@ impl ToolManager {
     }
 
     /// Installs a plugin addon into every host that has a CLI on PATH. Returns
-    /// `Ok(true)` when at least one host succeeded but Codex was skipped because
-    /// it is too old to support `plugin add` -- the caller nudges the user to
-    /// update Codex. A too-old Codex is not a real error (no Sentry warning); it
-    /// is a version skew the user can only fix by updating Codex.
-    pub fn install_plugin(&self, id: &str) -> Result<bool> {
+    /// the label of a host that was skipped because its CLI is too old for
+    /// plugins while another host succeeded -- the caller nudges the user to
+    /// update it. A too-old CLI is not a real error (no Sentry warning); it is
+    /// a version skew the user can only fix by updating that CLI.
+    pub fn install_plugin(&self, id: &str) -> Result<Option<&'static str>> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         let hosts: Vec<(PluginHost, PathBuf)> = PluginHost::ALL
             .into_iter()
@@ -7856,26 +7863,12 @@ impl ToolManager {
                 "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again."
             );
         }
-        let mut errors: Vec<String> = Vec::new();
-        let mut installed_any = false;
-        let mut codex_outdated = false;
-        for (host, cli) in hosts {
-            match self.install_plugin_into(plugin, host, &cli) {
-                Ok(()) => installed_any = true,
-                Err(err) if matches!(host, PluginHost::Codex) && is_outdated_codex(&err) => {
-                    codex_outdated = true;
-                }
-                Err(err) => errors.push(format!("{}: {err:#}", host.label())),
-            }
-        }
-        if !installed_any {
-            if codex_outdated && errors.is_empty() {
-                bail!(
-                    "Your Codex CLI is too old to install the {id} plugin. Update Codex, then try again."
-                );
-            }
-            bail!("installing the {id} plugin failed: {}", errors.join("; "));
-        }
+        let (mut outdated, errors) = settle_plugin_hosts(
+            id,
+            hosts
+                .into_iter()
+                .map(|(host, cli)| (host, self.install_plugin_into(plugin, host, &cli))),
+        )?;
         if !errors.is_empty() {
             let detail = errors.join("; ");
             // Explicit per-category fingerprint; the bridged warn is local-only
@@ -7900,7 +7893,8 @@ impl ToolManager {
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))?;
-        Ok(codex_outdated)
+        // At most one: with two hosts, the other one installed.
+        Ok(outdated.pop())
     }
 
     pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<()> {
@@ -12392,10 +12386,10 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         || lower.contains("authentication_error")
         || lower.contains("please run /login")
     {
-        // The host CLI is signed out, so every command we hand it 401s before
-        // it touches a plugin (RUST-DQ: `claude plugin marketplace add` and the
-        // install behind it, both "Please run /login"). User-side: nothing we
-        // ship installs until they log in again.
+        // A plugin command that reached the API at all. The RUST-DQ and RUST-K8
+        // events were a `claude` too old to have `plugin`, which sent our args
+        // as a prompt; `run_plugin_cmd` now refuses such a CLI, so this bucket
+        // reappearing is a new cause.
         "cli-not-authenticated"
     } else {
         "other"
@@ -12917,6 +12911,99 @@ fn is_outdated_codex(err: &anyhow::Error) -> bool {
         .is_some_and(|failure| failure.stderr.contains("unrecognized subcommand"))
 }
 
+/// First Claude Code release with `claude plugin marketplace add`. 2.0.12-2.0.15
+/// have `plugin` but reject `marketplace` as an unknown command.
+const CLAUDE_PLUGIN_MIN_VERSION: [u32; 3] = [2, 0, 17];
+
+/// The Claude Code CLI is older than [`CLAUDE_PLUGIN_MIN_VERSION`]. Same class
+/// as [`is_outdated_codex`]: a soft skip + update nudge, not an error.
+#[derive(Debug)]
+struct OutdatedClaudeCli;
+
+impl std::fmt::Display for OutdatedClaudeCli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the Claude Code CLI is too old for plugins (needs 2.0.17 or newer); run `claude update`"
+        )
+    }
+}
+
+impl std::error::Error for OutdatedClaudeCli {}
+
+/// Settles per-host install results. Fails when no host installed, naming
+/// every real error and every CLI too old for plugins; otherwise returns the
+/// too-old host labels (update nudge, never Sentry) and the real errors (the
+/// partial-install warning).
+fn settle_plugin_hosts(
+    id: &str,
+    results: impl IntoIterator<Item = (PluginHost, Result<()>)>,
+) -> Result<(Vec<&'static str>, Vec<String>)> {
+    let mut installed_any = false;
+    let mut outdated = Vec::new();
+    let mut errors = Vec::new();
+    for (host, result) in results {
+        match result {
+            Ok(()) => installed_any = true,
+            Err(err)
+                if err.is::<OutdatedClaudeCli>()
+                    || (matches!(host, PluginHost::Codex) && is_outdated_codex(&err)) =>
+            {
+                log::info!("{id} [{}]: CLI too old for plugins; skipped", host.label());
+                outdated.push(host.label());
+            }
+            Err(err) => errors.push(format!("{}: {err:#}", host.label())),
+        }
+    }
+    if !installed_any {
+        let mut msg = if errors.is_empty() {
+            String::new()
+        } else {
+            format!("installing the {id} plugin failed: {}. ", errors.join("; "))
+        };
+        if !outdated.is_empty() {
+            let names = outdated.join(" and ");
+            let clis = if outdated.len() > 1 {
+                "CLIs are"
+            } else {
+                "CLI is"
+            };
+            msg += &format!(
+                "Your {names} {clis} too old to install the {id} plugin. Update {names}, then try again."
+            );
+        }
+        bail!("{}", msg.trim_end());
+    }
+    Ok((outdated, errors))
+}
+
+/// Whether a `claude --version` line ("2.1.283 (Claude Code)") names a release
+/// with plugin support. `None` when it does not parse.
+fn claude_version_supports_plugins(version: &str) -> Option<bool> {
+    let parts = version
+        .split_whitespace()
+        .next()?
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect::<Option<Vec<u32>>>()?;
+    Some(parts.as_slice() >= CLAUDE_PLUGIN_MIN_VERSION.as_slice())
+}
+
+/// A `claude` older than 2.0.12 has no `plugin` command, so it takes our
+/// arguments as a chat prompt: it sends "plugin" to the model on the user's
+/// account instead of touching a plugin. Signed out, it prints "Invalid API
+/// key - Please run /login" (RUST-K8, and the RUST-DQ "OAuth access token is
+/// invalid" events). A version we cannot read is let through, as before.
+fn claude_cli_too_old_for_plugins(cli: &Path, cwd: &Path) -> bool {
+    crate::proc::output_with_timeout(
+        build_command(cli, &["--version"], cwd),
+        Duration::from_secs(10),
+    )
+    .is_ok_and(|out| {
+        claude_version_supports_plugins(&String::from_utf8_lossy(&out.stdout)) == Some(false)
+    })
+}
+
 /// Extract the Unix signal number that killed a child, or `None` on non-Unix
 /// or when the process exited normally. Used to populate `CommandFailure.signal`
 /// so failure reports distinguish SIGKILL from SIGTERM.
@@ -13139,9 +13226,10 @@ mod tests {
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, build_command, cc_switch_proxy_url,
         cc_switch_reconcile_for_spawn, classify_kompress_prefetch_failure,
-        codebase_memory_distribution_artifact, compact_pip_failure, describe_proxy_port_occupant,
-        diagnose_proxy_port, exe_path_is_under, extract_required_pydantic_core_version,
-        format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
+        claude_version_supports_plugins, codebase_memory_distribution_artifact,
+        compact_pip_failure, describe_proxy_port_occupant, diagnose_proxy_port, exe_path_is_under,
+        extract_required_pydantic_core_version, format_all_foreign_bail,
+        format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, netstat_rows_on_port, occupant_image, parse_lsof_listener,
@@ -13153,11 +13241,11 @@ mod tests {
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
+        savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
         summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
         wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PluginHost, PortState,
-        ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        CommandFailure, HeadroomRelease, ManagedRuntime, OutdatedClaudeCli, PipOutputCapture,
+        PluginHost, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
         HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
         HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
         PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
@@ -19095,6 +19183,101 @@ after
         let result = manager.install_plugin_into(caveman, PluginHost::Codex, &cli);
         let _ = fs::remove_dir_all(&root);
         result.expect("install retries once the stale cache entry is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_plugin_commands_skip_a_cli_too_old_for_plugins() {
+        // RUST-K8: a `claude` older than 2.0.12 has no `plugin` command and
+        // sends our args to the model as a prompt. It must never get them.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, _runtime, manager) = seed_test_runtime("plugin-claude-too-old");
+        let _home = HomeGuard::new(&root);
+        let cli = root.join("claude");
+        fs::write(
+            &cli,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.0.11 (Claude Code)'; exit 0; }\n\
+             echo \"$*\" >> \"$(dirname \"$0\")/prompts\"\n\
+             echo 'Invalid API key - Please run /login'\nexit 1\n",
+        )
+        .expect("fake claude");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let ponytail = PLUGIN_ADDONS.iter().find(|p| p.id == "ponytail").unwrap();
+        let result = manager.install_plugin_into(ponytail, PluginHost::ClaudeCode, &cli);
+        let prompted = root.join("prompts").exists();
+        let _ = fs::remove_dir_all(&root);
+        assert!(!prompted, "a too-old claude must not be handed plugin args");
+        assert!(result
+            .expect_err("a too-old claude cannot install")
+            .is::<OutdatedClaudeCli>());
+    }
+
+    #[test]
+    fn settle_plugin_hosts_keeps_a_too_old_cli_out_of_errors() {
+        // RUST-K8 reaches here wrapped in `marketplace add failed first`
+        // context; it must still count as outdated, or every partial install
+        // on an old CLI files a Sentry warning again.
+        let too_old = || anyhow::Error::from(OutdatedClaudeCli).context("marketplace add failed");
+        let codex_err = |stderr: &str| {
+            Err(anyhow::Error::new(CommandFailure {
+                program: "codex".into(),
+                args: vec!["plugin".into(), "add".into()],
+                stdout: String::new(),
+                stderr: stderr.into(),
+                exit_code: Some(2),
+                signal: None,
+            }))
+        };
+        let (outdated, errors) = settle_plugin_hosts(
+            "ponytail",
+            [
+                (PluginHost::ClaudeCode, Err(too_old())),
+                (PluginHost::Codex, Ok(())),
+            ],
+        )
+        .expect("codex installed");
+        assert_eq!(outdated, ["Claude Code"]);
+        assert!(errors.is_empty());
+
+        let both = settle_plugin_hosts(
+            "ponytail",
+            [
+                (PluginHost::ClaudeCode, Err(too_old())),
+                (
+                    PluginHost::Codex,
+                    codex_err("error: unrecognized subcommand 'add'"),
+                ),
+            ],
+        )
+        .expect_err("nothing installed");
+        assert_eq!(
+            both.to_string(),
+            "Your Claude Code and Codex CLIs are too old to install the ponytail plugin. Update Claude Code and Codex, then try again."
+        );
+
+        let mixed = settle_plugin_hosts(
+            "ponytail",
+            [
+                (PluginHost::ClaudeCode, Err(too_old())),
+                (PluginHost::Codex, codex_err("error: network unreachable")),
+            ],
+        )
+        .expect_err("nothing installed")
+        .to_string();
+        assert!(mixed.starts_with("installing the ponytail plugin failed: Codex: "));
+        assert!(mixed.ends_with("Your Claude Code CLI is too old to install the ponytail plugin. Update Claude Code, then try again."));
+    }
+
+    #[test]
+    fn claude_version_supports_plugins_from_2_0_17() {
+        let supports = claude_version_supports_plugins;
+        assert_eq!(supports("1.0.128 (Claude Code)\n"), Some(false));
+        assert_eq!(supports("2.0.11 (Claude Code)"), Some(false));
+        assert_eq!(supports("2.0.15 (Claude Code)"), Some(false));
+        assert_eq!(supports("2.0.17 (Claude Code)"), Some(true));
+        assert_eq!(supports("2.1.283 (Claude Code)"), Some(true));
+        assert_eq!(supports(""), None);
+        assert_eq!(supports("claude 2.1"), None);
     }
 
     #[test]
