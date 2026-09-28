@@ -102,6 +102,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -129,6 +130,10 @@ jobs:
       - name: Validate release version state
         id: release_guard
         shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          DISPATCH_PLATFORMS: ${{ github.event.inputs.platforms }}
+          DISPATCH_PUBLISH: ${{ github.event.inputs.publish }}
         run: |
           set -euo pipefail
           package_version="$(node -p "require('./package.json').version")"
@@ -142,7 +147,7 @@ jobs:
           fi
 
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            before_sha="${{ github.event.before }}"
+            before_sha="${BEFORE_SHA:-}"
             if [[ -n "${before_sha}" ]] && [[ "${before_sha}" != "0000000000000000000000000000000000000000" ]] && git cat-file -e "${before_sha}^{commit}" 2>/dev/null; then
               previous_package_version="$(
                 git show "${before_sha}:package.json" \
@@ -177,11 +182,11 @@ jobs:
           # the pushed range (same idiom as [skip-rc-check]). Default all, so
           # forgetting the marker ships to everyone rather than stranding a
           # platform.
-          release_platforms="${{ github.event.inputs.platforms || 'all' }}"
+          release_platforms="${DISPATCH_PLATFORMS:-all}"
           # Whether the finished release is flipped to `latest` (stable) or left
           # a prerelease only pinned new downloads can reach (download-only).
           # Same marker idiom: `[publish: download-only]`.
-          release_publish="${{ github.event.inputs.publish || 'stable' }}"
+          release_publish="${DISPATCH_PUBLISH:-stable}"
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             release_platforms=all
             release_publish=stable
@@ -393,8 +398,8 @@ jobs:
           # Published but not `releases/latest`, so the stable updater endpoint
           # keeps serving the previous version until the publish job flips this.
           prerelease: true
-          assetNamePattern: '[name]_[version]_mac[ext]'
-          includeUpdaterJson: true
+          releaseAssetNamePattern: '[name]_[version]_mac[ext]'
+          uploadUpdaterJson: true
           args: --target universal-apple-darwin
 
   windows:
@@ -427,6 +432,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -447,7 +454,9 @@ jobs:
         run: npm ci
 
       - name: Install Azure Artifact Signing CLI
-        run: cargo install artifact-signing-cli --locked
+        # Pinned on purpose: this binary runs with the signing secrets in env.
+        # crates.io versions are immutable; bump by hand after reviewing the diff.
+        run: cargo install artifact-signing-cli --version =0.11.0 --locked
 
       - name: Build NSIS installer
         shell: bash
@@ -501,6 +510,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux system dependencies
         run: |

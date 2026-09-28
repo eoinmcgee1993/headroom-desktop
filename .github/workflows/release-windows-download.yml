@@ -60,6 +60,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Validate target version
         id: guard
@@ -119,7 +121,9 @@ jobs:
         run: npm ci
 
       - name: Install Azure Artifact Signing CLI
-        run: cargo install artifact-signing-cli --locked
+        # Pinned on purpose: this binary runs with the signing secrets in env.
+        # crates.io versions are immutable; bump by hand after reviewing the diff.
+        run: cargo install artifact-signing-cli --version =0.11.0 --locked
 
       - name: Build NSIS installer
         shell: bash
