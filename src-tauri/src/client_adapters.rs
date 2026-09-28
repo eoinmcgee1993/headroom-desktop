@@ -8405,7 +8405,7 @@ FLAG_DENY = {
 FIND_DENY = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls", "-files0-from"}
 BRANCH_LIST = {"-a", "-r", "-v", "-vv", "-l", "--list", "--show-current", "--all", "--remotes", "--verbose", "--no-color"}
 BRANCH_VALUE = ("--contains", "--merged", "--no-merged")
-SHELL = re.compile(r"[;&|<>`$(){}\n\r]")
+SHELL = re.compile(r"[;&|<>`$(){}\x00-\x08\x0a-\x1f\x7f]")
 
 
 def lists_branches(args):
@@ -8421,6 +8421,18 @@ def lists_branches(args):
     return True
 
 
+def inside(arg, roots):
+    # Claude Code prompts for reads outside the working directories, so must we.
+    if arg.startswith("-") and "=" not in arg:
+        return True
+    path = arg.split("=", 1)[1] if arg.startswith("-") else arg
+    if path.startswith("~"):
+        return False
+    base = roots[0] if roots else os.getcwd()
+    full = os.path.realpath(os.path.join(base, path))
+    return any(full == r or full.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
 def read_only(cmd, out):
     # One plain read-only command, rewritten to one plain rtk call.
     if len(cmd) > 10000 or SHELL.search(cmd) or SHELL.search(out) or not out.startswith("rtk "):
@@ -8430,6 +8442,9 @@ def read_only(cmd, out):
     except ValueError:
         return False
     if not argv or argv[0] not in READ_ONLY:
+        return False
+    roots = [os.path.realpath(d) for d in (data.get("cwd"), os.environ.get("CLAUDE_PROJECT_DIR")) if isinstance(d, str) and d]
+    if not roots or not all(inside(a, roots) for a in argv[1:]):
         return False
     name, args = argv[0], argv[1:]
     # An unquoted glob can expand to a file named -delete or --pre=sh.
@@ -8471,7 +8486,7 @@ def cli_rules():
         if pid not in procs:
             return True
         pid, command = procs[pid]
-        if "--settings" in command or "--disallowed" in command:
+        if re.search(r"--(managed-)?settings|--disallowed", command):
             return True
     return True
 
@@ -8485,10 +8500,21 @@ def settings():
     conf = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
     opaque = [os.path.join(d, n) for d in ("/Library/Application Support/ClaudeCode", "/etc/claude-code") for n in ("managed-settings.json", "managed-settings.d")]
     opaque.append(os.path.join(conf, "remote-settings.json"))
+    if os.environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH") or os.environ.get("CLAUDE_CODE_REMOTE_SETTINGS_PATH"):
+        return None
     if any(os.path.exists(p) for p in opaque) or glob.glob("/Library/Managed Preferences/**/com.anthropic.claudecode.plist", recursive=True):
         return None
     files = [os.path.join(conf, "settings.json"), os.path.join(conf, "settings.local.json")]
-    for base in (os.environ.get("CLAUDE_PROJECT_DIR"), data.get("cwd")):
+    bases = [os.environ.get("CLAUDE_PROJECT_DIR"), data.get("cwd")]
+    for base in bases[:2]:
+        if isinstance(base, str) and base:
+            try:
+                common = subprocess.run(["git", "-C", base, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=5).stdout.strip()
+            except Exception:
+                return None
+            if common:
+                bases.append(os.path.dirname(common))
+    for base in bases:
         d = os.path.abspath(base) if isinstance(base, str) and base else ""
         while d:
             files += [os.path.join(d, ".claude", n) for n in ("settings.json", "settings.local.json")]
@@ -8534,7 +8560,7 @@ if os.environ.get("HEADROOM_RTK_RC") != "0":
     ask, deny, blocks = rules
     name = shlex.split(cmd)[0] if ro else ""
     bypass = mode == "bypassPermissions" and not (ask or deny or blocks)
-    if not bypass and not (ro and not blocks and not any(hides(r, name, True) for r in ask) and not any(hides(r, name, False) for r in deny)):
+    if not bypass and not (ro and not blocks and not any(hides(r, name, True) for r in ask) and not any(hides(r, name, True) for r in deny)):
         sys.exit(0)
 updated = dict(tool_input)
 updated["command"] = os.environ["HEADROOM_RTK_REWRITTEN"]
