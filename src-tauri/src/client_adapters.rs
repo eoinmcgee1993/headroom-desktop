@@ -101,6 +101,7 @@ pub fn ensure_rtk_integrations(
     managed_rtk_path: &Path,
     managed_python_path: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
+    let _setup = setup_write_lock();
     ensure_rtk_integrations_for_targets(
         managed_rtk_path,
         managed_python_path,
@@ -185,6 +186,24 @@ pub fn rtk_integration_status() -> Result<(bool, bool)> {
     Ok((path_configured, hook_configured))
 }
 
+/// Serialises the public writers of client-setup.json and of the client configs
+/// setup rewrites (~/.claude/settings.json, shell rc files). Each one loads the
+/// file, changes its part and writes the whole thing back, and they run on
+/// different threads: launch restore, the warm-runtime RTK/MarkItDown refresh
+/// and the UI toggles each wrote a stale copy over the others' changes (a lost
+/// configured_clients stamp, preserved gateway URL, opt-out flag or hook).
+/// Only the public entry points take it, never the helpers they share, so no
+/// thread takes it twice.
+// ponytail: one global lock held across a whole apply (up to seconds while
+// Codex holds its thread DB); per-file locks if a toggle ever visibly waits.
+static SETUP_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn setup_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    SETUP_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// True when the user turned RTK off via the tool status toggle.
 pub fn is_rtk_disabled() -> bool {
     load_setup_state().rtk_disabled
@@ -200,6 +219,7 @@ pub fn is_auto_learn_disabled() -> bool {
 /// Persist the auto-learning opt-out. Only read when the proxy is spawned, so
 /// the caller restarts the backend for it to take effect.
 pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
+    let _setup = setup_write_lock();
     let mut state = load_setup_state();
     state.auto_learn_disabled = !enabled;
     write_setup_state(&state)
@@ -213,6 +233,7 @@ pub fn is_statusline_disabled() -> bool {
 /// Persist the statusline opt-out and apply it now: install it when Claude
 /// Code routes through Headroom, remove it otherwise.
 pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
+    let _setup = setup_write_lock();
     let mut state = load_setup_state();
     let was_disabled = state.statusline_disabled;
     state.statusline_disabled = !enabled;
@@ -250,12 +271,17 @@ pub fn set_rtk_enabled(
     managed_rtk_path: &Path,
     managed_python_path: &Path,
 ) -> Result<()> {
+    let _setup = setup_write_lock();
     let mut state = load_setup_state();
     state.rtk_disabled = !enabled;
     write_setup_state(&state)?;
 
     if enabled {
-        ensure_rtk_integrations(managed_rtk_path, managed_python_path)?;
+        ensure_rtk_integrations_for_targets(
+            managed_rtk_path,
+            managed_python_path,
+            &resolve_default_shell_targets(),
+        )?;
     } else {
         let shell_targets = resolve_client_shell_targets_for_cleanup(&state, "claude_code")?;
         remove_shell_block(&shell_targets, "managed_rtk")?;
@@ -384,6 +410,7 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
 }
 
 fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
+    let _setup = setup_write_lock();
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
     let mut state = load_setup_state();
@@ -421,7 +448,7 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             )?;
             updates.0.append(&mut tool_search.0);
             updates.1.append(&mut tool_search.1);
-            let mut legacy_updates = remove_legacy_vscode_base_url_keys()?;
+            let mut legacy_updates = remove_legacy_vscode_base_url_keys();
             updates.0.append(&mut legacy_updates.0);
             updates.1.append(&mut legacy_updates.1);
 
@@ -1361,6 +1388,7 @@ pub fn list_client_connectors(
 }
 
 pub fn disable_client_setup(client_id: &str) -> Result<()> {
+    let _setup = setup_write_lock();
     let mut state = load_setup_state();
 
     match client_id {
@@ -1410,7 +1438,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
                 HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
                 None,
             );
-            let _ = remove_legacy_vscode_base_url_keys()?;
+            remove_legacy_vscode_base_url_keys();
             // Strip the PreToolUse hook entry and delete the hook script so CC
             // behaves exactly as it did before Headroom was launched.
             for settings_path in claude_settings_candidates() {
@@ -1520,6 +1548,8 @@ pub fn clear_client_setups() -> Result<()> {
 
     // Re-save the remembered snapshot so restore_client_setups works on next launch.
     if !snapshot_clients.is_empty() {
+        // Only here: disable_client_setup above takes the lock itself.
+        let _setup = setup_write_lock();
         let mut state = load_setup_state();
         state.remembered_clients = snapshot_clients;
         state.remembered_shell_files = snapshot_shell_files;
@@ -3208,6 +3238,7 @@ pub fn enable_markitdown_integration(
     markitdown_shim: &Path,
     python_path: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
+    let _setup = setup_write_lock();
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
 
@@ -3269,6 +3300,7 @@ pub fn enable_markitdown_integration(
 /// nudge), leaving any RTK hook untouched. Cleanup runs unconditionally so a
 /// client that was later disconnected is still scrubbed.
 pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
+    let _setup = setup_write_lock();
     let mut changed =
         remove_pre_tool_use_markers(&claude_settings_path(), &["headroom-markitdown-read.sh"])?;
     let hook_path = headroom_markitdown_hook_path();
@@ -3304,6 +3336,7 @@ pub fn refresh_markitdown_integration(
     legacy_shims: &[PathBuf],
     python_path: &Path,
 ) -> Result<()> {
+    let _setup = setup_write_lock();
     let hook_path = headroom_markitdown_hook_path();
     if hook_path.exists() {
         let hook_body = build_headroom_markitdown_hook(markitdown_entrypoint, python_path);
@@ -3432,7 +3465,7 @@ fn configure_vscode_settings() -> Result<(Vec<String>, Vec<String>, Option<Strin
     )?;
     changed_files.extend(ts_changed);
     backup_files.extend(ts_backups);
-    let (legacy_changed, legacy_backups) = remove_legacy_vscode_base_url_keys()?;
+    let (legacy_changed, legacy_backups) = remove_legacy_vscode_base_url_keys();
     changed_files.extend(legacy_changed);
     backup_files.extend(legacy_backups);
     Ok((changed_files, backup_files, replaced))
@@ -3449,7 +3482,7 @@ fn remove_vscode_connector_keys(restore_value: Option<&str>) -> Result<()> {
         HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
         None,
     );
-    let _ = remove_legacy_vscode_base_url_keys()?;
+    remove_legacy_vscode_base_url_keys();
     Ok(())
 }
 
@@ -3945,6 +3978,7 @@ pub fn apply_upstream_client_config(
     next: &mut UpstreamOverride,
     token: Option<&str>,
 ) -> Result<(), String> {
+    let _setup = setup_write_lock();
     // Checked before the keychain or settings.json is touched: a rejected
     // field must not leave a provider token live in the client config.
     if !next.context_window.chars().all(|c| c.is_ascii_digit()) {
@@ -4140,7 +4174,18 @@ fn command_contains(command: &Value, fragment: &str) -> bool {
     }
 }
 
-fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
+/// Best-effort: the keys route nothing today, and VS Code tolerates a
+/// settings.json this parser refuses (a pasted shell command), so a failure
+/// here aborted Claude Code connect after the routing write and disconnect
+/// before the hooks were stripped. An unparseable file is left untouched.
+fn remove_legacy_vscode_base_url_keys() -> (Vec<String>, Vec<String>) {
+    try_remove_legacy_vscode_base_url_keys().unwrap_or_else(|err| {
+        log::warn!("skipping legacy VS Code base URL cleanup: {err:#}");
+        Default::default()
+    })
+}
+
+fn try_remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
     // Deliberately the macOS path only. These keys were written into VS Code's
     // settings.json by macOS-only builds; the connector has since moved to
     // ~/.claude/settings.json, which is where every platform reads and writes
@@ -9701,6 +9746,12 @@ pub(crate) fn codex_logged_in() -> bool {
 }
 
 fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, Value>> {
+    // An empty file (a `touch`, a writer that died mid-write) holds no settings
+    // to protect, and both parsers reject it: that blocked setup until the user
+    // fixed the file by hand.
+    if raw.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
     let value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(_) => {
@@ -12953,6 +13004,124 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .map(String::as_str),
             Some(gateway)
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_connect_and_disconnect_survive_an_unparseable_vscode_settings_file() {
+        // Audit #11: VS Code tolerates a settings.json it cannot parse (here a
+        // pasted shell command), but the legacy base-URL cleanup refused it and
+        // aborted connect after the routing write, and disconnect before the
+        // hooks were stripped and the client was marked off.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        let vscode = home
+            .path()
+            .join("Library/Application Support/Code/User/settings.json");
+        fs::create_dir_all(vscode.parent().unwrap()).unwrap();
+        fs::write(&vscode, "cd /x\n").unwrap();
+
+        super::apply_client_setup("claude_code").expect("apply");
+        assert!(super::claude_guard_registered().unwrap());
+        assert!(super::load_setup_state()
+            .configured_clients
+            .contains_key("claude_code"));
+
+        super::disable_client_setup("claude_code").expect("disable");
+        assert!(!super::claude_guard_registered().unwrap());
+        assert!(!super::load_setup_state()
+            .configured_clients
+            .contains_key("claude_code"));
+        assert_eq!(fs::read_to_string(&vscode).unwrap(), "cd /x\n");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_connect_routes_through_a_whitespace_only_settings_file() {
+        // Audit #98: a 0-byte or whitespace-only settings.json (a `touch`, or
+        // a writer that died mid-write) failed both parsers, so setup refused
+        // it as "potentially valid user settings" until fixed by hand.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, "  \n").unwrap();
+
+        super::apply_client_setup("claude_code").expect("apply");
+        assert_eq!(
+            read_settings_json(&settings)["env"]["ANTHROPIC_BASE_URL"],
+            super::HEADROOM_ANTHROPIC_BASE_URL
+        );
+    }
+
+    /// Runs `write` on another thread while this one holds the setup write
+    /// lock, as an apply in flight on the launch-restore thread does, and
+    /// asserts the write waits for it instead of interleaving.
+    fn assert_waits_for_setup_writes(write: impl FnOnce() + Send + 'static) {
+        let in_flight = super::setup_write_lock();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            write();
+            let _ = done_tx.send(());
+        });
+        assert_eq!(
+            done.recv_timeout(std::time::Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "wrote while another setup write was in flight"
+        );
+        drop(in_flight);
+        writer.join().expect("writer thread");
+        done.recv().expect("write finished");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn setup_state_toggles_wait_for_an_apply_in_flight() {
+        // Audit #86: each writer loads client-setup.json, changes one field and
+        // writes the whole state back, so a toggle landing inside a launch
+        // restore's apply was overwritten by the apply's stale copy (the
+        // statusline or RTK opt-out silently reverted, a connector lost its
+        // configured stamp).
+        let home = TestHome::new();
+        let tools = home.path().to_path_buf();
+        assert_waits_for_setup_writes(|| super::set_statusline_enabled(false).unwrap());
+        assert_waits_for_setup_writes(|| super::set_auto_learn_enabled(false).unwrap());
+        assert_waits_for_setup_writes(move || {
+            super::set_rtk_enabled(false, &tools, &tools).unwrap()
+        });
+        assert_waits_for_setup_writes(|| super::disable_client_setup("claude_code").unwrap());
+        let state = super::load_setup_state();
+        assert!(state.statusline_disabled && state.auto_learn_disabled && state.rtk_disabled);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn launch_refreshes_of_claude_settings_wait_for_an_apply_in_flight() {
+        // Audit #134: the warm-runtime thread's RTK hook and MarkItDown writes
+        // rewrote ~/.claude/settings.json from a copy read before the restore
+        // thread's apply wrote its routing env and hooks, dropping them.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        seed_installed_rtk();
+        let py = home.path().join("python3");
+        let shim = home.path().join("markitdown");
+        let (rtk, rtk_py) = (super::default_headroom_rtk_path(), py.clone());
+        assert_waits_for_setup_writes(move || {
+            super::ensure_rtk_integrations(&rtk, &rtk_py).unwrap();
+        });
+        let (md, md_shim, md_py) = (shim.clone(), shim.clone(), py.clone());
+        assert_waits_for_setup_writes(move || {
+            super::refresh_markitdown_integration(&md, &md_shim, &[], &md_py).unwrap()
+        });
+        let (md, md_shim, md_py) = (shim.clone(), shim.clone(), py.clone());
+        assert_waits_for_setup_writes(move || {
+            super::enable_markitdown_integration(&md, &md_shim, &md_py).unwrap();
+        });
+        assert_waits_for_setup_writes(move || {
+            super::disable_markitdown_integration(&shim).unwrap();
+        });
+        assert!(super::claude_settings_hook_matches("headroom-rtk-rewrite.sh").unwrap());
     }
 
     #[test]
