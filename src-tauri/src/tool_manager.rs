@@ -8366,7 +8366,14 @@ impl ToolManager {
         if hosts.is_empty() {
             bail!(NO_PLUGIN_HOST_CLI);
         }
-        let mut errors: Vec<String> = Vec::new();
+        // A host whose CLI was not detected can still hold the plugin (probe
+        // timeout, IDE-only Claude Code). It was not toggled, so it counts as
+        // a failure rather than a silent skip.
+        let mut errors: Vec<String> = PluginHost::ALL
+            .into_iter()
+            .filter(|host| !hosts.iter().any(|(h, _)| h == host) && host.plugin_present(plugin))
+            .map(|host| format!("{}: CLI not found on PATH", host.label()))
+            .collect();
         let mut changed_any = false;
         for &(host, ref cli) in hosts {
             // Codex has no enable/disable verb, so enabling re-installs and
@@ -8397,6 +8404,12 @@ impl ToolManager {
         }
         if !changed_any && !errors.is_empty() {
             bail!("toggling {id} failed: {}", errors.join("; "));
+        }
+        if !errors.is_empty() {
+            log::warn!(
+                "{id} toggled on some hosts but not all: {}",
+                errors.join("; ")
+            );
         }
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
@@ -8483,7 +8496,7 @@ const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the
 /// install through their own `<cli> plugin ...` managers. Their verbs differ
 /// (Claude has enable/disable/install/uninstall; Codex only add/remove), so
 /// each host carries its own argument vectors.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PluginHost {
     ClaudeCode,
     Codex,
@@ -20648,6 +20661,41 @@ after
             .expect_err("no host CLI means nothing was toggled")
             .to_string()
             .contains("was found on PATH"));
+        assert_eq!(enabled, Some(true), "receipt must not flip");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_disable_fails_when_the_host_holding_it_has_no_cli() {
+        // Codex is on PATH without the plugin; Claude Code has it registered
+        // but its CLI was not detected (probe timeout, IDE-only install). No
+        // `plugin disable` ran anywhere, so the receipt must not flip.
+        let (root, runtime, manager) = seed_test_runtime("plugin-toggle-missing-host");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        fs::write(
+            registry.join("installed_plugins.json"),
+            br#"{"plugins":{"ponytail@ponytail":[{"scope":"user"}]}}"#,
+        )
+        .expect("registry");
+        let receipt = runtime.tools_dir.join("ponytail.json");
+        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
+        let result = manager.set_plugin_enabled_on(
+            "ponytail",
+            false,
+            &[(PluginHost::Codex, root.join("codex"))],
+        );
+        let enabled = manager
+            .read_tool_receipt("ponytail")
+            .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_bool));
+        let _ = fs::remove_dir_all(&root);
+        let err = result.expect_err("the host holding the plugin was not toggled");
+        assert!(
+            err.to_string()
+                .contains("Claude Code: CLI not found on PATH"),
+            "{err:#}"
+        );
         assert_eq!(enabled, Some(true), "receipt must not flip");
     }
 
