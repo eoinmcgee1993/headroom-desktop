@@ -6891,11 +6891,21 @@ fn claude_remote_control_command_path() -> PathBuf {
 /// define (identically, so either block works alone): does the intercept
 /// answer on 127.0.0.1:`port`? A local connect with no external command and
 /// no network: bash's /dev/tcp, zsh's ztcp; a plain sh (dash reading
-/// ~/.profile) has neither and says no. A closed loopback port refuses at
-/// once and an open one completes the handshake in the kernel, so the probe
-/// never holds up a shell.
+/// ~/.profile) has neither and says no. On macOS and Linux a closed loopback
+/// port refuses at once and an open one completes the handshake in the
+/// kernel, so the answer is usually instant. The start-up export runs it
+/// once per shell (`intercept_export_line`); `claude` and `codex` run it per
+/// call while the shell carries Headroom's URL.
 ///
-/// Known residuals, both outside what a probe can see:
+/// Known residuals:
+/// * It has no timeout. While the intercept is wedged with a full accept
+///   queue (macOS caps the backlog at kern.ipc.somaxconn, 128 by default)
+///   each probe blocks until the connect times out, measured at about 8 s
+///   on macOS in bash, zsh and sh. On Windows (Git Bash reads these blocks
+///   too) Winsock retries a refused connect, so with 6767 closed each probe
+///   takes about 1-2 s: a new terminal after a crash or a failed quit
+///   cleanup, and each `claude`/`codex` call in a terminal opened while
+///   Headroom ran.
 /// * A terminal opened while Headroom ran keeps the exported URL after quit,
 ///   and so does every tool started from it: a running process's env cannot
 ///   be changed from outside. `claude` and `codex` below re-probe per call;
@@ -6921,9 +6931,16 @@ fn intercept_probe_function(port: u16) -> String {
 /// `CLAUDE_CONFIG_DIR` setups), unless the user already set their own. Once
 /// it is down, a Headroom value inherited from an older shell (a tmux server,
 /// an IDE) is dropped instead; the user's own value never is.
+///
+/// A login shell runs this four times (both blocks, in .zprofile and .zshrc
+/// or .bash_profile and .bashrc), so the probe's verdict is kept in
+/// `__headroom_live`, keyed by `$$` so a child shell that inherited it (an rc
+/// under `set -a`) probes afresh. Re-sourcing an rc keeps the start-up
+/// verdict; `claude` and `codex` re-probe per call anyway.
 fn intercept_export_line(var: &str, url: &str) -> String {
     format!(
-        r#"if __headroom_up; then export {var}="${{{var}:-{url}}}"; elif [ "${{{var}-}}" = {url} ]; then unset {var}; fi"#
+        r#"case ${{__headroom_live-}} in "$$:"[01]) ;; *) if __headroom_up; then __headroom_live=$$:1; else __headroom_live=$$:0; fi ;; esac
+if [ "$__headroom_live" = "$$:1" ]; then export {var}="${{{var}:-{url}}}"; elif [ "${{{var}-}}" = {url} ]; then unset {var}; fi"#
     )
 }
 
@@ -6932,7 +6949,9 @@ fn intercept_export_line(var: &str, url: &str) -> String {
 /// a Headroom OPENAI_BASE_URL the shell still carries once the intercept is
 /// gone, so Codex falls back to its own provider instead of the dead port.
 /// Defined through `eval` and only when `codex` is not an alias, as
-/// `claude_code_shell_block` explains.
+/// `claude_code_shell_block` explains, nor already a function: a user's own
+/// `codex` wrapper (profile, sandbox or approval flags) earlier in the rc is
+/// kept, and the block's copy in the other profile finds ours already there.
 fn codex_shell_block(port: u16) -> String {
     let function = r#"codex() {
   if [ "${OPENAI_BASE_URL-}" = __BASE__ ] && ! __headroom_up; then
@@ -6943,7 +6962,7 @@ fn codex_shell_block(port: u16) -> String {
 }"#
     .replace("__BASE__", HEADROOM_OPENAI_BASE_URL);
     format!(
-        "{}\n{}\nif ! alias codex >/dev/null 2>&1; then eval '{}'; fi",
+        "{}\n{}\nif ! alias codex >/dev/null 2>&1 && ! typeset -f codex >/dev/null 2>&1; then eval '{}'; fi",
         intercept_probe_function(port),
         intercept_export_line("OPENAI_BASE_URL", HEADROOM_OPENAI_BASE_URL),
         function
@@ -17304,19 +17323,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         for shell in shells {
             // `inherited`: both variables as the shell's parent passed them;
             // `later`: set after the rc ran (a shell started while Headroom ran).
-            let run = |block: &Path,
-                       inherited: Option<(&str, &str)>,
-                       later: Option<(&str, &str)>| {
-                let mut script = format!(". '{}'\n", block.display());
-                if let Some((anthropic, openai)) = later {
-                    script.push_str(&format!(
-                        "export ANTHROPIC_BASE_URL={anthropic} OPENAI_BASE_URL={openai}\n"
-                    ));
-                }
-                script.push_str(
-                    "echo \"shell=${ANTHROPIC_BASE_URL:-unset},${OPENAI_BASE_URL:-unset}\"; claude; codex\n\
-                     echo \"after=${ANTHROPIC_BASE_URL:-unset},${OPENAI_BASE_URL:-unset}\"",
-                );
+            let exec = |script: String, inherited: Option<(&str, &str)>| {
                 let mut cmd = crate::proc::command(shell);
                 cmd.arg("-c")
                     .arg(script)
@@ -17336,6 +17343,21 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                     String::from_utf8_lossy(&out.stderr)
                 );
                 String::from_utf8(out.stdout).unwrap()
+            };
+            let run = |block: &Path,
+                       inherited: Option<(&str, &str)>,
+                       later: Option<(&str, &str)>| {
+                let mut script = format!(". '{}'\n", block.display());
+                if let Some((anthropic, openai)) = later {
+                    script.push_str(&format!(
+                        "export ANTHROPIC_BASE_URL={anthropic} OPENAI_BASE_URL={openai}\n"
+                    ));
+                }
+                script.push_str(
+                    "echo \"shell=${ANTHROPIC_BASE_URL:-unset},${OPENAI_BASE_URL:-unset}\"; claude; codex\n\
+                     echo \"after=${ANTHROPIC_BASE_URL:-unset},${OPENAI_BASE_URL:-unset}\"",
+                );
+                exec(script, inherited)
             };
             let both = |x: &str, y: &str| {
                 format!("shell={x},{y}\nclaude={x},{y}\ncodex={x},{y}\nafter={x},{y}\n")
@@ -17373,9 +17395,76 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                     both(own.0, own.1),
                     "{shell}: nor stripped"
                 );
+                // A codex() wrapper of the user's own, sourced before a block
+                // (and after the .zprofile copy of it), keeps its flags.
+                for before in ["", &format!(". '{}'\n", block.display())] {
+                    assert_eq!(
+                        exec(
+                            format!(
+                                "{before}codex() {{ echo mine; }}\n. '{}'\ncodex\n",
+                                block.display()
+                            ),
+                            None
+                        ),
+                        "mine\n",
+                        "{shell}: the user's codex function is kept"
+                    );
+                }
             }
         }
         drop(listener);
+    }
+
+    /// A login shell sources both blocks from both profiles (.zprofile and
+    /// .zshrc, or .bash_profile sourcing .bashrc): the start-up probe runs
+    /// once for all four export lines, so a slow probe (a full accept queue,
+    /// Windows retrying a refused connect) stalls a new terminal once, not 4x.
+    #[cfg(unix)]
+    #[test]
+    fn shell_start_probes_the_intercept_once() {
+        let home = TestHome::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let block = home.path().join("block.sh");
+        std::fs::write(
+            &block,
+            format!(
+                "{}\n{}\n",
+                claude_code_shell_block(port),
+                super::codex_shell_block(port)
+            ),
+        )
+        .unwrap();
+        for shell in ["bash", "zsh"] {
+            if crate::proc::command(shell)
+                .arg("-c")
+                .arg(":")
+                .status()
+                .is_err()
+            {
+                continue;
+            }
+            let out = crate::proc::command(shell)
+                .arg("-c")
+                .arg(format!(
+                    ". '{0}'\n. '{0}'\necho \"$ANTHROPIC_BASE_URL\"",
+                    block.display()
+                ))
+                .env("HOME", home.path())
+                .env_remove("ANTHROPIC_BASE_URL")
+                .env_remove("OPENAI_BASE_URL")
+                .output()
+                .expect("run shell");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("{HEADROOM_ANTHROPIC_BASE_URL}\n"),
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let probes = std::iter::from_fn(|| listener.accept().ok()).count();
+            assert_eq!(probes, 1, "{shell}: connects at shell start");
+        }
     }
 
     /// settings.json is hand-maintained JSONC: the wrapper key goes in and out
