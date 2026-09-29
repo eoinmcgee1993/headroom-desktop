@@ -5917,10 +5917,13 @@ async fn start_headroom(app: AppHandle) -> Result<(), String> {
 
 fn start_headroom_blocking(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
-    state.resume_runtime().map_err(|err| err.to_string())?;
-    std::thread::spawn(|| {
-        client_adapters::restore_client_setups();
-    });
+    // Restore even when the start fails: resume_runtime has already un-paused,
+    // so nothing else brings back the clients the pause cleared, and the 6767
+    // intercept forwards direct while the backend is down (same reasoning as
+    // resume_for_client_setup).
+    let resumed = state.resume_runtime();
+    std::thread::spawn(client_adapters::restore_client_setups);
+    resumed.map_err(|err| err.to_string())?;
     analytics::track_event(&app, "runtime_resumed", None);
     Ok(())
 }
@@ -5940,10 +5943,10 @@ fn force_restart_headroom_blocking(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
     state.stop_headroom();
     state.set_runtime_auto_paused(false);
-    state.resume_runtime().map_err(|err| err.to_string())?;
-    std::thread::spawn(|| {
-        client_adapters::restore_client_setups();
-    });
+    // Restore whatever the start returns; see start_headroom_blocking.
+    let resumed = state.resume_runtime();
+    std::thread::spawn(client_adapters::restore_client_setups);
+    resumed.map_err(|err| err.to_string())?;
     analytics::track_event(&app, "runtime_force_restarted", None);
     Ok(())
 }
@@ -9541,6 +9544,28 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         outcome.label()
                     );
                 }
+                // `runtime` is this tick's snapshot and the cold-boot wait
+                // above can run for minutes. A user pause, pricing bypass or
+                // upgrade that landed since owns the lifecycle now: giving up
+                // anyway overwrote a deliberate pause with an auto-pause that
+                // the self-heal then resumed without the cleared client setups.
+                if SHUTTING_DOWN.load(Ordering::Acquire) {
+                    return;
+                }
+                if !watchdog_should_be_up(
+                    state.tool_manager.python_runtime_installed(),
+                    state.runtime_is_paused(),
+                    state.runtime_is_starting(),
+                    state.runtime_upgrade_in_progress(),
+                    state.proxy_bypass.load(Ordering::Acquire),
+                ) {
+                    log::info!(
+                        "watchdog: runtime paused, bypassed or upgrading during the down episode; skipping auto-pause"
+                    );
+                    consecutive_failures = 0;
+                    hung_kill_attempted = false;
+                    continue;
+                }
                 // info! not warn!/error!: this is the documented recovery
                 // path (flip bypass, pause runtime, notify user). FileLogger
                 // forwards both warn! and error! to Sentry as capture_message,
@@ -9611,6 +9636,18 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             // (cached/laxer) reachability view and "restart" nothing, letting
             // strikes reach give-up without a single spawn attempt (RUST-53).
             if !state.tracked_child_alive() {
+                // Busy, not wedged (see the give-up guard above). An ADOPTED
+                // backend is untracked too, so without this it was killed on
+                // strike 1 and every in-flight stream cut. Skip the respawn as
+                // well: its pre-flight reclaims an orphan that misses /readyz.
+                // A dead backend delivers nothing and ages past the window.
+                if proxy_intercept::backend_traffic_within(std::time::Duration::from_secs(10)) {
+                    log::info!(
+                        "watchdog: untracked backend streamed bytes within 10s; busy not wedged, resetting counter"
+                    );
+                    consecutive_failures = 0;
+                    continue;
+                }
                 state.stop_headroom();
             }
             match state.ensure_headroom_running() {
@@ -12656,6 +12693,78 @@ Some unrelated content.
     #[test]
     fn watchdog_should_be_up_skips_when_pricing_gate_bypassed() {
         assert!(!watchdog_should_be_up(true, false, false, false, true));
+    }
+
+    /// The watchdog loop needs a running app, so these pin its ordering in
+    /// source. The cold-boot wait runs for minutes; a user pause that lands
+    /// meanwhile must not be overwritten by the give-up's auto-pause, which
+    /// the self-heal then resumes without the client setups the pause cleared.
+    #[test]
+    fn watchdog_give_up_rechecks_live_state_after_the_cold_boot_wait() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, watchdog) = source
+            .split_once("fn spawn_proxy_watchdog(")
+            .expect("watchdog present");
+        let (_, after_wait) = watchdog
+            .split_once("state.wait_for_boot_validation(")
+            .expect("cold-boot wait present");
+        let before_give_up = &after_wait[..after_wait
+            .find("\"watchdog: giving up after")
+            .expect("give-up present")];
+        for live in [
+            "SHUTTING_DOWN.load(",
+            "state.runtime_is_paused()",
+            "state.runtime_upgrade_in_progress()",
+        ] {
+            assert!(
+                before_give_up.contains(live),
+                "give-up must re-read {live} after the wait: {before_give_up}"
+            );
+        }
+    }
+
+    /// An adopted backend (relaunch after a crash) is untracked, so the RUST-53
+    /// teardown read it as dead on strike 1 and killed it mid-stream before the
+    /// busy-not-wedged guard at give-up ever ran. The guard must also skip the
+    /// respawn: the spawn pre-flight reclaims an orphan that misses /readyz.
+    #[test]
+    fn watchdog_does_not_tear_down_a_busy_untracked_backend() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, watchdog) = source
+            .split_once("fn spawn_proxy_watchdog(")
+            .expect("watchdog present");
+        let (_, teardown) = watchdog
+            .split_once("if !state.tracked_child_alive() {")
+            .expect("RUST-53 teardown present");
+        let before_stop = &teardown[..teardown
+            .find("state.stop_headroom();")
+            .expect("teardown stops the backend")];
+        assert!(
+            before_stop.contains("proxy_intercept::backend_traffic_within(")
+                && before_stop.contains("continue;"),
+            "busy guard must precede the untracked teardown: {before_stop}"
+        );
+    }
+
+    /// resume_runtime un-pauses before it starts the backend, so a failed
+    /// start used to leave the app unpaused with the clients the pause cleared
+    /// still unrouted for the rest of the session.
+    #[test]
+    fn resume_restores_client_setups_even_when_the_backend_start_fails() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        for name in [
+            "fn start_headroom_blocking(",
+            "fn force_restart_headroom_blocking(",
+        ] {
+            let (_, body) = source.split_once(name).expect("fn present");
+            let body = &body[..body.find("\n}\n").expect("fn end")];
+            let resume = body.find("resume_runtime()").expect("resumes");
+            let restore = body.find("restore_client_setups").expect("restores");
+            assert!(
+                resume < restore && !body[resume..restore].contains('?'),
+                "{name} must restore clients before propagating a resume error: {body}"
+            );
+        }
     }
 
     #[test]
