@@ -748,12 +748,30 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             // logged (its output isn't surfaced in the result today); never a
             // `verified` failure (doctor can flag unrelated issues, and an
             // untrusted-but-installed guard is expected until the user runs
-            // /hooks).
-            std::thread::spawn(|| {
-                if let Some(summary) = codex_doctor_summary() {
-                    log::info!("codex doctor: {summary}");
+            // /hooks). At most hourly: verify runs on every setup-UI poll and
+            // repair pass, and each doctor run scans the rollout DB and probes
+            // the proxy unauthenticated (`HEAD /v1/responses` + `GET
+            // /v1/models`, both 401 by design), which read as a Codex auth
+            // failure in the log (84 runs in a day on one machine).
+            static LAST_DOCTOR: std::sync::Mutex<Option<std::time::Instant>> =
+                std::sync::Mutex::new(None);
+            let due = {
+                let mut last = LAST_DOCTOR
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let due = last.is_none_or(|at| at.elapsed() >= Duration::from_secs(3600));
+                if due {
+                    *last = Some(std::time::Instant::now());
                 }
-            });
+                due
+            };
+            if due {
+                std::thread::spawn(|| {
+                    if let Some(summary) = codex_doctor_summary() {
+                        log::info!("codex doctor: {summary}");
+                    }
+                });
+            }
         }
         "grok_build" => {
             let state = load_setup_state();
@@ -7378,7 +7396,11 @@ fn remove_claude_guard_hook() -> Result<()> {
 /// reasons must not flip `verified`.
 fn codex_doctor_summary() -> Option<String> {
     let codex = find_on_path(&["codex"])?;
-    let output = crate::proc::command(codex).arg("doctor").output().ok()?;
+    let mut command = crate::proc::command(codex);
+    command.arg("doctor");
+    // Its reachability probe can hang on a wedged network; a detached thread
+    // waiting forever would leak one thread and one codex process per run.
+    let output = crate::proc::output_with_timeout(command, Duration::from_secs(60)).ok()?;
     if output.status.success() {
         Some("`codex doctor` reports the Codex CLI install is healthy.".into())
     } else {
