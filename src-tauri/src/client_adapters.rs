@@ -407,6 +407,9 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                     .preserved_base_urls
                     .insert(state_id.clone(), original.clone());
                 replaced_base_url = Some(original);
+                // Persist now: settings.json already holds our URL, so if a
+                // later step fails the gateway would otherwise be lost for good.
+                write_setup_state(&state)?;
             }
             // Ride ENABLE_TOOL_SEARCH alongside the base URL so Claude Code keeps
             // deferring tool schemas (issue #746). If-absent so a user's own value
@@ -507,6 +510,7 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             // block is what routes Codex through Headroom.
             let (changed, backups, preserved) = configure_codex_provider_block()?;
             let mut updates = (changed, backups);
+            let captured = !preserved.is_empty();
             for (entry, original) in preserved {
                 // A custom root `model_provider` or `openai_base_url` (gateway,
                 // LM Studio) was routing Codex before us: remember it for
@@ -516,6 +520,11 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                 state
                     .preserved_base_urls
                     .insert(entry.to_string(), original);
+            }
+            // Persist now: config.toml no longer holds the user's value, so if
+            // a later step fails (malformed hooks.json) it would be lost for good.
+            if captured {
+                write_setup_state(&state)?;
             }
 
             // Loud-fail guard so a closed app or clobbered config surfaces in
@@ -12600,6 +12609,37 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn claude_apply_failing_after_the_settings_write_still_persists_the_captured_base_url() {
+        // Review of A-2: settings.json already holds Headroom's URL once the
+        // env write lands, so a later failing step (here the guard script)
+        // must not drop the captured gateway, or the next launch captures
+        // nothing and quit deletes it for good.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let gateway = "https://gateway.corp.example/anthropic";
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"{gateway}"}}}}"#),
+        )
+        .unwrap();
+        seed_installed_rtk();
+        // A directory where the guard script goes makes that step fail.
+        fs::create_dir_all(super::claude_guard_hook_path().join("blocker")).unwrap();
+
+        assert!(super::apply_client_setup("claude_code").is_err());
+        assert_eq!(
+            super::load_setup_state()
+                .preserved_base_urls
+                .get("claude_code")
+                .map(String::as_str),
+            Some(gateway)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn apply_without_custom_base_url_does_not_report_takeover() {
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
@@ -14772,6 +14812,45 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             parsed.get("model").and_then(|v| v.as_str()),
             Some("qwen"),
             "other root keys survive the round trip, got:\n{after_disable}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_apply_failing_after_the_config_write_still_persists_the_captured_base_url() {
+        // Review of A-2: the config.toml write strips the user's root
+        // openai_base_url, so a later failing step (a malformed hooks.json
+        // breaks the guard hook) must not drop the captured value, or quit
+        // strips with nothing to restore.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "openai_base_url = \"http://127.0.0.1:1234/v1\"\n",
+        )
+        .unwrap();
+        let hooks_json = codex_dir.join("hooks.json");
+        fs::write(&hooks_json, "{ not json").unwrap();
+
+        assert!(super::apply_client_setup("codex").is_err());
+        assert_eq!(
+            super::load_setup_state()
+                .preserved_base_urls
+                .get("codex_cli_openai_base_url")
+                .map(String::as_str),
+            Some("http://127.0.0.1:1234/v1")
+        );
+
+        // Once hooks.json is fixed, quit hands the user's value back.
+        fs::remove_file(&hooks_json).unwrap();
+        super::disable_client_setup("codex").expect("disable succeeds");
+        let after: toml::Value = fs::read_to_string(&config_toml).unwrap().parse().unwrap();
+        assert_eq!(
+            after.get("openai_base_url").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:1234/v1")
         );
     }
 
