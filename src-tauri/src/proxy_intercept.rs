@@ -1200,6 +1200,16 @@ pub fn spawn(
                                         *bind_error.lock() = Some(format!(
                                             "port {INTERCEPT_PORT} is held by {UNIDENTIFIED_HOLDER}"
                                         ));
+                                        // Every wired client still sends this
+                                        // user's bearer and prompts to that
+                                        // listener. Unwire them; `run` wires
+                                        // them back once the port is ours.
+                                        if crate::client_adapters::unwire_clients_for_port_holder()
+                                        {
+                                            log::warn!(
+                                                "[proxy_intercept] unwired clients from the unidentified holder of port {INTERCEPT_PORT}"
+                                            );
+                                        }
                                         if reported_errors.insert(format!("unidentified:{key}")) {
                                             sentry::with_scope(
                                                 |scope| {
@@ -1374,6 +1384,12 @@ async fn run(
     // Serving again: clear whatever the previous attempt recorded so a
     // recovered port stops showing a stale cause in the UI.
     *bind_error.lock() = None;
+    // And wire back any clients the bind loop unwired from an unidentified
+    // holder of this port. Off this single-threaded runtime, which must
+    // accept; tests bind other ports and never reach it.
+    if bind_addr.port() == INTERCEPT_PORT {
+        std::thread::spawn(crate::client_adapters::rewire_clients_after_port_reclaimed);
+    }
 
     loop {
         match listener.accept().await {

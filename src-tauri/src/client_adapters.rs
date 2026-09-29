@@ -1516,7 +1516,45 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Set while the clients are unwired because 6767 is held by a listener
+/// Headroom cannot identify (see `unwire_clients_for_port_holder`).
+static CLIENTS_UNWIRED_FOR_PORT_HOLDER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Pause and quit. Also ends a port-holder unwire: the user's decision now
+/// stands, so reclaiming the port must not wire the clients back over it.
 pub fn clear_client_setups() -> Result<()> {
+    CLIENTS_UNWIRED_FOR_PORT_HOLDER.store(false, std::sync::atomic::Ordering::Release);
+    clear_and_remember_client_setups()
+}
+
+/// The intercept's bind loop found 6767 held by a live listener it cannot
+/// name, which is what another signed-in user's Headroom looks like. Every
+/// wired client would keep sending this user's bearer and prompts to it, so
+/// unwire them the way a pause does, remembered for
+/// `rewire_clients_after_port_reclaimed`. Returns whether anything was wired;
+/// with nothing wired (already paused, say) this claims nothing.
+pub fn unwire_clients_for_port_holder() -> bool {
+    if load_setup_state().configured_clients.is_empty() {
+        return false;
+    }
+    CLIENTS_UNWIRED_FOR_PORT_HOLDER.store(true, std::sync::atomic::Ordering::Release);
+    if let Err(err) = clear_and_remember_client_setups() {
+        log::warn!("unwiring clients from an unidentified port holder: {err:#}");
+    }
+    true
+}
+
+/// The intercept bound 6767: wire back what `unwire_clients_for_port_holder`
+/// took off, unless a pause or quit has taken over since.
+pub fn rewire_clients_after_port_reclaimed() {
+    if CLIENTS_UNWIRED_FOR_PORT_HOLDER.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        log::info!("port reclaimed; re-wiring clients unwired from its previous holder");
+        restore_client_setups();
+    }
+}
+
+fn clear_and_remember_client_setups() -> Result<()> {
     // Capture snapshot before disabling. We re-apply it afterwards because
     // disable_client_setup also clears remembered_clients as a side effect,
     // which would otherwise erase the snapshot we need for restore_client_setups.
@@ -13077,6 +13115,38 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             state.remembered_clients.contains_key("claude_code"),
             "quit-time clear after a pause must keep the restore snapshot, got: {:?}",
             state.remembered_clients
+        );
+    }
+
+    /// Finding 38: a 6767 holder Headroom cannot identify (another signed-in
+    /// user's Headroom looks exactly like this) must stop receiving this
+    /// user's credentials. The bind loop unwires every client the way a pause
+    /// does, and reclaiming the port wires them back, unless the user paused
+    /// in between.
+    #[test]
+    #[serial_test::serial]
+    fn clients_unwired_for_an_unidentified_port_holder_return_only_without_a_pause() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+
+        assert!(super::unwire_clients_for_port_holder(), "a wired client");
+        assert!(!super::is_claude_code_enabled(), "unwired like a pause");
+        assert!(
+            !super::unwire_clients_for_port_holder(),
+            "nothing left wired, so a repeat claims nothing"
+        );
+        super::rewire_clients_after_port_reclaimed();
+        assert!(super::is_claude_code_enabled(), "the bind wires it back");
+
+        assert!(super::unwire_clients_for_port_holder());
+        super::clear_client_setups().expect("user pause");
+        super::rewire_clients_after_port_reclaimed();
+        assert!(
+            !super::is_claude_code_enabled(),
+            "a pause after the unwire is the user's call; the bind must not undo it"
         );
     }
 
