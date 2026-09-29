@@ -10062,7 +10062,6 @@ fn headroom_python_startup_args() -> Vec<String> {
         "--port".to_string(),
         headroom_proxy_port(),
         "--no-http2".to_string(),
-        "--log-messages".to_string(),
         "--no-rate-limit".to_string(),
     ]
 }
@@ -10266,9 +10265,11 @@ fn headroom_entrypoint_startup_args(
     // unconditionally, which surfaced as SSLV3_ALERT_BAD_RECORD_MAC under
     // multi-tab concurrency. The flag is belt-and-suspenders against a future
     // runtime regressing on the env var — but only on runtimes whose click
-    // entrypoint defines it (see runtime_supports_no_http2). --log-messages
-    // stores full request/response bodies so the desktop's Activity tab can
-    // render the live transformations feed.
+    // entrypoint defines it (see runtime_supports_no_http2). No --log-messages:
+    // it keeps the last 100 full prompts and completions readable from
+    // /transformations/feed by any local account, and the desktop reads only
+    // the per-request numbers (include_messages=0). HEADROOM_LOG_MESSAGES=1
+    // in the launch environment still opts back in.
     let mut args = vec![
         "proxy".to_string(),
         "--port".to_string(),
@@ -10277,7 +10278,6 @@ fn headroom_entrypoint_startup_args(
     if runtime_supports_no_http2(installed_version) {
         args.push("--no-http2".to_string());
     }
-    args.push("--log-messages".to_string());
     // The wheel's per-key limiter (100k tokens/min default) started counting
     // tokens in 0.39.0 (#3350). Its bucket caps at the per-minute rate, so one
     // request above 100k tokens can never pass: every 1M-context session past
@@ -10341,7 +10341,7 @@ fn headroom_entrypoint_startup_args(
 /// With auto-learning off the learn flags are not passed, so they drop out of
 /// the signature too.
 fn expected_proxy_arg_signature(learn_enabled: bool) -> Vec<&'static str> {
-    let mut flags = vec!["--port", "--log-messages", "--no-rate-limit"];
+    let mut flags = vec!["--port", "--no-rate-limit"];
     if learn_enabled {
         flags.extend([
             "--learn",
@@ -10417,7 +10417,17 @@ fn proxy_argv_contains_expected_flags(argv: &str, learn_enabled: bool) -> bool {
     if !learn_enabled && argv_contains_flag(argv, "--learn") {
         return false;
     }
-    expected_proxy_arg_signature(learn_enabled)
+    // Older builds passed --log-messages; such a backend still holds full
+    // prompt and completion bodies, so restart it rather than adopt it.
+    if argv_contains_flag(argv, "--log-messages") {
+        return false;
+    }
+    // The `-m headroom.proxy.server` fallback cannot take the learn flags
+    // (see headroom_python_startup_args), so never expect them from it:
+    // otherwise every ensure pass kills a healthy fallback backend and
+    // respawns it onto the same fallback.
+    let learn_expected = learn_enabled && !argv_contains_flag(argv, "headroom.proxy.server");
+    expected_proxy_arg_signature(learn_expected)
         .iter()
         .all(|flag| argv_contains_flag(argv, flag))
 }
@@ -16215,7 +16225,7 @@ mod tests {
 
     #[test]
     fn proxy_argv_matches_when_all_expected_flags_present() {
-        let argv = "/Users/x/headroom proxy --port 6768 --log-messages --no-rate-limit \
+        let argv = "/Users/x/headroom proxy --port 6768 --no-rate-limit \
                     --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
@@ -16225,27 +16235,27 @@ mod tests {
         // Builds before 2026-08-17 spawned the backend under `nice`. Upgrading
         // users still have one of those running, and it must be recognized as
         // ours rather than treated as a foreign occupant of the port.
-        let argv = "/usr/bin/nice -n 2 /Users/x/headroom proxy --port 6768 --log-messages \
+        let argv = "/usr/bin/nice -n 2 /Users/x/headroom proxy --port 6768 \
                     --no-rate-limit --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
     fn proxy_argv_matches_without_learn_flags_when_auto_learn_off() {
-        let argv = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages --no-rate-limit";
+        let argv = "/Users/x/headroom proxy --port 6768 --no-http2 --no-rate-limit";
         assert!(proxy_argv_contains_expected_flags(argv, false));
     }
 
     #[test]
     fn proxy_argv_mismatch_when_learn_present_but_auto_learn_off() {
         // Leftover learn-enabled proxy from before the toggle flipped: restart.
-        let argv = "/Users/x/headroom proxy --port 6768 --log-messages --learn \
+        let argv = "/Users/x/headroom proxy --port 6768 --no-rate-limit --learn \
                     --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(!proxy_argv_contains_expected_flags(argv, false));
     }
 
     #[test]
-    fn proxy_argv_mismatch_when_log_messages_missing() {
+    fn proxy_argv_mismatch_for_bare_old_build_proxy() {
         // The exact orphan-from-old-build case: a v0.2.x proxy still running
         // with just `proxy --port 6768`.
         let argv = "/Users/x/headroom proxy --port 6768";
@@ -16254,7 +16264,7 @@ mod tests {
 
     #[test]
     fn proxy_argv_mismatch_when_learn_missing() {
-        let argv = "headroom proxy --port 6768 --log-messages --no-memory-tools \
+        let argv = "headroom proxy --port 6768 --no-rate-limit --no-memory-tools \
                     --no-memory-context --memory-db-path /tmp/m.db";
         assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
@@ -16263,17 +16273,77 @@ mod tests {
     fn proxy_argv_match_does_not_get_fooled_by_negated_flag_substring() {
         // `--no-learn` contains `--learn` as a substring; whitespace tokenizing
         // ensures we don't false-positive on it.
-        let argv = "headroom proxy --port 6768 --log-messages --no-learn \
+        let argv = "headroom proxy --port 6768 --no-rate-limit --no-learn \
                     --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
     fn proxy_argv_match_works_for_python_module_invocation() {
+        // The real fallback argv: `-m headroom.proxy.server` takes no learn
+        // flags, so with auto-learn on it must still read as current instead
+        // of being killed and respawned (onto the same fallback) every pass.
         let argv = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
-                    --no-http2 --log-messages --no-rate-limit --learn --no-memory-tools \
-                    --no-memory-context --memory-db-path /tmp/m.db";
+                    --no-http2 --no-rate-limit";
         assert!(proxy_argv_contains_expected_flags(argv, true));
+        assert!(proxy_argv_contains_expected_flags(argv, false));
+        // The entrypoint variant still owes the learn flags when learn is on.
+        let entrypoint = "/Users/x/headroom proxy --port 6768 --no-http2 --no-rate-limit";
+        assert!(!proxy_argv_contains_expected_flags(entrypoint, true));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn every_spawn_variant_reads_as_current_to_the_argv_gate() {
+        // A backend this build spawned must pass this build's staleness gate,
+        // or ensure_headroom_running kills it on every pass.
+        backend_port::reset_for_tests();
+        for learn in [true, false] {
+            let variants = [
+                (
+                    "/Users/x/venv/bin/headroom",
+                    headroom_entrypoint_startup_args(Some("0.39.0"), learn),
+                ),
+                (
+                    "/Users/x/venv/bin/headroom",
+                    headroom_entrypoint_startup_args(Some("0.26.0"), learn),
+                ),
+                ("/Users/x/venv/bin/python3", headroom_python_startup_args()),
+            ];
+            for (exe, args) in variants {
+                let argv = format!("{exe} {}", args.join(" "));
+                assert!(
+                    proxy_argv_contains_expected_flags(&argv, learn),
+                    "learn={learn}: {argv}"
+                );
+            }
+        }
+        backend_port::reset_for_tests();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_is_never_asked_to_keep_message_bodies() {
+        // --log-messages holds the last 100 full prompts and completions,
+        // readable from /transformations/feed by any local account. Nothing
+        // in the desktop reads them (the feed is fetched with
+        // include_messages=0).
+        backend_port::reset_for_tests();
+        let flag = "--log-messages".to_string();
+        for learn in [true, false] {
+            for version in [Some("0.26.0"), Some("0.39.0"), None] {
+                assert!(!headroom_entrypoint_startup_args(version, learn).contains(&flag));
+            }
+            assert!(!super::expected_proxy_arg_signature(learn).contains(&"--log-messages"));
+        }
+        assert!(!headroom_python_startup_args().contains(&flag));
+        // A backend an older build started still holds bodies: restart it.
+        let old = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages --no-rate-limit";
+        assert!(!proxy_argv_contains_expected_flags(old, false));
+        let old_fallback = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
+                            --no-http2 --log-messages --no-rate-limit";
+        assert!(!proxy_argv_contains_expected_flags(old_fallback, true));
+        backend_port::reset_for_tests();
     }
 
     #[test]
@@ -17143,7 +17213,6 @@ time.sleep(30)
             "--port".to_string(),
             default_port.clone(),
             "--no-http2".to_string(),
-            "--log-messages".to_string(),
         ]));
         assert!(entrypoint_args.contains(&"--learn".to_string()));
         assert!(entrypoint_args.contains(&"--no-memory-tools".to_string()));
@@ -17159,7 +17228,6 @@ time.sleep(30)
                 "--port".to_string(),
                 default_port,
                 "--no-http2".to_string(),
-                "--log-messages".to_string(),
                 "--no-rate-limit".to_string(),
             ]
         );
@@ -17267,7 +17335,7 @@ time.sleep(30)
         assert!(headroom_python_startup_args().contains(&flag));
         assert!(super::expected_proxy_arg_signature(false).contains(&"--no-rate-limit"));
         // The rc.7/rc.8 proxy that is 429ing right now must be restarted.
-        let rc8 = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages";
+        let rc8 = "/Users/x/headroom proxy --port 6768 --no-http2";
         assert!(!proxy_argv_contains_expected_flags(rc8, false));
 
         backend_port::reset_for_tests();

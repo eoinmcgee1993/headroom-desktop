@@ -3347,7 +3347,7 @@ impl AppState {
         // Tear down any orphan proxy from an older desktop build BEFORE taking
         // the lifecycle lock, since `stop_headroom` acquires the same lock.
         // The orphan check: a proxy is reachable, but its argv is missing flags
-        // this build relies on (e.g. --log-messages, --learn). Without this we
+        // this build relies on (e.g. --no-rate-limit, --learn). Without this we
         // would happily reuse a v0.2.x proxy that pre-dates the Activity feed.
         if is_headroom_proxy_reachable()
             && !crate::tool_manager::running_proxy_matches_expected_args()
