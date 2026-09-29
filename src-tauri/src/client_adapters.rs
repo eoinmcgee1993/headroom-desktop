@@ -1280,13 +1280,25 @@ pub(crate) fn codex_unrouted_diagnostics(
     ]
 }
 
-/// Pure decision: the agent ran on this machine while Headroom, up the whole
-/// time, saw nothing from it. `requests_recent` is the agent's proxied request
-/// count over today and yesterday (usage_counters::requests_since_yesterday).
+/// When `client_id`'s routing took effect: the later of `started` and the
+/// connector's enable time. Activity before it had nowhere to route, so it is
+/// no evidence of a broken hookup: a user coding in Codex through the six
+/// minutes of a first-run bootstrap read as unrouted one second after setup
+/// applied (RUST-KC).
+pub(crate) fn routed_since(client_id: &str, started: SystemTime) -> SystemTime {
+    configured_timestamp(&load_setup_state(), client_id)
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+        .map_or(started, |at| started.max(at.into()))
+}
+
+/// Pure decision: the agent ran on this machine while Headroom, routing it the
+/// whole time (`routed_since`), saw nothing from it. `requests_recent` is the
+/// agent's proxied request count over today and yesterday
+/// (usage_counters::requests_since_yesterday).
 pub(crate) fn client_ran_unrouted(
     activity_at: Option<SystemTime>,
     requests_recent: u64,
-    app_started_at: SystemTime,
+    routed_since: SystemTime,
     now: SystemTime,
 ) -> bool {
     let Some(activity_at) = activity_at else {
@@ -1296,12 +1308,12 @@ pub(crate) fn client_ran_unrouted(
         return false;
     }
     let uptime_ok = now
-        .duration_since(app_started_at)
+        .duration_since(routed_since)
         .is_ok_and(|uptime| uptime >= UNROUTED_MIN_UPTIME);
     let recent = now
         .duration_since(activity_at)
         .is_ok_and(|age| age <= UNROUTED_ACTIVITY_WINDOW);
-    uptime_ok && recent && activity_at > app_started_at
+    uptime_ok && recent && activity_at > routed_since
 }
 
 pub fn is_claude_code_enabled() -> bool {
@@ -14291,6 +14303,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             now
         ));
         assert!(!super::client_ran_unrouted(None, 0, started, now));
+    }
+
+    /// RUST-KC: Codex used before its connector was enabled had no route to
+    /// take, so the unrouted baseline is the enable time when that is later.
+    #[test]
+    fn routed_since_is_the_later_of_start_and_enable() {
+        let _home = TestHome::new();
+        let started = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        // Not enabled: app start is all there is.
+        assert_eq!(super::routed_since("codex", started), started);
+        let enabled = started + std::time::Duration::from_secs(360);
+        let mut state = super::ClientSetupState::default();
+        state.configured_clients.insert(
+            "codex_cli".into(),
+            chrono::DateTime::<chrono::Utc>::from(enabled).to_rfc3339(),
+        );
+        state
+            .configured_clients
+            .insert("claude_code".into(), "2020-01-01T00:00:00+00:00".into());
+        super::write_setup_state(&state).expect("write");
+        assert_eq!(super::routed_since("codex", started), enabled);
+        // Enabled in an earlier run: this run's start still bounds it.
+        assert_eq!(super::routed_since("claude_code", started), started);
     }
 
     // NOTE: keep this the only test that calls repair_client_setups: the

@@ -548,15 +548,14 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         return;
     }
     // Cached (~90s warmer cadence), so polling this every 5s costs nothing.
-    let claude = state
-        .list_claude_code_projects()
-        .map(|projects| claude_sessions_touched_since(&projects, since))
-        .unwrap_or(false);
+    let projects = state.list_claude_code_projects().unwrap_or_default();
+    let claude = claude_sessions_touched_since(&projects, since);
     // Shared with the hourly self-heal in `detect_unrouted_clients`: the one
     // helper that knows Codex's session dir AND its GUI thread store, and how
     // to ignore Headroom's own writes to it. It walks, so it is re-asked at
     // most once a minute, not on every 5s poll.
-    let codex = codex_ran_locally_since(since);
+    let codex_active_at = codex_local_activity_at();
+    let codex = codex_active_at.is_some_and(|at| at > since);
     if !claude && !codex {
         // Nothing visible anywhere: no proxied request, and no agent session
         // growing either. Age-matched cohorts (2026-08-11..09-07) put Windows
@@ -577,6 +576,23 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         }
         return;
     }
+    // Activity counts as a leak only once it postdates the agent's routing
+    // (the absence check above rightly counts it from app start). Earlier it
+    // had no route to take (RUST-KC), and the three-minute settle lets the
+    // first proxied request reach `lifetime_requests`.
+    let routed = |client_id| {
+        let at: chrono::DateTime<Utc> =
+            client_adapters::routed_since(client_id, since.into()).into();
+        (Utc::now() - at >= chrono::Duration::minutes(3)).then_some(at)
+    };
+    let claude = claude
+        && routed("claude_code").is_some_and(|at| claude_sessions_touched_since(&projects, at));
+    let codex_routed_since =
+        routed("codex").filter(|at| codex_active_at.is_some_and(|active| active > *at));
+    let codex = codex_routed_since.is_some();
+    if !claude && !codex {
+        return;
+    }
     // One beacon per agent: Codex users save at 55-66% against ~90% for
     // Claude Code on both platforms, with 25-35% never producing traffic, and
     // server-side data cannot tell "routing failed" from "logged in once,
@@ -587,9 +603,11 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     if claude && !CLAUDE_BEACON_SENT.swap(true, Ordering::AcqRel) {
         pricing::report_funnel_step(state, "unrouted_usage_detected");
     }
-    if codex && !CODEX_BEACON_SENT.swap(true, Ordering::AcqRel) {
-        pricing::report_funnel_step(state, "unrouted_codex_usage_detected");
-        report_first_run_unrouted_codex(state, since);
+    if let Some(routed_since) = codex_routed_since {
+        if !CODEX_BEACON_SENT.swap(true, Ordering::AcqRel) {
+            pricing::report_funnel_step(state, "unrouted_codex_usage_detected");
+            report_first_run_unrouted_codex(state, routed_since);
+        }
     }
     if !state.try_mark_unrouted_usage_notified() {
         return;
@@ -658,22 +676,21 @@ fn unrouted_usage_copy(claude: bool, codex: bool) -> (&'static str, &'static str
     }
 }
 
-/// `client_local_activity_at("codex")` against `since`, memoized for a
-/// minute: the helper walks the sessions tree and the thread store (capped),
-/// which is too much for the 5s dashboard poll that drives the nudge. A
-/// cached `false` delays detection by at most that minute; the beacon and the
-/// notification are one-shot anyway.
-fn codex_ran_locally_since(since: chrono::DateTime<Utc>) -> bool {
-    static LAST: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+/// `client_local_activity_at("codex")`, memoized for a minute: the helper
+/// walks the sessions tree and the thread store (capped), which is too much
+/// for the 5s dashboard poll that drives the nudge. A stale answer delays
+/// detection by at most that minute; the beacon and the notification are
+/// one-shot anyway.
+fn codex_local_activity_at() -> Option<chrono::DateTime<Utc>> {
+    type Cached = Option<(std::time::Instant, Option<chrono::DateTime<Utc>>)>;
+    static LAST: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((asked_at, answer)) = *last {
         if asked_at.elapsed() < std::time::Duration::from_secs(60) {
             return answer;
         }
     }
-    let answer = client_adapters::client_local_activity_at("codex")
-        .map(|at| chrono::DateTime::<Utc>::from(at) > since)
-        .unwrap_or(false);
+    let answer = client_adapters::client_local_activity_at("codex").map(Into::into);
     *last = Some((std::time::Instant::now(), answer));
     answer
 }
@@ -5496,7 +5513,8 @@ async fn detect_unrouted_clients(
         ] {
             let activity = client_adapters::client_local_activity_at(client_id);
             let requests = usage_counters::requests_since_yesterday(counter_key);
-            if !client_adapters::client_ran_unrouted(activity, requests, app_started_at, now) {
+            let routed_since = client_adapters::routed_since(client_id, app_started_at);
+            if !client_adapters::client_ran_unrouted(activity, requests, routed_since, now) {
                 continue;
             }
             // One report per client per DAY. The condition is defined over a
@@ -5532,7 +5550,7 @@ async fn detect_unrouted_clients(
             };
             // Before the re-apply: it rewrites the config these tags describe.
             let codex_diagnostics = if client_id == "codex" {
-                client_adapters::codex_unrouted_diagnostics(app_started_at)
+                client_adapters::codex_unrouted_diagnostics(routed_since)
             } else {
                 Vec::new()
             };
