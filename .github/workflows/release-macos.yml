@@ -760,15 +760,22 @@ jobs:
               "$workdir"/*
           fi
 
-          # The windows-preview channel is retired (its workflow is deleted),
-          # but installs from it still poll windows-preview/latest.json. Keep
-          # refreshing it so they are offered this stable build and move onto
-          # the stable endpoint; drop this once the release is deleted.
+          # The windows-preview and linux-preview channels are retired (their
+          # workflows are deleted), but installs from them still poll
+          # <channel>/latest.json. Keep refreshing both so they are offered this
+          # stable build and move onto the stable endpoint; drop a block once
+          # its release is deleted.
           if gh release view windows-preview --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload windows-preview "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit windows-preview --repo "$GITHUB_REPOSITORY" \
               --title "Headroom Windows preview (rolling)" \
               --notes "Windows now ships with the stable releases (current: ${STABLE_TAG}). This channel only redirects remaining preview installs to stable - install from the latest stable release instead."
+          fi
+          if gh release view linux-preview --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload linux-preview "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit linux-preview --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom Linux preview (rolling)" \
+              --notes "Linux now ships with the stable releases (current: ${STABLE_TAG}). This channel only redirects remaining preview installs to stable - install from the latest stable release instead."
           fi
 
           # This version's rcs are dead now that staging-rolling points at the
