@@ -11921,22 +11921,6 @@ fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&ledger).ok()
 }
 
-/// Drop the output-shaper A/B control arm left over from the abandoned 1%
-/// holdout, exactly once.
-///
-/// Those samples predate the current shaper and were collected under a policy
-/// that never gathered enough of them to mean anything, so folding them into
-/// the 3% arm would poison it from the first request. Clearing them on every
-/// spawn is not an option either: the arm is live data now, and this runs each
-/// time the proxy starts.
-///
-/// The stamp sits beside the ledger on purpose. A reset that removes
-/// `~/.headroom` takes the control samples with it, so the stamp going too is
-/// correct — there is nothing left to purge either way.
-///
-/// Best-effort throughout: never touch a missing or unparseable ledger, and
-/// only rewrite when there is control data to drop. Uses `atomic_write` so a
-/// crash mid-write cannot truncate the ledger.
 /// Holdout once this machine's measured estimate is promotable.
 const OUTPUT_HOLDOUT_STEADY: &str = "0.03";
 /// Holdout until then. `assign_arm` is one nested threshold on one hash
@@ -11968,6 +11952,23 @@ fn output_holdout_fraction() -> &'static str {
     holdout
 }
 
+/// Drop the output-shaper A/B control arm left over from the abandoned 1%
+/// holdout, exactly once.
+///
+/// Those samples predate the current shaper and were collected under a policy
+/// that never gathered enough of them to mean anything, so folding them into
+/// the 3% arm would poison it from the first request. Clearing them on every
+/// spawn is not an option either: the arm is live data now, and this runs each
+/// time the proxy starts.
+///
+/// The stamp sits beside the ledger on purpose. A reset that removes
+/// `~/.headroom` takes the control samples with it, so the stamp going too is
+/// correct: there is nothing left to purge either way.
+///
+/// Best-effort throughout: a missing ledger holds nothing legacy and is only
+/// stamped, an unparseable one is never touched, and the ledger is only
+/// rewritten when there is control data to drop. Uses `atomic_write` so a
+/// crash mid-write cannot truncate the ledger.
 fn purge_legacy_output_savings_control_arm_once() {
     let Some(path) = output_savings_ledger_path() else {
         return;
@@ -11976,8 +11977,12 @@ fn purge_legacy_output_savings_control_arm_once() {
     if stamp.exists() {
         return;
     }
-    let Ok(bytes) = std::fs::read(&path) else {
-        return;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        // No ledger, nothing legacy: whatever the proxy writes from here on
+        // is the live arm, so stamp now or the next spawn would clear it.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return,
     };
     if let Some(out) = ledger_bytes_without_control(&bytes) {
         if let Err(err) = crate::client_adapters::atomic_write(&path, &out) {
@@ -14243,6 +14248,29 @@ mod tests {
         std::fs::write(&ledger, with_control).unwrap();
         purge_legacy_output_savings_control_arm_once();
         assert_eq!(std::fs::read(&ledger).unwrap(), with_control);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_ledger_stamps_the_purge_so_the_live_arm_survives() {
+        let root =
+            std::env::temp_dir().join(format!("headroom-purge-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _guard = HomeGuard::new(&root);
+        let ledger = root.join(".headroom").join("output_savings.json");
+
+        // First spawn on a fresh install: no ledger, so nothing legacy exists.
+        purge_legacy_output_savings_control_arm_once();
+
+        // The proxy then fills the live holdout arm. The next spawn must not
+        // mistake it for the abandoned 1% one.
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let live =
+            br#"{"baseline":{"glob":{"n":5}},"treatment":{"k":{"n":3}},"control":{"k":{"n":2}}}"#;
+        std::fs::write(&ledger, live).unwrap();
+        purge_legacy_output_savings_control_arm_once();
+        assert_eq!(std::fs::read(&ledger).unwrap(), live);
 
         let _ = std::fs::remove_dir_all(&root);
     }

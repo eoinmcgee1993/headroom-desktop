@@ -388,11 +388,17 @@ fn measured_if_ready(
     if half_width > MEASURED_MAX_CI_HALF_WIDTH_PCT {
         return None;
     }
-    // Never trade a usable estimate for a measurement of less traffic.
-    if estimated
-        .as_ref()
-        .is_some_and(|e| e.requests > measured.requests)
-    {
+    // Never trade a usable estimate for a measurement of less traffic. Both
+    // sides on the qn basis: `measured.requests` counts only conversation-
+    // qualified rows, so comparing it to the estimate's `n` let one legacy
+    // row block promotion (and hold the 10% holdout boost) for good.
+    let estimated_qn: u64 = ledger
+        .treatment
+        .iter()
+        .filter(|(key, _)| ledger.baseline_for(key).is_some())
+        .map(|(_, acc)| acc.qn)
+        .sum();
+    if estimated.is_some() && estimated_qn > measured.requests {
         return None;
     }
     Some(measured)
@@ -554,6 +560,21 @@ mod tests {
         let e = estimate(HOLDOUT);
         assert_eq!(e.method, "measured");
         assert!((e.reduction_percent - 20.0).abs() < 1e-9);
+        assert_eq!(e.requests, 1000);
+    }
+
+    #[test]
+    fn legacy_treatment_rows_do_not_block_a_solid_holdout() {
+        // A ledger upgraded from before wheel 0.38.0 keeps 10 treatment rows
+        // with no conversation: they count in n, never in qn. The measured
+        // side is on the qn basis, so the "never trade for less traffic"
+        // check has to be too, or it refuses promotion (and the 10% holdout
+        // boost) for good.
+        let e = estimate(&HOLDOUT.replace(
+            r#"{"n": 1000, "sum": 800000, "sumsq": 649990000,"#,
+            r#"{"n": 1010, "sum": 808000, "sumsq": 656390000,"#,
+        ));
+        assert_eq!(e.method, "measured");
         assert_eq!(e.requests, 1000);
     }
 
