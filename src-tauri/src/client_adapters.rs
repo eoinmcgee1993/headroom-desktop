@@ -505,15 +505,17 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
         "codex" | "codex_cli" => {
             // Critical, app-owned write first: the ~/.codex/config.toml provider
             // block is what routes Codex through Headroom.
-            let (changed, backups, preserved_provider) = configure_codex_provider_block()?;
+            let (changed, backups, preserved) = configure_codex_provider_block()?;
             let mut updates = (changed, backups);
-            if let Some(original) = preserved_provider {
-                // A custom root `model_provider` (gateway/alternate provider) was
-                // routing Codex before us: remember it for restore-on-disable so
-                // we don't silently drop the user onto api.openai.com. Restored
-                // silently (no takeover notice — that copy is Claude/base_url
-                // specific).
-                state.preserved_base_urls.insert(state_id.clone(), original);
+            for (entry, original) in preserved {
+                // A custom root `model_provider` or `openai_base_url` (gateway,
+                // LM Studio) was routing Codex before us: remember it for
+                // restore-on-disable so we don't silently drop the user onto
+                // api.openai.com. Restored silently (no takeover notice: that
+                // copy is Claude/base_url specific).
+                state
+                    .preserved_base_urls
+                    .insert(entry.to_string(), original);
             }
 
             // Loud-fail guard so a closed app or clobbered config surfaces in
@@ -1353,16 +1355,19 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
 
     match client_id {
         "codex" | "codex_cli" => {
-            let preserved_provider = state
-                .preserved_base_urls
-                .get(normalized_setup_id(client_id))
-                .cloned();
+            let preserved: Vec<(&str, String)> = CODEX_ROOT_KEYS
+                .iter()
+                .filter_map(|&(key, _, entry)| {
+                    Some((key, state.preserved_base_urls.get(entry)?.clone()))
+                })
+                .collect();
             disable_codex_cli()?;
-            // Restore any pre-Headroom root model_provider instead of leaving the
-            // key deleted -- deleting it silently drops a gateway user onto
-            // api.openai.com (mirrors the Claude base_url restore).
-            if let Some(provider) = preserved_provider {
-                let _ = restore_codex_model_provider(&provider);
+            // Restore any pre-Headroom root model_provider/openai_base_url
+            // instead of leaving the key deleted -- deleting it silently drops a
+            // gateway user onto api.openai.com (mirrors the Claude base_url
+            // restore).
+            for (key, value) in preserved {
+                let _ = restore_codex_root_key(key, &value);
             }
             disable_codex_gui()?;
             // Hand the threads back to the native-provider menu so the full
@@ -1442,9 +1447,11 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             state.remembered_shell_files.remove("codex");
             state.remembered_shell_files.remove("codex_cli");
             state.remembered_shell_files.remove("codex_gui");
-            // Consumed: the provider is back in the user's config now. The next
-            // apply re-captures it if Headroom is re-enabled.
-            state.preserved_base_urls.remove("codex_cli");
+            // Consumed: the values are back in the user's config now. The next
+            // apply re-captures them if Headroom is re-enabled.
+            for (_, _, entry) in CODEX_ROOT_KEYS {
+                state.preserved_base_urls.remove(entry);
+            }
             state.setup_versions.remove("codex_cli");
         }
         "opencode" => {
@@ -4288,6 +4295,25 @@ pub fn retag_codex_threads_to_headroom() {
     retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
 }
 
+/// The root keys the managed `codex_cli` block owns, Headroom's value for each,
+/// and the `preserved_base_urls` entry that holds a user's own value until
+/// disable restores it. `model_provider` keeps the bare `codex_cli` entry older
+/// builds persisted.
+const CODEX_ROOT_KEYS: [(&str, &str, &str); 2] = [
+    ("model_provider", "headroom", "codex_cli"),
+    (
+        "openai_base_url",
+        HEADROOM_OPENAI_BASE_URL,
+        "codex_cli_openai_base_url",
+    ),
+];
+
+/// Whether a comment-stripped TOML line assigns one of [`CODEX_ROOT_KEYS`].
+fn is_codex_root_key_line(code: &str) -> bool {
+    code.split_once('=')
+        .is_some_and(|(key, _)| CODEX_ROOT_KEYS.iter().any(|(k, ..)| key.trim() == *k))
+}
+
 fn codex_root_keys_body() -> String {
     format!(
         "model_provider = \"headroom\"\n\
@@ -4381,13 +4407,14 @@ fn strip_codex_managed_toml(content: &str) -> String {
         &strip_marker_block(&rescued, CODEX_ROOT_BLOCK_ID),
         CODEX_TABLE_BLOCK_ID,
     );
-    let openai_orphan_prefix = "openai_base_url = \"http://127.0.0.1:";
+    // Exact values only: this runs on every quit, and a loopback URL of the
+    // user's own (LM Studio on :1234) is not ours to delete.
+    let openai_orphan = format!("openai_base_url = \"{HEADROOM_OPENAI_BASE_URL}\"");
     without_blocks
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
-            !(trimmed == "model_provider = \"headroom\""
-                || (trimmed.starts_with(openai_orphan_prefix) && trimmed.ends_with("/v1\"")))
+            !(trimmed == "model_provider = \"headroom\"" || trimmed == openai_orphan)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -4396,9 +4423,11 @@ fn strip_codex_managed_toml(content: &str) -> String {
 /// Move every TOML table we do not own out of a managed marker block, re-emitting
 /// it after the closing marker (byte-preserved, order kept). `owned_table` is the
 /// one table header the block legitimately contains (`None` for the root-keys
-/// block). Lines before the first header inside the block stay put: they are root
-/// keys, which are ours by construction. Handles repeated blocks in one pass
-/// since classification is line-state based, not index based.
+/// block). The root-keys block owns only the [`CODEX_ROOT_KEYS`] assignments:
+/// any other root key in it is Codex's (see below) and is moved out the same
+/// way, landing right after the end marker, still in root scope. Handles
+/// repeated blocks in one pass since classification is line-state based, not
+/// index based.
 // ponytail: a comment line directly above a trapped table stays with the block
 // (and is dropped on strip); attach comment-carrying to the following header if
 // a real config ever shows up with one.
@@ -4435,7 +4464,12 @@ fn rescue_foreign_toml_from_block(
             if code.starts_with('[') && code.ends_with(']') {
                 in_foreign_table = owned_table != Some(code);
             }
-            if in_foreign_table {
+            // Codex's TOML writer appends a new root key (/model's `model`,
+            // `model_reasoning_effort`) after the last root key -- our
+            // openai_base_url -- so it lands before our end marker too.
+            let foreign_root_line =
+                owned_table.is_none() && !code.is_empty() && !is_codex_root_key_line(code);
+            if in_foreign_table || foreign_root_line {
                 rescued.push(line);
                 continue;
             }
@@ -4497,39 +4531,40 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
     out
 }
 
-/// The root-scope `model_provider` value in a Codex config, if set to something
-/// other than our managed `headroom`. Root scope only: a `model_provider` inside
-/// a `[profiles.x]`/`[model_providers.x]` table belongs to that table, not the
-/// global route. This is the Codex analog of a foreign `ANTHROPIC_BASE_URL` --
-/// captured on apply and restored on disable.
-fn codex_foreign_model_provider(content: &str) -> Option<String> {
+/// Root-scope lines assigning `key` in a Codex config. Root scope only: the
+/// same key inside a `[profiles.x]`/`[model_providers.x]` table belongs to that
+/// table, not the global route.
+fn codex_root_key_lines<'a>(content: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
     let mut in_root = true;
-    for raw in content.lines() {
+    content.lines().filter(move |raw| {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.starts_with('[') && line.ends_with(']') {
             in_root = false;
-            continue;
         }
-        if !in_root {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim() == "model_provider" {
-                let name = value.trim().trim_matches('"');
-                if !name.is_empty() && name != "headroom" {
-                    return Some(name.to_string());
-                }
-            }
-        }
-    }
-    None
+        in_root && line.split_once('=').is_some_and(|(k, _)| k.trim() == key)
+    })
 }
 
-/// Drop any root-scope `model_provider = ...` line so the managed block's
-/// `model_provider = "headroom"` isn't a duplicate root key (which is invalid
-/// TOML and makes Codex refuse to load its config). A `model_provider` inside a
-/// table is left untouched.
-fn strip_codex_root_model_provider(content: &str) -> String {
+/// The root-scope value of `key` in a Codex config when set to something other
+/// than Headroom's `ours`. This is the Codex analog of a foreign
+/// `ANTHROPIC_BASE_URL` -- captured on apply and restored on disable. Each line
+/// is read as TOML, so a literal ('single-quoted') string or a trailing comment
+/// yields the value Codex itself sees.
+fn codex_foreign_root_value(content: &str, key: &str, ours: &str) -> Option<String> {
+    codex_root_key_lines(content, key)
+        .filter_map(|raw| {
+            let line = toml::from_str::<toml::Table>(raw).ok()?;
+            line.get(key)?.as_str().map(str::to_owned)
+        })
+        .find(|value| !value.is_empty() && value != ours)
+}
+
+/// Drop every root-scope assignment of a [`CODEX_ROOT_KEYS`] key, whatever its
+/// value or spacing, so the managed block's copies aren't duplicate root keys
+/// (invalid TOML: Codex refuses to load its config). The user's own values are
+/// captured by [`codex_foreign_root_value`] before this runs. The same keys
+/// inside a table are left untouched.
+fn strip_codex_root_keys(content: &str) -> String {
     let mut in_root = true;
     content
         .lines()
@@ -4539,11 +4574,7 @@ fn strip_codex_root_model_provider(content: &str) -> String {
                 in_root = false;
                 return true;
             }
-            !(in_root
-                && line
-                    .split_once('=')
-                    .map(|(key, _)| key.trim() == "model_provider")
-                    .unwrap_or(false))
+            !(in_root && is_codex_root_key_line(line))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -4551,7 +4582,7 @@ fn strip_codex_root_model_provider(content: &str) -> String {
 
 /// Drop an unmarked `[model_providers.headroom]` table so the managed block's
 /// copy isn't a duplicate table key. This is the table-scope analog of
-/// [`strip_codex_root_model_provider`]: a second `[model_providers.headroom]`
+/// [`strip_codex_root_keys`]: a second `[model_providers.headroom]`
 /// makes Codex refuse to load its *entire* config, so one stale table breaks
 /// every `codex` invocation, not just our routing (Sentry RUST-6K).
 ///
@@ -4581,20 +4612,21 @@ fn strip_codex_headroom_provider_table(content: &str) -> String {
         .join("\n")
 }
 
-/// Restore a preserved pre-Headroom root `model_provider` after teardown, so a
-/// gateway/alternate-provider user isn't silently left on api.openai.com. No-op
-/// if the config already has a root `model_provider` (user re-added their own).
-fn restore_codex_model_provider(provider: &str) -> Result<()> {
+/// Restore a preserved pre-Headroom root key (`model_provider`,
+/// `openai_base_url`) after teardown, so a gateway/alternate-provider user
+/// isn't silently left on api.openai.com. No-op if the config already has that
+/// root key (user re-added their own): a second one is invalid TOML.
+fn restore_codex_root_key(key: &str, value: &str) -> Result<()> {
     let path = codex_config_toml_path();
     let existing = if path.exists() {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
     } else {
         String::new()
     };
-    if codex_foreign_model_provider(&existing).is_some() {
+    if codex_root_key_lines(&existing, key).next().is_some() {
         return Ok(());
     }
-    let line = format!("model_provider = {}", toml_basic_string(provider));
+    let line = format!("{key} = {}", toml_basic_string(value));
     let trimmed = existing.trim();
     let rebuilt = if trimmed.is_empty() {
         format!("{line}\n")
@@ -4614,9 +4646,9 @@ fn restore_codex_model_provider(provider: &str) -> Result<()> {
 /// the provider table appended at the end, around the user's other content.
 fn render_codex_config(existing: &str) -> String {
     let mid = strip_codex_managed_toml(existing);
-    // Drop a foreign root model_provider too, else our managed
-    // `model_provider = "headroom"` collides with it as a duplicate root key.
-    let mid = strip_codex_root_model_provider(&mid);
+    // Drop a foreign root model_provider/openai_base_url too, else our managed
+    // copies collide with them as duplicate root keys.
+    let mid = strip_codex_root_keys(&mid);
     // Same collision one scope down: an unmarked `[model_providers.headroom]`
     // table would duplicate the one in the managed block below.
     let mid = strip_codex_headroom_provider_table(&mid);
@@ -4636,11 +4668,14 @@ fn render_codex_config(existing: &str) -> String {
     out
 }
 
-/// Returns `(changed_files, backup_files, preserved_provider)`. The third
-/// element is a pre-existing *foreign* root `model_provider` this write replaced
-/// -- callers must preserve it and restore it on disable instead of dropping the
-/// user onto api.openai.com (mirrors [`configure_claude_settings_env`]).
-fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+/// A [`CODEX_ROOT_KEYS`] state entry and the user's own root value it holds.
+type CodexPreservedKey = (&'static str, String);
+
+/// Returns `(changed_files, backup_files, preserved)`: the pre-existing
+/// *foreign* root values this write replaced -- callers must preserve them and
+/// restore them on disable instead of dropping the user onto api.openai.com
+/// (mirrors [`configure_claude_settings_env`]).
+fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Vec<CodexPreservedKey>)> {
     let path = codex_config_toml_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -4652,10 +4687,23 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Option<
         String::new()
     };
 
-    let preserved = codex_foreign_model_provider(&existing);
+    let preserved: Vec<CodexPreservedKey> = CODEX_ROOT_KEYS
+        .iter()
+        .filter_map(|&(key, ours, entry)| {
+            Some((entry, codex_foreign_root_value(&existing, key, ours)?))
+        })
+        .collect();
     let updated = render_codex_config(&existing);
     if updated == existing {
-        return Ok((Vec::new(), Vec::new(), None));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    // Never turn a config Codex loads into one it refuses (a duplicate root key
+    // or table makes Codex reject the whole file): keep the user's file.
+    if existing.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
+        return Err(anyhow!(
+            "rendered {} is not valid TOML; refusing to overwrite",
+            path.display()
+        ));
     }
 
     let backup = backup_if_exists(&path)?;
@@ -14215,21 +14263,40 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     fn codex_foreign_model_provider_is_root_scope_only() {
+        let codex_foreign_model_provider =
+            |content| super::codex_foreign_root_value(content, "model_provider", "headroom");
         assert_eq!(
-            super::codex_foreign_model_provider("model_provider = \"gateway\"\n").as_deref(),
+            codex_foreign_model_provider("model_provider = \"gateway\"\n").as_deref(),
             Some("gateway"),
         );
         // Our own managed value is not "foreign".
         assert_eq!(
-            super::codex_foreign_model_provider("model_provider = \"headroom\"\n"),
+            codex_foreign_model_provider("model_provider = \"headroom\"\n"),
             None,
         );
         // A model_provider inside a table belongs to that table, not the route.
         assert_eq!(
-            super::codex_foreign_model_provider("[profiles.work]\nmodel_provider = \"gateway\"\n"),
+            codex_foreign_model_provider("[profiles.work]\nmodel_provider = \"gateway\"\n"),
             None,
         );
-        assert_eq!(super::codex_foreign_model_provider(""), None);
+        assert_eq!(codex_foreign_model_provider(""), None);
+    }
+
+    #[test]
+    fn codex_foreign_model_provider_reads_the_value_as_toml() {
+        let codex_foreign_model_provider =
+            |content| super::codex_foreign_root_value(content, "model_provider", "headroom");
+        // Audit #90: the value was trimmed of `"` only, so a single-quoted
+        // (literal string) provider was preserved as `'azure'` and restored
+        // as a provider named with quotes, which Codex cannot find.
+        assert_eq!(
+            codex_foreign_model_provider("model_provider = 'azure'\n").as_deref(),
+            Some("azure"),
+        );
+        assert_eq!(
+            codex_foreign_model_provider("model_provider = \"gw\" # corp gateway\n").as_deref(),
+            Some("gw"),
+        );
     }
 
     #[test]
@@ -14658,6 +14725,105 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .is_some(),
             "user provider table survives the round trip, got:\n{after_disable}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_then_disable_codex_restores_a_foreign_root_openai_base_url() {
+        // Audit #2: the managed root block also sets openai_base_url, so a
+        // user's own root value (LM Studio, a gateway) became a duplicate root
+        // key and Codex refused to load its config. A loopback value was
+        // instead deleted outright by the orphan filter.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "openai_base_url=\"http://127.0.0.1:1234/v1\" # LM Studio\nmodel = \"qwen\"\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+
+        let after_apply = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = after_apply
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after apply: {e}\n{after_apply}"));
+        assert_eq!(
+            parsed.get("openai_base_url").and_then(|v| v.as_str()),
+            Some(super::HEADROOM_OPENAI_BASE_URL),
+            "Headroom takes over routing while enabled, got:\n{after_apply}"
+        );
+
+        super::disable_client_setup("codex").expect("disable succeeds");
+
+        let after_disable = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = after_disable
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after disable: {e}\n{after_disable}"));
+        assert_eq!(
+            parsed.get("openai_base_url").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:1234/v1"),
+            "the pre-Headroom base URL is restored on disable, got:\n{after_disable}"
+        );
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("qwen"),
+            "other root keys survive the round trip, got:\n{after_disable}"
+        );
+    }
+
+    #[test]
+    fn strip_codex_managed_toml_keeps_root_keys_codex_appended_inside_the_root_block() {
+        // Audit #18: Codex's /model writes `model` and `model_reasoning_effort`
+        // through toml_edit, which appends them after the last root key --
+        // our openai_base_url -- so they land before our end marker. Every
+        // launch and quit then deleted the user's model choice with the block.
+        let existing = "# >>> headroom:codex_cli >>>\n\
+                        model_provider = \"headroom\"\n\
+                        openai_base_url = \"http://127.0.0.1:6767/v1\"\n\
+                        model = \"gpt-5.5\"\n\
+                        model_reasoning_effort = \"high\"\n\
+                        # <<< headroom:codex_cli <<<\n\
+                        [projects.'/Users/me/code']\n\
+                        trust_level = \"trusted\"\n\
+                        \n\
+                        # >>> headroom:codex_cli_provider >>>\n\
+                        [model_providers.headroom]\n\
+                        name = \"Headroom persistent proxy\"\n\
+                        base_url = \"http://127.0.0.1:6767/v1\"\n\
+                        supports_websockets = false\n\
+                        # <<< headroom:codex_cli_provider <<<\n";
+
+        for (label, out) in [
+            ("render", render_codex_config(existing)),
+            ("strip", super::strip_codex_managed_toml(existing)),
+        ] {
+            let parsed: toml::Value = out
+                .parse()
+                .unwrap_or_else(|e| panic!("{label}: valid toml: {e}\n{out}"));
+            assert_eq!(
+                parsed.get("model").and_then(|v| v.as_str()),
+                Some("gpt-5.5"),
+                "{label}: /model's choice stays a root key, got:\n{out}"
+            );
+            assert_eq!(
+                parsed
+                    .get("model_reasoning_effort")
+                    .and_then(|v| v.as_str()),
+                Some("high"),
+                "{label}: reasoning effort stays a root key, got:\n{out}"
+            );
+            if let Some(start) = out.find("# >>> headroom:codex_cli >>>") {
+                let end = out.find("# <<< headroom:codex_cli <<<").unwrap();
+                assert!(
+                    !out[start..end].contains("model ="),
+                    "{label}: rescued keys sit outside the managed block, got:\n{out}"
+                );
+            }
+        }
     }
 
     #[test]
