@@ -62,8 +62,12 @@ jobs:
           TAG: ${{ github.event.inputs.release_tag }}
         run: |
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # --latest=false: a new full release otherwise becomes
+            # releases/latest, which has no latest.json, and every stable
+            # install's update check 404s (silently) until the next stable.
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
+              --latest=false \
               --title "Vendor wheels ($TAG)" \
               --notes "Pre-built wheels for sdist-only PyPI packages. Consumed by headroom-desktop bootstrap via pip --find-links."
           fi

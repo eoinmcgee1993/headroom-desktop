@@ -1805,6 +1805,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "flate2",
+ "glib",
  "image",
  "json5",
  "keyring",

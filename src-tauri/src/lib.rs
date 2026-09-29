@@ -216,10 +216,9 @@ struct AppUpdateConfiguration {
     endpoint_count: usize,
     configuration_error: Option<String>,
     beta_channel_enabled: bool,
-    // macOS install() swaps the .app in place with no privilege prompt, so the
-    // frontend may stage updates silently. Windows install() exits the app to
-    // run the installer, and Linux .deb raises a polkit prompt - both must
-    // stay behind an explicit user click.
+    // Whether the frontend may stage updates with no click. Only a macOS
+    // bundle that it and its folder can move without admin rights qualifies:
+    // see silent_install_supported.
     silent_install_supported: bool,
 }
 
@@ -266,6 +265,13 @@ static LOOPBACK_SOCKET_DENIED_CAPTURED: AtomicBool = AtomicBool::new(false);
 // `configured_clients` is already empty, leaving nothing for the next launch's
 // `restore_client_setups()` to bring back.
 static EXIT_CLEAR_DONE: AtomicBool = AtomicBool::new(false);
+
+// Same for the quit-time backend stop. Quit, restart and uninstall stop the
+// backend before `app.exit(0)`, and the exit handler then fires for both
+// `ExitRequested` and `Exit`. Every repeat found no child but still ran the
+// full orphan sweep on the UI thread, three PowerShell CIM queries on Windows,
+// so one quit spawned PowerShell up to nine times in a row.
+static EXIT_STOP_DONE: AtomicBool = AtomicBool::new(false);
 
 // Set at the start of every exit path (settings/tray quit, Cmd-Q / dock quit,
 // restart_app) BEFORE stop_headroom runs. The proxy watchdog polls every 5s
@@ -469,7 +475,7 @@ fn maybe_fire_onboarding_recovery_nudge(
     if first_polled_at.elapsed() < std::time::Duration::from_secs(10 * 60) {
         return;
     }
-    if dashboard.lifetime_requests > 0 {
+    if dashboard.lifetime_requests > 0 || unrouted_usage_expected(state) {
         return;
     }
     if !state.try_mark_onboarding_recovery_notified() {
@@ -542,9 +548,8 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         return;
     }
     // Sessions growing while nothing reaches the proxy proves a leak, not its
-    // cause. With 6767 unbound the cause is ours, and "restart your terminal"
-    // is advice that cannot work -- same reasoning as the hourly detector.
-    if state.intercept_bind_failed() {
+    // cause. See `unrouted_usage_expected`.
+    if unrouted_usage_expected(state) {
         return;
     }
     // Cached (~90s warmer cadence), so polling this every 5s costs nothing.
@@ -572,7 +577,7 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         if Utc::now() - since >= chrono::Duration::minutes(45)
             && !ABSENT_BEACON_SENT.swap(true, Ordering::AcqRel)
         {
-            pricing::report_funnel_step(state, "agent_activity_absent");
+            pricing::report_funnel_step(app, "agent_activity_absent");
         }
         return;
     }
@@ -585,7 +590,10 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
             client_adapters::routed_since(client_id, since.into()).into();
         (Utc::now() - at >= chrono::Duration::minutes(3)).then_some(at)
     };
+    // The Claude-only gate sends Claude Code direct on purpose while Codex
+    // stays routed, so only the Codex half can still be a leak.
     let claude = claude
+        && !state.claude_only_bypass.load(Ordering::Acquire)
         && routed("claude_code").is_some_and(|at| claude_sessions_touched_since(&projects, at));
     let codex_routed_since =
         routed("codex").filter(|at| codex_active_at.is_some_and(|active| active > *at));
@@ -601,15 +609,20 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     static CLAUDE_BEACON_SENT: AtomicBool = AtomicBool::new(false);
     static CODEX_BEACON_SENT: AtomicBool = AtomicBool::new(false);
     if claude && !CLAUDE_BEACON_SENT.swap(true, Ordering::AcqRel) {
-        pricing::report_funnel_step(state, "unrouted_usage_detected");
+        pricing::report_funnel_step(app, "unrouted_usage_detected");
     }
     if let Some(routed_since) = codex_routed_since {
         if !CODEX_BEACON_SENT.swap(true, Ordering::AcqRel) {
-            pricing::report_funnel_step(state, "unrouted_codex_usage_detected");
+            pricing::report_funnel_step(app, "unrouted_codex_usage_detected");
             report_first_run_unrouted_codex(state, routed_since);
         }
     }
-    if !state.try_mark_unrouted_usage_notified() {
+    // The beacons count an agent whose connector is off as well, as the hourly
+    // detector does (its `enabled` tag), but restarting a terminal only helps
+    // an agent Headroom routes: with the connector off there is no route.
+    let claude = claude && client_adapters::is_claude_code_enabled();
+    let codex = codex && client_adapters::is_codex_enabled();
+    if !(claude || codex) || !state.try_mark_unrouted_usage_notified() {
         return;
     }
     let (title, body) = unrouted_usage_copy(claude, codex);
@@ -619,6 +632,17 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         "unrouted_usage_nudge_shown",
         Some(json!({ "claude": claude, "codex": codex })),
     );
+}
+
+/// True when an agent going direct is expected, so "active locally, nothing
+/// proxied" is no leak and "restart your terminal" is advice that cannot work:
+/// paused (the watchdog's give-up auto-pause included), the pricing gate's
+/// full bypass, or 6767 never bound, which makes the cause ours. Shared by the
+/// hourly detector and both first-run nudges.
+fn unrouted_usage_expected(state: &AppState) -> bool {
+    state.runtime_is_paused()
+        || state.intercept_bind_failed()
+        || state.proxy_bypass.load(Ordering::Acquire)
 }
 
 /// First-run twin of the hourly `unrouted_client` report, with the same Codex
@@ -870,6 +894,7 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            utc_keyed: false,
         })
         .collect();
     // Keep the headline card in sync with the buckets it derives from.
@@ -926,7 +951,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         if dashboard.lifetime_estimated_tokens_saved > 0
             && !FIRST_SAVINGS_FUNNEL_REPORTED.swap(true, Ordering::AcqRel)
         {
-            pricing::report_funnel_step(&state, "first_savings_recorded");
+            pricing::report_funnel_step(&app, "first_savings_recorded");
         }
 
         maybe_inject_fake_daily_savings(&mut dashboard);
@@ -941,6 +966,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
 fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
     let current_version = app.package_info().version.to_string();
     let beta_channel_enabled = beta_channel_enabled();
+    let silent_install_supported = silent_install_supported();
     match release_updater_config(&current_version, beta_channel_enabled) {
         Ok(Some(config)) => AppUpdateConfiguration {
             enabled: true,
@@ -948,7 +974,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
             endpoint_count: config.endpoints.len(),
             configuration_error: None,
             beta_channel_enabled,
-            silent_install_supported: cfg!(target_os = "macos"),
+            silent_install_supported,
         },
         Ok(None) => AppUpdateConfiguration {
             enabled: false,
@@ -956,7 +982,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
             endpoint_count: 0,
             configuration_error: None,
             beta_channel_enabled,
-            silent_install_supported: cfg!(target_os = "macos"),
+            silent_install_supported,
         },
         Err(ref err) => {
             sentry::capture_message(
@@ -969,7 +995,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
                 endpoint_count: 0,
                 configuration_error: Some(err.clone()),
                 beta_channel_enabled,
-                silent_install_supported: cfg!(target_os = "macos"),
+                silent_install_supported,
             }
         }
     }
@@ -997,7 +1023,11 @@ async fn check_for_app_update(
     // so macOS/Linux keep tearing down through `restart_app` exactly as before.
     // The installer does not launch until this returns, so it must be bounded:
     // `stop_headroom` caps itself at ~2s on the lifecycle lock plus ~2s on the
-    // child before it force-kills.
+    // child before it force-kills, and the rest rewrites a few client configs.
+    // It runs the full quit teardown, client clear included: without it Claude
+    // Code and Codex stayed on the dead 127.0.0.1:6767 whenever the installer
+    // failed to start or relaunch us. A relaunched build's launch-time
+    // restore_client_setups re-applies the remembered clients.
     let teardown = app.clone();
     let updater = app
         .updater_builder()
@@ -1005,10 +1035,9 @@ async fn check_for_app_update(
         .endpoints(config.endpoints)
         .map_err(|err| err.to_string())?
         .on_before_exit(move || {
-            log::info!("update: stopping the backend before the installer exits the app");
-            SHUTTING_DOWN.store(true, Ordering::Release);
+            log::info!("update: running the exit teardown before the installer exits the app");
             let state: tauri::State<'_, AppState> = teardown.state();
-            state.stop_headroom();
+            run_exit_teardown(&state);
         })
         .build()
         .map_err(|err| err.to_string())?;
@@ -1189,7 +1218,7 @@ async fn restart_app(app: AppHandle) {
     // proxy-arg change shipped by an upgrade silently never takes effect.
     {
         let state: tauri::State<'_, AppState> = app.state();
-        state.stop_headroom();
+        stop_headroom_for_exit(&state);
     }
     analytics::shutdown(&app);
 
@@ -1236,15 +1265,18 @@ const READ_ONLY_BUNDLE_MESSAGE: &str =
 /// `EROFS` is the dead end, so only `EROFS` may block.
 #[cfg(target_os = "macos")]
 fn dir_is_read_only(dir: &std::path::Path) -> bool {
+    probe_dir_write(dir).is_err_and(|err| is_read_only_filesystem(&err))
+}
+
+/// Creates and removes a throwaway file in `dir`: the only honest answer to
+/// "can this folder be written", since mode bits miss read-only mounts and ACLs.
+#[cfg(target_os = "macos")]
+fn probe_dir_write(dir: &std::path::Path) -> std::io::Result<()> {
     let probe = dir.join(format!(".headroom-write-probe-{}", std::process::id()));
     // direct-write: throwaway write probe, removed right after
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            false
-        }
-        Err(err) => is_read_only_filesystem(&err),
-    }
+    std::fs::File::create(&probe)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// `EROFS` (30). Raw errno rather than `io::ErrorKind::ReadOnlyFilesystem` so
@@ -1252,6 +1284,47 @@ fn dir_is_read_only(dir: &std::path::Path) -> bool {
 #[cfg(target_os = "macos")]
 fn is_read_only_filesystem(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(30)
+}
+
+/// Whether the frontend may stage an update with no click. Windows install()
+/// exits the app to run the installer and Linux .deb raises a polkit prompt, so
+/// both stay behind an explicit click; macOS qualifies only when the in-place
+/// swap needs no privileges.
+fn silent_install_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        bundle_folder_accepts_writes(current_app_bundle_path().as_deref())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// True only when a real file create in the folder holding `bundle` succeeds
+/// and the bundle itself is writable. On `PermissionDenied` (a standard account
+/// under the root:admin `/Applications`, the managed-Mac case) the updater
+/// plugin retries the swap under an AppleScript admin prompt it runs on the
+/// main thread, so a quiet hourly install froze the app behind a password
+/// dialog nobody asked for, and cancelling it only queued the next one. Those
+/// installs notify instead and prompt only after a click.
+///
+/// The plugin's swap renames the bundle into a `$TMPDIR` folder, and moving a
+/// directory to a new parent also needs write on the directory itself (its
+/// `..` entry), so a 755 bundle owned by another admin or by root (a pkg or
+/// MDM deploy) hits the same prompt from a writable folder. `access(W_OK)`
+/// asks without writing into the signed bundle and honours ACLs like rename.
+#[cfg(target_os = "macos")]
+fn bundle_folder_accepts_writes(bundle: Option<&std::path::Path>) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    bundle.is_some_and(|bundle| {
+        bundle
+            .parent()
+            .is_some_and(|dir| probe_dir_write(dir).is_ok())
+            && std::ffi::CString::new(bundle.as_os_str().as_bytes())
+                .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0)
+    })
 }
 
 /// `true` when the running `.app` cannot be replaced in place because the folder
@@ -1364,9 +1437,10 @@ fn detached_script(script: &str) -> String {
 /// the file name never fires and the gate silently blocks every force-kill. Read
 /// the value the kernel will actually report instead. macOS has no `/proc`, but
 /// its `ps -o comm=` prints the full executable path, so the file name matches as
-/// a substring there.
-#[cfg(target_os = "macos")]
-fn relauncher_expect_name() -> String {
+/// a substring there. The unix process sweep (`state::sweep_should_kill`)
+/// uses the same value to tell a Headroom parent from a subreaper.
+#[cfg(unix)]
+pub(crate) fn relauncher_expect_name() -> String {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_to_string("/proc/self/comm")
@@ -1597,12 +1671,14 @@ fn show_notification_impl(
 }
 
 #[tauri::command]
-async fn install_addon(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<DashboardState, String> {
-    match id.as_str() {
+async fn install_addon(app: AppHandle, id: String) -> Result<DashboardState, String> {
+    // pip, npx and asset downloads run for minutes; see run_lifecycle_command.
+    run_lifecycle_command(app, move |app| install_addon_blocking(&app, &id)).await
+}
+
+fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, String> {
+    let state: State<'_, AppState> = app.state();
+    match id {
         "markitdown" => {
             // markitdown[all] shares the runtime venv; a pip run beside the
             // upgrade's replaces the same files twice.
@@ -1635,7 +1711,7 @@ async fn install_addon(
         "ponytail" | "caveman" => {
             let outdated = state
                 .tool_manager
-                .install_plugin(&id)
+                .install_plugin(id)
                 .map_err(|err| err.to_string())?;
             if let Some(host) = outdated {
                 let name = if id == "caveman" {
@@ -1649,7 +1725,7 @@ async fn install_addon(
                     "Codex"
                 };
                 let _ = show_notification_impl(
-                    &app,
+                    app,
                     &format!("Update the {host} CLI to finish {name} setup"),
                     &format!("{name} is installed for {other}. Your {host} CLI is too old to add it -- update the {host} CLI, then re-install {name} to enable it there too."),
                     None,
@@ -1676,18 +1752,29 @@ async fn install_addon(
         }
         other => return Err(format!("unknown addon: {other}")),
     }
-    analytics::track_event(&app, &format!("{id}_installed"), None);
+    analytics::track_event(app, &format!("{id}_installed"), None);
     Ok(state.dashboard())
 }
 
 #[tauri::command]
 async fn set_addon_enabled(
     app: AppHandle,
-    state: State<'_, AppState>,
     id: String,
     enabled: bool,
 ) -> Result<DashboardState, String> {
-    match id.as_str() {
+    run_lifecycle_command(app, move |app| {
+        set_addon_enabled_blocking(&app, &id, enabled)
+    })
+    .await
+}
+
+fn set_addon_enabled_blocking(
+    app: &AppHandle,
+    id: &str,
+    enabled: bool,
+) -> Result<DashboardState, String> {
+    let state: State<'_, AppState> = app.state();
+    match id {
         "markitdown" => {
             state
                 .tool_manager
@@ -1710,7 +1797,7 @@ async fn set_addon_enabled(
         "ponytail" | "caveman" => {
             state
                 .tool_manager
-                .set_plugin_enabled(&id, enabled)
+                .set_plugin_enabled(id, enabled)
                 .map_err(|err| err.to_string())?;
         }
         "serena" => {
@@ -1734,17 +1821,18 @@ async fn set_addon_enabled(
         other => return Err(format!("unknown addon: {other}")),
     }
     let action = if enabled { "enabled" } else { "disabled" };
-    analytics::track_event(&app, &format!("{id}_{action}"), None);
+    analytics::track_event(app, &format!("{id}_{action}"), None);
     Ok(state.dashboard())
 }
 
 #[tauri::command]
-async fn uninstall_addon(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<DashboardState, String> {
-    match id.as_str() {
+async fn uninstall_addon(app: AppHandle, id: String) -> Result<DashboardState, String> {
+    run_lifecycle_command(app, move |app| uninstall_addon_blocking(&app, &id)).await
+}
+
+fn uninstall_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, String> {
+    let state: State<'_, AppState> = app.state();
+    match id {
         "markitdown" => {
             refuse_venv_cli_during_upgrade(&state)?;
             let _ = client_adapters::disable_markitdown_integration(
@@ -1770,7 +1858,7 @@ async fn uninstall_addon(
         "ponytail" | "caveman" => {
             state
                 .tool_manager
-                .uninstall_plugin(&id)
+                .uninstall_plugin(id)
                 .map_err(|err| err.to_string())?;
         }
         "serena" => {
@@ -1793,7 +1881,7 @@ async fn uninstall_addon(
         }
         other => return Err(format!("unknown addon: {other}")),
     }
-    analytics::track_event(&app, &format!("{id}_uninstalled"), None);
+    analytics::track_event(app, &format!("{id}_uninstalled"), None);
     Ok(state.dashboard())
 }
 
@@ -1839,7 +1927,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         );
     } else {
         analytics::track_event(&app, "bootstrap_started", None);
-        pricing::report_funnel_step(&app.state::<AppState>(), "bootstrap_started");
+        pricing::report_funnel_step(&app, "bootstrap_started");
     }
 
     let app_handle = app.clone();
@@ -1895,7 +1983,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                     "bootstrap_failed",
                     Some(json!({ "phase": "install_runtime", "kind": kind.as_str() })),
                 );
-                pricing::report_funnel_step(&state, "bootstrap_failed");
+                pricing::report_funnel_step(&app_handle, "bootstrap_failed");
                 return;
             }
 
@@ -1967,7 +2055,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         state.mark_bootstrap_complete();
         emit_bootstrap_progress(&app_handle, &state);
         analytics::track_event(&app_handle, "bootstrap_completed", None);
-        pricing::report_funnel_step(&state, "bootstrap_completed");
+        pricing::report_funnel_step(&app_handle, "bootstrap_completed");
     });
 
     Ok(())
@@ -2348,15 +2436,16 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              the app. Contact support@extraheadroom.com if you need help."
         }
         BootstrapFailureKind::NoUsableTempDir => {
-            "Installation failed: Headroom can't create temporary files on this Mac. \
-             This usually means your disk is full, or security software (like an MDM \
-             profile or endpoint protection) is blocking writes to /tmp and \
-             /var/folders. Free up disk space, restart your Mac, and try again. \
-             If it still fails, contact support@extraheadroom.com."
+            "Installation failed: Headroom can't create temporary files on this \
+             computer. This usually means your disk is full, or security software \
+             (like an MDM profile or endpoint protection) is blocking writes to the \
+             system temporary folder (%TEMP% on Windows, /tmp and /var/folders on a \
+             Mac, /tmp on Linux). Free up disk space, restart your computer, and try \
+             again. If it still fails, contact support@extraheadroom.com."
         }
         BootstrapFailureKind::NetworkDownload => {
             "Couldn't reach the download server. This is usually a temporary \
-             network or server hiccup, not a problem with your Mac. Check your \
+             network or server hiccup, not a problem with your computer. Check your \
              internet connection and click Try again. If it keeps failing, a \
              firewall, VPN, or corporate proxy may be blocking pypi.org and \
              files.pythonhosted.org - try another network or contact \
@@ -3701,14 +3790,33 @@ pub(crate) fn endpoint_protection_hint_runtime() -> String {
 
 /// Map common runtime-upgrade failure modes to a short user-facing hint.
 pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
-    let chain_raw = format!("{err:#}");
+    // The chain as `{err:#}` renders it, but a pip failure contributes only
+    // its stderr: stdout is one line per locked package, and `networkx` read
+    // as a network error on every failed dependency pass (disk full, file
+    // lock), telling those users PyPI was unreachable.
+    let chain_raw = err
+        .chain()
+        .map(
+            |cause| match cause.downcast_ref::<tool_manager::CommandFailure>() {
+                Some(failure) => failure.stderr.clone(),
+                None => cause.to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(": ");
     // Endpoint protection check uses the raw chain (the matcher does its own
     // case-folding) so signal patterns like "signal=9" match exactly.
     if is_endpoint_protection_signal(&chain_raw) {
         return Some(endpoint_protection_hint_install());
     }
     let chain = chain_raw.to_ascii_lowercase();
-    if chain.contains("network")
+    // "network" as a word (or `NetworkError`), not as the head of a name:
+    // stderr still names the file pip failed on, often under `networkx/`.
+    let mentions_network = chain.match_indices("network").any(|(at, word)| {
+        let rest = &chain[at + word.len()..];
+        rest.starts_with("error") || !rest.starts_with(|c: char| c.is_ascii_alphanumeric())
+    });
+    if mentions_network
         || chain.contains("timed out")
         || chain.contains("dns")
         || chain.contains("connection refused")
@@ -3728,6 +3836,25 @@ pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
         return Some(
             "The new Headroom version couldn't be imported. Try retrying or reinstalling.".into(),
         );
+    }
+    // pip offline never says "network": it retries through a DNS or connect
+    // error (the markers tool_manager's pip categories read), then reports
+    // "No matching distribution found". Checked after the disk and checksum
+    // hints, which a retry that recovered would otherwise mask.
+    let pip_offline = [
+        "temporary failure in name resolution",
+        "nodename nor servname",
+        "getaddrinfo failed",
+        "newconnectionerror",
+        "failed to establish a new connection",
+    ]
+    .iter()
+    .any(|marker| chain.contains(marker))
+        || tool_manager::pip_index_fetch_failed(
+            &tool_manager::pip_failure_evidence(err, &chain).to_ascii_lowercase(),
+        );
+    if pip_offline {
+        return Some("Couldn't reach PyPI. Check your network and retry.".into());
     }
     if chain.contains("resolution") || chain.contains("no matching distribution") {
         return Some(
@@ -3889,22 +4016,30 @@ fn get_gated_bypass_bytes() -> u64 {
 /// Code that has sat dormant since March gets a "Waiting for a prompt..."
 /// spinner that can never resolve -- and because the success button needs
 /// every row green, the screen reads as "your setup failed" forever.
+///
+/// On the blocking pool: the walk visits up to 20k transcript entries per
+/// client, which froze every webview and the tray as a sync command.
 #[tauri::command]
-fn get_client_local_activity_ages(
+async fn get_client_local_activity_ages(
     client_ids: Vec<String>,
 ) -> std::collections::HashMap<String, u64> {
-    let now = std::time::SystemTime::now();
-    client_ids
-        .into_iter()
-        .filter_map(|client_id| {
-            let at = client_adapters::client_local_activity_at(&client_id)?;
-            // A clock that moved backwards yields no reading rather than a
-            // wrapped one: "never used" is the safe answer, since it only ever
-            // removes a row from the test, never fails one.
-            let age = now.duration_since(at).ok()?.as_secs();
-            Some((client_id, age))
-        })
-        .collect()
+    tauri::async_runtime::spawn_blocking(move || {
+        let now = std::time::SystemTime::now();
+        client_ids
+            .into_iter()
+            .filter_map(|client_id| {
+                let at = client_adapters::client_local_activity_at(&client_id)?;
+                // A clock that moved backwards yields no reading rather than a
+                // wrapped one: "never used" is the safe answer, since it only ever
+                // removes a row from the test, never fails one.
+                let age = now.duration_since(at).ok()?.as_secs();
+                Some((client_id, age))
+            })
+            .collect()
+    })
+    .await
+    // Same safe answer for a walk that panicked: no reading, never a failure.
+    .unwrap_or_default()
 }
 
 /// Running agent processes keyed by connector id, for the verify screen's
@@ -3958,13 +4093,19 @@ fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize
 /// can offer one click instead of a copy-paste terminal round-trip. Exactly
 /// the script the panel shows for manual use; nothing is decided here, the
 /// panel re-probes connectors afterwards and the installer's own output comes
-/// back on failure. Blocking for its ~30-60s is fine only off the UI thread:
-/// Tauri 2 runs a plain sync command ON the main thread, so it takes
-/// `command(async)` to keep the window responsive while the button holds a
-/// busy state. No timeout - a hung download leaves the button busy, which the
-/// user can abandon for the manual command sitting right under it.
-#[tauri::command(async)]
-fn install_claude_code_cli() -> Result<(), String> {
+/// back on failure. Its ~30-60s runs on the blocking pool: a sync command runs
+/// on the main thread (Tauri 2), and `command(async)` on a sync fn runs it
+/// inline on an async worker, starving other async IPC. No timeout - a hung
+/// download leaves the button busy and holds one blocking-pool thread, which
+/// the user can abandon for the manual command sitting right under it.
+#[tauri::command]
+async fn install_claude_code_cli() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(install_claude_code_cli_blocking)
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn install_claude_code_cli_blocking() -> Result<(), String> {
     #[cfg(windows)]
     let output = crate::proc::command("powershell")
         .args([
@@ -4084,8 +4225,10 @@ pub struct DebugOverrides {
 }
 
 /// Cached launch flags. On a cold cache, performs one bounded config fetch so
-/// a fresh first launch does not miss its server bucket.
-#[tauri::command]
+/// a fresh first launch does not miss its server bucket. `async` so that fetch
+/// never runs on the main thread: both windows call this at startup, and on a
+/// network that drops extraheadroom.com each call froze the UI for 8s.
+#[tauri::command(async)]
 fn get_launch_flags() -> LaunchFlags {
     LaunchFlags {
         paywall_first: pricing::paywall_first_flag_or_refresh(),
@@ -4137,26 +4280,42 @@ fn get_claude_profile(state: State<'_, AppState>) -> ClaudeAccountProfile {
 }
 
 #[tauri::command]
-async fn get_headroom_pricing_status(
-    state: State<'_, AppState>,
-) -> Result<HeadroomPricingStatus, String> {
-    let status = pricing::get_pricing_status(&state)?;
-    // Reconcile the runtime with the freshly evaluated status. Bridges the
-    // gap between "user just upgraded" (subscription_active flips on) and
-    // "Headroom optimization actually resumes" — without this, the pricing
-    // gate's bypass flag would stay set and Python would stay down until
-    // the next app launch.
-    state.apply_pricing_gates(&status);
-    state.report_weekly_limit_transitions(&status);
-    Ok(status)
+async fn get_headroom_pricing_status(app: AppHandle) -> Result<HeadroomPricingStatus, String> {
+    // The fetch is blocking HTTP (8s timeout per call), polled every 5-60s.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        let status = pricing::get_pricing_status(&state)?;
+        // Reconcile the runtime with the freshly evaluated status. Bridges the
+        // gap between "user just upgraded" (subscription_active flips on) and
+        // "Headroom optimization actually resumes" - without this, the pricing
+        // gate's bypass flag would stay set and Python would stay down until
+        // the next app launch.
+        //
+        // On its own thread for the reason `verify_headroom_auth_code` gives:
+        // an ungate starts the backend and `ensure_headroom_running` waits out
+        // a cold boot (minutes), which kept the paywall up and made the UI
+        // skip every other pricing refresh until Python opened its port.
+        {
+            let app_handle = app.clone();
+            let status = status.clone();
+            std::thread::spawn(move || {
+                let state: State<'_, AppState> = app_handle.state();
+                state.apply_pricing_gates(&status);
+            });
+        }
+        state.report_weekly_limit_transitions(&status);
+        Ok(status)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 /// Fire-and-forget install-wizard funnel beacon from the frontend. Returns
 /// immediately; `pricing::report_funnel_step` does the POST on a detached
 /// thread so a slow/offline network never blocks the wizard.
 #[tauri::command]
-fn report_funnel_step(state: State<'_, AppState>, step: String) {
-    pricing::report_funnel_step(&state, &step);
+fn report_funnel_step(app: AppHandle, step: String) {
+    pricing::report_funnel_step(&app, &step);
 }
 
 /// Credentials handed over by a `headroom://auth` magic link, waiting for the
@@ -4390,15 +4549,23 @@ fn get_headroom_learn_status(
     state.headroom_learn_status(project_path.as_deref())
 }
 
+/// On the blocking pool: a cold cache smoke-tests each CLI and falls back to a
+/// `$SHELL -ilc` probe per missing one (up to 2s each with a heavy rc file),
+/// which froze the window on every Re-check as a sync command.
 #[tauri::command]
-fn get_headroom_learn_prereq_status(
-    state: State<'_, AppState>,
+async fn get_headroom_learn_prereq_status(
+    app: AppHandle,
     force: Option<bool>,
-) -> HeadroomLearnPrereqStatus {
-    if force.unwrap_or(false) {
-        state.invalidate_headroom_learn_prereq_cache();
-    }
-    state.headroom_learn_prereq_status()
+) -> Result<HeadroomLearnPrereqStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        if force.unwrap_or(false) {
+            state.invalidate_headroom_learn_prereq_cache();
+        }
+        state.headroom_learn_prereq_status()
+    })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -4414,14 +4581,19 @@ async fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedRespo
 /// Read-only snapshot of the activity feed. Observation — fetching the proxy,
 /// writing to ActivityFacts, persisting — happens on a dedicated background
 /// timer (see `spawn_activity_observer`), so this command never mutates state.
-/// That keeps the IPC hot path short: one in-memory lock + a cheap /readyz
-/// ping to the local proxy.
+/// Still on the blocking pool: the /readyz ping waits up to 5s, and a Serena
+/// stats cache miss runs `ps`, reads today's logs and probes four ports.
 #[tauri::command]
-async fn get_activity_feed(state: State<'_, AppState>) -> Result<ActivityFeedResponse, String> {
-    Ok(ActivityFeedResponse {
-        tiles: state.activity_feed_snapshot(),
-        proxy_reachable: crate::state::headroom_proxy_reachable(),
+async fn get_activity_feed(app: AppHandle) -> Result<ActivityFeedResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        ActivityFeedResponse {
+            tiles: state.activity_feed_snapshot(),
+            proxy_reachable: crate::state::headroom_proxy_reachable(),
+        }
     })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 /// Observation cadence for background activity milestones. A modest delay is
@@ -4547,6 +4719,16 @@ fn feed_failure_is_persistent(elapsed: std::time::Duration) -> bool {
     elapsed >= FEED_FETCH_FAILURE_GRACE
 }
 
+/// Whether the app itself is holding the backend (or 6767) down, so a failing
+/// feed pull is expected. See the stand-down in `run_activity_observation`.
+fn feed_canary_stands_down(state: &AppState) -> bool {
+    state.runtime_is_paused()
+        || state.runtime_is_auto_paused()
+        || state.runtime_is_starting()
+        || state.intercept_bind_failed()
+        || state.proxy_bypass.load(Ordering::Acquire)
+}
+
 fn transformations_feed_pull_limit() -> Option<u32> {
     static LAST_PULL: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
     let forwarded: u64 = crate::proxy_intercept::intercept_request_counts()
@@ -4584,13 +4766,10 @@ fn run_activity_observation(app: &AppHandle) {
     // cannot bind 6767 (RUST-EQ, Windows refusing the socket outright), every
     // fetch is refused for as long as that lasts -- and the bind loop already
     // reports it, with the OS code and the occupant. The canary would only add
-    // a second, blinder issue for the same machine (RUST-DT).
-    let intercept_bind_failed = state.intercept_bind_failed();
-    if state.runtime_is_paused()
-        || state.runtime_is_auto_paused()
-        || state.runtime_is_starting()
-        || intercept_bind_failed
-    {
+    // a second, blinder issue for the same machine (RUST-DT). The pricing
+    // gate's full bypass stops the backend on purpose too, for as long as the
+    // gate holds (the Claude-only gate keeps it up, so it still counts).
+    if feed_canary_stands_down(&state) {
         *FEED_FAILING_SINCE.lock() = None;
     } else if let Some(limit) = transformations_feed_pull_limit() {
         match fetch_transformations_feed(limit) {
@@ -4884,14 +5063,33 @@ fn claude_learn_md_path(project_path: &str) -> std::path::PathBuf {
 
 #[tauri::command]
 async fn delete_applied_pattern(
+    state: State<'_, AppState>,
     project_path: String,
     file_kind: String,
     section_title: String,
     bullet_text: String,
 ) -> Result<(), String> {
-    let path = match file_kind.as_str() {
-        "claude" => claude_learn_md_path(&project_path),
-        "memory" => crate::tool_manager::claude_project_memory_file(&project_path),
+    delete_applied_pattern_in(
+        &headroom_memory_db_path(),
+        &project_path,
+        &file_kind,
+        &section_title,
+        &bullet_text,
+    )?;
+    state.invalidate_memory_export_cache();
+    Ok(())
+}
+
+fn delete_applied_pattern_in(
+    memory_db: &Path,
+    project_path: &str,
+    file_kind: &str,
+    section_title: &str,
+    bullet_text: &str,
+) -> Result<(), String> {
+    let path = match file_kind {
+        "claude" => claude_learn_md_path(project_path),
+        "memory" => crate::tool_manager::claude_project_memory_file(project_path),
         other => return Err(format!("Unknown file_kind: {other}")),
     };
     if !path.exists() {
@@ -4899,14 +5097,34 @@ async fn delete_applied_pattern(
     }
     let content =
         std::fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
-    let updated =
-        crate::tool_manager::delete_applied_bullet(&content, &section_title, &bullet_text);
+    let updated = crate::tool_manager::delete_applied_bullet(&content, section_title, bullet_text);
     if updated == content {
         return Ok(()); // no-op; nothing to write
+    }
+    // The backend's traffic learner rebuilds every `Learned:` section from
+    // memory.db on its next flush, so the bullet would come back unless its
+    // source row goes first. Fail before touching the file so a retry works.
+    if section_title.starts_with("Learned: ") {
+        forget_traffic_learner_rule(memory_db, bullet_text)
+            .map_err(|err| format!("forget rule in {}: {err}", memory_db.display()))?;
     }
     crate::client_adapters::atomic_write(&path, updated.as_bytes())
         .map_err(|err| format!("write {}: {err:#}", path.display()))?;
     Ok(())
+}
+
+/// Delete the traffic_learner rows a `Learned:` bullet was rendered from
+/// (the writer emits `- {content}`). A missing DB means nothing to forget.
+fn forget_traffic_learner_rule(memory_db: &Path, bullet_text: &str) -> rusqlite::Result<usize> {
+    if !memory_db.exists() {
+        return Ok(0);
+    }
+    rusqlite::Connection::open(memory_db)?.execute(
+        "DELETE FROM memories \
+         WHERE json_extract(metadata, '$.source') = 'traffic_learner' \
+           AND trim(content) = ?1",
+        [bullet_text],
+    )
 }
 
 fn read_applied_block(path: &std::path::Path) -> Vec<crate::models::AppliedSection> {
@@ -5041,10 +5259,15 @@ async fn start_headroom_learn(
     if matches!(agent, LearnAgent::Claude) && project_path.is_none() {
         return Err("A project path is required for Claude Headroom Learn.".into());
     }
+    // Uncached: smoke-tests both CLIs and may `$SHELL -ilc` probe for each
+    // missing one, seconds that belong on the blocking pool.
+    let prereq = tauri::async_runtime::spawn_blocking(detect_headroom_learn_prereq_status)
+        .await
+        .map_err(|err| err.to_string())?;
     check_headroom_learn_prereqs(
         agent,
         crate::state::headroom_learn_platform_message().as_deref(),
-        &detect_headroom_learn_prereq_status(),
+        &prereq,
     )?;
 
     // Codex isn't project-organized, so its run-status is keyed on a stable id.
@@ -5056,7 +5279,7 @@ async fn start_headroom_learn(
     };
     {
         let state: tauri::State<'_, AppState> = app.state();
-        state.begin_headroom_learn_run(&run_key)?;
+        state.begin_headroom_learn_run(&run_key, matches!(agent, LearnAgent::Claude))?;
     }
 
     let app_handle = app.clone();
@@ -5339,7 +5562,7 @@ async fn apply_client_setup(
             // path counts: launcher auto-configure, the manual client-setup
             // screen, and the dashboard connector toggle. First-write-wins
             // server-side, so post-onboarding re-applies are no-ops.
-            pricing::report_funnel_step(&state, "client_setup_applied");
+            pricing::report_funnel_step(&app, "client_setup_applied");
             analytics::track_event(
                 &app,
                 "client_setup_applied",
@@ -5414,7 +5637,7 @@ async fn apply_client_setup(
             // exclusions: permission-denied and disk-full are environmental,
             // but the per-OS funnel still needs them counted as "setup was
             // attempted and did not stick" (invisible on Windows otherwise).
-            pricing::report_funnel_step(&state, "client_setup_failed");
+            pricing::report_funnel_step(&app, "client_setup_failed");
             Err(msg)
         }
     }
@@ -5492,12 +5715,7 @@ async fn detect_unrouted_clients(
         // the client, re-applies a setup that was never wrong, and shows the
         // user a "ran without Headroom" affordance pointing at their terminal.
         // The bind loop already reports the real cause, with the OS code.
-        if state.runtime_is_paused()
-            || state.intercept_bind_failed()
-            || state
-                .proxy_bypass
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if unrouted_usage_expected(&state) {
             return Vec::new();
         }
         // ponytail: process-wide hourly throttle, same shape as
@@ -5637,6 +5855,9 @@ async fn get_client_connectors(
 
 #[tauri::command]
 async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), String> {
+    // Before the disable, so the tray loop cannot see the connector gone
+    // first and announce the user's own change as a disconnect.
+    *LAST_USER_CONNECTOR_DISABLE.lock() = Some(std::time::Instant::now());
     client_adapters::disable_client_setup(&client_id).map_err(|err| err.to_string())?;
     analytics::track_event(
         &app,
@@ -5907,10 +6128,13 @@ async fn start_headroom(app: AppHandle) -> Result<(), String> {
 
 fn start_headroom_blocking(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
-    state.resume_runtime().map_err(|err| err.to_string())?;
-    std::thread::spawn(|| {
-        client_adapters::restore_client_setups();
-    });
+    // Restore even when the start fails: resume_runtime has already un-paused,
+    // so nothing else brings back the clients the pause cleared, and the 6767
+    // intercept forwards direct while the backend is down (same reasoning as
+    // resume_for_client_setup).
+    let resumed = state.resume_runtime();
+    std::thread::spawn(client_adapters::restore_client_setups);
+    resumed.map_err(|err| err.to_string())?;
     analytics::track_event(&app, "runtime_resumed", None);
     Ok(())
 }
@@ -5930,10 +6154,10 @@ fn force_restart_headroom_blocking(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
     state.stop_headroom();
     state.set_runtime_auto_paused(false);
-    state.resume_runtime().map_err(|err| err.to_string())?;
-    std::thread::spawn(|| {
-        client_adapters::restore_client_setups();
-    });
+    // Restore whatever the start returns; see start_headroom_blocking.
+    let resumed = state.resume_runtime();
+    std::thread::spawn(client_adapters::restore_client_setups);
+    resumed.map_err(|err| err.to_string())?;
     analytics::track_event(&app, "runtime_force_restarted", None);
     Ok(())
 }
@@ -6061,7 +6285,7 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     SHUTTING_DOWN.store(true, Ordering::Release);
     {
         let state: tauri::State<'_, AppState> = app.state();
-        state.stop_headroom();
+        stop_headroom_for_exit(&state);
         // Plugin addons live in the hosts' plugin registries, outside Headroom's
         // own footprint that perform_full_cleanup() wipes, so remove them here
         // while we still have the ToolManager. Best-effort.
@@ -6103,6 +6327,11 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
         let _ = manager.disable();
     }
 
+    // The cleanup reverts every client setup itself. Left unset, the exit
+    // handler's clear_client_setups ran after it and its write_setup_state
+    // recreated `<app data>/config/client-setup.json` in the directory the
+    // cleanup just purged.
+    EXIT_CLEAR_DONE.store(true, Ordering::Release);
     let mut removed = client_adapters::perform_full_cleanup();
 
     // Trash the running .app bundle itself once we exit. Best-effort and
@@ -6190,7 +6419,7 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
     let runtime_paused = {
         let state: tauri::State<'_, AppState> = app.state();
         let runtime_paused = state.runtime_is_paused();
-        state.stop_headroom();
+        stop_headroom_for_exit(&state);
         // Mark the quit-time clear as done so the RunEvent::Exit handler skips
         // its redundant clear_client_setups(). A second call would wipe the
         // remembered_clients snapshot we just saved (configured_clients is now
@@ -6212,6 +6441,85 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         client.flush(Some(std::time::Duration::from_secs(2)));
     }
     app.exit(0);
+}
+
+/// Stops the backend at most once per process. See `EXIT_STOP_DONE`.
+fn stop_headroom_for_exit(state: &AppState) {
+    if !EXIT_STOP_DONE.swap(true, Ordering::AcqRel) {
+        log::info!("exit: stop_headroom");
+        state.stop_headroom();
+    }
+}
+
+/// The teardown every exit runs: the RunEvent exit arm, and the Windows
+/// updater's `on_before_exit`, which exits through `std::process::exit` and so
+/// never reaches that arm.
+fn run_exit_teardown(state: &AppState) {
+    SHUTTING_DOWN.store(true, Ordering::Release);
+    // Step markers: this teardown runs on the UI thread, so a step that blocks
+    // freezes the app mid-quit and emits nothing (Sentry only receives
+    // warn!/error!). The last marker in the log names the step that hung.
+    stop_headroom_for_exit(state);
+    // Gracefully reverse every client's base-URL override (and shell blocks) on
+    // quit so Claude Code / Codex fall back to talking directly to their native
+    // providers while Headroom is not running, instead of pointing at a
+    // now-dead proxy on 6767. The snapshot is remembered so the next launch's
+    // restore_client_setups re-applies it. Guarded to run once: the exit
+    // handler fires for both ExitRequested and Exit, and a second
+    // clear_client_setups wipes the remembered snapshot.
+    if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+        log::info!("exit: clear_client_setups");
+        if let Err(err) = client_adapters::clear_client_setups() {
+            log::warn!("exit: clear_client_setups failed: {err}");
+        }
+    }
+    // Hand Codex threads back to the native provider so its history menu stays
+    // whole while Headroom is not running. Cmd-Q / dock quit / signals skip
+    // exit_headroom -> clear_client_setups, so this is the only retag they
+    // get; the next launch re-applies the headroom tag via
+    // restore_client_setups. Best-effort.
+    log::info!("exit: retag_codex_threads_to_native");
+    client_adapters::retag_codex_threads_to_native();
+    log::info!("exit: teardown complete");
+}
+
+/// What a Linux logout, shutdown, reboot or `kill` sends (SIGTERM), plus a
+/// closed launching terminal (SIGHUP) and Ctrl-C (SIGINT).
+#[cfg(target_os = "linux")]
+const EXIT_SIGNALS: [i32; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
+
+/// Turns each signal into a normal quit. Their default action killed the
+/// process with no RunEvent, so the exit teardown never ran and Claude Code /
+/// Codex stayed routed to a dead 127.0.0.1:6767 after every reboot until
+/// Headroom was opened by hand. The callback runs on the GTK main loop.
+/// `Break` drops the source, which restores the default action, so the same
+/// signal sent again still kills the app if the teardown hangs.
+/// A signal the process inherited as ignored (`nohup` ignores SIGHUP, a
+/// script's background job ignores SIGINT) stays ignored: GLib would replace
+/// SIG_IGN with its own handler, so closing the terminal would quit the app and
+/// unroute every client.
+#[cfg(target_os = "linux")]
+fn route_signals_to_exit(signals: &[i32], exit: impl Fn() + Clone + Send + 'static) {
+    for &signum in signals {
+        if signal_is_ignored(signum) {
+            log::info!("exit: signal {signum} inherited as ignored, not routing it");
+            continue;
+        }
+        let exit = exit.clone();
+        glib::unix_signal_add(signum, move || {
+            log::info!("exit: signal {signum}, quitting");
+            exit();
+            glib::ControlFlow::Break
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_is_ignored(signum: i32) -> bool {
+    // SAFETY: a null `act` only reads the current disposition into `old`.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::sigaction(signum, std::ptr::null(), &mut old) };
+    read == 0 && old.sa_sigaction == libc::SIG_IGN
 }
 
 fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Value {
@@ -6463,53 +6771,6 @@ pub fn run() {
 
     let state = AppState::new().unwrap_or_else(|err| fatal_app_state_error(err));
 
-    // A previous bootstrap attempt that never reached a verdict: the app was
-    // quit, crashed, or killed mid-install, so neither bootstrap_completed nor
-    // the error branch ever ran. Production funnel data (2026-08-26) shows
-    // these silent deaths outnumber classified failures ~4:1; this is the only
-    // signal they leave.
-    if let Some(abandoned) = state.tool_manager.take_abandoned_bootstrap() {
-        // The tail of the previous run's app log usually holds the last thing
-        // the install did before dying. Same 12KB cap as
-        // capture_upgrade_failure: Sentry drops extras past ~16KB. Connection-
-        // pool debug lines are dropped first so the budget goes to the install
-        // rather than to health polling (RUST-9Y).
-        let log_tail = std::fs::read_to_string(logging::log_path())
-            .ok()
-            .map(|s| tail_bytes_for_sentry(&strip_connection_noise(&s), SENTRY_EXTRA_TAIL_BYTES))
-            .unwrap_or_else(|| "app log unreadable".into());
-        sentry::with_scope(
-            |scope| {
-                let fp = ["bootstrap_abandoned", abandoned.step.as_str()];
-                scope.set_fingerprint(Some(fp.as_slice()));
-                scope.set_tag("abandoned_step", &abandoned.step);
-                scope.set_extra("percent", u64::from(abandoned.percent).into());
-                scope.set_extra("app_log_tail", log_tail.into());
-                // File it under the build that died, not this one.
-                if !abandoned.version.is_empty() {
-                    let release = format!("{}@{}", env!("CARGO_PKG_NAME"), abandoned.version);
-                    scope.add_event_processor(move |mut event| {
-                        event.release = Some(release.clone().into());
-                        Some(event)
-                    });
-                }
-            },
-            || {
-                sentry::capture_message(
-                    &format!(
-                        "bootstrap_abandoned (died at \"{}\" {}%)",
-                        abandoned.step, abandoned.percent
-                    ),
-                    sentry::Level::Warning,
-                );
-            },
-        );
-        // Funnel mirror so the server-side stall query can tell "died
-        // mid-install but came back" from "gone for good". Unknown step names
-        // are ignored by servers that predate this one.
-        pricing::report_funnel_step(&state, "bootstrap_abandoned");
-    }
-
     let mut builder =
         tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Second launch: focus the existing window and exit the new process.
@@ -6551,7 +6812,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init());
 
     let app = builder
-        .setup(|app| {
+        .setup(move |app| {
             // First thing in setup, before anything that can pump the Windows
             // message loop (set_size/center below re-enter the webview and can
             // dispatch a frontend command): every analytics accessor resolves
@@ -6560,6 +6821,63 @@ pub fn run() {
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
             ));
+            // A previous bootstrap attempt that never reached a verdict: the
+            // app was quit, crashed, or killed mid-install, so neither
+            // bootstrap_completed nor the error branch ever ran. Production
+            // funnel data (2026-08-26) shows these silent deaths outnumber
+            // classified failures ~4:1; this is the only signal they leave.
+            //
+            // Taken here, not before the builder: single-instance exits a
+            // second launch from its plugin setup, which runs before this
+            // closure. A second process on Windows/Linux (a shortcut clicked
+            // during a slow install, any headroom:// link) used to take the
+            // running install's marker first and file a false abandon.
+            let state: tauri::State<'_, AppState> = app.state();
+            if let Some(abandoned) = state.tool_manager.take_abandoned_bootstrap() {
+                // The tail of the previous run's app log usually holds the last
+                // thing the install did before dying. Same 12KB cap as
+                // capture_upgrade_failure: Sentry drops extras past ~16KB.
+                // Connection-pool debug lines are dropped first so the budget
+                // goes to the install rather than to health polling (RUST-9Y).
+                let log_tail = std::fs::read_to_string(logging::log_path())
+                    .ok()
+                    .map(|s| {
+                        tail_bytes_for_sentry(&strip_connection_noise(&s), SENTRY_EXTRA_TAIL_BYTES)
+                    })
+                    .unwrap_or_else(|| "app log unreadable".into());
+                sentry::with_scope(
+                    |scope| {
+                        let fp = ["bootstrap_abandoned", abandoned.step.as_str()];
+                        scope.set_fingerprint(Some(fp.as_slice()));
+                        scope.set_tag("abandoned_step", &abandoned.step);
+                        scope.set_extra("percent", u64::from(abandoned.percent).into());
+                        scope.set_extra("app_log_tail", log_tail.into());
+                        // File it under the build that died, not this one.
+                        if !abandoned.version.is_empty() {
+                            let release =
+                                format!("{}@{}", env!("CARGO_PKG_NAME"), abandoned.version);
+                            scope.add_event_processor(move |mut event| {
+                                event.release = Some(release.clone().into());
+                                Some(event)
+                            });
+                        }
+                    },
+                    || {
+                        sentry::capture_message(
+                            &format!(
+                                "bootstrap_abandoned (died at \"{}\" {}%)",
+                                abandoned.step, abandoned.percent
+                            ),
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
+                // Funnel mirror of the capture, so the server-side stall query
+                // can tell "died mid-install but came back" from "gone for
+                // good". Needs the AnalyticsClient managed above. Unknown step
+                // names are ignored by servers that predate this one.
+                pricing::report_funnel_step(app.handle(), "bootstrap_abandoned");
+            }
             // A WebView2 runtime that is registered but broken passes Tauri's
             // "installed" check, then fails to create the config windows, and
             // Tauri only logs that: the app ran with a tray icon and no window
@@ -6632,6 +6950,12 @@ pub fn run() {
             // Autostart is opt-in. Users enable it explicitly from Settings,
             // which avoids triggering macOS's "Background item added" prompt
             // on first launch.
+
+            #[cfg(target_os = "linux")]
+            route_signals_to_exit(&EXIT_SIGNALS, {
+                let handle = app.handle().clone();
+                move || handle.exit(0)
+            });
 
             app.manage(TraySessionSavings(Mutex::new(TraySavingsToday::default())));
             setup_tray(app.handle())?;
@@ -6724,7 +7048,8 @@ pub fn run() {
             // channel forever). On panic we log + report and resume the
             // recv loop on the next signal.
             // Warm the paywall-first flag cache once per launch. Fire-and-forget:
-            // get_launch_flags serves cached-or-false immediately either way.
+            // get_launch_flags waits on its own fetch only until one has failed
+            // on this install, then serves cached-or-false.
             std::thread::Builder::new()
                 .name("paywall-flag-fetch".into())
                 .spawn(pricing::refresh_paywall_first_flag)
@@ -6985,43 +7310,16 @@ pub fn run() {
             }
             return;
         }
-        // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
-        // or our explicit quit/restart commands). Without this, the proxy
-        // outlives the desktop and the next launch reuses an orphan.
+        // Tear down the proxy on every exit path (Cmd-Q, dock quit, a Linux
+        // SIGTERM/SIGHUP/SIGINT via route_signals_to_exit, or our explicit
+        // quit/restart commands). Without this, the proxy outlives the
+        // desktop and the next launch reuses an orphan.
         if matches!(
             event,
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
-            SHUTTING_DOWN.store(true, Ordering::Release);
-            // Step markers: this teardown runs on the UI thread, so a step
-            // that blocks freezes the app mid-quit and emits nothing (Sentry
-            // only receives warn!/error!). The last marker in the log names
-            // the step that hung.
-            log::info!("exit: stop_headroom");
             let state: tauri::State<'_, AppState> = app.state();
-            state.stop_headroom();
-            // Gracefully reverse every client's base-URL override (and shell
-            // blocks) on quit so Claude Code / Codex fall back to talking
-            // directly to their native providers while Headroom is not
-            // running, instead of pointing at a now-dead proxy on 6767. The
-            // snapshot is remembered so the next launch's
-            // restore_client_setups re-applies it. Guarded to run once: the
-            // exit handler fires for both ExitRequested and Exit, and a
-            // second clear_client_setups wipes the remembered snapshot.
-            if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
-                log::info!("exit: clear_client_setups");
-                if let Err(err) = client_adapters::clear_client_setups() {
-                    log::warn!("exit: clear_client_setups failed: {err}");
-                }
-            }
-            // Hand Codex threads back to the native provider so its history
-            // menu stays whole while Headroom is not running. Cmd-Q / dock
-            // quit / signals skip exit_headroom -> clear_client_setups, so
-            // this is the only retag they get; the next launch re-applies the
-            // headroom tag via restore_client_setups. Best-effort.
-            log::info!("exit: retag_codex_threads_to_native");
-            client_adapters::retag_codex_threads_to_native();
-            log::info!("exit: teardown complete");
+            run_exit_teardown(&state);
         }
     });
 }
@@ -7151,12 +7449,18 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
         .map(|point| {
             let day_counters = counters.get(&point.date);
             pricing::SavingsDay {
-                // Only local-tracker buckets have a local boundary. Backend
-                // rollups are UTC-keyed and carry no new-input dimension; stamping
-                // a local end on them would relabel a UTC day as a local one.
-                day_ends_at: (point.new_input_tokens > 0)
-                    .then(|| savings_day_end(&point.date, &chrono::Local))
-                    .flatten(),
+                // Backend rollups are UTC-keyed: they end at UTC midnight, sent
+                // explicitly because the server keeps a stored end on nil, so
+                // only a value repairs a local end stamped by older builds.
+                // Local-tracker buckets (new-input evidence) end at local
+                // midnight; anything else stays unstated.
+                day_ends_at: if point.utc_keyed {
+                    savings_day_end(&point.date, &Utc)
+                } else {
+                    (point.new_input_tokens > 0)
+                        .then(|| savings_day_end(&point.date, &chrono::Local))
+                        .flatten()
+                },
                 date: point.date.clone(),
                 savings_usd: point.estimated_savings_usd,
                 output_savings_usd: point.output_savings_usd,
@@ -7416,16 +7720,17 @@ fn check_headroom_learn_prereqs(
 }
 
 /// Count entries in a `headroom memory export` JSON payload whose `created_at`
-/// parses into the same UTC day as `now`. The export writes `created_at` as an
+/// falls on the same local day as `now`. The export writes `created_at` as an
 /// RFC3339-ish string without a timezone suffix (`2026-04-21T10:00:00`); we
-/// treat those as UTC, matching the rest of the activity pipeline.
+/// parse those as UTC and bucket by the user's local day, like the sibling
+/// reminders/learnings counters.
 fn count_memories_created_today(
     json: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<usize, String> {
     let raw: Vec<serde_json::Value> =
         serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
-    let today = now.date_naive();
+    let today = crate::storage::user_day(now);
     Ok(raw
         .into_iter()
         .filter_map(|v| {
@@ -7433,7 +7738,7 @@ fn count_memories_created_today(
                 .and_then(|c| c.as_str())
                 .and_then(parse_memory_created_at)
         })
-        .filter(|dt| dt.date_naive() == today)
+        .filter(|dt| crate::storage::user_day(*dt) == today)
         .count())
 }
 
@@ -7588,11 +7893,34 @@ fn normalize_learn_failure_signature(signature: &str) -> String {
     )
 }
 
+/// The agent whose CLI runs a learn scan's analysis, which is what every
+/// failure hint must name. OpenCode and Grok sessions are read plugin-side and
+/// analyzed through Claude Code when it is installed, else Codex (the prereq
+/// check guarantees one of the two).
+fn learn_analysis_agent(agent: LearnAgent, claude_installed: bool) -> LearnAgent {
+    match agent {
+        LearnAgent::Opencode | LearnAgent::Grok if claude_installed => LearnAgent::Claude,
+        LearnAgent::Opencode | LearnAgent::Grok => LearnAgent::Codex,
+        other => other,
+    }
+}
+
+/// A learn failure's stderr up to upstream's `returned unparseable output`
+/// marker. What follows it is the model's answer (RUST-B7), an analysis of the
+/// user's own sessions that can quote an auth or limit line. That dump only
+/// exists when the CLI exited 0, so it never holds the CLI's own verdict, and
+/// the auth, limit and API classifiers must not read it.
+fn learn_failure_diagnosis(stderr: &str) -> &str {
+    stderr
+        .split_once("returned unparseable output")
+        .map_or(stderr, |(head, _)| head)
+}
+
 /// True when a `headroom learn` failure was the coding agent's CLI refusing to
 /// run because nobody is signed in to it on this machine.
 ///
 /// This is a user-environment condition, not an app bug: the analyzer shells
-/// out to `claude`/`codex`/`opencode`, and if that CLI has no session it exits
+/// out to `claude` or `codex`, and if that CLI has no session it exits
 /// non-zero with its own login prompt. RUST-B6 is the whole class -- four
 /// events whose only content was `Not logged in - Please run /login`, which no
 /// change on our side can resolve. It stays out of Sentry and becomes an
@@ -7622,13 +7950,12 @@ fn learn_failure_is_agent_auth(text: &str) -> bool {
 }
 
 /// The user-facing remedy for [`learn_failure_is_agent_auth`], naming the CLI
-/// the run actually shelled out to.
+/// the run actually shelled out to. The hints take [`learn_analysis_agent`],
+/// so only Claude and Codex reach them.
 fn learn_agent_auth_hint(agent: LearnAgent) -> String {
     let (cli, command) = match agent {
-        LearnAgent::Claude => ("Claude Code", "claude"),
         LearnAgent::Codex => ("Codex", "codex"),
-        LearnAgent::Opencode => ("opencode", "opencode"),
-        LearnAgent::Grok => ("Grok", "grok"),
+        _ => ("Claude Code", "claude"),
     };
     format!(
         "{cli} is not signed in on this machine, so headroom learn could not run its analysis. \
@@ -7723,10 +8050,8 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
 /// The user-facing remedy for [`learn_failure_agent_api_error_line`].
 fn learn_agent_api_error_hint(agent: LearnAgent, line: &str) -> String {
     let (cli, command) = match agent {
-        LearnAgent::Claude => ("Claude Code", "claude"),
         LearnAgent::Codex => ("Codex", "codex"),
-        LearnAgent::Opencode => ("opencode", "opencode"),
-        LearnAgent::Grok => ("Grok", "grok"),
+        _ => ("Claude Code", "claude"),
     };
     format!(
         "{cli}'s API refused the request (\"{line}\"), so headroom learn could not run its \
@@ -7739,10 +8064,8 @@ fn learn_agent_api_error_hint(agent: LearnAgent, line: &str) -> String {
 /// CLI's own line so the reset time survives to the UI.
 fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
     let cli = match agent {
-        LearnAgent::Claude => "Claude Code",
         LearnAgent::Codex => "Codex",
-        LearnAgent::Opencode => "opencode",
-        LearnAgent::Grok => "Grok",
+        _ => "Claude Code",
     };
     format!(
         "{cli} hit your plan's usage limit, so headroom learn could not run its analysis \
@@ -7810,10 +8133,8 @@ fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
 /// The user-facing remedy for [`learn_failure_is_agent_api_unreachable`].
 fn learn_agent_api_unreachable_hint(agent: LearnAgent) -> String {
     let cli = match agent {
-        LearnAgent::Claude => "Claude Code",
         LearnAgent::Codex => "Codex",
-        LearnAgent::Opencode => "opencode",
-        LearnAgent::Grok => "Grok",
+        _ => "Claude Code",
     };
     format!(
         "{cli} could not reach its API -- it retried and gave up -- so headroom learn could not \
@@ -7876,10 +8197,8 @@ fn learn_agent_cli_outdated_hint(agent: LearnAgent) -> String {
 /// The user-facing remedy for [`learn_failure_is_agent_unparseable_output`].
 fn learn_agent_unparseable_output_hint(agent: LearnAgent) -> String {
     let cli = match agent {
-        LearnAgent::Claude => "Claude Code",
         LearnAgent::Codex => "Codex",
-        LearnAgent::Opencode => "opencode",
-        LearnAgent::Grok => "Grok",
+        _ => "Claude Code",
     };
     format!(
         "{cli} answered with something other than the analysis headroom learn asked for, so \
@@ -8111,14 +8430,16 @@ fn execute_headroom_learn_run(
         }
     }
 
-    let cli_path = match agent {
-        LearnAgent::Claude => claude_cli::detect_claude_cli(),
+    // Analysis CLI, not the agent's own binary. Resolved once, so the spawn
+    // below and the failure hints cannot disagree about which CLI ran.
+    let claude_path = match agent {
+        LearnAgent::Codex => None,
+        _ => claude_cli::detect_claude_cli(),
+    };
+    let analysis_agent = learn_analysis_agent(agent, claude_path.is_some());
+    let cli_path = match analysis_agent {
         LearnAgent::Codex => client_adapters::detect_codex_cli(),
-        // Analysis CLI, not the agent's own binary: prefer Claude, fall back
-        // to Codex (prereq check guarantees one exists).
-        LearnAgent::Opencode | LearnAgent::Grok => {
-            claude_cli::detect_claude_cli().or_else(client_adapters::detect_codex_cli)
-        }
+        _ => claude_path,
     };
 
     let mut command = crate::proc::command(&entrypoint);
@@ -8171,7 +8492,7 @@ fn execute_headroom_learn_run(
             });
             // Session parsing is plugin-side; the analysis LLM runs through
             // whichever supported CLI is installed (mirrors the prereq check).
-            if claude_cli::detect_claude_cli().is_some() {
+            if analysis_agent == LearnAgent::Claude {
                 command.env("HEADROOM_LEARN_CLI", "claude");
             } else {
                 command
@@ -8261,21 +8582,24 @@ fn execute_headroom_learn_run(
                     // branch below (RUST-B6, RUST-BF): when the agent CLI has no
                     // signed-in session or its plan hit a usage limit, nothing
                     // on our side can change the outcome.
-                    let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
+                    // Never the model's dumped answer (see
+                    // `learn_failure_diagnosis`).
+                    let diagnosis = learn_failure_diagnosis(&stderr);
+                    let agent_not_signed_in = learn_failure_is_agent_auth(diagnosis);
                     let agent_limit_line =
-                        learn_failure_agent_limit_line(&stderr).map(str::to_string);
+                        learn_failure_agent_limit_line(diagnosis).map(str::to_string);
                     // RUST-EW, third cause in the same class: the CLI never
                     // reached its own API.
-                    let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
+                    let agent_api_unreachable = learn_failure_is_agent_api_unreachable(diagnosis);
                     // RUST-B7, fourth: the model's answer was not the JSON the
                     // analyzer asked for.
                     let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
                     // Fifth: the CLI's own API said no (status, rate limit,
                     // credit balance).
                     let agent_api_error_line =
-                        learn_failure_agent_api_error_line(&stderr).map(str::to_string);
+                        learn_failure_agent_api_error_line(diagnosis).map(str::to_string);
                     // Sixth: the CLI is too old for upstream's flags (RUST-K9).
-                    let agent_cli_outdated = learn_failure_is_agent_cli_outdated(&stderr);
+                    let agent_cli_outdated = learn_failure_is_agent_cli_outdated(diagnosis);
                     if !agent_not_signed_in
                         && agent_limit_line.is_none()
                         && !agent_api_unreachable
@@ -8339,24 +8663,24 @@ fn execute_headroom_learn_run(
                     let (summary, detail) = if agent_not_signed_in {
                         (
                             format!("headroom learn needs a signed-in agent for {project_name}."),
-                            learn_agent_auth_hint(agent),
+                            learn_agent_auth_hint(analysis_agent),
                         )
                     } else if let Some(line) = &agent_limit_line {
                         (
                             format!(
                                 "headroom learn hit the agent's usage limit for {project_name}."
                             ),
-                            learn_agent_limit_hint(agent, line),
+                            learn_agent_limit_hint(analysis_agent, line),
                         )
                     } else if let Some(line) = &agent_api_error_line {
                         (
                             format!("headroom learn could not reach the agent's API for {project_name}."),
-                            learn_agent_api_error_hint(agent, line),
+                            learn_agent_api_error_hint(analysis_agent, line),
                         )
                     } else if agent_cli_outdated {
                         (
                             format!("headroom learn needs a newer agent CLI for {project_name}."),
-                            learn_agent_cli_outdated_hint(agent),
+                            learn_agent_cli_outdated_hint(analysis_agent),
                         )
                     } else {
                         (
@@ -8476,12 +8800,16 @@ fn execute_headroom_learn_run(
                 // Matched against the whole stderr rather than the signature:
                 // upstream's marker line ends before the child's diagnosis,
                 // which can land several lines further down.
-                let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
-                let agent_limit_line = learn_failure_agent_limit_line(&stderr).map(str::to_string);
-                let agent_model_rejected = learn_failure_is_agent_model_rejected(&stderr);
-                let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
+                // Never the model's dumped answer, though (see
+                // `learn_failure_diagnosis`).
+                let diagnosis = learn_failure_diagnosis(&stderr);
+                let agent_not_signed_in = learn_failure_is_agent_auth(diagnosis);
+                let agent_limit_line =
+                    learn_failure_agent_limit_line(diagnosis).map(str::to_string);
+                let agent_model_rejected = learn_failure_is_agent_model_rejected(diagnosis);
+                let agent_api_unreachable = learn_failure_is_agent_api_unreachable(diagnosis);
                 let agent_api_error_line =
-                    learn_failure_agent_api_error_line(&stderr).map(str::to_string);
+                    learn_failure_agent_api_error_line(diagnosis).map(str::to_string);
                 // RUST-3F: this used to read `signature.contains(...)`, which is
                 // exactly the mistake the paragraph above warns about. Click
                 // prints its usage banner FIRST and the diagnosis LAST:
@@ -8495,9 +8823,9 @@ fn execute_headroom_learn_run(
                 // and never the verdict. The suppression never fired and every
                 // ejected external volume filed an event. Match the whole
                 // stderr, like the three siblings below.
-                let path_unreadable = stderr.contains("is not readable");
+                let path_unreadable = diagnosis.contains("is not readable");
                 let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
-                let agent_cli_outdated = learn_failure_is_agent_cli_outdated(&stderr);
+                let agent_cli_outdated = learn_failure_is_agent_cli_outdated(diagnosis);
                 let user_env_condition = path_unreadable
                     || agent_cli_outdated
                     || agent_not_signed_in
@@ -8545,17 +8873,17 @@ fn execute_headroom_learn_run(
                 // A missing agent session has a remedy the user can act on;
                 // the raw exit status and output tail do not name it.
                 let user_error = if agent_not_signed_in {
-                    learn_agent_auth_hint(agent)
+                    learn_agent_auth_hint(analysis_agent)
                 } else if let Some(line) = &agent_limit_line {
-                    learn_agent_limit_hint(agent, line)
+                    learn_agent_limit_hint(analysis_agent, line)
                 } else if let Some(line) = &agent_api_error_line {
-                    learn_agent_api_error_hint(agent, line)
+                    learn_agent_api_error_hint(analysis_agent, line)
                 } else if agent_api_unreachable {
-                    learn_agent_api_unreachable_hint(agent)
+                    learn_agent_api_unreachable_hint(analysis_agent)
                 } else if agent_unparseable {
-                    learn_agent_unparseable_output_hint(agent)
+                    learn_agent_unparseable_output_hint(analysis_agent)
                 } else if agent_cli_outdated {
-                    learn_agent_cli_outdated_hint(agent)
+                    learn_agent_cli_outdated_hint(analysis_agent)
                 } else {
                     format!(
                         "headroom learn exited with {}.\n{}",
@@ -8733,6 +9061,9 @@ enum TrayRuntimeVisual {
     Paused,
     Unhealthy,
     Disconnected,
+    /// The pricing gate's full bypass: the backend is stopped on purpose and
+    /// traffic goes direct, so nothing is broken and nothing is restarting.
+    Gated,
 }
 
 struct TrayRuntimeIcons {
@@ -8765,6 +9096,67 @@ fn debounced_tray_runtime_visual(
 
     *unhealthy_streak = 0;
     raw_visual
+}
+
+/// The tray state `runtime` reads as, before debouncing. `backend_answers`
+/// re-probes the backend directly and runs only on a missed proxy probe.
+fn tray_raw_visual(
+    runtime: &crate::models::RuntimeStatus,
+    connector_enabled: bool,
+    backend_answers: impl FnOnce() -> bool,
+) -> TrayRuntimeVisual {
+    let connected = if connector_enabled {
+        TrayRuntimeVisual::Running
+    } else {
+        TrayRuntimeVisual::Disconnected
+    };
+    if runtime.running {
+        connected
+    } else if runtime.starting {
+        TrayRuntimeVisual::Booting
+    } else if runtime.paused {
+        TrayRuntimeVisual::Paused
+    } else if runtime.bypassed {
+        // The gate stopped the backend on purpose, so both probes miss. Not
+        // Paused: its Resume clears the bypass only for the next pricing poll
+        // to set it again.
+        TrayRuntimeVisual::Gated
+    } else if runtime.installed && !runtime.proxy_reachable {
+        // The fast reachability probe (1.5s via the 6767 intercept) missed,
+        // but it flaps on transient upstream-connectivity blips and brief
+        // backend busyness (compression / embedding) while the process is
+        // perfectly alive. Mirror the watchdog's tolerance instead of
+        // immediately flashing "proxy unreachable, attempting restart":
+        // re-probe the backend /readyz directly, and treat an `ok` or
+        // upstream-only-503 outcome as healthy (the process is fine; only the
+        // cached upstream probe is down). Only a genuinely non-answering
+        // backend shows Unhealthy. This probe runs only on the rare
+        // !proxy_reachable tick, so its cost is off the happy path.
+        if backend_answers() {
+            connected
+        } else {
+            TrayRuntimeVisual::Unhealthy
+        }
+    } else {
+        TrayRuntimeVisual::Off
+    }
+}
+
+/// When the user last switched a connector off in the app.
+static LAST_USER_CONNECTOR_DISABLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Whether a tray move into Disconnected from `last_non_booting` deserves the
+/// "your coding tools were disconnected" notification. Not when the user just
+/// switched their last connector off: they are looking at the window where
+/// they did it. The window covers the loop's lag in noticing (a 2s connector
+/// re-check plus a 5s idle tick); a real disconnect inside it still changes
+/// the icon and tooltip, it only goes unannounced.
+fn disconnect_notice_due(last_non_booting: Option<TrayRuntimeVisual>) -> bool {
+    const USER_DISABLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+    last_non_booting == Some(TrayRuntimeVisual::Running)
+        && !LAST_USER_CONNECTOR_DISABLE
+            .lock()
+            .is_some_and(|at| at.elapsed() < USER_DISABLE_WINDOW)
 }
 
 fn spawn_tray_runtime_icon_updater(app: AppHandle) {
@@ -8819,45 +9211,12 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
 
             let raw_visual = {
                 let state: tauri::State<'_, AppState> = app.state();
-                let runtime = state.runtime_status();
-                if runtime.running {
-                    if cached_connector_enabled {
-                        TrayRuntimeVisual::Running
-                    } else {
-                        TrayRuntimeVisual::Disconnected
-                    }
-                } else if runtime.starting {
-                    TrayRuntimeVisual::Booting
-                } else if runtime.paused {
-                    TrayRuntimeVisual::Paused
-                } else if runtime.installed && !runtime.proxy_reachable {
-                    // The fast reachability probe (1.5s via the 6767 intercept)
-                    // missed, but it flaps on transient upstream-connectivity
-                    // blips and brief backend busyness (compression /
-                    // embedding) while the process is perfectly alive. Mirror
-                    // the watchdog's tolerance instead of immediately flashing
-                    // "proxy unreachable, attempting restart": re-probe the
-                    // backend /readyz directly, and treat an `ok` or
-                    // upstream-only-503 outcome as healthy (the process is fine;
-                    // only the cached upstream probe is down). Only a genuinely
-                    // non-answering backend shows Unhealthy. This probe runs
-                    // only on the rare !proxy_reachable tick, so its cost is off
-                    // the happy path.
+                tray_raw_visual(&state.runtime_status(), cached_connector_enabled, || {
                     let outcome = probe_backend_readyz_outcome_with_timeout(
                         std::time::Duration::from_secs(5),
                     );
-                    if outcome == "ok" || readyz_failure_is_upstream_only(&outcome) {
-                        if cached_connector_enabled {
-                            TrayRuntimeVisual::Running
-                        } else {
-                            TrayRuntimeVisual::Disconnected
-                        }
-                    } else {
-                        TrayRuntimeVisual::Unhealthy
-                    }
-                } else {
-                    TrayRuntimeVisual::Off
-                }
+                    outcome == "ok" || readyz_failure_is_upstream_only(&outcome)
+                })
             };
             let visual =
                 debounced_tray_runtime_visual(raw_visual, last_non_booting, &mut unhealthy_streak);
@@ -8884,6 +9243,9 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     // No connector enabled at all (any_gate_exempt_client_enabled
                     // covers Codex, OpenCode and Grok), not just Claude/Codex.
                     TrayRuntimeVisual::Disconnected => "Headroom: no coding tools connected".into(),
+                    TrayRuntimeVisual::Gated => {
+                        "Headroom: paused by your plan, your coding tools connect directly".into()
+                    }
                     TrayRuntimeVisual::Off => "Headroom: off".into(),
                 };
 
@@ -8966,6 +9328,15 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             last_displayed_dollars = None;
                         }
                     }
+                    // No red badge: that means broken, and the gate is not.
+                    TrayRuntimeVisual::Gated => {
+                        if last_non_booting != Some(TrayRuntimeVisual::Gated) {
+                            let _ = tray.set_icon(Some(icons.paused.clone()));
+                            icon_changed = true;
+                            last_non_booting = Some(TrayRuntimeVisual::Gated);
+                            last_displayed_dollars = None;
+                        }
+                    }
                     TrayRuntimeVisual::Unhealthy => {
                         if last_non_booting != Some(TrayRuntimeVisual::Unhealthy) {
                             let _ = tray.set_icon(Some(icons.off.clone()));
@@ -8980,7 +9351,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             icon_changed = true;
                             // Only notify when transitioning from a healthy running
                             // state — not on first boot or from other non-running states.
-                            if last_non_booting == Some(TrayRuntimeVisual::Running) {
+                            if disconnect_notice_due(last_non_booting) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
@@ -9446,6 +9817,28 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         outcome.label()
                     );
                 }
+                // `runtime` is this tick's snapshot and the cold-boot wait
+                // above can run for minutes. A user pause, pricing bypass or
+                // upgrade that landed since owns the lifecycle now: giving up
+                // anyway overwrote a deliberate pause with an auto-pause that
+                // the self-heal then resumed without the cleared client setups.
+                if SHUTTING_DOWN.load(Ordering::Acquire) {
+                    return;
+                }
+                if !watchdog_should_be_up(
+                    state.tool_manager.python_runtime_installed(),
+                    state.runtime_is_paused(),
+                    state.runtime_is_starting(),
+                    state.runtime_upgrade_in_progress(),
+                    state.proxy_bypass.load(Ordering::Acquire),
+                ) {
+                    log::info!(
+                        "watchdog: runtime paused, bypassed or upgrading during the down episode; skipping auto-pause"
+                    );
+                    consecutive_failures = 0;
+                    hung_kill_attempted = false;
+                    continue;
+                }
                 // info! not warn!/error!: this is the documented recovery
                 // path (flip bypass, pause runtime, notify user). FileLogger
                 // forwards both warn! and error! to Sentry as capture_message,
@@ -9516,6 +9909,18 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             // (cached/laxer) reachability view and "restart" nothing, letting
             // strikes reach give-up without a single spawn attempt (RUST-53).
             if !state.tracked_child_alive() {
+                // Busy, not wedged (see the give-up guard above). An ADOPTED
+                // backend is untracked too, so without this it was killed on
+                // strike 1 and every in-flight stream cut. Skip the respawn as
+                // well: its pre-flight reclaims an orphan that misses /readyz.
+                // A dead backend delivers nothing and ages past the window.
+                if proxy_intercept::backend_traffic_within(std::time::Duration::from_secs(10)) {
+                    log::info!(
+                        "watchdog: untracked backend streamed bytes within 10s; busy not wedged, resetting counter"
+                    );
+                    consecutive_failures = 0;
+                    continue;
+                }
                 state.stop_headroom();
             }
             match state.ensure_headroom_running() {
@@ -10189,7 +10594,7 @@ mod tests {
         classify_backend_readyz, classify_bootstrap_failure, classify_update_check,
         classify_upgrade_error, client_setup_error_kind, compute_panel_corner_position,
         compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
-        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
+        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern_in,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
         fake_override, feed_failure_is_persistent, feed_pull_limit,
         fetch_transformations_feed_from, first_savings_body, format_token_count,
@@ -10197,8 +10602,10 @@ mod tests {
         is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
         is_loopback_socket_denied_signal, is_missing_headroom_module_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
-        learn_agent_auth_hint, learn_agent_limit_hint, learn_failure_agent_api_error_line,
-        learn_failure_agent_limit_line, learn_failure_is_agent_api_unreachable,
+        learn_agent_auth_hint, learn_agent_cli_outdated_hint, learn_agent_limit_hint,
+        learn_agent_unparseable_output_hint, learn_analysis_agent,
+        learn_failure_agent_api_error_line, learn_failure_agent_limit_line,
+        learn_failure_diagnosis, learn_failure_is_agent_api_unreachable,
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
         learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
         learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
@@ -10218,7 +10625,7 @@ mod tests {
         PENDING_MAGIC_LINK,
     };
     #[cfg(target_os = "macos")]
-    use super::{dir_is_read_only, is_read_only_filesystem};
+    use super::{bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem};
     use parking_lot::Mutex;
     use serde_json::json;
     use std::sync::Arc;
@@ -10291,6 +10698,7 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            utc_keyed: false,
         }
     }
 
@@ -10575,6 +10983,67 @@ mod tests {
     }
 
     #[test]
+    fn exit_paths_stop_the_backend_once_per_exit() {
+        // Quit stops the backend, then the RunEvent arm fires for both
+        // ExitRequested and Exit. Each repeat re-ran the orphan sweep (three
+        // PowerShell CIM queries on Windows) on the UI thread. A lock-held stop
+        // clears `starting`, so a repeat that still ran would clear it again.
+        let base_dir =
+            std::env::temp_dir().join(format!("headroom-exit-stop-once-{}", uuid::Uuid::new_v4()));
+        let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
+        super::EXIT_STOP_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        state.set_runtime_starting(true);
+        super::stop_headroom_for_exit(&state);
+        assert!(
+            !state.runtime_is_starting(),
+            "the first exit path stops the backend"
+        );
+
+        state.set_runtime_starting(true);
+        super::stop_headroom_for_exit(&state);
+        assert!(
+            state.runtime_is_starting(),
+            "a repeat in the same exit must not stop again"
+        );
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_exit_signal_routes_to_the_exit_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        super::route_signals_to_exit(&[libc::SIGHUP], move || flag.store(true, Ordering::SeqCst));
+        // Without the route, SIGHUP's default action kills this test process.
+        unsafe { libc::raise(libc::SIGHUP) };
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fired.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "SIGHUP never reached the exit route"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_exit_signal_inherited_as_ignored_stays_ignored() {
+        // `nohup` hands the app SIGHUP as SIG_IGN; routing it would let GLib
+        // install its own handler, so a closed terminal would quit the app.
+        // SIGUSR2 stands in so the SIGHUP test above cannot race this one.
+        unsafe { libc::signal(libc::SIGUSR2, libc::SIG_IGN) };
+        super::route_signals_to_exit(&[libc::SIGUSR2], || {});
+        let still_ignored = super::signal_is_ignored(libc::SIGUSR2);
+        unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
+        assert!(still_ignored, "an inherited SIG_IGN was replaced");
+    }
+
+    #[test]
     fn tray_visual_keeps_running_during_brief_unhealthy_probe_blips() {
         let mut unhealthy_streak = 0;
 
@@ -10620,6 +11089,87 @@ mod tests {
             TrayRuntimeVisual::Running
         );
         assert_eq!(unhealthy_streak, 0);
+    }
+
+    fn runtime_status_for_tray(json: serde_json::Value) -> crate::models::RuntimeStatus {
+        let mut status = serde_json::json!({
+            "platform": "macos", "supportTier": "supported", "installed": true,
+            "running": false, "starting": false, "paused": false, "autoPaused": false,
+            "bypassed": false, "proxyReachable": false, "headroomLearnSupported": true,
+            "rtk": { "installed": false, "enabled": false, "pathConfigured": false,
+                     "hookConfigured": false },
+        });
+        status
+            .as_object_mut()
+            .unwrap()
+            .extend(json.as_object().unwrap().clone());
+        serde_json::from_value(status).expect("runtime status")
+    }
+
+    #[test]
+    fn tray_shows_a_gated_backend_as_gated_not_unhealthy() {
+        // Full bypass stops the backend on purpose, so both probes miss. That
+        // is the plan pausing Headroom, not a proxy that is restarting.
+        let gated = runtime_status_for_tray(serde_json::json!({ "bypassed": true }));
+        assert_eq!(
+            super::tray_raw_visual(&gated, true, || false),
+            TrayRuntimeVisual::Gated
+        );
+        // A backend that is supposed to be up and does not answer still is.
+        let down = runtime_status_for_tray(serde_json::json!({}));
+        assert_eq!(
+            super::tray_raw_visual(&down, true, || false),
+            TrayRuntimeVisual::Unhealthy
+        );
+        // A user pause (the watchdog's give-up sets bypass too) keeps Resume.
+        let paused =
+            runtime_status_for_tray(serde_json::json!({ "bypassed": true, "paused": true }));
+        assert_eq!(
+            super::tray_raw_visual(&paused, true, || false),
+            TrayRuntimeVisual::Paused
+        );
+    }
+
+    #[test]
+    fn switching_a_connector_off_does_not_announce_a_disconnect() {
+        assert!(
+            super::disconnect_notice_due(Some(TrayRuntimeVisual::Running)),
+            "a disconnect nobody asked for is announced"
+        );
+        *super::LAST_USER_CONNECTOR_DISABLE.lock() = Some(std::time::Instant::now());
+        assert!(
+            !super::disconnect_notice_due(Some(TrayRuntimeVisual::Running)),
+            "the user just switched it off in the app"
+        );
+        *super::LAST_USER_CONNECTOR_DISABLE.lock() = None;
+    }
+
+    #[test]
+    fn unrouted_nudge_and_feed_canary_stand_down_while_paused_or_gated() {
+        let base_dir =
+            std::env::temp_dir().join(format!("headroom-unrouted-gate-{}", uuid::Uuid::new_v4()));
+        let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
+        assert!(!super::unrouted_usage_expected(&state));
+        assert!(!super::feed_canary_stands_down(&state));
+
+        state.set_runtime_paused(true);
+        assert!(
+            super::unrouted_usage_expected(&state),
+            "paused: going direct is the intended state"
+        );
+        state.set_runtime_paused(false);
+
+        // The pricing gate's full bypass stops the backend on purpose, so the
+        // agent goes direct and every feed pull is a 503.
+        state
+            .proxy_bypass
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(super::unrouted_usage_expected(&state), "gated: no leak");
+        assert!(
+            super::feed_canary_stands_down(&state),
+            "gated: a dead feed is expected"
+        );
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -11749,30 +12299,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn count_memories_created_today_only_counts_today_entries() {
+    /// A local instant on 2026-04-22 (or `day`), converted to UTC the way
+    /// the export stores it, so these tests hold in any timezone.
+    fn local_instant(day: u32, hour: u32, min: u32) -> chrono::DateTime<chrono::Utc> {
         use chrono::TimeZone;
-        let json = r#"[
-            {"id":"a","created_at":"2026-04-22T10:00:00"},
-            {"id":"b","created_at":"2026-04-22T23:59:59"},
-            {"id":"c","created_at":"2026-04-21T23:00:00"},
+        chrono::Local
+            .with_ymd_and_hms(2026, 4, day, hour, min, 0)
+            .earliest()
+            .expect("local time exists")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn count_memories_created_today_buckets_by_local_day() {
+        // `created_at` is UTC without a suffix; "today" is the user's local
+        // day, like the sibling reminders/learnings counters.
+        let naive = |dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let json = serde_json::json!([
+            {"id":"a","created_at":naive(local_instant(22, 0, 30))},
+            {"id":"b","created_at":naive(local_instant(22, 23, 59))},
+            {"id":"c","created_at":naive(local_instant(21, 23, 0))},
             {"id":"d","created_at":null},
             {"id":"e"}
-        ]"#;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
-        assert_eq!(count_memories_created_today(json, now).unwrap(), 2);
+        ])
+        .to_string();
+        let now = local_instant(22, 12, 0);
+        assert_eq!(count_memories_created_today(&json, now).unwrap(), 2);
     }
 
     #[test]
     fn count_memories_created_today_accepts_rfc3339_with_tz() {
-        use chrono::TimeZone;
-        let json = r#"[
-            {"id":"a","created_at":"2026-04-22T10:00:00Z"},
-            {"id":"b","created_at":"2026-04-22T02:00:00-09:00"}
-        ]"#;
-        // 2026-04-22T02:00:00-09:00 == 2026-04-22T11:00:00Z, both land on today.
-        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
-        assert_eq!(count_memories_created_today(json, now).unwrap(), 2);
+        let west = chrono::FixedOffset::west_opt(9 * 3600).unwrap();
+        let json = serde_json::json!([
+            {"id":"a","created_at":local_instant(22, 10, 0).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)},
+            {"id":"b","created_at":local_instant(22, 11, 0).with_timezone(&west).to_rfc3339()}
+        ])
+        .to_string();
+        let now = local_instant(22, 12, 0);
+        assert_eq!(count_memories_created_today(&json, now).unwrap(), 2);
     }
 
     #[test]
@@ -12148,6 +12712,33 @@ mod tests {
             .contains("internet connection"));
     }
 
+    /// These messages show on every platform, so none may assume a Mac.
+    #[test]
+    fn cross_platform_failure_messages_do_not_assume_a_mac() {
+        for kind in [
+            BootstrapFailureKind::SslInterception,
+            BootstrapFailureKind::NoUsableTempDir,
+            BootstrapFailureKind::NetworkDownload,
+            BootstrapFailureKind::UnsupportedPin,
+            BootstrapFailureKind::Permission,
+            BootstrapFailureKind::SourceBuild,
+            BootstrapFailureKind::Other,
+        ] {
+            let msg = user_message_for(kind);
+            for mac_only in ["your Mac", "this Mac"] {
+                assert!(
+                    !msg.contains(mac_only),
+                    "{} message says {mac_only}: {msg}",
+                    kind.as_str()
+                );
+            }
+        }
+        assert!(
+            user_message_for(BootstrapFailureKind::NoUsableTempDir).contains("%TEMP%"),
+            "Windows users need the folder that actually applies to them"
+        );
+    }
+
     #[test]
     fn unsupported_pin_wins_over_the_network_heuristic() {
         // pip echoes every index it consulted before reporting the resolution
@@ -12372,13 +12963,13 @@ Some unrelated content.
         );
 
         // Deletes must target the same file the read came from.
-        delete_applied_pattern(
-            tmp.path().to_str().unwrap().to_string(),
-            "claude".into(),
-            "Local Section".into(),
-            "Local bullet.".into(),
+        delete_applied_pattern_in(
+            &tmp.path().join("memory.db"),
+            tmp.path().to_str().unwrap(),
+            "claude",
+            "Local Section",
+            "Local bullet.",
         )
-        .await
         .expect("delete bullet from CLAUDE.local.md");
         let on_disk = std::fs::read_to_string(&local).unwrap();
         assert!(
@@ -12392,13 +12983,13 @@ Some unrelated content.
         let tmp = tempfile::tempdir().expect("tempdir");
         write_claude_md_with_headroom_block(tmp.path());
 
-        delete_applied_pattern(
-            tmp.path().to_str().unwrap().to_string(),
-            "claude".into(),
-            "First Section".into(),
-            "First bullet.".into(),
+        delete_applied_pattern_in(
+            &tmp.path().join("memory.db"),
+            tmp.path().to_str().unwrap(),
+            "claude",
+            "First Section",
+            "First bullet.",
         )
-        .await
         .expect("delete bullet");
 
         let result = read_applied_patterns_for_project(tmp.path().to_str().unwrap());
@@ -12423,13 +13014,13 @@ Some unrelated content.
         let tmp = tempfile::tempdir().expect("tempdir");
         write_claude_md_with_headroom_block(tmp.path());
 
-        delete_applied_pattern(
-            tmp.path().to_str().unwrap().to_string(),
-            "claude".into(),
-            "Second Section".into(),
-            "Third bullet.".into(),
+        delete_applied_pattern_in(
+            &tmp.path().join("memory.db"),
+            tmp.path().to_str().unwrap(),
+            "claude",
+            "Second Section",
+            "Third bullet.",
         )
-        .await
         .expect("delete bullet");
 
         let result = read_applied_patterns_for_project(tmp.path().to_str().unwrap());
@@ -12463,18 +13054,82 @@ Some unrelated content.
         let tmp = tempfile::tempdir().expect("tempdir");
         write_claude_md_with_headroom_block(tmp.path());
 
-        let err = delete_applied_pattern(
-            tmp.path().to_str().unwrap().to_string(),
-            "garbage".into(),
-            "First Section".into(),
-            "First bullet.".into(),
+        let err = delete_applied_pattern_in(
+            &tmp.path().join("memory.db"),
+            tmp.path().to_str().unwrap(),
+            "garbage",
+            "First Section",
+            "First bullet.",
         )
-        .await
         .expect_err("unknown file_kind rejected");
         assert!(
             err.contains("Unknown file_kind"),
             "expected Unknown file_kind error, got: {err}"
         );
+    }
+
+    #[test]
+    fn delete_applied_pattern_forgets_the_learned_rule_in_memory_db() {
+        // The backend's traffic learner rebuilds every `Learned:` section from
+        // memory.db on its next flush, so a bullet deleted only from the file
+        // came back. Its source row has to go too; unrelated rows stay.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rule = "Run tests with `uv run pytest` in /x/proj";
+        std::fs::write(
+            tmp.path().join("CLAUDE.local.md"),
+            format!(
+                "<!-- headroom:learn:start -->\n\
+                 ## Headroom Learned Patterns\n\
+                 ### Learned: environment\n\
+                 - {rule}\n\
+                 - Keep this rule\n\
+                 <!-- headroom:learn:end -->\n"
+            ),
+        )
+        .expect("write CLAUDE.local.md");
+        let db = tmp.path().join("memory.db");
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        conn.execute(
+            "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, metadata TEXT)",
+            [],
+        )
+        .expect("create table");
+        let learner = r#"{"source":"traffic_learner","category":"environment","evidence_count":7}"#;
+        for (id, content, meta) in [
+            ("deleted", rule, learner),
+            ("kept", "Keep this rule", learner),
+            ("other-source", rule, r#"{"source":"user"}"#),
+        ] {
+            conn.execute(
+                "INSERT INTO memories (id, content, metadata) VALUES (?1, ?2, ?3)",
+                [id, content, meta],
+            )
+            .expect("insert row");
+        }
+
+        delete_applied_pattern_in(
+            &db,
+            tmp.path().to_str().unwrap(),
+            "claude",
+            "Learned: environment",
+            rule,
+        )
+        .expect("delete learned bullet");
+
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM memories ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids, vec!["kept".to_string(), "other-source".to_string()]);
+        let on_disk = std::fs::read_to_string(tmp.path().join("CLAUDE.local.md")).unwrap();
+        assert!(
+            !on_disk.contains(rule),
+            "bullet removed from file:\n{on_disk}"
+        );
+        assert!(on_disk.contains("- Keep this rule"));
     }
 
     #[test]
@@ -12514,6 +13169,209 @@ Some unrelated content.
     #[test]
     fn watchdog_should_be_up_skips_when_pricing_gate_bypassed() {
         assert!(!watchdog_should_be_up(true, false, false, false, true));
+    }
+
+    /// A second launch on Windows/Linux (a shortcut clicked during a slow first
+    /// install, or any headroom:// link) runs until single-instance exits it
+    /// from its plugin setup, which Tauri runs before the app's own `.setup`.
+    /// Taking the bootstrap marker any earlier let that side process delete a
+    /// running install's marker and file a false bootstrap_abandoned. Needs a
+    /// real second process, so pinned in source.
+    #[test]
+    fn abandoned_bootstrap_is_taken_only_after_single_instance_can_exit() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, run) = source.split_once("\npub fn run() {").expect("run present");
+        let run = &run[..run.find("\n}\n").expect("run end")];
+        let setup = run.find(".setup(move |app| {").expect("setup closure");
+        let take = run
+            .find(".take_abandoned_bootstrap()")
+            .expect("run takes the marker");
+        assert!(
+            setup < take,
+            "the marker must be taken inside .setup, after plugin setup"
+        );
+    }
+
+    /// The watchdog loop needs a running app, so these pin its ordering in
+    /// source. The cold-boot wait runs for minutes; a user pause that lands
+    /// meanwhile must not be overwritten by the give-up's auto-pause, which
+    /// the self-heal then resumes without the client setups the pause cleared.
+    #[test]
+    fn watchdog_give_up_rechecks_live_state_after_the_cold_boot_wait() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, watchdog) = source
+            .split_once("fn spawn_proxy_watchdog(")
+            .expect("watchdog present");
+        let (_, after_wait) = watchdog
+            .split_once("state.wait_for_boot_validation(")
+            .expect("cold-boot wait present");
+        let before_give_up = &after_wait[..after_wait
+            .find("\"watchdog: giving up after")
+            .expect("give-up present")];
+        for live in [
+            "SHUTTING_DOWN.load(",
+            "state.runtime_is_paused()",
+            "state.runtime_upgrade_in_progress()",
+        ] {
+            assert!(
+                before_give_up.contains(live),
+                "give-up must re-read {live} after the wait: {before_give_up}"
+            );
+        }
+    }
+
+    /// An adopted backend (relaunch after a crash) is untracked, so the RUST-53
+    /// teardown read it as dead on strike 1 and killed it mid-stream before the
+    /// busy-not-wedged guard at give-up ever ran. The guard must also skip the
+    /// respawn: the spawn pre-flight reclaims an orphan that misses /readyz.
+    #[test]
+    fn watchdog_does_not_tear_down_a_busy_untracked_backend() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, watchdog) = source
+            .split_once("fn spawn_proxy_watchdog(")
+            .expect("watchdog present");
+        let (_, teardown) = watchdog
+            .split_once("if !state.tracked_child_alive() {")
+            .expect("RUST-53 teardown present");
+        let before_stop = &teardown[..teardown
+            .find("state.stop_headroom();")
+            .expect("teardown stops the backend")];
+        assert!(
+            before_stop.contains("proxy_intercept::backend_traffic_within(")
+                && before_stop.contains("continue;"),
+            "busy guard must precede the untracked teardown: {before_stop}"
+        );
+    }
+
+    /// resume_runtime un-pauses before it starts the backend, so a failed
+    /// start used to leave the app unpaused with the clients the pause cleared
+    /// still unrouted for the rest of the session.
+    #[test]
+    fn resume_restores_client_setups_even_when_the_backend_start_fails() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        for name in [
+            "fn start_headroom_blocking(",
+            "fn force_restart_headroom_blocking(",
+        ] {
+            let (_, body) = source.split_once(name).expect("fn present");
+            let body = &body[..body.find("\n}\n").expect("fn end")];
+            let resume = body.find("resume_runtime()").expect("resumes");
+            let restore = body.find("restore_client_setups").expect("restores");
+            assert!(
+                resume < restore && !body[resume..restore].contains('?'),
+                "{name} must restore clients before propagating a resume error: {body}"
+            );
+        }
+    }
+
+    /// Attribute and body of one Tauri command. Where a command runs (main
+    /// thread, async worker, blocking pool) needs a running app to observe, so
+    /// the tests below pin it in source. Note that `#[tauri::command(async)]`
+    /// on a sync fn runs the body inline on an async worker, not the blocking
+    /// pool, so it only trades a UI freeze for worker starvation.
+    fn tauri_command_source<'a>(source: &'a str, name: &str) -> (&'a str, &'a str) {
+        let at = source
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} present"));
+        let attr = source[..at]
+            .rfind("#[tauri::command")
+            .unwrap_or_else(|| panic!("{name} attribute"));
+        let end = at + source[at..].find("\n}\n").expect("command end");
+        (&source[attr..at], &source[at..end])
+    }
+
+    /// pip, npx and asset downloads run for minutes; on an async worker two
+    /// clicks on a 2-core machine froze the dashboard and runtime status.
+    #[test]
+    fn addon_commands_run_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        for name in ["install_addon", "set_addon_enabled", "uninstall_addon"] {
+            let (_, body) = tauri_command_source(&source, name);
+            assert!(
+                body.contains("run_lifecycle_command("),
+                "{name} must run on the blocking pool: {body}"
+            );
+        }
+    }
+
+    /// The transcript walk visits up to 40k entries; as a sync command it
+    /// froze every webview and the tray on entering post_install.
+    #[test]
+    fn local_activity_ages_walk_runs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (attr, body) = tauri_command_source(&source, "get_client_local_activity_ages");
+        assert!(
+            attr.trim_end().ends_with("async") && body.contains("spawn_blocking("),
+            "the walk must leave the main thread for the blocking pool: {body}"
+        );
+    }
+
+    /// An ungate starts the backend, and `ensure_headroom_running` waits out a
+    /// cold boot (minutes). Awaited inline, the paywall stayed up and every
+    /// other pricing refresh was skipped until Python opened its port.
+    #[test]
+    fn pricing_status_poll_applies_gates_off_the_ipc_path() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, body) = tauri_command_source(&source, "get_headroom_pricing_status");
+        let detached = body
+            .find("std::thread::spawn(")
+            .expect("gates run on a detached thread");
+        let gates = body
+            .find("apply_pricing_gates(")
+            .expect("gates still applied");
+        assert!(
+            body.contains("spawn_blocking(") && detached < gates,
+            "the fetch belongs on the blocking pool and the gate on its own thread: {body}"
+        );
+    }
+
+    /// A forced Re-check runs the CLI smoke tests and a `$SHELL -ilc` probe
+    /// per missing CLI (up to 2s each with a heavy rc file).
+    #[test]
+    fn learn_prereq_probe_runs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (attr, body) = tauri_command_source(&source, "get_headroom_learn_prereq_status");
+        assert!(
+            attr.trim_end().ends_with("async") && body.contains("spawn_blocking("),
+            "the probe must leave the main thread for the blocking pool: {body}"
+        );
+    }
+
+    /// Serena stats run `ps`, read today's logs and probe four ports on a
+    /// cache miss, and the /readyz probe waits up to 5s; polled every 4s.
+    #[test]
+    fn activity_feed_runs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, body) = tauri_command_source(&source, "get_activity_feed");
+        assert!(
+            body.contains("spawn_blocking("),
+            "the snapshot must not block an async worker: {body}"
+        );
+    }
+
+    /// Every Learn click re-probes both CLIs uncached, with a `$SHELL -ilc`
+    /// fallback per missing one (2-4s without codex, even for a Claude run).
+    #[test]
+    fn learn_start_probes_prereqs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, body) = tauri_command_source(&source, "start_headroom_learn");
+        assert!(
+            body.contains("spawn_blocking(detect_headroom_learn_prereq_status)")
+                && !body.contains("detect_headroom_learn_prereq_status()"),
+            "the prereq probe must not block an async worker: {body}"
+        );
+    }
+
+    /// curl|bash (or irm|iex) runs 30-60s with no timeout; a sync body under
+    /// `command(async)` pinned an async worker for all of it.
+    #[test]
+    fn claude_code_cli_install_runs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (attr, body) = tauri_command_source(&source, "install_claude_code_cli");
+        assert!(
+            attr.trim_end().ends_with("async") && body.contains("spawn_blocking("),
+            "the installer must run on the blocking pool: {attr}{body}"
+        );
     }
 
     #[test]
@@ -13450,6 +14308,77 @@ Some unrelated content.
         assert!(learn_agent_auth_hint(LearnAgent::Codex).contains("`codex`"));
     }
 
+    /// OpenCode and Grok scans run their analysis on Claude Code, else Codex.
+    /// A failure hint that named the scanned agent sent the user to sign in to
+    /// a CLI the scan never used.
+    #[test]
+    fn learn_hints_name_the_cli_the_analysis_ran_on() {
+        for agent in [LearnAgent::Opencode, LearnAgent::Grok] {
+            let hint = learn_agent_auth_hint(learn_analysis_agent(agent, true));
+            assert!(hint.contains("Claude Code"), "got: {hint}");
+            assert!(hint.contains("`claude`"), "got: {hint}");
+
+            let codex = learn_analysis_agent(agent, false);
+            assert!(learn_agent_auth_hint(codex).contains("`codex`"));
+            let outdated = learn_agent_cli_outdated_hint(codex);
+            assert!(outdated.contains("Codex CLI"), "got: {outdated}");
+        }
+        assert_eq!(
+            learn_analysis_agent(LearnAgent::Claude, false),
+            LearnAgent::Claude
+        );
+        assert_eq!(
+            learn_analysis_agent(LearnAgent::Codex, true),
+            LearnAgent::Codex
+        );
+    }
+
+    /// Upstream dumps the model's unparseable answer after the marker, and
+    /// that answer is an analysis of the user's own sessions: a rule quoting
+    /// "not authenticated" or a usage-limit line is not the CLI's verdict,
+    /// which only exists when the CLI failed and so left no answer to dump.
+    #[test]
+    fn learn_failure_classifiers_ignore_the_dumped_model_answer() {
+        let stderr = "WARNING - LLM analysis failed: `claude -p --output-format stream-json \
+                      --verbose` returned unparseable output. Head and tail of the output:\n\
+                      Rules: `gh` says not authenticated in CI; Invalid API key in .env.\n\
+                      You've hit your usage limit \u{b7} resets 9am\n\
+                      API Error: 500 from the staging deploy\n\
+                      error: unknown option '--verbose'\n\
+                      Path 'fixtures' is not readable.\n\
+                        Analysis failed: `claude -p` returned unparseable output.\n";
+        assert!(learn_failure_is_agent_unparseable_output(stderr));
+        let diagnosis = learn_failure_diagnosis(stderr);
+        assert!(!learn_failure_is_agent_auth(diagnosis), "{diagnosis}");
+        assert_eq!(learn_failure_agent_limit_line(diagnosis), None);
+        assert_eq!(learn_failure_agent_api_error_line(diagnosis), None);
+        assert!(!learn_failure_is_agent_cli_outdated(diagnosis));
+        assert!(!diagnosis.contains("is not readable"), "{diagnosis}");
+        assert!(learn_agent_unparseable_output_hint(LearnAgent::Claude).contains("scan again"));
+
+        // A CLI that failed on its own terms keeps its whole diagnosis.
+        let auth = "LLM analysis failed: `claude -p` failed (exit 1):\nNot logged in \u{b7} Please run /login\n";
+        assert_eq!(learn_failure_diagnosis(auth), auth);
+
+        // The run reads every classifier but the dump marker off the diagnosis.
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, run) = source
+            .split_once("fn execute_headroom_learn_run(")
+            .expect("run fn present");
+        let run = &run[..run.find("\nfn ").expect("run fn end")];
+        for raw in [
+            "learn_failure_is_agent_auth(&stderr)",
+            "learn_failure_agent_limit_line(&stderr)",
+            "learn_failure_agent_api_error_line(&stderr)",
+            "learn_failure_is_agent_model_rejected(&stderr)",
+            "learn_failure_is_agent_api_unreachable(&stderr)",
+            "learn_failure_is_agent_cli_outdated(&stderr)",
+            "stderr.contains(\"is not readable\")",
+        ] {
+            assert!(!run.contains(raw), "{raw} still reads the dumped answer");
+        }
+    }
+
     #[test]
     fn extract_llm_failure_warnings_returns_none_for_clean_stderr() {
         let stderr =
@@ -14109,6 +15038,86 @@ Some unrelated content.
         );
     }
 
+    #[test]
+    fn classify_upgrade_error_ignores_the_networkx_package_name() {
+        // pip lists every pin on stdout (networkx among them) and names the
+        // file it failed on in stderr; neither is a network error.
+        let pip_failure = |stderr: &str| {
+            anyhow::Error::new(crate::tool_manager::CommandFailure {
+                program: "python".into(),
+                args: vec!["-m".into(), "pip".into(), "install".into()],
+                stdout: "Requirement already satisfied: networkx==3.6.1 in /v/site-packages\n"
+                    .into(),
+                stderr: stderr.into(),
+                exit_code: Some(1),
+                signal: None,
+            })
+            .context("upgrading Headroom's bundled dependencies in place")
+        };
+        let disk_full = pip_failure(
+            "ERROR: Could not install packages due to an OSError: [Errno 28] \
+             No space left on device: '/v/site-packages/networkx/__init__.py'",
+        );
+        let hint = classify_upgrade_error(&disk_full).expect("must classify");
+        assert!(
+            hint.contains("disk space"),
+            "expected disk hint, got: {hint}"
+        );
+
+        let file_lock = pip_failure(
+            "ERROR: Could not install packages due to an OSError: [WinError 32] \
+             The process cannot access the file because it is being used by another \
+             process: 'C:\\v\\site-packages\\networkx\\__init__.py'",
+        );
+        assert_eq!(classify_upgrade_error(&file_lock), None);
+
+        // A real network failure still gets the PyPI hint.
+        let offline = pip_failure("OSError: [Errno 51] Network is unreachable");
+        let hint = classify_upgrade_error(&offline).expect("must classify");
+        assert!(hint.contains("PyPI"), "expected network hint, got: {hint}");
+    }
+
+    #[test]
+    fn classify_upgrade_error_reads_pips_offline_stderr_as_unreachable_pypi() {
+        // pip's stderr when DNS is down, per platform: the retry warning, then
+        // a "no matching distribution" that must not read as a resolver bug.
+        for errno in [
+            "[Errno -3] Temporary failure in name resolution",
+            "[Errno 8] nodename nor servname provided, or not known",
+            "[Errno 11001] getaddrinfo failed",
+        ] {
+            let stderr = format!(
+                "WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, \
+                 status=None)) after connection broken by 'NewConnectionError('<pip._vendor.\
+                 urllib3.connection.HTTPSConnection object at 0x7f2c1c3b5a90>: Failed to \
+                 establish a new connection: {errno}')': /simple/headroom-ai/\n\
+                 ERROR: Could not find a version that satisfies the requirement \
+                 headroom-ai==0.39.0 (from versions: none)\n\
+                 ERROR: No matching distribution found for headroom-ai==0.39.0\n"
+            );
+            let err = anyhow::Error::new(crate::tool_manager::CommandFailure {
+                program: "python".into(),
+                args: vec!["-m".into(), "pip".into(), "install".into()],
+                stdout: String::new(),
+                stderr,
+                exit_code: Some(1),
+                signal: None,
+            })
+            .context("upgrading Headroom's bundled dependencies in place");
+            let hint = classify_upgrade_error(&err).expect("must classify");
+            assert!(
+                hint.contains("PyPI"),
+                "{errno}: expected network hint, got: {hint}"
+            );
+        }
+
+        // A genuine resolver conflict keeps its own hint.
+        let conflict =
+            anyhow::anyhow!("ERROR: ResolutionImpossible: for help visit https://pip.pypa.io");
+        let hint = classify_upgrade_error(&conflict).expect("must classify");
+        assert!(hint.contains("resolve dependencies"), "got: {hint}");
+    }
+
     /// The gate is only as good as the name it matches on, and that name is not
     /// the executable's: the Linux .deb ships `/usr/bin/headroom-desktop` while
     /// the kernel reports `headroom`. Check the derivation against what `ps`
@@ -14449,6 +15458,45 @@ Some unrelated content.
         assert!(!is_read_only_filesystem(
             &std::io::Error::from_raw_os_error(13)
         ));
+    }
+
+    /// The counterpart of the guard above: EACCES does install, but only
+    /// through the plugin's admin prompt, so it must never be the silent path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn silent_install_needs_a_bundle_folder_that_takes_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("Headroom.app");
+        std::fs::create_dir(&bundle).expect("create");
+        assert!(bundle_folder_accepts_writes(Some(&bundle)));
+
+        // A bundle another admin (or a pkg, as root) installed sits 755 in a
+        // folder this user can write, but the plugin's swap renames it into
+        // $TMPDIR, and moving a directory to a new parent needs write on the
+        // directory itself to rewrite its '..': EACCES, then the admin prompt.
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let accepts = bundle_folder_accepts_writes(Some(&bundle));
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            !accepts,
+            "an unwritable bundle cannot move out of a writable folder without an admin prompt"
+        );
+
+        let locked = dir.path().join("Applications");
+        std::fs::create_dir(&locked).expect("create");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let accepts = bundle_folder_accepts_writes(Some(&locked.join("Headroom.app")));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            !accepts,
+            "an unwritable folder installs only via an admin prompt, never silently"
+        );
+        assert!(
+            !bundle_folder_accepts_writes(None),
+            "no bundle found means nothing to swap"
+        );
     }
 }
 

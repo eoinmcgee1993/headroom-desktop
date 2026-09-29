@@ -224,8 +224,9 @@ release no longer drops `linux-x86_64` from that channel.
 
 The retired `windows-preview` and `linux-preview` channels had their workflows
 deleted once every platform started building per rc. Their releases stay up
-because installs in the wild still poll those manifests; the stable Windows job
-keeps rewriting `windows-preview/latest.json` to pull those installs forward.
+because installs in the wild still poll those manifests; the stable publish job
+keeps rewriting `windows-preview/latest.json` and `linux-preview/latest.json` to
+pull those installs forward.
 
 ### Branching model
 

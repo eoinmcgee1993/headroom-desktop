@@ -262,6 +262,11 @@ pub struct DailySavingsPoint {
     pub output_sampled_tokens_saved: Option<u64>,
     #[serde(default)]
     pub output_baseline_tokens: Option<u64>,
+    /// `date` is a UTC day: the bucket is a backend rollup (fresh, or archived
+    /// at ingest). False for buckets the local tracker keyed by LOCAL day.
+    /// Decides whether the reported day ends at UTC or local midnight.
+    #[serde(default)]
+    pub utc_keyed: bool,
 }
 
 /// Per-provider (anthropic / openai / unknown) attribution for a single hourly

@@ -11746,21 +11746,26 @@ pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_tex
 
     let mut out_lines: Vec<String> = Vec::new();
     let mut current_section_start: Option<usize> = None;
-    let mut current_section_has_bullets = false;
+    let mut current_section_has_content = false;
+    let mut removed_here = false;
     let mut in_target_section = false;
     let mut bullet_removed = false;
 
+    // Drops a section only when this call emptied it; a section that never
+    // had `- ` bullets (a `* ` list, prose) is not ours to remove.
     fn flush(
         out_lines: &mut Vec<String>,
         section_start: &mut Option<usize>,
-        has_bullets: &mut bool,
+        has_content: &mut bool,
+        removed_here: &mut bool,
     ) {
         if let Some(idx) = section_start.take() {
-            if !*has_bullets {
+            if !*has_content && *removed_here {
                 out_lines.truncate(idx);
             }
         }
-        *has_bullets = false;
+        *has_content = false;
+        *removed_here = false;
     }
 
     for line in block.lines() {
@@ -11775,7 +11780,8 @@ pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_tex
             flush(
                 &mut out_lines,
                 &mut current_section_start,
-                &mut current_section_has_bullets,
+                &mut current_section_has_content,
+                &mut removed_here,
             );
             current_section_start = Some(out_lines.len());
             in_target_section = title.trim() == section_title;
@@ -11785,14 +11791,19 @@ pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_tex
 
         if current_section_start.is_some() {
             if let Some(rest) = trimmed.strip_prefix("- ") {
-                let bullet = rest.trim();
-                if in_target_section && !bullet_removed && bullet == bullet_text {
+                if in_target_section && !bullet_removed && rest.trim() == bullet_text {
                     bullet_removed = true;
+                    removed_here = true;
                     continue;
                 }
-                if !bullet.is_empty() {
-                    current_section_has_bullets = true;
-                }
+            }
+            // Only list items count: the writer's `*~N tokens/session saved*`
+            // note alone must not keep an emptied section alive.
+            let item = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "));
+            if item.is_some_and(|rest| !rest.trim().is_empty()) {
+                current_section_has_content = true;
             }
         }
 
@@ -11801,7 +11812,8 @@ pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_tex
     flush(
         &mut out_lines,
         &mut current_section_start,
-        &mut current_section_has_bullets,
+        &mut current_section_has_content,
+        &mut removed_here,
     );
 
     if !bullet_removed {
@@ -18662,6 +18674,56 @@ after
             "<!-- headroom:learn:start -->\n### Foo\n- alpha\n<!-- headroom:learn:end -->\n";
         let out = super::delete_applied_bullet(content, "Foo", "not-there");
         assert_eq!(out, content);
+    }
+
+    #[test]
+    fn delete_applied_bullet_keeps_sections_it_did_not_remove_from() {
+        // `headroom learn` can write a section without `- ` bullets. Deleting
+        // a bullet elsewhere must not drop it, nor non-dash lines left in the
+        // section the bullet came from.
+        let content = "\
+<!-- headroom:learn:start -->
+### Starred
+* Use uv run
+### Prose
+Always run the linter first.
+### Foo
+- alpha
+- beta
+### Mixed
+- only dash
+* star item
+<!-- headroom:learn:end -->
+";
+        let out = super::delete_applied_bullet(content, "Foo", "alpha");
+        assert!(out.contains("### Starred\n* Use uv run\n"), "{out}");
+        assert!(
+            out.contains("### Prose\nAlways run the linter first.\n"),
+            "{out}"
+        );
+        assert!(out.contains("### Foo\n- beta\n"), "{out}");
+        let out = super::delete_applied_bullet(&out, "Mixed", "only dash");
+        assert!(out.contains("### Mixed\n* star item\n"), "{out}");
+        assert!(out.contains("### Starred\n* Use uv run\n"), "{out}");
+    }
+
+    #[test]
+    fn delete_applied_bullet_drops_section_left_with_only_its_savings_note() {
+        // The learn writer puts `*~N tokens/session saved*` under each
+        // heading; it is not a rule, so it must not keep an emptied section.
+        let content = "\
+<!-- headroom:learn:start -->
+### X
+*~1,000 tokens/session saved*
+- only
+### Y
+- stays
+<!-- headroom:learn:end -->
+";
+        let out = super::delete_applied_bullet(content, "X", "only");
+        assert!(!out.contains("### X"), "{out}");
+        assert!(!out.contains("tokens/session saved"), "{out}");
+        assert!(out.contains("### Y\n- stays\n"), "{out}");
     }
 
     const START_ONLY: &str = "<!-- headroom:learn:start -->\n\

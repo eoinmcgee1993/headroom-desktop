@@ -38,6 +38,11 @@ name: Release App
 # Its rc releases are not pruned automatically; staging-rolling still points at
 # the last one, so delete them (`gh release delete vX.Y.Z-rc.N`) only after the
 # next release has moved staging-rolling on.
+#
+# A publish job that fails after flipping the release to `latest` is finished
+# with `gh run rerun <id> --failed`. A full re-run or a dispatch is refused
+# once the release is live: rebuilding would clobber signed bundles installs
+# are verifying against the live latest.json.
 
 on:
   push:
@@ -174,10 +179,11 @@ jobs:
           fi
 
           # Which platforms are *offered* this version. Manual runs pass an
-          # input; pushes carry `[platforms: windows]` in a commit message in
-          # the pushed range (same idiom as [skip-rc-check]). Default all, so
-          # forgetting the marker ships to everyone rather than stranding a
-          # platform.
+          # input; pushes carry `[platforms: windows]` in a release-branch commit
+          # message (a commit in the pushed range that is not on staging, so an
+          # rc-cycle commit quoting a marker cannot set it), and the newest
+          # marker wins. Default all, so forgetting the marker ships to everyone
+          # rather than stranding a platform.
           release_platforms="${DISPATCH_PLATFORMS:-all}"
           # Whether the finished release is flipped to `latest` (stable) or left
           # a prerelease only pinned new downloads can reach (download-only).
@@ -188,13 +194,14 @@ jobs:
             release_publish=stable
             range_msgs="$(git log -1 --pretty=%B "${GITHUB_SHA}")"
             if [[ -n "${before_sha:-}" ]] && git cat-file -e "${before_sha}^{commit}" 2>/dev/null; then
-              range_msgs="$(git log --pretty=%B "${before_sha}..${GITHUB_SHA}")"
+              range_msgs="$(git log --pretty=%B "${before_sha}..${GITHUB_SHA}" --not origin/staging)"
             fi
-            marker="$(grep -oiE '\[platforms:[^]]+\]' <<< "$range_msgs" | tail -1 || true)"
+            # git log prints newest first.
+            marker="$(grep -oiE '\[platforms:[^]]+\]' <<< "$range_msgs" | head -1 || true)"
             if [[ -n "$marker" ]]; then
               release_platforms="$(sed -E 's/^\[[Pp]latforms:[[:space:]]*//; s/\][[:space:]]*$//; s/[[:space:]]//g' <<< "$marker")"
             fi
-            marker="$(grep -oiE '\[publish:[^]]+\]' <<< "$range_msgs" | tail -1 || true)"
+            marker="$(grep -oiE '\[publish:[^]]+\]' <<< "$range_msgs" | head -1 || true)"
             if [[ -n "$marker" ]]; then
               release_publish="$(sed -E 's/^\[[Pp]ublish:[[:space:]]*//; s/\][[:space:]]*$//; s/[[:space:]]//g' <<< "$marker")"
             fi
@@ -232,6 +239,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # Never rebuild into a release installs already trust (mirrors
+          # release-windows-download.yml): a full re-run or a dispatch after
+          # the publish job flipped it to `latest` would clobber the signed
+          # bundles under a latest.json that still carries the old signatures.
+          # Before [skip-rc-check], which would otherwise skip this.
+          if gh release view "v${PACKAGE_VERSION}" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease 2>/dev/null | grep -qx false; then
+            echo "v${PACKAGE_VERSION} is already a published (non-prerelease) release. Refusing to rebuild into it; to finish a failed publish, re-run only the failed jobs (gh run rerun <id> --failed)." >&2
+            exit 1
+          fi
 
           commit_message="$(git log -1 --pretty=%B "${GITHUB_SHA}")"
           if [[ "$commit_message" == *"[skip-rc-check]"* ]]; then
@@ -701,7 +718,21 @@ jobs:
           # too. Update in place rather than delete-then-recreate: a mid-step
           # failure used to leave the release deleted, 404ing that endpoint
           # until the next release. Binaries first, latest.json last.
-          if gh release view staging-rolling --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # The rc mirror (release-macos-staging.yml, another concurrency group,
+          # same check) also writes it, and the last rc can finish after this
+          # stable, or the next cycle's rc.1 before it. Neither writer may roll
+          # the channel back, so skip the refresh when it already names a newer
+          # version.
+          staging_rolling_is_newer_than() {
+            gh release download staging-rolling --repo "$GITHUB_REPOSITORY" -p latest.json -O - 2>/dev/null \
+              | jq -e --arg new "$1" '
+                  def key: ltrimstr("v") | capture("^(?<a>[0-9]+)\\.(?<b>[0-9]+)\\.(?<c>[0-9]+)(-rc\\.(?<r>[0-9]+))?$")
+                    | [(.a, .b, .c | tonumber), (if .r then 0 else 1 end), ((.r // "0") | tonumber)];
+                  (.version | key) > ($new | key)' >/dev/null
+          }
+          if staging_rolling_is_newer_than "${STABLE_TAG#v}"; then
+            echo "::notice::staging-rolling already serves a version newer than ${STABLE_TAG}; leaving it alone."
+          elif gh release view staging-rolling --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             bundles=()
             for f in "$workdir"/*; do
               [ "$(basename "$f")" = "latest.json" ] || bundles+=("$f")
@@ -729,15 +760,22 @@ jobs:
               "$workdir"/*
           fi
 
-          # The windows-preview channel is retired (its workflow is deleted),
-          # but installs from it still poll windows-preview/latest.json. Keep
-          # refreshing it so they are offered this stable build and move onto
-          # the stable endpoint; drop this once the release is deleted.
+          # The windows-preview and linux-preview channels are retired (their
+          # workflows are deleted), but installs from them still poll
+          # <channel>/latest.json. Keep refreshing both so they are offered this
+          # stable build and move onto the stable endpoint; drop a block once
+          # its release is deleted.
           if gh release view windows-preview --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload windows-preview "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit windows-preview --repo "$GITHUB_REPOSITORY" \
               --title "Headroom Windows preview (rolling)" \
               --notes "Windows now ships with the stable releases (current: ${STABLE_TAG}). This channel only redirects remaining preview installs to stable - install from the latest stable release instead."
+          fi
+          if gh release view linux-preview --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload linux-preview "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit linux-preview --repo "$GITHUB_REPOSITORY" \
+              --title "Headroom Linux preview (rolling)" \
+              --notes "Linux now ships with the stable releases (current: ${STABLE_TAG}). This channel only redirects remaining preview installs to stable - install from the latest stable release instead."
           fi
 
           # This version's rcs are dead now that staging-rolling points at the

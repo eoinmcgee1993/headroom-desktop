@@ -576,7 +576,7 @@ pub struct AppState {
     weekly_limit_reached_reported: Arc<AtomicBool>,
     weekly_limit_approaching_reported: Arc<AtomicBool>,
     launch_profile: Mutex<LaunchProfile>,
-    launch_profile_path: std::path::PathBuf,
+    launch_profile_path: Option<std::path::PathBuf>,
     last_known_good_plan: Mutex<Option<LastKnownGoodPlan>>,
     last_known_good_plan_path: std::path::PathBuf,
     savings_tracker: Mutex<SavingsTracker>,
@@ -586,7 +586,9 @@ pub struct AppState {
     cumulative_report_throttle: Mutex<Option<(u64, Instant)>>,
     activity_facts: Mutex<ActivityFacts>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
-    cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
+    /// `(stats, fetched_at, hold)`: `hold` is how long this poll's outcome
+    /// stands, which depends on how it failed; see `polled_headroom_stats`.
+    cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant, Duration)>>,
     /// Last `/stats` payload that actually arrived, with the time it did.
     /// Kept apart from `cached_headroom_stats` so the miss backoff and the
     /// retention window measure different things: that cache stamps the last
@@ -595,10 +597,13 @@ pub struct AppState {
     last_good_headroom_stats: Mutex<Option<(HeadroomDashboardStats, Instant)>>,
     /// Set while a `/stats` fetch is in flight; see `polled_headroom_stats`.
     headroom_stats_fetch_in_flight: AtomicBool,
-    /// `(history, fetched_at, fresh)` — `fresh` is false when `history` is a
-    /// retained last-good value served because the latest fetch failed (proxy
-    /// paused/unreachable), so it re-probes on the short miss TTL.
-    cached_headroom_history: Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant, bool)>>,
+    /// `(history, fetched_at, hold)`. After a failed fetch `history` is the
+    /// retained last-good value and `hold` says when to re-probe; see
+    /// `cached_headroom_history`.
+    cached_headroom_history:
+        Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant, Duration)>>,
+    /// Set while a `/stats-history` fetch is in flight; see `cached_headroom_history`.
+    headroom_history_fetch_in_flight: AtomicBool,
     cached_rtk_gain_summary: Mutex<Option<(Option<RtkGainSummary>, Instant)>>,
     cached_rtk_today_stats: Mutex<Option<(Option<crate::models::RtkTodayStats>, Instant)>>,
     cached_claude_profile: Mutex<Option<(Option<String>, ClaudeAccountProfile, Instant)>>,
@@ -607,12 +612,13 @@ pub struct AppState {
     /// `~/.codex/auth.json` + the live `codex_plan_tier` slot; no network fetch,
     /// so the cache is a plain value + timestamp.
     cached_codex_profile: Mutex<Option<(Option<CodexAccountProfile>, Instant)>>,
-    /// When the current run of transient profile-fetch failures began. Set the
+    /// The current run of transient profile-fetch failures, as (start, last
+    /// failure) on the wall clock (`pricing::extend_failure_run`). Set the
     /// first time we suppress a transient error (and serve the last good
     /// profile), cleared on the next successful fetch. Once the run exceeds
     /// `STALE_PROFILE_ESCALATE_AFTER` we stop suppressing and surface the
     /// banner — the token-rotation gap has lasted long enough to be real.
-    stale_profile_since: Mutex<Option<Instant>>,
+    stale_profile_since: Mutex<Option<(DateTime<Utc>, DateTime<Utc>)>>,
     /// Last `IdentityFingerprint` we successfully posted to
     /// `desktop/grace/start`. Used by the bearer-triggered identity-pusher
     /// worker to skip redundant posts when the same Claude account/plan is
@@ -634,6 +640,10 @@ pub struct AppState {
     /// just-finished learn runs appear promptly once their explicit
     /// invalidation fires.
     cached_claude_code_projects: Mutex<Option<(Vec<ClaudeCodeProject>, Instant)>>,
+    /// Bumped by `invalidate_claude_code_projects_cache`. A scan that started
+    /// before an invalidation may hold a project's pre-learn state, so it only
+    /// caches its result when the generation is unchanged.
+    claude_projects_cache_gen: std::sync::atomic::AtomicU64,
     /// Cached `detect_headroom_learn_prereq_status`. The Claude CLI location
     /// can't change without explicit user action during a session, and the
     /// fallback shell probe can take up to 2s, so we keep this sticky and
@@ -762,6 +772,7 @@ impl AppState {
             last_good_headroom_stats: Mutex::new(None),
             headroom_stats_fetch_in_flight: AtomicBool::new(false),
             cached_headroom_history: Mutex::new(None),
+            headroom_history_fetch_in_flight: AtomicBool::new(false),
             cached_rtk_gain_summary: Mutex::new(None),
             cached_rtk_today_stats: Mutex::new(None),
             cached_claude_profile: Mutex::new(None),
@@ -771,6 +782,7 @@ impl AppState {
             last_complete_identity_fetch_at: Mutex::new(None),
             cached_memory_export: Mutex::new(None),
             cached_claude_code_projects: Mutex::new(None),
+            claude_projects_cache_gen: std::sync::atomic::AtomicU64::new(0),
             cached_headroom_learn_prereq: Mutex::new(None),
             cached_runtime_status: Mutex::new(None),
             kompress_prefetch_attempted: AtomicBool::new(false),
@@ -785,19 +797,7 @@ impl AppState {
         // run was killed between move-aside and commit, the venv.backup/
         // dir holds the real working environment and the live venv is a
         // partial install. Restore before doing anything else.
-        if self.tool_manager.upgrade_interrupted() {
-            // Recovery pip-reinstalls or renames the live venv, so it gets the
-            // upgrade's protection: no spawn may start mid-recovery, a start
-            // already in flight is waited out, and whatever runs from the venv
-            // (the updater's orphan proxy, Claude Code's MCP servers) is
-            // cleared first. Only when a marker exists: this sweep on every
-            // launch would kill the user's MCP servers for nothing.
-            let _recovery_guard = UpgradeInstallGuard::engage(self);
-            drop(self.lifecycle_lock.lock());
-            self.stop_headroom();
-            kill_venv_lock_holders(&self.tool_manager.venv_dir());
-            let _ = self.tool_manager.recover_from_interrupted_upgrade();
-        }
+        self.recover_interrupted_upgrade();
 
         if !self.tool_manager.python_runtime_installed() {
             // First-run; start_bootstrap (wizard) handles install.
@@ -1031,8 +1031,11 @@ impl AppState {
                 Some(plan) => plan,
                 None => {
                     // App version changed but no runtime maintenance is actually
-                    // needed — just stamp the version.
-                    self.stamp_app_version(&current_app_version);
+                    // needed: stamp the version, under the launch path's guard
+                    // (a Retry after a failed rollback lands here too).
+                    if self.can_stamp_no_maintenance(&current_app_version) {
+                        self.stamp_app_version(&current_app_version);
+                    }
                     return;
                 }
             };
@@ -1173,6 +1176,7 @@ impl AppState {
                     "run_upgrade_with_ui: install failed after {duration_ms}ms (restored={restored}): {error:#}"
                 );
                 let restarted = self.ensure_headroom_running().is_ok();
+                self.stop_python_if_any_gate();
                 let hint = crate::classify_upgrade_error(&error);
                 let fallback_hint = match maintenance_kind {
                     RuntimeMaintenanceKind::Upgrade if restored && restarted => {
@@ -1374,29 +1378,7 @@ impl AppState {
                 })),
             );
             analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
-            // ensure_headroom_running's gate guards were suppressed during
-            // validation so a gated user's brand-new venv could actually be
-            // validated (otherwise we'd commit untested or roll back a
-            // perfectly good install). Now that the upgrade has committed,
-            // restore the gate state by stopping the validation Python if any
-            // gate is asserting Python should be down. Client-side routing is
-            // already pointed direct-to-Anthropic by whoever asserted the
-            // gate, so the validation Python wasn't receiving traffic anyway.
-            // Claude-only gate (Codex enabled) keeps Python up for Codex —
-            // same carve-out as stop_python_if_gated / ensure_headroom_running
-            // (RUST-53); without it every upgrade bounces the backend for
-            // gated Codex users (stop here, watchdog respawn ~5-10s later).
-            let gate_wants_python_down =
-                self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
-                    || (!self.pricing_allows_optimization()
-                        && !crate::client_adapters::any_gate_exempt_client_enabled())
-                    || self.runtime_is_paused();
-            if gate_wants_python_down {
-                log::info!(
-                    "run_upgrade_with_ui: validation succeeded; stopping validation Python because a gate is active"
-                );
-                self.stop_headroom();
-            }
+            self.stop_python_if_any_gate();
             return;
         }
 
@@ -1463,6 +1445,7 @@ impl AppState {
         }
         analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
         let restarted = self.ensure_headroom_running().is_ok();
+        self.stop_python_if_any_gate();
 
         let err_msg = match log_tail.as_deref() {
             Some(tail) => format!(
@@ -1615,9 +1598,45 @@ impl AppState {
             if let Some(failure) = profile.last_runtime_upgrade_failure.as_mut() {
                 failure.attempts = 0;
             }
-            persist_launch_profile(&self.launch_profile_path, &profile);
+            persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         }
+        // A failed rollback leaves its marker and a receipt that already reads
+        // the pin, so the plan finds no work and Retry did nothing. Recover as
+        // launch does: the old receipt comes back and the upgrade replans.
+        let recovery_stopped_python = self.recover_interrupted_upgrade();
         self.run_upgrade_with_ui(app, force_rebuild);
+        if recovery_stopped_python {
+            // run_upgrade_with_ui restarts Python only when it ran; a recovery
+            // that failed again (still offline) left nothing to run. Gates apply.
+            let _ = self.ensure_headroom_running();
+        }
+    }
+
+    /// Restore the pre-upgrade runtime when an upgrade marker is on disk (an
+    /// upgrade died mid-install, or its rollback failed). Returns true when a
+    /// marker was found, which stopped Python, whether or not recovery worked.
+    fn recover_interrupted_upgrade(&self) -> bool {
+        // A running upgrade wrote the marker itself: never recover under it.
+        let Some(_upgrade) = self.upgrade_lock.try_lock() else {
+            return false;
+        };
+        if !self.tool_manager.upgrade_interrupted() {
+            return false;
+        }
+        // Recovery pip-reinstalls or renames the live venv, so it gets the
+        // upgrade's protection: no spawn may start mid-recovery, a start
+        // already in flight is waited out, the proxy is stopped, and
+        // kill_venv_lock_holders clears the rest: on Windows whatever runs
+        // from the venv (the updater's orphan proxy, Claude Code's MCP
+        // servers), on Unix only a previous instance's orphaned pip. Only
+        // when a marker exists: the Windows sweep on every launch would kill
+        // the user's MCP servers for nothing.
+        let _recovery_guard = UpgradeInstallGuard::engage(self);
+        drop(self.lifecycle_lock.lock());
+        self.stop_headroom();
+        kill_venv_lock_holders(&self.tool_manager.venv_dir());
+        let _ = self.tool_manager.recover_from_interrupted_upgrade();
+        true
     }
 
     pub fn runtime_upgrade_in_progress(&self) -> bool {
@@ -1895,7 +1914,7 @@ impl AppState {
     fn stamp_app_version(&self, version: &str) {
         let mut profile = self.launch_profile.lock();
         profile.last_launched_app_version = Some(version.to_string());
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     /// True when the launch-profile stamp can be safely advanced to
@@ -1905,8 +1924,14 @@ impl AppState {
     /// Refuses to stamp when:
     /// - the stamp already matches (no work; avoids a redundant disk write), or
     /// - there's an unresolved upgrade failure for this exact app version
-    ///   (stamping would mask the failure record the retry banner relies on).
+    ///   (stamping would mask the failure record the retry banner relies on), or
+    /// - an upgrade marker is still on disk: the receipt may read the pin only
+    ///   because rollback failed, and the next recovery restores the old one,
+    ///   which a stamped version would then never upgrade again.
     fn can_stamp_no_maintenance(&self, current_app_version: &str) -> bool {
+        if self.tool_manager.upgrade_interrupted() {
+            return false;
+        }
         let profile = self.launch_profile.lock();
         if profile.last_launched_app_version.as_deref() == Some(current_app_version) {
             return false;
@@ -1922,7 +1947,7 @@ impl AppState {
     fn clear_upgrade_failure(&self) {
         let mut profile = self.launch_profile.lock();
         profile.last_runtime_upgrade_failure = None;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     pub fn dismiss_upgrade_failure(&self) {
@@ -1945,7 +1970,7 @@ impl AppState {
             }
         }
         profile.last_runtime_upgrade_failure = Some(failure);
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     fn upgrade_failure_attempts(&self, app_version: &str) -> u32 {
@@ -1988,7 +2013,7 @@ impl AppState {
             return;
         }
         profile.setup_wizard_complete = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     /// One-shot gate for the "setup finished but no traffic ever" recovery
@@ -2000,7 +2025,7 @@ impl AppState {
             return false;
         }
         profile.onboarding_recovery_notified = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         true
     }
 
@@ -2020,7 +2045,7 @@ impl AppState {
         }
         profile.unrouted_usage_notified = true;
         profile.onboarding_recovery_notified = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         true
     }
 
@@ -2032,7 +2057,7 @@ impl AppState {
             return false;
         }
         profile.first_savings_notified = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         true
     }
 
@@ -2046,7 +2071,7 @@ impl AppState {
             return;
         }
         profile.accepted_terms_version = version;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     pub fn upstream_override(&self) -> UpstreamOverride {
@@ -2062,7 +2087,7 @@ impl AppState {
                 return;
             }
             profile.upstream_override = next.clone();
-            persist_launch_profile(&self.launch_profile_path, &profile);
+            persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         }
         crate::upstream_override::publish(next);
     }
@@ -2151,11 +2176,9 @@ impl AppState {
         // no longer a momentary rotation blip, so we stop suppressing and let
         // the real error (and its banner) through.
         if detection.error_is_transient && !pricing::is_identity_complete(&profile) {
-            let escalate = {
-                let mut since = self.stale_profile_since.lock();
-                let started = since.get_or_insert_with(Instant::now);
-                started.elapsed() >= STALE_PROFILE_ESCALATE_AFTER
-            };
+            let escalate =
+                pricing::extend_failure_run(&mut self.stale_profile_since.lock(), Utc::now())
+                    >= STALE_PROFILE_ESCALATE_AFTER;
             if !escalate {
                 let mut cache = self.cached_claude_profile.lock();
                 if let Some((_, prev, _)) = cache.as_ref() {
@@ -2171,6 +2194,13 @@ impl AppState {
         let mut cache = self.cached_claude_profile.lock();
         *cache = Some((current_token, profile.clone(), Instant::now()));
         profile
+    }
+
+    /// Test hook: serve `profile` from the Claude profile cache without a fetch.
+    #[cfg(test)]
+    pub(crate) fn seed_claude_profile_for_test(&self, profile: ClaudeAccountProfile) {
+        *self.cached_claude_profile.lock() =
+            Some((self.current_bearer_token(), profile, Instant::now()));
     }
 
     /// True iff a `desktop/grace/start` post with this exact set of Claude
@@ -2306,21 +2336,24 @@ impl AppState {
         // re-fetch from the proxy. 12s gives at least one cache hit between
         // dashboard refreshes while keeping session savings visibly fresh.
         const TTL: Duration = Duration::from_secs(12);
-        // A failure is held far longer than a success, which is the opposite of
-        // `cached_headroom_history` and deliberate: the dominant failure here
-        // is a `/stats` rebuild that outruns its 15s timeout on a backend busy
-        // serving a session. Re-probing that every 12s keeps a 15s blocking
-        // request in flight essentially all the time, so the poll itself
-        // becomes part of the starvation it is reporting -- RUST-86 shipped
-        // 1601 events that way. At 60s the probe still recovers within a few
-        // seconds of the backend freeing up, at a fifth of the load, and the
-        // retained payload above covers the gap.
+        // A failed request is held far longer than a success, deliberately: the
+        // dominant failure here is a `/stats` rebuild that outruns its 15s
+        // timeout on a backend busy serving a session. Re-probing that every
+        // 12s keeps a 15s blocking request in flight essentially all the
+        // time, so the poll itself becomes part of the starvation it is
+        // reporting -- RUST-86 shipped 1601 events that way. At 60s the probe
+        // still recovers within a few seconds of the backend freeing up, at a
+        // fifth of the load, and the retained payload above covers the gap.
         const MISS_TTL: Duration = Duration::from_secs(60);
+        // But only a request that was SENT: a proxy that is not up yet (cold
+        // start, restart) was never asked for a rebuild, so there is nothing
+        // to back off from, and holding that miss 60s left the `/stats`-only
+        // fields blank for up to a minute after the backend began serving.
+        const UNREACHABLE_TTL: Duration = Duration::from_secs(3);
         {
             let cache = self.cached_headroom_stats.lock();
-            if let Some((stats, at)) = cache.as_ref() {
-                let ttl = if stats.is_some() { TTL } else { MISS_TTL };
-                if at.elapsed() < ttl {
+            if let Some((stats, at, hold)) = cache.as_ref() {
+                if at.elapsed() < *hold {
                     return stats.clone();
                 }
             }
@@ -2342,17 +2375,15 @@ impl AppState {
         {
             return None;
         }
-        // Cleared on every exit, panics included: a stuck flag would stop
-        // `/stats` fetching for the process lifetime.
-        struct InFlight<'a>(&'a AtomicBool);
-        impl Drop for InFlight<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::Release);
-            }
-        }
         let _in_flight = InFlight(&self.headroom_stats_fetch_in_flight);
-        let stats = fetch_headroom_dashboard_stats();
-        *self.cached_headroom_stats.lock() = Some((stats.clone(), Instant::now()));
+        let (stats, hold) = if is_headroom_proxy_reachable() {
+            let stats = fetch_headroom_dashboard_stats();
+            let hold = if stats.is_some() { TTL } else { MISS_TTL };
+            (stats, hold)
+        } else {
+            (None, UNREACHABLE_TTL)
+        };
+        *self.cached_headroom_stats.lock() = Some((stats.clone(), Instant::now(), hold));
         stats
     }
 
@@ -2361,39 +2392,48 @@ impl AppState {
         // the Home charts only change a handful of times per minute under
         // active traffic. A 30s TTL absorbs most dashboard polls while still
         // updating the chart's most-recent bucket within one full refresh.
+        // A request that was sent and failed is held as long: the build it
+        // asked for already ran on the backend's event loop, and re-asking
+        // every poll turned that 30s cadence into ~20% of the loop.
         const TTL: Duration = Duration::from_secs(30);
-        // A miss (backend not yet reachable on cold start, or a retained
-        // last-good value while the proxy is paused) is cached briefly so the
-        // chart resolves/recovers within a few seconds, instead of holding the
-        // startup loading state or stale data for a full 30s.
-        const MISS_TTL: Duration = Duration::from_secs(3);
+        // A proxy that is not up yet (cold start, or paused) is re-probed
+        // briefly so the chart resolves/recovers within a few seconds, instead
+        // of holding the startup loading state or stale data for a full 30s.
+        const UNREACHABLE_TTL: Duration = Duration::from_secs(3);
         {
             let cache = self.cached_headroom_history.lock();
-            if let Some((history, at, fresh)) = cache.as_ref() {
-                let ttl = if *fresh { TTL } else { MISS_TTL };
-                if at.elapsed() < ttl {
+            if let Some((history, at, hold)) = cache.as_ref() {
+                if at.elapsed() < *hold {
                     return history.clone();
                 }
             }
         }
-        // Guard dropped across the fetch — see cached_headroom_stats.
-        match fetch_headroom_savings_history() {
-            Some(history) => {
-                *self.cached_headroom_history.lock() =
-                    Some((Some(history.clone()), Instant::now(), true));
-                Some(history)
-            }
-            None => {
-                // Retain the last good history so a transient proxy pause
-                // doesn't revert the Home chart to the sparse tracker-only
-                // layer. Mark it stale so we re-probe on the short miss TTL and
-                // recover quickly once the proxy returns.
-                let mut cache = self.cached_headroom_history.lock();
-                let retained = cache.as_ref().and_then(|(h, _, _)| h.clone());
-                *cache = Some((retained.clone(), Instant::now(), false));
-                retained
-            }
+        // One fetch at a time, guard dropped across it, as for `/stats`: with
+        // a 15s timeout the 5s dashboard poll and the tray updater would
+        // otherwise stack fetches on one slow build. A caller arriving
+        // mid-fetch gets the retained value.
+        if self
+            .headroom_history_fetch_in_flight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return self
+                .cached_headroom_history
+                .lock()
+                .as_ref()
+                .and_then(|(history, _, _)| history.clone());
         }
+        let _in_flight = InFlight(&self.headroom_history_fetch_in_flight);
+        let (fetched, hold) = if is_headroom_proxy_reachable() {
+            (fetch_headroom_savings_history(), TTL)
+        } else {
+            (None, UNREACHABLE_TTL)
+        };
+        // A miss retains the last good history so a transient proxy pause
+        // doesn't revert the Home chart to the sparse tracker-only layer.
+        let mut cache = self.cached_headroom_history.lock();
+        let history = fetched.or_else(|| cache.as_ref().and_then(|(h, _, _)| h.clone()));
+        *cache = Some((history.clone(), Instant::now(), hold));
+        history
     }
 
     fn cached_rtk_gain_summary(&self) -> Option<RtkGainSummary> {
@@ -2525,10 +2565,7 @@ impl AppState {
         let start = recap_monday.checked_sub_days(chrono::Days::new(7))?;
         let end = recap_monday.pred_opt()?;
 
-        let totals = {
-            let tracker = self.savings_tracker.lock();
-            aggregate_weekly_totals(&tracker.daily_savings, start, end)
-        };
+        let totals = self.savings_tracker.lock().weekly_totals(start, end);
 
         let mut facts = self.activity_facts.lock();
         let event = facts.maybe_record_weekly_recap(recap_monday, totals, now);
@@ -2557,8 +2594,15 @@ impl AppState {
         };
         let mut pending_milestones = PendingMilestones::default();
 
-        let stats = self.cached_headroom_stats();
-        let history = self.cached_headroom_history();
+        // 6767 not ours (another OS user's Headroom holds it, or a relaunch
+        // overlap) means `/stats` and `/stats-history` describe THAT
+        // instance's traffic: ingesting them would persist it here and report
+        // it as this account's savings. The tracker's own record stands in.
+        let spectator = self.intercept_bind_failed();
+        let stats = (!spectator).then(|| self.cached_headroom_stats()).flatten();
+        let history = (!spectator)
+            .then(|| self.cached_headroom_history())
+            .flatten();
         if history.is_some() {
             self.savings_history_loaded
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2595,18 +2639,22 @@ impl AppState {
         // `/stats`, which credits strata the baseline never observed against a
         // global mean and flips to the A/B number on a single sample per arm.
         // See `output_savings`. The backend's figure is a fallback ONLY when
-        // the ledger carries no evidence at all (missing, mid-write, or no
-        // shaped traffic yet), so a torn read never blanks the tile. A
-        // readable ledger that scores nothing shows nothing: falling back
+        // the ledger carries no evidence at all (missing, or no shaped
+        // traffic yet); a torn mid-write read stands for this launch's last
+        // evidenced read (see `ledger_read_or_last`), so it neither blanks
+        // the tile nor flips it to the credited figure. A readable ledger that scores nothing shows nothing: falling back
         // there put the credited number on exactly the machines the recompute
         // refuses to score (all-codex traffic vs a claude-seeded baseline
         // read as "Output -100%" on Windows, 0.9.7-rc.7).
-        let ledger_read = crate::output_savings::estimate();
+        let ledger_read = self
+            .savings_tracker
+            .lock()
+            .ledger_read_or_last(crate::output_savings::estimate());
         let backend_output_fallback_allowed = matches!(
             ledger_read,
             crate::output_savings::LedgerEstimate::NoEvidence
         );
-        let ledger_estimate = ledger_read.scored();
+        let ledger_estimate = ledger_read.clone().scored();
         let output_reduction = ledger_estimate
             .as_ref()
             .map(|e| crate::models::OutputReduction {
@@ -2667,12 +2715,12 @@ impl AppState {
                 )
             };
 
+            let utc_today_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
             // Lock the backend's authoritative settled rollups into the local
             // archive so they survive its history trimming and fill gaps from
             // periods the app wasn't running.
             {
                 let today_key = local_day_key(Local::now());
-                let utc_today_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
                 let mut tracker = self.savings_tracker.lock();
                 // Before ingest: a native overwrite of the live bucket already
                 // contains this delta, so it must land first and be superseded.
@@ -2691,7 +2739,8 @@ impl AppState {
                 }
             }
 
-            daily_savings = merge_daily_savings(daily_savings, native_daily, &cutoff_date);
+            daily_savings =
+                merge_daily_savings(daily_savings, native_daily, &cutoff_date, &utc_today_key);
             hourly_savings = merge_hourly_savings(hourly_savings, native_hourly, &cutoff_hour);
         }
 
@@ -2699,6 +2748,9 @@ impl AppState {
         // Neither merge source carries it: backend rollups have no baseline
         // dimension and tracker buckets predate the sampler. Daily joins on
         // UTC date keys, hourly on local hour keys — matching each list.
+        // Output dollars are then repriced from those samples, so the chart,
+        // the tray and the per-day report stop carrying the backend's credit
+        // (see `ledger_priced_output`).
         //
         // Cache fields overlay from the archive too, and the archive wins:
         // the history points carry a fresh derivation from the backend's
@@ -2708,6 +2760,8 @@ impl AppState {
         // and the live UTC day's archive equals this poll's derivation;
         // live local-day hours are never ingested, keep None here, and so
         // fall through to the fresh derivation.
+        let ledger_unscored =
+            matches!(ledger_read, crate::output_savings::LedgerEstimate::Unscored);
         {
             let tracker = self.savings_tracker.lock();
             for point in daily_savings.iter_mut() {
@@ -2715,6 +2769,12 @@ impl AppState {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
+                (point.output_savings_usd, point.output_tokens_saved) = ledger_priced_output(
+                    point.output_savings_usd,
+                    point.output_tokens_saved,
+                    point.output_sampled_tokens_saved,
+                    ledger_unscored,
+                );
                 if let Some(bucket) = tracker.daily_savings.get(&point.date) {
                     (
                         point.cache_read_tokens,
@@ -2748,6 +2808,12 @@ impl AppState {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
+                (point.output_savings_usd, point.output_tokens_saved) = ledger_priced_output(
+                    point.output_savings_usd,
+                    point.output_tokens_saved,
+                    point.output_sampled_tokens_saved,
+                    ledger_unscored,
+                );
                 if let Some(bucket) = tracker.hourly_savings.get(&point.hour) {
                     (
                         point.cache_read_tokens,
@@ -2801,31 +2867,19 @@ impl AppState {
                 tracker.last_output_estimator_tokens_saved,
             )
         };
-        // Until the backend is reachable (cold start), price the output layer
-        // off the last persisted estimator reading instead of the bucket sum,
-        // so the headline doesn't dip by hundreds of dollars for the first
-        // minutes and then jump back up.
         // Same ledger recomputation as the tile above: the dollar row and the
         // percentage have to describe one estimate, or the drill-down stops
-        // explaining the headline.
+        // explaining the headline. With no ledger evidence this launch, the
+        // last persisted ledger reading prices it; the backend's token total
+        // (global-mean credit) only on a machine that never had one.
         let lifetime_output_savings_usd = lifetime_output_savings_usd(
             &daily_savings,
-            ledger_estimate
+            &ledger_read,
+            cached_output_estimator_tokens,
+            stats
                 .as_ref()
-                .map(|e| e.tokens_saved)
-                .or_else(|| {
-                    // Same gate as the tile above: the backend's token total
-                    // carries the global-mean credit, so it may only stand in
-                    // when the ledger itself has nothing to say.
-                    if !backend_output_fallback_allowed {
-                        return None;
-                    }
-                    stats
-                        .as_ref()
-                        .and_then(|s| s.output_reduction.as_ref())
-                        .map(|r| r.tokens_saved)
-                })
-                .or(cached_output_estimator_tokens),
+                .and_then(|s| s.output_reduction.as_ref())
+                .map(|r| r.tokens_saved),
         );
         let lifetime_tool_schema_savings_usd =
             tool_schema_savings_usd(&daily_savings, lifetime_tool_schema_tokens_saved);
@@ -2954,9 +3008,27 @@ impl AppState {
         if let Some(cached) = self.cached_claude_code_projects_fresh() {
             return Ok(cached);
         }
+        let generation = self
+            .claude_projects_cache_gen
+            .load(std::sync::atomic::Ordering::Acquire);
         let projects = self.list_claude_code_projects_uncached()?;
-        *self.cached_claude_code_projects.lock() = Some((projects.clone(), Instant::now()));
+        self.store_claude_code_projects(generation, &projects);
         Ok(projects)
+    }
+
+    /// Caches a scan that started at `generation`, unless an invalidation
+    /// landed while it ran: that scan may have read a project before its
+    /// learn run finished, and caching it would pin the stale row for the
+    /// whole TTL. The next reader rescans instead.
+    fn store_claude_code_projects(&self, generation: u64, projects: &[ClaudeCodeProject]) {
+        let mut cache = self.cached_claude_code_projects.lock();
+        if self
+            .claude_projects_cache_gen
+            .load(std::sync::atomic::Ordering::Acquire)
+            == generation
+        {
+            *cache = Some((projects.to_vec(), Instant::now()));
+        }
     }
 
     fn cached_claude_code_projects_fresh(&self) -> Option<Vec<ClaudeCodeProject>> {
@@ -2970,7 +3042,10 @@ impl AppState {
     }
 
     pub fn invalidate_claude_code_projects_cache(&self) {
-        *self.cached_claude_code_projects.lock() = None;
+        let mut cache = self.cached_claude_code_projects.lock();
+        self.claude_projects_cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        *cache = None;
     }
 
     pub fn headroom_learn_prereq_status(&self) -> HeadroomLearnPrereqStatus {
@@ -3070,7 +3145,14 @@ impl AppState {
         Ok(projects)
     }
 
-    pub fn begin_headroom_learn_run(&self, project_path: &str) -> Result<(), String> {
+    /// `is_path` is true only for a Claude run, whose key is the project
+    /// directory. Codex, OpenCode and Grok are keyed on a fixed id ("codex"),
+    /// which a path check would resolve against the app's cwd and refuse.
+    pub fn begin_headroom_learn_run(
+        &self,
+        project_path: &str,
+        is_path: bool,
+    ) -> Result<(), String> {
         if project_path.trim().is_empty() {
             return Err("Select a project before running headroom learn.".into());
         }
@@ -3081,13 +3163,13 @@ impl AppState {
             return Err("Headroom runtime is not available yet.".into());
         }
         let project = Path::new(project_path);
-        if !project.exists() {
+        if is_path && !project.exists() {
             return Err(format!(
                 "Project path does not exist: {}",
                 project.display()
             ));
         }
-        if !project.is_dir() {
+        if is_path && !project.is_dir() {
             return Err(format!(
                 "Project path is not a directory: {}",
                 project.display()
@@ -3318,9 +3400,10 @@ impl AppState {
         // configuration (`disable_client_setup`/`clear_client_setups`) is
         // mutated by whoever asserted the gate, so Claude Code is already
         // pointed direct-to-Anthropic regardless of whether Python is
-        // bound on :6768. After validation, `run_upgrade_with_ui` calls
-        // `stop_headroom()` if a gate is still active so we don't leave
-        // the validation Python running where the user expected it down.
+        // bound on :6768. Every exit of `run_upgrade_with_ui` that started
+        // Python (validation success, install failure, rollback) calls
+        // `stop_python_if_any_gate` so we don't leave that Python running
+        // where the user expected it down.
         let in_upgrade_validation = *self.runtime_upgrade_in_progress.lock();
 
         if !in_upgrade_validation {
@@ -4036,8 +4119,22 @@ impl AppState {
     /// bypass flag alone is enough to make the Rust intercept pass traffic
     /// straight through to api.anthropic.com while Python is down.
     fn enforce_pricing_gate(&self) {
+        self.enforce_pricing_status(pricing::get_pricing_status(self));
+    }
+
+    fn enforce_pricing_status(
+        &self,
+        status: std::result::Result<crate::models::HeadroomPricingStatus, String>,
+    ) {
         use std::sync::atomic::Ordering::Release;
-        match pricing::get_pricing_status(self) {
+        match status {
+            // Same guard as apply_pricing_gates: a failed account sync
+            // evaluates as allowed but is no verdict.
+            Ok(status) if Self::is_error_reading(&status) => {
+                log::info!(
+                    "enforce_pricing_gate: account sync failed; leaving gate flags untouched"
+                );
+            }
             Ok(status) if !status.optimization_allowed => {
                 // Gated. When Codex is still enabled, use the Claude-only
                 // bypass (Python stays up for Codex) instead of the full
@@ -4082,6 +4179,32 @@ impl AppState {
             Err(err) => {
                 log::warn!("enforce_pricing_gate: pricing status unavailable, leaving gate flags unchanged: {err}");
             }
+        }
+    }
+
+    /// Every exit of `run_upgrade_with_ui` that (re)started Python ends here.
+    /// ensure_headroom_running's gate guards are suppressed while the upgrade
+    /// runs so a gated user's new venv can be validated (otherwise we'd commit
+    /// untested or roll back a perfectly good install) and so a failure can
+    /// prove the fallback still boots. Nothing stops that Python later (the
+    /// watchdog skips under bypass, the pricing poll acts only on edges), so
+    /// restore the gate state here. Client-side routing is already pointed
+    /// direct by whoever asserted the gate, so that Python got no traffic.
+    /// Claude-only gate (Codex enabled) keeps Python up for Codex -- same
+    /// carve-out as stop_python_if_gated / ensure_headroom_running (RUST-53);
+    /// without it every upgrade bounces the backend for gated Codex users
+    /// (stop here, watchdog respawn ~5-10s later).
+    /// Acquires `lifecycle_lock`, so callers MUST NOT already hold it.
+    fn stop_python_if_any_gate(&self) {
+        let gate_wants_python_down = self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
+            || (!self.pricing_allows_optimization()
+                && !crate::client_adapters::any_gate_exempt_client_enabled())
+            || self.runtime_is_paused();
+        if gate_wants_python_down {
+            log::info!(
+                "run_upgrade_with_ui: stopping the upgrade's Python because a gate is active"
+            );
+            self.stop_headroom();
         }
     }
 
@@ -4263,7 +4386,7 @@ impl AppState {
     }
 
     /// TTL-cached Codex identity profile, the Codex analog of
-    /// `cached_claude_profile`. Reads `~/.codex/auth.json` at most once per TTL.
+    /// `cached_claude_profile`. Reads `$CODEX_HOME/auth.json` at most once per TTL.
     /// `None` when nothing is known yet (no auth.json and no live capture).
     pub fn cached_codex_profile(&self) -> Option<CodexAccountProfile> {
         const TTL: Duration = Duration::from_secs(300);
@@ -4287,12 +4410,12 @@ impl AppState {
     /// so a Codex overage can't pause Claude optimization for a mixed user.
     pub fn apply_codex_pricing_gate_status(&self, codex: Option<&crate::models::CodexUsage>) {
         let was_bypassed = self.codex_bypass.load(std::sync::atomic::Ordering::Acquire);
-        // No Codex usage signal yet → leave the current state untouched rather
-        // than clearing a gate that a transient empty poll didn't disprove.
-        let Some(codex) = codex else {
-            return;
-        };
-        let should_bypass = !codex.optimization_allowed;
+        // `None` is no gate verdict, which allows: Codex disabled, or Ungated/
+        // Metered with no snapshot yet (a hard block always carries a reading,
+        // and error polls never get here, see `is_error_reading`). Keeping the
+        // flag left a user who paid after a trial-ended block on API-key Codex,
+        // which never yields a snapshot, bypassed until relaunch.
+        let should_bypass = codex.is_some_and(|codex| !codex.optimization_allowed);
 
         if should_bypass {
             if was_bypassed {
@@ -4303,7 +4426,7 @@ impl AppState {
             }
             log::info!(
                 "codex_gate: entering bypass (gate_reason={:?})",
-                codex.gate_reason
+                codex.and_then(|codex| codex.gate_reason.as_ref())
             );
             self.codex_bypass
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -4782,10 +4905,30 @@ fn parse_launch_profile_salvaging(bytes: &[u8]) -> Result<(LaunchProfile, Vec<St
     Ok((profile, dropped))
 }
 
-fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
+/// `None` when the profile on disk could not be read this launch: the session
+/// then runs on defaults and must never write them over the real file.
+fn persist_launch_profile(path: Option<&std::path::Path>, profile: &LaunchProfile) {
+    let Some(path) = path else {
+        return;
+    };
     if let Ok(bytes) = serde_json::to_vec_pretty(profile) {
         let _ = crate::client_adapters::atomic_write(path, &bytes);
     }
+}
+
+/// Read one of Headroom's own state files, retrying once after a short
+/// backoff. A read error on an EXISTING file (ENFILE, EIO) says nothing about
+/// its bytes, so a caller may reset or move aside only a file it actually
+/// parsed: conflating the two lost real state in RUST-5T (see
+/// `load_setup_state`). NotFound is returned at once, unretried.
+pub(crate) fn read_state_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path).or_else(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Err(err);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::fs::read(path)
+    })
 }
 
 impl Default for LaunchProfile {
@@ -4813,8 +4956,11 @@ impl LaunchProfile {
         }
     }
 
-    fn load_or_create(base_dir: &std::path::Path) -> Result<(Self, std::path::PathBuf)> {
+    /// The path is `None` when an existing profile could not be read: see
+    /// `persist_launch_profile`.
+    fn load_or_create(base_dir: &std::path::Path) -> Result<(Self, Option<std::path::PathBuf>)> {
         let path = config_file(base_dir, "launch-profile.json");
+        let mut persist_path = Some(path.clone());
 
         // A corrupt or truncated profile (0-byte file from a crash mid-write,
         // RUST-1P) must not crash startup — that's an unrecoverable launch
@@ -4822,10 +4968,8 @@ impl LaunchProfile {
         // profile; the warn still reaches Sentry for visibility. A profile
         // that is valid JSON with one unreadable field keeps every other
         // field (RUST-D7).
-        let previous = if path.exists() {
-            std::fs::read(&path)
-                .map_err(anyhow::Error::from)
-                .and_then(|bytes| parse_launch_profile_salvaging(&bytes))
+        let previous = match read_state_file(&path) {
+            Ok(bytes) => parse_launch_profile_salvaging(&bytes)
                 .map(|(profile, dropped)| {
                     if !dropped.is_empty() {
                         log::warn!(
@@ -4844,9 +4988,20 @@ impl LaunchProfile {
                     );
                     let _ = crate::client_adapters::move_aside(&path, &path.with_extension("json.corrupt"));
                     Self::fresh()
-                })
-        } else {
-            Self::fresh()
+                }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::fresh(),
+            // Unread is not corrupt: moving the file aside or persisting the
+            // defaults over it would lose onboarding, accepted terms and the
+            // upstream override for good. This session runs on defaults and
+            // the next launch reads the file intact.
+            Err(err) => {
+                log::warn!(
+                    "launch profile at {} could not be read ({err}); running this session on defaults and leaving the file untouched",
+                    path.display()
+                );
+                persist_path = None;
+                Self::fresh()
+            }
         };
 
         let mut current = previous;
@@ -4871,13 +5026,13 @@ impl LaunchProfile {
         // Best-effort persist: a failed write here (e.g. EPERM from locked-down
         // Application Support perms, RUST-1P) must not crash startup. The profile
         // is telemetry; degrade to the in-memory copy and continue.
-        if let Ok(bytes) = serde_json::to_vec_pretty(&current) {
-            if let Err(e) = crate::client_adapters::atomic_write(&path, &bytes) {
+        if let (Some(path), Ok(bytes)) = (&persist_path, serde_json::to_vec_pretty(&current)) {
+            if let Err(e) = crate::client_adapters::atomic_write(path, &bytes) {
                 log::warn!("could not persist {}: {e:#}", path.display());
             }
         }
 
-        Ok((current, path))
+        Ok((current, persist_path))
     }
 }
 
@@ -4990,6 +5145,12 @@ struct SavingsObservation {
     session_estimated_tokens_saved: u64,
     session_actual_cost_usd: f64,
     session_total_tokens_sent: u64,
+    /// Basis of `session_total_tokens_sent` (see
+    /// `HeadroomDashboardStats::session_sent_is_forwarded`). `None` on
+    /// observations persisted before the field existed: basis unknown, so no
+    /// basis switch is inferred from them.
+    #[serde(default)]
+    sent_is_forwarded: Option<bool>,
 }
 
 impl SavingsObservation {
@@ -5028,6 +5189,11 @@ struct DailySavingsBucket {
     // None for buckets archived before it existed, which keep the old
     // discount-derived estimate.
     cache_read_cost_usd: Option<f64>,
+    // The key is a UTC date: ingest archived a backend daily rollup here.
+    // False for the tracker's own LOCAL-day buckets, for every hourly bucket
+    // (hourly keys are local on every path), and for rollups archived before
+    // the field existed.
+    utc_keyed: bool,
 }
 
 impl DailySavingsBucket {
@@ -5157,7 +5323,9 @@ struct PersistedSavingsState {
 
 struct SavingsTracker {
     records_path: std::path::PathBuf,
-    state_path: std::path::PathBuf,
+    /// `None` when savings-state.json exists but could not be read this
+    /// launch: the session is kept in memory only (see `load_or_create`).
+    state_path: Option<std::path::PathBuf>,
     session_requests: usize,
     session_estimated_savings_usd: f64,
     session_estimated_tokens_saved: u64,
@@ -5203,8 +5371,15 @@ struct SavingsTracker {
     last_output_estimator_tokens_saved: Option<u64>,
     /// See `PersistedSavingsState::last_output_estimator_baseline_tokens`.
     last_output_estimator_baseline_tokens: Option<u64>,
+    /// See `ledger_read_or_last`. Not persisted: across launches the cached
+    /// `last_output_estimator_tokens_saved` stands in instead.
+    last_evidenced_ledger: Option<crate::output_savings::LedgerEstimate>,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
+    /// Bytes of the last successful savings-state write. Every dashboard poll
+    /// persists, and most change nothing: an identical state skips the
+    /// fsync'd rewrite.
+    last_persisted: Vec<u8>,
 }
 
 impl SavingsTracker {
@@ -5226,26 +5401,31 @@ impl SavingsTracker {
             }
         }
 
-        // A corrupt file must not brick launch, but it must also not be
-        // silently replaced: back it up for recovery and say so in the log.
-        let persisted_state = match load_persisted_savings_state(&state_path) {
-            Ok(state) => state,
+        // An unusable file is backed up and its history salvaged inside
+        // `load_persisted_savings_state`. An Err here means the file exists
+        // but could not be READ, which says nothing about its bytes (ENFILE,
+        // the RUST-5T shape): leave it alone, run this session in memory,
+        // and never persist over it, so the next launch reads it intact.
+        let (persisted_state, readable) = match load_persisted_savings_state(&state_path) {
+            Ok(state) => (state, true),
             Err(err) => {
-                log::warn!("savings-state.json unreadable ({err}); backing up");
-                let _ = crate::client_adapters::move_aside(&state_path, &state_path.with_extension("json.corrupt"));
-                None
+                log::warn!(
+                    "savings-state.json unreadable ({err:#}); leaving it untouched and not persisting this session"
+                );
+                (None, false)
             }
-        }
-        // Missing/corrupt/schema-mismatched state used to mean starting the
-        // user's savings history from zero even though savings-records.jsonl
-        // holds every observation delta — rebuild the buckets from it instead.
-        // Approximate is fine: the backend's settled-day rollups overwrite
-        // these keys on the next stats poll anyway.
-        .or_else(|| {
-            let rebuilt = rebuild_persisted_savings_from_records(&records_path);
+        };
+        // Last resort when nothing was salvaged (or the file is missing):
+        // savings-records.jsonl. It holds little more than each backend
+        // session's first-poll backfill, so this restores only a fraction of
+        // the history; the backend's rollups refill the days its ring covers.
+        let persisted_state = persisted_state.or_else(|| {
+            let rebuilt = readable
+                .then(|| rebuild_persisted_savings_from_records(&records_path))
+                .flatten();
             if rebuilt.is_some() {
                 log::warn!(
-                    "savings-state.json missing or unusable; rebuilt history from savings-records.jsonl"
+                    "savings-state.json missing or unsalvageable; rebuilt history from savings-records.jsonl"
                 );
             }
             rebuilt
@@ -5253,10 +5433,13 @@ impl SavingsTracker {
 
         // Seed the milestone high-water from the persisted value, or (on first
         // load after upgrade) from the current bucket sum so already-earned
-        // savings don't re-fire every milestone at once.
+        // savings don't re-fire every milestone at once. A session that could
+        // not read the history fires none: its total is only what the backend
+        // rollups refill, and every milestone under it was already earned.
         let lifetime_token_milestone_high_water = persisted_state
             .as_ref()
             .and_then(|state| state.lifetime_token_milestone_high_water)
+            .or((!readable).then_some(u64::MAX))
             .unwrap_or_else(|| {
                 persisted_state.as_ref().map_or(0, |state| {
                     state
@@ -5294,7 +5477,7 @@ impl SavingsTracker {
 
         let mut tracker = Self {
             records_path,
-            state_path,
+            state_path: readable.then_some(state_path),
             session_requests: 0,
             session_estimated_savings_usd: 0.0,
             session_estimated_tokens_saved: 0,
@@ -5366,7 +5549,9 @@ impl SavingsTracker {
                 .as_ref()
                 .filter(|_| output_series_current)
                 .and_then(|state| state.last_output_estimator_baseline_tokens),
+            last_evidenced_ledger: None,
             last_written_at: None,
+            last_persisted: Vec::new(),
         };
         // Best-effort: persistence failing (ENOSPC/EACCES) degrades to
         // in-memory stats; it is retried on every observe tick anyway.
@@ -5442,6 +5627,7 @@ impl SavingsTracker {
                 // Filled by the sampler overlay in build_dashboard.
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
+                utc_keyed: bucket.utc_keyed,
             })
             .collect()
     }
@@ -5459,6 +5645,14 @@ impl SavingsTracker {
             .collect();
         days.dedup(); // BTreeMap order: sorted, so dedup is enough
         days
+    }
+
+    /// Weekly recap totals for the local days `start..=end`. From the hourly
+    /// map for the reason `active_day_keys` gives: `daily_savings` holds the
+    /// backend's UTC-dated rollups, which shift a UTC-west Sunday evening into
+    /// the next week.
+    fn weekly_totals(&self, start: chrono::NaiveDate, end: chrono::NaiveDate) -> WeeklyTotals {
+        aggregate_weekly_totals(&self.hourly_savings, start, end)
     }
 
     fn hourly_savings(&self) -> Vec<HourlySavingsPoint> {
@@ -5580,6 +5774,7 @@ impl SavingsTracker {
                 cache_read_tokens,
                 cache_savings_usd,
                 cache_read_cost_usd,
+                utc_keyed: true,
             };
             if archived.as_ref() != Some(&bucket) {
                 self.daily_savings.insert(point.date.clone(), bucket);
@@ -5623,6 +5818,7 @@ impl SavingsTracker {
                 cache_read_tokens,
                 cache_savings_usd,
                 cache_read_cost_usd,
+                utc_keyed: false,
             };
             if archived.as_ref() != Some(&bucket) {
                 self.hourly_savings.insert(point.hour.clone(), bucket);
@@ -5754,10 +5950,21 @@ impl SavingsTracker {
         let requests_went_back = previous.as_ref().is_some_and(|prev| {
             stats.session_requests.is_some() && session_requests < prev.session_requests
         });
+        // Sent moved between the forwarded fallback and new input: the two
+        // readings are on different scales, so neither a drop nor a delta
+        // between them means anything. A real restart still shows in the
+        // requests and saved checks.
+        let sent_basis_changed = session_total_tokens_sent.is_some()
+            && previous.as_ref().is_some_and(|prev| {
+                prev.sent_is_forwarded
+                    .is_some_and(|was| was != stats.session_sent_is_forwarded)
+            });
         let reset_detected = previous.as_ref().is_some_and(|prev| {
             session_tokens_saved < prev.session_estimated_tokens_saved
                 || session_total_tokens_sent.is_some_and(|value| {
-                    prev.session_total_tokens_sent > 0 && value < prev.session_total_tokens_sent
+                    !sent_basis_changed
+                        && prev.session_total_tokens_sent > 0
+                        && value < prev.session_total_tokens_sent
                 })
                 || session_actual_cost_usd.is_some_and(|value| {
                     prev.session_actual_cost_usd > 0.0
@@ -5797,7 +6004,7 @@ impl SavingsTracker {
                         }
                     }),
                     session_total_tokens_sent.map_or(0, |value| {
-                        if prev.session_total_tokens_sent > 0 {
+                        if prev.session_total_tokens_sent > 0 && !sent_basis_changed {
                             value.saturating_sub(prev.session_total_tokens_sent)
                         } else {
                             0
@@ -5816,6 +6023,10 @@ impl SavingsTracker {
         };
         if reset_detected {
             self.session_savings_history.clear();
+        }
+        if reset_detected || sent_basis_changed {
+            // Re-seed the sent series on the new basis: its old points would
+            // hold the new readings below them forever.
             self.session_new_input_history.clear();
         }
         self.session_savings_history =
@@ -5841,12 +6052,23 @@ impl SavingsTracker {
             );
         }
 
-        let previous_session_hourly_buckets = self.session_hourly_buckets.clone();
-        let current_session_hourly_buckets = derive_session_hourly_buckets(
+        let mut current_session_hourly_buckets = derive_session_hourly_buckets(
             stats,
             &self.session_savings_history,
             &self.session_new_input_history,
         );
+        // `persist_state` prunes hours past retention from the diff baseline
+        // while the session history still derives them, so every later poll
+        // read them as new and added them to their day again. Drop them from
+        // both sides with one cutoff: days already banked stay as they are.
+        if !first_observation && !reset_detected {
+            if let Some(cutoff) = self.hourly_cutoff(&current_session_hourly_buckets) {
+                current_session_hourly_buckets.retain(|(key, _)| key.as_str() >= cutoff.as_str());
+                self.session_hourly_buckets
+                    .retain(|key, _| key.as_str() >= cutoff.as_str());
+            }
+        }
+        let previous_session_hourly_buckets = self.session_hourly_buckets.clone();
         let current_session_hourly_buckets_map = current_session_hourly_buckets
             .iter()
             .cloned()
@@ -5866,7 +6088,7 @@ impl SavingsTracker {
         self.session_estimated_savings_usd = session_savings_usd;
         self.session_estimated_tokens_saved = session_tokens_saved;
         self.session_savings_pct = stats.session_savings_pct.unwrap_or(0.0);
-        if reset_detected {
+        if reset_detected || sent_basis_changed {
             self.display_session_baseline = None;
         } else if rollover_display_session {
             self.display_session_baseline = previous.clone();
@@ -5911,7 +6133,16 @@ impl SavingsTracker {
             session_requests,
             session_estimated_savings_usd: session_savings_usd,
             session_estimated_tokens_saved: session_tokens_saved,
-            observed_at: Utc::now(),
+            // Held on an idle poll so it serializes unchanged and
+            // `persist_state` can skip the rewrite. Nothing reads it as a
+            // poll clock: it is only the pre-`last_activity_at` fallback.
+            observed_at: if changed {
+                Utc::now()
+            } else {
+                previous
+                    .as_ref()
+                    .map_or_else(Utc::now, |prev| prev.observed_at)
+            },
             last_activity_at: Some(if changed {
                 Utc::now()
             } else {
@@ -5930,6 +6161,11 @@ impl SavingsTracker {
                     .as_ref()
                     .map_or(0, |prev| prev.session_total_tokens_sent),
             ),
+            sent_is_forwarded: if session_total_tokens_sent.is_some() {
+                Some(stats.session_sent_is_forwarded)
+            } else {
+                previous.as_ref().and_then(|prev| prev.sent_is_forwarded)
+            },
         });
 
         let now = std::time::Instant::now();
@@ -6268,6 +6504,23 @@ impl SavingsTracker {
     /// were seeded from the same credited cumulative, and a mark parked at
     /// that larger figure would silence the sampler long after the control
     /// arm makes this machine scoreable. Runs every poll; a no-op once clean.
+    /// Upstream rewrites the ledger in place (a plain `write_text` every 25
+    /// requests), so a read can land mid-write, parse as `NoEvidence`, and
+    /// flip every output figure to the backend's credit for one poll: the
+    /// headline, the chart points, and $0 to credited dollars on an unscored
+    /// machine. Once this launch has read evidence, a later `NoEvidence`
+    /// stands for that last read instead.
+    fn ledger_read_or_last(
+        &mut self,
+        read: crate::output_savings::LedgerEstimate,
+    ) -> crate::output_savings::LedgerEstimate {
+        if read == crate::output_savings::LedgerEstimate::NoEvidence {
+            return self.last_evidenced_ledger.clone().unwrap_or(read);
+        }
+        self.last_evidenced_ledger = Some(read.clone());
+        read
+    }
+
     fn drop_unscoreable_output_samples(&mut self) {
         if self.output_daily_samples.is_empty()
             && self.output_hourly_samples.is_empty()
@@ -6323,22 +6576,32 @@ impl SavingsTracker {
     /// cost. Daily buckets are kept indefinitely (365/year is nothing).
     const HOURLY_RETENTION_DAYS: i64 = 30;
 
-    fn prune_hourly_savings(&mut self) {
+    /// Oldest day key hourly retention keeps, counted over the hourly maps
+    /// plus `extra` (hour keys about to join them). Shared by the prune and by
+    /// `observe`, so the session diff baseline and the buckets derived from
+    /// the session history always cover the same hours.
+    fn hourly_cutoff(&self, extra: &[(String, DailySavingsBucket)]) -> Option<String> {
         // Anchor retention to the newest bucket rather than the wall clock so
         // a returning user's charts don't vanish before new data arrives.
         let latest_day = self
             .hourly_savings
             .keys()
             .chain(self.session_hourly_buckets.keys())
+            .chain(extra.iter().map(|(key, _)| key))
             .filter_map(|key| key.get(..10))
             .max()
-            .and_then(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok());
-        let Some(latest_day) = latest_day else {
+            .and_then(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok())?;
+        Some(
+            (latest_day - chrono::Duration::days(Self::HOURLY_RETENTION_DAYS))
+                .format("%Y-%m-%d")
+                .to_string(),
+        )
+    }
+
+    fn prune_hourly_savings(&mut self) {
+        let Some(cutoff) = self.hourly_cutoff(&[]) else {
             return;
         };
-        let cutoff = (latest_day - chrono::Duration::days(Self::HOURLY_RETENTION_DAYS))
-            .format("%Y-%m-%d")
-            .to_string();
         // Keys are "YYYY-MM-DDTHH:00", so day-key prefix comparison is date order.
         self.hourly_savings
             .retain(|key, _| key.as_str() >= cutoff.as_str());
@@ -6352,14 +6615,22 @@ impl SavingsTracker {
 
     fn persist_state(&mut self) -> Result<()> {
         self.prune_hourly_savings();
+        let Some(state_path) = &self.state_path else {
+            return Ok(());
+        };
         // Compact (not pretty) JSON: this is a machine-read file rewritten on
-        // every observe tick; pretty-printing roughly doubled the write.
+        // every observe tick that changes it; pretty-printing roughly doubled
+        // the write.
         let serialized =
             serde_json::to_vec(&self.persisted_state()).context("serializing savings state")?;
+        if serialized == self.last_persisted {
+            return Ok(());
+        }
         // Temp+rename: a crash/power loss mid-write used to leave truncated
         // JSON that the next launch silently replaced with a fresh tracker.
-        crate::client_adapters::atomic_write(&self.state_path, &serialized)
-            .with_context(|| format!("writing {}", self.state_path.display()))?;
+        crate::client_adapters::atomic_write(state_path, &serialized)
+            .with_context(|| format!("writing {}", state_path.display()))?;
+        self.last_persisted = serialized;
         Ok(())
     }
 }
@@ -6373,28 +6644,28 @@ fn most_recent_monday(d: chrono::NaiveDate) -> chrono::NaiveDate {
         .unwrap_or(d)
 }
 
+/// Sums local-hour-keyed buckets over the local days `start..=end`.
 fn aggregate_weekly_totals(
-    daily_savings: &BTreeMap<String, DailySavingsBucket>,
+    hourly_savings: &BTreeMap<String, DailySavingsBucket>,
     start: chrono::NaiveDate,
     end: chrono::NaiveDate,
 ) -> WeeklyTotals {
-    let start_key = start.format("%Y-%m-%d").to_string();
-    let end_key = end.format("%Y-%m-%d").to_string();
+    let start_key = format!("{}T00:00", start.format("%Y-%m-%d"));
+    let end_key = format!("{}T23:59", end.format("%Y-%m-%d"));
     let mut total_tokens_saved: u64 = 0;
     let mut total_savings_usd: f64 = 0.0;
-    let mut active_days: u32 = 0;
-    for (day_key, bucket) in daily_savings.range(start_key..=end_key) {
+    let mut active_days = HashSet::new();
+    for (hour_key, bucket) in hourly_savings.range(start_key..=end_key) {
         if bucket.is_active() {
-            active_days += 1;
+            active_days.insert(day_key_from_hour_key(hour_key));
         }
         total_tokens_saved = total_tokens_saved.saturating_add(bucket.estimated_tokens_saved);
         total_savings_usd += bucket.estimated_savings_usd;
-        let _ = day_key;
     }
     WeeklyTotals {
         total_tokens_saved,
         total_savings_usd,
-        active_days,
+        active_days: active_days.len() as u32,
     }
 }
 
@@ -6419,11 +6690,11 @@ fn lifetime_token_milestones_crossed(previous_total: u64, current_total: u64) ->
 
 /// Rebuild a best-effort `PersistedSavingsState` from the append-only
 /// savings-records.jsonl (current + one rotated generation) by summing each
-/// record's observation deltas into day/hour buckets. Used when
-/// savings-state.json is missing, corrupt, or schema-mismatched. Session
-/// state is not recoverable (and doesn't matter across a restart); the
-/// milestone high-water is seeded from the rebuilt total so already-earned
-/// milestones don't re-fire.
+/// record's observation deltas into day/hour buckets. Used only when
+/// savings-state.json is missing or nothing could be salvaged from it: the
+/// records hold little more than each backend session's first-poll backfill.
+/// Session state is not recoverable (and doesn't matter across a restart);
+/// the milestone high-water is seeded from the rebuilt total.
 fn rebuild_persisted_savings_from_records(records_path: &Path) -> Option<PersistedSavingsState> {
     let mut daily: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
     let mut hourly: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
@@ -6485,29 +6756,78 @@ fn rebuild_persisted_savings_from_records(records_path: &Path) -> Option<Persist
     })
 }
 
+/// `Err` only when the file exists but could not be read (twice): the caller
+/// must then leave it alone. Unparsable or schema-mismatched bytes are backed
+/// up for recovery and their format-agnostic fields salvaged.
 fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsState>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let persisted = serde_json::from_slice::<PersistedSavingsState>(&bytes)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    if persisted.schema_version == 3 {
-        Ok(Some(persisted))
-    } else {
+    let bytes = match read_state_file(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    let backup = match serde_json::from_slice::<PersistedSavingsState>(&bytes) {
+        Ok(persisted) if persisted.schema_version == 3 => return Ok(Some(persisted)),
         // Unknown schema (e.g. downgrade after a bad update): preserve the
         // file — the fresh tracker's first persist would otherwise overwrite
         // the user's entire savings history with zeros.
-        log::warn!(
-            "{} has schema {} (expected 3); backing up and starting fresh",
-            path.display(),
-            persisted.schema_version
-        );
-        let _ =
-            crate::client_adapters::move_aside(path, &path.with_extension("json.schema-mismatch"));
-        Ok(None)
+        Ok(persisted) => {
+            log::warn!(
+                "{} has schema {} (expected 3); backing up and salvaging its history",
+                path.display(),
+                persisted.schema_version
+            );
+            "json.schema-mismatch"
+        }
+        // A corrupt file must not brick launch, but it must also not be
+        // silently replaced.
+        Err(err) => {
+            log::warn!(
+                "{} unparsable ({err}); backing up and salvaging its history",
+                path.display()
+            );
+            "json.corrupt"
+        }
+    };
+    let _ = crate::client_adapters::move_aside(path, &path.with_extension(backup));
+    Ok(salvage_persisted_savings_state(&bytes))
+}
+
+/// The format-agnostic part of a savings-state.json that cannot be used
+/// whole: day/hour history, lifetime counters and the milestone high-water.
+/// Each bucket is taken on its own, so one unreadable bucket costs only
+/// itself. Session state and the version-sensitive output samples are
+/// dropped. None for a pre-v3 file (older semantics) or when nothing is left.
+fn salvage_persisted_savings_state(bytes: &[u8]) -> Option<PersistedSavingsState> {
+    fn entries<T: serde::de::DeserializeOwned>(
+        map: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> BTreeMap<String, T> {
+        map.get(key)
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| Some((k.clone(), serde_json::from_value(v.clone()).ok()?)))
+            .collect()
     }
+    let serde_json::Value::Object(map) = serde_json::from_slice(bytes).ok()? else {
+        return None;
+    };
+    let number = |key: &str| map.get(key).and_then(serde_json::Value::as_u64);
+    if number("schemaVersion").unwrap_or(0) < 3 {
+        return None;
+    }
+    let salvaged = PersistedSavingsState {
+        schema_version: 3,
+        lifetime_requests: number("lifetimeRequests").unwrap_or(0) as usize,
+        lifetime_token_milestone_high_water: number("lifetimeTokenMilestoneHighWater"),
+        lifetime_tool_schema_tokens_saved: number("lifetimeToolSchemaTokensSaved").unwrap_or(0),
+        daily_savings: entries(&map, "dailySavings"),
+        hourly_savings: entries(&map, "hourlySavings"),
+        tool_schema_daily_samples: entries(&map, "toolSchemaDailySamples"),
+        tool_schema_hourly_samples: entries(&map, "toolSchemaHourlySamples"),
+        ..Default::default()
+    };
+    (!salvaged.daily_savings.is_empty() || salvaged.lifetime_requests > 0).then_some(salvaged)
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -6524,6 +6844,11 @@ struct HeadroomDashboardStats {
     session_savings_pct: Option<f64>,
     session_actual_cost_usd: Option<f64>,
     session_total_tokens_sent: Option<u64>,
+    /// True when `session_total_tokens_sent` is the total-forwarded fallback
+    /// because the backend reported no new input yet. Its first cache-active
+    /// request switches the figure to the far smaller new-input sum, and
+    /// `observe` must not read that drop as a backend restart.
+    session_sent_is_forwarded: bool,
     savings_history: Vec<HeadroomSavingsHistoryPoint>,
     output_reduction: Option<OutputReduction>,
     /// Whether the wheel's rollout gate actually enabled the output shaper
@@ -6672,46 +6997,82 @@ impl HeadroomSavingsHistoryResponse {
                 // Filled by the sampler overlay in build_dashboard.
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
+                utc_keyed: true,
             })
             .collect()
     }
 
     fn hourly_savings(&self) -> Vec<HourlySavingsPoint> {
-        self.hourly
-            .iter()
-            .map(|point| HourlySavingsPoint {
-                hour: local_hour_key(point.timestamp.with_timezone(&Local)),
-                estimated_savings_usd: point.compression_savings_usd_delta,
-                estimated_tokens_saved: point.tokens_saved,
-                tool_schema_savings_usd: 0.0,
-                tool_schema_tokens_saved: 0,
-                actual_cost_usd: point.total_input_cost_usd_delta,
-                total_tokens_sent: point.total_input_tokens_delta,
-                // Backend history has no new-input dimension: this point's
-                // sent tokens are full-forwarded (cache-polluted). 0 = no coverage.
-                new_input_tokens: 0,
-                output_savings_usd: point.output_savings_usd_delta,
-                output_tokens_saved: point.output_tokens_saved_delta,
-                cache_read_tokens: point.cache_read_tokens_delta,
-                cache_savings_usd: point.cache_savings_usd_delta,
-                cache_read_cost_usd: point.cache_read_cost_usd_delta,
-                output_sampled_tokens_saved: None,
-                output_baseline_tokens: None,
-                by_provider: point
-                    .by_provider
-                    .iter()
-                    .map(|p| crate::models::ProviderSavingsPoint {
-                        provider: p.provider.clone(),
-                        estimated_savings_usd: p.compression_savings_usd_delta,
-                        estimated_tokens_saved: p.tokens_saved,
-                        actual_cost_usd: p.total_input_cost_usd_delta,
-                        total_tokens_sent: p.total_input_tokens_delta,
-                        cache_savings_usd: p.cache_savings_usd_delta,
-                        cache_read_cost_usd: p.cache_read_cost_usd_delta,
-                    })
-                    .collect(),
-            })
-            .collect()
+        self.hourly_savings_keyed(|at| local_hour_key(at.with_timezone(&Local)))
+    }
+
+    /// Relabelling UTC hours as local ones maps the two UTC hours of a DST
+    /// fall-back onto one key. Every consumer inserts by key, so a second
+    /// point overwrote the first; the repeated hour is summed instead.
+    fn hourly_savings_keyed(
+        &self,
+        hour_key: impl Fn(DateTime<Utc>) -> String,
+    ) -> Vec<HourlySavingsPoint> {
+        let points = self.hourly.iter().map(|point| HourlySavingsPoint {
+            hour: hour_key(point.timestamp),
+            estimated_savings_usd: point.compression_savings_usd_delta,
+            estimated_tokens_saved: point.tokens_saved,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
+            actual_cost_usd: point.total_input_cost_usd_delta,
+            total_tokens_sent: point.total_input_tokens_delta,
+            // Backend history has no new-input dimension: this point's
+            // sent tokens are full-forwarded (cache-polluted). 0 = no coverage.
+            new_input_tokens: 0,
+            output_savings_usd: point.output_savings_usd_delta,
+            output_tokens_saved: point.output_tokens_saved_delta,
+            cache_read_tokens: point.cache_read_tokens_delta,
+            cache_savings_usd: point.cache_savings_usd_delta,
+            cache_read_cost_usd: point.cache_read_cost_usd_delta,
+            output_sampled_tokens_saved: None,
+            output_baseline_tokens: None,
+            by_provider: point
+                .by_provider
+                .iter()
+                .map(|p| crate::models::ProviderSavingsPoint {
+                    provider: p.provider.clone(),
+                    estimated_savings_usd: p.compression_savings_usd_delta,
+                    estimated_tokens_saved: p.tokens_saved,
+                    actual_cost_usd: p.total_input_cost_usd_delta,
+                    total_tokens_sent: p.total_input_tokens_delta,
+                    cache_savings_usd: p.cache_savings_usd_delta,
+                    cache_read_cost_usd: p.cache_read_cost_usd_delta,
+                })
+                .collect(),
+        });
+        let mut by_hour: BTreeMap<String, HourlySavingsPoint> = BTreeMap::new();
+        for p in points {
+            let Some(sum) = by_hour.get_mut(&p.hour) else {
+                by_hour.insert(p.hour.clone(), p);
+                continue;
+            };
+            sum.estimated_savings_usd += p.estimated_savings_usd;
+            sum.estimated_tokens_saved += p.estimated_tokens_saved;
+            sum.actual_cost_usd += p.actual_cost_usd;
+            sum.total_tokens_sent += p.total_tokens_sent;
+            sum.output_savings_usd += p.output_savings_usd;
+            sum.output_tokens_saved += p.output_tokens_saved;
+            // Coverage must hold for both hours, or the sum claims a partial one.
+            sum.cache_read_tokens = sum
+                .cache_read_tokens
+                .zip(p.cache_read_tokens)
+                .map(|(a, b)| a + b);
+            sum.cache_savings_usd = sum
+                .cache_savings_usd
+                .zip(p.cache_savings_usd)
+                .map(|(a, b)| a + b);
+            sum.cache_read_cost_usd = sum
+                .cache_read_cost_usd
+                .zip(p.cache_read_cost_usd)
+                .map(|(a, b)| a + b);
+            sum.by_provider.extend(p.by_provider);
+        }
+        by_hour.into_values().collect()
     }
 }
 
@@ -6742,7 +7103,8 @@ const STATS_FETCH_WARN_MAX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// enough that a busy-proxy flap cannot span it, short enough that a genuine
 /// fix is loud again within one sitting.
 const STATS_FETCH_RECOVERY_WINDOW: Duration = Duration::from_secs(300);
-/// Per-request `/stats` timeout; see `fetch_headroom_dashboard_stats` for why 15s.
+/// Per-request `/stats` and `/stats-history` timeout; see
+/// `fetch_headroom_dashboard_stats` for why 15s.
 const STATS_FETCH_TIMEOUT_SECS: u64 = 15;
 static STATS_FETCH_WARNED_AT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
 /// When the current unbroken run of successful fetches began; `None` when the
@@ -7051,11 +7413,18 @@ fn report_cache_integrity(body: &str) {
     );
 }
 
-fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
-    if !is_headroom_proxy_reachable() {
-        return None;
-    }
+/// Clears a fetch's in-flight flag on every exit, panics included: a stuck
+/// flag would stop that fetch for the process lifetime.
+struct InFlight<'a>(&'a AtomicBool);
 
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Callers probe `/readyz` first (see `polled_headroom_stats`).
+fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     // 500ms was silently fatal: `/stats` rebuilds its whole payload per call
     // and crossed half a second as history grew, so every fetch timed out and
     // the dashboard lost the layers only this endpoint reports (output
@@ -7076,7 +7445,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     let mut last_failure: Option<String> = None;
 
     for host in hosts {
-        let url = format!("http://{host}:6767/stats?cached=1");
+        let url = format!("http://{host}:{}/stats?cached=1", local_proxy_port());
         let response = match client.get(&url).send() {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
@@ -7174,24 +7543,27 @@ fn scrape_compression_quarantine() {
     }
 }
 
+/// Callers probe `/readyz` first (see `cached_headroom_history`).
 fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
-    if !is_headroom_proxy_reachable() {
-        return None;
-    }
-
+    // Same budget as `/stats`: the backend builds this on its event loop in
+    // 0.5-1.9s under ordinary traffic, so the 500ms this used to allow failed
+    // most fetches and re-ran the build on every retry.
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .tls_built_in_root_certs(false)
-        .timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
         .build()
         .ok()?;
 
     let hosts = ["127.0.0.1", "localhost"];
 
     for host in hosts {
-        let url = format!("http://{host}:6767/stats-history");
+        let url = format!("http://{host}:{}/stats-history", local_proxy_port());
         let response = match client.get(&url).send() {
             Ok(response) if response.status().is_success() => response,
+            // Both host names reach the same listener, so retrying a stalled
+            // build on the other alias only runs it twice.
+            Err(err) if err.is_timeout() => return None,
             _ => continue,
         };
 
@@ -7401,10 +7773,12 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
     // Filter the primary to >0 *before* the fallback: new_input_tokens is
     // Some(0) on a fully-cached snapshot, and `.or` only fires on None -- without
     // this the Some(0) skips the fallback and is then dropped, losing a valid count.
+    let new_input_tokens = new_input_tokens.filter(|value| *value > 0);
     let session_total_tokens_sent = new_input_tokens
-        .filter(|value| *value > 0)
         .or(total_after_compression)
         .filter(|value| *value > 0);
+    let session_sent_is_forwarded =
+        session_total_tokens_sent.is_some() && new_input_tokens.is_none();
     // `summary.compression` carries the process-cumulative counter. The
     // `savings.by_layer` block reports the same layer but only over the recent
     // request window, so it is a fallback for shape, not a preferred source.
@@ -7520,6 +7894,7 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
             session_savings_pct,
             session_actual_cost_usd: actual_cost_usd.map(|value| value.max(0.0)),
             session_total_tokens_sent,
+            session_sent_is_forwarded,
             savings_history,
             output_reduction,
             output_shaper_active,
@@ -8073,10 +8448,11 @@ where
         return Vec::new();
     }
 
-    // The session saved counter is all-layers while the checkpoint series is
-    // compression-only ("bare message figure", tool_search disjoint), so
-    // proportions over the raw session total dropped the tool-schema share of
-    // sent on the floor even at full history coverage.
+    // The session saved counter is all-layers while the checkpoint series and
+    // `cost.compression_savings_usd` are compression-only ("bare message
+    // figure", tool_search disjoint), so proportions over the raw session
+    // total dropped the tool-schema share of sent, dollars and spend on the
+    // floor even at full history coverage.
     let compression_total =
         total_tokens.saturating_sub(stats.tool_schema_tokens_saved.unwrap_or(0));
 
@@ -8103,8 +8479,8 @@ where
         return Vec::new();
     }
 
-    if total_tokens > 0 && total_usd > 0.0 {
-        let usd_per_token = total_usd / total_tokens as f64;
+    if compression_total > 0 && total_usd > 0.0 {
+        let usd_per_token = total_usd / compression_total as f64;
         for bucket in buckets.values_mut() {
             bucket.estimated_savings_usd = bucket.estimated_tokens_saved as f64 * usd_per_token;
         }
@@ -8169,12 +8545,12 @@ where
         }
     }
 
-    if total_tokens > 0 && total_actual_cost_usd > 0.0 {
+    if compression_total > 0 && total_actual_cost_usd > 0.0 {
         let keys = buckets.keys().cloned().collect::<Vec<_>>();
         for key in keys.iter() {
             let bucket = buckets.get_mut(key).expect("bucket exists");
             bucket.actual_cost_usd = total_actual_cost_usd
-                * (bucket.estimated_tokens_saved as f64 / total_tokens as f64);
+                * (bucket.estimated_tokens_saved as f64 / compression_total as f64);
         }
     }
 
@@ -8193,13 +8569,28 @@ fn merge_session_savings_history(
             .or_insert(point.total_tokens_saved);
     }
 
+    // Keep the first point (the baseline the first delta is taken from) and
+    // the last point of each local hour. Hourly buckets diff consecutive
+    // points into the later point's hour, so an interior point only splits
+    // its hour's delta in two: dropping it keeps every hour exact, and the
+    // persisted history grows per hour instead of per request. Points the
+    // /stats window re-delivers are dropped again on the next merge.
+    // ponytail: one point per hour for the backend process's lifetime (a
+    // restart clears it); trim points past hourly retention if backends ever
+    // routinely live for months.
     let mut normalized = Vec::with_capacity(merged.len());
     let mut previous_total = 0u64;
+    let mut previous_hour = String::new();
     for (timestamp, total_tokens_saved) in merged {
         if !normalized.is_empty() && total_tokens_saved < previous_total {
             continue;
         }
         previous_total = total_tokens_saved;
+        let hour = local_hour_key(timestamp.with_timezone(&Local));
+        if normalized.len() > 1 && hour == previous_hour {
+            normalized.pop();
+        }
+        previous_hour = hour;
         normalized.push(HeadroomSavingsHistoryPoint {
             timestamp,
             total_tokens_saved,
@@ -8534,10 +8925,7 @@ pub(crate) fn headroom_proxy_readyz() -> (bool, Option<serde_json::Value>) {
     // matching the watchdog's tolerance — a healthy /readyz still answers in
     // milliseconds, so the dot stays responsive; the larger budget only bites
     // when the backend is genuinely slow.
-    probe_proxy_readyz(
-        crate::proxy_intercept::INTERCEPT_PORT,
-        Duration::from_secs(5),
-    )
+    probe_proxy_readyz(local_proxy_port(), Duration::from_secs(5))
 }
 
 /// The `error_hint` recorded for a boot-validation failure. `startup_hint` is
@@ -8753,11 +9141,23 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
 }
 
 fn is_headroom_proxy_reachable() -> bool {
-    probe_proxy_readyz(
-        crate::proxy_intercept::INTERCEPT_PORT,
-        Duration::from_millis(1500),
-    )
-    .0
+    probe_proxy_readyz(local_proxy_port(), Duration::from_millis(1500)).0
+}
+
+/// The intercept port the local `/readyz`, `/stats` and `/stats-history` polls
+/// target. A test points its own thread at a throwaway listener instead, since
+/// a dev machine has the real Headroom answering on 6767.
+fn local_proxy_port() -> u16 {
+    #[cfg(test)]
+    if let Some(port) = TEST_PROXY_PORT.with(std::cell::Cell::get) {
+        return port;
+    }
+    crate::proxy_intercept::INTERCEPT_PORT
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PROXY_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the runtime is already serving, so `ensure_headroom_running` can
@@ -9040,7 +9440,8 @@ fn escape_powershell_like(value: &str) -> String {
 /// lock, which is where that case surfaces today; count failed kills in the
 /// script if that ever stops being true.
 ///
-/// Parent filter (same rule as the unix sweep, see `sweep_should_kill`): under
+/// Parent filter (the unix sweep's rule, see `sweep_should_kill`, minus its
+/// subreaper clause, which Windows never needs): under
 /// `SweepParents::Orphans` a match is killed only when its parent is gone
 /// (Windows never reparents an orphan, so its ParentProcessId names a dead
 /// pid) or, with `own_children`, when its parent is this app (`self_pid`). A match
@@ -9115,10 +9516,50 @@ fn windows_process_sweep_script(
 /// hosts). `own_children` is false when the caller could not take the
 /// lifecycle lock: then a sibling transition in this process is mid-spawn and
 /// its child is likewise off limits.
-fn sweep_should_kill(ppid: u32, self_pid: u32, parents: SweepParents) -> bool {
+///
+/// "Some other live process" means another Headroom desktop
+/// (`parent_is_headroom`), nothing wider: on Linux an orphan reparents to the
+/// nearest subreaper, which on a systemd desktop is the `systemd --user`
+/// manager, not pid 1. Sparing every live parent left that orphan backend
+/// running through every quit, gate pause and runtime upgrade until reboot.
+fn sweep_should_kill(
+    ppid: u32,
+    self_pid: u32,
+    parent_is_headroom: bool,
+    parents: SweepParents,
+) -> bool {
     match parents {
         SweepParents::Any => true,
-        SweepParents::Orphans { own_children } => ppid <= 1 || (own_children && ppid == self_pid),
+        SweepParents::Orphans { own_children } => {
+            ppid <= 1
+                || (own_children && ppid == self_pid)
+                || (ppid != self_pid && !parent_is_headroom)
+        }
+    }
+}
+
+/// Whether `comm` (what `ps -o comm=` reports for a match's parent) names a
+/// Headroom desktop, given `own`, what it reports for this process. An empty
+/// `comm` is a parent that has exited; an unknown `own` matches anything, so
+/// the sweep falls back to sparing every live parent.
+fn comm_is_headroom_desktop(comm: &str, own: &str) -> bool {
+    let comm = comm.trim();
+    !comm.is_empty() && comm.contains(own)
+}
+
+/// `comm_is_headroom_desktop` for a live pid. A `ps` that cannot run spares
+/// the match.
+#[cfg(unix)]
+fn parent_is_headroom_desktop(ppid: u32) -> bool {
+    match crate::proc::command("ps")
+        .args(["-o", "comm=", "-p", &ppid.to_string()])
+        .output()
+    {
+        Ok(out) => comm_is_headroom_desktop(
+            &String::from_utf8_lossy(&out.stdout),
+            &crate::relauncher_expect_name(),
+        ),
+        Err(_) => true,
     }
 }
 
@@ -9196,9 +9637,11 @@ fn kill_processes_by_command_pattern(
             if pid == self_pid {
                 continue;
             }
-            if !sweep_should_kill(ppid, self_pid, parents) {
+            let parent_is_headroom =
+                ppid > 1 && ppid != self_pid && parent_is_headroom_desktop(ppid);
+            if !sweep_should_kill(ppid, self_pid, parent_is_headroom, parents) {
                 log::info!(
-                    "process sweep: leaving pid {pid} (parent {ppid} is alive and not us) for '{pattern}'"
+                    "process sweep: leaving pid {pid} (parent {ppid} is a live Headroom) for '{pattern}'"
                 );
                 continue;
             }
@@ -9285,17 +9728,37 @@ fn kill_processes_by_command_pattern(
 }
 
 /// Kill every process whose command line references the managed venv
-/// directory. Windows-only: pip cannot overwrite files a running process
-/// holds open, so an upgrade's `--force-reinstall` — and the rollback that
-/// retries the same operation — both die with permission errors when an
-/// IDE-spawned MCP server or stray python is still running from the venv
-/// (RUST-6Z/70: install failed, restored=false, runtime bricked).
+/// directory (Windows; Unix reaps less, see below): pip cannot overwrite
+/// files a running process holds open, so an upgrade's `--force-reinstall`
+/// and the rollback that retries the same operation both die with
+/// permission errors when an IDE-spawned MCP server or stray python is
+/// still running from the venv (RUST-6Z/70: install failed, restored=false, runtime bricked).
 /// `stop_headroom` doesn't cover these: it only matches the proxy's own
-/// command patterns. Unix replaces in-use files fine, so this is a no-op
-/// there. Identity is verified by the venv path in the command line, never
-/// by port.
+/// command patterns. Identity is verified by the venv path in the command
+/// line, never by port.
+///
+/// Unix: in-use files are no obstacle, but a second writer is. A pip orphaned
+/// by a quit (or crash) mid-install keeps unpacking into the venv that this
+/// mutation, or `recover_from_interrupted_upgrade`'s remove-and-rename, is
+/// about to rewrite, leaving duplicate dist-info or a half-deleted venv. So
+/// there only an orphaned `python3 -m pip` from this venv is reaped (the
+/// orphan rule spares this app's own pip and a live Headroom's). Killing it
+/// mid-install costs nothing: the mutation about to run rewrites the venv
+/// anyway, and an interrupted upgrade's marker makes recovery restore it.
+/// ponytail: SIGTERM is not awaited, so a pip mid-write can land one more
+/// file within milliseconds; poll the pids if that ever shows up.
 pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     if !cfg!(target_os = "windows") {
+        // `tool_manager`'s `managed_python` on unix.
+        if let Err(err) = kill_processes_by_command_pattern(
+            &venv_dir.join("bin").join("python3"),
+            "-m pip",
+            SweepParents::Orphans {
+                own_children: false,
+            },
+        ) {
+            log::warn!("reaping orphaned pip before venv mutation failed: {err:#}");
+        }
         return;
     }
     // Empty args pattern makes the exe-path clause the only real filter:
@@ -9706,33 +10169,52 @@ fn tool_schema_savings_usd(daily_savings: &[DailySavingsPoint], tokens_saved: u6
 
 /// Lifetime dollars saved by output shaping.
 ///
-/// The daily buckets only carry this layer from the day the backend's rollups
-/// started reporting it, which is far later than the shaper itself started
-/// working: on 2026-08-06 the buckets held 2.66M output tokens across 4 days
-/// while the shaper's own durable estimator held 17.38M across 48,638 requests.
-/// Summing the buckets therefore understates the layer roughly six-fold.
+/// Priced from the shaper's own ledger, the same recomputation the output tile
+/// shows. The daily buckets are the backend's rollups, which credit strata the
+/// baseline never observed at a global mean: on 2026-09-29 one machine's
+/// buckets held 47.75M output tokens against 2.73M in its ledger. The buckets
+/// only lend their blended $/token, so a user on cheaper models is priced at
+/// their own models' rates.
 ///
-/// The estimator has no timestamps -- it is a set of stratified running sums --
-/// so its total can only be a lifetime figure, and it is priced with the
-/// blended $/token the tracked buckets already imply rather than a hardcoded
-/// rate, so a user on cheaper models is priced at their own models' rates.
+/// - Scored: the ledger total, floored by the sampled series (it survives a
+///   re-seeded ledger), never by the credited bucket sum. The ledger has no
+///   timestamps, so its total can only be a lifetime figure, and it reaches
+///   back before the rollups carried this layer at all.
+/// - Unscored: nothing. The buckets hold only the credit the tile refuses.
+/// - NoEvidence (no ledger this launch, or a torn first read):
+///   `cached_ledger_tokens`, the tracker's last ledger reading, priced exactly
+///   as Scored. Only a machine that never had one falls back to
+///   `backend_tokens_saved` (the `/stats` credited total) when it exceeds the
+///   buckets, else the bucket sum. The credited total always exceeds the
+///   repriced buckets, so preferring it on a torn read flipped the headline
+///   to it for one poll (and posted it, if a savings report went out then).
 ///
-/// Falls back to the bucket sum whenever the estimator is absent, is smaller
-/// (a re-seeded baseline), or the buckets carry no rate to price with. The two
-/// sources measure the same layer, so this replaces the bucket sum, never adds
-/// to it. `estimator_tokens_saved` is the live `/stats` reading when the
-/// backend is up, or the tracker's persisted last reading during cold start.
+/// Falls back to the bucket sum whenever the buckets carry no rate to price
+/// with. The sources measure the same layer, so this replaces the bucket sum,
+/// never adds to it.
 fn lifetime_output_savings_usd(
     daily_savings: &[DailySavingsPoint],
-    estimator_tokens_saved: Option<u64>,
+    ledger: &crate::output_savings::LedgerEstimate,
+    cached_ledger_tokens: Option<u64>,
+    backend_tokens_saved: Option<u64>,
 ) -> f64 {
+    use crate::output_savings::LedgerEstimate;
     let bucket_usd: f64 = daily_savings.iter().map(|p| p.output_savings_usd).sum();
     let bucket_tokens: u64 = daily_savings.iter().map(|p| p.output_tokens_saved).sum();
-
-    let Some(tokens_saved) = estimator_tokens_saved else {
-        return bucket_usd;
+    let sampled_tokens: u64 = daily_savings
+        .iter()
+        .filter_map(|p| p.output_sampled_tokens_saved)
+        .sum();
+    let tokens_saved = match (ledger, cached_ledger_tokens) {
+        (LedgerEstimate::Unscored, _) => return 0.0,
+        (LedgerEstimate::Scored(e), _) => e.tokens_saved.max(sampled_tokens),
+        (LedgerEstimate::NoEvidence, Some(cached)) => cached.max(sampled_tokens),
+        (LedgerEstimate::NoEvidence, None) => match backend_tokens_saved {
+            Some(tokens) if tokens > bucket_tokens => tokens,
+            _ => return bucket_usd,
+        },
     };
-    if bucket_tokens == 0 || bucket_usd <= 0.0 || tokens_saved <= bucket_tokens {
+    if bucket_tokens == 0 || bucket_usd <= 0.0 {
         return bucket_usd;
     }
 
@@ -9740,13 +10222,37 @@ fn lifetime_output_savings_usd(
     usd_per_token * tokens_saved as f64
 }
 
+/// A bucket's output figures, repriced from the ledger-backed sampled series
+/// for the chart, the tray and the per-day report. The rollup's own figure
+/// carries the backend's credit (see `lifetime_output_savings_usd`), but its
+/// $/token still prices the bucket's models. An unsampled bucket keeps the
+/// rollup figure, having nothing better; a ledger that scores nothing zeroes
+/// it, as the tile shows nothing.
+fn ledger_priced_output(
+    usd: f64,
+    tokens: u64,
+    sampled_tokens: Option<u64>,
+    ledger_unscored: bool,
+) -> (f64, u64) {
+    if ledger_unscored {
+        return (0.0, 0);
+    }
+    match sampled_tokens {
+        Some(sampled) if tokens > 0 => (usd / tokens as f64 * sampled as f64, sampled),
+        _ => (usd, tokens),
+    }
+}
+
 /// For days before `cutoff_date` (exclusive), the tracker is preferred.
 /// For days on/after `cutoff_date`, native history is preferred.
-/// Falls back to whichever source has data when the preferred one is absent.
+/// Falls back to whichever source has data when the preferred one is absent,
+/// except a tracker day after `utc_today_key` (the UTC date): east of UTC
+/// that local day's hours are already inside history's live UTC bucket.
 fn merge_daily_savings(
     tracker: Vec<DailySavingsPoint>,
     history: Vec<DailySavingsPoint>,
     cutoff_date: &str,
+    utc_today_key: &str,
 ) -> Vec<DailySavingsPoint> {
     use std::collections::BTreeMap;
     // Index the local tracker by date so a desynced history point can fall back
@@ -9780,6 +10286,7 @@ fn merge_daily_savings(
             by_date.insert(p.date.clone(), p);
         }
     }
+    let history_has_live_day = by_date.contains_key(utc_today_key);
     for p in tracker {
         if p.date.as_str() < cutoff_date {
             by_date.insert(p.date.clone(), p);
@@ -9792,6 +10299,10 @@ fn merge_daily_savings(
                     let merged = entry.get_mut();
                     merged.new_input_tokens = merged.new_input_tokens.max(p.new_input_tokens);
                 }
+                // A local day ahead of UTC (a UTC+ morning before UTC
+                // midnight): the live UTC bucket already counts its hours.
+                std::collections::btree_map::Entry::Vacant(_)
+                    if history_has_live_day && p.date.as_str() > utc_today_key => {}
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(p);
                 }
@@ -10096,7 +10607,7 @@ mod tests {
         );
     }
 
-    use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
+    use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
 
@@ -10110,7 +10621,7 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
-        hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
+        hf_cache_grew, intercept_bind_hint, ledger_priced_output, lifetime_output_savings_usd,
         lifetime_token_milestones_crossed, log_mtime_advanced, lone_stats_stall,
         merge_daily_savings, merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
@@ -10121,11 +10632,12 @@ mod tests {
         tool_schema_savings_usd, top_models_by_requests, total_dir_size_bytes,
         warn_stats_fetch_failed, AppState, BackfillSettle, BootValidationOutcome,
         ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
-        HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
-        RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_LAST_OK,
-        STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT,
-        STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
+        HeadroomSavingsHistoryPoint, HeadroomSavingsHistoryResponse, HeadroomSavingsRollupPoint,
+        Instant, OutputSampleBucket, PersistedSavingsState, ProviderRollupDelta, RingStartTotals,
+        SavingsObservation, SavingsRecord, SavingsTracker, OUTPUT_SAMPLE_SERIES_VERSION,
+        STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_LAST_OK, STATS_FETCH_RECOVERED_AT,
+        STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
+        STATS_FETCH_WARN_MAX_INTERVAL, TEST_PROXY_PORT,
     };
 
     #[test]
@@ -10279,7 +10791,8 @@ mod tests {
             Some(&ring_start),
             |p| p.hour.as_str(),
         );
-        let merged_daily = merge_daily_savings(tracker_daily, settled_daily, "2026-06-02");
+        let merged_daily =
+            merge_daily_savings(tracker_daily, settled_daily, "2026-06-02", "2026-08-27");
         let merged_hourly =
             merge_hourly_savings(tracker_hourly, settled_hourly, "2026-06-02T00:00");
 
@@ -10302,6 +10815,7 @@ mod tests {
 
     #[test]
     fn lifetime_output_savings_prices_the_estimators_full_history() {
+        // No ledger evidence (missing or torn): the fallback estimator.
         // Buckets: 2 days, 100k tokens for $2.50 -> $25/M blended.
         let mut buckets = vec![daily("2026-08-04", 0, 0.0), daily("2026-08-05", 0, 0.0)];
         buckets[0].output_tokens_saved = 40_000;
@@ -10311,20 +10825,111 @@ mod tests {
 
         // The estimator covers history the rollups never carried: price all of
         // it at the buckets' own rate.
-        let usd = lifetime_output_savings_usd(&buckets, Some(1_000_000));
+        let none = crate::output_savings::LedgerEstimate::NoEvidence;
+        let usd = lifetime_output_savings_usd(&buckets, &none, None, Some(1_000_000));
         assert!((usd - 25.0).abs() < 1e-9, "{usd}");
 
         // Re-seeded / lagging estimator: never go below what we can see.
-        let usd = lifetime_output_savings_usd(&buckets, Some(10_000));
+        let usd = lifetime_output_savings_usd(&buckets, &none, None, Some(10_000));
         assert!((usd - 2.5).abs() < 1e-9, "{usd}");
 
         // No estimate at all (old backend, unseeded baseline).
-        let usd = lifetime_output_savings_usd(&buckets, None);
+        let usd = lifetime_output_savings_usd(&buckets, &none, None, None);
         assert!((usd - 2.5).abs() < 1e-9, "{usd}");
 
         // No priced buckets yet: nothing to extrapolate a rate from.
         let empty = vec![daily("2026-08-04", 0, 0.0)];
-        assert_eq!(lifetime_output_savings_usd(&empty, Some(1_000_000)), 0.0);
+        assert_eq!(
+            lifetime_output_savings_usd(&empty, &none, None, Some(1_000_000)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn lifetime_output_savings_follow_the_ledger_not_the_credited_buckets() {
+        use crate::output_savings::{LedgerEstimate, OutputEstimate};
+        let scored = |tokens_saved| {
+            LedgerEstimate::Scored(OutputEstimate {
+                method: "estimated",
+                reduction_percent: 10.0,
+                ci_low_percent: 5.0,
+                ci_high_percent: 15.0,
+                requests: 100,
+                coverage_percent: 90.0,
+                tokens_saved,
+                baseline_tokens: tokens_saved * 10,
+            })
+        };
+        // The rollups carry the backend's credited figure: 100k tokens, $2.50.
+        let mut buckets = vec![daily("2026-09-04", 0, 0.0), daily("2026-09-05", 0, 0.0)];
+        buckets[0].output_tokens_saved = 40_000;
+        buckets[0].output_savings_usd = 1.0;
+        buckets[1].output_tokens_saved = 60_000;
+        buckets[1].output_savings_usd = 1.5;
+
+        // The recompute scores 20k: price that at the buckets' rate ($25/M),
+        // never floor it at the credited bucket sum.
+        let usd = lifetime_output_savings_usd(&buckets, &scored(20_000), None, None);
+        assert!((usd - 0.5).abs() < 1e-9, "{usd}");
+        // A re-seeded ledger: the sampled series survives it and floors it.
+        buckets[1].output_sampled_tokens_saved = Some(40_000);
+        let usd = lifetime_output_savings_usd(&buckets, &scored(20_000), None, None);
+        assert!((usd - 1.0).abs() < 1e-9, "{usd}");
+        // A readable ledger that scores nothing: the buckets are all credit.
+        let usd =
+            lifetime_output_savings_usd(&buckets, &LedgerEstimate::Unscored, None, Some(500_000));
+        assert_eq!(usd, 0.0);
+        // No readable ledger (a torn read of the in-place rewrite) with a
+        // cached ledger reading: priced exactly as that reading would be,
+        // never as the backend's larger credited total, and never floored by
+        // the bucket sum, which an unsampled bucket keeps at rollup credit.
+        let none = LedgerEstimate::NoEvidence;
+        let usd = lifetime_output_savings_usd(&buckets, &none, Some(20_000), Some(500_000));
+        assert!((usd - 1.0).abs() < 1e-9, "{usd}");
+        let usd = lifetime_output_savings_usd(&buckets, &none, Some(60_000), Some(500_000));
+        assert!((usd - 1.5).abs() < 1e-9, "{usd}");
+
+        // Chart, tray and per-day report: a sampled bucket is repriced from
+        // its sample at the bucket's own rate; an unsampled one is left alone.
+        let (usd, tokens) = ledger_priced_output(1.5, 60_000, Some(6_000), false);
+        assert!((usd - 0.15).abs() < 1e-9, "{usd}");
+        assert_eq!(tokens, 6_000);
+        assert_eq!(
+            ledger_priced_output(1.5, 60_000, None, false),
+            (1.5, 60_000)
+        );
+        assert_eq!(ledger_priced_output(1.5, 60_000, None, true), (0.0, 0));
+    }
+
+    #[test]
+    fn torn_ledger_read_recalls_the_launchs_last_evidenced_read() {
+        use crate::output_savings::{LedgerEstimate, OutputEstimate};
+        let mut tracker = make_tracker();
+        let none = LedgerEstimate::NoEvidence;
+        // Nothing read yet this launch: no evidence stays no evidence.
+        assert_eq!(tracker.ledger_read_or_last(none.clone()), none);
+        // An unscored machine's torn read stays unscored ($0 output), not the
+        // backend's credited fallback.
+        assert_eq!(
+            tracker.ledger_read_or_last(LedgerEstimate::Unscored),
+            LedgerEstimate::Unscored
+        );
+        assert_eq!(
+            tracker.ledger_read_or_last(none.clone()),
+            LedgerEstimate::Unscored
+        );
+        let scored = LedgerEstimate::Scored(OutputEstimate {
+            method: "estimated",
+            reduction_percent: 10.0,
+            ci_low_percent: 5.0,
+            ci_high_percent: 15.0,
+            requests: 100,
+            coverage_percent: 90.0,
+            tokens_saved: 2_000,
+            baseline_tokens: 20_000,
+        });
+        assert_eq!(tracker.ledger_read_or_last(scored.clone()), scored);
+        assert_eq!(tracker.ledger_read_or_last(none), scored);
     }
 
     #[test]
@@ -11453,7 +12058,7 @@ mod tests {
             first_savings_notified: true,
             unrouted_usage_notified: true,
         };
-        super::persist_launch_profile(&path, &profile);
+        super::persist_launch_profile(Some(&path), &profile);
 
         let bytes = std::fs::read(&path).expect("persisted");
         let round_tripped: super::LaunchProfile =
@@ -11857,7 +12462,7 @@ mod tests {
         let state_path = std::env::temp_dir().join(format!("headroom-savings-state-{}.json", id));
         SavingsTracker {
             records_path,
-            state_path,
+            state_path: Some(state_path),
             session_requests: 0,
             session_estimated_savings_usd: 0.0,
             session_estimated_tokens_saved: 0,
@@ -11881,7 +12486,9 @@ mod tests {
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: None,
             last_output_estimator_baseline_tokens: None,
+            last_evidenced_ledger: None,
             last_written_at: None,
+            last_persisted: Vec::new(),
         }
     }
 
@@ -11982,11 +12589,47 @@ mod tests {
     }
 
     #[test]
+    fn weekly_totals_sum_local_hours_not_utc_dated_rollups() {
+        let mut tracker = make_tracker();
+        let saved = |tokens, usd| DailySavingsBucket {
+            estimated_tokens_saved: tokens,
+            estimated_savings_usd: usd,
+            ..Default::default()
+        };
+        // Recap week: local Mon 2026-09-21 .. Sun 2026-09-27.
+        let hours = [
+            ("2026-09-20T23:00", 1, 0.01), // the Sunday before
+            ("2026-09-22T10:00", 10, 0.10),
+            ("2026-09-22T11:00", 20, 0.20),
+            ("2026-09-27T23:00", 5, 0.05), // Sunday evening
+            ("2026-09-28T00:00", 7, 0.07), // next Monday
+        ];
+        for (hour, tokens, usd) in hours {
+            tracker
+                .hourly_savings
+                .insert(hour.into(), saved(tokens, usd));
+        }
+        // UTC-dated rollups: at UTC-7 that Sunday evening sits in UTC Monday.
+        tracker
+            .daily_savings
+            .insert("2026-09-22".into(), saved(999, 9.99));
+        tracker
+            .daily_savings
+            .insert("2026-09-28".into(), saved(5, 0.05));
+
+        let day = |d| chrono::NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
+        let totals = tracker.weekly_totals(day(21), day(27));
+        assert_eq!(totals.total_tokens_saved, 35);
+        assert!((totals.total_savings_usd - 0.35).abs() < 1e-9);
+        assert_eq!(totals.active_days, 2);
+    }
+
+    #[test]
     fn aggregate_weekly_totals_sums_active_days_in_window() {
         use std::collections::BTreeMap;
-        let mut daily: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
-        daily.insert(
-            "2026-04-19".into(), // outside window (Sunday of week before)
+        let mut hourly: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
+        hourly.insert(
+            "2026-04-19T12:00".into(), // outside window (Sunday of week before)
             DailySavingsBucket {
                 estimated_savings_usd: 1.0,
                 estimated_tokens_saved: 50,
@@ -11997,8 +12640,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        daily.insert(
-            "2026-04-20".into(),
+        hourly.insert(
+            "2026-04-20T12:00".into(),
             DailySavingsBucket {
                 estimated_savings_usd: 2.5,
                 estimated_tokens_saved: 200,
@@ -12009,8 +12652,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        daily.insert(
-            "2026-04-23".into(),
+        hourly.insert(
+            "2026-04-23T12:00".into(),
             DailySavingsBucket {
                 estimated_savings_usd: 1.0,
                 estimated_tokens_saved: 100,
@@ -12021,8 +12664,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        daily.insert(
-            "2026-04-26".into(),
+        hourly.insert(
+            "2026-04-26T12:00".into(),
             DailySavingsBucket {
                 estimated_savings_usd: 0.0,
                 estimated_tokens_saved: 0, // zero activity day — not counted
@@ -12033,8 +12676,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        daily.insert(
-            "2026-04-27".into(), // outside window (today Monday)
+        hourly.insert(
+            "2026-04-27T12:00".into(), // outside window (today Monday)
             DailySavingsBucket {
                 estimated_savings_usd: 99.0,
                 estimated_tokens_saved: 9999,
@@ -12047,7 +12690,7 @@ mod tests {
         );
         let start = chrono::NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
         let end = chrono::NaiveDate::from_ymd_opt(2026, 4, 26).unwrap();
-        let totals = aggregate_weekly_totals(&daily, start, end);
+        let totals = aggregate_weekly_totals(&hourly, start, end);
         assert_eq!(totals.active_days, 2);
         assert_eq!(totals.total_tokens_saved, 300);
         assert!((totals.total_savings_usd - 3.5).abs() < 1e-9);
@@ -12125,21 +12768,37 @@ mod tests {
             own_children: false,
         };
         // Orphan of a previous instance (reparented to launchd/init).
-        assert!(sweep_should_kill(1, me, held));
-        assert!(sweep_should_kill(1, me, unheld));
-        assert!(sweep_should_kill(0, me, unheld));
+        assert!(sweep_should_kill(1, me, false, held));
+        assert!(sweep_should_kill(1, me, false, unheld));
+        assert!(sweep_should_kill(0, me, false, unheld));
         // Our own untracked child: ours to kill only when we hold the
         // lifecycle lock; otherwise a sibling transition is mid-spawn on it.
-        assert!(sweep_should_kill(me, me, held));
-        assert!(!sweep_should_kill(me, me, unheld));
-        // Another live process's child (a relaunched Headroom instance, or a
-        // shell running the venv by hand): never ours.
-        assert!(!sweep_should_kill(777, me, held));
-        assert!(!sweep_should_kill(777, me, unheld));
+        assert!(sweep_should_kill(me, me, false, held));
+        assert!(!sweep_should_kill(me, me, false, unheld));
+        // A relaunched Headroom instance's child: never ours (RUST-CA/CB).
+        assert!(!sweep_should_kill(777, me, true, held));
+        assert!(!sweep_should_kill(777, me, true, unheld));
+        // Orphan reparented to a live subreaper (Linux `systemd --user`):
+        // still an orphan.
+        assert!(sweep_should_kill(777, me, false, held));
+        assert!(sweep_should_kill(777, me, false, unheld));
         // RUST-HY: the venv-lock sweep's targets are MCP servers a live
         // Claude Code / Codex spawned. Sparing them left pip facing a locked
         // Scripts\headroom.exe, so that sweep ignores the parent.
-        assert!(sweep_should_kill(777, me, SweepParents::Any));
+        assert!(sweep_should_kill(777, me, false, SweepParents::Any));
+
+        use super::comm_is_headroom_desktop as is_headroom;
+        assert!(!is_headroom("systemd\n", "headroom"));
+        assert!(is_headroom("headroom\n", "headroom"));
+        // macOS `ps -o comm=` prints the full executable path.
+        assert!(is_headroom(
+            "/Applications/Headroom.app/Contents/MacOS/headroom-desktop",
+            "headroom-desktop"
+        ));
+        // Parent already gone: an orphan.
+        assert!(!is_headroom("", "headroom"));
+        // Own name unknown: spare every live parent, the old rule.
+        assert!(is_headroom("systemd", ""));
     }
 
     #[test]
@@ -12150,6 +12809,140 @@ mod tests {
             vec![(501, 1), (502, 501), (503, 4242)]
         );
         assert!(super::parse_pid_ppid("").is_empty());
+    }
+
+    /// Writes `<venv>/bin/python3`, a script that records its pid and then
+    /// idles (bounded, so a failing run leaves nothing behind for long), and
+    /// returns its path plus the pid file it writes.
+    #[cfg(unix)]
+    fn fake_venv_python(venv: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = venv.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let python = bin.join("python3");
+        let pid_file = venv.join("pid");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\ni=0\nwhile [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write script");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (python, pid_file)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(pid_file: &std::path::Path) -> u32 {
+        for _ in 0..100 {
+            if let Some(pid) = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("fake python never started");
+    }
+
+    #[cfg(unix)]
+    fn pid_exits_within(pid: u32, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !alive {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Linux orphans reparent to the systemd --user subreaper, not pid 1, so a
+    /// live parent that is not a Headroom desktop must not spare a match: the
+    /// orphan backend then survived every quit and upgrade until reboot.
+    #[cfg(unix)]
+    #[test]
+    fn unix_sweep_reaps_a_match_whose_live_parent_is_not_headroom() {
+        let venv = tempfile::tempdir().expect("tempdir");
+        let (python, pid_file) = fake_venv_python(venv.path());
+        // `sh` stands in for the subreaper: alive, not us, not Headroom. The
+        // script path goes in as $0 so the sh's own argv never matches.
+        let mut parent = std::process::Command::new("/bin/sh")
+            .args(["-c", "\"$0\" -m headroom.proxy.server; true"])
+            .arg(&python)
+            .spawn()
+            .expect("spawn sh");
+        let pid = wait_for_pid_file(&pid_file);
+        super::kill_processes_by_command_pattern(
+            &python,
+            "-m headroom.proxy.server",
+            super::SweepParents::Orphans {
+                own_children: false,
+            },
+        )
+        .expect("sweep");
+        let reaped = pid_exits_within(pid, std::time::Duration::from_secs(5));
+        let _ = parent.kill();
+        let _ = parent.wait();
+        assert!(
+            reaped,
+            "sweep spared pid {pid} under a live non-Headroom parent"
+        );
+    }
+
+    /// A pip orphaned by a quit mid-upgrade keeps writing into the venv that
+    /// recovery is about to restore; on Unix the lock-holder sweep reaps it.
+    #[cfg(unix)]
+    #[test]
+    fn venv_lock_holder_sweep_reaps_an_orphaned_pip_on_unix() {
+        let venv = tempfile::tempdir().expect("tempdir");
+        let (python, pid_file) = fake_venv_python(venv.path());
+        // Background it and exit: the fake pip's parent is gone.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "\"$0\" -m pip install x >/dev/null 2>&1 &"])
+            .arg(&python)
+            .status()
+            .expect("spawn sh");
+        assert!(status.success());
+        let pid = wait_for_pid_file(&pid_file);
+        super::kill_venv_lock_holders(venv.path());
+        assert!(
+            pid_exits_within(pid, std::time::Duration::from_secs(5)),
+            "orphaned pip {pid} survived the venv lock-holder sweep"
+        );
+    }
+
+    #[test]
+    fn projects_scan_straddling_an_invalidation_is_not_cached() {
+        let base_dir = temp_test_dir("headroom-projects-cache-gen");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        // A scan starts, then a learn run completes and invalidates before
+        // the scan stores its (pre-learn) result.
+        let generation = state
+            .claude_projects_cache_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        state.invalidate_claude_code_projects_cache();
+        state.store_claude_code_projects(generation, &[]);
+        assert!(
+            state.cached_claude_code_projects_fresh().is_none(),
+            "a scan that straddled an invalidation must not be cached"
+        );
+
+        // A scan that started after the invalidation caches normally.
+        let generation = state
+            .claude_projects_cache_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        state.store_claude_code_projects(generation, &[]);
+        assert!(state.cached_claude_code_projects_fresh().is_some());
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -12224,6 +13017,47 @@ mod tests {
             "stop_headroom blocked on the held lifecycle lock for {lock_wait:?} \
              (total {waited:?}, sweep baseline {baseline:?})"
         );
+    }
+
+    /// Codex, OpenCode and Grok runs are keyed on a made-up id, not a
+    /// directory. Checking "codex" as a path resolved it against the app's cwd
+    /// ("/" from Finder), so every non-Claude scan died with "Project path does
+    /// not exist: codex" before it spawned.
+    #[test]
+    fn learn_run_key_is_path_checked_only_for_a_claude_project() {
+        let base_dir = temp_test_dir("headroom-learn-run-key");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&base_dir);
+        let stdlib = if cfg!(target_os = "windows") {
+            runtime.python_dir.join("Lib")
+        } else {
+            runtime.python_dir.join("lib").join("python3.12")
+        };
+        for file in [
+            runtime.ready_flag(),
+            runtime.managed_python(),
+            runtime.standalone_python(),
+            runtime.venv_dir.join("pyvenv.cfg"),
+            stdlib.join("os.py"),
+            state.tool_manager.headroom_entrypoint(),
+        ] {
+            fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+            fs::write(&file, b"").expect("seed runtime file");
+        }
+        assert!(state.tool_manager.python_runtime_installed());
+
+        let missing = base_dir.join("no-such-project");
+        let err = state
+            .begin_headroom_learn_run(&missing.to_string_lossy(), true)
+            .expect_err("a missing Claude project must still be refused");
+        assert!(err.contains("does not exist"), "got: {err}");
+
+        state
+            .begin_headroom_learn_run("codex", false)
+            .expect("the codex run key is not a path");
+        assert!(state.headroom_learn_status(None).running);
+
+        let _ = fs::remove_dir_all(&base_dir);
     }
 
     #[test]
@@ -12334,8 +13168,9 @@ mod tests {
         // Prime both poll caches with a fresh miss: on a dev machine the real
         // proxy answers on 6767, and its live stats would replace the seeded
         // buckets above.
-        *state.cached_headroom_stats.lock() = Some((None, Instant::now()));
-        *state.cached_headroom_history.lock() = Some((None, Instant::now(), true));
+        *state.cached_headroom_stats.lock() = Some((None, Instant::now(), Duration::from_secs(60)));
+        *state.cached_headroom_history.lock() =
+            Some((None, Instant::now(), Duration::from_secs(30)));
 
         // The output layer prices off ~/.headroom/output_savings.json; on a
         // developer machine that real ledger adds hundreds of dollars to the
@@ -12479,6 +13314,32 @@ mod tests {
         assert!(!state
             .proxy_bypass
             .load(std::sync::atomic::Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    /// #140: enforce_pricing_gate (launch, tray, watchdog, provider save) is
+    /// a second gate writer. On a failed account sync it took the ungated arm
+    /// and cleared the bypass, reopening the leak apply_pricing_gates guards.
+    #[test]
+    fn enforce_pricing_gate_leaves_flags_untouched_on_an_error_reading() {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let base_dir = temp_test_dir("headroom-enforce-error-reading");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        // Claude-only gate engaged (Codex keeps Python up).
+        state.claude_only_bypass.store(true, Release);
+
+        let mut blip = pricing_status_with_optimization(true);
+        blip.account = None;
+        blip.account_sync_error = Some("send: timed out".into());
+        state.enforce_pricing_status(Ok(blip));
+        assert!(
+            state.claude_only_bypass.load(Acquire),
+            "a failed account sync must not lift the gate"
+        );
+
+        // A real ungated verdict still lifts it.
+        state.enforce_pricing_status(Ok(pricing_status_with_optimization(true)));
+        assert!(!state.claude_only_bypass.load(Acquire));
         let _ = std::fs::remove_dir_all(base_dir);
     }
 
@@ -12632,19 +13493,22 @@ mod tests {
     }
 
     #[test]
-    fn apply_codex_gate_ignores_absent_usage() {
+    fn apply_codex_gate_lifts_when_the_block_clears_without_usage() {
         let base_dir = temp_test_dir("headroom-codex-bypass-none");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
-        // Flip it on first.
+        // Trial-ended hard block engages on the default (empty) snapshot, as it
+        // does for API-key Codex, whose traffic never yields rate-limit headers.
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
         state.age_gate_debounce();
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
         assert!(state
             .codex_bypass
             .load(std::sync::atomic::Ordering::Acquire));
-        // A poll with no Codex signal must leave the gate as-is, not clear it.
+        // The user subscribes: activation is Ungated and there is still no
+        // snapshot, so `fetch_codex_usage` reports None. That is no gate
+        // verdict, i.e. allowed, and must lift the bypass.
         state.apply_codex_pricing_gate_status(None);
-        assert!(state
+        assert!(!state
             .codex_bypass
             .load(std::sync::atomic::Ordering::Acquire));
         fs::remove_dir_all(base_dir).ok();
@@ -12932,6 +13796,68 @@ mod tests {
     }
 
     #[test]
+    fn can_stamp_no_maintenance_skips_stamp_while_upgrade_marker_is_pending() {
+        // A failed rollback leaves the receipt at the pin and the marker on
+        // disk, so the plan finds no work. Stamping then would make the next
+        // launch's recovery (which restores the OLD receipt) look current.
+        let base_dir = temp_test_dir("can-stamp-with-marker");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        state.stamp_app_version("0.3.6-rc.3");
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&base_dir);
+        fs::create_dir_all(&runtime.runtime_dir).expect("create runtime dir");
+        fs::write(
+            runtime.runtime_dir.join("upgrade.in_progress.json"),
+            r#"{"target_version":"0.39.0"}"#,
+        )
+        .expect("write marker");
+        assert!(!state.can_stamp_no_maintenance("0.3.12-rc.3"));
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn recover_interrupted_upgrade_lets_retry_replan_after_a_failed_rollback() {
+        // A failed rollback: new venv live, old one aside, receipt at the pin,
+        // marker on disk. Retry's plan found nothing to do until recovery put
+        // the old receipt back.
+        let base_dir = temp_test_dir("retry-recovers-failed-rollback");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&base_dir);
+        write_headroom_receipt(&base_dir, "0.38.0", "stale");
+        fs::rename(
+            runtime.tools_dir.join("headroom.json"),
+            runtime.tools_dir.join("headroom.json.backup"),
+        )
+        .expect("receipt backup");
+        write_headroom_receipt(
+            &base_dir,
+            crate::tool_manager::HEADROOM_PINNED_VERSION,
+            "stale",
+        );
+        fs::create_dir_all(&runtime.venv_dir).expect("new venv");
+        fs::create_dir_all(runtime.runtime_dir.join("venv.backup")).expect("old venv");
+        fs::write(
+            runtime.runtime_dir.join("upgrade.in_progress.json"),
+            r#"{"target_version":"0.39.0"}"#,
+        )
+        .expect("write marker");
+
+        // An upgrade holding the lock wrote that marker itself: hands off.
+        {
+            let _running = state.upgrade_lock.lock();
+            assert!(!state.recover_interrupted_upgrade());
+            assert!(state.tool_manager.upgrade_interrupted());
+        }
+
+        assert!(state.recover_interrupted_upgrade());
+        assert!(!state.tool_manager.upgrade_interrupted());
+        assert!(matches!(
+            state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION")),
+            Some(super::RuntimeMaintenancePlan::Upgrade(_))
+        ));
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
     fn lifetime_token_milestones_include_firsts_and_repeating_tens() {
         assert_eq!(
             lifetime_token_milestones_crossed(0, 5_000_000),
@@ -12965,6 +13891,7 @@ mod tests {
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
+            session_sent_is_forwarded: false,
             session_requests: Some(1),
             session_estimated_savings_usd: Some(1.0),
             session_estimated_tokens_saved: Some(1_500_000),
@@ -12976,10 +13903,15 @@ mod tests {
                 history_point_at(2026, 3, 20, 12, 1_500_000),
             ],
         };
-        *state.cached_headroom_stats.lock() = Some((Some(stats), std::time::Instant::now()));
+        *state.cached_headroom_stats.lock() = Some((
+            Some(stats),
+            std::time::Instant::now(),
+            Duration::from_secs(12),
+        ));
         // Pin the history cache to a fresh miss so build_dashboard doesn't try
         // to fetch native rollups over the network during the test.
-        *state.cached_headroom_history.lock() = Some((None, std::time::Instant::now(), true));
+        *state.cached_headroom_history.lock() =
+            Some((None, std::time::Instant::now(), Duration::from_secs(30)));
 
         // Read-only path observes (building buckets) but must not surface or
         // consume milestones.
@@ -13014,6 +13946,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(10),
                 session_estimated_savings_usd: Some(1.2),
                 session_estimated_tokens_saved: Some(1_200),
@@ -13038,6 +13971,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(12),
                 session_estimated_savings_usd: Some(1.5),
                 session_estimated_tokens_saved: Some(1_500),
@@ -13066,6 +14000,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(10),
                 session_estimated_savings_usd: Some(1.0),
                 session_estimated_tokens_saved: Some(1_000),
@@ -13085,6 +14020,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(2),
                 session_estimated_savings_usd: Some(0.2),
                 session_estimated_tokens_saved: Some(200),
@@ -13112,6 +14048,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -13184,6 +14121,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -13913,7 +14851,7 @@ mod tests {
         };
         *state.last_good_headroom_stats.lock() = Some((good.clone(), Instant::now()));
         // A failed poll, cached as a miss.
-        *state.cached_headroom_stats.lock() = Some((None, Instant::now()));
+        *state.cached_headroom_stats.lock() = Some((None, Instant::now(), Duration::from_secs(60)));
 
         let served = state
             .cached_headroom_stats()
@@ -13922,7 +14860,7 @@ mod tests {
 
         // The miss is still cached: no fetch was attempted, so the 15s probe
         // is not re-armed on the next dashboard poll.
-        let (cached, _) = (*state.cached_headroom_stats.lock())
+        let (cached, _, _) = (*state.cached_headroom_stats.lock())
             .clone()
             .expect("miss stays cached");
         assert!(
@@ -13942,6 +14880,102 @@ mod tests {
                 "a retained payload must expire"
             );
         }
+    }
+
+    /// A local port with nothing listening, so every probe is refused at once.
+    fn dead_local_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("bind ephemeral")
+            .port()
+    }
+
+    #[test]
+    fn a_stats_miss_before_the_proxy_is_up_is_retried_on_the_next_poll() {
+        // Cold start: the first dashboard build lands before /readyz answers.
+        // That miss was held the 60s meant for a /stats request that was sent
+        // and timed out, so the /stats-only fields stayed blank for up to a
+        // minute after the backend was serving.
+        TEST_PROXY_PORT.with(|port| port.set(Some(dead_local_port())));
+        let state = AppState::new().expect("state");
+        assert!(state.polled_headroom_stats().is_none());
+        {
+            let mut cache = state.cached_headroom_stats.lock();
+            let entry = cache.as_mut().expect("the unreachable miss is cached");
+            // One dashboard poll interval later.
+            entry.1 = Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .expect("uptime");
+        }
+        assert!(state.polled_headroom_stats().is_none());
+        let age = state
+            .cached_headroom_stats
+            .lock()
+            .as_ref()
+            .expect("cached")
+            .1
+            .elapsed();
+        assert!(
+            age < Duration::from_secs(5),
+            "a proxy-not-up miss must re-probe on the next poll, not wait out 60s"
+        );
+    }
+
+    #[test]
+    fn savings_history_waits_out_a_slow_backend_build() {
+        // /stats-history builds on the backend's event loop and takes 0.5-1.9s
+        // under ordinary traffic. A 500ms client timeout failed every such
+        // fetch, so the chart never hydrated and each retry re-ran the build.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let port = listener.local_addr().expect("addr").port();
+        // The readyz probe, then the history fetch.
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if String::from_utf8_lossy(&buf[..n]).starts_with("GET /stats-history") {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                let body = r#"{"lifetime":{"compression_savings_usd":1.5}}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        TEST_PROXY_PORT.with(|cell| cell.set(Some(port)));
+        let state = AppState::new().expect("state");
+        assert!(
+            state.cached_headroom_history().is_some(),
+            "a 1s /stats-history build must land, not time out"
+        );
+        server.join().expect("mock server");
+    }
+
+    #[test]
+    fn a_spectator_instance_does_not_poll_the_other_instances_stats() {
+        // 6767 held by another Headroom (another OS user's app, or a relaunch
+        // overlap): its /stats and /stats-history carry THAT instance's
+        // traffic, which this one would persist and report as its own savings.
+        TEST_PROXY_PORT.with(|port| port.set(Some(dead_local_port())));
+        let state = AppState::new().expect("state");
+        *state.intercept_bind_error.lock() =
+            Some("port 6767 is served by another Headroom instance".to_string());
+        let _ = state.dashboard();
+        assert!(
+            state.cached_headroom_stats.lock().is_none(),
+            "a spectator must not poll /stats"
+        );
+        assert!(
+            state.cached_headroom_history.lock().is_none(),
+            "a spectator must not poll /stats-history"
+        );
     }
 
     #[test]
@@ -14705,6 +15739,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14732,6 +15767,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14755,6 +15791,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14788,6 +15825,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(1),
                 session_estimated_savings_usd: Some(0.2),
                 session_estimated_tokens_saved: Some(400),
@@ -14810,6 +15848,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(2),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14858,6 +15897,7 @@ mod tests {
             session_estimated_tokens_saved: 10_000,
             session_actual_cost_usd: 1.0,
             session_total_tokens_sent: 5_000,
+            sent_is_forwarded: None,
         });
         tracker.session_hourly_buckets.insert(
             "2026-03-24T13:00".into(),
@@ -14905,6 +15945,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(11),
                 session_estimated_savings_usd: Some(10.1),
                 session_estimated_tokens_saved: Some(10_200),
@@ -14937,6 +15978,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(2),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14960,6 +16002,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(3),
                 session_estimated_savings_usd: Some(0.6),
                 session_estimated_tokens_saved: Some(1_200),
@@ -14992,6 +16035,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(1),
                 session_estimated_savings_usd: Some(0.2),
                 session_estimated_tokens_saved: Some(400),
@@ -15019,6 +16063,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(5),
                 session_estimated_savings_usd: Some(10.0),
                 session_estimated_tokens_saved: Some(10_000),
@@ -15086,6 +16131,7 @@ mod tests {
                     learner_progress: None,
                     output_reduction: None,
                     tool_schema_tokens_saved: None,
+                    session_sent_is_forwarded: false,
                     session_requests: Some(requests),
                     session_estimated_savings_usd: Some(saved as f64 / 1000.0),
                     session_estimated_tokens_saved: Some(saved),
@@ -15110,6 +16156,204 @@ mod tests {
     }
 
     #[test]
+    fn session_history_compacts_per_hour_with_exact_hourly_buckets() {
+        // Four requests an hour for three hours. The kept history is the first
+        // point plus each hour's last, it does not regrow when the /stats
+        // window re-delivers the same points, and every hour's bucket matches
+        // what the uncompacted history derives.
+        let mut raw = Vec::new();
+        let mut total = 0u64;
+        for hour in 8..11 {
+            for minute in [0u32, 5, 10, 15] {
+                total += 100 + u64::from(minute);
+                raw.push(HeadroomSavingsHistoryPoint {
+                    timestamp: Utc
+                        .with_ymd_and_hms(2026, 3, 20, hour, minute, 0)
+                        .single()
+                        .expect("valid timestamp"),
+                    total_tokens_saved: total,
+                });
+            }
+        }
+        let stats = HeadroomDashboardStats {
+            session_requests: Some(raw.len()),
+            session_estimated_savings_usd: Some(total as f64 / 1000.0),
+            session_estimated_tokens_saved: Some(total),
+            session_actual_cost_usd: Some(1.0),
+            session_total_tokens_sent: Some(total * 3),
+            savings_history: raw.clone(),
+            ..Default::default()
+        };
+        let mut tracker = make_tracker();
+        tracker.observe(&stats).expect("snapshot");
+
+        let kept = tracker.session_savings_history.len();
+        assert!(kept < raw.len(), "kept {kept} of {} points", raw.len());
+        let expected =
+            super::derive_session_hourly_buckets(&stats, &raw, &tracker.session_new_input_history)
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(tracker.session_hourly_buckets, expected);
+
+        tracker.observe(&stats).expect("snapshot");
+        assert_eq!(tracker.session_savings_history.len(), kept);
+        assert_eq!(tracker.session_hourly_buckets, expected);
+    }
+
+    #[test]
+    fn unchanged_poll_does_not_rewrite_savings_state() {
+        let mut tracker = make_tracker();
+        let stats = HeadroomDashboardStats {
+            session_requests: Some(2),
+            session_estimated_savings_usd: Some(0.5),
+            session_estimated_tokens_saved: Some(1_000),
+            session_total_tokens_sent: Some(4_000),
+            savings_history: vec![
+                history_point_at(2026, 3, 20, 8, 0),
+                history_point_at(2026, 3, 20, 9, 1_000),
+            ],
+            ..Default::default()
+        };
+        tracker.observe(&stats).expect("snapshot");
+        let path = tracker.state_path.clone().expect("state path");
+        std::fs::write(&path, b"sentinel").expect("overwrite state");
+
+        tracker.observe(&stats).expect("snapshot");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read state"),
+            "sentinel",
+            "an idle poll rewrote savings-state.json"
+        );
+
+        tracker
+            .observe(&HeadroomDashboardStats {
+                session_requests: Some(3),
+                ..stats.clone()
+            })
+            .expect("snapshot");
+        assert_ne!(
+            std::fs::read_to_string(&path).expect("read state"),
+            "sentinel"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_hours_past_retention_are_not_rebanked_on_every_poll() {
+        // One backend session spanning more than the hourly retention: the
+        // Jan 1 hour is pruned from the diff baseline, and later polls must
+        // not read it as new and add it to that day again.
+        let mut tracker = make_tracker();
+        let stats = HeadroomDashboardStats {
+            session_requests: Some(3),
+            session_estimated_savings_usd: Some(0.3),
+            session_estimated_tokens_saved: Some(3_000),
+            session_actual_cost_usd: Some(1.0),
+            session_total_tokens_sent: Some(9_000),
+            savings_history: vec![
+                history_point_at(2026, 1, 1, 10, 0),
+                history_point_at(2026, 1, 1, 12, 1_000),
+                history_point_at(2026, 2, 5, 12, 3_000),
+            ],
+            ..Default::default()
+        };
+        tracker.observe(&stats).expect("snapshot");
+        let banked = tracker.daily_savings.clone();
+        for _ in 0..3 {
+            tracker.observe(&stats).expect("snapshot");
+        }
+        assert_eq!(tracker.daily_savings, banked);
+    }
+
+    #[test]
+    fn switch_to_new_input_basis_is_not_read_as_a_backend_restart() {
+        // Until its first cache-active request the backend reports zero
+        // prefix-cache totals, so sent falls back to total forwarded tokens;
+        // then it drops to the much smaller new-input sum. Same process:
+        // nothing may be counted twice.
+        let body = |requests: u64, saved: u64, write: u64, uncached: u64, input: u64| {
+            format!(
+                r#"{{
+                    "requests": {{ "total": {requests} }},
+                    "tokens": {{ "saved": {saved}, "input": {input} }},
+                    "cost": {{ "compression_savings_usd": 0.5 }},
+                    "prefix_cache": {{ "totals": {{
+                        "cache_write_tokens": {write},
+                        "uncached_input_tokens": {uncached}
+                    }} }},
+                    "compression_savings_history": [
+                        ["2026-03-20T08:00:00Z", 0],
+                        ["2026-03-20T09:00:00Z", 1000],
+                        ["2026-03-20T10:00:00Z", {saved}]
+                    ]
+                }}"#
+            )
+        };
+        let forwarded = parse_headroom_stats_from_json(&body(10, 1_000, 0, 0, 3_000_000))
+            .expect("parsed stats");
+        assert_eq!(forwarded.session_total_tokens_sent, Some(3_000_000));
+        let new_input = parse_headroom_stats_from_json(&body(11, 1_200, 25_000, 5_000, 3_100_000))
+            .expect("parsed stats");
+        assert_eq!(new_input.session_total_tokens_sent, Some(30_000));
+
+        let mut tracker = make_tracker();
+        tracker.observe(&forwarded).expect("snapshot");
+        tracker.observe(&new_input).expect("snapshot");
+
+        assert_eq!(tracker.lifetime_requests, 11);
+        let saved: u64 = tracker
+            .hourly_savings
+            .values()
+            .map(|bucket| bucket.estimated_tokens_saved)
+            .sum();
+        assert_eq!(saved, 1_200);
+    }
+
+    #[test]
+    fn session_buckets_price_compression_dollars_per_compression_token() {
+        // tokens.saved is all-layers (80% tool-schema deferral here) while the
+        // history and cost.compression_savings_usd are compression-only. With
+        // the history covering the whole session, the buckets carry all of the
+        // compression dollars and all of the spend.
+        let mut tracker = make_tracker();
+        tracker
+            .observe(&HeadroomDashboardStats {
+                session_requests: Some(2),
+                session_estimated_savings_usd: Some(0.5),
+                session_estimated_tokens_saved: Some(5_000),
+                tool_schema_tokens_saved: Some(4_000),
+                session_actual_cost_usd: Some(2.0),
+                session_total_tokens_sent: Some(10_000),
+                savings_history: vec![
+                    history_point_at(2026, 3, 20, 8, 0),
+                    history_point_at(2026, 3, 20, 9, 400),
+                    history_point_at(2026, 3, 20, 10, 1_000),
+                ],
+                ..Default::default()
+            })
+            .expect("snapshot");
+
+        let tokens: u64 = tracker
+            .hourly_savings
+            .values()
+            .map(|bucket| bucket.estimated_tokens_saved)
+            .sum();
+        let usd: f64 = tracker
+            .hourly_savings
+            .values()
+            .map(|bucket| bucket.estimated_savings_usd)
+            .sum();
+        let cost: f64 = tracker
+            .hourly_savings
+            .values()
+            .map(|bucket| bucket.actual_cost_usd)
+            .sum();
+        assert_eq!(tokens, 1_000);
+        assert!((usd - 0.5).abs() < 1e-9, "bucket USD {usd}");
+        assert!((cost - 2.0).abs() < 1e-9, "bucket spend {cost}");
+    }
+
+    #[test]
     fn rolling_window_does_not_dump_unattributable_remainder_into_last_hour() {
         let mut tracker = make_tracker();
 
@@ -15122,6 +16366,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(5),
                 session_estimated_savings_usd: Some(10.0),
                 session_estimated_tokens_saved: Some(10_000),
@@ -15145,6 +16390,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(6),
                 session_estimated_savings_usd: Some(10.0),
                 session_estimated_tokens_saved: Some(10_000),
@@ -15178,6 +16424,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(10),
                 session_estimated_savings_usd: Some(1.0),
                 session_estimated_tokens_saved: Some(1_000),
@@ -15197,6 +16444,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(11),
                 session_estimated_savings_usd: Some(1.2),
                 session_estimated_tokens_saved: Some(1_200),
@@ -15234,6 +16482,7 @@ mod tests {
             session_estimated_tokens_saved: 1_000,
             session_actual_cost_usd: 2.0,
             session_total_tokens_sent: 4_000,
+            sent_is_forwarded: None,
         });
         tracker.session_requests = 10;
         tracker.session_estimated_savings_usd = 5.0;
@@ -15250,6 +16499,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(11),
                 session_estimated_savings_usd: Some(5.5),
                 session_estimated_tokens_saved: Some(1_100),
@@ -15376,6 +16626,7 @@ mod tests {
                 session_estimated_tokens_saved: 900,
                 session_actual_cost_usd: 0.0,
                 session_total_tokens_sent: 0,
+                sent_is_forwarded: None,
             }),
             display_session_baseline: None,
             session_savings_history: Vec::new(),
@@ -15402,6 +16653,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(base_dir);
     }
 
+    /// #46: an unusable savings-state.json is still the only full copy of the
+    /// user's history. savings-records.jsonl holds little more than each
+    /// backend session's first-poll backfill, so rebuilding from it restored
+    /// under 1% and re-fired earned milestones. Recovery salvages the
+    /// format-agnostic fields from the unusable bytes instead, for an
+    /// unparsable bucket and for a newer schema alike, and keeps the backup.
+    #[test]
+    fn savings_state_recovery_salvages_history_from_the_unusable_file() {
+        for (schema_version, garbled_bucket, backup) in [
+            (3, true, "json.corrupt"),
+            (4, false, "json.schema-mismatch"),
+        ] {
+            let base_dir = temp_test_dir("headroom-savings-salvage");
+            ensure_data_dirs(&base_dir).expect("create temp dirs");
+            let tiny_backfill = SavingsRecord {
+                schema_version: 7,
+                day_key: "2026-09-01".into(),
+                hour_key: "2026-09-01T09:00".into(),
+                delta_requests: 3,
+                delta_estimated_tokens_saved: 1_000,
+                ..Default::default()
+            };
+            std::fs::write(
+                telemetry_file(&base_dir, "savings-records.jsonl"),
+                serde_json::to_string(&tiny_backfill).unwrap(),
+            )
+            .unwrap();
+            let mut daily = serde_json::json!({
+                "2026-08-31": {"estimated_tokens_saved": 700_000_000u64, "estimated_savings_usd": 900.0},
+                "2026-09-01": {"estimated_tokens_saved": 690_000_000u64},
+            });
+            if garbled_bucket {
+                // One bucket of the wrong type fails the whole typed parse.
+                daily["2026-09-02"] = serde_json::json!({"estimated_tokens_saved": "garbled"});
+            }
+            let state_path = config_file(&base_dir, "savings-state.json");
+            std::fs::write(
+                &state_path,
+                serde_json::json!({
+                    "schemaVersion": schema_version,
+                    "lifetimeRequests": 177_000,
+                    "lifetimeTokenMilestoneHighWater": 1_390_000_000u64,
+                    "dailySavings": daily,
+                    "hourlySavings": {"2026-09-01T09:00": {"estimated_tokens_saved": 690_000_000u64}},
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let tracker = SavingsTracker::load_or_create(&base_dir).expect("load tracker");
+            assert_eq!(
+                tracker.lifetime_requests, 177_000,
+                "schema {schema_version}"
+            );
+            assert_eq!(tracker.lifetime_token_milestone_high_water, 1_390_000_000);
+            assert_eq!(tracker.daily_savings.len(), 2, "schema {schema_version}");
+            assert_eq!(
+                tracker.daily_savings["2026-09-01"].estimated_tokens_saved,
+                690_000_000
+            );
+            assert_eq!(
+                tracker.hourly_savings["2026-09-01T09:00"].estimated_tokens_saved,
+                690_000_000
+            );
+            assert!(state_path.with_extension(backup).exists(), "{backup} kept");
+            let _ = std::fs::remove_dir_all(&base_dir);
+        }
+    }
+
+    /// #141: a read that fails twice on an existing launch-profile.json or
+    /// savings-state.json (ENFILE, EIO: the RUST-5T shape) says nothing about
+    /// the bytes. The session runs on defaults, and neither file is moved
+    /// aside or written over, not at load and not by a later persist, so the
+    /// next launch reads them intact.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_launch_profile_and_savings_state_are_left_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let base_dir = temp_test_dir("headroom-unreadable-state");
+        ensure_data_dirs(&base_dir).expect("create temp dirs");
+        let profile_path = config_file(&base_dir, "launch-profile.json");
+        let state_path = config_file(&base_dir, "savings-state.json");
+        let files: [(&PathBuf, &[u8]); 2] = [
+            (
+                &profile_path,
+                br#"{"launch_count": 40, "setup_wizard_complete": true, "accepted_terms_version": 2}"#,
+            ),
+            (&state_path, br#"{"schemaVersion": 3, "lifetimeRequests": 177000}"#),
+        ];
+        for (path, bytes) in files {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        assert!(
+            std::fs::read(&profile_path).is_err(),
+            "file must really be unreadable, or this test proves nothing"
+        );
+
+        let state = AppState::new_in(base_dir.clone()).expect("degrades, never fails");
+        assert_eq!(
+            state.accepted_terms_version(),
+            0,
+            "session runs on defaults"
+        );
+        state.mark_terms_accepted(3);
+        let _ = state.savings_tracker.lock().persist_state();
+
+        for (path, bytes) in files {
+            assert!(
+                !path.with_extension("json.corrupt").exists(),
+                "{} moved aside",
+                path.display()
+            );
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                bytes,
+                "{} written over",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
     fn daily(date: &str, tokens: u64, usd: f64) -> DailySavingsPoint {
         DailySavingsPoint {
             date: date.to_string(),
@@ -15419,6 +16794,7 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            utc_keyed: false,
         }
     }
 
@@ -15527,7 +16903,7 @@ mod tests {
         // still has the full-day value, so the merge no longer falls back to
         // the tracker's own partial observation.
         assert!(!tracker.ingest_native_rollups(&[], &[], cutoff, "2026-06-17", "2026-06-17"));
-        let merged = merge_daily_savings(tracker.daily_savings(), vec![], cutoff);
+        let merged = merge_daily_savings(tracker.daily_savings(), vec![], cutoff, "2026-06-17");
         let day = merged
             .iter()
             .find(|p| p.date == "2026-06-16")
@@ -15721,7 +17097,7 @@ mod tests {
     fn merge_daily_tracker_preferred_before_cutoff() {
         let tracker = vec![daily("2026-04-13", 500, 1.0)];
         let history = vec![daily("2026-04-13", 999, 2.0)];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         // tracker wins pre-cutoff
         assert_eq!(result[0].estimated_tokens_saved, 500);
@@ -15731,7 +17107,7 @@ mod tests {
     fn merge_daily_history_preferred_on_and_after_cutoff() {
         let tracker = vec![daily("2026-04-20", 100, 0.5)];
         let history = vec![daily("2026-04-20", 800, 2.0)];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         // history wins on cutoff date
         assert_eq!(result[0].estimated_tokens_saved, 800);
@@ -15747,7 +17123,7 @@ mod tests {
             ..daily("2026-04-20", 100, 0.5)
         }];
         let history = vec![daily("2026-04-20", 800, 2.0)];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].estimated_tokens_saved, 800);
         assert_eq!(result[0].new_input_tokens, 4_000);
@@ -15773,8 +17149,9 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            utc_keyed: false,
         }];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         // Tracker point (with real spend) wins over the desynced history point.
         assert_eq!(result[0].total_tokens_sent, 123_456);
@@ -15786,7 +17163,7 @@ mod tests {
         // No real spend anywhere -> nothing to fall back to; history is kept as-is.
         let history = vec![daily("2026-04-21", 800, 2.0)];
         let tracker = vec![daily("2026-04-21", 100, 0.5)];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].estimated_tokens_saved, 800);
         assert_eq!(result[0].total_tokens_sent, 0);
@@ -15795,7 +17172,7 @@ mod tests {
     #[test]
     fn merge_daily_fallback_when_only_tracker_has_post_cutoff_day() {
         let tracker = vec![daily("2026-04-21", 300, 1.2)];
-        let result = merge_daily_savings(tracker, vec![], "2026-04-20");
+        let result = merge_daily_savings(tracker, vec![], "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].estimated_tokens_saved, 300);
     }
@@ -15805,7 +17182,7 @@ mod tests {
         // Pre-cutoff is tracker-only: empty tracker + pre-cutoff history => no entry.
         // This protects against pre-v6 schema drift leaking into the graph.
         let history = vec![daily("2026-04-10", 400, 1.5)];
-        let result = merge_daily_savings(vec![], history, "2026-04-20");
+        let result = merge_daily_savings(vec![], history, "2026-04-20", "2026-04-30");
         assert!(result.is_empty());
     }
 
@@ -15813,11 +17190,111 @@ mod tests {
     fn merge_daily_combines_days_from_both_sources() {
         let tracker = vec![daily("2026-04-10", 200, 0.8), daily("2026-04-13", 300, 1.0)];
         let history = vec![daily("2026-04-20", 500, 2.0), daily("2026-04-21", 600, 2.5)];
-        let mut result = merge_daily_savings(tracker, history, "2026-04-20");
+        let mut result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         result.sort_by(|a, b| a.date.cmp(&b.date));
         assert_eq!(result.len(), 4);
         assert_eq!(result[0].date, "2026-04-10");
         assert_eq!(result[3].date, "2026-04-21");
+    }
+
+    #[test]
+    fn merge_daily_skips_a_local_day_ahead_of_the_live_utc_bucket() {
+        // UTC+10 at local 09:00 on the 30th is 23:00Z on the 29th: the
+        // tracker's local "30th" holds hours that history's live UTC "29th"
+        // already counts. Gap-filling it counted the morning twice.
+        let tracker = vec![daily("2026-09-29", 100, 0.5), daily("2026-09-30", 300, 1.5)];
+        let history = vec![daily("2026-09-29", 1_000, 5.0)];
+        let merged = merge_daily_savings(tracker.clone(), history, "2026-06-02", "2026-09-29");
+        let lifetime: u64 = merged.iter().map(|p| p.estimated_tokens_saved).sum();
+        assert_eq!(lifetime, 1_000);
+
+        // No live UTC bucket yet: nothing else holds those hours, keep them.
+        let stale_history = vec![daily("2026-09-28", 50, 0.2)];
+        let merged = merge_daily_savings(tracker, stale_history, "2026-06-02", "2026-09-29");
+        assert!(merged.iter().any(|p| p.date == "2026-09-30"));
+    }
+
+    #[test]
+    fn rollup_days_report_a_utc_day_end_even_with_local_new_input() {
+        // The rollup won the bucket and the tracker added its local new-input
+        // sample; that used to stamp a LOCAL midnight on a UTC day, which the
+        // server's trial usage-day count compares against the trial start.
+        let history = HeadroomSavingsHistoryResponse {
+            daily: vec![HeadroomSavingsRollupPoint {
+                timestamp: "2026-09-08T00:00:00Z".parse().unwrap(),
+                tokens_saved: 800,
+                compression_savings_usd_delta: 2.0,
+                total_input_tokens_delta: 10_000,
+                total_input_cost_usd_delta: 1.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tracker = vec![DailySavingsPoint {
+            new_input_tokens: 4_000,
+            ..daily("2026-09-08", 100, 0.5)
+        }];
+        let merged =
+            merge_daily_savings(tracker, history.daily_savings(), "2026-06-02", "2026-09-08");
+        let ends: Vec<_> = crate::recent_savings_days(&merged)
+            .into_iter()
+            .map(|day| day.day_ends_at.map(|at| at.to_rfc3339()))
+            .collect();
+        assert_eq!(ends, [Some("2026-09-09T00:00:00+00:00".to_string())]);
+
+        // Archived rollups keep the UTC keying once history trims them.
+        let mut archive = make_tracker();
+        assert!(archive.ingest_native_rollups(
+            &history.daily_savings(),
+            &[],
+            "2026-06-02",
+            "2026-09-09",
+            "2026-09-09",
+        ));
+        assert!(archive.daily_savings()[0].utc_keyed);
+    }
+
+    #[test]
+    fn native_hourly_sums_the_repeated_dst_fall_back_hour() {
+        // US Eastern, 2026-11-01: 05:00Z is 01:00 EDT and 06:00Z is 01:00 EST.
+        let fall_back: DateTime<Utc> = "2026-11-01T06:00:00Z".parse().unwrap();
+        let eastern = |at: DateTime<Utc>| {
+            let hours_west = if at < fall_back { 4 } else { 5 };
+            let offset = chrono::FixedOffset::west_opt(hours_west * 3600).unwrap();
+            at.with_timezone(&offset)
+                .format("%Y-%m-%dT%H:00")
+                .to_string()
+        };
+        let point = |at: &str, tokens: u64, provider: &str| HeadroomSavingsRollupPoint {
+            timestamp: at.parse().unwrap(),
+            tokens_saved: tokens,
+            compression_savings_usd_delta: tokens as f64 / 100.0,
+            output_tokens_saved_delta: tokens,
+            cache_read_tokens_delta: Some(tokens),
+            by_provider: vec![ProviderRollupDelta {
+                provider: provider.into(),
+                tokens_saved: tokens,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let history = HeadroomSavingsHistoryResponse {
+            hourly: vec![
+                point("2026-11-01T04:00:00Z", 1, "anthropic"),
+                point("2026-11-01T05:00:00Z", 10, "anthropic"),
+                point("2026-11-01T06:00:00Z", 20, "openai"),
+            ],
+            ..Default::default()
+        };
+        let hours = history.hourly_savings_keyed(eastern);
+        let keys: Vec<&str> = hours.iter().map(|p| p.hour.as_str()).collect();
+        assert_eq!(keys, ["2026-11-01T00:00", "2026-11-01T01:00"]);
+        let repeated = &hours[1];
+        assert_eq!(repeated.estimated_tokens_saved, 30);
+        assert!((repeated.estimated_savings_usd - 0.30).abs() < 1e-9);
+        assert_eq!(repeated.output_tokens_saved, 30);
+        assert_eq!(repeated.cache_read_tokens, Some(30));
+        assert_eq!(repeated.by_provider.len(), 2);
     }
 
     // merge_hourly_savings
@@ -15871,6 +17348,7 @@ mod tests {
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
+            session_sent_is_forwarded: false,
             session_requests: Some(1),
             session_estimated_savings_usd: Some(1.0),
             session_estimated_tokens_saved: Some(1_000),
@@ -15894,6 +17372,7 @@ mod tests {
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
+            session_sent_is_forwarded: false,
             session_requests: Some(3),
             session_estimated_savings_usd: Some(3.0),
             session_estimated_tokens_saved: Some(3_000),
