@@ -5000,14 +5000,33 @@ fn claude_learn_md_path(project_path: &str) -> std::path::PathBuf {
 
 #[tauri::command]
 async fn delete_applied_pattern(
+    state: State<'_, AppState>,
     project_path: String,
     file_kind: String,
     section_title: String,
     bullet_text: String,
 ) -> Result<(), String> {
-    let path = match file_kind.as_str() {
-        "claude" => claude_learn_md_path(&project_path),
-        "memory" => crate::tool_manager::claude_project_memory_file(&project_path),
+    delete_applied_pattern_in(
+        &headroom_memory_db_path(),
+        &project_path,
+        &file_kind,
+        &section_title,
+        &bullet_text,
+    )?;
+    state.invalidate_memory_export_cache();
+    Ok(())
+}
+
+fn delete_applied_pattern_in(
+    memory_db: &Path,
+    project_path: &str,
+    file_kind: &str,
+    section_title: &str,
+    bullet_text: &str,
+) -> Result<(), String> {
+    let path = match file_kind {
+        "claude" => claude_learn_md_path(project_path),
+        "memory" => crate::tool_manager::claude_project_memory_file(project_path),
         other => return Err(format!("Unknown file_kind: {other}")),
     };
     if !path.exists() {
@@ -5015,14 +5034,34 @@ async fn delete_applied_pattern(
     }
     let content =
         std::fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
-    let updated =
-        crate::tool_manager::delete_applied_bullet(&content, &section_title, &bullet_text);
+    let updated = crate::tool_manager::delete_applied_bullet(&content, section_title, bullet_text);
     if updated == content {
         return Ok(()); // no-op; nothing to write
+    }
+    // The backend's traffic learner rebuilds every `Learned:` section from
+    // memory.db on its next flush, so the bullet would come back unless its
+    // source row goes first. Fail before touching the file so a retry works.
+    if section_title.starts_with("Learned: ") {
+        forget_traffic_learner_rule(memory_db, bullet_text)
+            .map_err(|err| format!("forget rule in {}: {err}", memory_db.display()))?;
     }
     crate::client_adapters::atomic_write(&path, updated.as_bytes())
         .map_err(|err| format!("write {}: {err:#}", path.display()))?;
     Ok(())
+}
+
+/// Delete the traffic_learner rows a `Learned:` bullet was rendered from
+/// (the writer emits `- {content}`). A missing DB means nothing to forget.
+fn forget_traffic_learner_rule(memory_db: &Path, bullet_text: &str) -> rusqlite::Result<usize> {
+    if !memory_db.exists() {
+        return Ok(0);
+    }
+    rusqlite::Connection::open(memory_db)?.execute(
+        "DELETE FROM memories \
+         WHERE json_extract(metadata, '$.source') = 'traffic_learner' \
+           AND trim(content) = ?1",
+        [bullet_text],
+    )
 }
 
 fn read_applied_block(path: &std::path::Path) -> Vec<crate::models::AppliedSection> {
@@ -7619,16 +7658,17 @@ fn check_headroom_learn_prereqs(
 }
 
 /// Count entries in a `headroom memory export` JSON payload whose `created_at`
-/// parses into the same UTC day as `now`. The export writes `created_at` as an
+/// falls on the same local day as `now`. The export writes `created_at` as an
 /// RFC3339-ish string without a timezone suffix (`2026-04-21T10:00:00`); we
-/// treat those as UTC, matching the rest of the activity pipeline.
+/// parse those as UTC and bucket by the user's local day, like the sibling
+/// reminders/learnings counters.
 fn count_memories_created_today(
     json: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<usize, String> {
     let raw: Vec<serde_json::Value> =
         serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
-    let today = now.date_naive();
+    let today = crate::storage::user_day(now);
     Ok(raw
         .into_iter()
         .filter_map(|v| {
@@ -7636,7 +7676,7 @@ fn count_memories_created_today(
                 .and_then(|c| c.as_str())
                 .and_then(parse_memory_created_at)
         })
-        .filter(|dt| dt.date_naive() == today)
+        .filter(|dt| crate::storage::user_day(*dt) == today)
         .count())
 }
 
@@ -10491,7 +10531,7 @@ mod tests {
         classify_backend_readyz, classify_bootstrap_failure, classify_update_check,
         classify_upgrade_error, client_setup_error_kind, compute_panel_corner_position,
         compute_tray_window_position, conflicting_openssl_dirs, count_memories_created_today,
-        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
+        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern_in,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
         fake_override, feed_failure_is_persistent, feed_pull_limit,
         fetch_transformations_feed_from, first_savings_body, format_token_count,
@@ -12196,30 +12236,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn count_memories_created_today_only_counts_today_entries() {
+    /// A local instant on 2026-04-22 (or `day`), converted to UTC the way
+    /// the export stores it, so these tests hold in any timezone.
+    fn local_instant(day: u32, hour: u32, min: u32) -> chrono::DateTime<chrono::Utc> {
         use chrono::TimeZone;
-        let json = r#"[
-            {"id":"a","created_at":"2026-04-22T10:00:00"},
-            {"id":"b","created_at":"2026-04-22T23:59:59"},
-            {"id":"c","created_at":"2026-04-21T23:00:00"},
+        chrono::Local
+            .with_ymd_and_hms(2026, 4, day, hour, min, 0)
+            .earliest()
+            .expect("local time exists")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn count_memories_created_today_buckets_by_local_day() {
+        // `created_at` is UTC without a suffix; "today" is the user's local
+        // day, like the sibling reminders/learnings counters.
+        let naive = |dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let json = serde_json::json!([
+            {"id":"a","created_at":naive(local_instant(22, 0, 30))},
+            {"id":"b","created_at":naive(local_instant(22, 23, 59))},
+            {"id":"c","created_at":naive(local_instant(21, 23, 0))},
             {"id":"d","created_at":null},
             {"id":"e"}
-        ]"#;
-        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
-        assert_eq!(count_memories_created_today(json, now).unwrap(), 2);
+        ])
+        .to_string();
+        let now = local_instant(22, 12, 0);
+        assert_eq!(count_memories_created_today(&json, now).unwrap(), 2);
     }
 
     #[test]
     fn count_memories_created_today_accepts_rfc3339_with_tz() {
-        use chrono::TimeZone;
-        let json = r#"[
-            {"id":"a","created_at":"2026-04-22T10:00:00Z"},
-            {"id":"b","created_at":"2026-04-22T02:00:00-09:00"}
-        ]"#;
-        // 2026-04-22T02:00:00-09:00 == 2026-04-22T11:00:00Z, both land on today.
-        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
-        assert_eq!(count_memories_created_today(json, now).unwrap(), 2);
+        let west = chrono::FixedOffset::west_opt(9 * 3600).unwrap();
+        let json = serde_json::json!([
+            {"id":"a","created_at":local_instant(22, 10, 0).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)},
+            {"id":"b","created_at":local_instant(22, 11, 0).with_timezone(&west).to_rfc3339()}
+        ])
+        .to_string();
+        let now = local_instant(22, 12, 0);
+        assert_eq!(count_memories_created_today(&json, now).unwrap(), 2);
     }
 
     #[test]
@@ -12830,13 +12884,13 @@ Some unrelated content.
         );
 
         // Deletes must target the same file the read came from.
-        delete_applied_pattern(
-            tmp.path().to_str().unwrap().to_string(),
-            "claude".into(),
-            "Local Section".into(),
-            "Local bullet.".into(),
+        delete_applied_pattern_in(
+            &tmp.path().join("memory.db"),
+            tmp.path().to_str().unwrap(),
+            "claude",
+            "Local Section",
+            "Local bullet.",
         )
-        .await
         .expect("delete bullet from CLAUDE.local.md");
         let on_disk = std::fs::read_to_string(&local).unwrap();
         assert!(
@@ -12850,13 +12904,13 @@ Some unrelated content.
         let tmp = tempfile::tempdir().expect("tempdir");
         write_claude_md_with_headroom_block(tmp.path());
 
-        delete_applied_pattern(
-            tmp.path().to_str().unwrap().to_string(),
-            "claude".into(),
-            "First Section".into(),
-            "First bullet.".into(),
+        delete_applied_pattern_in(
+            &tmp.path().join("memory.db"),
+            tmp.path().to_str().unwrap(),
+            "claude",
+            "First Section",
+            "First bullet.",
         )
-        .await
         .expect("delete bullet");
 
         let result = read_applied_patterns_for_project(tmp.path().to_str().unwrap());
@@ -12881,13 +12935,13 @@ Some unrelated content.
         let tmp = tempfile::tempdir().expect("tempdir");
         write_claude_md_with_headroom_block(tmp.path());
 
-        delete_applied_pattern(
-            tmp.path().to_str().unwrap().to_string(),
-            "claude".into(),
-            "Second Section".into(),
-            "Third bullet.".into(),
+        delete_applied_pattern_in(
+            &tmp.path().join("memory.db"),
+            tmp.path().to_str().unwrap(),
+            "claude",
+            "Second Section",
+            "Third bullet.",
         )
-        .await
         .expect("delete bullet");
 
         let result = read_applied_patterns_for_project(tmp.path().to_str().unwrap());
@@ -12921,18 +12975,82 @@ Some unrelated content.
         let tmp = tempfile::tempdir().expect("tempdir");
         write_claude_md_with_headroom_block(tmp.path());
 
-        let err = delete_applied_pattern(
-            tmp.path().to_str().unwrap().to_string(),
-            "garbage".into(),
-            "First Section".into(),
-            "First bullet.".into(),
+        let err = delete_applied_pattern_in(
+            &tmp.path().join("memory.db"),
+            tmp.path().to_str().unwrap(),
+            "garbage",
+            "First Section",
+            "First bullet.",
         )
-        .await
         .expect_err("unknown file_kind rejected");
         assert!(
             err.contains("Unknown file_kind"),
             "expected Unknown file_kind error, got: {err}"
         );
+    }
+
+    #[test]
+    fn delete_applied_pattern_forgets_the_learned_rule_in_memory_db() {
+        // The backend's traffic learner rebuilds every `Learned:` section from
+        // memory.db on its next flush, so a bullet deleted only from the file
+        // came back. Its source row has to go too; unrelated rows stay.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rule = "Run tests with `uv run pytest` in /x/proj";
+        std::fs::write(
+            tmp.path().join("CLAUDE.local.md"),
+            format!(
+                "<!-- headroom:learn:start -->\n\
+                 ## Headroom Learned Patterns\n\
+                 ### Learned: environment\n\
+                 - {rule}\n\
+                 - Keep this rule\n\
+                 <!-- headroom:learn:end -->\n"
+            ),
+        )
+        .expect("write CLAUDE.local.md");
+        let db = tmp.path().join("memory.db");
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        conn.execute(
+            "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, metadata TEXT)",
+            [],
+        )
+        .expect("create table");
+        let learner = r#"{"source":"traffic_learner","category":"environment","evidence_count":7}"#;
+        for (id, content, meta) in [
+            ("deleted", rule, learner),
+            ("kept", "Keep this rule", learner),
+            ("other-source", rule, r#"{"source":"user"}"#),
+        ] {
+            conn.execute(
+                "INSERT INTO memories (id, content, metadata) VALUES (?1, ?2, ?3)",
+                [id, content, meta],
+            )
+            .expect("insert row");
+        }
+
+        delete_applied_pattern_in(
+            &db,
+            tmp.path().to_str().unwrap(),
+            "claude",
+            "Learned: environment",
+            rule,
+        )
+        .expect("delete learned bullet");
+
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM memories ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids, vec!["kept".to_string(), "other-source".to_string()]);
+        let on_disk = std::fs::read_to_string(tmp.path().join("CLAUDE.local.md")).unwrap();
+        assert!(
+            !on_disk.contains(rule),
+            "bullet removed from file:\n{on_disk}"
+        );
+        assert!(on_disk.contains("- Keep this rule"));
     }
 
     #[test]

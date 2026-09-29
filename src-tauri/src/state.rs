@@ -640,6 +640,10 @@ pub struct AppState {
     /// just-finished learn runs appear promptly once their explicit
     /// invalidation fires.
     cached_claude_code_projects: Mutex<Option<(Vec<ClaudeCodeProject>, Instant)>>,
+    /// Bumped by `invalidate_claude_code_projects_cache`. A scan that started
+    /// before an invalidation may hold a project's pre-learn state, so it only
+    /// caches its result when the generation is unchanged.
+    claude_projects_cache_gen: std::sync::atomic::AtomicU64,
     /// Cached `detect_headroom_learn_prereq_status`. The Claude CLI location
     /// can't change without explicit user action during a session, and the
     /// fallback shell probe can take up to 2s, so we keep this sticky and
@@ -778,6 +782,7 @@ impl AppState {
             last_complete_identity_fetch_at: Mutex::new(None),
             cached_memory_export: Mutex::new(None),
             cached_claude_code_projects: Mutex::new(None),
+            claude_projects_cache_gen: std::sync::atomic::AtomicU64::new(0),
             cached_headroom_learn_prereq: Mutex::new(None),
             cached_runtime_status: Mutex::new(None),
             kompress_prefetch_attempted: AtomicBool::new(false),
@@ -2992,9 +2997,27 @@ impl AppState {
         if let Some(cached) = self.cached_claude_code_projects_fresh() {
             return Ok(cached);
         }
+        let generation = self
+            .claude_projects_cache_gen
+            .load(std::sync::atomic::Ordering::Acquire);
         let projects = self.list_claude_code_projects_uncached()?;
-        *self.cached_claude_code_projects.lock() = Some((projects.clone(), Instant::now()));
+        self.store_claude_code_projects(generation, &projects);
         Ok(projects)
+    }
+
+    /// Caches a scan that started at `generation`, unless an invalidation
+    /// landed while it ran: that scan may have read a project before its
+    /// learn run finished, and caching it would pin the stale row for the
+    /// whole TTL. The next reader rescans instead.
+    fn store_claude_code_projects(&self, generation: u64, projects: &[ClaudeCodeProject]) {
+        let mut cache = self.cached_claude_code_projects.lock();
+        if self
+            .claude_projects_cache_gen
+            .load(std::sync::atomic::Ordering::Acquire)
+            == generation
+        {
+            *cache = Some((projects.to_vec(), Instant::now()));
+        }
     }
 
     fn cached_claude_code_projects_fresh(&self) -> Option<Vec<ClaudeCodeProject>> {
@@ -3008,7 +3031,10 @@ impl AppState {
     }
 
     pub fn invalidate_claude_code_projects_cache(&self) {
-        *self.cached_claude_code_projects.lock() = None;
+        let mut cache = self.cached_claude_code_projects.lock();
+        self.claude_projects_cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        *cache = None;
     }
 
     pub fn headroom_learn_prereq_status(&self) -> HeadroomLearnPrereqStatus {
@@ -12818,6 +12844,32 @@ mod tests {
             pid_exits_within(pid, std::time::Duration::from_secs(5)),
             "orphaned pip {pid} survived the venv lock-holder sweep"
         );
+    }
+
+    #[test]
+    fn projects_scan_straddling_an_invalidation_is_not_cached() {
+        let base_dir = temp_test_dir("headroom-projects-cache-gen");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+
+        // A scan starts, then a learn run completes and invalidates before
+        // the scan stores its (pre-learn) result.
+        let generation = state
+            .claude_projects_cache_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        state.invalidate_claude_code_projects_cache();
+        state.store_claude_code_projects(generation, &[]);
+        assert!(
+            state.cached_claude_code_projects_fresh().is_none(),
+            "a scan that straddled an invalidation must not be cached"
+        );
+
+        // A scan that started after the invalidation caches normally.
+        let generation = state
+            .claude_projects_cache_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        state.store_claude_code_projects(generation, &[]);
+        assert!(state.cached_claude_code_projects_fresh().is_some());
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
