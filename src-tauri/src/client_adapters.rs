@@ -11342,6 +11342,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    #[cfg(unix)]
     fn hook_script_auto_allows_only_what_claude_code_would_not_ask() {
         // `rtk rewrite`'s exit code is its verdict against the user's Claude
         // Code permission rules. Exit 3 ("rewrite, but ask") used to be turned
