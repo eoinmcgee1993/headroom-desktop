@@ -30,6 +30,9 @@ import {
   formatDayKey,
   formatLearnStatus,
   hasNeverScanned,
+  historyOverlayCaption,
+  formatMonthLabel,
+  formatSelectedDayLabel,
   getEnabledSupportedConnectors,
   hasEnabledConnector,
   hourOfDayTickFormatter,
@@ -487,6 +490,37 @@ describe("dashboard helpers", () => {
     expect(hasNeverScanned({ lastLearnRanAt: null })).toBe(true);
     expect(hasNeverScanned({ lastLearnRanAt: "invalid" })).toBe(true);
     expect(hasNeverScanned({ lastLearnRanAt: "2026-03-22T08:00:00Z" })).toBe(false);
+  });
+
+  it("dates a learn scan by local calendar day, not elapsed 24h periods", () => {
+    vi.useFakeTimers();
+    // 00:30 local; the scan ran an hour earlier, before local midnight.
+    vi.setSystemTime(new Date(2026, 2, 27, 0, 30));
+    const lateYesterday = new Date(2026, 2, 26, 23, 30).toISOString();
+    expect(formatLearnStatus({ lastLearnRanAt: lateYesterday })).toBe("last scan: yesterday");
+    const lateTwoDaysAgo = new Date(2026, 2, 25, 23, 30).toISOString();
+    expect(formatLearnStatus({ lastLearnRanAt: lateTwoDaysAgo })).toBe("last scan: 2 days ago");
+    // A clock-skewed future stamp still reads as today, never "-1 days ago".
+    const later = new Date(2026, 2, 27, 5, 0).toISOString();
+    expect(formatLearnStatus({ lastLearnRanAt: later })).toBe("last scan: today");
+  });
+});
+
+describe("historyOverlayCaption", () => {
+  const now = new Date(2026, 8, 29, 15, 0);
+
+  it("calls the open period today / this month", () => {
+    expect(historyOverlayCaption("day", new Date(2026, 8, 29), now)).toBe("saved today");
+    expect(historyOverlayCaption("month", new Date(2026, 8, 1), now)).toBe("saved this month");
+  });
+
+  it("names an earlier period instead of calling it today / this month", () => {
+    const pastDay = historyOverlayCaption("day", new Date(2026, 8, 25), now);
+    expect(pastDay).not.toContain("today");
+    expect(pastDay).toBe(`saved on ${formatSelectedDayLabel(new Date(2026, 8, 25))}`);
+    const pastMonth = historyOverlayCaption("month", new Date(2026, 7, 1), now);
+    expect(pastMonth).not.toContain("this month");
+    expect(pastMonth).toBe(`saved in ${formatMonthLabel(new Date(2026, 7, 1))}`);
   });
 });
 

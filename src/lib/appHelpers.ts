@@ -10,7 +10,14 @@ import type {
   PlanPrices,
   TierRecommendationSource,
 } from "./types";
-import { compactNumber, currencyExact } from "./dashboardHelpers";
+import {
+  addDays,
+  compactNumber,
+  currencyExact,
+  formatDayKey,
+  parseDayKey,
+  startOfDay
+} from "./dashboardHelpers";
 // Type-only, so this stays free of setupHealthAlert's Tauri imports at runtime.
 import type { SetupStallKind } from "./setupHealthAlert";
 
@@ -223,13 +230,25 @@ export function annualFirstYearSavingCents(
   );
 }
 
-/// Average daily savings over the trailing `days` window (default 7), used to
-/// project realized/forgone savings for upgrade copy. Returns 0 with no history.
-export function recentDailySavingsUsd(daily: DailySavingsPoint[], days = 7): number {
-  if (daily.length === 0) return 0;
-  const window = daily.slice(-days);
-  const total = window.reduce((sum, p) => sum + p.estimatedSavingsUsd, 0);
-  return total / window.length;
+/// Average daily savings over the trailing `days` calendar days (default 7,
+/// today included), used to project realized/forgone savings for upgrade copy.
+/// `daily` has entries only for active days, so the divisor is calendar days,
+/// clamped to the days since the first entry so a new install is not diluted.
+/// Returns 0 with no savings in the window.
+export function recentDailySavingsUsd(
+  daily: DailySavingsPoint[],
+  days = 7,
+  now: Date = new Date()
+): number {
+  const today = startOfDay(now);
+  const windowStart = formatDayKey(addDays(today, -(days - 1)));
+  const total = daily
+    .filter((p) => p.date >= windowStart)
+    .reduce((sum, p) => sum + p.estimatedSavingsUsd, 0);
+  if (total <= 0) return 0;
+  const first = parseDayKey(daily.reduce((min, p) => (p.date < min ? p.date : min), daily[0].date));
+  const sinceFirst = first ? Math.round((today.getTime() - first.getTime()) / 86_400_000) + 1 : days;
+  return total / Math.min(days, Math.max(1, sinceFirst));
 }
 
 /// "Unsaved while Headroom was paused" counter for the gate card. `bypassBytes`
@@ -250,7 +269,7 @@ export function unsavedWhileBlockedLabel(
   if (unsavedTokens < 10_000) return null;
   const unsavedUsd = unsavedTokens * (usd / saved);
   const usdPart = unsavedUsd >= 1 ? ` (about ${currencyExact(unsavedUsd)})` : "";
-  return `Since your trial ended, about ${compactNumber(unsavedTokens)} tokens${usdPart} went through unoptimized.`;
+  return `While Headroom was paused, about ${compactNumber(unsavedTokens)} tokens${usdPart} went through unoptimized.`;
 }
 
 /// Item 1 - "pays for itself" anchor. Compares the user's recent monthly

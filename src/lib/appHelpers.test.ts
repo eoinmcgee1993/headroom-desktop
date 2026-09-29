@@ -43,11 +43,18 @@ describe("app helpers", () => {
     expect(upgradePlanIntentLabel(null)).toBeNull();
   });
 
-  it("averages savings over the trailing window only", () => {
-    expect(recentDailySavingsUsd([])).toBe(0);
-    // 9 days present, default window 7 -> mean of the last 7 ($2 each).
-    const points = [daily(100), daily(100), ...Array(7).fill(daily(2))];
-    expect(recentDailySavingsUsd(points)).toBe(2);
+  it("averages savings over the trailing calendar days, not active-day entries", () => {
+    const now = new Date(2026, 5, 10, 12);
+    const on = (date: string, usd: number) => ({ ...daily(usd), date });
+    expect(recentDailySavingsUsd([], 7, now)).toBe(0);
+    // Active on 3 of the last 7 calendar days at $7 -> $3/day, not $7. The
+    // $100 day is outside the window.
+    const gapped = [on("2026-06-01", 100), on("2026-06-04", 7), on("2026-06-07", 7), on("2026-06-10", 7)];
+    expect(recentDailySavingsUsd(gapped, 7, now)).toBe(3);
+    // A two-day-old install is averaged over its two days, not diluted over 7.
+    expect(recentDailySavingsUsd([on("2026-06-09", 4), on("2026-06-10", 4)], 7, now)).toBe(4);
+    // Nothing in the window -> 0, so upgrade copy never rests on old activity.
+    expect(recentDailySavingsUsd([on("2026-05-01", 50)], 7, now)).toBe(0);
   });
 
   it("prices unsaved traffic at the user's own rate, or stays quiet", () => {
@@ -59,6 +66,10 @@ describe("app helpers", () => {
     const label = unsavedWhileBlockedLabel(4_000_000, history);
     expect(label).toContain("500K tokens");
     expect(label).toContain("$5.00");
+    // Reason-neutral: the same line follows weekly-limit pauses, where no
+    // trial ended.
+    expect(label).toMatch(/^While Headroom was paused, /);
+    expect(label).not.toContain("trial");
     // Below the floor (10k tokens) -> null, so a trickle never nags.
     expect(unsavedWhileBlockedLabel(40_000, history)).toBeNull();
   });

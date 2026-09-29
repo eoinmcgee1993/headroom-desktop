@@ -388,6 +388,23 @@ export function formatSelectedDayLabel(date: Date) {
   }).format(date);
 }
 
+// Caption under the History overlay total. The total covers whichever period
+// the chart shows, so only the open period may be called today / this month.
+export function historyOverlayCaption(
+  view: "day" | "month",
+  visible: Date,
+  now: Date = new Date()
+): string {
+  if (view === "day") {
+    return visible >= startOfDay(now)
+      ? "saved today"
+      : `saved on ${formatSelectedDayLabel(visible)}`;
+  }
+  return visible >= startOfMonth(now)
+    ? "saved this month"
+    : `saved in ${formatMonthLabel(visible)}`;
+}
+
 export function buildMonthlySavingsWindow(data: DailySavingsPoint[], month: Date) {
   const monthStart = startOfMonth(month);
   const monthEnd = endOfMonth(month);
@@ -787,8 +804,13 @@ export function formatLearnStatus(project: {
   if (!parsed) {
     return "never scan";
   }
-  const diffMs = Date.now() - parsed.getTime();
-  const diffDays = Math.floor(diffMs / 86_400_000);
+  // Local calendar days, not elapsed 24h periods: a scan at 23:30 is
+  // "yesterday" at 09:00. Math.round absorbs 23h/25h DST days; the clamp keeps
+  // a clock-skewed future stamp at "today".
+  const diffDays = Math.max(
+    0,
+    Math.round((startOfDay(new Date()).getTime() - startOfDay(parsed).getTime()) / 86_400_000)
+  );
   if (diffDays === 0) return "last scan: today";
   if (diffDays === 1) return "last scan: yesterday";
   return `last scan: ${diffDays} days ago`;

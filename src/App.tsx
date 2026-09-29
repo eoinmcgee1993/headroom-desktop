@@ -149,6 +149,7 @@ import {
   formatDateTime,
   formatDayKey,
   formatLearnStatus,
+  historyOverlayCaption,
   formatMonthLabel,
   formatSelectedDayLabel,
   hasEnabledConnector,
@@ -1119,7 +1120,7 @@ function DailySavingsChart({
               {chartMode === "usd" ? currency(chartSaved) : compactNumber(chartSaved)}
             </span>
             <span className="savings-chart__overlay-label">
-              {view === "day" ? "saved today" : "saved this month"}
+              {historyOverlayCaption(view, view === "day" ? visibleDay : visibleMonth)}
               {chartMode === "usd" && chartTokens > 0
                 ? ` across ${compactNumber(chartTokens)} tokens`
                 : ""}
