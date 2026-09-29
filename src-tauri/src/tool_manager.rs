@@ -11260,7 +11260,12 @@ pub fn delete_applied_bullet(file_content: &str, section_title: &str, bullet_tex
                     continue;
                 }
             }
-            if !trimmed.trim().is_empty() {
+            // Only list items count: the writer's `*~N tokens/session saved*`
+            // note alone must not keep an emptied section alive.
+            let item = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "));
+            if item.is_some_and(|rest| !rest.trim().is_empty()) {
                 current_section_has_content = true;
             }
         }
@@ -17476,6 +17481,25 @@ Always run the linter first.
         let out = super::delete_applied_bullet(&out, "Mixed", "only dash");
         assert!(out.contains("### Mixed\n* star item\n"), "{out}");
         assert!(out.contains("### Starred\n* Use uv run\n"), "{out}");
+    }
+
+    #[test]
+    fn delete_applied_bullet_drops_section_left_with_only_its_savings_note() {
+        // The learn writer puts `*~N tokens/session saved*` under each
+        // heading; it is not a rule, so it must not keep an emptied section.
+        let content = "\
+<!-- headroom:learn:start -->
+### X
+*~1,000 tokens/session saved*
+- only
+### Y
+- stays
+<!-- headroom:learn:end -->
+";
+        let out = super::delete_applied_bullet(content, "X", "only");
+        assert!(!out.contains("### X"), "{out}");
+        assert!(!out.contains("tokens/session saved"), "{out}");
+        assert!(out.contains("### Y\n- stays\n"), "{out}");
     }
 
     const START_ONLY: &str = "<!-- headroom:learn:start -->\n\
