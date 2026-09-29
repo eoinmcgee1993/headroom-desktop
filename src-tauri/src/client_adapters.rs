@@ -6456,12 +6456,16 @@ fn claude_remote_control_command_path() -> PathBuf {
 /// layer whenever the user passes `--remote-control`, (b) tags the session with
 /// `HEADROOM_RC_RELAUNCHER=tty` so the script only ends sessions this function
 /// will bring back (an alias, `command claude` or a shell opened before setup
-/// skips it), and (c) after the wrapped session exits,
-/// resumes the session named in the relaunch marker for this tty. The marker
-/// is written by the /remote-control script (`build_claude_remote_control_script`),
-/// keyed by tty so two terminals never swap sessions, and ignored once stale so
-/// a terminal without the function (opened before setup) cannot leave a marker
-/// that hijacks some later exit.
+/// skips it), (c) after the wrapped session exits, resumes the session named
+/// in the relaunch marker for this tty, and (d) routes a
+/// `CLAUDE_CONFIG_DIR=~/.claude-work` session, which reads that dir's
+/// settings.json instead of ours, by setting ANTHROPIC_BASE_URL for that one
+/// process while ~/.claude/settings.json still routes through Headroom and the
+/// user set no base URL of their own; checked per call, so it ends with quit.
+/// The marker is written by the /remote-control script
+/// (`build_claude_remote_control_script`), keyed by tty so two terminals never
+/// swap sessions, and ignored once stale so a terminal without the function
+/// (opened before setup) cannot leave a marker that hijacks some later exit.
 ///
 /// The function is defined through `eval`, and only when `claude` is not an
 /// alias: zsh and bash alias-expand a function name at parse time, so a bare
@@ -6475,7 +6479,12 @@ fn claude_remote_control_command_path() -> PathBuf {
 fn claude_code_shell_block() -> String {
     let function = r#"claude() {
   local a; for a in "$@"; do [ "$a" = --remote-control ] && { set -- --settings '__OVERRIDE__' "$@"; break; }; done
-  HEADROOM_RC_RELAUNCHER=tty command claude "$@"
+  if [ -n "$CLAUDE_CONFIG_DIR" ] && [ "${CLAUDE_CONFIG_DIR%/}" != "$HOME/.claude" ] && [ -z "$ANTHROPIC_BASE_URL" ] &&
+    command grep -qs '"ANTHROPIC_BASE_URL"[[:space:]]*:[[:space:]]*"__BASE__"' "$HOME/.claude/settings.json"; then
+    ANTHROPIC_BASE_URL=__BASE__ HEADROOM_RC_RELAUNCHER=tty command claude "$@"
+  else
+    HEADROOM_RC_RELAUNCHER=tty command claude "$@"
+  fi
   local rc=$?
   local m="$HOME/.headroom/remote-control/$(command basename "$(command tty 2>/dev/null)" 2>/dev/null)"
   if [ -s "$m" ] && [ -n "$(command find "$m" -mmin -2 2>/dev/null)" ]; then
@@ -6504,7 +6513,8 @@ fn claude_code_shell_block() -> String {
             .collect::<Vec<_>>()
             .join("|"),
     )
-    .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE);
+    .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE)
+    .replace("__BASE__", HEADROOM_ANTHROPIC_BASE_URL);
     format!(
         "# /remote-control needs api.anthropic.com; this relaunches the same session without Headroom.\n\
          if ! alias claude >/dev/null 2>&1; then eval '{}'; fi",
@@ -15587,6 +15597,93 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// Claude Code under `CLAUDE_CONFIG_DIR=~/.claude-work` reads that dir's
+    /// settings.json, not the one Headroom routes, and the rc export that
+    /// used to route it outlived quit. The `claude` function routes such a
+    /// session for its own process only, and only while ~/.claude/settings.json
+    /// still routes through Headroom and the user set no base URL of their own.
+    #[cfg(unix)]
+    #[test]
+    fn claude_shell_function_routes_another_config_dir_only_while_headroom_routes() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("claude"),
+            "#!/bin/sh\necho \"${ANTHROPIC_BASE_URL:-unset}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let block = home.path().join("block.sh");
+        std::fs::write(&block, claude_code_shell_block()).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let work = home.path().join(".claude-work");
+        let default_dir = format!("{}/", home.path().join(".claude").display());
+        let shells: Vec<&str> = ["bash", "zsh"]
+            .into_iter()
+            .filter(|sh| crate::proc::command(sh).arg("-c").arg(":").status().is_ok())
+            .collect();
+        for shell in shells {
+            let run = |config_dir: Option<&str>, base_url: Option<&str>| {
+                let mut cmd = crate::proc::command(shell);
+                cmd.arg("-c")
+                    .arg(format!(
+                        ". '{}'; claude; echo \"after=${{ANTHROPIC_BASE_URL:-unset}}\"",
+                        block.display()
+                    ))
+                    .env("HOME", home.path())
+                    .env("PATH", &path)
+                    .env_remove("CLAUDE_CONFIG_DIR")
+                    .env_remove("ANTHROPIC_BASE_URL");
+                if let Some(dir) = config_dir {
+                    cmd.env("CLAUDE_CONFIG_DIR", dir);
+                }
+                if let Some(url) = base_url {
+                    cmd.env("ANTHROPIC_BASE_URL", url);
+                }
+                String::from_utf8(cmd.output().expect("run shell").stdout).unwrap()
+            };
+            let work = work.to_str().unwrap();
+
+            super::configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)
+                .expect("route settings.json");
+            assert_eq!(
+                run(Some(work), None),
+                format!("{HEADROOM_ANTHROPIC_BASE_URL}\nafter=unset\n"),
+                "{shell}: another config dir is routed for that process only"
+            );
+            assert_eq!(
+                run(None, None),
+                "unset\nafter=unset\n",
+                "{shell}: settings.json routes the default dir"
+            );
+            assert_eq!(
+                run(Some(&default_dir), None),
+                "unset\nafter=unset\n",
+                "{shell}: ~/.claude/ is the default dir"
+            );
+            assert_eq!(
+                run(Some(work), Some("https://gateway.example")),
+                "https://gateway.example\nafter=https://gateway.example\n",
+                "{shell}: the user's own base URL wins"
+            );
+
+            // After quit settings.json no longer routes: never the dead port.
+            std::fs::write(home.path().join(".claude/settings.json"), "{}\n").unwrap();
+            assert_eq!(
+                run(Some(work), None),
+                "unset\nafter=unset\n",
+                "{shell}: not routed once Headroom stops"
+            );
+        }
     }
 
     /// settings.json is hand-maintained JSONC: the wrapper key goes in and out
