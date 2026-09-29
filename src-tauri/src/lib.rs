@@ -217,7 +217,8 @@ struct AppUpdateConfiguration {
     configuration_error: Option<String>,
     beta_channel_enabled: bool,
     // Whether the frontend may stage updates with no click. Only a macOS
-    // bundle whose folder takes writes qualifies: see silent_install_supported.
+    // bundle that it and its folder can move without admin rights qualifies:
+    // see silent_install_supported.
     silent_install_supported: bool,
 }
 
@@ -1300,18 +1301,30 @@ fn silent_install_supported() -> bool {
     }
 }
 
-/// True only when a real file create in the folder holding `bundle` succeeds.
-/// On `PermissionDenied` (a standard account under the root:admin
-/// `/Applications`, the managed-Mac case) the updater plugin retries the swap
-/// under an AppleScript admin prompt it runs on the main thread, so a quiet
-/// hourly install froze the app behind a password dialog nobody asked for, and
-/// cancelling it only queued the next one. Those installs notify instead and
-/// prompt only after a click.
+/// True only when a real file create in the folder holding `bundle` succeeds
+/// and the bundle itself is writable. On `PermissionDenied` (a standard account
+/// under the root:admin `/Applications`, the managed-Mac case) the updater
+/// plugin retries the swap under an AppleScript admin prompt it runs on the
+/// main thread, so a quiet hourly install froze the app behind a password
+/// dialog nobody asked for, and cancelling it only queued the next one. Those
+/// installs notify instead and prompt only after a click.
+///
+/// The plugin's swap renames the bundle into a `$TMPDIR` folder, and moving a
+/// directory to a new parent also needs write on the directory itself (its
+/// `..` entry), so a 755 bundle owned by another admin or by root (a pkg or
+/// MDM deploy) hits the same prompt from a writable folder. `access(W_OK)`
+/// asks without writing into the signed bundle and honours ACLs like rename.
 #[cfg(target_os = "macos")]
 fn bundle_folder_accepts_writes(bundle: Option<&std::path::Path>) -> bool {
-    bundle
-        .and_then(std::path::Path::parent)
-        .is_some_and(|dir| probe_dir_write(dir).is_ok())
+    use std::os::unix::ffi::OsStrExt;
+
+    bundle.is_some_and(|bundle| {
+        bundle
+            .parent()
+            .is_some_and(|dir| probe_dir_write(dir).is_ok())
+            && std::ffi::CString::new(bundle.as_os_str().as_bytes())
+                .is_ok_and(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0)
+    })
 }
 
 /// `true` when the running `.app` cannot be replaced in place because the folder
@@ -15061,9 +15074,21 @@ Some unrelated content.
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(bundle_folder_accepts_writes(Some(
-            &dir.path().join("Headroom.app")
-        )));
+        let bundle = dir.path().join("Headroom.app");
+        std::fs::create_dir(&bundle).expect("create");
+        assert!(bundle_folder_accepts_writes(Some(&bundle)));
+
+        // A bundle another admin (or a pkg, as root) installed sits 755 in a
+        // folder this user can write, but the plugin's swap renames it into
+        // $TMPDIR, and moving a directory to a new parent needs write on the
+        // directory itself to rewrite its '..': EACCES, then the admin prompt.
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let accepts = bundle_folder_accepts_writes(Some(&bundle));
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            !accepts,
+            "an unwritable bundle cannot move out of a writable folder without an admin prompt"
+        );
 
         let locked = dir.path().join("Applications");
         std::fs::create_dir(&locked).expect("create");
