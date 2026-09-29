@@ -779,6 +779,20 @@ pub(crate) fn verdict_unwires_clients(
     }
 }
 
+/// Counts the bind loop's consecutive stranger verdicts
+/// (`verdict_unwires_clients`) in `streak` and says whether to act on this
+/// one. A single diagnosis is not enough: one failed `ps` or netstat makes
+/// this user's second copy look like a stranger, and a holder the reclaim just
+/// killed can still be listed, so only a second verdict in a row unwires.
+fn stranger_confirmed(streak: &mut u32, stranger: bool) -> bool {
+    *streak = if stranger {
+        streak.saturating_add(1)
+    } else {
+        0
+    };
+    *streak >= 2
+}
+
 pub(crate) fn classify_held_port(
     occupant: Option<(String, u32)>,
     probe: PortProbe,
@@ -848,6 +862,8 @@ pub fn spawn(
                 // Headroom desktop instance (updater relaunch), which nothing
                 // else ever clears -- see reclaim_stranded_intercept_holder.
                 let mut reclaim_attempted = false;
+                // Consecutive stranger verdicts; see `stranger_confirmed`.
+                let mut stranger_streak = 0u32;
                 let mut orphans_reaped = false;
                 // A restart -- the updater relaunch, or the "Restart now"
                 // button -- starts the new process while the old one still
@@ -935,6 +951,7 @@ pub fn spawn(
                                 *bind_error.lock() = Some(format!(
                                     "port {INTERCEPT_PORT} is served by another Headroom instance"
                                 ));
+                                stranger_streak = 0;
                                 // Clients still reach A Headroom, so this is
                                 // benign for traffic -- but nothing in this
                                 // loop ever clears it, and a second instance
@@ -1060,14 +1077,17 @@ pub fn spawn(
                                         log::info!(
                                             "[proxy_intercept] reclaimed stranded instance on port {INTERCEPT_PORT}; retrying bind"
                                         );
-                                        continue;
-                                    }
-                                    if !orphans_reaped {
+                                    } else if !orphans_reaped {
                                         orphans_reaped = true;
-                                        if reap_orphans_holding_intercept() {
-                                            continue;
-                                        }
+                                        reap_orphans_holding_intercept();
                                     }
+                                    // Diagnose on the next pass, never on
+                                    // `probe`: it predates the reclaim, which
+                                    // can kill our stranded instance without
+                                    // the port coming free inside its 3s
+                                    // (Windows TIME_WAIT, RUST-7M), and that
+                                    // stale probe read as a live stranger.
+                                    continue;
                                 }
                                 // Who actually holds it decides whether this
                                 // is worth a report. `listener_process` only
@@ -1101,21 +1121,31 @@ pub fn spawn(
                                 if verdict_permits_reuse(&verdict) {
                                     reuse_addr = true;
                                 }
-                                let unwire = verdict_unwires_clients(
+                                let stranger = verdict_unwires_clients(
                                     &verdict,
                                     crate::tool_manager::pid_is_same_user_headroom_desktop,
                                 );
+                                let confirmed = stranger_confirmed(&mut stranger_streak, stranger);
                                 // Every wired client still sends this user's
                                 // bearer and prompts to that listener. Unwire
                                 // them; `run` wires them back once the port
                                 // is ours.
-                                if unwire && crate::client_adapters::unwire_clients_for_port_holder()
+                                if confirmed
+                                    && crate::client_adapters::unwire_clients_for_port_holder()
                                 {
                                     log::warn!(
                                         "[proxy_intercept] unwired clients from the holder of port {INTERCEPT_PORT}"
                                     );
                                 }
                                 match verdict {
+                                    // Unconfirmed, so the banner keeps saying
+                                    // we are identifying the holder rather
+                                    // than that the tools connect directly.
+                                    _ if stranger && !confirmed => {
+                                        log::info!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} looks held by a stranger ({verdict:?}); confirming on the next retry ({e})"
+                                        );
+                                    }
                                     HeldPortVerdict::Draining => {
                                         // Still a real outage from the user's
                                         // side, so the banner stays -- but it
@@ -1197,7 +1227,7 @@ pub fn spawn(
                                         log::warn!(
                                             "[proxy_intercept] port {INTERCEPT_PORT} is held by {name} (pid {pid}); retrying in 15s ({e})"
                                         );
-                                        let holder = if unwire {
+                                        let holder = if stranger {
                                             name.as_str()
                                         } else {
                                             OTHER_HEADROOM_COPY
@@ -4005,6 +4035,19 @@ mod tests {
             stranger
         ));
         assert!(!verdict_unwires_clients(&HeldPortVerdict::Stuck, stranger));
+    }
+
+    /// One diagnosis never unwires: a failed `ps` makes this user's second
+    /// copy look like a stranger, and a holder the reclaim just killed can
+    /// still be listed. Only a second stranger verdict in a row acts.
+    #[test]
+    fn a_stranger_verdict_unwires_only_when_the_next_diagnosis_agrees() {
+        let mut streak = 0;
+        assert!(!super::stranger_confirmed(&mut streak, true));
+        assert!(!super::stranger_confirmed(&mut streak, false));
+        assert!(!super::stranger_confirmed(&mut streak, true));
+        assert!(super::stranger_confirmed(&mut streak, true));
+        assert!(super::stranger_confirmed(&mut streak, true));
     }
 
     /// Off Windows the flag is inert (Unix already sets SO_REUSEADDR), so both

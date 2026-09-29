@@ -1603,13 +1603,23 @@ pub fn clear_client_setups() -> Result<()> {
 /// and prompts to it, so unwire them the way a pause does, remembered for
 /// `rewire_clients_after_port_reclaimed`. Returns whether anything was wired;
 /// with nothing wired (already paused, say) this claims nothing.
+///
+/// Runs once per holder: the bind loop calls it on every 15s retry, and a
+/// client whose disable failed stays configured, which reran the whole
+/// teardown each time. Nothing can wire a client while the flag holds
+/// (`apply_client_setup` refuses), and pause and quit clear it, so a Resume
+/// under the same holder is still caught on the next retry.
 pub fn unwire_clients_for_port_holder() -> bool {
-    if load_setup_state().configured_clients.is_empty() {
+    if clients_unwired_for_port_holder() || load_setup_state().configured_clients.is_empty() {
         return false;
     }
     CLIENTS_UNWIRED_FOR_PORT_HOLDER.store(true, std::sync::atomic::Ordering::Release);
     if let Err(err) = clear_and_remember_client_setups() {
         log::warn!("unwiring clients from a port holder: {err:#}");
+    }
+    let left: Vec<String> = load_setup_state().configured_clients.into_keys().collect();
+    if !left.is_empty() {
+        log::warn!("unwiring clients from a port holder left {left:?} wired");
     }
     true
 }
@@ -14113,6 +14123,28 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !super::is_claude_code_enabled(),
             "a pause after the unwire is the user's call; the bind must not undo it"
         );
+    }
+
+    /// The bind loop retries every 15s while the holder stays. A client whose
+    /// disable failed stays in configured_clients, and that used to rerun the
+    /// whole teardown of every client on each retry. Once unwired, a repeat
+    /// does nothing.
+    #[test]
+    #[serial_test::serial]
+    fn a_repeat_port_holder_unwire_does_not_redo_the_teardown() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+
+        // What a failed disable leaves: unwired, yet still configured.
+        super::set_clients_unwired_for_port_holder(true);
+        let repeat = super::unwire_clients_for_port_holder();
+        let still_wired = super::is_claude_code_enabled();
+        super::set_clients_unwired_for_port_holder(false);
+        assert!(!repeat, "already unwired, so a repeat claims nothing");
+        assert!(still_wired, "a repeat must not rerun the teardown");
     }
 
     #[test]

@@ -10077,14 +10077,21 @@ pub(crate) fn pid_is_same_user_headroom_desktop(pid: u32) -> bool {
     same_user_process_command(pid).is_some_and(|theirs| runs_executable_named(&theirs, &name))
 }
 
-/// `pid`'s executable path (Windows) or argv line (unix `ps -o command=`),
-/// when this same user runs it. Windows is native, for the same reasons as
-/// `pid_is_headroom_backend`, and needs no owner check: OpenProcess is denied
-/// on another user's process (see `ps_row_command_if_owned_by`).
+/// `pid`'s executable path (Windows, Linux) or argv line (macOS `ps -o
+/// command=`), when this same user runs it. Windows is native, for the same
+/// reasons as `pid_is_headroom_backend`, and needs no owner check: OpenProcess
+/// is denied on another user's process (see `ps_row_command_if_owned_by`).
+/// Linux reads the executable rather than argv (see `proc_exe_if_owned_by`).
 fn same_user_process_command(pid: u32) -> Option<String> {
     #[cfg(windows)]
     return crate::winproc::process_image_path(pid);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let my_uid = unsafe { libc::getuid() };
+        proc_exe_if_owned_by(Path::new(&format!("/proc/{pid}")), my_uid)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let output = crate::proc::command("/bin/ps")
             .args(["-o", "uid=", "-o", "command=", "-p", &pid.to_string()])
@@ -10097,17 +10104,35 @@ fn same_user_process_command(pid: u32) -> Option<String> {
     }
 }
 
+/// The executable behind `proc_dir` (`/proc/<pid>` on Linux), when `uid` owns
+/// that process. Not argv: an AppImage Headroom runs as
+/// `/tmp/.mount_XXXX/AppRun.wrapped` (linuxdeploy's AppRun execs that
+/// symlink), which names no Headroom, while `exe` resolves to
+/// `.../usr/bin/headroom-desktop`. The kernel also refuses the readlink on
+/// another user's process, so the uid check is belt and braces for root.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn proc_exe_if_owned_by(proc_dir: &Path, uid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata(proc_dir).ok()?.uid() != uid {
+        return None;
+    }
+    std::fs::read_link(proc_dir.join("exe"))
+        .ok()?
+        .to_str()
+        .map(str::to_owned)
+}
+
 /// Whether `command` -- a bare exe path or an argv line, as
 /// `same_user_process_command` returns them -- runs an executable named
 /// `exe_name` from any directory. Case-insensitive, and the name must be a
 /// whole path component, so `headroom-desktop-old` and `my-headroom-desktop`
 /// do not pass.
 ///
-/// ponytail: matches the name anywhere in argv, so a same-user listener whose
-/// ARGUMENTS end in `/headroom-desktop` passes too (the bind loop then keeps
-/// today's no-unwire behaviour for it). Paths with spaces make argv[0]
-/// ambiguous; read `/proc/<pid>/exe` or `ps -o comm=` per platform if that
-/// ever matters.
+/// ponytail: on macOS this matches the name anywhere in argv, so a same-user
+/// listener whose ARGUMENTS end in `/headroom-desktop` passes too (the bind
+/// loop then keeps today's no-unwire behaviour for it). Paths with spaces make
+/// argv[0] ambiguous; read `ps -o comm=` there if that ever matters.
 fn runs_executable_named(command: &str, exe_name: &str) -> bool {
     let command = command.trim().to_lowercase();
     let name = exe_name.to_lowercase();
@@ -10128,7 +10153,7 @@ fn runs_executable_named(command: &str, exe_name: &str) -> bool {
 /// reclaim kill at it. Windows needs no such check: the NSIS install is per
 /// user, so the path already differs, and OpenProcess is denied on another
 /// user's process anyway.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(any(windows, target_os = "linux"), allow(dead_code))]
 fn ps_row_command_if_owned_by(row: &str, uid: u32) -> Option<&str> {
     let (owner, command) = row.trim_start().split_once(char::is_whitespace)?;
     (owner.parse::<u32>().ok()? == uid).then_some(command)
@@ -17407,6 +17432,33 @@ assert g.done"#,
         assert!(!super::runs_executable_named(name, ""));
         // This test process runs its own executable, as this user.
         assert!(super::pid_is_same_user_headroom_desktop(std::process::id()));
+    }
+
+    /// Linux names the holder by `/proc/<pid>/exe`, not argv: an AppImage
+    /// Headroom's argv is linuxdeploy's `/tmp/.mount_XXXX/AppRun.wrapped`,
+    /// which names no Headroom, so this user's second AppImage copy counted as
+    /// a stranger and the two fought over the clients. The link resolves to
+    /// the real executable, and another user's process is never read.
+    #[cfg(unix)]
+    #[test]
+    fn an_appimage_headroom_is_named_by_its_proc_exe_not_its_argv() {
+        let name = "headroom-desktop";
+        assert!(!super::runs_executable_named(
+            "/tmp/.mount_ab12/AppRun.wrapped",
+            name
+        ));
+        let proc_dir = tempfile::tempdir().expect("tempdir");
+        let exe = "/tmp/.mount_ab12/usr/bin/headroom-desktop";
+        std::os::unix::fs::symlink(exe, proc_dir.path().join("exe")).unwrap();
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let me = unsafe { libc::getuid() };
+        let theirs = super::proc_exe_if_owned_by(proc_dir.path(), me);
+        assert_eq!(theirs.as_deref(), Some(exe));
+        assert!(super::runs_executable_named(&theirs.unwrap(), name));
+        assert_eq!(
+            super::proc_exe_if_owned_by(proc_dir.path(), me.wrapping_add(1)),
+            None
+        );
     }
 
     #[test]
