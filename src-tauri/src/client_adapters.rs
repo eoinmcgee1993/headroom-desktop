@@ -2191,6 +2191,8 @@ fn strip_headroom_mcp_from_opencode() -> Option<String> {
 fn strip_headroom_mcp_toml(content: &str) -> String {
     fn mcp_table_name(line: &str) -> Option<&str> {
         let inner = line
+            .split('#')
+            .next()?
             .trim()
             .strip_prefix("[mcp_servers.")?
             .strip_suffix(']')?;
@@ -4860,8 +4862,9 @@ fn find_grok_build_table(lines: &[&str]) -> Option<(usize, Option<usize>)> {
     let mut header_idx = None;
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if trimmed == "[model.grok-build]" {
+        let code = trimmed.split('#').next().unwrap_or("").trim_end();
+        if code.starts_with('[') && code.ends_with(']') {
+            if code == "[model.grok-build]" {
                 header_idx = Some(idx);
             } else if let Some(header) = header_idx {
                 // Next table started: the grok-build table had no base_url.
@@ -4881,13 +4884,12 @@ fn find_grok_build_table(lines: &[&str]) -> Option<(usize, Option<usize>)> {
     header_idx.map(|h| (h, None))
 }
 
-/// Extract the quoted string value of a `key = "value"` TOML line, ignoring
-/// any trailing comment.
+/// Extract the string value of a `key = "value"` TOML line. The line is read
+/// as TOML, so escapes (`\\` in a Windows path), a literal ('single-quoted')
+/// string or a trailing comment yield the value the client itself sees.
 fn toml_line_value(line: &str) -> Option<String> {
-    let (_, rest) = line.split_once('=')?;
-    let rest = rest.trim_start().strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    let table = toml::from_str::<toml::Table>(line).ok()?;
+    table.values().next()?.as_str().map(str::to_owned)
 }
 
 /// Rewrite `base_url` inside a user-owned `[model.grok-build]` table (e.g.
@@ -4941,7 +4943,7 @@ fn restore_grok_build_base_url(content: &str) -> String {
     let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     if let Some((_, was)) = line.split_once("# was: ") {
         let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-        out[idx] = format!("{indent}base_url = \"{}\"", was.trim());
+        out[idx] = format!("{indent}base_url = {}", toml_basic_string(was.trim()));
     } else {
         out.remove(idx);
     }
@@ -4983,6 +4985,14 @@ fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
     let updated = render_grok_config(&existing);
     if updated == existing {
         return Ok((Vec::new(), Vec::new()));
+    }
+    // A table header the text scan misses (quoted key, odd spacing) would get
+    // a duplicate [model.grok-build], which Grok refuses: keep the user's file.
+    if existing.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
+        return Err(anyhow!(
+            "rendered {} is not valid TOML; refusing to overwrite",
+            path.display()
+        ));
     }
 
     let backup = backup_if_exists(&path)?;
@@ -5127,15 +5137,18 @@ fn read_opencode_config(path: &Path) -> Result<serde_json::Value> {
 /// be parsed with serde_json. String contents (including escapes) survive.
 fn strip_jsonc(text: &str) -> String {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    // Bytes, not chars: `byte as char` turned each UTF-8 byte of a non-ASCII
+    // character into its own Latin-1 char. Only whole ASCII bytes and whole
+    // comments are dropped, so the output stays valid UTF-8.
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
     let mut i = 0;
     let mut in_string = false;
     while i < bytes.len() {
         let c = bytes[i] as char;
         if in_string {
-            out.push(c);
+            out.push(bytes[i]);
             if c == '\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
@@ -5148,7 +5161,7 @@ fn strip_jsonc(text: &str) -> String {
         match c {
             '"' => {
                 in_string = true;
-                out.push(c);
+                out.push(b'"');
                 i += 1;
             }
             '/' if bytes.get(i + 1) == Some(&b'/') => {
@@ -5188,17 +5201,17 @@ fn strip_jsonc(text: &str) -> String {
                     break;
                 }
                 if !matches!(bytes.get(j), Some(b'}') | Some(b']')) {
-                    out.push(',');
+                    out.push(b',');
                 }
                 i += 1;
             }
             _ => {
-                out.push(c);
+                out.push(bytes[i]);
                 i += 1;
             }
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn opencode_provider_base_url(config: &serde_json::Value, provider: &str) -> Option<String> {
@@ -8418,8 +8431,11 @@ fn expand_env_vars(raw: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'$' {
-            out.push(bytes[i] as char);
-            i += 1;
+            // Copy up to the next `$` as a str slice: `byte as char` mangled
+            // every non-ASCII character in the path.
+            let end = raw[i..].find('$').map_or(raw.len(), |o| i + o);
+            out.push_str(&raw[i..end]);
+            i = end;
             continue;
         }
         let (name, next) = if bytes.get(i + 1) == Some(&b'{') {
@@ -10849,6 +10865,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let empty = unique_temp_dir("headroom-zdotdir-none");
         fs::create_dir_all(&empty).unwrap();
         assert_eq!(super::zdotdir_from_zshenv(&empty), None);
+    }
+
+    #[test]
+    fn expand_env_vars_keeps_non_ascii_text() {
+        assert_eq!(
+            super::expand_env_vars("/Users/j\u{f6}rg/\u{65e5}\u{672c}/zsh"),
+            "/Users/j\u{f6}rg/\u{65e5}\u{672c}/zsh"
+        );
     }
 
     #[test]
@@ -13352,6 +13376,20 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn strip_jsonc_keeps_non_ascii_strings_intact() {
+        // Bytes pushed as chars turned every non-ASCII character into Latin-1
+        // mojibake, which the OpenCode rewrite then saved to disk.
+        let src = "{\"p\": \"Pr\u{fc}fe - \u{65e5}\u{672c} // \u{e9}\", // c\u{f6}mment\n /* \u{e4} */ \"q\": 1,\n}";
+        let parsed: serde_json::Value =
+            serde_json::from_str(&super::strip_jsonc(src)).expect("stripped source parses");
+        assert_eq!(
+            parsed["p"],
+            serde_json::json!("Pr\u{fc}fe - \u{65e5}\u{672c} // \u{e9}")
+        );
+        assert_eq!(parsed["q"], serde_json::json!(1));
+    }
+
+    #[test]
     #[serial_test::serial]
     fn opencode_apply_tolerates_jsonc_config() {
         let _home = TestHome::new(); // env guard
@@ -13491,6 +13529,55 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !after.contains("# was:"),
             "redirect comment removed, got:\n{after}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn grok_config_reads_commented_header_and_literal_base_url() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        let grok_dir = home.path().join(".grok");
+        fs::create_dir_all(&grok_dir).unwrap();
+        let config = grok_dir.join("config.toml");
+        // A trailing comment on the header hid the table (a second
+        // [model.grok-build] made the file invalid TOML), and a literal
+        // ('single-quoted') base_url was overwritten with no `# was:` record.
+        fs::write(
+            &config,
+            "[model.grok-build] # my gateway\nbase_url = 'https://gw.example/v1'\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+        let toml = fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            toml.matches("[model.grok-build]").count(),
+            1,
+            "no duplicate table, got:\n{toml}"
+        );
+        assert!(
+            toml.parse::<toml::Value>().is_ok(),
+            "valid TOML, got:\n{toml}"
+        );
+        assert!(
+            toml.contains("# was: https://gw.example/v1"),
+            "previous base_url recorded, got:\n{toml}"
+        );
+
+        super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
+        let after = fs::read_to_string(&config).unwrap();
+        assert!(
+            after.contains("base_url = \"https://gw.example/v1\""),
+            "original base_url restored, got:\n{after}"
+        );
+
+        // A spelling the text scan still misses must not be turned into a
+        // duplicate table: refuse and keep the user's file.
+        let quoted = "[model.\"grok-build\"]\nbase_url = \"https://gw.example/v1\"\n";
+        fs::write(&config, quoted).unwrap();
+        assert!(super::apply_client_setup("grok_build").is_err());
+        assert_eq!(fs::read_to_string(&config).unwrap(), quoted);
     }
 
     #[test]
@@ -15147,6 +15234,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "/Users/jo/.headroom",
             false
         ));
+    }
+
+    #[test]
+    fn toml_line_value_unescapes_windows_command_paths() {
+        // The registrar TOML-escapes backslashes, so a Windows config.toml
+        // holds `C:\\Users\\...`. Compared raw, the uninstall fallback never
+        // matched Headroom-owned MCP tables and left them behind.
+        let line = r#"command = "C:\\Users\\Jo\\AppData\\Local\\Headroom\\headroom\\serena-venv\\Scripts\\serena.exe""#;
+        let command = super::toml_line_value(line).expect("string value");
+        assert_eq!(
+            command,
+            r"C:\Users\Jo\AppData\Local\Headroom\headroom\serena-venv\Scripts\serena.exe"
+        );
+        assert!(super::command_under_dir_for(
+            &command,
+            r"C:\Users\Jo\AppData\Local\Headroom",
+            true
+        ));
+        // Literal strings and trailing comments read as the client sees them.
+        assert_eq!(
+            super::toml_line_value("command = 'C:\\x\\y.exe'  # note").as_deref(),
+            Some(r"C:\x\y.exe")
+        );
     }
 
     #[test]
