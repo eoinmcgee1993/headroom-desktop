@@ -4999,6 +4999,12 @@ struct SavingsObservation {
     session_estimated_tokens_saved: u64,
     session_actual_cost_usd: f64,
     session_total_tokens_sent: u64,
+    /// Basis of `session_total_tokens_sent` (see
+    /// `HeadroomDashboardStats::session_sent_is_forwarded`). `None` on
+    /// observations persisted before the field existed: basis unknown, so no
+    /// basis switch is inferred from them.
+    #[serde(default)]
+    sent_is_forwarded: Option<bool>,
 }
 
 impl SavingsObservation {
@@ -5216,6 +5222,10 @@ struct SavingsTracker {
     last_output_estimator_baseline_tokens: Option<u64>,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
+    /// Bytes of the last successful savings-state write. Every dashboard poll
+    /// persists, and most change nothing: an identical state skips the
+    /// fsync'd rewrite.
+    last_persisted: Vec<u8>,
 }
 
 impl SavingsTracker {
@@ -5386,6 +5396,7 @@ impl SavingsTracker {
                 .filter(|_| output_series_current)
                 .and_then(|state| state.last_output_estimator_baseline_tokens),
             last_written_at: None,
+            last_persisted: Vec::new(),
         };
         // Best-effort: persistence failing (ENOSPC/EACCES) degrades to
         // in-memory stats; it is retried on every observe tick anyway.
@@ -5773,10 +5784,21 @@ impl SavingsTracker {
         let requests_went_back = previous.as_ref().is_some_and(|prev| {
             stats.session_requests.is_some() && session_requests < prev.session_requests
         });
+        // Sent moved between the forwarded fallback and new input: the two
+        // readings are on different scales, so neither a drop nor a delta
+        // between them means anything. A real restart still shows in the
+        // requests and saved checks.
+        let sent_basis_changed = session_total_tokens_sent.is_some()
+            && previous.as_ref().is_some_and(|prev| {
+                prev.sent_is_forwarded
+                    .is_some_and(|was| was != stats.session_sent_is_forwarded)
+            });
         let reset_detected = previous.as_ref().is_some_and(|prev| {
             session_tokens_saved < prev.session_estimated_tokens_saved
                 || session_total_tokens_sent.is_some_and(|value| {
-                    prev.session_total_tokens_sent > 0 && value < prev.session_total_tokens_sent
+                    !sent_basis_changed
+                        && prev.session_total_tokens_sent > 0
+                        && value < prev.session_total_tokens_sent
                 })
                 || session_actual_cost_usd.is_some_and(|value| {
                     prev.session_actual_cost_usd > 0.0
@@ -5816,7 +5838,7 @@ impl SavingsTracker {
                         }
                     }),
                     session_total_tokens_sent.map_or(0, |value| {
-                        if prev.session_total_tokens_sent > 0 {
+                        if prev.session_total_tokens_sent > 0 && !sent_basis_changed {
                             value.saturating_sub(prev.session_total_tokens_sent)
                         } else {
                             0
@@ -5835,6 +5857,10 @@ impl SavingsTracker {
         };
         if reset_detected {
             self.session_savings_history.clear();
+        }
+        if reset_detected || sent_basis_changed {
+            // Re-seed the sent series on the new basis: its old points would
+            // hold the new readings below them forever.
             self.session_new_input_history.clear();
         }
         self.session_savings_history =
@@ -5860,12 +5886,23 @@ impl SavingsTracker {
             );
         }
 
-        let previous_session_hourly_buckets = self.session_hourly_buckets.clone();
-        let current_session_hourly_buckets = derive_session_hourly_buckets(
+        let mut current_session_hourly_buckets = derive_session_hourly_buckets(
             stats,
             &self.session_savings_history,
             &self.session_new_input_history,
         );
+        // `persist_state` prunes hours past retention from the diff baseline
+        // while the session history still derives them, so every later poll
+        // read them as new and added them to their day again. Drop them from
+        // both sides with one cutoff: days already banked stay as they are.
+        if !first_observation && !reset_detected {
+            if let Some(cutoff) = self.hourly_cutoff(&current_session_hourly_buckets) {
+                current_session_hourly_buckets.retain(|(key, _)| key.as_str() >= cutoff.as_str());
+                self.session_hourly_buckets
+                    .retain(|key, _| key.as_str() >= cutoff.as_str());
+            }
+        }
+        let previous_session_hourly_buckets = self.session_hourly_buckets.clone();
         let current_session_hourly_buckets_map = current_session_hourly_buckets
             .iter()
             .cloned()
@@ -5885,7 +5922,7 @@ impl SavingsTracker {
         self.session_estimated_savings_usd = session_savings_usd;
         self.session_estimated_tokens_saved = session_tokens_saved;
         self.session_savings_pct = stats.session_savings_pct.unwrap_or(0.0);
-        if reset_detected {
+        if reset_detected || sent_basis_changed {
             self.display_session_baseline = None;
         } else if rollover_display_session {
             self.display_session_baseline = previous.clone();
@@ -5930,7 +5967,16 @@ impl SavingsTracker {
             session_requests,
             session_estimated_savings_usd: session_savings_usd,
             session_estimated_tokens_saved: session_tokens_saved,
-            observed_at: Utc::now(),
+            // Held on an idle poll so it serializes unchanged and
+            // `persist_state` can skip the rewrite. Nothing reads it as a
+            // poll clock: it is only the pre-`last_activity_at` fallback.
+            observed_at: if changed {
+                Utc::now()
+            } else {
+                previous
+                    .as_ref()
+                    .map_or_else(Utc::now, |prev| prev.observed_at)
+            },
             last_activity_at: Some(if changed {
                 Utc::now()
             } else {
@@ -5949,6 +5995,11 @@ impl SavingsTracker {
                     .as_ref()
                     .map_or(0, |prev| prev.session_total_tokens_sent),
             ),
+            sent_is_forwarded: if session_total_tokens_sent.is_some() {
+                Some(stats.session_sent_is_forwarded)
+            } else {
+                previous.as_ref().and_then(|prev| prev.sent_is_forwarded)
+            },
         });
 
         let now = std::time::Instant::now();
@@ -6342,22 +6393,32 @@ impl SavingsTracker {
     /// cost. Daily buckets are kept indefinitely (365/year is nothing).
     const HOURLY_RETENTION_DAYS: i64 = 30;
 
-    fn prune_hourly_savings(&mut self) {
+    /// Oldest day key hourly retention keeps, counted over the hourly maps
+    /// plus `extra` (hour keys about to join them). Shared by the prune and by
+    /// `observe`, so the session diff baseline and the buckets derived from
+    /// the session history always cover the same hours.
+    fn hourly_cutoff(&self, extra: &[(String, DailySavingsBucket)]) -> Option<String> {
         // Anchor retention to the newest bucket rather than the wall clock so
         // a returning user's charts don't vanish before new data arrives.
         let latest_day = self
             .hourly_savings
             .keys()
             .chain(self.session_hourly_buckets.keys())
+            .chain(extra.iter().map(|(key, _)| key))
             .filter_map(|key| key.get(..10))
             .max()
-            .and_then(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok());
-        let Some(latest_day) = latest_day else {
+            .and_then(|day| chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok())?;
+        Some(
+            (latest_day - chrono::Duration::days(Self::HOURLY_RETENTION_DAYS))
+                .format("%Y-%m-%d")
+                .to_string(),
+        )
+    }
+
+    fn prune_hourly_savings(&mut self) {
+        let Some(cutoff) = self.hourly_cutoff(&[]) else {
             return;
         };
-        let cutoff = (latest_day - chrono::Duration::days(Self::HOURLY_RETENTION_DAYS))
-            .format("%Y-%m-%d")
-            .to_string();
         // Keys are "YYYY-MM-DDTHH:00", so day-key prefix comparison is date order.
         self.hourly_savings
             .retain(|key, _| key.as_str() >= cutoff.as_str());
@@ -6375,13 +6436,18 @@ impl SavingsTracker {
             return Ok(());
         };
         // Compact (not pretty) JSON: this is a machine-read file rewritten on
-        // every observe tick; pretty-printing roughly doubled the write.
+        // every observe tick that changes it; pretty-printing roughly doubled
+        // the write.
         let serialized =
             serde_json::to_vec(&self.persisted_state()).context("serializing savings state")?;
+        if serialized == self.last_persisted {
+            return Ok(());
+        }
         // Temp+rename: a crash/power loss mid-write used to leave truncated
         // JSON that the next launch silently replaced with a fresh tracker.
         crate::client_adapters::atomic_write(state_path, &serialized)
             .with_context(|| format!("writing {}", state_path.display()))?;
+        self.last_persisted = serialized;
         Ok(())
     }
 }
@@ -6595,6 +6661,11 @@ struct HeadroomDashboardStats {
     session_savings_pct: Option<f64>,
     session_actual_cost_usd: Option<f64>,
     session_total_tokens_sent: Option<u64>,
+    /// True when `session_total_tokens_sent` is the total-forwarded fallback
+    /// because the backend reported no new input yet. Its first cache-active
+    /// request switches the figure to the far smaller new-input sum, and
+    /// `observe` must not read that drop as a backend restart.
+    session_sent_is_forwarded: bool,
     savings_history: Vec<HeadroomSavingsHistoryPoint>,
     output_reduction: Option<OutputReduction>,
     /// Whether the wheel's rollout gate actually enabled the output shaper
@@ -7469,10 +7540,12 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
     // Filter the primary to >0 *before* the fallback: new_input_tokens is
     // Some(0) on a fully-cached snapshot, and `.or` only fires on None -- without
     // this the Some(0) skips the fallback and is then dropped, losing a valid count.
+    let new_input_tokens = new_input_tokens.filter(|value| *value > 0);
     let session_total_tokens_sent = new_input_tokens
-        .filter(|value| *value > 0)
         .or(total_after_compression)
         .filter(|value| *value > 0);
+    let session_sent_is_forwarded =
+        session_total_tokens_sent.is_some() && new_input_tokens.is_none();
     // `summary.compression` carries the process-cumulative counter. The
     // `savings.by_layer` block reports the same layer but only over the recent
     // request window, so it is a fallback for shape, not a preferred source.
@@ -7588,6 +7661,7 @@ fn parse_headroom_stats_from_json(body: &str) -> Option<HeadroomDashboardStats> 
             session_savings_pct,
             session_actual_cost_usd: actual_cost_usd.map(|value| value.max(0.0)),
             session_total_tokens_sent,
+            session_sent_is_forwarded,
             savings_history,
             output_reduction,
             output_shaper_active,
@@ -8141,10 +8215,11 @@ where
         return Vec::new();
     }
 
-    // The session saved counter is all-layers while the checkpoint series is
-    // compression-only ("bare message figure", tool_search disjoint), so
-    // proportions over the raw session total dropped the tool-schema share of
-    // sent on the floor even at full history coverage.
+    // The session saved counter is all-layers while the checkpoint series and
+    // `cost.compression_savings_usd` are compression-only ("bare message
+    // figure", tool_search disjoint), so proportions over the raw session
+    // total dropped the tool-schema share of sent, dollars and spend on the
+    // floor even at full history coverage.
     let compression_total =
         total_tokens.saturating_sub(stats.tool_schema_tokens_saved.unwrap_or(0));
 
@@ -8171,8 +8246,8 @@ where
         return Vec::new();
     }
 
-    if total_tokens > 0 && total_usd > 0.0 {
-        let usd_per_token = total_usd / total_tokens as f64;
+    if compression_total > 0 && total_usd > 0.0 {
+        let usd_per_token = total_usd / compression_total as f64;
         for bucket in buckets.values_mut() {
             bucket.estimated_savings_usd = bucket.estimated_tokens_saved as f64 * usd_per_token;
         }
@@ -8237,12 +8312,12 @@ where
         }
     }
 
-    if total_tokens > 0 && total_actual_cost_usd > 0.0 {
+    if compression_total > 0 && total_actual_cost_usd > 0.0 {
         let keys = buckets.keys().cloned().collect::<Vec<_>>();
         for key in keys.iter() {
             let bucket = buckets.get_mut(key).expect("bucket exists");
             bucket.actual_cost_usd = total_actual_cost_usd
-                * (bucket.estimated_tokens_saved as f64 / total_tokens as f64);
+                * (bucket.estimated_tokens_saved as f64 / compression_total as f64);
         }
     }
 
@@ -8261,13 +8336,28 @@ fn merge_session_savings_history(
             .or_insert(point.total_tokens_saved);
     }
 
+    // Keep the first point (the baseline the first delta is taken from) and
+    // the last point of each local hour. Hourly buckets diff consecutive
+    // points into the later point's hour, so an interior point only splits
+    // its hour's delta in two: dropping it keeps every hour exact, and the
+    // persisted history grows per hour instead of per request. Points the
+    // /stats window re-delivers are dropped again on the next merge.
+    // ponytail: one point per hour for the backend process's lifetime (a
+    // restart clears it); trim points past hourly retention if backends ever
+    // routinely live for months.
     let mut normalized = Vec::with_capacity(merged.len());
     let mut previous_total = 0u64;
+    let mut previous_hour = String::new();
     for (timestamp, total_tokens_saved) in merged {
         if !normalized.is_empty() && total_tokens_saved < previous_total {
             continue;
         }
         previous_total = total_tokens_saved;
+        let hour = local_hour_key(timestamp.with_timezone(&Local));
+        if normalized.len() > 1 && hour == previous_hour {
+            normalized.pop();
+        }
+        previous_hour = hour;
         normalized.push(HeadroomSavingsHistoryPoint {
             timestamp,
             total_tokens_saved,
@@ -11900,6 +11990,7 @@ mod tests {
             last_output_estimator_tokens_saved: None,
             last_output_estimator_baseline_tokens: None,
             last_written_at: None,
+            last_persisted: Vec::new(),
         }
     }
 
@@ -13024,6 +13115,7 @@ mod tests {
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
+            session_sent_is_forwarded: false,
             session_requests: Some(1),
             session_estimated_savings_usd: Some(1.0),
             session_estimated_tokens_saved: Some(1_500_000),
@@ -13073,6 +13165,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(10),
                 session_estimated_savings_usd: Some(1.2),
                 session_estimated_tokens_saved: Some(1_200),
@@ -13097,6 +13190,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(12),
                 session_estimated_savings_usd: Some(1.5),
                 session_estimated_tokens_saved: Some(1_500),
@@ -13125,6 +13219,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(10),
                 session_estimated_savings_usd: Some(1.0),
                 session_estimated_tokens_saved: Some(1_000),
@@ -13144,6 +13239,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(2),
                 session_estimated_savings_usd: Some(0.2),
                 session_estimated_tokens_saved: Some(200),
@@ -13171,6 +13267,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -13243,6 +13340,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14764,6 +14862,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14791,6 +14890,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14814,6 +14914,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(4),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14847,6 +14948,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(1),
                 session_estimated_savings_usd: Some(0.2),
                 session_estimated_tokens_saved: Some(400),
@@ -14869,6 +14971,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(2),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -14917,6 +15020,7 @@ mod tests {
             session_estimated_tokens_saved: 10_000,
             session_actual_cost_usd: 1.0,
             session_total_tokens_sent: 5_000,
+            sent_is_forwarded: None,
         });
         tracker.session_hourly_buckets.insert(
             "2026-03-24T13:00".into(),
@@ -14964,6 +15068,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(11),
                 session_estimated_savings_usd: Some(10.1),
                 session_estimated_tokens_saved: Some(10_200),
@@ -14996,6 +15101,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(2),
                 session_estimated_savings_usd: Some(0.5),
                 session_estimated_tokens_saved: Some(1_000),
@@ -15019,6 +15125,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(3),
                 session_estimated_savings_usd: Some(0.6),
                 session_estimated_tokens_saved: Some(1_200),
@@ -15051,6 +15158,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(1),
                 session_estimated_savings_usd: Some(0.2),
                 session_estimated_tokens_saved: Some(400),
@@ -15078,6 +15186,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(5),
                 session_estimated_savings_usd: Some(10.0),
                 session_estimated_tokens_saved: Some(10_000),
@@ -15145,6 +15254,7 @@ mod tests {
                     learner_progress: None,
                     output_reduction: None,
                     tool_schema_tokens_saved: None,
+                    session_sent_is_forwarded: false,
                     session_requests: Some(requests),
                     session_estimated_savings_usd: Some(saved as f64 / 1000.0),
                     session_estimated_tokens_saved: Some(saved),
@@ -15169,6 +15279,204 @@ mod tests {
     }
 
     #[test]
+    fn session_history_compacts_per_hour_with_exact_hourly_buckets() {
+        // Four requests an hour for three hours. The kept history is the first
+        // point plus each hour's last, it does not regrow when the /stats
+        // window re-delivers the same points, and every hour's bucket matches
+        // what the uncompacted history derives.
+        let mut raw = Vec::new();
+        let mut total = 0u64;
+        for hour in 8..11 {
+            for minute in [0u32, 5, 10, 15] {
+                total += 100 + u64::from(minute);
+                raw.push(HeadroomSavingsHistoryPoint {
+                    timestamp: Utc
+                        .with_ymd_and_hms(2026, 3, 20, hour, minute, 0)
+                        .single()
+                        .expect("valid timestamp"),
+                    total_tokens_saved: total,
+                });
+            }
+        }
+        let stats = HeadroomDashboardStats {
+            session_requests: Some(raw.len()),
+            session_estimated_savings_usd: Some(total as f64 / 1000.0),
+            session_estimated_tokens_saved: Some(total),
+            session_actual_cost_usd: Some(1.0),
+            session_total_tokens_sent: Some(total * 3),
+            savings_history: raw.clone(),
+            ..Default::default()
+        };
+        let mut tracker = make_tracker();
+        tracker.observe(&stats).expect("snapshot");
+
+        let kept = tracker.session_savings_history.len();
+        assert!(kept < raw.len(), "kept {kept} of {} points", raw.len());
+        let expected =
+            super::derive_session_hourly_buckets(&stats, &raw, &tracker.session_new_input_history)
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(tracker.session_hourly_buckets, expected);
+
+        tracker.observe(&stats).expect("snapshot");
+        assert_eq!(tracker.session_savings_history.len(), kept);
+        assert_eq!(tracker.session_hourly_buckets, expected);
+    }
+
+    #[test]
+    fn unchanged_poll_does_not_rewrite_savings_state() {
+        let mut tracker = make_tracker();
+        let stats = HeadroomDashboardStats {
+            session_requests: Some(2),
+            session_estimated_savings_usd: Some(0.5),
+            session_estimated_tokens_saved: Some(1_000),
+            session_total_tokens_sent: Some(4_000),
+            savings_history: vec![
+                history_point_at(2026, 3, 20, 8, 0),
+                history_point_at(2026, 3, 20, 9, 1_000),
+            ],
+            ..Default::default()
+        };
+        tracker.observe(&stats).expect("snapshot");
+        let path = tracker.state_path.clone().expect("state path");
+        std::fs::write(&path, b"sentinel").expect("overwrite state");
+
+        tracker.observe(&stats).expect("snapshot");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read state"),
+            "sentinel",
+            "an idle poll rewrote savings-state.json"
+        );
+
+        tracker
+            .observe(&HeadroomDashboardStats {
+                session_requests: Some(3),
+                ..stats.clone()
+            })
+            .expect("snapshot");
+        assert_ne!(
+            std::fs::read_to_string(&path).expect("read state"),
+            "sentinel"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn session_hours_past_retention_are_not_rebanked_on_every_poll() {
+        // One backend session spanning more than the hourly retention: the
+        // Jan 1 hour is pruned from the diff baseline, and later polls must
+        // not read it as new and add it to that day again.
+        let mut tracker = make_tracker();
+        let stats = HeadroomDashboardStats {
+            session_requests: Some(3),
+            session_estimated_savings_usd: Some(0.3),
+            session_estimated_tokens_saved: Some(3_000),
+            session_actual_cost_usd: Some(1.0),
+            session_total_tokens_sent: Some(9_000),
+            savings_history: vec![
+                history_point_at(2026, 1, 1, 10, 0),
+                history_point_at(2026, 1, 1, 12, 1_000),
+                history_point_at(2026, 2, 5, 12, 3_000),
+            ],
+            ..Default::default()
+        };
+        tracker.observe(&stats).expect("snapshot");
+        let banked = tracker.daily_savings.clone();
+        for _ in 0..3 {
+            tracker.observe(&stats).expect("snapshot");
+        }
+        assert_eq!(tracker.daily_savings, banked);
+    }
+
+    #[test]
+    fn switch_to_new_input_basis_is_not_read_as_a_backend_restart() {
+        // Until its first cache-active request the backend reports zero
+        // prefix-cache totals, so sent falls back to total forwarded tokens;
+        // then it drops to the much smaller new-input sum. Same process:
+        // nothing may be counted twice.
+        let body = |requests: u64, saved: u64, write: u64, uncached: u64, input: u64| {
+            format!(
+                r#"{{
+                    "requests": {{ "total": {requests} }},
+                    "tokens": {{ "saved": {saved}, "input": {input} }},
+                    "cost": {{ "compression_savings_usd": 0.5 }},
+                    "prefix_cache": {{ "totals": {{
+                        "cache_write_tokens": {write},
+                        "uncached_input_tokens": {uncached}
+                    }} }},
+                    "compression_savings_history": [
+                        ["2026-03-20T08:00:00Z", 0],
+                        ["2026-03-20T09:00:00Z", 1000],
+                        ["2026-03-20T10:00:00Z", {saved}]
+                    ]
+                }}"#
+            )
+        };
+        let forwarded = parse_headroom_stats_from_json(&body(10, 1_000, 0, 0, 3_000_000))
+            .expect("parsed stats");
+        assert_eq!(forwarded.session_total_tokens_sent, Some(3_000_000));
+        let new_input = parse_headroom_stats_from_json(&body(11, 1_200, 25_000, 5_000, 3_100_000))
+            .expect("parsed stats");
+        assert_eq!(new_input.session_total_tokens_sent, Some(30_000));
+
+        let mut tracker = make_tracker();
+        tracker.observe(&forwarded).expect("snapshot");
+        tracker.observe(&new_input).expect("snapshot");
+
+        assert_eq!(tracker.lifetime_requests, 11);
+        let saved: u64 = tracker
+            .hourly_savings
+            .values()
+            .map(|bucket| bucket.estimated_tokens_saved)
+            .sum();
+        assert_eq!(saved, 1_200);
+    }
+
+    #[test]
+    fn session_buckets_price_compression_dollars_per_compression_token() {
+        // tokens.saved is all-layers (80% tool-schema deferral here) while the
+        // history and cost.compression_savings_usd are compression-only. With
+        // the history covering the whole session, the buckets carry all of the
+        // compression dollars and all of the spend.
+        let mut tracker = make_tracker();
+        tracker
+            .observe(&HeadroomDashboardStats {
+                session_requests: Some(2),
+                session_estimated_savings_usd: Some(0.5),
+                session_estimated_tokens_saved: Some(5_000),
+                tool_schema_tokens_saved: Some(4_000),
+                session_actual_cost_usd: Some(2.0),
+                session_total_tokens_sent: Some(10_000),
+                savings_history: vec![
+                    history_point_at(2026, 3, 20, 8, 0),
+                    history_point_at(2026, 3, 20, 9, 400),
+                    history_point_at(2026, 3, 20, 10, 1_000),
+                ],
+                ..Default::default()
+            })
+            .expect("snapshot");
+
+        let tokens: u64 = tracker
+            .hourly_savings
+            .values()
+            .map(|bucket| bucket.estimated_tokens_saved)
+            .sum();
+        let usd: f64 = tracker
+            .hourly_savings
+            .values()
+            .map(|bucket| bucket.estimated_savings_usd)
+            .sum();
+        let cost: f64 = tracker
+            .hourly_savings
+            .values()
+            .map(|bucket| bucket.actual_cost_usd)
+            .sum();
+        assert_eq!(tokens, 1_000);
+        assert!((usd - 0.5).abs() < 1e-9, "bucket USD {usd}");
+        assert!((cost - 2.0).abs() < 1e-9, "bucket spend {cost}");
+    }
+
+    #[test]
     fn rolling_window_does_not_dump_unattributable_remainder_into_last_hour() {
         let mut tracker = make_tracker();
 
@@ -15181,6 +15489,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(5),
                 session_estimated_savings_usd: Some(10.0),
                 session_estimated_tokens_saved: Some(10_000),
@@ -15204,6 +15513,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(6),
                 session_estimated_savings_usd: Some(10.0),
                 session_estimated_tokens_saved: Some(10_000),
@@ -15237,6 +15547,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(10),
                 session_estimated_savings_usd: Some(1.0),
                 session_estimated_tokens_saved: Some(1_000),
@@ -15256,6 +15567,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(11),
                 session_estimated_savings_usd: Some(1.2),
                 session_estimated_tokens_saved: Some(1_200),
@@ -15293,6 +15605,7 @@ mod tests {
             session_estimated_tokens_saved: 1_000,
             session_actual_cost_usd: 2.0,
             session_total_tokens_sent: 4_000,
+            sent_is_forwarded: None,
         });
         tracker.session_requests = 10;
         tracker.session_estimated_savings_usd = 5.0;
@@ -15309,6 +15622,7 @@ mod tests {
                 learner_progress: None,
                 output_reduction: None,
                 tool_schema_tokens_saved: None,
+                session_sent_is_forwarded: false,
                 session_requests: Some(11),
                 session_estimated_savings_usd: Some(5.5),
                 session_estimated_tokens_saved: Some(1_100),
@@ -15435,6 +15749,7 @@ mod tests {
                 session_estimated_tokens_saved: 900,
                 session_actual_cost_usd: 0.0,
                 session_total_tokens_sent: 0,
+                sent_is_forwarded: None,
             }),
             display_session_baseline: None,
             session_savings_history: Vec::new(),
@@ -16054,6 +16369,7 @@ mod tests {
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
+            session_sent_is_forwarded: false,
             session_requests: Some(1),
             session_estimated_savings_usd: Some(1.0),
             session_estimated_tokens_saved: Some(1_000),
@@ -16077,6 +16393,7 @@ mod tests {
             learner_progress: None,
             output_reduction: None,
             tool_schema_tokens_saved: None,
+            session_sent_is_forwarded: false,
             session_requests: Some(3),
             session_estimated_savings_usd: Some(3.0),
             session_estimated_tokens_saved: Some(3_000),
