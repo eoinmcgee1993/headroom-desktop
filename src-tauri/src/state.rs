@@ -2514,10 +2514,7 @@ impl AppState {
         let start = recap_monday.checked_sub_days(chrono::Days::new(7))?;
         let end = recap_monday.pred_opt()?;
 
-        let totals = {
-            let tracker = self.savings_tracker.lock();
-            aggregate_weekly_totals(&tracker.daily_savings, start, end)
-        };
+        let totals = self.savings_tracker.lock().weekly_totals(start, end);
 
         let mut facts = self.activity_facts.lock();
         let event = facts.maybe_record_weekly_recap(recap_monday, totals, now);
@@ -2595,7 +2592,7 @@ impl AppState {
             ledger_read,
             crate::output_savings::LedgerEstimate::NoEvidence
         );
-        let ledger_estimate = ledger_read.scored();
+        let ledger_estimate = ledger_read.clone().scored();
         let output_reduction = ledger_estimate
             .as_ref()
             .map(|e| crate::models::OutputReduction {
@@ -2656,12 +2653,12 @@ impl AppState {
                 )
             };
 
+            let utc_today_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
             // Lock the backend's authoritative settled rollups into the local
             // archive so they survive its history trimming and fill gaps from
             // periods the app wasn't running.
             {
                 let today_key = local_day_key(Local::now());
-                let utc_today_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
                 let mut tracker = self.savings_tracker.lock();
                 // Before ingest: a native overwrite of the live bucket already
                 // contains this delta, so it must land first and be superseded.
@@ -2680,7 +2677,8 @@ impl AppState {
                 }
             }
 
-            daily_savings = merge_daily_savings(daily_savings, native_daily, &cutoff_date);
+            daily_savings =
+                merge_daily_savings(daily_savings, native_daily, &cutoff_date, &utc_today_key);
             hourly_savings = merge_hourly_savings(hourly_savings, native_hourly, &cutoff_hour);
         }
 
@@ -2688,6 +2686,9 @@ impl AppState {
         // Neither merge source carries it: backend rollups have no baseline
         // dimension and tracker buckets predate the sampler. Daily joins on
         // UTC date keys, hourly on local hour keys — matching each list.
+        // Output dollars are then repriced from those samples, so the chart,
+        // the tray and the per-day report stop carrying the backend's credit
+        // (see `ledger_priced_output`).
         //
         // Cache fields overlay from the archive too, and the archive wins:
         // the history points carry a fresh derivation from the backend's
@@ -2697,6 +2698,8 @@ impl AppState {
         // and the live UTC day's archive equals this poll's derivation;
         // live local-day hours are never ingested, keep None here, and so
         // fall through to the fresh derivation.
+        let ledger_unscored =
+            matches!(ledger_read, crate::output_savings::LedgerEstimate::Unscored);
         {
             let tracker = self.savings_tracker.lock();
             for point in daily_savings.iter_mut() {
@@ -2704,6 +2707,12 @@ impl AppState {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
+                (point.output_savings_usd, point.output_tokens_saved) = ledger_priced_output(
+                    point.output_savings_usd,
+                    point.output_tokens_saved,
+                    point.output_sampled_tokens_saved,
+                    ledger_unscored,
+                );
                 if let Some(bucket) = tracker.daily_savings.get(&point.date) {
                     (
                         point.cache_read_tokens,
@@ -2737,6 +2746,12 @@ impl AppState {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
+                (point.output_savings_usd, point.output_tokens_saved) = ledger_priced_output(
+                    point.output_savings_usd,
+                    point.output_tokens_saved,
+                    point.output_sampled_tokens_saved,
+                    ledger_unscored,
+                );
                 if let Some(bucket) = tracker.hourly_savings.get(&point.hour) {
                     (
                         point.cache_read_tokens,
@@ -2790,30 +2805,20 @@ impl AppState {
                 tracker.last_output_estimator_tokens_saved,
             )
         };
-        // Until the backend is reachable (cold start), price the output layer
-        // off the last persisted estimator reading instead of the bucket sum,
-        // so the headline doesn't dip by hundreds of dollars for the first
-        // minutes and then jump back up.
         // Same ledger recomputation as the tile above: the dollar row and the
         // percentage have to describe one estimate, or the drill-down stops
-        // explaining the headline.
+        // explaining the headline. The fallback stands in only when the
+        // ledger has no evidence (same gate as the tile: the backend's token
+        // total carries the global-mean credit); until the backend is
+        // reachable (cold start) it is the last persisted estimator reading,
+        // so the headline doesn't dip for the first minutes and jump back.
         let lifetime_output_savings_usd = lifetime_output_savings_usd(
             &daily_savings,
-            ledger_estimate
+            &ledger_read,
+            stats
                 .as_ref()
-                .map(|e| e.tokens_saved)
-                .or_else(|| {
-                    // Same gate as the tile above: the backend's token total
-                    // carries the global-mean credit, so it may only stand in
-                    // when the ledger itself has nothing to say.
-                    if !backend_output_fallback_allowed {
-                        return None;
-                    }
-                    stats
-                        .as_ref()
-                        .and_then(|s| s.output_reduction.as_ref())
-                        .map(|r| r.tokens_saved)
-                })
+                .and_then(|s| s.output_reduction.as_ref())
+                .map(|r| r.tokens_saved)
                 .or(cached_output_estimator_tokens),
         );
         let lifetime_tool_schema_savings_usd =
@@ -5043,6 +5048,11 @@ struct DailySavingsBucket {
     // None for buckets archived before it existed, which keep the old
     // discount-derived estimate.
     cache_read_cost_usd: Option<f64>,
+    // The key is a UTC date: ingest archived a backend daily rollup here.
+    // False for the tracker's own LOCAL-day buckets, for every hourly bucket
+    // (hourly keys are local on every path), and for rollups archived before
+    // the field existed.
+    utc_keyed: bool,
 }
 
 impl DailySavingsBucket {
@@ -5472,6 +5482,7 @@ impl SavingsTracker {
                 // Filled by the sampler overlay in build_dashboard.
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
+                utc_keyed: bucket.utc_keyed,
             })
             .collect()
     }
@@ -5489,6 +5500,14 @@ impl SavingsTracker {
             .collect();
         days.dedup(); // BTreeMap order: sorted, so dedup is enough
         days
+    }
+
+    /// Weekly recap totals for the local days `start..=end`. From the hourly
+    /// map for the reason `active_day_keys` gives: `daily_savings` holds the
+    /// backend's UTC-dated rollups, which shift a UTC-west Sunday evening into
+    /// the next week.
+    fn weekly_totals(&self, start: chrono::NaiveDate, end: chrono::NaiveDate) -> WeeklyTotals {
+        aggregate_weekly_totals(&self.hourly_savings, start, end)
     }
 
     fn hourly_savings(&self) -> Vec<HourlySavingsPoint> {
@@ -5610,6 +5629,7 @@ impl SavingsTracker {
                 cache_read_tokens,
                 cache_savings_usd,
                 cache_read_cost_usd,
+                utc_keyed: true,
             };
             if archived.as_ref() != Some(&bucket) {
                 self.daily_savings.insert(point.date.clone(), bucket);
@@ -5653,6 +5673,7 @@ impl SavingsTracker {
                 cache_read_tokens,
                 cache_savings_usd,
                 cache_read_cost_usd,
+                utc_keyed: false,
             };
             if archived.as_ref() != Some(&bucket) {
                 self.hourly_savings.insert(point.hour.clone(), bucket);
@@ -6461,28 +6482,28 @@ fn most_recent_monday(d: chrono::NaiveDate) -> chrono::NaiveDate {
         .unwrap_or(d)
 }
 
+/// Sums local-hour-keyed buckets over the local days `start..=end`.
 fn aggregate_weekly_totals(
-    daily_savings: &BTreeMap<String, DailySavingsBucket>,
+    hourly_savings: &BTreeMap<String, DailySavingsBucket>,
     start: chrono::NaiveDate,
     end: chrono::NaiveDate,
 ) -> WeeklyTotals {
-    let start_key = start.format("%Y-%m-%d").to_string();
-    let end_key = end.format("%Y-%m-%d").to_string();
+    let start_key = format!("{}T00:00", start.format("%Y-%m-%d"));
+    let end_key = format!("{}T23:59", end.format("%Y-%m-%d"));
     let mut total_tokens_saved: u64 = 0;
     let mut total_savings_usd: f64 = 0.0;
-    let mut active_days: u32 = 0;
-    for (day_key, bucket) in daily_savings.range(start_key..=end_key) {
+    let mut active_days = HashSet::new();
+    for (hour_key, bucket) in hourly_savings.range(start_key..=end_key) {
         if bucket.is_active() {
-            active_days += 1;
+            active_days.insert(day_key_from_hour_key(hour_key));
         }
         total_tokens_saved = total_tokens_saved.saturating_add(bucket.estimated_tokens_saved);
         total_savings_usd += bucket.estimated_savings_usd;
-        let _ = day_key;
     }
     WeeklyTotals {
         total_tokens_saved,
         total_savings_usd,
-        active_days,
+        active_days: active_days.len() as u32,
     }
 }
 
@@ -6814,46 +6835,82 @@ impl HeadroomSavingsHistoryResponse {
                 // Filled by the sampler overlay in build_dashboard.
                 output_sampled_tokens_saved: None,
                 output_baseline_tokens: None,
+                utc_keyed: true,
             })
             .collect()
     }
 
     fn hourly_savings(&self) -> Vec<HourlySavingsPoint> {
-        self.hourly
-            .iter()
-            .map(|point| HourlySavingsPoint {
-                hour: local_hour_key(point.timestamp.with_timezone(&Local)),
-                estimated_savings_usd: point.compression_savings_usd_delta,
-                estimated_tokens_saved: point.tokens_saved,
-                tool_schema_savings_usd: 0.0,
-                tool_schema_tokens_saved: 0,
-                actual_cost_usd: point.total_input_cost_usd_delta,
-                total_tokens_sent: point.total_input_tokens_delta,
-                // Backend history has no new-input dimension: this point's
-                // sent tokens are full-forwarded (cache-polluted). 0 = no coverage.
-                new_input_tokens: 0,
-                output_savings_usd: point.output_savings_usd_delta,
-                output_tokens_saved: point.output_tokens_saved_delta,
-                cache_read_tokens: point.cache_read_tokens_delta,
-                cache_savings_usd: point.cache_savings_usd_delta,
-                cache_read_cost_usd: point.cache_read_cost_usd_delta,
-                output_sampled_tokens_saved: None,
-                output_baseline_tokens: None,
-                by_provider: point
-                    .by_provider
-                    .iter()
-                    .map(|p| crate::models::ProviderSavingsPoint {
-                        provider: p.provider.clone(),
-                        estimated_savings_usd: p.compression_savings_usd_delta,
-                        estimated_tokens_saved: p.tokens_saved,
-                        actual_cost_usd: p.total_input_cost_usd_delta,
-                        total_tokens_sent: p.total_input_tokens_delta,
-                        cache_savings_usd: p.cache_savings_usd_delta,
-                        cache_read_cost_usd: p.cache_read_cost_usd_delta,
-                    })
-                    .collect(),
-            })
-            .collect()
+        self.hourly_savings_keyed(|at| local_hour_key(at.with_timezone(&Local)))
+    }
+
+    /// Relabelling UTC hours as local ones maps the two UTC hours of a DST
+    /// fall-back onto one key. Every consumer inserts by key, so a second
+    /// point overwrote the first; the repeated hour is summed instead.
+    fn hourly_savings_keyed(
+        &self,
+        hour_key: impl Fn(DateTime<Utc>) -> String,
+    ) -> Vec<HourlySavingsPoint> {
+        let points = self.hourly.iter().map(|point| HourlySavingsPoint {
+            hour: hour_key(point.timestamp),
+            estimated_savings_usd: point.compression_savings_usd_delta,
+            estimated_tokens_saved: point.tokens_saved,
+            tool_schema_savings_usd: 0.0,
+            tool_schema_tokens_saved: 0,
+            actual_cost_usd: point.total_input_cost_usd_delta,
+            total_tokens_sent: point.total_input_tokens_delta,
+            // Backend history has no new-input dimension: this point's
+            // sent tokens are full-forwarded (cache-polluted). 0 = no coverage.
+            new_input_tokens: 0,
+            output_savings_usd: point.output_savings_usd_delta,
+            output_tokens_saved: point.output_tokens_saved_delta,
+            cache_read_tokens: point.cache_read_tokens_delta,
+            cache_savings_usd: point.cache_savings_usd_delta,
+            cache_read_cost_usd: point.cache_read_cost_usd_delta,
+            output_sampled_tokens_saved: None,
+            output_baseline_tokens: None,
+            by_provider: point
+                .by_provider
+                .iter()
+                .map(|p| crate::models::ProviderSavingsPoint {
+                    provider: p.provider.clone(),
+                    estimated_savings_usd: p.compression_savings_usd_delta,
+                    estimated_tokens_saved: p.tokens_saved,
+                    actual_cost_usd: p.total_input_cost_usd_delta,
+                    total_tokens_sent: p.total_input_tokens_delta,
+                    cache_savings_usd: p.cache_savings_usd_delta,
+                    cache_read_cost_usd: p.cache_read_cost_usd_delta,
+                })
+                .collect(),
+        });
+        let mut by_hour: BTreeMap<String, HourlySavingsPoint> = BTreeMap::new();
+        for p in points {
+            let Some(sum) = by_hour.get_mut(&p.hour) else {
+                by_hour.insert(p.hour.clone(), p);
+                continue;
+            };
+            sum.estimated_savings_usd += p.estimated_savings_usd;
+            sum.estimated_tokens_saved += p.estimated_tokens_saved;
+            sum.actual_cost_usd += p.actual_cost_usd;
+            sum.total_tokens_sent += p.total_tokens_sent;
+            sum.output_savings_usd += p.output_savings_usd;
+            sum.output_tokens_saved += p.output_tokens_saved;
+            // Coverage must hold for both hours, or the sum claims a partial one.
+            sum.cache_read_tokens = sum
+                .cache_read_tokens
+                .zip(p.cache_read_tokens)
+                .map(|(a, b)| a + b);
+            sum.cache_savings_usd = sum
+                .cache_savings_usd
+                .zip(p.cache_savings_usd)
+                .map(|(a, b)| a + b);
+            sum.cache_read_cost_usd = sum
+                .cache_read_cost_usd
+                .zip(p.cache_read_cost_usd)
+                .map(|(a, b)| a + b);
+            sum.by_provider.extend(p.by_provider);
+        }
+        by_hour.into_values().collect()
     }
 }
 
@@ -9844,33 +9901,47 @@ fn tool_schema_savings_usd(daily_savings: &[DailySavingsPoint], tokens_saved: u6
 
 /// Lifetime dollars saved by output shaping.
 ///
-/// The daily buckets only carry this layer from the day the backend's rollups
-/// started reporting it, which is far later than the shaper itself started
-/// working: on 2026-08-06 the buckets held 2.66M output tokens across 4 days
-/// while the shaper's own durable estimator held 17.38M across 48,638 requests.
-/// Summing the buckets therefore understates the layer roughly six-fold.
+/// Priced from the shaper's own ledger, the same recomputation the output tile
+/// shows. The daily buckets are the backend's rollups, which credit strata the
+/// baseline never observed at a global mean: on 2026-09-29 one machine's
+/// buckets held 47.75M output tokens against 2.73M in its ledger. The buckets
+/// only lend their blended $/token, so a user on cheaper models is priced at
+/// their own models' rates.
 ///
-/// The estimator has no timestamps -- it is a set of stratified running sums --
-/// so its total can only be a lifetime figure, and it is priced with the
-/// blended $/token the tracked buckets already imply rather than a hardcoded
-/// rate, so a user on cheaper models is priced at their own models' rates.
+/// - Scored: the ledger total, floored by the sampled series (it survives a
+///   re-seeded ledger), never by the credited bucket sum. The ledger has no
+///   timestamps, so its total can only be a lifetime figure, and it reaches
+///   back before the rollups carried this layer at all.
+/// - Unscored: nothing. The buckets hold only the credit the tile refuses.
+/// - NoEvidence (no ledger, or a torn read): `fallback_tokens_saved` (the live
+///   `/stats` reading, or the tracker's last reading during cold start) when
+///   it exceeds the buckets, else the bucket sum.
 ///
-/// Falls back to the bucket sum whenever the estimator is absent, is smaller
-/// (a re-seeded baseline), or the buckets carry no rate to price with. The two
-/// sources measure the same layer, so this replaces the bucket sum, never adds
-/// to it. `estimator_tokens_saved` is the live `/stats` reading when the
-/// backend is up, or the tracker's persisted last reading during cold start.
+/// Falls back to the bucket sum whenever the buckets carry no rate to price
+/// with. The sources measure the same layer, so this replaces the bucket sum,
+/// never adds to it.
 fn lifetime_output_savings_usd(
     daily_savings: &[DailySavingsPoint],
-    estimator_tokens_saved: Option<u64>,
+    ledger: &crate::output_savings::LedgerEstimate,
+    fallback_tokens_saved: Option<u64>,
 ) -> f64 {
+    use crate::output_savings::LedgerEstimate;
     let bucket_usd: f64 = daily_savings.iter().map(|p| p.output_savings_usd).sum();
     let bucket_tokens: u64 = daily_savings.iter().map(|p| p.output_tokens_saved).sum();
-
-    let Some(tokens_saved) = estimator_tokens_saved else {
-        return bucket_usd;
+    let tokens_saved = match ledger {
+        LedgerEstimate::Unscored => return 0.0,
+        LedgerEstimate::Scored(e) => e.tokens_saved.max(
+            daily_savings
+                .iter()
+                .filter_map(|p| p.output_sampled_tokens_saved)
+                .sum(),
+        ),
+        LedgerEstimate::NoEvidence => match fallback_tokens_saved {
+            Some(tokens) if tokens > bucket_tokens => tokens,
+            _ => return bucket_usd,
+        },
     };
-    if bucket_tokens == 0 || bucket_usd <= 0.0 || tokens_saved <= bucket_tokens {
+    if bucket_tokens == 0 || bucket_usd <= 0.0 {
         return bucket_usd;
     }
 
@@ -9878,13 +9949,37 @@ fn lifetime_output_savings_usd(
     usd_per_token * tokens_saved as f64
 }
 
+/// A bucket's output figures, repriced from the ledger-backed sampled series
+/// for the chart, the tray and the per-day report. The rollup's own figure
+/// carries the backend's credit (see `lifetime_output_savings_usd`), but its
+/// $/token still prices the bucket's models. An unsampled bucket keeps the
+/// rollup figure, having nothing better; a ledger that scores nothing zeroes
+/// it, as the tile shows nothing.
+fn ledger_priced_output(
+    usd: f64,
+    tokens: u64,
+    sampled_tokens: Option<u64>,
+    ledger_unscored: bool,
+) -> (f64, u64) {
+    if ledger_unscored {
+        return (0.0, 0);
+    }
+    match sampled_tokens {
+        Some(sampled) if tokens > 0 => (usd / tokens as f64 * sampled as f64, sampled),
+        _ => (usd, tokens),
+    }
+}
+
 /// For days before `cutoff_date` (exclusive), the tracker is preferred.
 /// For days on/after `cutoff_date`, native history is preferred.
-/// Falls back to whichever source has data when the preferred one is absent.
+/// Falls back to whichever source has data when the preferred one is absent,
+/// except a tracker day after `utc_today_key` (the UTC date): east of UTC
+/// that local day's hours are already inside history's live UTC bucket.
 fn merge_daily_savings(
     tracker: Vec<DailySavingsPoint>,
     history: Vec<DailySavingsPoint>,
     cutoff_date: &str,
+    utc_today_key: &str,
 ) -> Vec<DailySavingsPoint> {
     use std::collections::BTreeMap;
     // Index the local tracker by date so a desynced history point can fall back
@@ -9918,6 +10013,7 @@ fn merge_daily_savings(
             by_date.insert(p.date.clone(), p);
         }
     }
+    let history_has_live_day = by_date.contains_key(utc_today_key);
     for p in tracker {
         if p.date.as_str() < cutoff_date {
             by_date.insert(p.date.clone(), p);
@@ -9930,6 +10026,10 @@ fn merge_daily_savings(
                     let merged = entry.get_mut();
                     merged.new_input_tokens = merged.new_input_tokens.max(p.new_input_tokens);
                 }
+                // A local day ahead of UTC (a UTC+ morning before UTC
+                // midnight): the live UTC bucket already counts its hours.
+                std::collections::btree_map::Entry::Vacant(_)
+                    if history_has_live_day && p.date.as_str() > utc_today_key => {}
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(p);
                 }
@@ -10234,7 +10334,7 @@ mod tests {
         );
     }
 
-    use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
+    use chrono::{DateTime, Datelike, Local, TimeZone, Timelike, Utc};
 
     use crate::storage::{config_file, ensure_data_dirs, telemetry_file};
 
@@ -10248,7 +10348,7 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
-        hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
+        hf_cache_grew, intercept_bind_hint, ledger_priced_output, lifetime_output_savings_usd,
         lifetime_token_milestones_crossed, log_mtime_advanced, lone_stats_stall,
         merge_daily_savings, merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
@@ -10259,11 +10359,12 @@ mod tests {
         tool_schema_savings_usd, top_models_by_requests, total_dir_size_bytes,
         warn_stats_fetch_failed, AppState, BackfillSettle, BootValidationOutcome,
         ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
-        HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
-        RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_LAST_OK,
-        STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT,
-        STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
+        HeadroomSavingsHistoryPoint, HeadroomSavingsHistoryResponse, HeadroomSavingsRollupPoint,
+        Instant, OutputSampleBucket, PersistedSavingsState, ProviderRollupDelta, RingStartTotals,
+        SavingsObservation, SavingsRecord, SavingsTracker, OUTPUT_SAMPLE_SERIES_VERSION,
+        STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_LAST_OK, STATS_FETCH_RECOVERED_AT,
+        STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
+        STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -10417,7 +10518,8 @@ mod tests {
             Some(&ring_start),
             |p| p.hour.as_str(),
         );
-        let merged_daily = merge_daily_savings(tracker_daily, settled_daily, "2026-06-02");
+        let merged_daily =
+            merge_daily_savings(tracker_daily, settled_daily, "2026-06-02", "2026-08-27");
         let merged_hourly =
             merge_hourly_savings(tracker_hourly, settled_hourly, "2026-06-02T00:00");
 
@@ -10440,6 +10542,7 @@ mod tests {
 
     #[test]
     fn lifetime_output_savings_prices_the_estimators_full_history() {
+        // No ledger evidence (missing or torn): the fallback estimator.
         // Buckets: 2 days, 100k tokens for $2.50 -> $25/M blended.
         let mut buckets = vec![daily("2026-08-04", 0, 0.0), daily("2026-08-05", 0, 0.0)];
         buckets[0].output_tokens_saved = 40_000;
@@ -10449,20 +10552,70 @@ mod tests {
 
         // The estimator covers history the rollups never carried: price all of
         // it at the buckets' own rate.
-        let usd = lifetime_output_savings_usd(&buckets, Some(1_000_000));
+        let none = crate::output_savings::LedgerEstimate::NoEvidence;
+        let usd = lifetime_output_savings_usd(&buckets, &none, Some(1_000_000));
         assert!((usd - 25.0).abs() < 1e-9, "{usd}");
 
         // Re-seeded / lagging estimator: never go below what we can see.
-        let usd = lifetime_output_savings_usd(&buckets, Some(10_000));
+        let usd = lifetime_output_savings_usd(&buckets, &none, Some(10_000));
         assert!((usd - 2.5).abs() < 1e-9, "{usd}");
 
         // No estimate at all (old backend, unseeded baseline).
-        let usd = lifetime_output_savings_usd(&buckets, None);
+        let usd = lifetime_output_savings_usd(&buckets, &none, None);
         assert!((usd - 2.5).abs() < 1e-9, "{usd}");
 
         // No priced buckets yet: nothing to extrapolate a rate from.
         let empty = vec![daily("2026-08-04", 0, 0.0)];
-        assert_eq!(lifetime_output_savings_usd(&empty, Some(1_000_000)), 0.0);
+        assert_eq!(
+            lifetime_output_savings_usd(&empty, &none, Some(1_000_000)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn lifetime_output_savings_follow_the_ledger_not_the_credited_buckets() {
+        use crate::output_savings::{LedgerEstimate, OutputEstimate};
+        let scored = |tokens_saved| {
+            LedgerEstimate::Scored(OutputEstimate {
+                method: "estimated",
+                reduction_percent: 10.0,
+                ci_low_percent: 5.0,
+                ci_high_percent: 15.0,
+                requests: 100,
+                coverage_percent: 90.0,
+                tokens_saved,
+                baseline_tokens: tokens_saved * 10,
+            })
+        };
+        // The rollups carry the backend's credited figure: 100k tokens, $2.50.
+        let mut buckets = vec![daily("2026-09-04", 0, 0.0), daily("2026-09-05", 0, 0.0)];
+        buckets[0].output_tokens_saved = 40_000;
+        buckets[0].output_savings_usd = 1.0;
+        buckets[1].output_tokens_saved = 60_000;
+        buckets[1].output_savings_usd = 1.5;
+
+        // The recompute scores 20k: price that at the buckets' rate ($25/M),
+        // never floor it at the credited bucket sum.
+        let usd = lifetime_output_savings_usd(&buckets, &scored(20_000), None);
+        assert!((usd - 0.5).abs() < 1e-9, "{usd}");
+        // A re-seeded ledger: the sampled series survives it and floors it.
+        buckets[1].output_sampled_tokens_saved = Some(40_000);
+        let usd = lifetime_output_savings_usd(&buckets, &scored(20_000), None);
+        assert!((usd - 1.0).abs() < 1e-9, "{usd}");
+        // A readable ledger that scores nothing: the buckets are all credit.
+        let usd = lifetime_output_savings_usd(&buckets, &LedgerEstimate::Unscored, Some(500_000));
+        assert_eq!(usd, 0.0);
+
+        // Chart, tray and per-day report: a sampled bucket is repriced from
+        // its sample at the bucket's own rate; an unsampled one is left alone.
+        let (usd, tokens) = ledger_priced_output(1.5, 60_000, Some(6_000), false);
+        assert!((usd - 0.15).abs() < 1e-9, "{usd}");
+        assert_eq!(tokens, 6_000);
+        assert_eq!(
+            ledger_priced_output(1.5, 60_000, None, false),
+            (1.5, 60_000)
+        );
+        assert_eq!(ledger_priced_output(1.5, 60_000, None, true), (0.0, 0));
     }
 
     #[test]
@@ -12091,11 +12244,47 @@ mod tests {
     }
 
     #[test]
+    fn weekly_totals_sum_local_hours_not_utc_dated_rollups() {
+        let mut tracker = make_tracker();
+        let saved = |tokens, usd| DailySavingsBucket {
+            estimated_tokens_saved: tokens,
+            estimated_savings_usd: usd,
+            ..Default::default()
+        };
+        // Recap week: local Mon 2026-09-21 .. Sun 2026-09-27.
+        let hours = [
+            ("2026-09-20T23:00", 1, 0.01), // the Sunday before
+            ("2026-09-22T10:00", 10, 0.10),
+            ("2026-09-22T11:00", 20, 0.20),
+            ("2026-09-27T23:00", 5, 0.05), // Sunday evening
+            ("2026-09-28T00:00", 7, 0.07), // next Monday
+        ];
+        for (hour, tokens, usd) in hours {
+            tracker
+                .hourly_savings
+                .insert(hour.into(), saved(tokens, usd));
+        }
+        // UTC-dated rollups: at UTC-7 that Sunday evening sits in UTC Monday.
+        tracker
+            .daily_savings
+            .insert("2026-09-22".into(), saved(999, 9.99));
+        tracker
+            .daily_savings
+            .insert("2026-09-28".into(), saved(5, 0.05));
+
+        let day = |d| chrono::NaiveDate::from_ymd_opt(2026, 9, d).unwrap();
+        let totals = tracker.weekly_totals(day(21), day(27));
+        assert_eq!(totals.total_tokens_saved, 35);
+        assert!((totals.total_savings_usd - 0.35).abs() < 1e-9);
+        assert_eq!(totals.active_days, 2);
+    }
+
+    #[test]
     fn aggregate_weekly_totals_sums_active_days_in_window() {
         use std::collections::BTreeMap;
-        let mut daily: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
-        daily.insert(
-            "2026-04-19".into(), // outside window (Sunday of week before)
+        let mut hourly: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
+        hourly.insert(
+            "2026-04-19T12:00".into(), // outside window (Sunday of week before)
             DailySavingsBucket {
                 estimated_savings_usd: 1.0,
                 estimated_tokens_saved: 50,
@@ -12106,8 +12295,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        daily.insert(
-            "2026-04-20".into(),
+        hourly.insert(
+            "2026-04-20T12:00".into(),
             DailySavingsBucket {
                 estimated_savings_usd: 2.5,
                 estimated_tokens_saved: 200,
@@ -12118,8 +12307,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        daily.insert(
-            "2026-04-23".into(),
+        hourly.insert(
+            "2026-04-23T12:00".into(),
             DailySavingsBucket {
                 estimated_savings_usd: 1.0,
                 estimated_tokens_saved: 100,
@@ -12130,8 +12319,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        daily.insert(
-            "2026-04-26".into(),
+        hourly.insert(
+            "2026-04-26T12:00".into(),
             DailySavingsBucket {
                 estimated_savings_usd: 0.0,
                 estimated_tokens_saved: 0, // zero activity day — not counted
@@ -12142,8 +12331,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        daily.insert(
-            "2026-04-27".into(), // outside window (today Monday)
+        hourly.insert(
+            "2026-04-27T12:00".into(), // outside window (today Monday)
             DailySavingsBucket {
                 estimated_savings_usd: 99.0,
                 estimated_tokens_saved: 9999,
@@ -12156,7 +12345,7 @@ mod tests {
         );
         let start = chrono::NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
         let end = chrono::NaiveDate::from_ymd_opt(2026, 4, 26).unwrap();
-        let totals = aggregate_weekly_totals(&daily, start, end);
+        let totals = aggregate_weekly_totals(&hourly, start, end);
         assert_eq!(totals.active_days, 2);
         assert_eq!(totals.total_tokens_saved, 300);
         assert!((totals.total_savings_usd - 3.5).abs() < 1e-9);
@@ -15917,6 +16106,7 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            utc_keyed: false,
         }
     }
 
@@ -16025,7 +16215,7 @@ mod tests {
         // still has the full-day value, so the merge no longer falls back to
         // the tracker's own partial observation.
         assert!(!tracker.ingest_native_rollups(&[], &[], cutoff, "2026-06-17", "2026-06-17"));
-        let merged = merge_daily_savings(tracker.daily_savings(), vec![], cutoff);
+        let merged = merge_daily_savings(tracker.daily_savings(), vec![], cutoff, "2026-06-17");
         let day = merged
             .iter()
             .find(|p| p.date == "2026-06-16")
@@ -16219,7 +16409,7 @@ mod tests {
     fn merge_daily_tracker_preferred_before_cutoff() {
         let tracker = vec![daily("2026-04-13", 500, 1.0)];
         let history = vec![daily("2026-04-13", 999, 2.0)];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         // tracker wins pre-cutoff
         assert_eq!(result[0].estimated_tokens_saved, 500);
@@ -16229,7 +16419,7 @@ mod tests {
     fn merge_daily_history_preferred_on_and_after_cutoff() {
         let tracker = vec![daily("2026-04-20", 100, 0.5)];
         let history = vec![daily("2026-04-20", 800, 2.0)];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         // history wins on cutoff date
         assert_eq!(result[0].estimated_tokens_saved, 800);
@@ -16245,7 +16435,7 @@ mod tests {
             ..daily("2026-04-20", 100, 0.5)
         }];
         let history = vec![daily("2026-04-20", 800, 2.0)];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].estimated_tokens_saved, 800);
         assert_eq!(result[0].new_input_tokens, 4_000);
@@ -16271,8 +16461,9 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            utc_keyed: false,
         }];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         // Tracker point (with real spend) wins over the desynced history point.
         assert_eq!(result[0].total_tokens_sent, 123_456);
@@ -16284,7 +16475,7 @@ mod tests {
         // No real spend anywhere -> nothing to fall back to; history is kept as-is.
         let history = vec![daily("2026-04-21", 800, 2.0)];
         let tracker = vec![daily("2026-04-21", 100, 0.5)];
-        let result = merge_daily_savings(tracker, history, "2026-04-20");
+        let result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].estimated_tokens_saved, 800);
         assert_eq!(result[0].total_tokens_sent, 0);
@@ -16293,7 +16484,7 @@ mod tests {
     #[test]
     fn merge_daily_fallback_when_only_tracker_has_post_cutoff_day() {
         let tracker = vec![daily("2026-04-21", 300, 1.2)];
-        let result = merge_daily_savings(tracker, vec![], "2026-04-20");
+        let result = merge_daily_savings(tracker, vec![], "2026-04-20", "2026-04-30");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].estimated_tokens_saved, 300);
     }
@@ -16303,7 +16494,7 @@ mod tests {
         // Pre-cutoff is tracker-only: empty tracker + pre-cutoff history => no entry.
         // This protects against pre-v6 schema drift leaking into the graph.
         let history = vec![daily("2026-04-10", 400, 1.5)];
-        let result = merge_daily_savings(vec![], history, "2026-04-20");
+        let result = merge_daily_savings(vec![], history, "2026-04-20", "2026-04-30");
         assert!(result.is_empty());
     }
 
@@ -16311,11 +16502,111 @@ mod tests {
     fn merge_daily_combines_days_from_both_sources() {
         let tracker = vec![daily("2026-04-10", 200, 0.8), daily("2026-04-13", 300, 1.0)];
         let history = vec![daily("2026-04-20", 500, 2.0), daily("2026-04-21", 600, 2.5)];
-        let mut result = merge_daily_savings(tracker, history, "2026-04-20");
+        let mut result = merge_daily_savings(tracker, history, "2026-04-20", "2026-04-30");
         result.sort_by(|a, b| a.date.cmp(&b.date));
         assert_eq!(result.len(), 4);
         assert_eq!(result[0].date, "2026-04-10");
         assert_eq!(result[3].date, "2026-04-21");
+    }
+
+    #[test]
+    fn merge_daily_skips_a_local_day_ahead_of_the_live_utc_bucket() {
+        // UTC+10 at local 09:00 on the 30th is 23:00Z on the 29th: the
+        // tracker's local "30th" holds hours that history's live UTC "29th"
+        // already counts. Gap-filling it counted the morning twice.
+        let tracker = vec![daily("2026-09-29", 100, 0.5), daily("2026-09-30", 300, 1.5)];
+        let history = vec![daily("2026-09-29", 1_000, 5.0)];
+        let merged = merge_daily_savings(tracker.clone(), history, "2026-06-02", "2026-09-29");
+        let lifetime: u64 = merged.iter().map(|p| p.estimated_tokens_saved).sum();
+        assert_eq!(lifetime, 1_000);
+
+        // No live UTC bucket yet: nothing else holds those hours, keep them.
+        let stale_history = vec![daily("2026-09-28", 50, 0.2)];
+        let merged = merge_daily_savings(tracker, stale_history, "2026-06-02", "2026-09-29");
+        assert!(merged.iter().any(|p| p.date == "2026-09-30"));
+    }
+
+    #[test]
+    fn rollup_days_report_a_utc_day_end_even_with_local_new_input() {
+        // The rollup won the bucket and the tracker added its local new-input
+        // sample; that used to stamp a LOCAL midnight on a UTC day, which the
+        // server's trial usage-day count compares against the trial start.
+        let history = HeadroomSavingsHistoryResponse {
+            daily: vec![HeadroomSavingsRollupPoint {
+                timestamp: "2026-09-08T00:00:00Z".parse().unwrap(),
+                tokens_saved: 800,
+                compression_savings_usd_delta: 2.0,
+                total_input_tokens_delta: 10_000,
+                total_input_cost_usd_delta: 1.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tracker = vec![DailySavingsPoint {
+            new_input_tokens: 4_000,
+            ..daily("2026-09-08", 100, 0.5)
+        }];
+        let merged =
+            merge_daily_savings(tracker, history.daily_savings(), "2026-06-02", "2026-09-08");
+        let ends: Vec<_> = crate::recent_savings_days(&merged)
+            .into_iter()
+            .map(|day| day.day_ends_at.map(|at| at.to_rfc3339()))
+            .collect();
+        assert_eq!(ends, [Some("2026-09-09T00:00:00+00:00".to_string())]);
+
+        // Archived rollups keep the UTC keying once history trims them.
+        let mut archive = make_tracker();
+        assert!(archive.ingest_native_rollups(
+            &history.daily_savings(),
+            &[],
+            "2026-06-02",
+            "2026-09-09",
+            "2026-09-09",
+        ));
+        assert!(archive.daily_savings()[0].utc_keyed);
+    }
+
+    #[test]
+    fn native_hourly_sums_the_repeated_dst_fall_back_hour() {
+        // US Eastern, 2026-11-01: 05:00Z is 01:00 EDT and 06:00Z is 01:00 EST.
+        let fall_back: DateTime<Utc> = "2026-11-01T06:00:00Z".parse().unwrap();
+        let eastern = |at: DateTime<Utc>| {
+            let hours_west = if at < fall_back { 4 } else { 5 };
+            let offset = chrono::FixedOffset::west_opt(hours_west * 3600).unwrap();
+            at.with_timezone(&offset)
+                .format("%Y-%m-%dT%H:00")
+                .to_string()
+        };
+        let point = |at: &str, tokens: u64, provider: &str| HeadroomSavingsRollupPoint {
+            timestamp: at.parse().unwrap(),
+            tokens_saved: tokens,
+            compression_savings_usd_delta: tokens as f64 / 100.0,
+            output_tokens_saved_delta: tokens,
+            cache_read_tokens_delta: Some(tokens),
+            by_provider: vec![ProviderRollupDelta {
+                provider: provider.into(),
+                tokens_saved: tokens,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let history = HeadroomSavingsHistoryResponse {
+            hourly: vec![
+                point("2026-11-01T04:00:00Z", 1, "anthropic"),
+                point("2026-11-01T05:00:00Z", 10, "anthropic"),
+                point("2026-11-01T06:00:00Z", 20, "openai"),
+            ],
+            ..Default::default()
+        };
+        let hours = history.hourly_savings_keyed(eastern);
+        let keys: Vec<&str> = hours.iter().map(|p| p.hour.as_str()).collect();
+        assert_eq!(keys, ["2026-11-01T00:00", "2026-11-01T01:00"]);
+        let repeated = &hours[1];
+        assert_eq!(repeated.estimated_tokens_saved, 30);
+        assert!((repeated.estimated_savings_usd - 0.30).abs() < 1e-9);
+        assert_eq!(repeated.output_tokens_saved, 30);
+        assert_eq!(repeated.cache_read_tokens, Some(30));
+        assert_eq!(repeated.by_provider.len(), 2);
     }
 
     // merge_hourly_savings

@@ -877,6 +877,7 @@ fn maybe_inject_fake_daily_savings(dashboard: &mut DashboardState) {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            utc_keyed: false,
         })
         .collect();
     // Keep the headline card in sync with the buckets it derives from.
@@ -7227,12 +7228,18 @@ fn recent_savings_days(points: &[DailySavingsPoint]) -> Vec<pricing::SavingsDay>
         .map(|point| {
             let day_counters = counters.get(&point.date);
             pricing::SavingsDay {
-                // Only local-tracker buckets have a local boundary. Backend
-                // rollups are UTC-keyed and carry no new-input dimension; stamping
-                // a local end on them would relabel a UTC day as a local one.
-                day_ends_at: (point.new_input_tokens > 0)
-                    .then(|| savings_day_end(&point.date, &chrono::Local))
-                    .flatten(),
+                // Backend rollups are UTC-keyed: they end at UTC midnight, sent
+                // explicitly because the server keeps a stored end on nil, so
+                // only a value repairs a local end stamped by older builds.
+                // Local-tracker buckets (new-input evidence) end at local
+                // midnight; anything else stays unstated.
+                day_ends_at: if point.utc_keyed {
+                    savings_day_end(&point.date, &Utc)
+                } else {
+                    (point.new_input_tokens > 0)
+                        .then(|| savings_day_end(&point.date, &chrono::Local))
+                        .flatten()
+                },
                 date: point.date.clone(),
                 savings_usd: point.estimated_savings_usd,
                 output_savings_usd: point.output_savings_usd,
@@ -10425,6 +10432,7 @@ mod tests {
             cache_read_cost_usd: None,
             output_sampled_tokens_saved: None,
             output_baseline_tokens: None,
+            utc_keyed: false,
         }
     }
 
