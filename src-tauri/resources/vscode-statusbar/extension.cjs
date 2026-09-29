@@ -74,6 +74,14 @@ function fmt(n) {
   return `${tenths % 10 === 0 ? tenths / 10 : (tenths / 10).toFixed(1)}${unit}`;
 }
 
+/** False once Headroom deleted its terminal statusline script, which it does
+ *  whenever Claude Code stops routing through it (pause, quit, connector off):
+ *  the total would belong to conversations Headroom no longer sees. A
+ *  headroom.json from before scriptPath has none and keeps showing. */
+function routed(scriptPath, exists) {
+  return !scriptPath || exists(scriptPath);
+}
+
 /** What the item shows at `now`, or null to hide it. A fresh saving outranks
  *  "compressing", as in the terminal line. */
 function view(session, now) {
@@ -93,8 +101,11 @@ function view(session, now) {
 function activate(context) {
   const vscode = require("vscode");
   let statePath;
+  let scriptPath;
   try {
-    statePath = JSON.parse(fs.readFileSync(path.join(__dirname, "headroom.json"), "utf8")).statePath;
+    ({ statePath, scriptPath } = JSON.parse(
+      fs.readFileSync(path.join(__dirname, "headroom.json"), "utf8")
+    ));
   } catch {
     return;
   }
@@ -144,7 +155,7 @@ function activate(context) {
       mtime = -1;
       session = null;
     }
-    const shown = view(session, Date.now());
+    const shown = routed(scriptPath, fs.existsSync) ? view(session, Date.now()) : null;
     if (!shown) {
       item.hide();
       return;
@@ -169,4 +180,4 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate, fmt, pickSession, projectDirs, projectSlug, view };
+module.exports = { activate, deactivate, fmt, pickSession, projectDirs, projectSlug, routed, view };

@@ -12,22 +12,34 @@
 //! forwarder, spawn args, and health probes all read it through [`get`].
 //!
 //! Default value is [`DEFAULT_BACKEND_PORT`] so anything that reads the atomic
-//! before selection runs gets today's behavior.
+//! before selection runs gets today's behavior, except the intercept, which
+//! forwards nothing to the port until [`selected`].
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
 pub const DEFAULT_BACKEND_PORT: u16 = 6768;
 pub const FALLBACK_RANGE_START: u16 = 6769;
 pub const FALLBACK_RANGE_END: u16 = 6790;
 
 static BACKEND_PORT: AtomicU16 = AtomicU16::new(DEFAULT_BACKEND_PORT);
+static SELECTED: AtomicBool = AtomicBool::new(false);
 
 pub fn get() -> u16 {
     BACKEND_PORT.load(Ordering::Acquire)
 }
 
+/// Whether this process has vetted the port: [`set`] has run (spawn pre-flight
+/// or adopting our own healthy backend). Until then whatever listens on
+/// [`DEFAULT_BACKEND_PORT`] is not known to be ours (Orca, a dev server), so
+/// the intercept must not forward to it. Load this before [`get`]: [`set`]
+/// stores the port first, so a true here guarantees the vetted port.
+pub fn selected() -> bool {
+    SELECTED.load(Ordering::Acquire)
+}
+
 pub fn set(port: u16) {
     BACKEND_PORT.store(port, Ordering::Release);
+    SELECTED.store(true, Ordering::Release);
 }
 
 /// Test-only: reset the atomic to [`DEFAULT_BACKEND_PORT`] so test cases that
@@ -35,6 +47,15 @@ pub fn set(port: u16) {
 #[cfg(test)]
 pub fn reset_for_tests() {
     BACKEND_PORT.store(DEFAULT_BACKEND_PORT, Ordering::Release);
+    SELECTED.store(false, Ordering::Release);
+}
+
+/// Test-only: point the port at `port` without selecting it, the state before
+/// spawn pre-flight runs.
+#[cfg(test)]
+pub fn point_unselected_for_tests(port: u16) {
+    BACKEND_PORT.store(port, Ordering::Release);
+    SELECTED.store(false, Ordering::Release);
 }
 
 /// Successful selection of a port from the fallback range when the default

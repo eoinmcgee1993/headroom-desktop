@@ -71,6 +71,7 @@ const ALLOWED_EVENTS: &[&str] = &[
 ];
 const SESSION_TIMEOUT_SECS: i64 = 4 * 60 * 60;
 const HTTP_REQUEST_TIMEOUT_SECS: u64 = 10;
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 #[cfg(debug_assertions)]
 const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 2;
 #[cfg(not(debug_assertions))]
@@ -205,6 +206,18 @@ impl AnalyticsClient {
         };
 
         let _ = handle.sender.send(WorkerMessage::Shutdown);
+        // Quit calls this on the main thread, so never join unbounded: a
+        // request already in flight (or a periodic flush that was running when
+        // Shutdown arrived) ignores the worker's own deadline for up to the
+        // 10s HTTP timeout per chunk. Past the deadline the worker is left
+        // detached; process exit reclaims it.
+        let deadline = std::time::Instant::now() + SHUTDOWN_DEADLINE;
+        while !handle.worker.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         let _ = handle.worker.join();
     }
 
@@ -328,7 +341,7 @@ fn dispatcher_loop(receiver: Receiver<WorkerMessage>, config: AnalyticsConfig) {
                 // flush so quitting offline can't hang the app for
                 // chunks × HTTP timeout (10s each). Unsent events are dropped
                 // — it's telemetry, and the process is exiting.
-                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let deadline = std::time::Instant::now() + SHUTDOWN_DEADLINE;
                 flush_queue(&http_client, &config, &mut queue, Some(deadline));
                 return;
             }
@@ -517,7 +530,12 @@ fn new_session_id() -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{new_session_id, sanitize_properties, AnalyticsConfig, ALLOWED_EVENTS};
+    use super::{
+        new_session_id, sanitize_properties, spawn_dispatcher, system_properties, AnalyticsClient,
+        AnalyticsConfig, TrackingSession, ALLOWED_EVENTS,
+    };
+    use parking_lot::Mutex;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn sanitize_properties_keeps_supported_values() {
@@ -580,6 +598,44 @@ mod tests {
             "use try_state via client(): state() panics before manage()"
         );
         assert_eq!(source.matches(&guarded).count(), 1);
+    }
+
+    // Quit runs shutdown() on the main thread. A black-holed ingest endpoint
+    // (default-deny egress firewall) must not freeze it for the 10s request
+    // timeout, nor for a periodic flush that was already in flight.
+    #[test]
+    fn shutdown_returns_promptly_when_ingest_endpoint_never_answers() {
+        // Bound but never accepted: the kernel completes the handshake into
+        // the backlog and the request then waits for a reply that never comes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let config = AnalyticsConfig {
+            app_key: "A-DEV-123".into(),
+            ingest_api_url: format!("http://{}/api/v0/events", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+            flush_interval: Duration::from_millis(50),
+        };
+        let client = AnalyticsClient {
+            enabled: true,
+            session: Mutex::new(TrackingSession::new()),
+            dispatcher: Mutex::new(Some(spawn_dispatcher(&config))),
+            system_props: system_properties(),
+            app_version: "0.0.0".into(),
+            headroom_ai_version: Mutex::new(None),
+        };
+        client
+            .track_event("app_started", None)
+            .expect("queue event");
+        // Let the periodic flush start and block on the silent endpoint.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let started = Instant::now();
+        client.shutdown();
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(4),
+            "shutdown blocked for {waited:?}"
+        );
     }
 
     #[test]

@@ -375,7 +375,16 @@ mod platform {
             }
             Err(err) => {
                 warn_fallback(&err.to_string());
-                file_store::write_secret(service, account, secret)
+                file_store::write_secret(service, account, secret)?;
+                // read_secret asks the store first, so an older secret left
+                // there (one that fit before this one hit Windows' TooLong
+                // limit, say) would shadow the new file forever. File first:
+                // a failed file write keeps the old secret instead of losing
+                // both.
+                if let Ok(entry) = Entry::new(service, account) {
+                    let _ = entry.delete_credential();
+                }
+                Ok(())
             }
         }
     }

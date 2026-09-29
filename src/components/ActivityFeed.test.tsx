@@ -106,7 +106,7 @@ describe("ActivityFeed", () => {
     const emptyClassCount = (markup.match(/activity-feed__item--empty/g) ?? []).length;
     expect(emptyClassCount).toBe(6);
     expect(markup).toContain("activity-feed__item--rtk");
-    expect(markup).toContain("No RTK commands observed yet today.");
+    expect(markup).toContain("No RTK commands observed yet today (UTC).");
     expect(markup).not.toContain("activity-feed__item--serena");
   });
 
@@ -419,7 +419,8 @@ describe("ActivityFeed", () => {
     const feed = feedWith({ rtkToday: data });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
     expect(markup).toContain(">RTK<");
-    expect(markup).toContain("1,234 tokens saved today");
+    // rtk buckets by UTC date; the tile must not call it the local day.
+    expect(markup).toContain("1,234 tokens saved today (UTC)");
     expect(markup).toContain("3 commands");
   });
 

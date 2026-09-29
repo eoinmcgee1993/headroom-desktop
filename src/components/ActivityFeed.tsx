@@ -57,7 +57,7 @@ const EMPTY_TILE_COPY: Record<
   rtkToday: {
     badgeClass: "activity-feed__badge--rtk",
     badgeLabel: "RTK",
-    copy: "No RTK commands observed yet today.",
+    copy: "No RTK commands observed yet today (UTC).",
     itemModifier: "activity-feed__item--rtk"
   },
   serenaToday: {
@@ -618,7 +618,7 @@ function RtkTodayRow({ event }: { event: RtkTodayStats }) {
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
-          {event.savedTokens.toLocaleString()} tokens saved today
+          {event.savedTokens.toLocaleString()} tokens saved today (UTC)
         </strong>
         <span className="activity-feed__delta">
           {event.commands.toLocaleString()} command{event.commands === 1 ? "" : "s"}

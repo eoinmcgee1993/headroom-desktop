@@ -1711,6 +1711,7 @@ impl AppState {
         // previous 1.5s timeout false-fired during those bursts.
         let client = match reqwest::blocking::Client::builder()
             .no_proxy()
+            .tls_built_in_root_certs(false)
             .timeout(Duration::from_secs(5))
             .build()
         {
@@ -1731,7 +1732,8 @@ impl AppState {
         // avoids re-acquiring the lock every 500ms.
         let tracked_pid: Option<u32> = self.headroom_process.lock().as_ref().map(|c| c.id());
 
-        let start = Instant::now();
+        let mut start = Instant::now();
+        let mut last_tick = start;
         let mut last_log_activity = start;
         let mut last_seen_mtime = newest_proxy_log_mtime(&logs_dir);
         let mut last_hf_size = hf_cache
@@ -1762,6 +1764,15 @@ impl AppState {
                     "wait_for_boot_validation: tracked proxy child exited with status {exit_status}"
                 );
                 return BootValidationOutcome::ProcessExited;
+            }
+
+            // Windows counts a sleep in `Instant`: without this the first tick
+            // after wake read the sleep as silence and rolled back a good
+            // upgrade. Checked after the probe so a sleep inside it counts.
+            if let Some(gap) = crate::proc::suspend_gap(&mut last_tick) {
+                start = crate::proc::past_suspend(start, gap);
+                last_log_activity = crate::proc::past_suspend(last_log_activity, gap);
+                last_hf_growth_at = last_hf_growth_at.map(|at| crate::proc::past_suspend(at, gap));
             }
 
             // A download is "active" if the HF cache grew within the silence
@@ -3346,7 +3357,7 @@ impl AppState {
         // Tear down any orphan proxy from an older desktop build BEFORE taking
         // the lifecycle lock, since `stop_headroom` acquires the same lock.
         // The orphan check: a proxy is reachable, but its argv is missing flags
-        // this build relies on (e.g. --log-messages, --learn). Without this we
+        // this build relies on (e.g. --no-rate-limit, --learn). Without this we
         // would happily reuse a v0.2.x proxy that pre-dates the Activity feed.
         if is_headroom_proxy_reachable()
             && !crate::tool_manager::running_proxy_matches_expected_args()
@@ -3442,6 +3453,10 @@ impl AppState {
                     "ensure_headroom_running: adopting healthy backend on port {} behind an unreachable intercept; not spawning",
                     crate::backend_port::get()
                 );
+                // Vetted (/readyz plus this build's argv), so select it: the
+                // intercept treats an unselected port as down, and nothing
+                // else selects a backend this process did not spawn.
+                crate::backend_port::set(crate::backend_port::get());
             }
             *self.last_startup_error.lock() = None;
             return Ok(());
@@ -3533,7 +3548,7 @@ impl AppState {
         // "not hooked up" banner. The tight 1.5s probe flapped both red
         // under heavy multi-agent load while /readyz was healthy (Windows
         // report, 2026-09-16); the watchdog already re-probes with 5s.
-        let proxy_reachable = headroom_proxy_reachable();
+        let (proxy_reachable, readyz) = headroom_proxy_readyz();
         let mcp_configured = self.tool_manager.headroom_mcp_configured();
         let mcp_error = self.tool_manager.headroom_mcp_error();
         let ml_installed = self.tool_manager.headroom_ml_installed();
@@ -3541,7 +3556,7 @@ impl AppState {
         let support_tier = current_platform_support_tier();
         let headroom_learn_disabled_reason = headroom_learn_platform_message();
         let kompress_enabled = if installed && proxy_reachable {
-            self.tool_manager.headroom_kompress_enabled()
+            self.tool_manager.headroom_kompress_state(readyz.as_ref())
         } else {
             None
         };
@@ -7052,6 +7067,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     // fetch that still times out means the backend is genuinely starved.
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
         .build()
         .ok()?;
@@ -7133,6 +7149,7 @@ fn scrape_compression_quarantine() {
 
     let Ok(client) = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_secs(2))
         .build()
     else {
@@ -7164,6 +7181,7 @@ fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
 
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_millis(500))
         .build()
         .ok()?;
@@ -8503,13 +8521,23 @@ fn parse_f64_from_text(text: &str) -> Option<f64> {
 }
 
 pub(crate) fn headroom_proxy_reachable() -> bool {
+    headroom_proxy_readyz().0
+}
+
+/// [`headroom_proxy_reachable`] plus the `/readyz` body that answered it, so
+/// the status poll reads Kompress off the same request rather than a second,
+/// tighter one that times out under exactly this load.
+pub(crate) fn headroom_proxy_readyz() -> (bool, Option<serde_json::Value>) {
     // Status/UI boundary: tolerant by design. The tight 1.5s probe flaps red
     // under load when the backend is busy with compression/embedding,
     // even though traffic still flows ("red light, works"). Use a 5s ceiling
     // matching the watchdog's tolerance — a healthy /readyz still answers in
     // milliseconds, so the dot stays responsive; the larger budget only bites
     // when the backend is genuinely slow.
-    probe_proxy_readyz(Duration::from_secs(5))
+    probe_proxy_readyz(
+        crate::proxy_intercept::INTERCEPT_PORT,
+        Duration::from_secs(5),
+    )
 }
 
 /// The `error_hint` recorded for a boot-validation failure. `startup_hint` is
@@ -8725,7 +8753,11 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
 }
 
 fn is_headroom_proxy_reachable() -> bool {
-    probe_proxy_readyz(Duration::from_millis(1500))
+    probe_proxy_readyz(
+        crate::proxy_intercept::INTERCEPT_PORT,
+        Duration::from_millis(1500),
+    )
+    .0
 }
 
 /// Whether the runtime is already serving, so `ensure_headroom_running` can
@@ -8773,27 +8805,30 @@ fn runtime_already_serving(
     intercept_reachable || (!upgrade_in_progress && backend_serving && backend_argv_is_current)
 }
 
-fn probe_proxy_readyz(timeout: Duration) -> bool {
+/// Whether `/readyz` on `port` says the proxy is up, with the JSON body it
+/// answered with (None when there was no answer or it was not JSON).
+fn probe_proxy_readyz(port: u16, timeout: Duration) -> (bool, Option<serde_json::Value>) {
     let client = match reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(timeout)
         .build()
     {
         Ok(client) => client,
-        Err(_) => return false,
+        Err(_) => return (false, None),
     };
 
     for host in ["127.0.0.1", "localhost"] {
-        match client.get(format!("http://{host}:6767/readyz")).send() {
+        match client.get(format!("http://{host}:{port}/readyz")).send() {
             Ok(response) => return proxy_readyz_response_is_reachable(response),
             // Accepted but slow: the same server sits behind both names, so a
             // second leg only doubles the wait. Only a connect failure earns
             // the localhost retry.
-            Err(err) if err.is_timeout() => return false,
+            Err(err) if err.is_timeout() => return (false, None),
             Err(_) => continue,
         }
     }
-    false
+    (false, None)
 }
 
 /// Whether a `/readyz` response means the proxy is up and serving.
@@ -8805,18 +8840,21 @@ fn probe_proxy_readyz(timeout: Duration) -> bool {
 /// "crashed" on every transient network blip even though nothing restarted
 /// (mirrors the watchdog's `readyz_failure_is_upstream_only`). Any other 503 /
 /// 5xx stays not-reachable so the watchdog keeps waiting / restarting.
-fn proxy_readyz_response_is_reachable(response: reqwest::blocking::Response) -> bool {
+fn proxy_readyz_response_is_reachable(
+    response: reqwest::blocking::Response,
+) -> (bool, Option<serde_json::Value>) {
     let status = response.status();
-    if proxy_readyz_status_is_reachable(status) {
-        return true;
-    }
-    if status.as_u16() == 503 {
-        return response
-            .text()
-            .map(|body| proxy_readyz_503_body_is_upstream_only(&body))
-            .unwrap_or(false);
-    }
-    false
+    // The status decides a 2xx/404, so a starved body read only loses the body.
+    let body = response.text().ok();
+    let reachable = proxy_readyz_status_is_reachable(status)
+        || (status.as_u16() == 503
+            && body
+                .as_deref()
+                .is_some_and(proxy_readyz_503_body_is_upstream_only));
+    (
+        reachable,
+        body.and_then(|body| serde_json::from_str(&body).ok()),
+    )
 }
 
 /// Whether a `/readyz` HTTP status alone means the proxy is up and serving.
@@ -10474,6 +10512,36 @@ mod tests {
         let with_kompress =
             r#"{"checks":{"upstream":{"ready":false},"kompress":{"ready":false,"optional":true}}}"#;
         assert!(proxy_readyz_503_body_is_upstream_only(with_kompress));
+    }
+
+    /// The status poll reads Kompress off its own tolerant `/readyz` probe, so
+    /// a backend slow enough (2-5s) to time out a second, tighter fetch still
+    /// reports Kompress instead of flipping the dot to unknown.
+    #[test]
+    fn status_probe_returns_the_readyz_body_it_read() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        // One accept: a second /readyz request would never be answered.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            std::thread::sleep(Duration::from_millis(2500));
+            let body = r#"{"ready":true,"checks":{"kompress":{"enabled":true,"ready":true}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write");
+        });
+        let (reachable, body) = super::probe_proxy_readyz(port, Duration::from_secs(5));
+        server.join().expect("server thread");
+        assert!(reachable);
+        assert_eq!(
+            body.as_ref()
+                .and_then(crate::tool_manager::readyz_kompress_state),
+            Some(true)
+        );
     }
 
     #[test]

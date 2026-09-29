@@ -105,10 +105,13 @@ impl PipeDrain {
     }
 }
 
-/// Kills `child` and, on Windows, everything it started. A venv `python.exe`
-/// or an npm `.cmd` shim is only a launcher: killing it alone leaves the real
-/// process running beside the caller's retry, holding the venv and the pipes.
-/// Naming the pid is safe while we still hold the unreaped handle.
+/// Kills `child` and everything it started: on Windows the whole tree, on
+/// Unix its process group when it was spawned through [`own_process_group`].
+/// A venv `python.exe` or an npm shim is only a launcher: killing it alone
+/// leaves the real process running beside the caller's retry, holding the venv
+/// and the pipes. Naming the pid is safe while we still hold the unreaped
+/// handle, and so is naming the group: no other group can carry a live pid,
+/// so for a child that leads none this is ESRCH.
 pub fn kill_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
@@ -132,7 +135,62 @@ pub fn kill_tree(child: &mut std::process::Child) {
             let _ = taskkill.wait();
         }
     }
+    #[cfg(unix)]
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        // Never 0 or 1: that would name our own group, or init's.
+        if pgid > 1 {
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
     let _ = child.kill();
+}
+
+/// Puts the child in its own process group on Unix, so [`kill_tree`] reaches
+/// what it starts: an npm-installed codex is a node shim whose native binary
+/// is a grandchild, and pip has subprocesses. Killed alone, the shim left the
+/// worker running and holding the pipes. Windows needs nothing here:
+/// `kill_tree` walks the tree with `taskkill /T`.
+pub fn own_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
+/// Every watchdog loop that calls [`suspend_gap`] ticks in seconds, so a tick
+/// this long was a system suspend (or a thread starved as long, which the
+/// child it watches was too).
+const SUSPEND_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the machine was suspended since `*last_tick`, as `Instant`
+/// counted it, and moves `*last_tick` to now. Add it to every `Instant`
+/// baseline via [`past_suspend`].
+///
+/// Windows' `Instant` (QueryPerformanceCounter) keeps running while the
+/// machine sleeps, so a watchdog saw a lid closed for an hour as an hour of
+/// silence and killed a healthy pip, or rolled back a good upgrade, on the
+/// first tick after wake. macOS and Linux `Instant` stops during sleep, so
+/// this returns `None` there. That is why this measures `Instant` and not the
+/// wall clock `spawn_proxy_watchdog` uses: adding the wall-clock sleep to a
+/// baseline that never aged through it would push the deadline out by the
+/// whole sleep.
+pub fn suspend_gap(last_tick: &mut std::time::Instant) -> Option<std::time::Duration> {
+    let now = std::time::Instant::now();
+    let gap = now.duration_since(*last_tick);
+    *last_tick = now;
+    (gap > SUSPEND_TICK).then_some(gap)
+}
+
+/// `baseline` moved forward by a suspend `gap`, but never past now: a
+/// baseline refreshed after the wake never aged through the sleep.
+pub fn past_suspend(baseline: std::time::Instant, gap: std::time::Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    baseline
+        .checked_add(gap)
+        .map_or(now, |shifted| shifted.min(now))
 }
 
 /// Why a spawned child did not produce an `Output`.
@@ -159,14 +217,19 @@ pub fn output_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    own_process_group(&mut command);
     let mut child = command.spawn().map_err(OutputError::Spawn)?;
     // Drain both pipes off-thread: a child that fills one while we wait on
     // the other deadlocks against the pipe buffer.
     let stdout = PipeDrain::spawn(child.stdout.take());
     let stderr = PipeDrain::spawn(child.stderr.take());
 
-    let started = std::time::Instant::now();
+    let mut started = std::time::Instant::now();
+    let mut last_tick = started;
     let status = loop {
+        if let Some(gap) = suspend_gap(&mut last_tick) {
+            started = past_suspend(started, gap);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= timeout => {
@@ -268,6 +331,61 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(10),
             "waited on the grandchild: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A timeout used to SIGKILL only the direct child: an npm node shim's
+    /// native codex (or pip's subprocess) was orphaned and kept the pipes.
+    #[cfg(unix)]
+    #[test]
+    fn output_with_timeout_kills_the_grandchildren_on_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "sleep 30 & echo $! > '{}'; wait",
+            pid_file.display()
+        ));
+        let timed_out = super::output_with_timeout(cmd, std::time::Duration::from_secs(3));
+        assert!(matches!(timed_out, Err(super::OutputError::TimedOut)));
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        // A killed orphan lingers as a zombie until launchd/init reaps it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild {pid} survived the timeout kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Windows' `Instant` counts a lid-closed sleep, so a silence watchdog saw
+    /// the whole sleep as silence. The gap is credited back to the baselines,
+    /// and a baseline refreshed after the wake is never pushed into the future.
+    #[test]
+    fn suspend_gap_credits_a_stretched_tick_back_to_the_baselines() {
+        use std::time::{Duration, Instant};
+        let mut last_tick = Instant::now();
+        assert_eq!(super::suspend_gap(&mut last_tick), None, "a normal tick");
+        let Some(before_sleep) = Instant::now().checked_sub(Duration::from_secs(120)) else {
+            return; // uptime under two minutes
+        };
+        let mut last_tick = before_sleep;
+        let gap = super::suspend_gap(&mut last_tick).expect("a two-minute tick is a suspend");
+        assert!(gap >= Duration::from_secs(120), "gap {gap:?}");
+        assert!(last_tick > before_sleep, "the tick baseline moves on");
+        assert!(
+            super::past_suspend(before_sleep, gap).elapsed() < Duration::from_secs(5),
+            "a baseline from before the sleep ages only by the awake time"
+        );
+        assert!(
+            super::past_suspend(Instant::now(), gap) <= Instant::now(),
+            "a baseline refreshed after the wake stays in the past"
         );
     }
 

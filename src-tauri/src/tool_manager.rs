@@ -53,6 +53,14 @@ const MARKITDOWN_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// seeds in ~3s); the cap only trips on pathological corpora, after which the
 /// proxy starts anyway and seeding retries next launch.
 const HEADROOM_BASELINE_SEED_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest transcript corpus the seed run is pointed at. `learn --verbosity`
+/// reads it three times (~2.2s per 100MB on Apple Silicon, 2-3x that on slower
+/// disks and CPUs), so a heavy user's busiest project (1GB+) always hit the
+/// timeout above, seeded nothing, and retried on every launch, holding proxy
+/// start back 30s each time. The busiest project under this cap seeds instead.
+// ponytail: fixed cap; if outlier machines still time out, stamp the failed
+// size beside the ledger and halve the cap from it on the next launch.
+const HEADROOM_BASELINE_SEED_MAX_BYTES: u64 = 400 * 1024 * 1024;
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
 const VENDOR_WHEELS_INDEX_URL: &str =
@@ -364,7 +372,15 @@ between the desktop intercept and this process -- so every provider
 switch rewrote the client onto that port and out of the intercept, where
 the activity feed, request counts and savings accounting live. The
 desktop passes the intercept URL in HEADROOM_CC_SWITCH_PROXY_URL and the
-guard writes it onto every reconciler instance.
+guard writes it onto every reconciler instance. Because that replaces the
+string upstream's loop guard matches, the guard also refuses this proxy's
+own address (localhost, the internal port) as an upstream. And it records
+each capture in HEADROOM_CC_SWITCH_CAPTURE_PATH: the desktop restores
+settings.json on quit and pause after this process is gone, so an
+in-memory capture was lost and the provider's key went to
+api.anthropic.com; the next instance reseeds from the same file. It
+reconciles only while the cc-switch-routed file beside it exists, which the
+desktop keeps in step with the Claude Code connector.
 
 Also stops the traffic learner writing "Learned: error recovery" into the
 user's Claude Code MEMORY.md. It pairs any failed tool call with the next
@@ -554,11 +570,18 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         return self.flush()
                     out = bytearray()
                     while not self.done:
-                        cut = self.buf.find(b"\n\n")
-                        if cut == -1:
+                        # Same terminators as the wheel's SSE splitter: a
+                        # CRLF-framed gateway never sends b"\n\n".
+                        hits = [
+                            (i, len(t))
+                            for t in (b"\n\n", b"\r\n\r\n")
+                            if (i := self.buf.find(t)) != -1
+                        ]
+                        if not hits:
                             break
-                        event = bytes(self.buf[: cut + 2])
-                        del self.buf[: cut + 2]
+                        cut, n = min(hits)
+                        event = bytes(self.buf[: cut + n])
+                        del self.buf[: cut + n]
                         out += self._event(event)
                     if self.done:
                         out += self.flush()
@@ -582,10 +605,12 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         return rewritten
                     if b"message_delta" not in event:
                         return event
-                    self.done = True
+                    # _rewrite_delta disarms only on a real message_delta, so
+                    # content that merely quotes the name leaves us armed.
                     try:
                         return self._rewrite_delta(event)
                     except Exception:
+                        self.done = True
                         return event
 
                 def _rewrite_start(self, event):
@@ -619,9 +644,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                             target,
                             self.believed,
                         )
-                        lines[i] = b"data: " + _hd_cg_json.dumps(
-                            payload, separators=(",", ":")
-                        ).encode()
+                        lines[i] = (
+                            b"data: "
+                            + _hd_cg_json.dumps(payload, separators=(",", ":")).encode()
+                            + (b"\r" if line.endswith(b"\r") else b"")
+                        )
                         return b"\n".join(lines)
                     return event
 
@@ -633,6 +660,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         payload = _hd_cg_json.loads(line[5:].strip())
                         if payload.get("type") != "message_delta":
                             return event
+                        self.done = True
                         usage = payload.get("usage")
                         # A delta without cumulative input usage cannot
                         # override the already-nudged message_start.
@@ -646,9 +674,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         if int(usage.get("input_tokens") or 0) >= new_input:
                             return event
                         usage["input_tokens"] = new_input
-                        lines[i] = b"data: " + _hd_cg_json.dumps(
-                            payload, separators=(",", ":")
-                        ).encode()
+                        lines[i] = (
+                            b"data: "
+                            + _hd_cg_json.dumps(payload, separators=(",", ":")).encode()
+                            + (b"\r" if line.endswith(b"\r") else b"")
+                        )
                         return b"\n".join(lines)
                     return event
 
@@ -1243,12 +1273,89 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     "pinned upstream missing or malformed: %r" % (_hd_ccs_pinned,)
                 )
 
+        # Where a capture is recorded for the desktop, as {"url": ...}: the base
+        # URL this reconciler replaced in settings.json. The capture otherwise
+        # lives only in this process, and the desktop restores settings.json on
+        # quit and pause after this process is gone, so the provider URL was
+        # deleted and its token sent to api.anthropic.com. Required like the
+        # URL above; the next instance reseeds from it (see the tick).
+        _hd_ccs_capture = _hd_os.environ.get("HEADROOM_CC_SWITCH_CAPTURE_PATH", "").strip()
+        if not _hd_os.path.isabs(_hd_ccs_capture):
+            raise RuntimeError(
+                "HEADROOM_CC_SWITCH_CAPTURE_PATH missing or relative: %r" % (_hd_ccs_capture,)
+            )
+        # Beside it, present only while the desktop routes Claude Code's
+        # settings.json (cc_switch_routed_path): a disable hands the file back,
+        # and reconciling it then undid the connector toggle within 0.3s.
+        _hd_ccs_routed = _hd_os.path.join(
+            _hd_os.path.dirname(_hd_ccs_capture), "cc-switch-routed"
+        )
+
+        def _hd_ccs_save_capture(url):
+            tmp = "%s.%d.tmp" % (_hd_ccs_capture, _hd_os.getpid())
+            with open(tmp, "w", encoding="utf-8") as fh:
+                _hd_ccs_json.dump({"url": url}, fh)
+            _hd_os.replace(tmp, _hd_ccs_capture)
+
+        def _hd_ccs_load_capture():
+            try:
+                with open(_hd_ccs_capture, encoding="utf-8") as fh:
+                    url = _hd_ccs_json.load(fh).get("url")
+            except (OSError, ValueError, AttributeError):
+                return ""
+            ok = isinstance(url, str) and url.startswith(("http://", "https://"))
+            return url if ok else ""
+
+        def _hd_ccs_drop_capture():
+            try:
+                _hd_os.remove(_hd_ccs_capture)
+            except FileNotFoundError:
+                pass
+
+        from urllib.parse import urlsplit as _hd_ccs_urlsplit
+
+        def _hd_ccs_port(url):
+            try:
+                return _hd_ccs_urlsplit(url or "").port
+            except ValueError:
+                return None
+
+        def _hd_ccs_is_self(reconciler, url):
+            # This proxy under any loopback spelling (localhost, the internal
+            # port). Upstream's loop guard matches only the exact proxy_url,
+            # which _hd_ccs_init replaces, so these were captured as the
+            # upstream and every Anthropic request looped back into us.
+            try:
+                host = _hd_ccs_urlsplit(url or "").hostname
+            except ValueError:
+                return False
+            own = getattr(reconciler, "_hd_ccs_own_ports", ())
+            loopback = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+            return host in loopback and _hd_ccs_port(url) in own
+
+        def _hd_ccs_points_here(reconciler):
+            data = _hd_ccs_json.loads(reconciler.path.read_text(encoding="utf-8"))
+            env = data.get("env") if isinstance(data, dict) else None
+            url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+            return isinstance(url, str) and url.rstrip("/") == _hd_ccs_url
+
         _hd_ccs_orig_init = _hd_ccs_mod.CCSwitchReconciler.__init__
 
         def _hd_ccs_init(self, *args, **kwargs):
             _hd_ccs_orig_init(self, *args, **kwargs)
+            ports = {_hd_ccs_port(self.proxy_url), _hd_ccs_port(_hd_ccs_url)}
+            self._hd_ccs_own_ports = ports - {None}
             # Already rstripped, which is what the loop guard compares against.
             self.proxy_url = _hd_ccs_url
+            _hd_ccs_set = self._set_upstream
+
+            def _hd_ccs_guarded_set(url):
+                if _hd_ccs_is_self(self, url):
+                    _hd_ccs_log.info("event=cc_switch_self_upstream_ignored url=%s", url)
+                    return
+                _hd_ccs_set(url)
+
+            self._set_upstream = _hd_ccs_guarded_set
 
         _hd_ccs_mod.CCSwitchReconciler.__init__ = _hd_ccs_init
 
@@ -1266,7 +1373,32 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 
         def _hd_ccs_tick(self):
             global _hd_ccs_warned
+            if not _hd_os.path.exists(_hd_ccs_routed):
+                # Neither capture nor rewrite, and let go of a live capture:
+                # nothing routes to it now, and a switch to Official would go
+                # unseen. None, so routing again reseeds from the file.
+                target = _hd_ccs_pinned or self.default_upstream
+                if self.current_upstream not in (None, target):
+                    self._set_upstream(target)
+                    _hd_ccs_log.info("event=cc_switch_upstream_released upstream=%s", target)
+                self.current_upstream = None
+                return False
+            prev = self.current_upstream
+            seen = getattr(self, "_last_mtime_ns", None)
             rewrote = _hd_ccs_orig_tick(self)
+            if rewrote:
+                # Only a rewrite captures, so this stays off the 0.3s hot path.
+                try:
+                    if _hd_ccs_is_self(self, self.current_upstream):
+                        # settings.json already named us, just spelled another
+                        # way; the guarded setter refused it as the upstream.
+                        self.current_upstream = prev
+                    elif self.current_upstream not in (None, self.default_upstream):
+                        # Before the pin below: the file is what settings.json
+                        # said, which is what quit restores either way.
+                        _hd_ccs_save_capture(self.current_upstream)
+                except Exception as exc:  # noqa: BLE001 - the watcher must not die
+                    _hd_ccs_log.warning("event=cc_switch_capture_persist_failed err=%s", exc)
             try:
                 # With an override configured, the user's endpoint IS the
                 # default this reconciler returns to -- both when cc-switch
@@ -1280,6 +1412,24 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                             "event=cc_switch_upstream_pinned upstream=%s", target
                         )
                     return rewrote
+                # A new instance (relaunch, resume) meeting settings.json that
+                # already names us: the desktop, racing this process at launch,
+                # routed the provider URL the quit restored before we could
+                # capture it. Only on a settings.json change, and only when it
+                # points here -- anything else (Claude Official) would send
+                # Anthropic OAuth traffic to the recorded provider.
+                if (
+                    self.current_upstream is None
+                    and not rewrote
+                    and getattr(self, "_last_mtime_ns", None) != seen
+                ):
+                    captured = _hd_ccs_load_capture()
+                    if captured and not _hd_ccs_is_self(self, captured) and _hd_ccs_points_here(self):
+                        self.current_upstream = captured
+                        self._set_upstream(captured)
+                        _hd_ccs_log.info(
+                            "event=cc_switch_capture_restored upstream=%s", captured
+                        )
                 # Only a captured third-party upstream can go stale, and only a
                 # changed settings.json can end it. Both checks keep this off
                 # the hot path of a 0.3s poll -- an Anthropic-only user never
@@ -1301,6 +1451,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         "event=cc_switch_official_upstream_reset upstream=%s",
                         target,
                     )
+                    _hd_ccs_drop_capture()
             except Exception as exc:  # noqa: BLE001 - the watcher must not die
                 # Logged once: the reconciler is running and the reset that
                 # makes it safe just did not happen, so a captured third-party
@@ -1859,8 +2010,8 @@ if failures:
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
 /// the Context7 MCP entry. The registered command is a bare `npx` (resolved
 /// from the agent session's own PATH, so nvm version switches don't strand an
-/// absolute path) running the pinned package. argv: `register <package-spec>`
-/// | `unregister`.
+/// absolute path) running the pinned package, wrapped in `cmd /c` on Windows.
+/// argv: `register <package-spec>` | `unregister`.
 const CONTEXT7_MCP_HELPER: &str = r#"
 import sys
 
@@ -1879,6 +2030,9 @@ from headroom.mcp_registry.ledger import (
 )
 
 action = sys.argv[1]
+# On Windows npx is an npx.cmd shim, which agents that spawn MCP servers
+# without a shell cannot start ("Windows requires 'cmd /c' wrapper").
+npx = ("cmd", "/c", "npx") if sys.platform == "win32" else ("npx",)
 failures = []
 for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
     if not registrar.detect():
@@ -1887,8 +2041,8 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
     if action == "register":
         spec = ServerSpec(
             name="context7",
-            command="npx",
-            args=("-y", sys.argv[2]),
+            command=npx[0],
+            args=(*npx[1:], "-y", sys.argv[2]),
         )
         result = registrar.register_server(spec)
         if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
@@ -2479,13 +2633,23 @@ fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
 /// Bucket a prefetch-log tail into a coarse, stable failure category.
 fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
     let t = tail.to_lowercase();
+    // A dropped socket says "aborted" too (WinError 10053 "An established
+    // connection was aborted ...", requests' "Connection aborted."). Strip
+    // those so only a process abort reads as native; the drop is network.
+    let process_text = t
+        .replace("connectionabortederror", "")
+        .replace("connection was aborted", "")
+        .replace("connection aborted", "");
     if t.is_empty() {
         "no output"
-    } else if t.contains("sigabrt") || t.contains("aborted") {
+    } else if process_text.contains("sigabrt") || process_text.contains("aborted") {
         "native abort"
     } else if t.contains("no space left") || t.contains("disk full") || t.contains("errno 28") {
         "disk full"
     } else if t.contains("connection")
+        // WSAECONNABORTED / WSAECONNRESET: the number survives the locale.
+        || t.contains("winerror 10053")
+        || t.contains("winerror 10054")
         || t.contains("timed out")
         || t.contains("timeout")
         || t.contains("name resolution")
@@ -2959,7 +3123,9 @@ impl ToolManager {
         }
         log::info!("seeding output-shaper verbosity baseline (no baseline present yet)");
         let Some(project_cwd) = busiest_claude_project_cwd() else {
-            log::info!("verbosity baseline seeding skipped: no Claude transcripts found");
+            log::info!(
+                "verbosity baseline seeding skipped: no Claude transcripts under the size cap"
+            );
             return;
         };
         let args = [
@@ -3607,6 +3773,9 @@ impl ToolManager {
                     // written out, because a port mismatch here is exactly the
                     // bug being fixed.
                     .env("HEADROOM_CC_SWITCH_PROXY_URL", cc_switch_proxy_url())
+                    // Where the guard records a capture so quit/pause can
+                    // restore it; see cc_switch_capture_path.
+                    .env("HEADROOM_CC_SWITCH_CAPTURE_PATH", cc_switch_capture_path())
                     // User-configured upstream (GLM, Kimi, DeepSeek). Empty
                     // for everyone who has not set one, and an empty env is
                     // the same as unset to the runtime's _get_env_str, so this
@@ -3961,7 +4130,13 @@ impl ToolManager {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .map(|name| name.starts_with(&prefix) && name.ends_with(".log"))
+                    // Learn runs write `headroom-learn-*.log` beside the
+                    // proxy's logs (see `cap_live_proxy_logs`).
+                    .map(|name| {
+                        name.starts_with(&prefix)
+                            && name.ends_with(".log")
+                            && !name.starts_with("headroom-learn-")
+                    })
                     .unwrap_or(false)
             })
             .filter_map(|path| {
@@ -4119,7 +4294,22 @@ impl ToolManager {
     }
 
     pub fn headroom_kompress_enabled(&self) -> Option<bool> {
-        // The `headroom` Python package attaches a RotatingFileHandler to its
+        self.headroom_kompress_state(fetch_backend_readyz(crate::backend_port::get()).as_ref())
+    }
+
+    /// Kompress state from a `/readyz` body the caller already holds (the
+    /// status poll reads one to decide reachability).
+    pub fn headroom_kompress_state(&self, readyz: Option<&Value>) -> Option<bool> {
+        // The backend reports Kompress on `/readyz` (`checks.kompress`, lazy
+        // loads included). The log scan below went blind once the wheel's log
+        // rotated past the last marker and reread up to 10 MB per status poll,
+        // so it only runs for a wheel without that field, or when no body came
+        // back: a last-known marker beats flipping the dot to unknown.
+        if let Some(state) = readyz.and_then(readyz_kompress_state) {
+            return Some(state);
+        }
+
+        // Fallback. The `headroom` Python package attaches a RotatingFileHandler to its
         // `headroom` root logger with `propagate = False` (see helpers.py:
         // `_setup_file_logging`). Proxy-logger INFO lines — including the
         // `Kompress: ENABLED/not installed/disabled` startup markers — go to
@@ -4506,7 +4696,13 @@ impl ToolManager {
     }
 
     pub fn rtk_today_stats(&self) -> Option<RtkTodayStats> {
-        let today = Local::now().date_naive().to_string();
+        self.rtk_today_stats_at(Utc::now())
+    }
+
+    /// rtk buckets by SQLite `DATE(timestamp)`, the UTC date, and has no
+    /// timezone option, so "today" here is today in UTC and the tile says so.
+    fn rtk_today_stats_at(&self, now: DateTime<Utc>) -> Option<RtkTodayStats> {
+        let today = now.date_naive().to_string();
         self.rtk_gain_output()?
             .daily
             .into_iter()
@@ -4760,10 +4956,13 @@ impl ToolManager {
         if let Err(err) = self.ensure_msvc_runtime_dlls() {
             log::warn!("MSVC runtime DLL vendoring failed during bootstrap: {err:#}");
         }
+        // A repair that recreated a pip-less venv dropped markitdown with it.
+        self.restore_markitdown_after_rebuild();
 
         self.clear_bootstrap_attempt();
         self.write_ready_flag()?;
         self.write_bootstrap_receipt()?;
+        self.prune_headroom_wheels();
         log::info!("bootstrap: managed runtime install complete (ready flag written)");
         progress(BootstrapStepUpdate {
             step: "Install complete",
@@ -4850,6 +5049,35 @@ impl ToolManager {
              (system redistributable missing)"
         );
         Ok(true)
+    }
+
+    /// Every wheel, rtk and codebase-memory bump downloaded a new archive and
+    /// nothing removed the old ones (290 MB on one machine). Deletes the
+    /// regular files named `family*` except `keep*`. Best-effort; call only
+    /// once the `keep` artifact is installed.
+    fn prune_downloads(&self, family: &str, keep: &str) {
+        let Ok(entries) = std::fs::read_dir(&self.runtime.downloads_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with(family)
+                && !name.starts_with(keep)
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Wheels cached for any headroom-ai other than the installed one.
+    fn prune_headroom_wheels(&self) {
+        if let Some(version) = self.installed_headroom_version() {
+            self.prune_downloads("headroom_ai-", &format!("headroom_ai-{version}-"));
+        }
     }
 
     fn wheel_download_path(&self, wheel_url: &str) -> PathBuf {
@@ -5473,6 +5701,14 @@ impl ToolManager {
     /// drop the registration entirely on disable, so absence is expected
     /// there, not a failure (RUST-22 false positive).
     pub fn smoke_test_plugin(&self, id: &str) -> Result<()> {
+        self.smoke_test_plugin_on(id, PluginHost::detected)
+    }
+
+    fn smoke_test_plugin_on(
+        &self,
+        id: &str,
+        detect: impl FnOnce() -> Vec<(PluginHost, PathBuf)>,
+    ) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         let Some(receipt) = self.read_tool_receipt(plugin.id) else {
             return Ok(());
@@ -5488,6 +5724,25 @@ impl ToolManager {
             .iter()
             .any(|host| host.plugin_present(plugin))
         {
+            // Only a definite "not registered" drops the receipt, the rule
+            // install_plugin_into applies: an unreadable registry of a host
+            // whose CLI is here, or a Codex registry its own listing
+            // contradicts (RUST-HT), is "cannot tell", and install kept the
+            // receipt in exactly those states.
+            if detect()
+                .iter()
+                .any(|(host, cli)| match host.plugin_registration(plugin) {
+                    None => true,
+                    Some(_) => {
+                        matches!(host, PluginHost::Codex) && self.codex_lists_installed(plugin, cli)
+                    }
+                })
+            {
+                log::info!(
+                    "{id}: no host registry confirms or rules out the plugin; keeping its receipt"
+                );
+                return Ok(());
+            }
             // The plugin was removed behind our back (host-native `/plugin`
             // uninstall or a host registry migration). Drop the stale receipt
             // so this warns once instead of on every future upgrade;
@@ -5719,39 +5974,16 @@ impl ToolManager {
                  reinstalling previous headroom-ai {previous_version}"
             );
             // Both pip helpers need PyPI. Offline (laptop died mid-upgrade,
-            // reopened on a plane) they fail — and discarding those failures
-            // used to clear the marker anyway, leaving a mixed venv (new dep
-            // pins, unknown headroom-ai version) that the restored receipt
-            // declared healthy. On failure keep the marker AND the lock
-            // backup untouched so the next launch retries recovery; mirror
-            // `rollback_headroom_upgrade`, which propagates the same errors.
-            if let Some(ref backup) = previous_lock_backup {
-                if let Err(err) = self.pip_restore_deps_from_backup(backup) {
-                    log::warn!(
-                        "recover_from_interrupted_upgrade: dep restore failed ({err:#}); \
-                         keeping upgrade marker for retry"
-                    );
-                    return false;
-                }
-            }
-            if let Err(err) = self.pip_force_reinstall_headroom_version(&previous_version) {
+            // reopened on a plane) they fail, and the helper then keeps the
+            // marker and its recovery data so the next launch retries.
+            if let Err(err) =
+                self.restore_in_place_previous(&previous_version, previous_lock_backup.as_deref())
+            {
                 log::warn!(
-                    "recover_from_interrupted_upgrade: reinstalling headroom-ai \
-                     {previous_version} failed ({err:#}); keeping upgrade marker for retry"
+                    "recover_from_interrupted_upgrade: {err:#}; keeping upgrade marker for retry"
                 );
                 return false;
             }
-            if let Some(ref backup) = previous_lock_backup {
-                let _ = std::fs::copy(backup, self.active_lock_path());
-                let _ = std::fs::remove_file(backup);
-            }
-            let receipt_backup = self.headroom_receipt_backup_path();
-            if receipt_backup.exists() {
-                if let Err(err) = self.restore_receipt_from_backup() {
-                    log::warn!("recover_from_interrupted_upgrade: {err:#}");
-                }
-            }
-            self.clear_upgrade_marker();
             return true;
         }
 
@@ -5966,6 +6198,7 @@ impl ToolManager {
         if let Err(err) = self.ensure_msvc_runtime_dlls() {
             log::warn!("MSVC runtime DLL vendoring failed during upgrade: {err:#}");
         }
+        self.restore_markitdown_after_rebuild();
 
         progress(BootstrapStepUpdate {
             step: "Verifying install",
@@ -6020,28 +6253,9 @@ impl ToolManager {
         // previous headroom-ai and restore the receipt.
         if let Some((previous_version, _target, previous_lock_backup)) = self.read_in_place_marker()
         {
-            if let Some(ref backup) = previous_lock_backup {
-                self.pip_restore_deps_from_backup(backup).with_context(|| {
-                    format!(
-                        "rollback failed — could not restore dependencies from {}",
-                        backup.display()
-                    )
-                })?;
-                let _ = std::fs::copy(backup, self.active_lock_path());
-                let _ = std::fs::remove_file(backup);
-            }
-            self.pip_force_reinstall_headroom_version(&previous_version)
-                .with_context(|| {
-                    format!(
-                        "rollback failed — could not reinstall previous Headroom version {previous_version}"
-                    )
-                })?;
-            let receipt_backup = self.headroom_receipt_backup_path();
-            if receipt_backup.exists() {
-                self.restore_receipt_from_backup()?;
-            }
-            self.clear_upgrade_marker();
-            return Ok(());
+            return self
+                .restore_in_place_previous(&previous_version, previous_lock_backup.as_deref())
+                .context("rollback failed");
         }
 
         let backup_dir = self.venv_backup_dir();
@@ -6088,7 +6302,8 @@ impl ToolManager {
     /// either there is no prior install to upgrade, the previously-installed
     /// version is below `ATOMIC_REBUILD_FLOOR_VERSION` (in-place pip across
     /// that delta leaves stale native libs), or the lock churned but the
-    /// active lock file is missing on disk so we can't safely snapshot for
+    /// active lock file is missing on disk, or is not the lock the receipt
+    /// says the venv was built from, so we can't safely snapshot for
     /// rollback.
     ///
     /// When `Some`, the caller owns `previous_lock_backup` (if set): on
@@ -6106,13 +6321,22 @@ impl ToolManager {
             return None;
         }
         let previous_lock_backup = if self.lock_pins_differ_from_installed() {
-            let active = self.active_lock_path();
-            if !active.exists() {
+            // The snapshot is what a failed upgrade rolls back to. A full
+            // rebuild that failed validation (or a requirements repair that
+            // died mid-pip) leaves the NEW lock on disk under the old
+            // receipt, and snapshotting that made rollback "restore" the new
+            // pins under the old headroom-ai. Only the full rebuild keeps an
+            // exact copy of the old venv then.
+            let installed = std::fs::read_to_string(self.active_lock_path()).ok()?;
+            if Some(requirements_lock_sha(&installed)) != self.installed_requirements_lock_sha() {
+                log::info!(
+                    "prepare_in_place_upgrade: on-disk lock is not the installed one; \
+                     forcing full venv rebuild"
+                );
                 return None;
             }
             let backup = self.lock_backup_path();
-            let _ = std::fs::remove_file(&backup);
-            std::fs::copy(&active, &backup).ok()?;
+            crate::client_adapters::atomic_write(&backup, installed.as_bytes()).ok()?;
             Some(backup)
         } else {
             None
@@ -6539,28 +6763,62 @@ impl ToolManager {
         // hits the same Windows file locks reports restored=false and leaves
         // the runtime bricked (RUST-70).
         crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
-        // Restore deps first so headroom-ai lands on a consistent dep set.
-        let deps_ok = match ctx.previous_lock_backup.as_deref() {
-            Some(backup) => {
-                let ok = self.pip_restore_deps_from_backup(backup).is_ok();
-                let active = self.active_lock_path();
-                let _ = std::fs::copy(backup, &active);
-                let _ = std::fs::remove_file(backup);
-                ok
+        match self
+            .restore_in_place_previous(&ctx.previous_version, ctx.previous_lock_backup.as_deref())
+        {
+            Ok(()) => true,
+            Err(err) => {
+                log::warn!(
+                    "in-place upgrade rollback failed ({err:#}); keeping upgrade marker \
+                     for recovery on next launch"
+                );
+                false
             }
-            None => true,
-        };
-        let wheel_ok = self
-            .pip_force_reinstall_headroom_version(&ctx.previous_version)
-            .is_ok();
-        let receipt_backup = self.headroom_receipt_backup_path();
-        let receipt_ok = if receipt_backup.exists() {
-            self.restore_receipt_from_backup().is_ok()
-        } else {
-            true
-        };
+        }
+    }
+
+    /// Undo an in-place upgrade: reinstall the lock snapshot's pins (so
+    /// headroom-ai lands on a consistent dep set) and the previous
+    /// headroom-ai, restore the receipt, and only then consume the snapshot
+    /// and clear the marker. Any failure returns early with the marker, the
+    /// snapshot and the receipt backup untouched, so the next launch's
+    /// recovery retries. A marker naming a snapshot that was already deleted
+    /// can never finish (each launch re-ran `pip -r` on the missing file),
+    /// and a cleared marker left a mixed venv that the restored receipt
+    /// declared healthy.
+    ///
+    /// A marker that already names a missing snapshot (left by builds that
+    /// consumed it before the reinstall, or by a failed marker clear) skips
+    /// the dep restore: those paths deleted it only once the deps were
+    /// restored or the marker was meant to go.
+    fn restore_in_place_previous(
+        &self,
+        previous_version: &str,
+        previous_lock_backup: Option<&Path>,
+    ) -> Result<()> {
+        let previous_lock_backup = previous_lock_backup.filter(|backup| {
+            let present = backup.exists();
+            if !present {
+                log::warn!(
+                    "lock snapshot {} is gone; skipping the dependency restore",
+                    backup.display()
+                );
+            }
+            present
+        });
+        if let Some(backup) = previous_lock_backup {
+            self.pip_restore_deps_from_backup(backup)?;
+        }
+        self.pip_force_reinstall_headroom_version(previous_version)?;
+        if self.headroom_receipt_backup_path().exists() {
+            self.restore_receipt_from_backup()?;
+        }
+        if let Some(backup) = previous_lock_backup {
+            let _ = std::fs::copy(backup, self.active_lock_path());
+            let _ = std::fs::remove_file(backup);
+        }
         self.clear_upgrade_marker();
-        deps_ok && wheel_ok && receipt_ok
+        Ok(())
     }
 
     fn update_headroom_receipt_after_in_place_upgrade(
@@ -6592,6 +6850,16 @@ impl ToolManager {
     /// receipt snapshot. Non-fatal if cleanup fails — a future upgrade's
     /// "purge stale backup" step will clean up whatever we left behind.
     pub fn commit_headroom_upgrade(&self) -> Result<()> {
+        // Clear the in-progress marker FIRST: it is the commit point, and the
+        // new runtime already passed boot validation. Deleting the backups
+        // before it let a crash mid-delete (seconds on a big venv) leave the
+        // marker beside a half-deleted venv.backup, which the next launch's
+        // recovery swapped over the validated venv. A marker that could not
+        // be cleared keeps the backups too: they are what its recovery uses.
+        self.clear_upgrade_marker();
+        if self.upgrade_interrupted() {
+            return Ok(());
+        }
         let backup_dir = self.venv_backup_dir();
         if backup_dir.exists() {
             if let Err(err) = std::fs::remove_dir_all(&backup_dir) {
@@ -6603,11 +6871,7 @@ impl ToolManager {
         }
         let _ = std::fs::remove_file(self.headroom_receipt_backup_path());
         let _ = std::fs::remove_file(self.lock_backup_path());
-        // Clear the in-progress marker last, so a mid-commit crash (e.g.,
-        // between the remove_dir_all of the backup and the marker cleanup)
-        // still looks like an interrupted upgrade on the next launch and
-        // triggers recovery rather than a potentially-unsafe purge.
-        self.clear_upgrade_marker();
+        self.prune_headroom_wheels();
         Ok(())
     }
 
@@ -7051,6 +7315,7 @@ impl ToolManager {
             }
             return Err(anyhow!("renaming {} into place: {err}", staged.display()));
         }
+        self.prune_downloads("rtk-v", &format!("rtk-v{RTK_VERSION}-"));
 
         self.write_tool_receipt(
             "rtk",
@@ -7340,30 +7605,44 @@ impl ToolManager {
         }
         #[cfg(target_os = "windows")]
         {
-            let script = format!(
-                "@echo off\r\n\
-                 setlocal\r\n\
-                 rem Headroom-managed markitdown shim. Runs the real binary, then counts a conversion that succeeded.\r\n\
-                 rem UTF-8 stdout: the locale codepage (cp950, cp1252) garbles or drops non-ASCII document text.\r\n\
-                 set PYTHONUTF8=1\r\n\
-                 \"{real}\" %*\r\n\
-                 if %errorlevel% neq 0 exit /b %errorlevel%\r\n\
-                 if \"%~1\"==\"\" exit /b 0\r\n\
-                 if \"%~1\"==\"--help\" exit /b 0\r\n\
-                 set \"C={counter}\"\r\n\
-                 set /p n=<\"%C%\" 2>nul\r\n\
-                 if not defined n set n=0\r\n\
-                 set /a n+=1 >nul 2>nul\r\n\
-                 >\"%C%.tmp\" echo %n%\r\n\
-                 move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
-                 exit /b 0\r\n",
-                counter = self.markitdown_conversion_counter_path().display(),
-                real = self.markitdown_entrypoint().display(),
-            );
+            let script = self.markitdown_cmd_script();
             crate::client_adapters::atomic_write(&shim, script.as_bytes())
                 .with_context(|| format!("writing markitdown shim {}", shim.display()))?;
         }
         Ok(())
+    }
+
+    /// cmd.exe decodes a batch file in the OEM codepage, so an absolute path
+    /// under a non-ASCII profile (C:\Users\José) written as UTF-8 names a file
+    /// that does not exist. Paths are relative to the shim's folder instead:
+    /// `%~dp0` expands from cmd's UTF-16 command line, and the body stays ASCII.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn markitdown_cmd_script(&self) -> String {
+        // The shim sits in bin_dir, which is root_dir\bin.
+        let from_shim = |path: PathBuf| match path.strip_prefix(&self.runtime.root_dir) {
+            Ok(rel) => format!("%~dp0..\\{}", rel.display()),
+            Err(_) => path.display().to_string(),
+        };
+        format!(
+            "@echo off\r\n\
+             setlocal\r\n\
+             rem Headroom-managed markitdown shim. Runs the real binary, then counts a conversion that succeeded.\r\n\
+             rem UTF-8 stdout: the locale codepage (cp950, cp1252) garbles or drops non-ASCII document text.\r\n\
+             set PYTHONUTF8=1\r\n\
+             \"{real}\" %*\r\n\
+             if %errorlevel% neq 0 exit /b %errorlevel%\r\n\
+             if \"%~1\"==\"\" exit /b 0\r\n\
+             if \"%~1\"==\"--help\" exit /b 0\r\n\
+             set \"C={counter}\"\r\n\
+             set /p n=<\"%C%\" 2>nul\r\n\
+             if not defined n set n=0\r\n\
+             set /a n+=1 >nul 2>nul\r\n\
+             >\"%C%.tmp\" echo %n%\r\n\
+             move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
+             exit /b 0\r\n",
+            counter = from_shim(self.markitdown_conversion_counter_path()),
+            real = from_shim(self.markitdown_entrypoint()),
+        )
     }
 
     pub fn markitdown_installed(&self) -> bool {
@@ -7437,6 +7716,38 @@ impl ToolManager {
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
         Ok(())
+    }
+
+    /// markitdown[all] lives in the runtime venv, so a rebuilt venv drops it
+    /// while its receipt, shim and agent nudges survive and send every Office
+    /// read to a command that dies with ModuleNotFoundError. Reinstall it,
+    /// keeping the user's enabled flag; if that fails, take the integration
+    /// down like an uninstall. Never fails the caller: it is an optional addon.
+    fn restore_markitdown_after_rebuild(&self) {
+        if !self.runtime.tools_dir.join("markitdown.json").exists()
+            || self.markitdown_entrypoint().exists()
+        {
+            return;
+        }
+        let enabled = self.tool_enabled("markitdown");
+        let restored = self.install_markitdown().and_then(|()| {
+            if enabled {
+                Ok(())
+            } else {
+                self.set_markitdown_enabled(false)
+            }
+        });
+        if let Err(err) = restored {
+            log::warn!("markitdown reinstall after a venv rebuild failed, removing it: {err:#}");
+            if let Err(err) =
+                crate::client_adapters::disable_markitdown_integration(&self.markitdown_shim_path())
+            {
+                log::warn!("markitdown integration removal failed: {err:#}");
+            }
+            if let Err(err) = self.uninstall_markitdown() {
+                log::warn!("markitdown receipt removal failed: {err:#}");
+            }
+        }
     }
 
     /// Serena lives in its own venv: its LSP dependency tree must never
@@ -7742,6 +8053,10 @@ impl ToolManager {
             "codebase-memory",
             json!({ "version": CODEBASE_MEMORY_VERSION, "enabled": true }),
         )?;
+        self.prune_downloads(
+            "codebase-memory-mcp-v",
+            &format!("codebase-memory-mcp-v{CODEBASE_MEMORY_VERSION}-"),
+        );
         Ok(())
     }
 
@@ -7876,7 +8191,7 @@ impl ToolManager {
             cli,
             args,
             &self.runtime.root_dir,
-            None,
+            Some(PLUGIN_CMD_SILENCE_TIMEOUT),
             &mut |line: &str| log::info!("{id} [{label}]: {line}"),
         )
     }
@@ -8025,7 +8340,7 @@ impl ToolManager {
             cli,
             &["plugin", "list", "-m", plugin.marketplace_name],
             &self.runtime.root_dir,
-            None,
+            Some(PLUGIN_CMD_SILENCE_TIMEOUT),
             &mut |line: &str| listed |= codex_list_line_installed(line, plugin.plugin_ref),
         );
         listed
@@ -8038,14 +8353,9 @@ impl ToolManager {
     /// a version skew the user can only fix by updating that CLI.
     pub fn install_plugin(&self, id: &str) -> Result<Option<&'static str>> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        let hosts: Vec<(PluginHost, PathBuf)> = PluginHost::ALL
-            .into_iter()
-            .filter_map(|host| host.cli().map(|cli| (host, cli)))
-            .collect();
+        let hosts = PluginHost::detected();
         if hosts.is_empty() {
-            bail!(
-                "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again."
-            );
+            bail!(NO_PLUGIN_HOST_CLI);
         }
         let (mut outdated, errors) = settle_plugin_hosts(
             id,
@@ -8082,6 +8392,15 @@ impl ToolManager {
     }
 
     pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        self.set_plugin_enabled_on(id, enabled, &PluginHost::detected())
+    }
+
+    fn set_plugin_enabled_on(
+        &self,
+        id: &str,
+        enabled: bool,
+        hosts: &[(PluginHost, PathBuf)],
+    ) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         // Guard on the receipt, not host presence: disabling on a host without a
         // disable verb (Codex) removes the plugin, so `plugin_installed()`
@@ -8089,16 +8408,39 @@ impl ToolManager {
         if !self.plugin_receipt_exists(plugin) {
             bail!("{id} is not installed");
         }
-        let mut errors: Vec<String> = Vec::new();
+        // No CLI means no host was toggled; flipping the receipt anyway would
+        // show the card off while the plugin keeps running in every session.
+        if hosts.is_empty() {
+            bail!(NO_PLUGIN_HOST_CLI);
+        }
+        // A host whose CLI was not detected can still hold the plugin (probe
+        // timeout, IDE-only Claude Code). It was not toggled, so it counts as
+        // a failure rather than a silent skip.
+        let mut errors: Vec<String> = PluginHost::ALL
+            .into_iter()
+            .filter(|host| !hosts.iter().any(|(h, _)| h == host) && host.plugin_present(plugin))
+            .map(|host| format!("{}: CLI not found on PATH", host.label()))
+            .collect();
         let mut changed_any = false;
-        for host in PluginHost::ALL {
-            let Some(cli) = host.cli() else { continue };
+        for &(host, ref cli) in hosts {
             // Codex has no enable/disable verb, so enabling re-installs and
             // disabling removes. Skip disabling a host that isn't present.
-            let result = if enabled {
-                self.install_plugin_into(plugin, host, &cli)
+            // Claude Code's disable keeps the plugin registered and only flips
+            // `enabledPlugins`, which the install path's `update` never flips
+            // back, so a registered plugin is enabled, not reinstalled.
+            let result = if enabled && host.plugin_present(plugin) {
+                self.run_plugin_cmd(plugin, cli, host, &host.enable_args(plugin))
+                    .or_else(|err| {
+                        if format!("{err:#}").contains("is already enabled") {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
+                    })
+            } else if enabled {
+                self.install_plugin_into(plugin, host, cli)
             } else if host.plugin_present(plugin) {
-                self.run_plugin_cmd(plugin, &cli, host, &host.disable_args(plugin))
+                self.run_plugin_cmd(plugin, cli, host, &host.disable_args(plugin))
             } else {
                 continue;
             };
@@ -8109,6 +8451,12 @@ impl ToolManager {
         }
         if !changed_any && !errors.is_empty() {
             bail!("toggling {id} failed: {}", errors.join("; "));
+        }
+        if !errors.is_empty() {
+            log::warn!(
+                "{id} toggled on some hosts but not all: {}",
+                errors.join("; ")
+            );
         }
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
@@ -8189,11 +8537,13 @@ impl ToolManager {
     }
 }
 
+const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
+
 /// Plugin addons ship marketplace plugins that both Claude Code and Codex can
 /// install through their own `<cli> plugin ...` managers. Their verbs differ
 /// (Claude has enable/disable/install/uninstall; Codex only add/remove), so
 /// each host carries its own argument vectors.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PluginHost {
     ClaudeCode,
     Codex,
@@ -8214,6 +8564,14 @@ impl PluginHost {
             PluginHost::ClaudeCode => crate::claude_cli::detect_claude_cli(),
             PluginHost::Codex => crate::claude_cli::detect_codex_cli(),
         }
+    }
+
+    /// Every host whose CLI is on PATH, paired with that CLI.
+    fn detected() -> Vec<(PluginHost, PathBuf)> {
+        PluginHost::ALL
+            .into_iter()
+            .filter_map(|host| host.cli().map(|cli| (host, cli)))
+            .collect()
     }
 
     fn marketplace_add_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
@@ -8250,6 +8608,14 @@ impl PluginHost {
             // than the flag reject the whole command with "unknown option".
             PluginHost::ClaudeCode => vec!["plugin", "install", plugin.plugin_ref],
             PluginHost::Codex => vec!["plugin", "add", plugin.plugin_ref],
+        }
+    }
+
+    /// Codex has no enable verb; `add` on a registered plugin is a no-op.
+    fn enable_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
+        match self {
+            PluginHost::ClaudeCode => vec!["plugin", "enable", plugin.plugin_ref],
+            PluginHost::Codex => self.install_args(plugin),
         }
     }
 
@@ -8362,6 +8728,7 @@ const SERENA_DASHBOARD_PORT_SCAN: u16 = 4;
 fn fetch_serena_output_tokens(base_url: &str) -> Option<u64> {
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_millis(300))
         .build()
         .ok()?;
@@ -8594,10 +8961,35 @@ fn apply_serena_gitignore(existing: &str, present: bool) -> Option<String> {
 /// serena, so failures are logged at info (never Sentry-escalated) and the
 /// install continues.
 fn set_serena_global_gitignore(present: bool) {
+    // Without the Command Line Tools /usr/bin/git is the xcrun stub, and
+    // spawning it pops the "install developer tools" dialog. There is no git
+    // for the ignore entry to serve then, so skip it (same probe as
+    // configure_vscode_process_wrapper).
+    if cfg!(target_os = "macos")
+        && !crate::proc::command("/usr/bin/xcode-select")
+            .arg("-p")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    {
+        return;
+    }
     let Some(path) = global_git_excludes_path() else {
         return;
     };
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    update_serena_gitignore_file(&path, present);
+}
+
+fn update_serena_gitignore_file(path: &Path, present: bool) {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            // Unreadable or not UTF-8: it is the user's file, and rewriting it
+            // from "" would drop every global ignore pattern they have.
+            log::info!("serena: reading {} failed: {err:#}", path.display());
+            return;
+        }
+    };
     let Some(updated) = apply_serena_gitignore(&existing, present) else {
         return;
     };
@@ -8607,7 +8999,7 @@ fn set_serena_global_gitignore(present: bool) {
             return;
         }
     }
-    if let Err(err) = crate::client_adapters::atomic_write(&path, updated.as_bytes()) {
+    if let Err(err) = crate::client_adapters::atomic_write(path, updated.as_bytes()) {
         log::info!("serena: updating {} failed: {err:#}", path.display());
     } else {
         log::info!(
@@ -9210,42 +9602,43 @@ pub(crate) fn listener_process(port: u16) -> Option<(String, u32)> {
 /// Windows since XP and need no elevation for our own processes.
 #[cfg(windows)]
 fn windows_listener(port: u16) -> Option<(String, u32)> {
-    let output = crate::proc::command("netstat")
-        .args(["-ano"])
-        .output()
-        .ok()?;
+    // Bounded, both: this runs ahead of the lifecycle lock (the argv gate)
+    // and inside it (the spawn pre-flight), and tasklist enumerates processes
+    // through the same WMI a wedged host stalls, which is why `kill_pid` and
+    // `ps_command_uncached` are bounded too. A tasklist that timed out keeps
+    // the pid under the placeholder, like one that could not run.
+    let mut netstat = crate::proc::command("netstat");
+    netstat.args(["-ano"]);
+    let output = crate::proc::output_with_timeout(netstat, Duration::from_secs(10)).ok()?;
     if !output.status.success() {
         return None;
     }
     let pid = parse_netstat_listener(&String::from_utf8_lossy(&output.stdout), port)?;
 
-    let listed = crate::proc::command("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-        .ok();
-    let image = occupant_image(
-        listed
-            .as_ref()
-            .map(|out| String::from_utf8_lossy(&out.stdout))
-            .as_deref(),
-    )?;
+    let mut tasklist = crate::proc::command("tasklist");
+    tasklist.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    let listed = crate::proc::output_with_timeout(tasklist, Duration::from_secs(10)).ok();
+    let image = occupant_image(listed.as_ref())?;
     Some((image, pid))
 }
 
-/// The occupant name for `pid`, from `tasklist` stdout (`None` argument when
-/// tasklist itself could not be run).
+/// The occupant name for `pid`, from `tasklist`'s output (`None` argument when
+/// tasklist itself could not be run or timed out).
 ///
 /// A pid we could not name is still worth reporting and gating a kill on, so a
-/// tasklist we could not run keeps the pid under a placeholder. A tasklist that
-/// RAN and matched nothing is the opposite: proof that netstat's row named a
-/// holder which has since exited, so there is no listener to report. That case
-/// used to arrive as `Foreign { name: "unnamed process" }`, which told the user
-/// to end a pid their Task Manager no longer had (RUST-EE, an update relaunch)
-/// and blocked the `SO_REUSEADDR` rebind that clears a draining port.
+/// tasklist we could not run keeps the pid under a placeholder, and so does one
+/// that exited non-zero: a broken WMI fails it fast with no CSV row, and
+/// reading that as "gone" let the intercept `SO_REUSEADDR`-bind over a live
+/// listener. A tasklist that SUCCEEDED and matched nothing is the opposite:
+/// proof that netstat's row named a holder which has since exited, so there is
+/// no listener to report. That case used to arrive as
+/// `Foreign { name: "unnamed process" }`, which told the user to end a pid
+/// their Task Manager no longer had (RUST-EE, an update relaunch) and blocked
+/// the `SO_REUSEADDR` rebind that clears a draining port.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn occupant_image(tasklist_stdout: Option<&str>) -> Option<String> {
-    match tasklist_stdout {
-        Some(text) => parse_tasklist_image(text),
+fn occupant_image(tasklist: Option<&std::process::Output>) -> Option<String> {
+    match tasklist.filter(|out| out.status.success()) {
+        Some(out) => parse_tasklist_image(&String::from_utf8_lossy(&out.stdout)),
         None => Some("unnamed process".to_string()),
     }
 }
@@ -9305,7 +9698,9 @@ fn netstat_rows_on_port(text: &str, port: u16) -> Vec<String> {
 /// `netstat_rows_on_port` for the live machine, as one Sentry-extra string.
 #[cfg(windows)]
 pub(crate) fn port_socket_rows(port: u16) -> String {
-    match crate::proc::command("netstat").args(["-ano"]).output() {
+    let mut netstat = crate::proc::command("netstat");
+    netstat.args(["-ano"]);
+    match crate::proc::output_with_timeout(netstat, Duration::from_secs(10)) {
         Ok(out) => {
             let rows = netstat_rows_on_port(&String::from_utf8_lossy(&out.stdout), port);
             if rows.is_empty() {
@@ -9314,7 +9709,7 @@ pub(crate) fn port_socket_rows(port: u16) -> String {
                 rows.join("\n")
             }
         }
-        Err(e) => format!("netstat failed: {e}"),
+        Err(e) => format!("netstat failed: {e:?}"),
     }
 }
 
@@ -9415,6 +9810,7 @@ fn find_listener_command(port: u16) -> String {
 pub(crate) fn probe_backend_readyz_ok(port: u16) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_millis(800))
         .build()
     else {
@@ -9426,13 +9822,49 @@ pub(crate) fn probe_backend_readyz_ok(port: u16) -> bool {
     )
 }
 
-/// Poll until `port` is bindable or `timeout` elapses. Returns true once the
-/// port is free. A killed listener's socket is released as soon as the owning
+/// The backend's `/readyz` body, whatever the status: a 503 (a gating check
+/// down) carries the same `checks`. None when nothing answers with JSON. 5s,
+/// the reachability probe's budget: a busy backend answers /readyz slowly.
+fn fetch_backend_readyz(port: u16) -> Option<Value> {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .tls_built_in_root_certs(false)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    client
+        .get(format!("http://127.0.0.1:{port}/readyz"))
+        .send()
+        .ok()?
+        .json()
+        .ok()
+}
+
+/// Kompress state from a `/readyz` body's `checks.kompress` (every wheel since
+/// 0.35.0): `Some(true)` once the model is loaded, eagerly or lazily;
+/// `Some(false)` while disabled, not installed or still warming. None when the
+/// wheel predates the field.
+pub(crate) fn readyz_kompress_state(body: &Value) -> Option<bool> {
+    let check = body.get("checks")?.get("kompress")?;
+    // A disabled component reads `ready: true`, so `enabled` decides first.
+    Some(check.get("enabled")?.as_bool()? && check.get("ready")?.as_bool()?)
+}
+
+/// Poll until `pid` has let go of `port` or `timeout` elapses. Returns true
+/// once it has. A killed listener's socket is released as soon as the owning
 /// process dies, so this normally returns within a couple of poll intervals.
-fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
+///
+/// A bindable port alone is no proof: on macOS std's SO_REUSEADDR lets the
+/// 127.0.0.1 bind succeed over a WILDCARD listener (see `diagnose_proxy_port`),
+/// so a SIGTERM-deaf HEADROOM_HOST=0.0.0.0 orphan read as gone straight after
+/// the SIGTERM and never got the forced kill. The listener lookup only runs
+/// once the bind succeeds, so it normally costs one lookup per wait.
+fn wait_for_port_free(port: u16, pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && listener_process(port).map(|(_, holder)| holder) != Some(pid)
+        {
             return true;
         }
         if Instant::now() >= deadline {
@@ -9515,9 +9947,16 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     // NOT done for the intercept reclaim, whose target can be a desktop twin
     // that does own a window and needs the clean shutdown to flush state.
     kill_pid(pid, cfg!(windows));
-    if !wait_for_port_free(port, Duration::from_secs(3)) {
-        kill_pid(pid, true);
-        if !wait_for_port_free(port, Duration::from_secs(2)) {
+    if !wait_for_port_free(port, pid, Duration::from_secs(3)) {
+        // Re-verify before forcing: the first kill can have worked (Windows
+        // goes straight to /F) and left the port held only by sockets still
+        // closing, while the pid went to an unrelated process in those 3s,
+        // and `taskkill /T /F` would take that process's whole tree. The wait
+        // still runs, so a draining port gets the same 5s it always had.
+        if pid_is_headroom_backend(pid) {
+            kill_pid(pid, true);
+        }
+        if !wait_for_port_free(port, pid, Duration::from_secs(2)) {
             bail!("{}", format_already_running_bail(port));
         }
     }
@@ -9575,7 +10014,7 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
     // Sentry path -- same split `reclaim_orphan_proxy` already uses.
     log::info!("[proxy_intercept] reclaiming stranded Headroom process pid {pid} on port {port}");
     kill_pid(pid, false);
-    if !wait_for_port_free(port, Duration::from_secs(3)) {
+    if !wait_for_port_free(port, pid, Duration::from_secs(3)) {
         // Re-verify before forcing: in those 3s the pid can exit and be
         // reused by an unrelated process, and the identity check above was
         // about the old one.
@@ -9583,7 +10022,7 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
             return false;
         }
         kill_pid(pid, true);
-        if !wait_for_port_free(port, Duration::from_secs(2)) {
+        if !wait_for_port_free(port, pid, Duration::from_secs(2)) {
             return false;
         }
     }
@@ -9609,9 +10048,10 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
     true
 }
 
-/// True when `pid` runs the same executable as this process. The strictest
-/// identity claim available: an updater-stranded old instance runs from the
-/// exact same install path as us, while any foreign process cannot.
+/// True when `pid` runs the same executable as this process, as this same user
+/// (see `ps_row_command_if_owned_by`). The strictest identity claim available:
+/// an updater-stranded old instance runs from the exact same install path as
+/// us, while any foreign process cannot.
 fn pid_is_headroom_desktop_twin(pid: u32) -> bool {
     let Some(me) = std::env::current_exe()
         .ok()
@@ -9630,14 +10070,43 @@ fn pid_is_headroom_desktop_twin(pid: u32) -> bool {
     #[cfg(not(windows))]
     let theirs = {
         let Ok(output) = crate::proc::command("/bin/ps")
-            .args(["-o", "command=", "-p", &pid.to_string()])
+            .args(["-o", "uid=", "-o", "command=", "-p", &pid.to_string()])
             .output()
         else {
             return false;
         };
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let my_uid = unsafe { libc::getuid() };
+        let row = String::from_utf8_lossy(&output.stdout);
+        let Some(command) = ps_row_command_if_owned_by(&row, my_uid) else {
+            return false;
+        };
+        command.to_owned()
     };
     exe_identity_matches(&theirs, &me)
+}
+
+/// The command of a `ps -o uid= -o command=` row, when `uid` owns it.
+///
+/// One install serves every user of a Mac (/Applications) or a .deb, so the
+/// same executable path is not the same owner: another signed-in user's
+/// Headroom passes the path check, and treating it as our twin would make this
+/// window its spectator (routing this user's credentials into it) or point a
+/// reclaim kill at it. Windows needs no such check: the NSIS install is per
+/// user, so the path already differs, and OpenProcess is denied on another
+/// user's process anyway.
+#[cfg_attr(windows, allow(dead_code))]
+fn ps_row_command_if_owned_by(row: &str, uid: u32) -> Option<&str> {
+    let (owner, command) = row.trim_start().split_once(char::is_whitespace)?;
+    (owner.parse::<u32>().ok()? == uid).then_some(command)
+}
+
+/// Whether `port` is served by another window of this same Headroom, run by
+/// this same user. `listener_process` names only what it can see, so `None`
+/// (another user's socket, which lsof and ss cannot see, or a host whose
+/// policy blocks netstat) is never ours.
+pub(crate) fn port_held_by_desktop_twin(port: u16) -> bool {
+    listener_process(port).is_some_and(|(_, pid)| pid_is_headroom_desktop_twin(pid))
 }
 
 /// True when `listener_exe` -- a bare exe path (Windows `Get-Process .Path`)
@@ -9898,7 +10367,6 @@ fn headroom_python_startup_args() -> Vec<String> {
         "--port".to_string(),
         headroom_proxy_port(),
         "--no-http2".to_string(),
-        "--log-messages".to_string(),
         "--no-rate-limit".to_string(),
     ]
 }
@@ -10032,6 +10500,58 @@ fn cc_switch_proxy_url() -> String {
     )
 }
 
+/// Where the cc-switch guard in `SITECUSTOMIZE_PY` records, as `{"url": ...}`,
+/// the base URL the reconciler replaced in the client's settings.json. The
+/// backend writes it (tmp + os.replace) on every capture and removes it when
+/// settings.json goes back to Claude Official; its next instance reseeds from
+/// it. The desktop restores it on disable, since quit and pause restore
+/// settings.json after the backend (and its in-memory capture) is gone, and
+/// drops it once settings.json has moved off that URL (client_adapters).
+pub(crate) fn cc_switch_capture_path() -> PathBuf {
+    crate::storage::config_file(&crate::storage::app_data_dir(), "cc-switch-upstream.json")
+}
+
+/// The URL in [`cc_switch_capture_path`], when it holds a usable one.
+pub(crate) fn cc_switch_captured_upstream() -> Option<String> {
+    let raw = std::fs::read_to_string(cc_switch_capture_path()).ok()?;
+    let url = serde_json::from_str::<Value>(&raw).ok()?["url"]
+        .as_str()?
+        .to_string();
+    (url.starts_with("http://") || url.starts_with("https://")).then_some(url)
+}
+
+pub(crate) fn clear_cc_switch_capture() {
+    remove_cc_switch_file(&cc_switch_capture_path());
+}
+
+/// Present while Headroom routes Claude Code's settings.json (the Claude Code
+/// or VS Code connector applied it), absent once a disable (connector off,
+/// pause, quit) hands it back. The cc-switch guard in `SITECUSTOMIZE_PY` reads
+/// it beside the capture file: without it, the reconciler took the URL a
+/// disable restored straight back, so the card said disconnected while every
+/// request still went through Headroom.
+pub(crate) fn cc_switch_routed_path() -> PathBuf {
+    cc_switch_capture_path().with_file_name("cc-switch-routed")
+}
+
+pub(crate) fn set_cc_switch_routed(routed: bool) {
+    let path = cc_switch_routed_path();
+    if !routed {
+        return remove_cc_switch_file(&path);
+    }
+    if let Err(err) = crate::client_adapters::atomic_write(&path, b"") {
+        log::warn!("writing {} failed: {err:#}", path.display());
+    }
+}
+
+fn remove_cc_switch_file(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            log::warn!("removing {} failed: {err}", path.display());
+        }
+    }
+}
+
 fn cc_switch_reconcile_for_spawn(sitecustomize_injected: bool) -> &'static str {
     if sitecustomize_injected {
         "1"
@@ -10050,9 +10570,11 @@ fn headroom_entrypoint_startup_args(
     // unconditionally, which surfaced as SSLV3_ALERT_BAD_RECORD_MAC under
     // multi-tab concurrency. The flag is belt-and-suspenders against a future
     // runtime regressing on the env var — but only on runtimes whose click
-    // entrypoint defines it (see runtime_supports_no_http2). --log-messages
-    // stores full request/response bodies so the desktop's Activity tab can
-    // render the live transformations feed.
+    // entrypoint defines it (see runtime_supports_no_http2). No --log-messages:
+    // it keeps the last 100 full prompts and completions readable from
+    // /transformations/feed by any local account, and the desktop reads only
+    // the per-request numbers (include_messages=0). HEADROOM_LOG_MESSAGES=1
+    // in the launch environment still opts back in.
     let mut args = vec![
         "proxy".to_string(),
         "--port".to_string(),
@@ -10061,7 +10583,6 @@ fn headroom_entrypoint_startup_args(
     if runtime_supports_no_http2(installed_version) {
         args.push("--no-http2".to_string());
     }
-    args.push("--log-messages".to_string());
     // The wheel's per-key limiter (100k tokens/min default) started counting
     // tokens in 0.39.0 (#3350). Its bucket caps at the per-minute rate, so one
     // request above 100k tokens can never pass: every 1M-context session past
@@ -10125,7 +10646,7 @@ fn headroom_entrypoint_startup_args(
 /// With auto-learning off the learn flags are not passed, so they drop out of
 /// the signature too.
 fn expected_proxy_arg_signature(learn_enabled: bool) -> Vec<&'static str> {
-    let mut flags = vec!["--port", "--log-messages", "--no-rate-limit"];
+    let mut flags = vec!["--port", "--no-rate-limit"];
     if learn_enabled {
         flags.extend([
             "--learn",
@@ -10151,9 +10672,10 @@ pub fn running_proxy_argv() -> Option<String> {
 /// readyz gate (a 404 there deliberately counts as reachable), so the listener
 /// is the one fact that resolves the ambiguity. The identity string alone
 /// cannot: "python3.12 (pid 7)" is our managed runtime on one host and an
-/// unrelated venv on the next, so ownership goes through
-/// `pid_is_headroom_backend`, which checks argv (or the executable path on
-/// Windows) rather than the process name.
+/// unrelated venv on the next, so ownership goes through the identity checks
+/// (argv, or the executable path on Windows) rather than the process name.
+/// "Ours" includes this very process: the desktop's own intercept is what
+/// normally holds 6767, and reading it as foreign silenced every real 4xx.
 ///
 /// Best-effort: `None` where lsof is unavailable (Windows) or no listener could
 /// be resolved. That is "unknown", not "foreign" -- callers must not read it as
@@ -10161,7 +10683,10 @@ pub fn running_proxy_argv() -> Option<String> {
 pub(crate) fn listener_identity_and_ownership(port: u16) -> Option<(String, bool)> {
     let (cmd, pid) = listener_process(port)?;
     let identity = format_listener_identity(&cmd, pid, ps_command(pid).as_deref());
-    Some((identity, pid_is_headroom_backend(pid)))
+    let ours = pid == std::process::id()
+        || pid_is_headroom_desktop_twin(pid)
+        || pid_is_headroom_backend(pid);
+    Some((identity, ours))
 }
 
 fn format_listener_identity(cmd: &str, pid: u32, argv: Option<&str>) -> String {
@@ -10201,7 +10726,17 @@ fn proxy_argv_contains_expected_flags(argv: &str, learn_enabled: bool) -> bool {
     if !learn_enabled && argv_contains_flag(argv, "--learn") {
         return false;
     }
-    expected_proxy_arg_signature(learn_enabled)
+    // Older builds passed --log-messages; such a backend still holds full
+    // prompt and completion bodies, so restart it rather than adopt it.
+    if argv_contains_flag(argv, "--log-messages") {
+        return false;
+    }
+    // The `-m headroom.proxy.server` fallback cannot take the learn flags
+    // (see headroom_python_startup_args), so never expect them from it:
+    // otherwise every ensure pass kills a healthy fallback backend and
+    // respawns it onto the same fallback.
+    let learn_expected = learn_enabled && !argv_contains_flag(argv, "headroom.proxy.server");
+    expected_proxy_arg_signature(learn_expected)
         .iter()
         .all(|flag| argv_contains_flag(argv, flag))
 }
@@ -10316,9 +10851,11 @@ fn log_tail(path: &Path, max_bytes: u64) -> String {
         use std::io::Seek;
         let _ = f.seek(std::io::SeekFrom::Start(len - max_bytes));
     }
-    let mut buf = String::new();
-    let _ = f.read_to_string(&mut buf);
-    buf.trim().to_string()
+    // Bytes, not read_to_string: the seek can land inside a multi-byte
+    // character, and read_to_string then returns nothing at all.
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).trim().to_string()
 }
 
 fn rotate_log_if_large(path: &Path) {
@@ -11311,11 +11848,39 @@ pub fn claude_project_memory_file(project_path: &str) -> PathBuf {
         .join("MEMORY.md")
 }
 
+/// Claude Code's `~/.claude/projects` folder name for `project_path`, ported
+/// from its sanitizer (2.1.284): every UTF-16 unit outside [a-zA-Z0-9] becomes
+/// '-', and a name over 200 characters is truncated with a base-36 hash of the
+/// path appended. Mapping only '/' missed every Windows project and any path
+/// with a '.', '_' or space, so MEMORY.md was never found for them.
 fn encode_claude_project_folder_name(project_path: &str) -> String {
-    format!(
-        "-{}",
-        project_path.trim_start_matches('/').replace('/', "-")
-    )
+    const MAX_LEN: usize = 200;
+    let units: Vec<u16> = project_path.encode_utf16().collect();
+    let name: String = units
+        .iter()
+        .map(|&u| match char::from_u32(u32::from(u)) {
+            Some(c) if c.is_ascii_alphanumeric() => c,
+            _ => '-',
+        })
+        .collect();
+    if name.len() <= MAX_LEN {
+        return name;
+    }
+    // JS `(h << 5) - h + charCode | 0`, then `Math.abs(h).toString(36)`.
+    let hash = units.iter().fold(0i32, |h, &u| {
+        (h << 5).wrapping_sub(h).wrapping_add(i32::from(u))
+    });
+    let mut n = hash.unsigned_abs();
+    let mut digits = Vec::new();
+    loop {
+        digits.push(char::from_digit(n % 36, 36).unwrap_or('0'));
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    let hash36: String = digits.into_iter().rev().collect();
+    format!("{}-{hash36}", &name[..MAX_LEN])
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -11383,6 +11948,12 @@ fn bootstrap_requirements_lock_for_target(os: &str) -> &'static str {
 /// Ceiling for `headroom mcp install` (see `install_headroom_mcp`).
 const MCP_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Silence ceiling for a `claude`/`codex` plugin verb. At worst a verb clones
+/// a small marketplace repo; one quiet for three minutes is stuck, not slow,
+/// and without a bound it held addon install, and Uninstall before its
+/// cleanup, for good.
+const PLUGIN_CMD_SILENCE_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Ceiling for one venv/ensurepip/pip-probe step. Minutes on a Defender-
 /// scanned fresh install is normal; never finishing is not, and before this
 /// a stalled interpreter (AV hold, DLL-load deadlock) hung bootstrap forever
@@ -11417,22 +11988,6 @@ fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&ledger).ok()
 }
 
-/// Drop the output-shaper A/B control arm left over from the abandoned 1%
-/// holdout, exactly once.
-///
-/// Those samples predate the current shaper and were collected under a policy
-/// that never gathered enough of them to mean anything, so folding them into
-/// the 3% arm would poison it from the first request. Clearing them on every
-/// spawn is not an option either: the arm is live data now, and this runs each
-/// time the proxy starts.
-///
-/// The stamp sits beside the ledger on purpose. A reset that removes
-/// `~/.headroom` takes the control samples with it, so the stamp going too is
-/// correct — there is nothing left to purge either way.
-///
-/// Best-effort throughout: never touch a missing or unparseable ledger, and
-/// only rewrite when there is control data to drop. Uses `atomic_write` so a
-/// crash mid-write cannot truncate the ledger.
 /// Holdout once this machine's measured estimate is promotable.
 const OUTPUT_HOLDOUT_STEADY: &str = "0.03";
 /// Holdout until then. `assign_arm` is one nested threshold on one hash
@@ -11464,6 +12019,23 @@ fn output_holdout_fraction() -> &'static str {
     holdout
 }
 
+/// Drop the output-shaper A/B control arm left over from the abandoned 1%
+/// holdout, exactly once.
+///
+/// Those samples predate the current shaper and were collected under a policy
+/// that never gathered enough of them to mean anything, so folding them into
+/// the 3% arm would poison it from the first request. Clearing them on every
+/// spawn is not an option either: the arm is live data now, and this runs each
+/// time the proxy starts.
+///
+/// The stamp sits beside the ledger on purpose. A reset that removes
+/// `~/.headroom` takes the control samples with it, so the stamp going too is
+/// correct: there is nothing left to purge either way.
+///
+/// Best-effort throughout: a missing ledger holds nothing legacy and is only
+/// stamped, an unparseable one is never touched, and the ledger is only
+/// rewritten when there is control data to drop. Uses `atomic_write` so a
+/// crash mid-write cannot truncate the ledger.
 fn purge_legacy_output_savings_control_arm_once() {
     let Some(path) = output_savings_ledger_path() else {
         return;
@@ -11472,8 +12044,12 @@ fn purge_legacy_output_savings_control_arm_once() {
     if stamp.exists() {
         return;
     }
-    let Ok(bytes) = std::fs::read(&path) else {
-        return;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        // No ledger, nothing legacy: whatever the proxy writes from here on
+        // is the live arm, so stamp now or the next spawn would clear it.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return,
     };
     if let Some(out) = ledger_bytes_without_control(&bytes) {
         if let Err(err) = crate::client_adapters::atomic_write(&path, &out) {
@@ -11514,10 +12090,11 @@ fn verbosity_baseline_present() -> bool {
 }
 
 /// Real project root (the transcript `cwd`) of the Claude Code project with the
-/// most transcript bytes under `~/.claude/projects`. Reading `cwd` from a
-/// transcript avoids lossily decoding the mangled `~/.claude/projects` dir name
-/// — it is exactly the path headroom's plugin resolves to, so `--project <cwd>`
-/// matches. Returns `None` when no non-empty transcript exists.
+/// most transcript bytes under `~/.claude/projects`, among those no bigger than
+/// `HEADROOM_BASELINE_SEED_MAX_BYTES`. Reading `cwd` from a transcript avoids
+/// lossily decoding the mangled `~/.claude/projects` dir name; it is exactly
+/// the path headroom's plugin resolves to, so `--project <cwd>` matches.
+/// Returns `None` when no non-empty transcript fits the cap.
 fn busiest_claude_project_cwd() -> Option<String> {
     // client_adapters::home_dir, not a bare $HOME: a Windows GUI process has
     // no HOME env var, and bailing here silently skipped verbosity-baseline
@@ -11525,9 +12102,12 @@ fn busiest_claude_project_cwd() -> Option<String> {
     let projects_dir = crate::client_adapters::home_dir()
         .join(".claude")
         .join("projects");
+    busiest_claude_project_cwd_in(&projects_dir, HEADROOM_BASELINE_SEED_MAX_BYTES)
+}
 
+fn busiest_claude_project_cwd_in(projects_dir: &Path, max_bytes: u64) -> Option<String> {
     let mut best: Option<(u64, PathBuf)> = None;
-    for entry in std::fs::read_dir(&projects_dir).ok()?.flatten() {
+    for entry in std::fs::read_dir(projects_dir).ok()?.flatten() {
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
@@ -11543,7 +12123,7 @@ fn busiest_claude_project_cwd() -> Option<String> {
                 }
             }
         }
-        if bytes > 0 && best.as_ref().is_none_or(|(b, _)| bytes > *b) {
+        if bytes > 0 && bytes <= max_bytes && best.as_ref().is_none_or(|(b, _)| bytes > *b) {
             best = Some((bytes, dir));
         }
     }
@@ -11667,10 +12247,13 @@ fn path_with_binary_dir(binary: &Path) -> std::ffi::OsString {
 /// `ValueError: Unknown scheme for proxy URL` for anything outside
 /// http/https/socks5/socks5h -- socks4 in particular (v2rayN-style local
 /// proxies advertise socks4://127.0.0.1:10808). An empty value is how users
-/// disable a proxy; httpx ignores it, so it passes.
+/// disable a proxy; httpx ignores it, so it passes. A value without `://`
+/// passes too: httpx's `get_environment_proxies` mounts it as `http://<value>`,
+/// so `HTTPS_PROXY=proxy.corp:3128` is a working proxy, not a crash.
 fn httpx_supports_proxy_url(value: &str) -> bool {
     let v = value.trim().to_ascii_lowercase();
     v.is_empty()
+        || !v.contains("://")
         || ["http://", "https://", "socks5://", "socks5h://"]
             .iter()
             .any(|scheme| v.starts_with(scheme))
@@ -11812,7 +12395,8 @@ fn reg_dword_is_set(value: &str) -> bool {
 /// urllib's `getproxies_registry` expansion of the `ProxyServer` string,
 /// restricted to the keys httpx mounts (http/https). A value without `=`
 /// applies to every protocol; `proto=addr` pairs are per-protocol; an address
-/// without a scheme inherits its protocol name as the scheme. A keyed
+/// without a scheme gets `http://` for http/https ("the default proxy type of
+/// Windows is HTTP") and `socks://` for socks, never `https://`. A keyed
 /// `socks=` entry is NOT harmless: CPython backfills missing http/https keys
 /// with `socks4://addr` ("the default SOCKS proxy type of Windows is SOCKS4",
 /// urllib/request.py getproxies_registry) -- the RUST-B3 crash was exactly
@@ -11844,14 +12428,17 @@ fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, Strin
             continue;
         }
         // urllib keeps an existing scheme (`^([^/:]+)://`) and otherwise
-        // prefixes the protocol name.
+        // prefixes http:// (socks:// for socks). An https:// prefix would
+        // make httpx speak TLS to a plain CONNECT proxy.
         let has_scheme = addr
             .split_once("://")
             .is_some_and(|(scheme, _)| !scheme.contains('/') && !scheme.contains(':'));
         let url = if has_scheme {
             addr.to_string()
+        } else if proto == "socks" {
+            format!("socks://{addr}")
         } else {
-            format!("{proto}://{addr}")
+            format!("http://{addr}")
         };
         if proto == "socks" {
             // urllib's backfill rewrites a bare `socks://` to `socks4://`;
@@ -12862,6 +13449,7 @@ where
 
     let mut cmd = build_command(binary, args, cwd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::proc::own_process_group(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -12875,7 +13463,9 @@ where
     let tx_stderr = tx.clone();
     drop(tx);
 
-    let stdout_handle = std::thread::spawn(move || {
+    // Never joined: a descendant that inherited the pipes can hold them open
+    // long after the child is gone. They end when its last writer closes.
+    std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             let _ = tx_stdout.send(StreamedLine {
                 line,
@@ -12883,7 +13473,7 @@ where
             });
         }
     });
-    let stderr_handle = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             let _ = tx_stderr.send(StreamedLine {
                 line,
@@ -12904,11 +13494,17 @@ where
     // old wait-forever behavior for callers whose children are legitimately
     // quiet for long stretches.
     let mut last_output = Instant::now();
-    // Every caller of this function runs pip, so the unpack-phase check lives
-    // here rather than behind a caller knob.
+    let mut last_tick = last_output;
+    let mut exited_at: Option<Instant> = None;
+    // The unpack-phase check lives here rather than behind a caller knob: it
+    // only matches pip's own output, so the plugin CLI callers never trip it.
     let mut silence_limit = silence_timeout;
     loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        let received = rx.recv_timeout(Duration::from_millis(500));
+        if let Some(gap) = crate::proc::suspend_gap(&mut last_tick) {
+            last_output = crate::proc::past_suspend(last_output, gap);
+        }
+        match received {
             Ok(streamed) => {
                 last_output = Instant::now();
                 silence_limit = widen_silence_for_unpack(silence_limit, &streamed.line);
@@ -12924,40 +13520,43 @@ where
             }
             // Pipes closed: the child is exiting; fall through to wait().
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let Some(limit) = silence_limit else {
-                    continue;
-                };
-                if last_output.elapsed() >= limit {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // Do NOT join the reader threads here: an orphaned
-                    // grandchild (sh's `sleep`, a wedged pip subprocess) can
-                    // hold the pipe open indefinitely after the kill, and a
-                    // blocked join would re-create the very hang this branch
-                    // exists to end. The buffers already hold everything
-                    // received; the readers exit on their own when the pipe
-                    // finally closes.
-                    stderr_buf.push_str(&format!(
-                        "\n[headroom] killed: no output for {}s (stalled installer)\n",
-                        limit.as_secs()
-                    ));
-                    return Err(anyhow::Error::new(CommandFailure {
-                        program: binary.display().to_string(),
-                        args: args.iter().map(|s| s.to_string()).collect(),
-                        stdout: stdout_buf,
-                        stderr: stderr_buf,
-                        exit_code: None,
-                        signal: None,
-                    }));
-                }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        // Exit, not EOF, ends the wait: a descendant that inherited the pipes
+        // (an agent CLI's background updater, sh's `sleep`) keeps them open
+        // for as long as it lives (RUST-BH). What the child itself wrote is in
+        // the pipe by then; the grace lets the readers hand it over.
+        if exited_at.is_none() && matches!(child.try_wait(), Ok(Some(_))) {
+            exited_at = Some(Instant::now());
+        }
+        if let Some(at) = exited_at {
+            if at.elapsed() >= crate::proc::PIPE_DRAIN_GRACE {
+                break;
             }
+            continue;
+        }
+        let Some(limit) = silence_limit else {
+            continue;
+        };
+        if last_output.elapsed() >= limit {
+            crate::proc::kill_tree(&mut child);
+            let _ = child.wait();
+            stderr_buf.push_str(&format!(
+                "\n[headroom] killed: no output for {}s (stalled installer)\n",
+                limit.as_secs()
+            ));
+            return Err(anyhow::Error::new(CommandFailure {
+                program: binary.display().to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+                exit_code: None,
+                signal: None,
+            }));
         }
     }
 
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
-
+    // Already reaped when it exited above; `wait` then returns that status.
     let status = child
         .wait()
         .with_context(|| format!("waiting for {} {}", binary.display(), args.join(" ")))?;
@@ -12989,6 +13588,7 @@ fn run_command_with_timeout(
 ) -> Result<()> {
     let mut cmd = build_command(binary, args, cwd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::proc::own_process_group(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -12996,9 +13596,13 @@ fn run_command_with_timeout(
     let stdout_drain = crate::proc::PipeDrain::spawn(child.stdout.take());
     let stderr_drain = crate::proc::PipeDrain::spawn(child.stderr.take());
 
-    let started = Instant::now();
+    let mut started = Instant::now();
+    let mut last_tick = started;
     let mut timed_out = false;
     let status = loop {
+        if let Some(gap) = crate::proc::suspend_gap(&mut last_tick) {
+            started = crate::proc::past_suspend(started, gap);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
@@ -13424,13 +14028,14 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use chrono::Local;
+    use chrono::{DateTime, Utc};
 
     use super::codex_list_line_installed;
     #[cfg(windows)]
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
     use super::stalled_prefetch_cause;
+    use super::update_serena_gitignore_file;
     use super::{
         acquire_artifact_download_lock, publish_inflight_download, ARTIFACT_DOWNLOAD_LOCK,
     };
@@ -13444,23 +14049,24 @@ mod tests {
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
-        looks_like_corrupt_venv_error, netstat_rows_on_port, occupant_image, parse_lsof_listener,
-        parse_major_minor_patch, parse_netstat_listener, parse_pid_from_lsof_detail,
-        parse_ss_listener, parse_tasklist_image, path_with_binary_dir, pending_addon_update,
-        pinned_headroom_release, pip_failure_category, pip_line_to_progress, plugin_addon,
-        plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
-        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
-        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
-        CommandFailure, HeadroomRelease, ManagedRuntime, OutdatedClaudeCli, PipOutputCapture,
-        PluginHost, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
-        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
+        listener_identity_and_ownership, looks_like_corrupt_venv_error, netstat_rows_on_port,
+        occupant_image, parse_lsof_listener, parse_major_minor_patch, parse_netstat_listener,
+        parse_pid_from_lsof_detail, parse_ss_listener, parse_tasklist_image, path_with_binary_dir,
+        pending_addon_update, pinned_headroom_release, pip_failure_category, pip_line_to_progress,
+        plugin_addon, plugin_install_failure_category, pre_upstream_concurrency,
+        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
+        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
+        requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_plugin_hosts,
+        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env,
+        verify_sha256_file, wait_for_port_free, wheel_download_failure_category,
+        widen_silence_for_unpack, CommandFailure, HeadroomRelease, ManagedRuntime,
+        OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
+        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
+        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
+        PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -13580,6 +14186,30 @@ mod tests {
     }
 
     #[test]
+    fn serena_gitignore_never_clobbers_an_excludes_file_it_cannot_read() {
+        let root = unique_temp_dir("serena-gitignore-unreadable");
+        fs::create_dir_all(&root).expect("root");
+        // A cp1252 "e acute" from a Windows editor: not UTF-8, so
+        // read_to_string fails. Reading that as "" replaced every global
+        // ignore pattern (.env, *.pem) with our two lines.
+        let path = root.join("ignore");
+        let original = b"# caf\xe9 secrets\n.env\n*.pem\n".to_vec();
+        fs::write(&path, &original).expect("seed");
+        update_serena_gitignore_file(&path, true);
+        assert_eq!(fs::read(&path).expect("read back"), original);
+        update_serena_gitignore_file(&path, false);
+        assert_eq!(fs::read(&path).expect("read back"), original);
+
+        // A file that does not exist yet still gets the block.
+        let fresh = root.join("git").join("ignore");
+        update_serena_gitignore_file(&fresh, true);
+        assert!(fs::read_to_string(&fresh)
+            .expect("created")
+            .ends_with(".serena/\n"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn apply_serena_dashboard_interface_replaces_only_unset_default() {
         // Unset key (serena's generated default) -> forced to browser.
         assert_eq!(
@@ -13685,6 +14315,29 @@ mod tests {
         std::fs::write(&ledger, with_control).unwrap();
         purge_legacy_output_savings_control_arm_once();
         assert_eq!(std::fs::read(&ledger).unwrap(), with_control);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_ledger_stamps_the_purge_so_the_live_arm_survives() {
+        let root =
+            std::env::temp_dir().join(format!("headroom-purge-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _guard = HomeGuard::new(&root);
+        let ledger = root.join(".headroom").join("output_savings.json");
+
+        // First spawn on a fresh install: no ledger, so nothing legacy exists.
+        purge_legacy_output_savings_control_arm_once();
+
+        // The proxy then fills the live holdout arm. The next spawn must not
+        // mistake it for the abandoned 1% one.
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        let live =
+            br#"{"baseline":{"glob":{"n":5}},"treatment":{"k":{"n":3}},"control":{"k":{"n":2}}}"#;
+        std::fs::write(&ledger, live).unwrap();
+        purge_legacy_output_savings_control_arm_once();
+        assert_eq!(std::fs::read(&ledger).unwrap(), live);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -13917,6 +14570,99 @@ mod tests {
         assert!(py.contains("_rewrite_delta"));
         // ...and the kill switch is honored.
         assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
+    }
+
+    /// Runs `body` against the shipped `_HdCgGuard` bound into the installed
+    /// wheel. The probe gets `G` (the class), `ev(name, payload, nl)` (one SSE
+    /// event) and `start`/`nudged` (an armed 185k message_start on a 200k
+    /// window, and its 190k rewrite). None when there is no managed runtime.
+    fn run_context_guard_probe(tag: &str, body: &str) -> Option<std::process::Output> {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-cg-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let script = format!(
+            r#"import json, sitecustomize
+G = sitecustomize._HdCgGuard
+def ev(name, payload, nl):
+    data = json.dumps(payload, separators=(",", ":"))
+    return f"event: {{name}}{{nl}}data: {{data}}{{nl}}{{nl}}".encode()
+def usage(n):
+    return {{"input_tokens": n, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}
+start = {{"type": "message_start", "message": {{"id": "m", "usage": usage(185000)}}}}
+nudged = {{"type": "message_start", "message": {{"id": "m", "usage": usage(190000)}}}}
+{body}
+print("OK context guard")
+"#
+        );
+        let out = crate::proc::command(&python)
+            .arg("-c")
+            .arg(script)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            .output()
+            .expect("run context guard probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(out)
+    }
+
+    fn assert_context_guard_probe(out: std::process::Output) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("OK context guard"),
+            "context guard misbehaved against the installed wheel.\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn context_guard_streams_crlf_framed_events_against_the_installed_wheel() {
+        // A gateway that frames SSE with CRLF never sends b"\n\n"; the guard
+        // must still release each event as it completes (and keep its
+        // framing) instead of holding the whole response back.
+        let Some(out) = run_context_guard_probe(
+            "crlf",
+            r#"g = G(200000, 200000)
+out = g.feed(ev("message_start", start, "\r\n"))
+assert out == ev("message_start", nudged, "\r\n"), out
+ping = b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n"
+assert g.feed(ping) == ping and not g.done"#,
+        ) else {
+            return;
+        };
+        assert_context_guard_probe(out);
+    }
+
+    #[test]
+    fn context_guard_nudges_real_message_delta_after_one_quoted_in_content_against_the_installed_wheel(
+    ) {
+        // Content that merely mentions message_delta must not disarm the
+        // guard: the real final usage delta still has to be nudged.
+        let Some(out) = run_context_guard_probe(
+            "delta",
+            r#"g = G(200000, 200000)
+assert g.feed(ev("message_start", start, "\n")) == ev("message_start", nudged, "\n")
+text = {"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "wait for the message_delta event"}}
+assert g.feed(ev("content_block_delta", text, "\n")) == ev("content_block_delta", text, "\n")
+assert not g.done, "guard disarmed by content text"
+delta = {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"input_tokens": 185000, "output_tokens": 5}}
+out = g.feed(ev("message_delta", delta, "\n"))
+delta["usage"]["input_tokens"] = 190000
+assert out == ev("message_delta", delta, "\n"), out
+assert g.done"#,
+        ) else {
+            return;
+        };
+        assert_context_guard_probe(out);
     }
 
     /// Exact-pin vendors only bind on the pinned wheel; a dev machine whose
@@ -14604,6 +15350,36 @@ mod tests {
         assert_eq!(
             classify_kompress_prefetch_failure("ValueError: something unexpected"),
             "other"
+        );
+    }
+
+    /// A socket drop says "aborted" too, and filing it as a native abort
+    /// skipped the network retry after one attempt.
+    #[test]
+    fn classify_kompress_prefetch_failure_files_connection_aborts_as_network() {
+        for tail in [
+            "httpx.ReadError: [WinError 10053] An established connection was aborted \
+             by the software in your host machine",
+            "ConnectionAbortedError: [WinError 10053] An established connection was \
+             aborted by the software in your host machine",
+            "requests.exceptions.ConnectionError: ('Connection aborted.', \
+             RemoteDisconnected('Remote end closed connection without response'))",
+            // Localized: only the errno survives.
+            "httpx.ReadError: [WinError 10053] Eine bestehende Verbindung wurde \
+             softwaregesteuert durch den Hostcomputer abgebrochen",
+        ] {
+            assert_eq!(
+                classify_kompress_prefetch_failure(tail),
+                "network",
+                "{tail}"
+            );
+        }
+        // A process abort after a logged connection drop is still native.
+        assert_eq!(
+            classify_kompress_prefetch_failure(
+                "WARNING: connection aborted, retrying\nFatal Python error: Aborted"
+            ),
+            "native abort"
         );
     }
 
@@ -15681,6 +16457,68 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Kompress status comes from the backend's own `/readyz` report, so it
+    /// survives the wheel's log rotating past the last startup marker.
+    #[test]
+    fn kompress_state_comes_from_readyz_checks() {
+        // A 503 (a gating check down) still carries `checks`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = r#"{"ready":false,"checks":{"kompress":{"enabled":true,"ready":true,"status":"healthy","optional":true,"backend":"onnx"}}}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write");
+        });
+        let body = super::fetch_backend_readyz(port).expect("readyz body");
+        handle.join().expect("server thread");
+        assert_eq!(super::readyz_kompress_state(&body), Some(true));
+
+        let state = |check: &str| {
+            super::readyz_kompress_state(
+                &serde_json::from_str(&format!(r#"{{"checks":{{"kompress":{check}}}}}"#))
+                    .expect("json"),
+            )
+        };
+        // Enabled but the model is not loaded yet: the UI's "warming up".
+        assert_eq!(state(r#"{"enabled":true,"ready":false}"#), Some(false));
+        // Disabled components read `ready: true`; `enabled` decides.
+        assert_eq!(state(r#"{"enabled":false,"ready":true}"#), Some(false));
+        // A wheel without the field falls back to the log scan.
+        assert_eq!(
+            super::readyz_kompress_state(&serde_json::json!({"checks": {}})),
+            None
+        );
+    }
+
+    /// Learn runs write `headroom-learn-*.log` beside the proxy's logs; "Show
+    /// logs" must keep showing the proxy's.
+    #[test]
+    fn latest_headroom_log_skips_learn_run_logs() {
+        let (root, runtime, manager) = seed_test_runtime("latest-log-learn");
+        let logs = runtime.logs_dir();
+        fs::create_dir_all(&logs).expect("logs dir");
+        let proxy = logs.join("headroom-proxy---port-6768.log");
+        fs::write(&proxy, "proxy\n").expect("write proxy log");
+        let learn = logs.join("headroom-learn-app-0123456789ab.log");
+        fs::write(&learn, "learn\n").expect("write learn log");
+        // The learn log is the newest `headroom-*.log`.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&learn)
+            .and_then(|f| f.set_modified(SystemTime::now() + Duration::from_secs(60)))
+            .expect("bump learn mtime");
+
+        assert_eq!(manager.latest_tool_log_path("headroom"), Some(proxy));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rtk_distribution_artifact_is_pinned_to_current_release_with_checksum() {
         let artifact = rtk_distribution_artifact().expect("supported RTK target");
@@ -15880,7 +16718,7 @@ mod tests {
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn rtk_today_stats_returns_matching_daily_row() {
         let (root, runtime, manager) = seed_test_runtime("rtk-today");
-        let today = Local::now().date_naive().to_string();
+        let today = Utc::now().date_naive().to_string();
         let script = format!(
             "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  cat <<'EOF'\n{{\"daily\":[{{\"date\":\"1999-01-01\",\"commands\":1,\"saved_tokens\":2}},{{\"date\":\"{today}\",\"commands\":7,\"saved_tokens\":1234}}]}}\nEOF\n  exit 0\nfi\nexit 9\n",
         );
@@ -15892,6 +16730,31 @@ mod tests {
         let stats = manager.rtk_today_stats().expect("today stats");
         assert_eq!(stats.date, today);
         assert_eq!(stats.commands, 7);
+        assert_eq!(stats.saved_tokens, 1234);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn rtk_today_stats_reads_rtks_utc_day_bucket() {
+        // rtk groups by SQLite DATE(timestamp), which is the UTC date. At
+        // 23:30 UTC most zones east of UTC are already on the next local
+        // day; the tile must still read rtk's 09-29 row, not 09-30's.
+        let (root, runtime, manager) = seed_test_runtime("rtk-today-utc");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo '{\"daily\":[{\"date\":\"2026-09-28\",\"commands\":1,\"saved_tokens\":2},{\"date\":\"2026-09-29\",\"commands\":7,\"saved_tokens\":1234},{\"date\":\"2026-09-30\",\"commands\":3,\"saved_tokens\":5}]}';\n  exit 0\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+        let now = DateTime::parse_from_rfc3339("2026-09-29T23:30:00Z")
+            .expect("instant")
+            .with_timezone(&Utc);
+
+        let stats = manager.rtk_today_stats_at(now).expect("today stats");
+        assert_eq!(stats.date, "2026-09-29");
         assert_eq!(stats.saved_tokens, 1234);
 
         let _ = fs::remove_dir_all(root);
@@ -15999,7 +16862,7 @@ mod tests {
 
     #[test]
     fn proxy_argv_matches_when_all_expected_flags_present() {
-        let argv = "/Users/x/headroom proxy --port 6768 --log-messages --no-rate-limit \
+        let argv = "/Users/x/headroom proxy --port 6768 --no-rate-limit \
                     --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
@@ -16009,27 +16872,27 @@ mod tests {
         // Builds before 2026-08-17 spawned the backend under `nice`. Upgrading
         // users still have one of those running, and it must be recognized as
         // ours rather than treated as a foreign occupant of the port.
-        let argv = "/usr/bin/nice -n 2 /Users/x/headroom proxy --port 6768 --log-messages \
+        let argv = "/usr/bin/nice -n 2 /Users/x/headroom proxy --port 6768 \
                     --no-rate-limit --learn --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
     fn proxy_argv_matches_without_learn_flags_when_auto_learn_off() {
-        let argv = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages --no-rate-limit";
+        let argv = "/Users/x/headroom proxy --port 6768 --no-http2 --no-rate-limit";
         assert!(proxy_argv_contains_expected_flags(argv, false));
     }
 
     #[test]
     fn proxy_argv_mismatch_when_learn_present_but_auto_learn_off() {
         // Leftover learn-enabled proxy from before the toggle flipped: restart.
-        let argv = "/Users/x/headroom proxy --port 6768 --log-messages --learn \
+        let argv = "/Users/x/headroom proxy --port 6768 --no-rate-limit --learn \
                     --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(!proxy_argv_contains_expected_flags(argv, false));
     }
 
     #[test]
-    fn proxy_argv_mismatch_when_log_messages_missing() {
+    fn proxy_argv_mismatch_for_bare_old_build_proxy() {
         // The exact orphan-from-old-build case: a v0.2.x proxy still running
         // with just `proxy --port 6768`.
         let argv = "/Users/x/headroom proxy --port 6768";
@@ -16038,7 +16901,7 @@ mod tests {
 
     #[test]
     fn proxy_argv_mismatch_when_learn_missing() {
-        let argv = "headroom proxy --port 6768 --log-messages --no-memory-tools \
+        let argv = "headroom proxy --port 6768 --no-rate-limit --no-memory-tools \
                     --no-memory-context --memory-db-path /tmp/m.db";
         assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
@@ -16047,17 +16910,77 @@ mod tests {
     fn proxy_argv_match_does_not_get_fooled_by_negated_flag_substring() {
         // `--no-learn` contains `--learn` as a substring; whitespace tokenizing
         // ensures we don't false-positive on it.
-        let argv = "headroom proxy --port 6768 --log-messages --no-learn \
+        let argv = "headroom proxy --port 6768 --no-rate-limit --no-learn \
                     --no-memory-tools --no-memory-context --memory-db-path /tmp/m.db";
         assert!(!proxy_argv_contains_expected_flags(argv, true));
     }
 
     #[test]
     fn proxy_argv_match_works_for_python_module_invocation() {
+        // The real fallback argv: `-m headroom.proxy.server` takes no learn
+        // flags, so with auto-learn on it must still read as current instead
+        // of being killed and respawned (onto the same fallback) every pass.
         let argv = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
-                    --no-http2 --log-messages --no-rate-limit --learn --no-memory-tools \
-                    --no-memory-context --memory-db-path /tmp/m.db";
+                    --no-http2 --no-rate-limit";
         assert!(proxy_argv_contains_expected_flags(argv, true));
+        assert!(proxy_argv_contains_expected_flags(argv, false));
+        // The entrypoint variant still owes the learn flags when learn is on.
+        let entrypoint = "/Users/x/headroom proxy --port 6768 --no-http2 --no-rate-limit";
+        assert!(!proxy_argv_contains_expected_flags(entrypoint, true));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn every_spawn_variant_reads_as_current_to_the_argv_gate() {
+        // A backend this build spawned must pass this build's staleness gate,
+        // or ensure_headroom_running kills it on every pass.
+        backend_port::reset_for_tests();
+        for learn in [true, false] {
+            let variants = [
+                (
+                    "/Users/x/venv/bin/headroom",
+                    headroom_entrypoint_startup_args(Some("0.39.0"), learn),
+                ),
+                (
+                    "/Users/x/venv/bin/headroom",
+                    headroom_entrypoint_startup_args(Some("0.26.0"), learn),
+                ),
+                ("/Users/x/venv/bin/python3", headroom_python_startup_args()),
+            ];
+            for (exe, args) in variants {
+                let argv = format!("{exe} {}", args.join(" "));
+                assert!(
+                    proxy_argv_contains_expected_flags(&argv, learn),
+                    "learn={learn}: {argv}"
+                );
+            }
+        }
+        backend_port::reset_for_tests();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_is_never_asked_to_keep_message_bodies() {
+        // --log-messages holds the last 100 full prompts and completions,
+        // readable from /transformations/feed by any local account. Nothing
+        // in the desktop reads them (the feed is fetched with
+        // include_messages=0).
+        backend_port::reset_for_tests();
+        let flag = "--log-messages".to_string();
+        for learn in [true, false] {
+            for version in [Some("0.26.0"), Some("0.39.0"), None] {
+                assert!(!headroom_entrypoint_startup_args(version, learn).contains(&flag));
+            }
+            assert!(!super::expected_proxy_arg_signature(learn).contains(&"--log-messages"));
+        }
+        assert!(!headroom_python_startup_args().contains(&flag));
+        // A backend an older build started still holds bodies: restart it.
+        let old = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages --no-rate-limit";
+        assert!(!proxy_argv_contains_expected_flags(old, false));
+        let old_fallback = "/Users/x/venv/bin/python3 -m headroom.proxy.server --port 6768 \
+                            --no-http2 --log-messages --no-rate-limit";
+        assert!(!proxy_argv_contains_expected_flags(old_fallback, true));
+        backend_port::reset_for_tests();
     }
 
     #[test]
@@ -16339,6 +17262,17 @@ mod tests {
         assert_eq!(log_tail(&log, 4), "6789", "seeks to last N bytes");
     }
 
+    /// A tail cut inside a multi-byte character (a non-ASCII home path in a
+    /// traceback) must keep the traceback, not come back empty.
+    #[test]
+    fn log_tail_keeps_the_tail_when_the_cut_splits_a_character() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("t.log");
+        fs::write(&log, "é".repeat(600)).expect("write");
+        let tail = log_tail(&log, 1023);
+        assert_eq!(tail, format!("\u{FFFD}{}", "é".repeat(511)));
+    }
+
     #[test]
     fn parse_pid_from_lsof_detail_extracts_numeric_pid() {
         assert_eq!(parse_pid_from_lsof_detail("rapportd pid 594"), Some(594));
@@ -16380,6 +17314,23 @@ mod tests {
         ));
         assert!(!super::exe_identity_matches("", me));
         assert!(!super::exe_identity_matches(me, ""));
+    }
+
+    /// Finding 38: every user of a Mac runs the same /Applications binary, so
+    /// the path alone would make another signed-in user's Headroom our twin
+    /// and this window its spectator, with this user's traffic going into it.
+    #[test]
+    fn a_same_path_headroom_run_by_another_user_is_not_our_twin() {
+        let me = "/Applications/Headroom.app/Contents/MacOS/headroom-desktop";
+        assert_eq!(
+            super::ps_row_command_if_owned_by(&format!("  501 {me} --flag\n"), 501),
+            Some(format!("{me} --flag\n").as_str())
+        );
+        assert_eq!(
+            super::ps_row_command_if_owned_by(&format!("  502 {me}\n"), 501),
+            None
+        );
+        assert_eq!(super::ps_row_command_if_owned_by("", 501), None);
     }
 
     #[test]
@@ -16482,24 +17433,55 @@ mod tests {
         );
     }
 
+    fn tasklist_output(succeeded: bool, stdout: &str) -> std::process::Output {
+        let status = if succeeded {
+            std::process::ExitStatus::default()
+        } else {
+            #[cfg(unix)]
+            let failed = std::os::unix::process::ExitStatusExt::from_raw(1 << 8);
+            #[cfg(windows)]
+            let failed = std::os::windows::process::ExitStatusExt::from_raw(1);
+            failed
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
     #[test]
     fn occupant_image_reports_no_holder_once_the_pid_is_gone() {
         // tasklist ran and matched nothing: netstat's row was the exiting
         // instance, so the port has no listener to name at the user.
         assert_eq!(
-            occupant_image(Some(
+            occupant_image(Some(&tasklist_output(
+                true,
                 "INFO: No tasks are running which match the specified criteria."
-            )),
+            ))),
             None
         );
         assert_eq!(
-            occupant_image(Some(
+            occupant_image(Some(&tasklist_output(
+                true,
                 "\"python.exe\",\"9876\",\"Console\",\"1\",\"45,678 K\"\r\n"
-            )),
+            ))),
             Some("python.exe".to_string())
         );
         // tasklist itself could not run: the pid stands, the name does not.
         assert_eq!(occupant_image(None), Some("unnamed process".to_string()));
+    }
+
+    /// A tasklist that FAILED (broken WMI, the RUST-9A class) printed no CSV
+    /// row either, but that is no proof the holder exited. Reading it as gone
+    /// made the intercept `SO_REUSEADDR`-bind over a live listener and left
+    /// our own orphan on 6768 unreclaimed.
+    #[test]
+    fn occupant_image_keeps_the_pid_when_tasklist_failed() {
+        assert_eq!(
+            occupant_image(Some(&tasklist_output(false, ""))),
+            Some("unnamed process".to_string())
+        );
     }
 
     #[test]
@@ -16614,14 +17596,127 @@ mod tests {
     fn wait_for_port_free_detects_release() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let me = std::process::id();
         assert!(
-            !wait_for_port_free(port, Duration::from_millis(200)),
+            !wait_for_port_free(port, me, Duration::from_millis(200)),
             "port held by a live listener must not report free"
         );
         drop(listener);
         assert!(
-            wait_for_port_free(port, Duration::from_secs(2)),
+            wait_for_port_free(port, me, Duration::from_secs(2)),
             "port must report free shortly after the listener is dropped"
+        );
+    }
+
+    /// The desktop's own intercept is what holds 6767 on a normal host, so a
+    /// /stats 4xx resolved to this process read as a foreign squatter and the
+    /// RUST-87 gate dropped every real 4xx from Sentry.
+    #[test]
+    fn listener_identity_counts_this_desktop_process_as_ours() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (who, ours) = listener_identity_and_ownership(port).expect("listener resolved");
+        assert!(ours, "our own listener read as foreign: {who}");
+    }
+
+    /// Poll for up to 2s: SIGKILL is asynchronous, and the port can come free
+    /// a moment before the exit status is reapable.
+    #[cfg(unix)]
+    fn child_exits_within(child: &mut std::process::Child, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_standin_until_bound(script: &str, port: u16) -> std::process::Child {
+        let child = crate::proc::command("/usr/bin/python3")
+            .arg("-c")
+            .arg(script)
+            .arg(port.to_string())
+            .arg("--headroom-proxy-test-standin")
+            .spawn()
+            .expect("spawn stand-in");
+        // Generous: python startup on a loaded CI box has taken over 5s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stand-in never bound {port}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child
+    }
+
+    /// A SIGTERM-deaf orphan on a wildcard bind (HEADROOM_HOST=0.0.0.0). On
+    /// macOS the 127.0.0.1 probe bind succeeds over it, so the reclaim read
+    /// the port as free straight after the SIGTERM, reported success, and
+    /// never sent the forced kill: the orphan kept the port for good.
+    #[test]
+    #[cfg(unix)]
+    fn reclaim_orphan_proxy_forces_a_sigterm_deaf_wildcard_orphan() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let script = r#"
+import signal, socket, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+s = socket.socket(); s.bind(('0.0.0.0', int(sys.argv[1]))); s.listen(8)
+time.sleep(30)
+"#;
+        let mut child = spawn_standin_until_bound(script, port);
+        let result = reclaim_orphan_proxy(port, false);
+        let exited = child_exits_within(&mut child, Duration::from_secs(2));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            exited,
+            "reclaim reported success with the orphan still alive"
+        );
+    }
+
+    /// The pid resolved from the port can stop being our backend before the
+    /// forced kill: Windows reuses a pid within seconds, and here the
+    /// stand-in execs into a stranger that keeps the socket. The forced kill
+    /// must re-check identity, not land on whatever runs as that pid now.
+    #[test]
+    #[cfg(unix)]
+    fn reclaim_orphan_proxy_rechecks_identity_before_forcing() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let script = r#"
+import os, signal, socket, sys, time
+s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(8)
+os.set_inheritable(s.fileno(), True)
+def become_stranger(*_):
+    os.execv(sys.executable, [sys.executable, '-c', 'import time; time.sleep(30)'])
+signal.signal(signal.SIGTERM, become_stranger)
+time.sleep(30)
+"#;
+        let mut child = spawn_standin_until_bound(script, port);
+        let result = reclaim_orphan_proxy(port, false);
+        let alive = !child_exits_within(&mut child, Duration::from_millis(200));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            alive,
+            "the forced kill landed on a pid that is no longer ours"
+        );
+        assert!(
+            result.is_err(),
+            "the port is still held, so the reclaim failed"
         );
     }
 
@@ -16693,7 +17788,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             "force=true must reclaim even a healthy occupant"
         );
         assert!(
-            wait_for_port_free(port, Duration::from_secs(3)),
+            wait_for_port_free(port, child.id(), Duration::from_secs(3)),
             "force=true must free the port"
         );
 
@@ -16910,7 +18005,6 @@ time.sleep(30)
             "--port".to_string(),
             default_port.clone(),
             "--no-http2".to_string(),
-            "--log-messages".to_string(),
         ]));
         assert!(entrypoint_args.contains(&"--learn".to_string()));
         assert!(entrypoint_args.contains(&"--no-memory-tools".to_string()));
@@ -16926,7 +18020,6 @@ time.sleep(30)
                 "--port".to_string(),
                 default_port,
                 "--no-http2".to_string(),
-                "--log-messages".to_string(),
                 "--no-rate-limit".to_string(),
             ]
         );
@@ -17034,7 +18127,7 @@ time.sleep(30)
         assert!(headroom_python_startup_args().contains(&flag));
         assert!(super::expected_proxy_arg_signature(false).contains(&"--no-rate-limit"));
         // The rc.7/rc.8 proxy that is 429ing right now must be restarted.
-        let rc8 = "/Users/x/headroom proxy --port 6768 --no-http2 --log-messages";
+        let rc8 = "/Users/x/headroom proxy --port 6768 --no-http2";
         assert!(!proxy_argv_contains_expected_flags(rc8, false));
 
         backend_port::reset_for_tests();
@@ -17202,6 +18295,137 @@ time.sleep(30)
         // Missing or malformed falls into the same fail-closed except as the
         // reset guard: no reconciler rather than one writing a bad base_url.
         assert!(py.contains("HEADROOM_CC_SWITCH_PROXY_URL missing or malformed"));
+    }
+
+    /// Runs `script` against the installed wheel's real CCSwitchReconciler with
+    /// the shipped sitecustomize on PYTHONPATH, the env the backend spawn sets,
+    /// and a scratch dir (argv[1]) holding settings.json, the capture file and
+    /// the routed flag (present). The internal port is 6768 and the intercept
+    /// 6767. Skips without a
+    /// managed runtime to run it on.
+    fn run_cc_switch_probe(name: &str, script: &str) {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-ccs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp probe dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let prelude = "import json, os, sys\n\
+            from pathlib import Path\n\
+            assert os.environ['HEADROOM_CC_SWITCH_RECONCILE'] == '1', 'cc-switch guard did not bind'\n\
+            import headroom.proxy.cc_switch_reconciler as m\n\
+            d = Path(sys.argv[1]); settings = d / 'settings.json'; capture = d / 'capture.json'\n\
+            routed = d / 'cc-switch-routed'; routed.touch()\n\
+            ANTHROPIC = 'https://api.anthropic.com'; RELAY = 'https://api.relay.example/anthropic'\n\
+            n = [0]\n\
+            def write(env):\n    \
+                settings.write_text(json.dumps({'env': env}))\n    \
+                n[0] += 1; t = 1_700_000_000_000_000_000 + n[0] * 1_000_000_000\n    \
+                os.utime(settings, ns=(t, t))\n\
+            def recon(sink):\n    \
+                return m.CCSwitchReconciler(proxy_url='http://127.0.0.1:6768', default_upstream=ANTHROPIC, set_upstream=sink.append, path=settings)\n\
+            def base_url():\n    \
+                return json.loads(settings.read_text()).get('env', {}).get('ANTHROPIC_BASE_URL')\n";
+        std::fs::write(
+            dir.join("probe.py"),
+            format!("{prelude}{script}\nprint('PROBE OK')\n"),
+        )
+        .expect("write probe");
+        let out = crate::proc::command(&python)
+            .arg(dir.join("probe.py"))
+            .arg(&dir)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .env("HEADROOM_CC_SWITCH_RECONCILE", "1")
+            .env("HEADROOM_CC_SWITCH_PROXY_URL", cc_switch_proxy_url())
+            .env("HEADROOM_CC_SWITCH_CAPTURE_PATH", dir.join("capture.json"))
+            .env("HEADROOM_CC_SWITCH_PIN_UPSTREAM", "0")
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            .output()
+            .expect("run cc-switch probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            out.status.success() && stdout.contains("PROBE OK"),
+            "cc-switch probe {name} failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The reconciler's capture lived only in the backend's memory, and the
+    /// desktop restores settings.json on quit/pause after the backend is gone,
+    /// so the provider URL was deleted and Claude Code sent the provider's key
+    /// to api.anthropic.com. The capture has to reach a file the desktop reads,
+    /// come back on the next backend's first look at a settings.json already on
+    /// the intercept, never come back onto one that is not (Claude Official:
+    /// Anthropic OAuth must not follow it), and end on a switch to Official.
+    #[test]
+    fn cc_switch_capture_outlives_the_backend_against_the_installed_wheel() {
+        run_cc_switch_probe(
+            "capture",
+            "seen = []; r = recon(seen)\n\
+             write({'ANTHROPIC_BASE_URL': RELAY, 'ANTHROPIC_AUTH_TOKEN': 'sk-relay'}); r.tick()\n\
+             assert base_url() == 'http://127.0.0.1:6767', base_url()\n\
+             assert capture.exists() and json.loads(capture.read_text()) == {'url': RELAY}, 'capture not persisted'\n\
+             again = []; r2 = recon(again); r2.tick()\n\
+             assert r2.current_upstream == RELAY and again == [RELAY], ('restart lost the capture', again)\n\
+             write({}); r2.tick()\n\
+             assert again[-1] == ANTHROPIC and not capture.exists(), ('official kept the capture', again)\n\
+             capture.write_text(json.dumps({'url': RELAY}))\n\
+             write({}); stale = []; r3 = recon(stale); r3.tick()\n\
+             assert stale == [] and r3.current_upstream is None, ('reseeded onto official', stale)",
+        );
+    }
+
+    /// The reconciler follows the Claude Code connector, which the desktop
+    /// signals with `cc_switch_routed_path`. Ungated, turning the connector off
+    /// restored the relay and the reconciler took it back within 0.3s, so the
+    /// card said disconnected while every request still went through Headroom.
+    /// Unrouted it must neither capture nor rewrite, and must let go of a live
+    /// capture (nothing routes to it, and a switch to Official would go
+    /// unseen); routed again, it reseeds from the capture file.
+    #[test]
+    fn cc_switch_only_reconciles_while_claude_is_routed_against_the_installed_wheel() {
+        run_cc_switch_probe(
+            "routed",
+            "seen = []; r = recon(seen)\n\
+             write({'ANTHROPIC_BASE_URL': RELAY}); r.tick()\n\
+             assert seen == [RELAY] and base_url() == 'http://127.0.0.1:6767', seen\n\
+             routed.unlink(); write({'ANTHROPIC_BASE_URL': RELAY}); r.tick()\n\
+             assert base_url() == RELAY, 'rewrote an unrouted settings.json'\n\
+             assert seen == [RELAY, ANTHROPIC] and r.current_upstream is None, ('kept the capture live', seen)\n\
+             write({'ANTHROPIC_BASE_URL': 'https://api.other.example'}); r.tick()\n\
+             assert base_url() == 'https://api.other.example', 'rewrote an unrouted settings.json'\n\
+             assert json.loads(capture.read_text()) == {'url': RELAY}, 'captured while unrouted'\n\
+             write({'ANTHROPIC_BASE_URL': 'http://127.0.0.1:6767'}); routed.touch(); r.tick()\n\
+             assert seen[-1] == RELAY and r.current_upstream == RELAY, ('no reseed once routed', seen)",
+        );
+    }
+
+    /// Upstream's loop guard only matched the exact proxy_url string, which the
+    /// guard replaces with the intercept URL, so settings.json naming this proxy
+    /// any other way (localhost, the internal port the 0.9.3-rc.1 residue
+    /// restores) became the upstream and every request looped back into us.
+    #[test]
+    fn cc_switch_never_captures_its_own_address_against_the_installed_wheel() {
+        run_cc_switch_probe(
+            "self",
+            "seen = []; r = recon(seen)\n\
+             for url in ('http://localhost:6767', 'http://127.0.0.1:6768/', 'http://[::1]:6767'):\n    \
+                 write({'ANTHROPIC_BASE_URL': url}); r.tick()\n    \
+                 assert seen == [] and r.current_upstream is None, (url, seen)\n    \
+                 assert base_url() == 'http://127.0.0.1:6767' and not capture.exists(), url\n\
+             write({'ANTHROPIC_BASE_URL': RELAY}); r.tick()\n\
+             assert seen == [RELAY], seen\n\
+             write({'ANTHROPIC_BASE_URL': 'http://localhost:6768'}); r.tick()\n\
+             assert seen == [RELAY] and r.current_upstream == RELAY, (seen, r.current_upstream)\n\
+             assert json.loads(capture.read_text()) == {'url': RELAY}",
+        );
     }
 
     /// Regression: `start_headroom_background` previously built `startup_variants`
@@ -17521,9 +18745,6 @@ after
 
     #[test]
     fn encode_claude_project_folder_name_replaces_slashes_preserving_hyphens() {
-        // Claude Code's on-disk encoding only substitutes '/' with '-'; literal
-        // hyphens in the path are preserved verbatim. Verified against real
-        // ~/.claude/projects/ folder names.
         assert_eq!(
             super::encode_claude_project_folder_name("/Users/alice/my-project"),
             "-Users-alice-my-project"
@@ -17533,6 +18754,57 @@ after
     #[test]
     fn encode_claude_project_folder_name_handles_root_slash() {
         assert_eq!(super::encode_claude_project_folder_name("/foo"), "-foo");
+    }
+
+    #[test]
+    fn encode_claude_project_folder_name_matches_claude_code_for_every_non_alphanumeric() {
+        // Golden values from Claude Code 2.1.284's own sanitizer, run in node.
+        // It maps every non-[a-zA-Z0-9] UTF-16 unit to '-', so dots, underscores,
+        // spaces, Windows drive colons and backslashes all become hyphens.
+        let encode = super::encode_claude_project_folder_name;
+        assert_eq!(
+            encode("/Users/alice/Code/headroom/.worktrees/learn_prompt too-long"),
+            "-Users-alice-Code-headroom--worktrees-learn-prompt-too-long"
+        );
+        assert_eq!(encode("C:\\Users\\x\\my_proj"), "C--Users-x-my-proj");
+        // One hyphen per UTF-16 unit: an accented letter is one, an emoji two.
+        assert_eq!(encode("/tmp/caf\u{e9}/\u{1F600}"), "-tmp-caf----");
+        // Over 200 characters Claude Code truncates and appends a base-36 hash.
+        let long = format!("/Users/alice/{}proj", "very_long.dir name/".repeat(12));
+        assert_eq!(
+            encode(&long),
+            format!(
+                "-Users-alice-{}very-long-dir-na-d2ey4e",
+                "very-long-dir-name-".repeat(9)
+            )
+        );
+    }
+
+    #[test]
+    fn busiest_claude_project_cwd_skips_projects_over_the_seed_byte_cap() {
+        let root = unique_temp_dir("headroom-seed-pick");
+        for (dir, cwd, size) in [("-big", "/big", 3000), ("-small", "/small", 1000)] {
+            let line = format!("{{\"cwd\":\"{cwd}\"}}\n");
+            fs::create_dir_all(root.join(dir)).expect("create project dir");
+            fs::write(
+                root.join(dir).join("s.jsonl"),
+                format!("{line}{}", " ".repeat(size - line.len())),
+            )
+            .expect("write transcript");
+        }
+        // The busiest project wins while it fits the cap...
+        assert_eq!(
+            super::busiest_claude_project_cwd_in(&root, 10_000).as_deref(),
+            Some("/big")
+        );
+        // ...but one the seed run could not finish in time is passed over for
+        // the busiest one that fits, instead of timing out on every launch.
+        assert_eq!(
+            super::busiest_claude_project_cwd_in(&root, 2000).as_deref(),
+            Some("/small")
+        );
+        assert_eq!(super::busiest_claude_project_cwd_in(&root, 500), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -17809,11 +19081,28 @@ after
             "socks4://127.0.0.1:10808",
             "socks4a://127.0.0.1:1080",
             "socks://127.0.0.1:1080",
-            "127.0.0.1:8080",
         ] {
             assert!(
                 !super::httpx_supports_proxy_url(bad),
                 "{bad:?} should be stripped"
+            );
+        }
+    }
+
+    /// httpx mounts a schemeless proxy env value as `http://<value>`
+    /// (`get_environment_proxies`), so `HTTPS_PROXY=proxy.corp:3128` is a
+    /// working proxy. Stripping it sent the backend direct, and behind a
+    /// mandatory proxy every upstream request failed to connect.
+    #[test]
+    fn httpx_proxy_url_support_keeps_schemeless_values() {
+        for schemeless in [
+            "127.0.0.1:8080",
+            "proxy.corp:3128",
+            " user:pass@proxy.corp:3128 ",
+        ] {
+            assert!(
+                super::httpx_supports_proxy_url(schemeless),
+                "{schemeless:?} should pass through (httpx prefixes http://)"
             );
         }
     }
@@ -17901,7 +19190,22 @@ after
             super::registry_proxy_env_overrides("http=socks4://127.0.0.1:10808;https=1.2.3.4:8080"),
             Some(vec![(
                 "https_proxy".to_string(),
-                "https://1.2.3.4:8080".to_string()
+                "http://1.2.3.4:8080".to_string()
+            )])
+        );
+    }
+
+    /// CPython's getproxies_registry prefixes a schemeless http/https entry
+    /// with `http://` ("the default proxy type of Windows is HTTP"), never
+    /// with the protocol name: `https://proxy` would make httpx speak TLS to
+    /// a plain CONNECT proxy and fail every upstream request.
+    #[test]
+    fn registry_schemeless_https_entry_mirrors_as_http_like_cpython() {
+        assert_eq!(
+            super::registry_proxy_env_overrides("https=proxy.corp:8080;socks=proxy.corp:1080"),
+            Some(vec![(
+                "https_proxy".to_string(),
+                "http://proxy.corp:8080".to_string()
             )])
         );
     }
@@ -18482,6 +19786,111 @@ after
         );
     }
 
+    /// A TLS-inspecting network (Zscaler, antivirus HTTPS scanning, a school
+    /// filter) re-signs github.com with a root the OS trusts and reqwest's
+    /// bundled webpki list does not, so the runtime download failed with
+    /// UnknownIssuer on every attempt and the install never finished.
+    /// rustls-native-certs reads SSL_CERT_FILE in place of the OS store, so a
+    /// file holding one unparsable certificate makes exactly the clients that
+    /// consult the OS store fail to build. Loopback probes run every few
+    /// seconds and must not pay that ~130ms load. Child process: the variable
+    /// would break every other test's clients while set.
+    #[test]
+    fn downloads_consult_the_os_trust_store_and_loopback_probes_do_not() {
+        if std::env::var_os("HEADROOM_TEST_UNPARSABLE_CA_CHILD").is_some() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    let mut buf = [0u8; 1024];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    );
+                }
+            });
+            assert!(
+                super::probe_backend_readyz_ok(port),
+                "a loopback probe loaded the OS trust store"
+            );
+            let dir = tempfile::tempdir().expect("tempdir");
+            let err = super::download_to_path_with_progress(
+                &format!("http://127.0.0.1:{port}/python.tar.gz"),
+                &dir.path().join("python.tar.gz"),
+                None,
+                |_, _| {},
+            )
+            .expect_err("the download client never consulted the OS trust store");
+            assert!(
+                format!("{err:#}").contains("building download client"),
+                "{err:#}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pem = dir.path().join("unparsable.pem");
+        fs::write(
+            &pem,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write pem");
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "tool_manager::tests::downloads_consult_the_os_trust_store_and_loopback_probes_do_not",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env("HEADROOM_TEST_UNPARSABLE_CA_CHILD", "1")
+            .env("SSL_CERT_FILE", &pem)
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("run child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Finder and Login Items launch the app with no HTTPS_PROXY, so on a
+    /// network whose only way out is the proxy set in System Settings, the
+    /// runtime download, sign-in and the updater all went direct and failed
+    /// while the backend (httpx) and pip used that proxy.
+    /// `default-features = false` had dropped reqwest's system-proxy.
+    ///
+    /// Windows must not get it: hyper-util hands HKCU ProxyServer to the URI
+    /// parser raw. v2rayN's keyed `socks=127.0.0.1:10808` has one colon and
+    /// `=` is a legal URI character, so it became an HTTP proxy at host
+    /// `socks=127.0.0.1`; `socks4://` became a SOCKS port that reqwest (no
+    /// socks feature) sends CONNECT to. Every internet client, the updater
+    /// included, then failed on machines that worked direct (the fleet values
+    /// `registry_proxy_env_overrides` already handles for the backend).
+    /// Neither OS proxy store can be injected from a test, so pin the manifest.
+    #[test]
+    fn reqwest_reads_the_os_proxy_settings_on_macos_only() {
+        let mut section = "";
+        let mut system_proxy_in = Vec::new();
+        let mut native_roots = false;
+        for line in include_str!("../Cargo.toml").lines() {
+            if line.starts_with('[') {
+                section = line;
+            } else if line.starts_with("reqwest = ") {
+                if line.contains("\"system-proxy\"") {
+                    system_proxy_in.push(section);
+                }
+                native_roots |=
+                    section == "[dependencies]" && line.contains("\"rustls-tls-native-roots\"");
+            }
+        }
+        assert_eq!(
+            system_proxy_in,
+            ["[target.'cfg(target_os = \"macos\")'.dependencies]"]
+        );
+        assert!(native_roots, "rustls-tls-native-roots missing from reqwest");
+    }
+
     #[test]
     fn list_tools_exposes_savings_labels() {
         let (_root, runtime, manager) = seed_test_runtime("savings-labels");
@@ -18908,6 +20317,140 @@ after
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Seeds the disk state of an in-place upgrade that installed 0.11.0 over
+    /// 0.10.8 with churned lock pins: the NEW lock is active, the old one is
+    /// snapshotted, and the marker plus receipt backup name the way back.
+    fn seed_in_place_upgrade_with_lock_snapshot(manager: &ToolManager) -> PathBuf {
+        let lock_backup = manager.lock_backup_path();
+        fs::write(manager.active_lock_path(), b"new-lock==2.0\n").expect("seed active lock");
+        fs::write(&lock_backup, b"old-lock==1.0\n").expect("seed lock backup");
+        manager
+            .write_upgrade_marker("0.11.0", Some("0.10.8"), Some(&lock_backup))
+            .expect("marker");
+        fs::write(
+            manager.headroom_receipt_backup_path(),
+            br#"{"version":"0.10.8"}"#,
+        )
+        .expect("receipt snapshot");
+        lock_backup
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn rollback_headroom_upgrade_keeps_lock_snapshot_until_the_reinstall_lands() {
+        // Crash-injection: the dep restore succeeds, the previous headroom-ai
+        // reinstall fails (PyPI timeout). Consuming the lock snapshot before
+        // that step left the kept marker naming a missing file, so every
+        // later launch's recovery failed `pip -r` on it and never finished.
+        let (root, runtime, manager) = seed_test_runtime("rollback-reinstall-fails");
+        let lock_backup = seed_in_place_upgrade_with_lock_snapshot(&manager);
+        let python = runtime.managed_python();
+        write_executable(
+            &python,
+            "#!/bin/sh\ncase \"$*\" in *--force-reinstall*) exit 1;; esac\nexit 0\n",
+        );
+
+        assert!(manager.rollback_headroom_upgrade().is_err());
+        assert!(manager.upgrade_interrupted(), "marker kept for recovery");
+        assert_eq!(
+            fs::read(&lock_backup).expect("lock snapshot kept for recovery"),
+            b"old-lock==1.0\n"
+        );
+
+        // Back online: the next launch's recovery can now finish the job.
+        write_executable(&python, "#!/bin/sh\nexit 0\n");
+        assert!(manager.recover_from_interrupted_upgrade());
+        assert!(!manager.upgrade_interrupted(), "marker cleared");
+        assert!(!lock_backup.exists(), "lock snapshot consumed");
+        assert_eq!(
+            fs::read(manager.active_lock_path()).expect("active lock"),
+            b"old-lock==1.0\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn rollback_in_place_upgrade_inner_keeps_marker_and_snapshots_when_pip_fails() {
+        // An install-step failure whose own rollback cannot reach PyPI must
+        // leave the recovery data behind: clearing the marker and restoring
+        // the old receipt declared a mixed venv healthy with nothing left to
+        // drive another recovery.
+        let (root, runtime, manager) = seed_test_runtime("inner-rollback-pip-fails");
+        let lock_backup = seed_in_place_upgrade_with_lock_snapshot(&manager);
+        write_executable(
+            &runtime.managed_python(),
+            "#!/bin/sh\ncase \"$*\" in *--force-reinstall*) exit 1;; esac\nexit 0\n",
+        );
+        let ctx = super::InPlaceUpgradeContext {
+            previous_version: "0.10.8".into(),
+            previous_lock_backup: Some(lock_backup.clone()),
+        };
+
+        assert!(!manager.rollback_in_place_upgrade_inner(&ctx));
+        assert!(manager.upgrade_interrupted(), "marker kept for recovery");
+        assert!(lock_backup.exists(), "lock snapshot kept for recovery");
+        assert!(
+            manager.headroom_receipt_backup_path().exists(),
+            "receipt backup kept for recovery"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn recover_from_interrupted_upgrade_finishes_when_the_lock_snapshot_is_already_gone() {
+        // Pre-fix builds consumed the lock snapshot after the dep restore and
+        // then kept the marker when the headroom-ai reinstall failed. Every
+        // later recovery ran `pip -r` on the missing file, failed, and never
+        // reached the reinstall. The stub fails `--requirement` on a missing
+        // file, as pip does.
+        let (root, runtime, manager) = seed_test_runtime("recover-lock-backup-gone");
+        write_executable(
+            &runtime.managed_python(),
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  \
+             if [ \"$1\" = --requirement ] && [ ! -f \"$2\" ]; then exit 1; fi\n  \
+             shift\ndone\nexit 0\n",
+        );
+        let lock_backup = seed_in_place_upgrade_with_lock_snapshot(&manager);
+        fs::remove_file(&lock_backup).expect("drop lock snapshot");
+
+        assert!(manager.recover_from_interrupted_upgrade());
+        assert!(!manager.upgrade_interrupted(), "marker cleared");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(runtime.tools_dir.join("headroom.json")).expect("read receipt"),
+        )
+        .expect("parse receipt");
+        assert_eq!(receipt["version"], "0.10.8", "receipt restored to previous");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_headroom_upgrade_deletes_no_backup_while_the_marker_survives() {
+        // The marker is the commit point: backups go only once it is gone. A
+        // delete first let a crash mid-remove_dir_all (seconds on a big venv)
+        // leave the marker beside a half-deleted venv.backup, which the next
+        // launch's recovery swapped over the validated venv. A directory at
+        // the marker path stands in for a marker that cannot be removed.
+        let (root, _runtime, manager) = seed_test_runtime("commit-marker-first");
+        let backup = manager.venv_backup_dir();
+        fs::create_dir_all(&backup).expect("backup dir");
+        fs::write(backup.join("old-marker"), b"old").expect("old venv file");
+        let lock_backup = seed_in_place_upgrade_with_lock_snapshot(&manager);
+        let marker = manager.upgrade_marker_path();
+        fs::remove_file(&marker).expect("drop marker file");
+        fs::create_dir_all(marker.join("stuck")).expect("unremovable marker");
+
+        manager
+            .commit_headroom_upgrade()
+            .expect("commit is non-fatal");
+
+        assert!(backup.join("old-marker").exists(), "venv backup kept");
+        assert!(lock_backup.exists(), "lock snapshot kept");
+        assert!(manager.headroom_receipt_backup_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn atomic_upgrade_purges_stale_backup_and_reports_failure_without_python() {
         // Without a real standalone python available, create_managed_venv()
@@ -19063,12 +20606,15 @@ after
         let (root, runtime, manager) = seed_test_runtime("in-place-lock-churn");
         // Receipt must be ≥ ATOMIC_REBUILD_FLOOR_VERSION; this test is about
         // the lock-snapshot path, not the version-floor path (covered by
-        // `receipt_requires_atomic_rebuild_below_floor`).
+        // `receipt_requires_atomic_rebuild_below_floor`). Its sha is the
+        // on-disk lock's: that lock is what the installed venv was built from.
         fs::write(
             runtime.tools_dir.join("headroom.json"),
             serde_json::to_vec(&serde_json::json!({
                 "version": "0.20.0",
-                "artifact": { "requirementsLockSha256": "deadbeef".repeat(8) },
+                "artifact": {
+                    "requirementsLockSha256": requirements_lock_sha("old-lock-content==1.0\n"),
+                },
             }))
             .unwrap(),
         )
@@ -19109,6 +20655,29 @@ after
         .expect("receipt");
         // no active lock written
         assert!(manager.prepare_in_place_upgrade().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_in_place_falls_back_to_atomic_when_on_disk_lock_is_not_the_installed_one() {
+        // A full rebuild that failed boot validation (or a requirements repair
+        // that died mid-pip) leaves the NEW lock on disk under the old
+        // receipt. Snapshotting it as the rollback baseline made a failed
+        // in-place upgrade "restore" the new pins under the old headroom-ai.
+        let (root, runtime, manager) = seed_test_runtime("in-place-foreign-lock");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.20.0",
+                "artifact": { "requirementsLockSha256": requirements_lock_sha("old-lock==1.0\n") },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+        fs::write(manager.active_lock_path(), b"new-lock==2.0\n").expect("seed active lock");
+
+        assert!(manager.prepare_in_place_upgrade().is_none());
+        assert!(!manager.lock_backup_path().exists(), "no snapshot taken");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -19380,15 +20949,205 @@ after
             assert!(receipt.exists(), "disabled receipt must be kept");
 
             // Enabled but deregistered behind our back: warn once, then
-            // self-heal by dropping the stale receipt.
+            // self-heal by dropping the stale receipt. No host CLI, so no
+            // registry is left that could still hold it.
             fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
             let err = manager
-                .smoke_test_plugin(plugin.id)
+                .smoke_test_plugin_on(plugin.id, Vec::new)
                 .expect_err("enabled but unregistered must fail");
             assert!(err.to_string().contains("no longer registered"));
             assert!(!receipt.exists(), "stale receipt must be removed");
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn smoke_test_plugin_keeps_the_receipt_when_no_registry_rules_the_plugin_out() {
+        // Install keeps the receipt when Claude's registry is unreadable or
+        // Codex lists a plugin our config.toml read misses (RUST-HT); the
+        // upgrade smoke test must not then delete it as "removed".
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("plugin-smoke-unsure");
+        let _home = HomeGuard::new(&root);
+        let receipt = runtime.tools_dir.join("caveman.json");
+        let cli = root.join("cli");
+        fs::write(
+            &cli,
+            "#!/bin/sh\necho 'caveman@caveman  installed, enabled  1.0.0  caveman'\n",
+        )
+        .expect("fake cli");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
+        // Claude CLI present, installed_plugins.json unreadable.
+        let claude =
+            manager.smoke_test_plugin_on("caveman", || vec![(PluginHost::ClaudeCode, cli.clone())]);
+        let kept_unreadable = receipt.exists();
+        // Codex: config.toml lacks the table, but `codex plugin list` has it.
+        fs::create_dir_all(root.join(".codex")).expect("codex home");
+        fs::write(root.join(".codex").join("config.toml"), "").expect("config");
+        let codex =
+            manager.smoke_test_plugin_on("caveman", || vec![(PluginHost::Codex, cli.clone())]);
+        let kept_listed = receipt.exists();
+        let _ = fs::remove_dir_all(&root);
+        claude.expect("an unreadable registry is not a failure");
+        assert!(kept_unreadable, "unreadable registry must keep the receipt");
+        codex.expect("a plugin Codex lists is not a failure");
+        assert!(kept_listed, "a plugin Codex lists must keep the receipt");
+    }
+
+    #[test]
+    fn plugin_toggle_without_a_host_cli_fails_and_keeps_the_receipt() {
+        // No `plugin disable` can run, so reporting success would show the
+        // card off while the plugin keeps shaping every session.
+        let (root, runtime, manager) = seed_test_runtime("plugin-toggle-no-cli");
+        let receipt = runtime.tools_dir.join("caveman.json");
+        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
+        let result = manager.set_plugin_enabled_on("caveman", false, &[]);
+        let enabled = manager
+            .read_tool_receipt("caveman")
+            .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_bool));
+        let _ = fs::remove_dir_all(&root);
+        assert!(result
+            .expect_err("no host CLI means nothing was toggled")
+            .to_string()
+            .contains("was found on PATH"));
+        assert_eq!(enabled, Some(true), "receipt must not flip");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_disable_fails_when_the_host_holding_it_has_no_cli() {
+        // Codex is on PATH without the plugin; Claude Code has it registered
+        // but its CLI was not detected (probe timeout, IDE-only install). No
+        // `plugin disable` ran anywhere, so the receipt must not flip.
+        let (root, runtime, manager) = seed_test_runtime("plugin-toggle-missing-host");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        fs::write(
+            registry.join("installed_plugins.json"),
+            br#"{"plugins":{"ponytail@ponytail":[{"scope":"user"}]}}"#,
+        )
+        .expect("registry");
+        let receipt = runtime.tools_dir.join("ponytail.json");
+        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
+        let result = manager.set_plugin_enabled_on(
+            "ponytail",
+            false,
+            &[(PluginHost::Codex, root.join("codex"))],
+        );
+        let enabled = manager
+            .read_tool_receipt("ponytail")
+            .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_bool));
+        let _ = fs::remove_dir_all(&root);
+        let err = result.expect_err("the host holding the plugin was not toggled");
+        assert!(
+            err.to_string()
+                .contains("Claude Code: CLI not found on PATH"),
+            "{err:#}"
+        );
+        assert_eq!(enabled, Some(true), "receipt must not flip");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn plugin_reenable_on_claude_runs_enable_not_update() {
+        // Claude Code's `plugin disable` keeps the registry entry and only
+        // flips enabledPlugins, which `plugin update` never flips back.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("plugin-reenable-claude");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        fs::write(
+            registry.join("installed_plugins.json"),
+            br#"{"plugins":{"ponytail@ponytail":[{"scope":"user"}]}}"#,
+        )
+        .expect("registry");
+        fs::write(
+            runtime.tools_dir.join("ponytail.json"),
+            br#"{"version":"latest","enabled":false}"#,
+        )
+        .expect("receipt");
+        let cli = root.join("claude");
+        fs::write(
+            &cli,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.284 (Claude Code)'; exit 0; }\n\
+             echo \"$*\" >> \"$(dirname \"$0\")/argv\"\n\
+             [ \"$2\" = enable ] && { echo \"Plugin \\\"$3\\\" is already enabled\" >&2; exit 1; }\n\
+             exit 0\n",
+        )
+        .expect("fake claude");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let result =
+            manager.set_plugin_enabled_on("ponytail", true, &[(PluginHost::ClaudeCode, cli)]);
+        let argv = fs::read_to_string(root.join("argv")).unwrap_or_default();
+        let enabled = manager
+            .read_tool_receipt("ponytail")
+            .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_bool));
+        let _ = fs::remove_dir_all(&root);
+        result.expect("an already-enabled plugin is a successful enable");
+        assert!(argv.contains("plugin enable ponytail@ponytail"), "{argv}");
+        assert!(!argv.contains("plugin update"), "{argv}");
+        assert_eq!(enabled, Some(true));
+    }
+
+    #[test]
+    fn context7_helper_wraps_npx_in_cmd_on_windows() {
+        // Native Windows agents spawn MCP servers without a shell, and there
+        // npx is an npx.cmd shim ("Windows requires 'cmd /c' wrapper").
+        // Stub registrars print the spec the real helper registers.
+        let probe = r#"import os, sys, types, enum
+S = enum.Enum("S", {"REGISTERED": "registered", "MISMATCH": "mismatch", "FAILED": "failed"})
+class R:
+    name = "claude"
+    def detect(self): return True
+    def register_server(self, spec, force=False):
+        print("SPEC", spec.command, *spec.args)
+        return types.SimpleNamespace(status=S.REGISTERED, detail=None)
+class Off(R):
+    def detect(self): return False
+reg = types.ModuleType("headroom.mcp_registry")
+reg.ClaudeRegistrar, reg.CodexRegistrar, reg.GrokRegistrar, reg.OpencodeRegistrar = R, Off, Off, Off
+reg.ServerSpec = types.SimpleNamespace
+base = types.ModuleType("base"); base.RegisterStatus = S
+led = types.ModuleType("ledger")
+led.clear_install = led.record_install = lambda *a: None
+led.headroom_installed_matching = lambda *a: False
+sys.modules.update({"headroom": types.ModuleType("headroom"), "headroom.mcp_registry": reg,
+    "headroom.mcp_registry.base": base, "headroom.mcp_registry.ledger": led})
+sys.platform = sys.argv.pop(1)
+exec(os.environ["HELPER"])
+"#;
+        let spec = |platform: &str| {
+            let out = crate::proc::command("python3")
+                .args(["-c", probe, platform, "register", "@upstash/context7-mcp@9"])
+                .env("HELPER", super::CONTEXT7_MCP_HELPER)
+                .output()
+                .ok()?;
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(
+                out.status.success(),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            stdout
+                .lines()
+                .find(|l| l.starts_with("SPEC "))
+                .map(str::to_owned)
+        };
+        let Some(windows) = spec("win32") else {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        };
+        assert_eq!(windows, "SPEC cmd /c npx -y @upstash/context7-mcp@9");
+        assert_eq!(
+            spec("darwin").as_deref(),
+            Some("SPEC npx -y @upstash/context7-mcp@9")
+        );
     }
 
     #[test]
@@ -19652,6 +21411,103 @@ after
         assert!(!is_outdated_codex(&anyhow::anyhow!(
             "unrecognized subcommand"
         )));
+    }
+
+    /// cmd.exe decodes a .cmd in the OEM codepage, so an absolute path under
+    /// C:\Users\José written as UTF-8 named a file that does not exist and
+    /// every conversion through the shim failed.
+    #[test]
+    fn markitdown_cmd_shim_stays_ascii_under_a_non_ascii_profile() {
+        let runtime = ManagedRuntime::bootstrap_root(&unique_temp_dir("José 山田"));
+        let manager = ToolManager::new(runtime);
+        let script = manager.markitdown_cmd_script();
+        assert!(script.is_ascii(), "{script}");
+        assert!(script.contains("\"%~dp0..\\runtime"), "{script}");
+        assert!(script.contains("set \"C=%~dp0..\\tools"), "{script}");
+    }
+
+    /// markitdown[all] lives in the runtime venv, so a full rebuild dropped it
+    /// while its receipt and the CLAUDE.md nudge kept sending agents to a shim
+    /// that died with ModuleNotFoundError.
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script interpreter
+    fn venv_rebuild_reinstalls_markitdown_or_takes_its_nudge_down() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-rebuild");
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".claude")).expect("home");
+        let _home = HomeGuard::new(&home);
+        let receipt = runtime.tools_dir.join("markitdown.json");
+        let entrypoint = manager.markitdown_entrypoint();
+
+        // pip lays the entrypoint back down: the addon returns, still disabled.
+        fs::write(&receipt, br#"{"version":"0.1.5","enabled":false}"#).expect("receipt");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\nmkdir -p '{dir}'\nprintf '#!/bin/sh\\nexit 0\\n' > '{e}'\nchmod +x '{e}'\n",
+                dir = entrypoint.parent().expect("bin").display(),
+                e = entrypoint.display()
+            ),
+        );
+        manager.restore_markitdown_after_rebuild();
+        assert!(manager.markitdown_installed());
+        assert!(
+            !manager.tool_enabled("markitdown"),
+            "disabled stays disabled"
+        );
+
+        // The reinstall fails: nothing may keep pointing agents at the shim.
+        fs::remove_file(&entrypoint).expect("drop entrypoint");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
+        let claude_md = home.join(".claude").join("CLAUDE.md");
+        fs::write(
+            &claude_md,
+            "mine\n# >>> headroom:markitdown_office >>>\nrun the shim\n# <<< headroom:markitdown_office <<<\n",
+        )
+        .expect("nudge");
+        manager.restore_markitdown_after_rebuild();
+        assert!(!receipt.exists(), "receipt removed");
+        assert!(!manager.markitdown_shim_path().exists(), "shim removed");
+        let md = fs::read_to_string(&claude_md).expect("CLAUDE.md");
+        assert!(!md.contains("markitdown_office"), "{md}");
+        assert!(md.starts_with("mine\n"), "{md}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every wheel bump downloaded a new wheel and nothing removed the old
+    /// ones (290 MB of headroom_ai 0.5.17..0.39.0 on one machine).
+    #[test]
+    fn commit_headroom_upgrade_prunes_superseded_wheels() {
+        let (root, runtime, manager) = seed_test_runtime("prune-downloads");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"0.39.0"}"#,
+        )
+        .expect("receipt");
+        let downloads = &runtime.downloads_dir;
+        let kept = [
+            "headroom_ai-0.39.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "headroom_ai-0.39.0-py3-none-any.whl",
+            "python-standalone.tar.gz",
+            "headroom-requirements.lock",
+            "msvc_runtime-14.44.35208-py3-none-win_amd64.whl",
+        ];
+        let stale = [
+            "headroom_ai-0.38.0-py3-none-any.whl",
+            "headroom_ai-0.39.01-py3-none-any.whl",
+            "headroom_ai-0.5.17-py3-none-any.whl",
+        ];
+        for name in kept.iter().chain(&stale) {
+            fs::write(downloads.join(name), b"x").expect("seed download");
+        }
+        manager.commit_headroom_upgrade().expect("commit");
+        for name in kept {
+            assert!(downloads.join(name).exists(), "{name} must be kept");
+        }
+        for name in stale {
+            assert!(!downloads.join(name).exists(), "{name} must be pruned");
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -20025,6 +21881,33 @@ exit 0
             failure.stdout.contains("hi"),
             "output before the stall is preserved"
         );
+    }
+
+    /// RUST-BH on the plugin CLI path: the child exits but a background
+    /// descendant (an agent CLI's updater) inherited the pipes, so waiting
+    /// for EOF blocked addon install and Uninstall for as long as it lived.
+    #[test]
+    #[cfg(unix)]
+    fn run_command_streaming_returns_when_the_child_exits_but_a_grandchild_holds_the_pipes() {
+        let started = std::time::Instant::now();
+        let err = super::run_command_streaming(
+            std::path::Path::new("/bin/sh"),
+            &["-c", "echo hi; sleep 20 & exit 3"],
+            &std::env::temp_dir(),
+            None,
+            &mut |_| {},
+        )
+        .expect_err("exit 3 is a failure");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited on the grandchild: {:?}",
+            started.elapsed()
+        );
+        let failure = err
+            .downcast_ref::<CommandFailure>()
+            .expect("exit reports as CommandFailure");
+        assert_eq!(failure.exit_code, Some(3), "the child's own status is kept");
+        assert!(failure.stdout.contains("hi"), "output is kept");
     }
 
     #[test]

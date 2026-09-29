@@ -3,7 +3,9 @@
 //! The panel renders no `statusLine` (its webview has no code for one), so the
 //! terminal line from claude_statusline.rs never reaches it. This packs the
 //! small extension in resources/vscode-statusbar into a .vsix and installs it
-//! through each editor's own CLI; it reads the same per-conversation file.
+//! through each editor's own CLI, into the default profile and every named
+//! profile with extensions of its own; it reads the same per-conversation file
+//! and hides whenever the terminal line's script is gone (pause, quit).
 //!
 //! Installed alongside the terminal statusline and under the same opt-out.
 //! Removed only when the user turns that off or uninstalls Headroom, never on
@@ -32,6 +34,8 @@ struct Editor {
     id: &'static str,
     cli: PathBuf,
     extensions_dir: PathBuf,
+    /// The editor's `User` folder, whose globalStorage lists named profiles.
+    user_dir: PathBuf,
 }
 
 fn editors() -> Vec<Editor> {
@@ -44,18 +48,24 @@ fn editors() -> Vec<Editor> {
             "vscode",
             "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
             ".vscode",
+            "Code",
         ),
         (
             "cursor",
             "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
             ".cursor",
+            "Cursor",
         ),
     ]
     .into_iter()
-    .map(|(id, cli, dir)| Editor {
+    .map(|(id, cli, dir, data)| Editor {
         id,
         cli: PathBuf::from(cli),
         extensions_dir: home.join(dir).join("extensions"),
+        user_dir: home
+            .join("Library/Application Support")
+            .join(data)
+            .join("User"),
     })
     .filter(|editor| editor.cli.exists())
     .collect()
@@ -121,6 +131,53 @@ fn orphaned_by_our_uninstall(extensions_dir: &Path) -> bool {
         && !folder_versions(extensions_dir).is_empty()
 }
 
+/// A profile to install into. The default one lists its extensions in the
+/// extensions folder; a named one (the editor's Profiles feature) in its own
+/// `extensions.json`, and never loads what only the default one has.
+struct Profile {
+    /// `--profile` for the editor CLI; None for the default profile.
+    name: Option<String>,
+    /// Folder holding this profile's `extensions.json`.
+    registry_dir: PathBuf,
+    /// Tracking key: the editor id for the default profile, as before profiles.
+    key: String,
+}
+
+fn profiles(editor: &Editor) -> Vec<Profile> {
+    let mut out = vec![Profile {
+        name: None,
+        registry_dir: editor.extensions_dir.clone(),
+        key: editor.id.to_string(),
+    }];
+    let storage: serde_json::Value =
+        std::fs::read(editor.user_dir.join("globalStorage").join("storage.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+    for profile in storage["userDataProfiles"].as_array().into_iter().flatten() {
+        // Sharing the default profile's extensions: already covered.
+        if profile["useDefaultFlags"]["extensions"].as_bool() == Some(true) {
+            continue;
+        }
+        let Some(name) = profile["name"].as_str() else {
+            continue;
+        };
+        // Stored relative to User/profiles; older editors stored a file URI.
+        let location = &profile["location"];
+        let registry_dir = match (location.as_str(), location["path"].as_str()) {
+            (Some(relative), _) => editor.user_dir.join("profiles").join(relative),
+            (None, Some(absolute)) => PathBuf::from(absolute),
+            (None, None) => continue,
+        };
+        out.push(Profile {
+            name: Some(name.to_string()),
+            key: format!("{}:{}", editor.id, registry_dir.display()),
+            registry_dir,
+        });
+    }
+    out
+}
+
 /// Install when the editor has never had it, or has an older build of it.
 /// Nothing present after an earlier install means the user removed it.
 fn should_install(current: &str, present: &[String], installed_before: bool) -> bool {
@@ -133,7 +190,7 @@ fn should_install(current: &str, present: &[String], installed_before: bool) -> 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Tracking {
-    /// Editors Headroom has installed the extension into.
+    /// Profiles Headroom has installed the extension into (`Profile::key`).
     installed: BTreeSet<String>,
 }
 
@@ -162,10 +219,12 @@ fn save_tracking(tracking: &Tracking) {
 }
 
 /// The .vsix: a zip of the extension plus `headroom.json`, which tells it
-/// where this install keeps the per-conversation savings file.
-fn build_vsix(state_path: &Path) -> Result<Vec<u8>> {
+/// where this install keeps the per-conversation savings file, and the
+/// terminal statusline script whose absence means Claude Code is not routed.
+fn build_vsix(state_path: &Path, script_path: &Path) -> Result<Vec<u8>> {
     let version = extension_version();
-    let config = serde_json::json!({ "statePath": state_path }).to_string();
+    let config =
+        serde_json::json!({ "statePath": state_path, "scriptPath": script_path }).to_string();
     let content_types = r#"<?xml version="1.0" encoding="utf-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension=".json" ContentType="application/json"/><Default Extension=".js" ContentType="application/javascript"/><Default Extension=".vsixmanifest" ContentType="text/xml"/></Types>"#;
     let manifest = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
@@ -200,9 +259,12 @@ fn build_vsix(state_path: &Path) -> Result<Vec<u8>> {
 /// forever, freezing the statusline toggle and Headroom's uninstall cleanup.
 const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn run_cli(editor: &Editor, args: &[&std::ffi::OsStr]) -> Result<()> {
+fn run_cli(editor: &Editor, profile: &Profile, args: &[&std::ffi::OsStr]) -> Result<()> {
     let mut command = crate::proc::command(&editor.cli);
     command.args(args);
+    if let Some(name) = &profile.name {
+        command.arg("--profile").arg(name);
+    }
     let out = crate::proc::output_with_timeout(command, CLI_TIMEOUT).map_err(|err| match err {
         crate::proc::OutputError::Spawn(err) => {
             anyhow!(err).context(format!("running {}", editor.cli.display()))
@@ -222,13 +284,13 @@ fn run_cli(editor: &Editor, args: &[&std::ffi::OsStr]) -> Result<()> {
     Ok(())
 }
 
-fn install(editor: &Editor, state_path: &Path) -> Result<()> {
+fn install(editor: &Editor, profile: &Profile, vsix_bytes: &[u8]) -> Result<()> {
     let vsix = std::env::temp_dir().join(format!("headroom-status-{}.vsix", std::process::id()));
     // direct-write: a throwaway CLI input, deleted right after; not persisted state.
-    std::fs::write(&vsix, build_vsix(state_path)?)
-        .with_context(|| format!("writing {}", vsix.display()))?;
+    std::fs::write(&vsix, vsix_bytes).with_context(|| format!("writing {}", vsix.display()))?;
     let result = run_cli(
         editor,
+        profile,
         &[
             "--install-extension".as_ref(),
             vsix.as_os_str(),
@@ -250,54 +312,79 @@ pub fn ensure_installed() {
     if editors.is_empty() {
         return;
     }
-    std::thread::spawn(move || {
-        let _serial = INSTALL.lock().unwrap_or_else(|p| p.into_inner());
-        let current = extension_version();
-        let state_path = crate::claude_statusline::state_path();
-        let mut tracking = load_tracking();
-        let before = tracking.installed.clone();
-        for editor in &editors {
-            let present = installed_versions(&editor.extensions_dir);
+    std::thread::spawn(move || install_where_needed(&editors));
+}
+
+fn install_where_needed(editors: &[Editor]) {
+    let _serial = INSTALL.lock().unwrap_or_else(|p| p.into_inner());
+    // Turning the statusline off writes the flag, then uninstalls under
+    // INSTALL; an install queued behind that must not put it back.
+    if crate::client_adapters::is_statusline_disabled() {
+        return;
+    }
+    let current = extension_version();
+    let vsix = match build_vsix(
+        &crate::claude_statusline::state_path(),
+        &crate::client_adapters::claude_statusline_script_path(),
+    ) {
+        Ok(vsix) => vsix,
+        Err(err) => {
+            log::warn!("building the Headroom status bar extension failed: {err:#}");
+            return;
+        }
+    };
+    let mut tracking = load_tracking();
+    let before = tracking.installed.clone();
+    for editor in editors {
+        for profile in profiles(editor) {
+            let present = installed_versions(&profile.registry_dir);
             if present.contains(&current) {
-                tracking.installed.insert(editor.id.to_string());
+                tracking.installed.insert(profile.key);
                 continue;
             }
-            let removed_by_user = tracking.installed.contains(editor.id)
-                && !orphaned_by_our_uninstall(&editor.extensions_dir);
+            let removed_by_user = tracking.installed.contains(&profile.key)
+                && !orphaned_by_our_uninstall(&profile.registry_dir);
             if !should_install(&current, &present, removed_by_user) {
                 continue;
             }
-            match install(editor, &state_path) {
+            match install(editor, &profile, &vsix) {
                 Ok(()) => {
-                    log::info!("installed Headroom status bar extension in {}", editor.id);
-                    tracking.installed.insert(editor.id.to_string());
+                    log::info!("installed Headroom status bar extension in {}", profile.key);
+                    tracking.installed.insert(profile.key);
                 }
                 Err(err) => {
                     log::warn!("installing Headroom status bar extension failed: {err:#}")
                 }
             }
         }
-        if tracking.installed != before {
-            save_tracking(&tracking);
-        }
-    });
+    }
+    if tracking.installed != before {
+        save_tracking(&tracking);
+    }
 }
 
 /// Uninstall from every editor and forget earlier installs, so turning the
 /// feature back on installs it again. Synchronous: callers are a settings
 /// toggle and Headroom's own uninstall.
 pub fn uninstall() -> Result<()> {
+    uninstall_from(&editors())
+}
+
+fn uninstall_from(editors: &[Editor]) -> Result<()> {
     let _serial = INSTALL.lock().unwrap_or_else(|p| p.into_inner());
     let mut failures = Vec::new();
-    for editor in editors() {
-        if installed_versions(&editor.extensions_dir).is_empty() {
-            continue;
-        }
-        if let Err(err) = run_cli(
-            &editor,
-            &["--uninstall-extension".as_ref(), EXTENSION_ID.as_ref()],
-        ) {
-            failures.push(format!("{err:#}"));
+    for editor in editors {
+        for profile in profiles(editor) {
+            if installed_versions(&profile.registry_dir).is_empty() {
+                continue;
+            }
+            if let Err(err) = run_cli(
+                editor,
+                &profile,
+                &["--uninstall-extension".as_ref(), EXTENSION_ID.as_ref()],
+            ) {
+                failures.push(format!("{err:#}"));
+            }
         }
     }
     let path = tracking_path();
@@ -373,7 +460,7 @@ mod tests {
     #[test]
     fn vsix_carries_the_extension_and_this_install_s_state_path() {
         let state = Path::new("/Users/x/Library/Application Support/Headroom/config/s.json");
-        let bytes = build_vsix(state).unwrap();
+        let bytes = build_vsix(state, Path::new("/Users/x/.claude/hooks/h.sh")).unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let read = |zip: &mut zip::ZipArchive<_>, name: &str| {
             let mut out = String::new();
@@ -388,5 +475,152 @@ mod tests {
         assert!(manifest.contains(&format!(r#"Version="{}""#, extension_version())));
         assert!(!extension_version().is_empty());
         zip.by_name("[Content_Types].xml").unwrap();
+    }
+
+    /// HOME and the data dir in a temp dir, and a fake editor CLI there that
+    /// logs its arguments and keeps the last .vsix it was handed.
+    #[cfg(unix)]
+    struct Sandbox {
+        dir: tempfile::TempDir,
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl Sandbox {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let env_lock = crate::test_env_lock::lock_home();
+            let dir = tempfile::tempdir().unwrap();
+            let prev = ["HOME", "HEADROOM_DATA_DIR"]
+                .map(|key| (key, std::env::var_os(key)))
+                .to_vec();
+            std::env::set_var("HOME", dir.path());
+            std::env::set_var("HEADROOM_DATA_DIR", dir.path().join("data"));
+            crate::storage::ensure_data_dirs(&crate::storage::app_data_dir()).unwrap();
+            let cli = dir.path().join("code");
+            std::fs::write(
+                &cli,
+                format!(
+                    "#!/bin/sh\necho \"$*\" >> '{0}/cli.log'\n\
+                     [ \"$1\" = --install-extension ] && cp \"$2\" '{0}/last.vsix'\nexit 0\n",
+                    dir.path().display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self {
+                dir,
+                prev,
+                _env_lock: env_lock,
+            }
+        }
+
+        fn editor(&self) -> Editor {
+            Editor {
+                id: "vscode",
+                cli: self.dir.path().join("code"),
+                extensions_dir: self.dir.path().join(".vscode").join("extensions"),
+                user_dir: self.dir.path().join("User"),
+            }
+        }
+
+        fn cli_log(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("cli.log")).unwrap_or_default()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            for (key, value) in self.prev.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_installed_extension_knows_where_the_statusline_script_lives() {
+        let sandbox = Sandbox::new();
+        install_where_needed(&[sandbox.editor()]);
+        let vsix = std::fs::read(sandbox.dir.path().join("last.vsix")).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(vsix)).unwrap();
+        let mut config = String::new();
+        std::io::Read::read_to_string(
+            &mut zip.by_name("extension/headroom.json").unwrap(),
+            &mut config,
+        )
+        .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        // Headroom deletes that script on every pause and quit, and the item
+        // hides with it instead of showing a stale total.
+        let script = crate::client_adapters::claude_statusline_script_path();
+        assert_eq!(config["scriptPath"], script.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_install_queued_behind_turning_the_statusline_off_stays_off() {
+        let sandbox = Sandbox::new();
+        let editors = [sandbox.editor()];
+        // The toggle writes the flag, then uninstalls under INSTALL; a launch's
+        // install that was already waiting on INSTALL runs after it.
+        crate::client_adapters::set_statusline_enabled(false).unwrap();
+        install_where_needed(&editors);
+        assert_eq!(sandbox.cli_log(), "", "reinstalled while the flag says off");
+
+        crate::client_adapters::set_statusline_enabled(true).unwrap();
+        install_where_needed(&editors);
+        assert!(sandbox.cli_log().starts_with("--install-extension "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_profiles_get_the_extension_and_lose_it_on_uninstall() {
+        let sandbox = Sandbox::new();
+        let editor = sandbox.editor();
+        let storage = editor.user_dir.join("globalStorage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let profiles = serde_json::json!({ "userDataProfiles": [
+            { "location": "-5c2f1a", "name": "Work" },
+            // Shares the default profile's extensions: nothing of its own.
+            { "location": "builtin/agents", "name": "Agents",
+              "useDefaultFlags": { "extensions": true } },
+            // Older editors stored the location as a file URI.
+            { "location": { "$mid": 1, "scheme": "file",
+                "path": editor.user_dir.join("profiles").join("-9e01").to_str().unwrap() },
+              "name": "Old Box" },
+        ]});
+        std::fs::write(storage.join("storage.json"), profiles.to_string()).unwrap();
+
+        install_where_needed(std::slice::from_ref(&editor));
+        let log = sandbox.cli_log();
+        let calls: Vec<&str> = log.lines().collect();
+        assert_eq!(calls.len(), 3, "{log}");
+        assert!(calls[0].ends_with(" --force"), "default profile: {log}");
+        assert!(calls[1].ends_with(" --force --profile Work"), "{log}");
+        assert!(calls[2].ends_with(" --force --profile Old Box"), "{log}");
+
+        // Each named profile keeps its own registry; only Work lists it.
+        let work = editor.user_dir.join("profiles").join("-5c2f1a");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(
+            work.join("extensions.json"),
+            format!(
+                r#"[{{"identifier":{{"id":"{EXTENSION_ID}"}},"version":"{}"}}]"#,
+                extension_version()
+            ),
+        )
+        .unwrap();
+        std::fs::remove_file(sandbox.dir.path().join("cli.log")).unwrap();
+        uninstall_from(std::slice::from_ref(&editor)).unwrap();
+        assert_eq!(
+            sandbox.cli_log(),
+            format!("--uninstall-extension {EXTENSION_ID} --profile Work\n")
+        );
     }
 }

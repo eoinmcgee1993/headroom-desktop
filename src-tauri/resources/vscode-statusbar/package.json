@@ -2,7 +2,7 @@
   "name": "headroom-status",
   "displayName": "Headroom",
   "description": "Shows what Headroom saved in your Claude Code conversation, in the status bar. Installed and updated by Headroom Desktop.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "headroom",
   "engines": {
     "vscode": "^1.75.0"

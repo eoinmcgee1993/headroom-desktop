@@ -26,7 +26,12 @@ log = { version = "0.4", features = ["std"] }
 os_info = "3.10"
 parking_lot = "0.12"
 rand = "0.9"
-reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# rustls-tls-native-roots: trust the OS store (and SSL_CERT_FILE) on top of the
+# bundled webpki roots, so a TLS-inspecting network's corporate root works.
+# Loading it costs ~130ms per build on macOS, so loopback clients opt out with
+# .tls_built_in_root_certs(false) (every_reqwest_client_decides_about_the_system_proxy).
+# system-proxy is macOS-only, in the target table below.
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 serde = { version = "=1.0.228", features = ["derive"] }
@@ -55,6 +60,13 @@ serial_test = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6"
+# system-proxy: honor the System Settings proxy, not only *_PROXY env; via the
+# shared hyper-util feature it also reaches the updater's reqwest 0.13. Not on
+# Windows: hyper-util parses HKCU ProxyServer raw, and the values real machines
+# carry there (v2rayN `socks=127.0.0.1:10808`, `socks4://...`, see
+# registry_proxy_env_overrides) become an unusable proxy for every client,
+# where going direct worked. Linux has no system reader to enable.
+reqwest = { version = "=0.12.28", default-features = false, features = ["system-proxy"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
