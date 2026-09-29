@@ -1,7 +1,28 @@
-import { describe, expect, it } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { activityFeedSignature, notificationActionView } from "./trayHelpers";
+import {
+  activityFeedSignature,
+  notificationActionView,
+  runtimeStatusPollMs,
+  useWindowFocused,
+  whenWindowVisible
+} from "./trayHelpers";
 import type { ActivityFeedResponse } from "./types";
+
+const { isFocusedMock, isVisibleMock, onFocusChangedMock } = vi.hoisted(() => ({
+  isFocusedMock: vi.fn(),
+  isVisibleMock: vi.fn(),
+  onFocusChangedMock: vi.fn()
+}));
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    isFocused: isFocusedMock,
+    isVisible: isVisibleMock,
+    onFocusChanged: onFocusChangedMock
+  })
+}));
 
 const emptySnapshot: ActivityFeedResponse = {
   proxyReachable: true,
@@ -128,4 +149,67 @@ describe("activityFeedSignature", () => {
     expect(sig).toContain("ts:/Users/x/proj:2026-04-25T09:00:00Z");
   });
 
+});
+
+describe("useWindowFocused", () => {
+  let emitFocus: (focused: boolean) => void = () => {};
+
+  beforeEach(() => {
+    isFocusedMock.mockReset();
+    onFocusChangedMock.mockReset();
+    onFocusChangedMock.mockImplementation(
+      async (handler: (event: { payload: boolean }) => void) => {
+        emitFocus = (focused) => handler({ payload: focused });
+        return () => {};
+      }
+    );
+  });
+
+  it("reports a window that starts hidden as unfocused instead of assuming focus", async () => {
+    // Both windows are created hidden; the launcher is never shown on a
+    // returning launch and an autostarted main window is not either.
+    isFocusedMock.mockResolvedValue(false);
+    const { result } = renderHook(() => useWindowFocused());
+    await act(async () => {});
+    expect(result.current).toBe(false);
+  });
+
+  it("seeds a window that is already focused and then follows focus events", async () => {
+    isFocusedMock.mockResolvedValue(true);
+    const { result } = renderHook(() => useWindowFocused());
+    await act(async () => {});
+    expect(result.current).toBe(true);
+    act(() => emitFocus(false));
+    expect(result.current).toBe(false);
+  });
+});
+
+describe("runtimeStatusPollMs", () => {
+  it("keeps polling runtime status while the tray is hidden so a crash still notifies", () => {
+    expect(runtimeStatusPollMs(true)).toBe(3_000);
+    expect(runtimeStatusPollMs(false)).toBe(30_000);
+  });
+});
+
+describe("whenWindowVisible", () => {
+  beforeEach(() => {
+    isVisibleMock.mockReset();
+  });
+
+  it("skips the poll while the window is hidden and runs it once shown", async () => {
+    const poll = vi.fn();
+    const gated = whenWindowVisible(poll);
+
+    isVisibleMock.mockResolvedValue(false);
+    await gated();
+    expect(poll).not.toHaveBeenCalled();
+
+    isVisibleMock.mockRejectedValue(new Error("ipc down"));
+    await gated();
+    expect(poll).not.toHaveBeenCalled();
+
+    isVisibleMock.mockResolvedValue(true);
+    await gated();
+    expect(poll).toHaveBeenCalledTimes(1);
+  });
 });

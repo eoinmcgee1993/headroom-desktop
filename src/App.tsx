@@ -193,7 +193,10 @@ import {
 import {
   activityFeedSignature,
   notificationActionView,
+  runtimeStatusPollMs,
   serializeState,
+  useWindowFocused,
+  whenWindowVisible,
   type TrayView
 } from "./lib/trayHelpers";
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
@@ -1744,8 +1747,9 @@ export default function App() {
   // empty state and make the tab feel like it's already in an error state.
   const [activityFeedLoaded, setActivityFeedLoaded] = useState(false);
   // Tray window focus proxies for visibility: the window auto-hides on blur
-  // via `triggerHide`, so "not focused" ⇒ "hidden" for polling purposes.
-  const [trayWindowFocused, setTrayWindowFocused] = useState(true);
+  // via `triggerHide`, so "not focused" means "hidden" for polling purposes. The
+  // launcher tracks its own focus too, so its hidden webview slows down.
+  const trayWindowFocused = useWindowFocused();
   // Sticky flag: the user has visited a heavy-data tab (Activity or Optimize)
   // at least once this session. The tray-focus pre-warm is gated on this so
   // users who stay on Home don't pay its IPC/subprocess cost on every focus.
@@ -2481,82 +2485,80 @@ export default function App() {
     }
 
     let active = true;
-    const poll = () => {
-      void (async () => {
-        try {
-          // Counts come from the Rust intercept, never from the backend's
-          // /stats: that endpoint rebuilds its whole payload per call and a
-          // 1/s poll of it saturated the backend (see get_headroom_request_count).
-          const [runtime, counts] = await Promise.all([
-            interceptOnlyVerify
-              ? Promise.resolve<RuntimeStatus | null>(null)
-              : invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
-            invoke<Record<string, number> | null>("get_intercept_request_counts_by_agent").catch(
-              () => null
-            )
-          ]);
+    const poll = whenWindowVisible(async () => {
+      try {
+        // Counts come from the Rust intercept, never from the backend's
+        // /stats: that endpoint rebuilds its whole payload per call and a
+        // 1/s poll of it saturated the backend (see get_headroom_request_count).
+        const [runtime, counts] = await Promise.all([
+          interceptOnlyVerify
+            ? Promise.resolve<RuntimeStatus | null>(null)
+            : invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
+          invoke<Record<string, number> | null>("get_intercept_request_counts_by_agent").catch(
+            () => null
+          )
+        ]);
 
-          if (!active) {
-            return;
-          }
-
-          if ((!interceptOnlyVerify && runtime?.proxyReachable !== true) || counts === null) {
-            // On this screen the runtime is always app-managed and coming up
-            // (the pre-install case routes through interceptOnlyVerify). First
-            // launch synchronously downloads the compression/embedder models
-            // before the backend binds, so `proxyReachable` is false for a
-            // minute or more on a perfectly healthy install. Keep it calm and
-            // informational — only a hard startup fault is a real error.
-            const startupError = interceptOnlyVerify ? null : runtime?.startupError;
-            setProxyVerificationHint(
-              interceptOnlyVerify
-                ? { text: "Waiting for setup traffic. Send a test message from your coding tool.", tone: "info" }
-                : startupError
-                ? { text: `Headroom could not finish starting: ${startupError}`, tone: "error" }
-                : {
-                    text: "Finishing setup. The first launch downloads models and can take a minute. Send your test message once this clears.",
-                    tone: "info"
-                  }
-            );
-            return;
-          }
-
-          setProxyVerificationHint(null);
-
-          // Capture the baseline on the first reachable poll. Anchoring on a
-          // null/unreachable reading would let a later "proxy came up" jump
-          // (0 → N) look like new traffic.
-          if (proxyVerificationRequestAnchorRef.current === null) {
-            proxyVerificationRequestAnchorRef.current = counts;
-            return;
-          }
-
-          // Attribute traffic per client: a prompt sent to Claude Code must not
-          // flip the Codex row (and vice versa). The proxy keys agents as
-          // `claude-code` / `codex`; our rows use `claude_code` / `codex`.
-          const anchor = proxyVerificationRequestAnchorRef.current;
-          setProxyVerificationRows((current) =>
-            current.map((row) => {
-              if (row.state === "verified") {
-                return row;
-              }
-              const agentKey = row.clientId.replace(/_/g, "-");
-              const now = counts[agentKey] ?? 0;
-              const base = anchor[agentKey] ?? 0;
-              return now > base
-                ? { ...row, state: "verified", message: "Request received" }
-                : row;
-            })
-          );
-        } catch {
-          if (active) {
-            setProxyVerificationHint({ text: "Waiting for Headroom proxy activity...", tone: "info" });
-          }
+        if (!active) {
+          return;
         }
-      })();
-    };
-    poll();
-    const interval = window.setInterval(poll, 1000);
+
+        if ((!interceptOnlyVerify && runtime?.proxyReachable !== true) || counts === null) {
+          // On this screen the runtime is always app-managed and coming up
+          // (the pre-install case routes through interceptOnlyVerify). First
+          // launch synchronously downloads the compression/embedder models
+          // before the backend binds, so `proxyReachable` is false for a
+          // minute or more on a perfectly healthy install. Keep it calm and
+          // informational -- only a hard startup fault is a real error.
+          const startupError = interceptOnlyVerify ? null : runtime?.startupError;
+          setProxyVerificationHint(
+            interceptOnlyVerify
+              ? { text: "Waiting for setup traffic. Send a test message from your coding tool.", tone: "info" }
+              : startupError
+              ? { text: `Headroom could not finish starting: ${startupError}`, tone: "error" }
+              : {
+                  text: "Finishing setup. The first launch downloads models and can take a minute. Send your test message once this clears.",
+                  tone: "info"
+                }
+          );
+          return;
+        }
+
+        setProxyVerificationHint(null);
+
+        // Capture the baseline on the first reachable poll. Anchoring on a
+        // null/unreachable reading would let a later "proxy came up" jump
+        // (0 -> N) look like new traffic.
+        if (proxyVerificationRequestAnchorRef.current === null) {
+          proxyVerificationRequestAnchorRef.current = counts;
+          return;
+        }
+
+        // Attribute traffic per client: a prompt sent to Claude Code must not
+        // flip the Codex row (and vice versa). The proxy keys agents as
+        // `claude-code` / `codex`; our rows use `claude_code` / `codex`.
+        const anchor = proxyVerificationRequestAnchorRef.current;
+        setProxyVerificationRows((current) =>
+          current.map((row) => {
+            if (row.state === "verified") {
+              return row;
+            }
+            const agentKey = row.clientId.replace(/_/g, "-");
+            const now = counts[agentKey] ?? 0;
+            const base = anchor[agentKey] ?? 0;
+            return now > base
+              ? { ...row, state: "verified", message: "Request received" }
+              : row;
+          })
+        );
+      } catch {
+        if (active) {
+          setProxyVerificationHint({ text: "Waiting for Headroom proxy activity...", tone: "info" });
+        }
+      }
+    });
+    void poll();
+    const interval = window.setInterval(() => void poll(), 1000);
 
     return () => {
       active = false;
@@ -2573,15 +2575,14 @@ export default function App() {
       return;
     }
     let active = true;
-    const poll = () => {
-      void invoke<Record<string, number>>("get_running_agent_process_counts")
-        .then((counts) => {
-          if (active) setRunningAgentCounts(counts);
-        })
-        .catch(() => {});
-    };
-    poll();
-    const interval = window.setInterval(poll, 5000);
+    const poll = whenWindowVisible(async () => {
+      const counts = await invoke<Record<string, number>>(
+        "get_running_agent_process_counts"
+      ).catch(() => null);
+      if (active && counts) setRunningAgentCounts(counts);
+    });
+    void poll();
+    const interval = window.setInterval(() => void poll(), 5000);
     return () => {
       active = false;
       window.clearInterval(interval);
@@ -2834,15 +2835,17 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, forcedSetupStall]);
 
+  // Keeps a slow poll while hidden: the "Headroom stopped running"
+  // notification only fires while the window is hidden.
   useEffect(() => {
-    if (windowLabel !== "main" || !trayWindowFocused) {
+    if (windowLabel !== "main") {
       return;
     }
 
     void refreshRuntimeStatus();
     const interval = window.setInterval(() => {
       void refreshRuntimeStatus();
-    }, 3000);
+    }, runtimeStatusPollMs(trayWindowFocused));
 
     return () => window.clearInterval(interval);
   // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
@@ -2879,7 +2882,6 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
-        setTrayWindowFocused(focused);
         const now = new Date();
         const nowDayKey = formatDayKey(now);
 
@@ -3412,10 +3414,10 @@ export default function App() {
   useEffect(() => {
     // Pricing status hits the remote Headroom API. When the tray is focused,
     // poll at 60s so fresh subscription/trial state is visible on demand.
-    // When hidden, slow to 10 min — still fast enough for trial-expiry and
+    // When hidden, slow to 10 min: still fast enough for trial-expiry and
     // urgent notifications to fire, while cutting hourly API traffic by
-    // ~90%. The launcher window never sets `trayWindowFocused` to false
-    // (its focus listener isn't wired up), so it keeps the 60s cadence.
+    // ~90%. The launcher tracks its own focus, so its webview, hidden all
+    // session on a returning launch, takes the 10 min cadence too.
     const intervalMs = trayWindowFocused ? 60_000 : 600_000;
     void refreshPricingStatus();
     const interval = window.setInterval(() => {

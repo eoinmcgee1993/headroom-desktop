@@ -1,3 +1,6 @@
+import { useEffect, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
 import type { ActivityFeedResponse } from "./types";
 
 /// All views the tray window can land on. Kept here (rather than in App.tsx)
@@ -66,4 +69,54 @@ export function activityFeedSignature(feed: ActivityFeedResponse): string {
 /// in.
 export function serializeState(value: unknown): string {
   return JSON.stringify(value);
+}
+
+/// Whether this webview's window has focus, for both windows. Both are created
+/// hidden (tauri.conf.json), so this starts false and is seeded from the window
+/// once the listener is live. A hard-coded `true` that only the main window
+/// ever updated kept the never-shown launcher, and an autostarted main window
+/// until its first focus change, on the focused poll cadence all session.
+export function useWindowFocused(): boolean {
+  const [focused, setFocused] = useState(false);
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      const win = getCurrentWindow();
+      let sawEvent = false;
+      const fn = await win.onFocusChanged(({ payload }) => {
+        sawEvent = true;
+        if (active) setFocused(payload);
+      });
+      if (!active) return fn();
+      unlisten = fn;
+      // Queried only after the listener is up, so no later change is missed
+      // and a change that races this read is not overwritten by it.
+      const value = await win.isFocused();
+      if (active && !sawEvent) setFocused(value);
+    })().catch(() => {});
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+  return focused;
+}
+
+/// Runtime status poll cadence for the main window. It keeps a slow poll while
+/// hidden: the "Headroom stopped running" notification only fires while the
+/// window is hidden, so a focused-only poll could never raise it.
+export function runtimeStatusPollMs(focused: boolean): number {
+  return focused ? 3_000 : 30_000;
+}
+
+/// Gate for launcher-stage pollers. The launcher webview lives hidden all
+/// session on every returning launch, parked on post_install, so each tick
+/// checks the window is actually showing before spawning ps/tasklist or
+/// polling the runtime for a screen nobody can see.
+export function whenWindowVisible(poll: () => void | Promise<void>): () => Promise<void> {
+  return async () => {
+    if (!(await getCurrentWindow().isVisible().catch(() => false))) return;
+    await poll();
+  };
 }
