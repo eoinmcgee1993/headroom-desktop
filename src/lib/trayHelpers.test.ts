@@ -4,18 +4,21 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityFeedSignature,
   homeDashboardPoll,
-  notificationActionView,
+  loadDashboard,
   runtimeStatusPollMs,
   useWindowFocused,
   whenWindowVisible
 } from "./trayHelpers";
 import type { ActivityFeedResponse } from "./types";
 
-const { isFocusedMock, isVisibleMock, onFocusChangedMock } = vi.hoisted(() => ({
+const { invokeMock, isFocusedMock, isVisibleMock, onFocusChangedMock } = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
   isFocusedMock: vi.fn(),
   isVisibleMock: vi.fn(),
   onFocusChangedMock: vi.fn()
 }));
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -38,28 +41,15 @@ const emptySnapshot: ActivityFeedResponse = {
   }
 };
 
-describe("notificationActionView", () => {
-  it("routes auth-related actions to upgradeAuth", () => {
-    expect(notificationActionView("signin")).toBe("upgradeAuth");
-    expect(notificationActionView("signup")).toBe("upgradeAuth");
-    expect(notificationActionView("billing")).toBe("upgradeAuth");
-  });
+// Every caller has its own answer to a failed read (the pollers keep the last
+// known state). Resolving to mockDashboard instead zeroed every savings figure
+// and reset the terms gate on each failing 5s tick.
+describe("loadDashboard", () => {
+  it("rejects when get_dashboard_state fails instead of resolving to a zeroed dashboard", async () => {
+    invokeMock.mockRejectedValueOnce("JoinError: task panicked");
 
-  it("routes runtime/connectors/setup actions to settings", () => {
-    expect(notificationActionView("runtime")).toBe("settings");
-    expect(notificationActionView("connectors")).toBe("settings");
-    expect(notificationActionView("setup")).toBe("settings");
-  });
-
-  it("routes optimize/activity actions to their respective views", () => {
-    expect(notificationActionView("optimize")).toBe("optimization");
-    expect(notificationActionView("activity")).toBe("notifications");
-  });
-
-  it("returns null for unknown actions and explicit null", () => {
-    expect(notificationActionView(null)).toBeNull();
-    expect(notificationActionView("not-a-real-action")).toBeNull();
-    expect(notificationActionView("")).toBeNull();
+    await expect(loadDashboard()).rejects.toBe("JoinError: task panicked");
+    expect(invokeMock).toHaveBeenCalledWith("get_dashboard_state");
   });
 });
 

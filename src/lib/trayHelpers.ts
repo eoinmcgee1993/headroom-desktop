@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
-import type { ActivityFeedResponse } from "./types";
+import type { ActivityFeedResponse, DashboardState } from "./types";
 
 /// All views the tray window can land on. Kept here (rather than in App.tsx)
 /// so helpers and tests can import the union without pulling in App.tsx's
@@ -16,26 +17,12 @@ export type TrayView =
   | "upgradeAuth"
   | "settings";
 
-/// Map a notification's `action` payload to the tray view that should open
-/// when the user clicks the notification. Unknown actions return null so the
-/// caller can decide whether to fall back to a default.
-export function notificationActionView(action: string | null): TrayView | null {
-  switch (action) {
-    case "signin":
-    case "billing":
-    case "signup":
-      return "upgradeAuth";
-    case "runtime":
-    case "connectors":
-    case "setup":
-      return "settings";
-    case "optimize":
-      return "optimization";
-    case "activity":
-      return "notifications";
-    default:
-      return null;
-  }
+/// The dashboard read. It rejects on failure on purpose: each caller decides
+/// what a failed read means (the pollers keep the last known state). Falling
+/// back to mockDashboard here zeroed every savings figure and reset the terms
+/// gate on each failing 5s tick.
+export function loadDashboard(): Promise<DashboardState> {
+  return invoke<DashboardState>("get_dashboard_state");
 }
 
 /// O(1) structural fingerprint of an activity feed response. Used by the

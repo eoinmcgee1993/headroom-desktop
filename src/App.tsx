@@ -78,6 +78,7 @@ import {
   type SetupStallAlert,
   type SetupStallKind,
   maybeFireUnroutedAlert,
+  unroutedAfterReconnect,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
 import { ReconnectModal } from "./components/ReconnectModal";
@@ -165,6 +166,7 @@ import {
 import {
   buildInitialProxyVerificationRows,
   markIdleProxyVerificationRows,
+  proxyVerificationComplete,
   proxyVerificationRowMessage,
   type ProxyVerificationRowState,
   getClaudeConnector,
@@ -195,7 +197,7 @@ import {
 import {
   activityFeedSignature,
   homeDashboardPoll,
-  notificationActionView,
+  loadDashboard,
   runtimeStatusPollMs,
   serializeState,
   useWindowFocused,
@@ -605,14 +607,6 @@ const APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 const DESKTOP_ACTIVATION_MAX_ATTEMPTS = 5;
 const DESKTOP_ACTIVATION_RETRY_BASE_MS = 30_000;
 const DESKTOP_ACTIVATION_RETRY_MAX_MS = 5 * 60 * 1000;
-
-async function loadDashboard(): Promise<DashboardState> {
-  try {
-    return await invoke<DashboardState>("get_dashboard_state");
-  } catch {
-    return mockDashboard;
-  }
-}
 
 function SavingsChartTooltip({
   active,
@@ -2046,26 +2040,6 @@ export default function App() {
   }
 
   useEffect(() => {
-    const unlistenPromise = listen<{ action: string | null }>(
-      "notification-clicked",
-      (event) => {
-        const action = event.payload?.action ?? null;
-        if (action === "update") {
-          setShowAppUpdateDialog(true);
-          return;
-        }
-        const view = notificationActionView(action);
-        if (view) {
-          setActiveView(view);
-        }
-      }
-    );
-    return () => {
-      void unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, []);
-
-  useEffect(() => {
     setShowAllUpgradePlans(false);
     if (pricingAudience !== "individual") setBillingPeriod("monthly");
   }, [pricingAudience]);
@@ -2204,7 +2178,9 @@ export default function App() {
       }
 
       updateStartup("dashboard", 35, "Loading local dashboard state…");
-      const dashboardResult = await loadDashboard();
+      // No last known state yet: the launch decisions below read the mock,
+      // which is what state already starts as.
+      const dashboardResult = await loadDashboard().catch(() => mockDashboard);
       if (!active) {
         return;
       }
@@ -2339,11 +2315,11 @@ export default function App() {
         completionHandled = true;
         detach();
         setBootstrapping(false);
-        const latestDashboard = await loadDashboard();
+        const latestDashboard = await loadDashboard().catch(() => null);
         if (!active) {
           return;
         }
-        applyDashboardIfChanged(latestDashboard);
+        if (latestDashboard) applyDashboardIfChanged(latestDashboard);
         // Always land on the install step after a bootstrap completes during
         // this session, regardless of launchExperience. The install step's
         // Continue button is gated on runtime.running, so it handles both the
@@ -2649,7 +2625,8 @@ export default function App() {
     if (signupGateVisible) reportFunnelStep("signup_gate_shown");
   }, [signupGateVisible]);
 
-  // proxy_verified: every enabled client's test traffic reached the proxy.
+  // proxy_verified: every client the user actually uses (idle rows excluded)
+  // had its test traffic reach the proxy.
   // Once per launcher run: the poller rebuilds `proxyVerificationRows` every
   // tick, so without the ref this re-fired the beacon (a grace/start POST) on
   // every poll for as long as the screen stayed open -- one device sent it
@@ -2657,10 +2634,7 @@ export default function App() {
   useEffect(() => {
     if (windowLabel !== "launcher" || launcherStage !== "post_install") return;
     if (proxyVerifiedReportedRef.current) return;
-    if (
-      proxyVerificationRows.length > 0 &&
-      proxyVerificationRows.every((row) => row.state === "verified")
-    ) {
+    if (proxyVerificationComplete(proxyVerificationRows)) {
       proxyVerifiedReportedRef.current = true;
       // Persist for the main window: its own phase poller honors this marker,
       // so the tray doesn't ask the user to verify a second time right after
@@ -4890,8 +4864,9 @@ export default function App() {
         setConnectorsNotice(null);
       }
 
-      const latestDashboard = await loadDashboard();
-      applyDashboardIfChanged(latestDashboard);
+      // The toggle already landed: a failed refresh is not "Failed to update".
+      const latestDashboard = await loadDashboard().catch(() => null);
+      if (latestDashboard) applyDashboardIfChanged(latestDashboard);
       await refreshConnectors();
     } catch (error) {
       setConnectorsError(
@@ -8331,7 +8306,7 @@ export default function App() {
                 setActiveView("settings");
               }}
               onReconnect={(client) => {
-                setUnroutedClients(null);
+                setUnroutedClients(unroutedAfterReconnect(unroutedClients, client.clientId));
                 const connector = connectorsRef.current?.find(
                   (item) => item.clientId === client.clientId
                 );

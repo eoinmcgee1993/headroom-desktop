@@ -1,6 +1,10 @@
 import { Info } from "@phosphor-icons/react";
 
-import { setupStallNoTrafficMinutes, type SetupStallKind } from "../lib/setupHealthAlert";
+import {
+  setupStallNoTrafficMinutes,
+  stallTitle,
+  type SetupStallKind,
+} from "../lib/setupHealthAlert";
 
 export interface SetupStallModalProps {
   kind: SetupStallKind;
@@ -88,7 +92,7 @@ export function SetupStallModal({
       onClick={onClose}
     >
       <div className="modal-card setup-stall" onClick={(event) => event.stopPropagation()}>
-        <h3 id="setup-stall-title">Headroom hasn't saved anything yet</h3>
+        <h3 id="setup-stall-title">{stallTitle(kind)}</h3>
         <p>{lead}</p>
         <ul className="setup-stall__steps">
           {STEPS[kind].map((step) => (
