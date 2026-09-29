@@ -538,7 +538,12 @@ fn post_grace_start_with_step_to(
         .apply_headers(builder)
         .json(identity)
         .send()
-        .map_err(|err| format!("grace/start funnel request failed: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "grace/start funnel request failed: {}",
+                transport_cause_chain(&err)
+            )
+        })?;
     if !response.status().is_success() {
         return Err(format!(
             "grace/start funnel returned {}",
@@ -3730,12 +3735,27 @@ fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingSta
 }
 
 fn fetch_grace_start(identity: &IdentityPayload) -> Result<GraceResponse, String> {
-    let builder = http_client()?.post(api_url("desktop/grace/start"));
+    fetch_grace_start_with_base_url(identity, &api_base_url())
+}
+
+fn fetch_grace_start_with_base_url(
+    identity: &IdentityPayload,
+    base_url: &str,
+) -> Result<GraceResponse, String> {
+    let builder = http_client()?.post(join_url(base_url, "desktop/grace/start"));
     let response = identity
         .apply_headers(builder)
         .json(identity)
         .send()
-        .map_err(|err| format!("grace/start request failed: {err}"))?;
+        // The chain, not {err}: reqwest 0.12's Display stops at "error sending
+        // request", so RUST-78's `error` extra could not tell a DNS block from
+        // a firewall from TLS interception. Never shown to the user.
+        .map_err(|err| {
+            format!(
+                "grace/start request failed: {}",
+                transport_cause_chain(&err)
+            )
+        })?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -3810,14 +3830,23 @@ fn fetch_remote_account(
     token: &str,
     identity: &IdentityPayload,
 ) -> Result<RemoteAccountEnvelope, RemoteAccountSyncError> {
+    fetch_remote_account_with_base_url(token, identity, &api_base_url())
+}
+
+fn fetch_remote_account_with_base_url(
+    token: &str,
+    identity: &IdentityPayload,
+    base_url: &str,
+) -> Result<RemoteAccountEnvelope, RemoteAccountSyncError> {
     let builder = http_client()
         .map_err(RemoteAccountSyncError::Other)?
-        .get(api_url("desktop/account"))
+        .get(join_url(base_url, "desktop/account"))
         .header("Authorization", format!("Bearer {token}"));
-    let response = identity
-        .apply_headers(builder)
-        .send()
-        .map_err(|err| RemoteAccountSyncError::Other(format!("send: {err}")))?;
+    // Chain for the auth-silent alarm's `error` extra, same reason as
+    // fetch_grace_start; the user sees merge_background_account_sync's text.
+    let response = identity.apply_headers(builder).send().map_err(|err| {
+        RemoteAccountSyncError::Other(format!("send: {}", transport_cause_chain(&err)))
+    })?;
 
     if response.status().as_u16() == 401 {
         return Err(RemoteAccountSyncError::Unauthorized);
@@ -6601,6 +6630,54 @@ mod tests {
             chain.chars().count() <= 400,
             "chain must stay bounded: {chain}"
         );
+    }
+
+    /// RUST-78: the server-silent alarm's `error` extra is fetch_grace_start's
+    /// Err text, and reqwest's Display alone ("error sending request for url")
+    /// could not say whether DNS, a firewall or TLS interception blocked
+    /// extraheadroom.com. Every backend call that feeds a silent alarm or the
+    /// funnel log must name the cause, and never the token or identity headers.
+    #[test]
+    fn backend_send_failures_name_the_cause() {
+        let identity = super::IdentityPayload {
+            claude_email: Some("user@example.com".into()),
+            ..Default::default()
+        };
+        let refused = "http://127.0.0.1:1"; // nothing listens here
+        let grace =
+            super::fetch_grace_start_with_base_url(&identity, refused).expect_err("port 1 refuses");
+        let funnel = super::post_grace_start_with_step_to(&identity, "test_step", refused)
+            .expect_err("port 1 refuses");
+        let account =
+            match super::fetch_remote_account_with_base_url("secret-token", &identity, refused)
+                .err()
+            {
+                Some(super::RemoteAccountSyncError::Other(text)) => text,
+                other => panic!("expected a transport error, got {other:?}"),
+            };
+        for err in [&grace, &funnel, &account] {
+            // "Connection refused" on macOS/Linux, "actively refused it" on
+            // Windows.
+            assert!(
+                err.to_lowercase().contains("refused"),
+                "cause dropped: {err}"
+            );
+            assert!(
+                !err.contains("secret-token") && !err.contains("user@example.com"),
+                "leaked a credential: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn grace_start_send_failure_names_a_dns_failure() {
+        // .invalid never resolves (RFC 6761), online or offline.
+        let err = super::fetch_grace_start_with_base_url(
+            &super::IdentityPayload::default(),
+            "http://headroom-test.invalid",
+        )
+        .expect_err(".invalid never resolves");
+        assert!(err.contains("dns error"), "cause dropped: {err}");
     }
 
     #[test]

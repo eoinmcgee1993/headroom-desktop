@@ -65,6 +65,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: read # the Test-workflow gate before publishing
 
 jobs:
   release:
@@ -102,9 +103,10 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -113,11 +115,6 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
-        with:
-          tool: nextest
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -129,6 +126,10 @@ jobs:
       - name: Validate release version state
         id: release_guard
         shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          DISPATCH_PLATFORMS: ${{ github.event.inputs.platforms }}
+          DISPATCH_PUBLISH: ${{ github.event.inputs.publish }}
         run: |
           set -euo pipefail
           package_version="$(node -p "require('./package.json').version")"
@@ -142,7 +143,7 @@ jobs:
           fi
 
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
-            before_sha="${{ github.event.before }}"
+            before_sha="${BEFORE_SHA:-}"
             if [[ -n "${before_sha}" ]] && [[ "${before_sha}" != "0000000000000000000000000000000000000000" ]] && git cat-file -e "${before_sha}^{commit}" 2>/dev/null; then
               previous_package_version="$(
                 git show "${before_sha}:package.json" \
@@ -177,11 +178,11 @@ jobs:
           # the pushed range (same idiom as [skip-rc-check]). Default all, so
           # forgetting the marker ships to everyone rather than stranding a
           # platform.
-          release_platforms="${{ github.event.inputs.platforms || 'all' }}"
+          release_platforms="${DISPATCH_PLATFORMS:-all}"
           # Whether the finished release is flipped to `latest` (stable) or left
           # a prerelease only pinned new downloads can reach (download-only).
           # Same marker idiom: `[publish: download-only]`.
-          release_publish="${{ github.event.inputs.publish || 'stable' }}"
+          release_publish="${DISPATCH_PUBLISH:-stable}"
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             release_platforms=all
             release_publish=stable
@@ -339,11 +340,6 @@ jobs:
         if: steps.release_guard.outputs.should_release == 'true'
         run: npm ci
 
-      - name: Run release checks
-        if: steps.release_guard.outputs.should_release == 'true'
-        timeout-minutes: 12
-        run: ./scripts/verify-release.sh
-
       - name: Load release notes
         if: steps.release_guard.outputs.should_release == 'true'
         id: release_notes
@@ -366,7 +362,7 @@ jobs:
 
       - name: Build and publish Tauri release
         if: steps.release_guard.outputs.should_release == 'true'
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEADROOM_UPDATER_ENDPOINTS: ${{ env.HEADROOM_UPDATER_ENDPOINTS }}
@@ -393,8 +389,8 @@ jobs:
           # Published but not `releases/latest`, so the stable updater endpoint
           # keeps serving the previous version until the publish job flips this.
           prerelease: true
-          assetNamePattern: '[name]_[version]_mac[ext]'
-          includeUpdaterJson: true
+          releaseAssetNamePattern: '[name]_[version]_mac[ext]'
+          uploadUpdaterJson: true
           args: --target universal-apple-darwin
 
   windows:
@@ -427,9 +423,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -447,7 +445,9 @@ jobs:
         run: npm ci
 
       - name: Install Azure Artifact Signing CLI
-        run: cargo install artifact-signing-cli --locked
+        # Pinned on purpose: this binary runs with the signing secrets in env.
+        # crates.io versions are immutable; bump by hand after reviewing the diff.
+        run: cargo install artifact-signing-cli --version =0.11.0 --locked
 
       - name: Build NSIS installer
         shell: bash
@@ -501,6 +501,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux system dependencies
         run: |
@@ -518,7 +520,7 @@ jobs:
             wget
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
@@ -590,9 +592,30 @@ jobs:
     needs: [release, windows, linux]
     if: needs.release.outputs.should_release == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45 # up to 30 of it waiting on Test
 
     steps:
+      - name: Wait for the Test workflow on this commit
+        # The release builds compile no test code, so they pass where the
+        # Windows test build no longer compiles: rc8 and rc10 shipped that way.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          runs="repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=1"
+          for _ in $(seq 180); do
+            read -r status conclusion url < <(gh api "$runs" --jq '.workflow_runs[0] | "\(.status) \(.conclusion) \(.html_url)"') || true
+            if [ "$status" = completed ]; then
+              [ "$conclusion" = success ] && exit 0
+              echo "::error::Test finished $conclusion for $GITHUB_SHA: $url. Fix it (or re-run it), then re-run this job."
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "::error::no finished Test run for $GITHUB_SHA after 30 minutes (last status: $status)"
+          exit 1
+
       - name: Complete the manifest and publish the release
         shell: bash
         env:
@@ -679,10 +702,11 @@ jobs:
           # failure used to leave the release deleted, 404ing that endpoint
           # until the next release. Binaries first, latest.json last.
           if gh release view staging-rolling --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            bundles=()
             for f in "$workdir"/*; do
-              [ "$(basename "$f")" = "latest.json" ] && continue
-              gh release upload staging-rolling "$f" --clobber --repo "$GITHUB_REPOSITORY"
+              [ "$(basename "$f")" = "latest.json" ] || bundles+=("$f")
             done
+            gh release upload staging-rolling "${bundles[@]}" --clobber --repo "$GITHUB_REPOSITORY"
             gh release upload staging-rolling "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
             gh release edit staging-rolling \
               --repo "$GITHUB_REPOSITORY" \

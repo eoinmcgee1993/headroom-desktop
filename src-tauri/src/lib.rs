@@ -589,6 +589,7 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     }
     if codex && !CODEX_BEACON_SENT.swap(true, Ordering::AcqRel) {
         pricing::report_funnel_step(state, "unrouted_codex_usage_detected");
+        report_first_run_unrouted_codex(state, since);
     }
     if !state.try_mark_unrouted_usage_notified() {
         return;
@@ -599,6 +600,36 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         app,
         "unrouted_usage_nudge_shown",
         Some(json!({ "claude": claude, "codex": codex })),
+    );
+}
+
+/// First-run twin of the hourly `unrouted_client` report, with the same Codex
+/// diagnostics. That one needs two hours of uptime, and the new user who gives
+/// up inside the first hour never reaches it; that user is the Windows+Codex
+/// funnel leak (61% of Codex-only Windows installs save, 76% on macOS).
+fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc>) {
+    // Paused or bypassed, going direct is the intended state, not a leak.
+    if state.runtime_is_paused() || state.proxy_bypass.load(Ordering::Acquire) {
+        return;
+    }
+    let tags = client_adapters::codex_unrouted_diagnostics(since.into());
+    let enabled = client_adapters::is_codex_enabled();
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("flow", "unrouted_client_first_run");
+            scope.set_tag("client", "codex");
+            scope.set_tag("enabled", enabled);
+            for (key, value) in tags {
+                scope.set_tag(key, value);
+            }
+            scope.set_fingerprint(Some(&["unrouted_client_first_run", "codex"]));
+        },
+        || {
+            sentry::capture_message(
+                "unrouted client codex on first run: sessions growing, nothing proxied",
+                sentry::Level::Warning,
+            );
+        },
     );
 }
 
@@ -1585,20 +1616,25 @@ async fn install_addon(
             .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
         }
         "ponytail" | "caveman" => {
-            let codex_outdated = state
+            let outdated = state
                 .tool_manager
                 .install_plugin(&id)
                 .map_err(|err| err.to_string())?;
-            if codex_outdated {
+            if let Some(host) = outdated {
                 let name = if id == "caveman" {
                     "Caveman"
                 } else {
                     "Ponytail"
                 };
+                let other = if host == "Codex" {
+                    "Claude Code"
+                } else {
+                    "Codex"
+                };
                 let _ = show_notification_impl(
                     &app,
-                    &format!("Update the Codex CLI to finish {name} setup"),
-                    &format!("{name} is installed for Claude Code. Your Codex CLI is too old to add it -- update the Codex CLI, then re-install {name} to enable it there too."),
+                    &format!("Update the {host} CLI to finish {name} setup"),
+                    &format!("{name} is installed for {other}. Your {host} CLI is too old to add it -- update the {host} CLI, then re-install {name} to enable it there too."),
                     None,
                 );
             }
@@ -5494,6 +5530,12 @@ async fn detect_unrouted_clients(
                 "codex" => client_adapters::is_codex_enabled(),
                 _ => client_adapters::is_claude_code_enabled(),
             };
+            // Before the re-apply: it rewrites the config these tags describe.
+            let codex_diagnostics = if client_id == "codex" {
+                client_adapters::codex_unrouted_diagnostics(app_started_at)
+            } else {
+                Vec::new()
+            };
             let reapplied = enabled && client_adapters::apply_client_setup(client_id).is_ok();
             // Re-applying our own config is only a fix when our own config was
             // the problem. Ask the guard what the agent actually saw.
@@ -5515,6 +5557,9 @@ async fn detect_unrouted_clients(
                     scope.set_tag("client", client_id);
                     scope.set_tag("enabled", enabled);
                     scope.set_tag("reapplied", reapplied);
+                    for (key, value) in codex_diagnostics {
+                        scope.set_tag(key, value);
+                    }
                     scope.set_extra("active_at", active_at.to_rfc3339().into());
                     // Turns a blind fleet signal into a diagnosed one: without
                     // this every event says only "ran unrouted", which is the
@@ -6167,7 +6212,12 @@ fn fatal_build_error(err: tauri::Error) -> ! {
     let message = err.to_string();
     #[cfg(target_os = "windows")]
     if is_missing_webview_runtime(&message) {
-        show_webview2_missing_dialog();
+        show_webview2_dialog(concat!(
+            "Headroom needs the Microsoft Edge WebView2 runtime, ",
+            "which is not installed on this PC.\n\n",
+            "Open the download page? Install the Evergreen Runtime, ",
+            "then start Headroom again."
+        ));
     }
     panic!("error while building tauri application: {message}");
 }
@@ -6199,19 +6249,10 @@ fn fatal_app_state_error(err: anyhow::Error) -> ! {
 }
 
 #[cfg(target_os = "windows")]
-fn show_webview2_missing_dialog() {
+fn show_webview2_dialog(text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_YESNO};
 
-    let choice = show_cannot_start_dialog(
-        concat!(
-            "Headroom needs the Microsoft Edge WebView2 runtime, ",
-            "which is not installed on this PC.\n\n",
-            "Open the download page? Install the Evergreen Runtime, ",
-            "then start Headroom again."
-        ),
-        MB_YESNO,
-    );
-    if choice == IDYES {
+    if show_cannot_start_dialog(text, MB_YESNO) == IDYES {
         let _ = open_external_link_impl("https://developer.microsoft.com/microsoft-edge/webview2/");
     }
 }
@@ -6335,6 +6376,14 @@ pub fn run() {
                 scope.set_tag("abandoned_step", &abandoned.step);
                 scope.set_extra("percent", u64::from(abandoned.percent).into());
                 scope.set_extra("app_log_tail", log_tail.into());
+                // File it under the build that died, not this one.
+                if !abandoned.version.is_empty() {
+                    let release = format!("{}@{}", env!("CARGO_PKG_NAME"), abandoned.version);
+                    scope.add_event_processor(move |mut event| {
+                        event.release = Some(release.clone().into());
+                        Some(event)
+                    });
+                }
             },
             || {
                 sentry::capture_message(
@@ -6402,6 +6451,25 @@ pub fn run() {
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
             ));
+            // A WebView2 runtime that is registered but broken passes Tauri's
+            // "installed" check, then fails to create the config windows, and
+            // Tauri only logs that: the app ran with a tray icon and no window
+            // at all (Sentry RUST-K7, HRESULT 0x80070002 file not found). A
+            // getter is the probe: it errors on a window the runtime never
+            // created. Keep running afterwards so configured clients keep
+            // their proxy.
+            #[cfg(target_os = "windows")]
+            if app
+                .get_webview_window("main")
+                .is_some_and(|window| window.is_visible().is_err())
+            {
+                show_webview2_dialog(concat!(
+                    "Headroom could not open its window because the Microsoft ",
+                    "Edge WebView2 runtime on this PC failed to start.\n\n",
+                    "Open the download page? Reinstall the Evergreen Runtime, ",
+                    "then quit Headroom from its tray icon and start it again."
+                ));
+            }
             #[cfg(target_os = "macos")]
             {
                 // Accessory policy makes this a menu-bar-only app (no dock icon).
@@ -7658,6 +7726,41 @@ fn learn_failure_is_agent_unparseable_output(text: &str) -> bool {
     text.contains("returned unparseable output")
 }
 
+/// The agent CLI is older than a flag upstream's analyzer passes it (RUST-K9:
+/// ``error: unknown option '--include-partial-messages'`` from a stale
+/// `/usr/local/bin/claude`). Same class as RUST-DE's too-old-for-the-model
+/// line: the user's install, fixed by updating it, not by a release of ours.
+///
+/// Only a flag current CLIs accept counts. Any other unknown flag is upstream
+/// passing something no CLI has, which is ours to fix and must reach Sentry.
+/// A wheel bump that makes `learn/analyzer.py` pass a new flag adds it here.
+fn learn_failure_is_agent_cli_outdated(text: &str) -> bool {
+    const CURRENT_FLAGS: &[&str] = &[
+        "--include-partial-messages",
+        "--output-format",
+        "--verbose",
+        "--skip-git-repo-check",
+        "--json",
+    ];
+    // Commander (Claude Code) and clap (Codex) wording, respectively.
+    CURRENT_FLAGS.iter().any(|flag| {
+        text.contains(&format!("error: unknown option '{flag}'"))
+            || text.contains(&format!("error: unexpected argument '{flag}'"))
+    })
+}
+
+/// The user-facing remedy for [`learn_failure_is_agent_cli_outdated`].
+fn learn_agent_cli_outdated_hint(agent: LearnAgent) -> String {
+    let (cli, update) = match agent {
+        LearnAgent::Codex => ("Codex", "Update the Codex CLI"),
+        _ => ("Claude Code", "Run `claude update`"),
+    };
+    format!(
+        "The {cli} CLI on this machine is too old for headroom learn. {update}, then start \
+         the scan again."
+    )
+}
+
 /// The user-facing remedy for [`learn_failure_is_agent_unparseable_output`].
 fn learn_agent_unparseable_output_hint(agent: LearnAgent) -> String {
     let cli = match agent {
@@ -8059,10 +8162,13 @@ fn execute_headroom_learn_run(
                     // credit balance).
                     let agent_api_error_line =
                         learn_failure_agent_api_error_line(&stderr).map(str::to_string);
+                    // Sixth: the CLI is too old for upstream's flags (RUST-K9).
+                    let agent_cli_outdated = learn_failure_is_agent_cli_outdated(&stderr);
                     if !agent_not_signed_in
                         && agent_limit_line.is_none()
                         && !agent_api_unreachable
                         && !agent_unparseable
+                        && !agent_cli_outdated
                         && agent_api_error_line.is_none()
                     {
                         sentry::with_scope(
@@ -8134,6 +8240,11 @@ fn execute_headroom_learn_run(
                         (
                             format!("headroom learn could not reach the agent's API for {project_name}."),
                             learn_agent_api_error_hint(agent, line),
+                        )
+                    } else if agent_cli_outdated {
+                        (
+                            format!("headroom learn needs a newer agent CLI for {project_name}."),
+                            learn_agent_cli_outdated_hint(agent),
                         )
                     } else {
                         (
@@ -8274,7 +8385,9 @@ fn execute_headroom_learn_run(
                 // stderr, like the three siblings below.
                 let path_unreadable = stderr.contains("is not readable");
                 let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
+                let agent_cli_outdated = learn_failure_is_agent_cli_outdated(&stderr);
                 let user_env_condition = path_unreadable
+                    || agent_cli_outdated
                     || agent_not_signed_in
                     || agent_limit_line.is_some()
                     || agent_api_error_line.is_some()
@@ -8329,6 +8442,8 @@ fn execute_headroom_learn_run(
                     learn_agent_api_unreachable_hint(agent)
                 } else if agent_unparseable {
                     learn_agent_unparseable_output_hint(agent)
+                } else if agent_cli_outdated {
+                    learn_agent_cli_outdated_hint(agent)
                 } else {
                     format!(
                         "headroom learn exited with {}.\n{}",
@@ -8343,6 +8458,8 @@ fn execute_headroom_learn_run(
                     format!("headroom learn could not reach the agent's API for {project_name}.")
                 } else if agent_unparseable {
                     format!("headroom learn could not read the analysis for {project_name}.")
+                } else if agent_cli_outdated {
+                    format!("headroom learn needs a newer agent CLI for {project_name}.")
                 } else {
                     format!("headroom learn failed for {project_name}.")
                 };
@@ -9970,21 +10087,22 @@ mod tests {
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
         learn_agent_auth_hint, learn_agent_limit_hint, learn_failure_agent_api_error_line,
         learn_failure_agent_limit_line, learn_failure_is_agent_api_unreachable,
-        learn_failure_is_agent_auth, learn_failure_is_agent_model_rejected,
-        learn_failure_is_agent_unparseable_output, learn_failure_signature_source,
-        learn_step_label, lifetime_token_milestone_kind, noop_app_update_progress_emitter,
-        normalize_learn_failure_signature, onboarding_recovery_copy, parse_live_learnings,
-        parse_magic_link_auth, parse_updater_endpoint_list, pattern_matches_project,
-        persistent_zero_spend, physical_rect_from_rect, read_applied_patterns_for_project,
-        readyz_failed_checks_csv, readyz_failure_has_core_unhealthy,
-        readyz_failure_is_upstream_only, readyz_outcome_fingerprint_key, recent_savings_days,
-        resolve_release_updater_config, savings_report, select_updater_endpoints,
-        startup_error_fingerprint_key, store_checked_update, strip_connection_noise,
-        tail_bytes_for_sentry, take_pending_magic_link, user_message_for, watchdog_should_be_up,
-        zero_spend_affected_days, AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate,
-        BootstrapFailureKind, DailySavingsPoint, HeadroomLearnPrereqStatus,
-        InstallPendingUpdateFuture, InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect,
-        QuitSource, TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
+        learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
+        learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
+        learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
+        noop_app_update_progress_emitter, normalize_learn_failure_signature,
+        onboarding_recovery_copy, parse_live_learnings, parse_magic_link_auth,
+        parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
+        physical_rect_from_rect, read_applied_patterns_for_project, readyz_failed_checks_csv,
+        readyz_failure_has_core_unhealthy, readyz_failure_is_upstream_only,
+        readyz_outcome_fingerprint_key, recent_savings_days, resolve_release_updater_config,
+        savings_report, select_updater_endpoints, startup_error_fingerprint_key,
+        store_checked_update, strip_connection_noise, tail_bytes_for_sentry,
+        take_pending_magic_link, user_message_for, watchdog_should_be_up, zero_spend_affected_days,
+        AppUpdateProgress, AppUpdateProgressEmitter, AvailableAppUpdate, BootstrapFailureKind,
+        DailySavingsPoint, HeadroomLearnPrereqStatus, InstallPendingUpdateFuture,
+        InstallableAppUpdate, LearnAgent, MonitorBounds, PhysicalRect, QuitSource,
+        TrayRuntimeVisual, DEFAULT_UPDATER_ENDPOINT, DEFAULT_UPDATER_PUBLIC_KEY,
         PENDING_MAGIC_LINK,
     };
     #[cfg(target_os = "macos")]
@@ -13021,6 +13139,30 @@ Some unrelated content.
         ] {
             assert!(
                 !learn_failure_is_agent_api_unreachable(stderr),
+                "for: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn learn_failure_is_agent_cli_outdated_matches_an_unknown_flag_only() {
+        // RUST-K9 verbatim: a stale CLI that predates upstream's stream flag.
+        assert!(learn_failure_is_agent_cli_outdated(
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose --include-partial-messages` failed (exit 1):\nerror: unknown option '--include-partial-messages'\n"
+        ));
+        assert!(learn_failure_is_agent_cli_outdated(
+            "LLM analysis failed: `codex exec --json` failed (exit 2):\nerror: unexpected argument '--json' found\n"
+        ));
+        for stderr in [
+            "Error: No such option: --foo",
+            // A flag no CLI has is an upstream break, not a stale install.
+            "error: unknown option '--include-partial-mesages'",
+            "error: unexpected argument '--made-up' found",
+            "API Error: 400 status code (no body)",
+            "",
+        ] {
+            assert!(
+                !learn_failure_is_agent_cli_outdated(stderr),
                 "for: {stderr}"
             );
         }

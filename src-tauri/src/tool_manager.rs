@@ -2039,6 +2039,12 @@ pub struct BootstrapStepUpdate {
 pub struct AbandonedBootstrap {
     pub step: String,
     pub percent: u8,
+    /// App version that ran the attempt. The report is filed by the NEXT
+    /// launch, usually an updated build, so without this every update filed
+    /// the old build's death under the new release and reopened the issue
+    /// against the build carrying the fix (RUST-BH on 0.9.26-rc.5). Empty on
+    /// markers written before this field existed.
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4865,17 +4871,46 @@ impl ToolManager {
             })
             .with_context(|| format!("removing partial {}", self.runtime.python_dir.display()))?;
         }
-        Self::retry_fs("publishing extracted python", || {
+        let published = Self::retry_fs("publishing extracted python", || {
             // direct-write: directory swap inside Headroom's managed runtime
             std::fs::rename(&extracted_root, &self.runtime.python_dir)
-        })
-        .with_context(|| {
-            format!(
-                "publishing extracted python into {}",
-                self.runtime.python_dir.display()
-            )
-        })?;
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        });
+        match published {
+            Ok(()) => {}
+            // RUST-A8: Windows refuses to rename a directory while any file
+            // inside it is open without share-delete, and real-time AV scans
+            // every freshly unpacked file, outlasting the retry window on
+            // slow machines. Reading the files is still allowed, so copy.
+            // A sharing violation (os error 32) has no ErrorKind of its own.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    || (cfg!(windows) && err.raw_os_error() == Some(32)) =>
+            {
+                log::info!("publishing extracted python by rename denied ({err}); copying instead");
+                let interpreter = expected_python
+                    .strip_prefix(&extracted_root)
+                    .expect("interpreter lives under the extracted root")
+                    .to_path_buf();
+                copy_tree_interpreter_last(&extracted_root, &self.runtime.python_dir, &interpreter)
+                    .with_context(|| {
+                        format!(
+                            "publishing extracted python into {} (rename denied: {err}; copy)",
+                            self.runtime.python_dir.display()
+                        )
+                    })?;
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "publishing extracted python into {}",
+                    self.runtime.python_dir.display()
+                )));
+            }
+        }
+        // After a copy the scanner that denied the rename may still hold the
+        // staging files; a silent failure strands a second ~100 MB tree.
+        let _ = Self::retry_fs("removing python staging", || {
+            std::fs::remove_dir_all(&staging_dir)
+        });
 
         if !self.runtime.standalone_python().exists() {
             bail!(
@@ -6935,6 +6970,7 @@ impl ToolManager {
         let marker = AbandonedBootstrap {
             step: step.to_string(),
             percent,
+            version: env!("CARGO_PKG_VERSION").to_string(),
         };
         if let Ok(json) = serde_json::to_vec(&marker) {
             let _ =
@@ -7082,16 +7118,31 @@ impl ToolManager {
         self.runtime.venv_dir.join(bin_subdir()).join(name)
     }
 
-    /// Shim in the Headroom-managed bin dir. The Office nudge and the Bash
-    /// permission both reference this absolute path, so it works whether or not
-    /// the bin dir is on PATH (RTK, which exports it, is now opt-in).
+    /// The shim the Office nudge and the Bash permission reference by absolute
+    /// path. On unix it sits in `~/.headroom` (uninstall and the cask's zap
+    /// both remove it): off Application Support, whose space no
+    /// `Bash(<shim> *)` rule ever matched, so every Office read prompted, and
+    /// off our bin dir, which RTK users have on PATH. `~/.headroom/bin` is the
+    /// open-source CLI's (rtk, lean-ctx), which users put on PATH too, hence
+    /// the name: a bare `markitdown` would shadow theirs with a one-path one.
     pub fn markitdown_shim_path(&self) -> PathBuf {
-        let name = if cfg!(target_os = "windows") {
-            "markitdown.cmd"
+        if cfg!(target_os = "windows") {
+            self.runtime.bin_dir.join("markitdown.cmd")
         } else {
-            "markitdown"
-        };
-        self.runtime.bin_dir.join(name)
+            crate::client_adapters::home_dir()
+                .join(".headroom")
+                .join("bin")
+                .join("headroom-markitdown")
+        }
+    }
+
+    /// Where the unix shim lived before: bin/ (on PATH, until 0.9.26-rc.2) and
+    /// tools/ (rc.2-rc.3). Launch removes them and the Bash rules naming them.
+    pub fn legacy_markitdown_shim_paths(&self) -> [PathBuf; 2] {
+        [
+            self.runtime.bin_dir.join("markitdown"),
+            self.runtime.tools_dir.join("markitdown"),
+        ]
     }
 
     fn markitdown_conversion_counter_path(&self) -> PathBuf {
@@ -7105,32 +7156,58 @@ impl ToolManager {
     }
 
     /// Wrapper script (previously a bare symlink) so each real conversion bumps
-    /// a counter the Addons tab can show. Flag-only invocations (--help) are
-    /// not counted. Re-run on every launch so pre-wrapper installs pick it up.
+    /// a counter the Addons tab can show. Re-run on every launch so existing
+    /// installs pick up changes.
+    ///
+    /// On unix Claude Code runs `Bash(<shim> *)` without a prompt, so the shim
+    /// takes exactly one path inside the session's project and nothing else:
+    /// markitdown's `-o` writes anywhere, URL sources fetch over the network,
+    /// `-d`/`-e` send content to an arbitrary endpoint, and a file outside the
+    /// project is one Claude Code's own Read tool would prompt for. The Windows
+    /// `.cmd` cannot vet its arguments and gets no such rule (see
+    /// `enable_markitdown_integration`).
     pub fn ensure_markitdown_shim(&self) -> Result<()> {
         let shim = self.markitdown_shim_path();
-        if shim.exists() || shim.symlink_metadata().is_ok() {
-            let _ = std::fs::remove_file(&shim);
+        for stale in std::iter::once(&shim).chain(&self.legacy_markitdown_shim_paths()) {
+            if stale.symlink_metadata().is_ok() {
+                let _ = std::fs::remove_file(stale);
+            }
         }
         #[cfg(unix)]
         {
-            // ponytail: single-quoting is enough - both paths live under
-            // Application Support (spaces, no quotes).
+            if let Some(dir) = shim.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            // ponytail: single-quoting is enough - every embedded path is ours
+            // (Application Support or ~/.headroom: spaces, no quotes).
             let script = format!(
                 "#!/bin/sh\n\
-                 # Headroom-managed markitdown shim. Counts conversions, then runs the real binary.\n\
-                 case \"$1\" in\n\
-                   \"\"|-*) ;;\n\
-                   *)\n\
-                     C='{counter}'\n\
-                     n=$(cat \"$C\" 2>/dev/null)\n\
-                     case \"$n\" in ''|*[!0-9]*) n=0;; esac\n\
-                     printf '%s' $((n+1)) > \"$C.tmp\" 2>/dev/null && mv -f \"$C.tmp\" \"$C\" 2>/dev/null\n\
-                     ;;\n\
-                 esac\n\
-                 exec '{real}' \"$@\"\n",
+                 # Headroom-managed markitdown shim. Converts one project file, counts it, runs the real binary.\n\
+                 # Claude Code may run this without a prompt: no options, no URLs, one path inside $PWD only.\n\
+                 refuse() {{ echo \"markitdown (Headroom): $1. Usage: headroom-markitdown <file path inside this project>\" >&2; exit 2; }}\n\
+                 [ \"$#\" -eq 1 ] || refuse 'expected exactly one file path'\n\
+                 case \"$1\" in \"\"|-*) refuse 'options are not supported';; esac\n\
+                 # A 2+ letter scheme (http:, file:, data:) is a URL; a single letter is a drive.\n\
+                 case \"${{1%%:*}}\" in \"$1\"|?|*[!A-Za-z0-9+.-]*) ;; [A-Za-z]*) refuse 'URLs are not supported';; esac\n\
+                 # No more than the Read tool allows unprompted: the file, symlinks resolved, under the project.\n\
+                 # $(...) strips trailing newlines, which would name another file: the \".\" keeps them.\n\
+                 # realpath on both sides: bash 3.2's `pwd -P` keeps an inherited $PWD's letter case.\n\
+                 d=$(realpath . && echo .) && [ \"${{d#/}}\" != \"$d\" ] || refuse 'cannot resolve the current directory'\n\
+                 f=$(realpath \"$1\" 2>/dev/null && echo .) || refuse \"no such file: $1\"\n\
+                 d=${{d%?.}} f=${{f%?.}}\n\
+                 case \"$d$f\" in *'\n'*) refuse 'paths with newlines are not supported';; esac\n\
+                 case \"$f\" in \"$d\"/*) ;; *) refuse \"$1 is outside this project (for files outside it, run '{python}' -c '{main_q}' <path>)\";; esac\n\
+                 '{python}' -c '{main}' \"$f\" || exit\n\
+                 C='{counter}'\n\
+                 n=$(cat \"$C\" 2>/dev/null)\n\
+                 case \"$n\" in ''|*[!0-9]*) n=0;; esac\n\
+                 printf '%s' $((n+1)) > \"$C.tmp\" 2>/dev/null && mv -f \"$C.tmp\" \"$C\" 2>/dev/null\n\
+                 exit 0\n",
                 counter = self.markitdown_conversion_counter_path().display(),
-                real = self.markitdown_entrypoint().display(),
+                python = self.runtime.managed_python().display(),
+                main = crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO,
+                // The bare entrypoint transcribes audio; the hint keeps the guard.
+                main_q = crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO.replace('"', "\\\""),
             );
             crate::client_adapters::atomic_write(&shim, script.as_bytes())
                 .with_context(|| format!("writing markitdown shim {}", shim.display()))?;
@@ -7145,17 +7222,20 @@ impl ToolManager {
             let script = format!(
                 "@echo off\r\n\
                  setlocal\r\n\
-                 rem Headroom-managed markitdown shim. Counts conversions, then runs the real binary.\r\n\
-                 if \"%~1\"==\"\" goto :run\r\n\
-                 if \"%~1\"==\"--help\" goto :run\r\n\
+                 rem Headroom-managed markitdown shim. Runs the real binary, then counts a conversion that succeeded.\r\n\
+                 rem UTF-8 stdout: the locale codepage (cp950, cp1252) garbles or drops non-ASCII document text.\r\n\
+                 set PYTHONUTF8=1\r\n\
+                 \"{real}\" %*\r\n\
+                 if %errorlevel% neq 0 exit /b %errorlevel%\r\n\
+                 if \"%~1\"==\"\" exit /b 0\r\n\
+                 if \"%~1\"==\"--help\" exit /b 0\r\n\
                  set \"C={counter}\"\r\n\
                  set /p n=<\"%C%\" 2>nul\r\n\
                  if not defined n set n=0\r\n\
                  set /a n+=1 >nul 2>nul\r\n\
                  >\"%C%.tmp\" echo %n%\r\n\
                  move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
-                 :run\r\n\
-                 \"{real}\" %*\r\n",
+                 exit /b 0\r\n",
                 counter = self.markitdown_conversion_counter_path().display(),
                 real = self.markitdown_entrypoint().display(),
             );
@@ -7662,6 +7742,13 @@ impl ToolManager {
         host: PluginHost,
         args: &[&str],
     ) -> Result<()> {
+        // Every `claude plugin` call routes through here, so this one check
+        // keeps a too-old CLI from ever receiving our args as a prompt.
+        if matches!(host, PluginHost::ClaudeCode)
+            && claude_cli_too_old_for_plugins(cli, &self.runtime.root_dir)
+        {
+            return Err(OutdatedClaudeCli.into());
+        }
         let id = plugin.id;
         let label = host.label();
         run_command_streaming(
@@ -7824,11 +7911,11 @@ impl ToolManager {
     }
 
     /// Installs a plugin addon into every host that has a CLI on PATH. Returns
-    /// `Ok(true)` when at least one host succeeded but Codex was skipped because
-    /// it is too old to support `plugin add` -- the caller nudges the user to
-    /// update Codex. A too-old Codex is not a real error (no Sentry warning); it
-    /// is a version skew the user can only fix by updating Codex.
-    pub fn install_plugin(&self, id: &str) -> Result<bool> {
+    /// the label of a host that was skipped because its CLI is too old for
+    /// plugins while another host succeeded -- the caller nudges the user to
+    /// update it. A too-old CLI is not a real error (no Sentry warning); it is
+    /// a version skew the user can only fix by updating that CLI.
+    pub fn install_plugin(&self, id: &str) -> Result<Option<&'static str>> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         let hosts: Vec<(PluginHost, PathBuf)> = PluginHost::ALL
             .into_iter()
@@ -7839,26 +7926,12 @@ impl ToolManager {
                 "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again."
             );
         }
-        let mut errors: Vec<String> = Vec::new();
-        let mut installed_any = false;
-        let mut codex_outdated = false;
-        for (host, cli) in hosts {
-            match self.install_plugin_into(plugin, host, &cli) {
-                Ok(()) => installed_any = true,
-                Err(err) if matches!(host, PluginHost::Codex) && is_outdated_codex(&err) => {
-                    codex_outdated = true;
-                }
-                Err(err) => errors.push(format!("{}: {err:#}", host.label())),
-            }
-        }
-        if !installed_any {
-            if codex_outdated && errors.is_empty() {
-                bail!(
-                    "Your Codex CLI is too old to install the {id} plugin. Update Codex, then try again."
-                );
-            }
-            bail!("installing the {id} plugin failed: {}", errors.join("; "));
-        }
+        let (mut outdated, errors) = settle_plugin_hosts(
+            id,
+            hosts
+                .into_iter()
+                .map(|(host, cli)| (host, self.install_plugin_into(plugin, host, &cli))),
+        )?;
         if !errors.is_empty() {
             let detail = errors.join("; ");
             // Explicit per-category fingerprint; the bridged warn is local-only
@@ -7883,7 +7956,8 @@ impl ToolManager {
         let version =
             installed_plugin_version(plugin).unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
         self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))?;
-        Ok(codex_outdated)
+        // At most one: with two hosts, the other one installed.
+        Ok(outdated.pop())
     }
 
     pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<()> {
@@ -8867,10 +8941,18 @@ fn redact_command_line(command: &str) -> String {
             Some(_) => is_port_like(token),
             None if token.starts_with('-') => {
                 let (flag, value) = token.split_once('=').unwrap_or((token, ""));
-                out.push(if value.is_empty() || is_port_like(value) {
-                    token.to_owned()
-                } else {
+                // A short flag takes its value attached, no `=`: `-pS3cret`.
+                let short = token.char_indices().nth(2).map(|(at, _)| at);
+                out.push(if !value.is_empty() && !is_port_like(value) {
                     format!("{flag}=<arg>")
+                } else if let Some(at) = short.filter(|_| !token.starts_with("--")) {
+                    if is_port_like(&token[at..]) {
+                        token.to_owned()
+                    } else {
+                        format!("{}<arg>", &token[..at])
+                    }
+                } else {
+                    redact_sensitive(token)
                 });
                 if !token.contains('=') && token.len() > 1 {
                     value_of = Some(if token == "-m" { "-m" } else { "flag" });
@@ -8891,12 +8973,30 @@ fn redact_command_line(command: &str) -> String {
             }
         };
         out.push(if keep {
-            token.to_owned()
+            scrub_kept_arg(token)
         } else {
             "<arg>".into()
         });
     }
     out.join(" ")
+}
+
+/// A kept argument can still carry a credential: a URL's or DSN's userinfo
+/// (`postgres://user:pw@db/x`, `root:pw@tcp(db)/app`), query or fragment
+/// (`?token=...`), or a named assignment (`API_TOKEN=a/b`). What is kept is
+/// scheme, host and path. Userinfo may hold an unencoded `/`, `?`, `#` or
+/// `@`, so everything through the LAST `@` goes before anything is cut.
+fn scrub_kept_arg(token: &str) -> String {
+    let (scheme, rest) = token
+        .split_once("://")
+        .map_or((None, token), |(scheme, rest)| (Some(scheme), rest));
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let rest = rest.split(['?', '#', '&']).next().unwrap_or_default();
+    let token = match scheme {
+        Some(scheme) => format!("{scheme}://{rest}"),
+        None => rest.to_owned(),
+    };
+    redact_sensitive(&token)
 }
 
 fn is_port_like(token: &str) -> bool {
@@ -10394,6 +10494,47 @@ fn pinned_headroom_release() -> Result<HeadroomRelease> {
         wheel_url: url.into(),
         sha256: sha256.into(),
     })
+}
+
+/// Copies `src` into `dst` (created if missing), writing the file at
+/// `interpreter` (relative to `src`) after everything else. The runtime's
+/// "installed" gate needs that interpreter, so a copy cut short by a crash
+/// leaves a base the next bootstrap discards and re-extracts, never one it
+/// trusts with a missing stdlib file.
+fn copy_tree_interpreter_last(src: &Path, dst: &Path, interpreter: &Path) -> Result<()> {
+    fn walk(src: &Path, dst: &Path, skip: &Path) -> Result<()> {
+        std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+        for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+            let entry = entry?;
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if from == skip {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                walk(&from, &to, skip)?;
+                continue;
+            }
+            #[cfg(unix)]
+            if file_type.is_symlink() {
+                let target = std::fs::read_link(&from)?;
+                std::os::unix::fs::symlink(&target, &to)
+                    .with_context(|| format!("linking {}", to.display()))?;
+                continue;
+            }
+            ToolManager::retry_fs("copying python file", || std::fs::copy(&from, &to))
+                .with_context(|| format!("copying {}", from.display()))?;
+        }
+        Ok(())
+    }
+
+    let skip = src.join(interpreter);
+    walk(src, dst, &skip)?;
+    let to = dst.join(interpreter);
+    ToolManager::retry_fs("copying python interpreter", || std::fs::copy(&skip, &to))
+        .with_context(|| format!("copying {}", skip.display()))?;
+    Ok(())
 }
 
 fn python_distribution_artifact() -> Result<DownloadArtifact> {
@@ -12349,10 +12490,10 @@ fn plugin_install_failure_category(compact: &str) -> &'static str {
         || lower.contains("authentication_error")
         || lower.contains("please run /login")
     {
-        // The host CLI is signed out, so every command we hand it 401s before
-        // it touches a plugin (RUST-DQ: `claude plugin marketplace add` and the
-        // install behind it, both "Please run /login"). User-side: nothing we
-        // ship installs until they log in again.
+        // A plugin command that reached the API at all. The RUST-DQ and RUST-K8
+        // events were a `claude` too old to have `plugin`, which sent our args
+        // as a prompt; `run_plugin_cmd` now refuses such a CLI, so this bucket
+        // reappearing is a new cause.
         "cli-not-authenticated"
     } else {
         "other"
@@ -12417,7 +12558,12 @@ fn pip_retry_backoff(failed_attempt: u32, failure_text: &str) -> Option<Duration
 /// The bracket after 32 keeps 320-329 out.
 fn pip_failure_is_sharing_violation(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("winerror 32]") || lower.contains("os error 32)")
+    lower.contains("winerror 32]")
+        || lower.contains("os error 32)")
+        // pip stashing a package dir it could not rename (a live holder)
+        // falls back to copytree, which trips on the stash dir: RUST-6S's
+        // `[WinError 183] ... site-packages\~~adroom`.
+        || (lower.contains("winerror 183]") && lower.contains("\\~"))
 }
 
 /// Widen `limit` for the rest of the run once `line` marks the start of pip's
@@ -12720,32 +12866,14 @@ fn run_command_with_timeout(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<()> {
-    use std::io::Read;
-    use std::sync::mpsc;
-
     let mut cmd = build_command(binary, args, cwd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting {} {}", binary.display(), args.join(" ")))?;
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-
-    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
-    let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        let _ = stdout_tx.send(buf);
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stderr);
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        let _ = stderr_tx.send(buf);
-    });
+    let stdout_drain = crate::proc::PipeDrain::spawn(child.stdout.take());
+    let stderr_drain = crate::proc::PipeDrain::spawn(child.stderr.take());
 
     let started = Instant::now();
     let mut timed_out = false;
@@ -12755,7 +12883,7 @@ fn run_command_with_timeout(
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     timed_out = true;
-                    let _ = child.kill();
+                    crate::proc::kill_tree(&mut child);
                     break child.wait().with_context(|| {
                         format!("waiting for {} {}", binary.display(), args.join(" "))
                     })?;
@@ -12772,10 +12900,10 @@ fn run_command_with_timeout(
         }
     };
 
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
-    let stdout = String::from_utf8_lossy(&stdout_rx.recv().unwrap_or_default()).into_owned();
-    let mut stderr = String::from_utf8_lossy(&stderr_rx.recv().unwrap_or_default()).into_owned();
+    // Bounded: a killed Windows launcher leaves its python holding the pipes.
+    let drained_by = Instant::now() + crate::proc::PIPE_DRAIN_GRACE;
+    let stdout = String::from_utf8_lossy(&stdout_drain.finish(drained_by)).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr_drain.finish(drained_by)).into_owned();
 
     if timed_out {
         if !stderr.is_empty() && !stderr.ends_with('\n') {
@@ -12872,6 +13000,99 @@ impl std::error::Error for CommandFailure {}
 fn is_outdated_codex(err: &anyhow::Error) -> bool {
     err.downcast_ref::<CommandFailure>()
         .is_some_and(|failure| failure.stderr.contains("unrecognized subcommand"))
+}
+
+/// First Claude Code release with `claude plugin marketplace add`. 2.0.12-2.0.15
+/// have `plugin` but reject `marketplace` as an unknown command.
+const CLAUDE_PLUGIN_MIN_VERSION: [u32; 3] = [2, 0, 17];
+
+/// The Claude Code CLI is older than [`CLAUDE_PLUGIN_MIN_VERSION`]. Same class
+/// as [`is_outdated_codex`]: a soft skip + update nudge, not an error.
+#[derive(Debug)]
+struct OutdatedClaudeCli;
+
+impl std::fmt::Display for OutdatedClaudeCli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the Claude Code CLI is too old for plugins (needs 2.0.17 or newer); run `claude update`"
+        )
+    }
+}
+
+impl std::error::Error for OutdatedClaudeCli {}
+
+/// Settles per-host install results. Fails when no host installed, naming
+/// every real error and every CLI too old for plugins; otherwise returns the
+/// too-old host labels (update nudge, never Sentry) and the real errors (the
+/// partial-install warning).
+fn settle_plugin_hosts(
+    id: &str,
+    results: impl IntoIterator<Item = (PluginHost, Result<()>)>,
+) -> Result<(Vec<&'static str>, Vec<String>)> {
+    let mut installed_any = false;
+    let mut outdated = Vec::new();
+    let mut errors = Vec::new();
+    for (host, result) in results {
+        match result {
+            Ok(()) => installed_any = true,
+            Err(err)
+                if err.is::<OutdatedClaudeCli>()
+                    || (matches!(host, PluginHost::Codex) && is_outdated_codex(&err)) =>
+            {
+                log::info!("{id} [{}]: CLI too old for plugins; skipped", host.label());
+                outdated.push(host.label());
+            }
+            Err(err) => errors.push(format!("{}: {err:#}", host.label())),
+        }
+    }
+    if !installed_any {
+        let mut msg = if errors.is_empty() {
+            String::new()
+        } else {
+            format!("installing the {id} plugin failed: {}. ", errors.join("; "))
+        };
+        if !outdated.is_empty() {
+            let names = outdated.join(" and ");
+            let clis = if outdated.len() > 1 {
+                "CLIs are"
+            } else {
+                "CLI is"
+            };
+            msg += &format!(
+                "Your {names} {clis} too old to install the {id} plugin. Update {names}, then try again."
+            );
+        }
+        bail!("{}", msg.trim_end());
+    }
+    Ok((outdated, errors))
+}
+
+/// Whether a `claude --version` line ("2.1.283 (Claude Code)") names a release
+/// with plugin support. `None` when it does not parse.
+fn claude_version_supports_plugins(version: &str) -> Option<bool> {
+    let parts = version
+        .split_whitespace()
+        .next()?
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect::<Option<Vec<u32>>>()?;
+    Some(parts.as_slice() >= CLAUDE_PLUGIN_MIN_VERSION.as_slice())
+}
+
+/// A `claude` older than 2.0.12 has no `plugin` command, so it takes our
+/// arguments as a chat prompt: it sends "plugin" to the model on the user's
+/// account instead of touching a plugin. Signed out, it prints "Invalid API
+/// key - Please run /login" (RUST-K8, and the RUST-DQ "OAuth access token is
+/// invalid" events). A version we cannot read is let through, as before.
+fn claude_cli_too_old_for_plugins(cli: &Path, cwd: &Path) -> bool {
+    crate::proc::output_with_timeout(
+        build_command(cli, &["--version"], cwd),
+        Duration::from_secs(10),
+    )
+    .is_ok_and(|out| {
+        claude_version_supports_plugins(&String::from_utf8_lossy(&out.stdout)) == Some(false)
+    })
 }
 
 /// Extract the Unix signal number that killed a child, or `None` on non-Unix
@@ -13096,9 +13317,10 @@ mod tests {
         addon_unavailable_reason, apply_serena_dashboard_interface, apply_serena_gitignore,
         bootstrap_requirements_lock_for_target, build_command, cc_switch_proxy_url,
         cc_switch_reconcile_for_spawn, classify_kompress_prefetch_failure,
-        codebase_memory_distribution_artifact, compact_pip_failure, describe_proxy_port_occupant,
-        diagnose_proxy_port, exe_path_is_under, extract_required_pydantic_core_version,
-        format_all_foreign_bail, format_already_running_bail, headroom_entrypoint_startup_args,
+        claude_version_supports_plugins, codebase_memory_distribution_artifact,
+        compact_pip_failure, describe_proxy_port_occupant, diagnose_proxy_port, exe_path_is_under,
+        extract_required_pydantic_core_version, format_all_foreign_bail,
+        format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, netstat_rows_on_port, occupant_image, parse_lsof_listener,
@@ -13110,11 +13332,11 @@ mod tests {
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
         requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, settle_unowned_port, sha256_bytes,
+        savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
         summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
         wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, PluginHost, PortState,
-        ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        CommandFailure, HeadroomRelease, ManagedRuntime, OutdatedClaudeCli, PipOutputCapture,
+        PluginHost, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
         HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
         HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
         PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
@@ -15140,6 +15362,7 @@ mod tests {
         let taken = manager.take_abandoned_bootstrap().expect("marker reported");
         assert_eq!(taken.step, "Downloading Python");
         assert_eq!(taken.percent, 18);
+        assert_eq!(taken.version, env!("CARGO_PKG_VERSION"));
         // Consumed on read: a second launch must not double-report.
         assert!(manager.take_abandoned_bootstrap().is_none());
 
@@ -16387,6 +16610,16 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         assert_eq!(
             r("/bin/zsh -c source ~/.claude/snapshot.sh && python x.py"),
             "/bin/zsh -c <arg> ~/.claude/snapshot.sh <arg> python x.py"
+        );
+        assert_eq!(
+            r("node srv.js postgres://user:pw@db:5432/x https://h/cb?sig=abc#t API_TOKEN=a/b"),
+            "node srv.js postgres://db:5432/x https://h/cb API_TOKEN=[REDACTED]"
+        );
+        // Attached short-flag values, scheme-less DSNs, and `#`/`/` inside a
+        // password all used to pass through.
+        assert_eq!(
+            r("sshpass -pS3cretPw ssh root:S3cret@tcp(db:3306)/app mysql://root:pa#s/s@db/app -p8787"),
+            "sshpass -p<arg> <arg> tcp(db:3306)/app mysql://db/app -p8787"
         );
     }
 
@@ -17821,27 +18054,147 @@ after
 
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
-    fn markitdown_shim_counts_file_conversions_but_not_flag_calls() {
-        let (_root, _runtime, manager) = seed_test_runtime("markitdown-shim");
+    fn markitdown_shim_counts_file_conversions_and_refuses_everything_else() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-shim");
+        let home = root.join("home");
+        let _home = HomeGuard::new(&home);
+        // A `.bad` file stands in for one markitdown fails to convert.
         write_executable(
-            &manager.markitdown_entrypoint(),
-            "#!/bin/sh\necho converted:$1\n",
+            &runtime.managed_python(),
+            "#!/bin/sh\ncase \"$3\" in *.bad) exit 1;; esac\nexec /usr/bin/python3 \"$@\"\n",
         );
+        let pythonpath = crate::client_adapters::fake_markitdown_pythonpath(&root);
+        // The bin dir is on PATH for RTK users; tools/ sits under Application
+        // Support, whose space no Bash rule matches. Launch clears both.
+        for legacy in manager.legacy_markitdown_shim_paths() {
+            write_executable(&legacy, "#!/bin/sh\n");
+        }
         manager.ensure_markitdown_shim().expect("shim");
+        for legacy in manager.legacy_markitdown_shim_paths() {
+            assert!(!legacy.exists(), "{} survived", legacy.display());
+        }
+        let shim = manager.markitdown_shim_path();
+        assert_eq!(
+            shim,
+            home.join(".headroom")
+                .join("bin")
+                .join("headroom-markitdown")
+        );
 
-        let run = |arg: &str| {
-            let out = crate::proc::command(manager.markitdown_shim_path())
-                .arg(arg)
+        let project = root.join("project");
+        let outside = root.join("outside.docx");
+        for file in [
+            project.join("a.docx"),
+            project.join("docs").join("q3:final.xlsx"),
+            project.join("C:").join("Users").join("b.pptx"),
+            project.join("broken.bad"),
+            outside.clone(),
+            home.join("secret.docx"),
+        ] {
+            fs::create_dir_all(file.parent().unwrap()).expect("dir");
+            fs::write(&file, b"x").expect("file");
+        }
+        std::os::unix::fs::symlink(&outside, project.join("link.docx")).expect("file link");
+        std::os::unix::fs::symlink(&root, project.join("up")).expect("dir link");
+        // `python -c` puts the cwd first on sys.path: a cloned repo's own
+        // `markitdown` package must not be what runs.
+        fs::create_dir_all(project.join("markitdown")).expect("pkg");
+        fs::write(project.join("markitdown").join("__init__.py"), "").expect("init");
+        fs::write(
+            project.join("markitdown").join("__main__.py"),
+            "def main():\n    print('project code ran')\n",
+        )
+        .expect("main");
+        // $(...) strips a trailing newline: `notes.docx\n` (or a link to it)
+        // must not come out as `notes.docx`, which links outside.
+        std::os::unix::fs::symlink(&outside, project.join("notes.docx")).expect("link");
+        fs::write(project.join("notes.docx\n"), b"x").expect("newline file");
+        std::os::unix::fs::symlink("notes.docx\n", project.join("b.docx")).expect("link");
+
+        let run = |args: &[&str]| {
+            crate::proc::command(&shim)
+                .args(args)
+                .current_dir(&project)
+                .env("PYTHONPATH", &pythonpath)
                 .output()
-                .expect("run shim");
-            assert!(out.status.success(), "shim exited non-zero for {arg}");
-            String::from_utf8_lossy(&out.stdout).to_string()
+                .expect("run shim")
         };
 
-        assert!(run("/tmp/a.docx").contains("converted:/tmp/a.docx"));
-        run("/tmp/b.xlsx");
-        run("--help"); // flag-only invocation must not count
-        assert_eq!(manager.markitdown_conversion_count(), Some(2));
+        // "converted", not "transcribed": audio is never sent off to Google.
+        let out = run(&["a.docx"]);
+        let real_project = fs::canonicalize(&project).expect("canonical project");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("converted:1:{}\n", real_project.join("a.docx").display())
+        );
+        // A colon later in the path, or a one-letter drive prefix, is still a path.
+        assert!(run(&["docs/q3:final.xlsx"]).status.success());
+        assert!(run(&["C:/Users/b.pptx"]).status.success());
+        // A conversion that fails is not counted.
+        assert_eq!(run(&["broken.bad"]).status.code(), Some(1));
+
+        // Claude Code runs the shim without a prompt, so anything beyond one
+        // local path (-o writes anywhere, URLs hit the network) is refused
+        // before the real binary runs.
+        for args in [
+            &["--help"][..],
+            &["-o", "/tmp/x", "a.docx"],
+            &["a.docx", "-o", "/tmp/x"],
+            &["https://example.com/x.docx"],
+            &["file:///etc/passwd"],
+            &["data:text/plain,hi"],
+            &[],
+        ] {
+            let out = run(args);
+            assert!(!out.status.success(), "shim must refuse {args:?}");
+            assert!(out.stdout.is_empty(), "real binary ran for {args:?}");
+        }
+
+        // Nor anything outside the project, which the Read tool would prompt
+        // for: those name a command that prompts too, still without audio.
+        let secret = home.join("secret.docx").display().to_string();
+        let outside_abs = outside.display().to_string();
+        for arg in [
+            outside_abs.as_str(),
+            "../outside.docx",
+            "link.docx",
+            "up/outside.docx",
+            secret.as_str(),
+        ] {
+            let out = run(&[arg]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "shim must refuse {arg}");
+            assert!(out.stdout.is_empty(), "real binary ran for {arg}");
+            assert!(
+                stderr.contains("outside this project")
+                    && stderr.contains(&format!(
+                        "run '{}' -c '{}' <path>",
+                        manager.runtime.managed_python().display(),
+                        crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO
+                    )),
+                "{arg}: {stderr}"
+            );
+        }
+        // A literal `~` is not expanded, so it names no file in the project.
+        assert_eq!(run(&["~/secret.docx"]).status.code(), Some(2));
+        for arg in ["notes.docx\n", "b.docx"] {
+            let out = run(&[arg]);
+            assert_eq!(out.status.code(), Some(2), "shim must refuse {arg:?}");
+            assert!(out.stdout.is_empty(), "real binary ran for {arg:?}");
+        }
+        // A deleted cwd has no `pwd -P`; that must not widen the project to `/`.
+        let gone = project.join("gone");
+        fs::create_dir_all(&gone).expect("gone");
+        let out = crate::proc::command("sh")
+            .args(["-c", "cd \"$1\" && rmdir \"$1\" && exec \"$2\" \"$3\""])
+            .arg("sh")
+            .args([&gone, &shim, &outside])
+            .env("PYTHONPATH", &pythonpath)
+            .output()
+            .expect("run shim in a deleted dir");
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        assert!(out.stdout.is_empty(), "real binary ran from a deleted cwd");
+        assert_eq!(manager.markitdown_conversion_count(), Some(3));
     }
 
     #[test]
@@ -19014,6 +19367,101 @@ after
         result.expect("install retries once the stale cache entry is removed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn claude_plugin_commands_skip_a_cli_too_old_for_plugins() {
+        // RUST-K8: a `claude` older than 2.0.12 has no `plugin` command and
+        // sends our args to the model as a prompt. It must never get them.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, _runtime, manager) = seed_test_runtime("plugin-claude-too-old");
+        let _home = HomeGuard::new(&root);
+        let cli = root.join("claude");
+        fs::write(
+            &cli,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.0.11 (Claude Code)'; exit 0; }\n\
+             echo \"$*\" >> \"$(dirname \"$0\")/prompts\"\n\
+             echo 'Invalid API key - Please run /login'\nexit 1\n",
+        )
+        .expect("fake claude");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let ponytail = PLUGIN_ADDONS.iter().find(|p| p.id == "ponytail").unwrap();
+        let result = manager.install_plugin_into(ponytail, PluginHost::ClaudeCode, &cli);
+        let prompted = root.join("prompts").exists();
+        let _ = fs::remove_dir_all(&root);
+        assert!(!prompted, "a too-old claude must not be handed plugin args");
+        assert!(result
+            .expect_err("a too-old claude cannot install")
+            .is::<OutdatedClaudeCli>());
+    }
+
+    #[test]
+    fn settle_plugin_hosts_keeps_a_too_old_cli_out_of_errors() {
+        // RUST-K8 reaches here wrapped in `marketplace add failed first`
+        // context; it must still count as outdated, or every partial install
+        // on an old CLI files a Sentry warning again.
+        let too_old = || anyhow::Error::from(OutdatedClaudeCli).context("marketplace add failed");
+        let codex_err = |stderr: &str| {
+            Err(anyhow::Error::new(CommandFailure {
+                program: "codex".into(),
+                args: vec!["plugin".into(), "add".into()],
+                stdout: String::new(),
+                stderr: stderr.into(),
+                exit_code: Some(2),
+                signal: None,
+            }))
+        };
+        let (outdated, errors) = settle_plugin_hosts(
+            "ponytail",
+            [
+                (PluginHost::ClaudeCode, Err(too_old())),
+                (PluginHost::Codex, Ok(())),
+            ],
+        )
+        .expect("codex installed");
+        assert_eq!(outdated, ["Claude Code"]);
+        assert!(errors.is_empty());
+
+        let both = settle_plugin_hosts(
+            "ponytail",
+            [
+                (PluginHost::ClaudeCode, Err(too_old())),
+                (
+                    PluginHost::Codex,
+                    codex_err("error: unrecognized subcommand 'add'"),
+                ),
+            ],
+        )
+        .expect_err("nothing installed");
+        assert_eq!(
+            both.to_string(),
+            "Your Claude Code and Codex CLIs are too old to install the ponytail plugin. Update Claude Code and Codex, then try again."
+        );
+
+        let mixed = settle_plugin_hosts(
+            "ponytail",
+            [
+                (PluginHost::ClaudeCode, Err(too_old())),
+                (PluginHost::Codex, codex_err("error: network unreachable")),
+            ],
+        )
+        .expect_err("nothing installed")
+        .to_string();
+        assert!(mixed.starts_with("installing the ponytail plugin failed: Codex: "));
+        assert!(mixed.ends_with("Your Claude Code CLI is too old to install the ponytail plugin. Update Claude Code, then try again."));
+    }
+
+    #[test]
+    fn claude_version_supports_plugins_from_2_0_17() {
+        let supports = claude_version_supports_plugins;
+        assert_eq!(supports("1.0.128 (Claude Code)\n"), Some(false));
+        assert_eq!(supports("2.0.11 (Claude Code)"), Some(false));
+        assert_eq!(supports("2.0.15 (Claude Code)"), Some(false));
+        assert_eq!(supports("2.0.17 (Claude Code)"), Some(true));
+        assert_eq!(supports("2.1.283 (Claude Code)"), Some(true));
+        assert_eq!(supports(""), None);
+        assert_eq!(supports("claude 2.1"), None);
+    }
+
     #[test]
     fn is_outdated_codex_detects_unrecognized_subcommand() {
         let outdated = anyhow::Error::new(CommandFailure {
@@ -19569,6 +20017,14 @@ exit 0
             "[WinError 320] whatever"
         ));
         assert_eq!(backoff(0, locked), None, "attempt numbering starts at 1");
+        // RUST-6S: the stash-rename fallback under a live holder.
+        assert!(super::pip_failure_is_sharing_violation(
+            "OSError: [WinError 183] Eine Datei kann nicht erstellt werden, wenn sie bereits \
+             vorhanden ist: 'C:\\\\x\\\\venv\\\\Lib\\\\site-packages\\\\~~adroom'"
+        ));
+        assert!(!super::pip_failure_is_sharing_violation(
+            "[WinError 183] exists: 'C:\\\\x\\\\file.txt'"
+        ));
     }
 
     #[test]
@@ -19866,5 +20322,45 @@ exit 0
             std::io::ErrorKind::PermissionDenied
         );
         assert_eq!(attempts.get(), 5, "bounded at ATTEMPTS");
+    }
+
+    #[test]
+    fn copy_tree_interpreter_last_publishes_the_whole_runtime() {
+        // RUST-A8: the copy fallback for a denied rename must land the same
+        // tree the rename would have, interpreter included.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("python");
+        std::fs::create_dir_all(src.join("Lib").join("encodings")).unwrap();
+        std::fs::write(src.join("python.exe"), b"exe").unwrap();
+        std::fs::write(src.join("Lib").join("os.py"), b"os").unwrap();
+        std::fs::write(src.join("Lib").join("encodings").join("utf_8.py"), b"u8").unwrap();
+        let dst = dir.path().join("runtime").join("python");
+
+        super::copy_tree_interpreter_last(&src, &dst, Path::new("python.exe")).expect("copy");
+
+        assert_eq!(std::fs::read(dst.join("python.exe")).unwrap(), b"exe");
+        assert_eq!(std::fs::read(dst.join("Lib").join("os.py")).unwrap(), b"os");
+        assert_eq!(
+            std::fs::read(dst.join("Lib").join("encodings").join("utf_8.py")).unwrap(),
+            b"u8"
+        );
+    }
+
+    #[test]
+    fn copy_tree_interpreter_last_leaves_no_interpreter_when_the_tree_fails() {
+        // A copy cut short must not leave a base the "installed" gate trusts:
+        // the interpreter is written only after everything else landed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("python");
+        std::fs::create_dir_all(src.join("Lib")).unwrap();
+        std::fs::write(src.join("python.exe"), b"exe").unwrap();
+        std::fs::write(src.join("Lib").join("os.py"), b"os").unwrap();
+        let dst = dir.path().join("runtime").join("python");
+        // A regular file where the Lib directory must go fails the tree copy.
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(dst.join("Lib"), b"not a dir").unwrap();
+
+        assert!(super::copy_tree_interpreter_last(&src, &dst, Path::new("python.exe")).is_err());
+        assert!(!dst.join("python.exe").exists());
     }
 }

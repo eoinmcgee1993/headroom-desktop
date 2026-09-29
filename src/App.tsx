@@ -12,6 +12,7 @@ import {
 import {
   ArrowClockwise,
   Bell,
+  BookOpen,
   Brain,
   CaretLeft,
   Cpu,
@@ -560,6 +561,8 @@ const CODEX_CLI_INSTALL_CMD = "npm install -g @openai/codex";
 const CODEX_CLI_LOGIN_CMD = "codex login";
 const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
 const CODEX_INSTALL_NPM_CMD = "npm i -g @openai/codex";
+
+const DOCS_URL = "https://extraheadroom.com/docs";
 
 const APPSUMO_ACCOUNT_URL = "https://appsumo.com/account/products/";
 
@@ -6777,6 +6780,18 @@ export default function App() {
               </span>
             </button>
           ))}
+          <button
+            className="tray-nav__item"
+            onClick={() => void openExternalLink(DOCS_URL)}
+            type="button"
+          >
+            <span className="tray-nav__icon" aria-hidden="true">
+              <BookOpen className="tray-nav__icon-svg" size={26} />
+            </span>
+            <span className="tray-nav__text">
+              <strong>Docs</strong>
+            </span>
+          </button>
         </nav>
         <div className="tray-sidebar__footer">
           <button
@@ -7050,7 +7065,16 @@ export default function App() {
                       <span className="optimize-card__auto-learn-meta">
                         {autoLearnEnabled === false
                           ? "Off. Only manual scans add learnings."
-                          : autoLearnMeta}
+                          : autoLearnMeta}{" "}
+                        <button
+                          className="link-button"
+                          onClick={() =>
+                            void openExternalLink(`${DOCS_URL}/how-learning-works`)
+                          }
+                          type="button"
+                        >
+                          How learning works
+                        </button>
                       </span>
                     </div>
                     <button
@@ -7508,8 +7532,17 @@ export default function App() {
                 <h1>Addons</h1>
               </div>
               <p className="addons-card__blurb">
-                Additional tools that reduce token usage. Missing an addon you
-                want?{" "}
+                Additional tools that reduce token usage. The core proxy is
+                always on; these change how your agent behaves, so they ship off
+                and you switch on the ones you want.{" "}
+                <button
+                  type="button"
+                  className="addon-card__link"
+                  onClick={() => void openExternalLink(`${DOCS_URL}/add-ons`)}
+                >
+                  What each addon does
+                </button>
+                {". Missing an addon you want? "}
                 <button
                   type="button"
                   className="addon-card__link"
@@ -8444,6 +8477,15 @@ export default function App() {
                   </div>
                 ) : null}
                 <div className="modal-actions">
+                  <button
+                    className="link-button"
+                    onClick={() =>
+                      void openExternalLink(`${DOCS_URL}/how-savings-are-measured`)
+                    }
+                    type="button"
+                  >
+                    Full method
+                  </button>
                   <button
                     className="button button--primary"
                     onClick={() => setShowSavingsInfo(false)}

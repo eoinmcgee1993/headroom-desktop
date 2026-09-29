@@ -47,7 +47,7 @@ Click the tray icon, open the dashboard. Expect savings chart and per-client sta
 
 This does not need a human. The tray menu and the whole dashboard are exposed to the accessibility API, so checks 5, 6 and 16's visual step can all be driven headlessly (verified on the 0.9.11-rc.4 pass). Note the process name is `headroom-desktop`, the tray lives on menu bar 2, and the webview's own controls resolve as real AX elements (`button Home of group Tray navigation of ...`), so `click at` hits them:
 ```bash
-AX() { osascript -e "tell application \"System Events\" to tell process \"Headroom\" $1"; }
+AX() { osascript -e "tell application \"System Events\" to tell process \"headroom-desktop\" $1"; }
 AX 'to click menu bar item 1 of menu bar 2'                                    # open tray menu
 AX 'to get name of every menu item of menu 1 of menu bar item 1 of menu bar 2' # Show/Pause|Resume/Quit
 AX 'to click menu item "Show Headroom" of menu 1 of menu bar item 1 of menu bar 2'
@@ -92,7 +92,7 @@ Generate the payload with a real `Read` tool call. Dumping the file through Bash
    rtk proxy curl -s http://127.0.0.1:6767/stats | jq '{primary_model: .summary.primary_model, prefix_frozen: .summary.uncompressed_requests.prefix_frozen, requests_compressed: .summary.compression.requests_compressed, total_tokens_before: .summary.compression.total_tokens_before}'
    ```
    Capture it after any backend restart. `/stats` is in-memory per boot, so a baseline taken before checks 6 or 9 scores the re-check against reset counters (the script runs this check after the disruptive block for exactly that reason).
-2. End the turn with a large Read in flight — e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole; ~1300-1500 lines is plenty).
+2. End the turn with a large Read in flight - e.g. ask Claude to read a long file like `src-tauri/src/lib.rs` with as large an offset/limit window as the Read tool allows (the 25k-token cap means you cannot read it whole, and 1400 lines of it already exceeds the cap; ~1300-1350 lines is plenty).
 3. On the *next* turn, re-run the same `jq` command.
 
 `primary_model` is the single most-served model of the session, so on a box with a Codex session running alongside it can legitimately read `gpt-*` while Claude traffic is healthy (observed on the 0.9.11-rc.4 pass: `gpt-6-astra` with 17 gpt requests against 26 `claude-*` ones). Do not FAIL on it. Confirm Claude traffic directly instead - this key is present regardless of which model won the tiebreak, and its count must increase across the Read:
@@ -116,7 +116,7 @@ A `cache_read` that stays flat for several turns with `cache_write=0` while `tok
    ```bash
    rtk proxy curl -s http://127.0.0.1:6767/stats | jq '.summary.compression.requests_compressed, .summary.compression.total_tokens_removed'
    ```
-2. End the turn with the same large Read in flight (~1300-1500 lines clears the compression threshold).
+2. End the turn with the same large Read in flight (~1300-1350 lines clears the compression threshold).
 3. On the *next* turn, re-run the same `jq` command.
 
 Expect: `requests_compressed` increased by at least 1, and `total_tokens_removed` is strictly greater.
@@ -132,10 +132,12 @@ Expect: a `headroom, version X.Y.Z` line and a path under `.../runtime/venv/lib/
 Addons share that venv, so a wheel bump can resolve a transitive dependency out from under one of them without touching `headroom` itself. Each pinned addon's receipt must still match what its artifact actually reports - the update logic compares the receipt against the pin, so a stale receipt makes it offer (or withhold) an update on a false premise:
 ```bash
 R=~/Library/Application\ Support/Headroom/headroom
-echo "receipt: $(jq -r .version "$R/tools/markitdown.json")  artifact: $("$R/bin/markitdown" --version)"
+echo "receipt: $(jq -r .version "$R/tools/markitdown.json")  artifact: $("$R/runtime/venv/bin/markitdown" --version)"
 jq -r '.plugins | to_entries[] | "\(.key): \(.value[0].version // "?")"' ~/.claude/plugins/installed_plugins.json
+S=~/.headroom/bin/headroom-markitdown; ls -l "$S" && grep -F "Bash($S *)" ~/.claude/settings.json
+grep -F -e "Bash($R/bin/markitdown *)" -e "Bash($R/tools/markitdown *)" ~/.claude/settings.json; ls "$R/bin/markitdown" "$R/tools/markitdown"
 ```
-Expect: the two markitdown versions are equal, and each plugin resolves to a version string. Plugin addons (ponytail, caveman) are the deliberate exception - `PLUGIN_DISPLAY_VERSION` is the literal `latest`, they track a marketplace rather than a pin, and `installed_addon_version` reads `installed_plugins.json` rather than the receipt. A plugin receipt lagging the installed version is therefore expected and not a failure; only the pinned addons (markitdown, serena, context7, codebase-memory) must agree.
+Expect: the two markitdown versions are equal, and each plugin resolves to a version string. The Office shim `~/.headroom/bin/headroom-markitdown` exists, is executable, and has its `Bash(... *)` allow rule (none when the addon is disabled, per `.enabled` in the receipt). The shim lived under Application Support until 0.9.26-rc.4, and Claude Code never matched a rule on a path with a space in any quoting, so every Office read prompted. The last line must print no rule and report both old shims missing; anything else means the launch migration did not run. Grep the full `$R` paths: a bare `headroom/bin/markitdown` also matches the new `.headroom/bin/...` path. Plugin addons (ponytail, caveman) are the deliberate exception - `PLUGIN_DISPLAY_VERSION` is the literal `latest`, they track a marketplace rather than a pin, and `installed_addon_version` reads `installed_plugins.json` rather than the receipt. A plugin receipt lagging the installed version is therefore expected and not a failure; only the pinned addons (markitdown, serena, context7, codebase-memory) must agree.
 
 ### 9. Backend port fallback when 6768 is held
 The desktop's internal proxy port (default `6768`) can be claimed by other macOS processes — most often `rapportd` at login. The desktop should scan `6769..=6790` and pick a free one instead of failing.

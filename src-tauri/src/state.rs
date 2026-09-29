@@ -683,7 +683,10 @@ impl AppState {
         // The proxy spawn reads the override through the module-level cache
         // (no AppState in hand there, same as the backend port), so a launch
         // has to publish what it just loaded or the first spawn of the session
-        // would boot at the default upstream.
+        // would boot at the default upstream. Not under test: the slot is
+        // process-global, and dozens of parallel `new_in` calls would reset
+        // it under the serial tests that route by it.
+        #[cfg(not(test))]
         crate::upstream_override::publish(launch_profile.upstream_override.clone());
         let (last_known_good_plan, last_known_good_plan_path) = LastKnownGoodPlan::load(&base_dir);
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
@@ -856,6 +859,14 @@ impl AppState {
         if self.tool_manager.markitdown_installed() {
             if let Err(err) = self.tool_manager.ensure_markitdown_shim() {
                 log::warn!("markitdown shim refresh failed during warm_runtime_on_launch: {err:#}");
+            }
+            if let Err(err) = crate::client_adapters::refresh_markitdown_integration(
+                &self.tool_manager.markitdown_entrypoint(),
+                &self.tool_manager.markitdown_shim_path(),
+                &self.tool_manager.legacy_markitdown_shim_paths(),
+                &self.tool_manager.managed_python(),
+            ) {
+                log::warn!("markitdown hook refresh failed during warm_runtime_on_launch: {err:#}");
             }
         }
 
@@ -2304,8 +2315,14 @@ impl AppState {
         // (readyz probe + stats request, several seconds when the proxy is
         // down) serialized every concurrent dashboard builder behind one
         // stalled fetch. A rare duplicate fetch is cheaper than that.
+        let started = Instant::now();
         let stats = fetch_headroom_dashboard_stats();
-        *self.cached_headroom_stats.lock() = Some((stats.clone(), Instant::now()));
+        let mut cache = self.cached_headroom_stats.lock();
+        // A timeout that outlived a concurrent success must not replace it:
+        // that held a miss for MISS_TTL over a fresh answer.
+        if stats.is_some() || !matches!(cache.as_ref(), Some((Some(_), at)) if *at > started) {
+            *cache = Some((stats.clone(), Instant::now()));
+        }
         stats
     }
 
@@ -6590,6 +6607,8 @@ const STATS_FETCH_WARN_MAX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// enough that a busy-proxy flap cannot span it, short enough that a genuine
 /// fix is loud again within one sitting.
 const STATS_FETCH_RECOVERY_WINDOW: Duration = Duration::from_secs(300);
+/// Per-request `/stats` timeout; see `fetch_headroom_dashboard_stats` for why 15s.
+const STATS_FETCH_TIMEOUT_SECS: u64 = 15;
 static STATS_FETCH_WARNED_AT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
 /// When the current unbroken run of successful fetches began; `None` when the
 /// last fetch failed or nothing has failed yet.
@@ -6617,6 +6636,16 @@ static STATS_FETCH_LAST_FAILED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 fn lone_stats_stall(category: &str, since_previous_failure: Option<Duration>) -> bool {
     category == "timeout"
         && since_previous_failure.is_none_or(|gap| gap >= STATS_FETCH_RECOVERY_WINDOW)
+}
+
+/// Whether a `/stats` timeout was overtaken by a fetch that succeeded while it
+/// was still waiting. Callers fetch independently, so
+/// a slow request can time out after a newer one already refreshed the
+/// dashboard: RUST-86's only 0.9.25 event carried `secs_since_last_ok: 0`.
+/// The user saw fresh data, so there is nothing to report.
+fn stats_timeout_overtaken(category: &str, since_last_ok: Option<Duration>) -> bool {
+    category == "timeout"
+        && since_last_ok.is_some_and(|age| age < Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
 }
 
 fn total_intercept_requests() -> u64 {
@@ -6672,6 +6701,13 @@ fn stats_fetch_failure_category(reason: &str) -> String {
 
 fn warn_stats_fetch_failed(reason: &str) {
     let category = stats_fetch_failure_category(reason);
+    let last_ok_age = (*STATS_FETCH_LAST_OK.lock()).map(|(at, _)| at.elapsed());
+    if stats_timeout_overtaken(&category, last_ok_age) {
+        // Not a failure the dashboard shows: leave the stall and recovery
+        // state exactly as the newer success left it.
+        log::info!("headroom /stats fetch failed ({reason}); a newer fetch already succeeded");
+        return;
+    }
     let previous_failure = STATS_FETCH_LAST_FAILED_AT.lock().replace(Instant::now());
     if lone_stats_stall(&category, previous_failure.map(|at| at.elapsed())) {
         // Still breaks a recovery run, but does not arm the backoff, so the
@@ -6911,7 +6947,6 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     // fetch is a cold rebuild: ~3s idle, past 5s while the proxy is busy
     // serving a session (RUST-6V). 15s turns those into slow successes; a
     // fetch that still times out means the backend is genuinely starved.
-    const STATS_FETCH_TIMEOUT_SECS: u64 = 15;
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
@@ -8895,13 +8930,29 @@ fn windows_process_sweep_script(
     } else {
         format!("-and $_.CommandLine -like '*{args_escaped}*' ")
     };
+    // Broken WMI (RUST-JW/JX) leaves the venv-lock sweep blind, and pip then
+    // dies stashing site-packages\headroom under a live holder (RUST-6S,
+    // WinError 183 on `~~adroom`). A sweep that needs neither the parent nor
+    // the command line can fall back to Get-Process's image path, which
+    // catches the launcher (headroom.exe, venv python.exe); the launcher's job
+    // object takes its base-python child down with it.
+    let fallback = if matches!(parents, SweepParents::Any) && args_pattern.is_empty() {
+        format!(
+            "try {{ Get-Process -ErrorAction Stop \
+             | Where-Object {{ $_.Id -ne $PID -and $_.Id -ne $me -and $_.Path -like '*{exe_pattern}*' }} \
+             | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; exit 0 }} \
+             catch {{ }} "
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "try {{ $me = {self_pid}; Get-CimInstance Win32_Process -ErrorAction Stop \
+        "$me = {self_pid}; try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
          | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
          -and ($_.CommandLine -like '*{exe_pattern}*' -or $_.ExecutablePath -like '*{exe_pattern}*') \
          {args_rule}-and {parent_rule} }} \
          | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
-         catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
+         catch {{ {fallback}exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
     )
 }
 
@@ -9892,15 +9943,15 @@ mod tests {
         pick_cache_fields, proxy_readyz_503_body_is_upstream_only,
         proxy_readyz_status_is_reachable, rebuild_persisted_savings_from_records,
         savings_rate_implausible, settle_rollup_backfill, stats_fetch_stall_context,
-        stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
-        tool_schema_savings_usd, top_models_by_requests, total_dir_size_bytes,
-        warn_stats_fetch_failed, AppState, BackfillSettle, BootValidationOutcome,
-        ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
-        HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
-        RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_RECOVERED_AT,
-        STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
-        STATS_FETCH_WARN_MAX_INTERVAL,
+        stats_fetch_warn_interval, stats_timeout_overtaken, support_tier_for_platform,
+        tcp_port_accepts_connection, tool_schema_savings_usd, top_models_by_requests,
+        total_dir_size_bytes, warn_stats_fetch_failed, AppState, BackfillSettle,
+        BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
+        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
+        PersistedSavingsState, RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
+        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_LAST_OK,
+        STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_TIMEOUT_SECS,
+        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -13298,6 +13349,55 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn every_windows_sweep_script_runs_in_real_powershell() {
+        // String assertions cannot catch a PowerShell parse error: rc10 shipped
+        // a fallback `try` without its `catch`, so the whole venv-lock sweep
+        // failed to parse and never killed a holder. Run each shape for real
+        // against an exe nothing is running from; exit 0 means it parsed and
+        // the query ran.
+        let exe = std::path::Path::new(r"C:\headroom-sweep-test\none\headroom.exe");
+        for (args, parents) in [
+            ("", super::SweepParents::Any),
+            ("proxy --port", super::SweepParents::Any),
+            ("", super::SweepParents::Orphans { own_children: true }),
+            (
+                "proxy --port",
+                super::SweepParents::Orphans {
+                    own_children: false,
+                },
+            ),
+        ] {
+            let script =
+                super::windows_process_sweep_script(exe, args, std::process::id(), parents);
+            for (label, prefix) in [
+                ("wmi", ""),
+                // The fallback path, and both of its exits.
+                ("no-wmi", "function Get-CimInstance { throw 'broken' }; "),
+                (
+                    "no-wmi-no-get-process",
+                    "function Get-CimInstance { throw 'broken' }; function Get-Process { throw 'broken' }; ",
+                ),
+            ] {
+                let output = crate::proc::command("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command"])
+                    .arg(format!("{prefix}{script}"))
+                    .output()
+                    .expect("run powershell");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("ParserError"), "{label} {args:?}: {stderr}\n{script}");
+                let fallback = matches!(parents, super::SweepParents::Any) && args.is_empty();
+                let want = match label {
+                    "wmi" => 0,
+                    "no-wmi" if fallback => 0,
+                    _ => super::PS_SWEEP_ENUMERATION_FAILED,
+                };
+                assert_eq!(output.status.code(), Some(want), "{label} {args:?}: {stderr}\n{script}");
+            }
+        }
+    }
+
     /// RUST-CD: `Stop-Process` on a sibling instance's (or sibling thread's)
     /// in-flight backend is the 0xffffffff-after-banner failure. The script
     /// must carry the parent rule, and must drop our own children when the
@@ -13312,7 +13412,7 @@ mod tests {
             4242,
             super::SweepParents::Orphans { own_children: true },
         );
-        assert!(held.contains("$me = 4242;"), "{held}");
+        assert!(held.starts_with("$me = 4242; try {"), "{held}");
         assert!(held.contains("$_.ProcessId -ne $me"), "{held}");
         assert!(
             held.contains("($_.ParentProcessId -eq $me -and $true)"),
@@ -13348,6 +13448,21 @@ mod tests {
             "{any}"
         );
         assert!(!any.contains("-like '**'"), "{any}");
+        // RUST-6S: broken WMI must not blind the venv-lock sweep; it falls
+        // back to Get-Process by image path, and only fails if that fails too.
+        assert!(
+            any.contains(&format!(
+                "catch {{ try {{ Get-Process -ErrorAction Stop | Where-Object {{ $_.Id -ne $PID \
+                 -and $_.Id -ne $me -and $_.Path -like '*C:\\Users\\a\\venv\\Scripts\\headroom.exe*' }} \
+                 | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; \
+                 exit 0 }} catch {{ }} exit {} }}; exit 0",
+                super::PS_SWEEP_ENUMERATION_FAILED
+            )),
+            "{any}"
+        );
+        assert_eq!(any.matches('{').count(), any.matches('}').count(), "{any}");
+        // Parent-checked sweeps keep refusing: Get-Process has no parent pid.
+        assert!(!held.contains("Get-Process -ErrorAction Stop"), "{held}");
         assert!(
             held.contains("-and $_.CommandLine -like '*proxy --port*' -and ("),
             "{held}"
@@ -13390,12 +13505,25 @@ mod tests {
         );
     }
 
+    /// A sequential poll never fails within `STATS_FETCH_TIMEOUT_SECS` of a
+    /// success (12s cache TTL, then a 15s timeout), so age the last success
+    /// past that; a fresher one would read as an overtaken timeout.
+    fn age_last_stats_ok() {
+        let mut last_ok = STATS_FETCH_LAST_OK.lock();
+        if let Some((at, requests)) = *last_ok {
+            *last_ok = at
+                .checked_sub(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
+                .map(|aged| (aged, requests));
+        }
+    }
+
     #[test]
     #[serial_test::serial(stats_fetch_warn)]
     fn stats_fetch_warn_is_throttled_within_the_window() {
         // The dashboard retries /stats every 12s and this warn bridges to
         // Sentry, so only the first failure in a window may speak.
         *STATS_FETCH_WARNED_AT.lock() = None;
+        *STATS_FETCH_LAST_OK.lock() = None;
         // A repeat, so the lone-stall gate does not swallow the first call.
         *STATS_FETCH_LAST_FAILED_AT.lock() = Some(Instant::now());
 
@@ -13449,6 +13577,7 @@ mod tests {
         // decay never applied: 97 events in 2 days from one host.
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;
+        *STATS_FETCH_LAST_OK.lock() = None;
         *STATS_FETCH_LAST_FAILED_AT.lock() = Some(Instant::now());
 
         warn_stats_fetch_failed("timed out after 15s");
@@ -13466,6 +13595,7 @@ mod tests {
 
         // The next failure warns only when the window has elapsed, and it
         // breaks the recovery run.
+        age_last_stats_ok();
         warn_stats_fetch_failed("timed out after 15s");
         assert_eq!(
             (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped").0,
@@ -13487,6 +13617,7 @@ mod tests {
                 "a sustained recovery clears the backoff"
             );
 
+            age_last_stats_ok();
             warn_stats_fetch_failed("timed out after 15s");
             let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("loud again");
             assert_eq!(streak, 1, "a healed-then-broken cause warns immediately");
@@ -13494,6 +13625,24 @@ mod tests {
 
         *STATS_FETCH_WARNED_AT.lock() = None;
         *STATS_FETCH_RECOVERED_AT.lock() = None;
+    }
+
+    #[test]
+    fn a_stats_timeout_overtaken_by_a_newer_success_is_not_a_failure() {
+        // RUST-86 on 0.9.25: secs_since_last_ok was 0 -- a concurrent fetch
+        // had just refreshed the dashboard when this one gave up.
+        assert!(stats_timeout_overtaken("timeout", Some(Duration::ZERO)));
+        assert!(stats_timeout_overtaken(
+            "timeout",
+            Some(Duration::from_secs(14))
+        ));
+        assert!(!stats_timeout_overtaken(
+            "timeout",
+            Some(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
+        ));
+        assert!(!stats_timeout_overtaken("timeout", None));
+        // A 500 is our backend misbehaving whatever a sibling fetch saw.
+        assert!(!stats_timeout_overtaken("http-500", Some(Duration::ZERO)));
     }
 
     #[test]
