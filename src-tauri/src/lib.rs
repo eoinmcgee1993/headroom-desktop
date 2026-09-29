@@ -6280,9 +6280,17 @@ const EXIT_SIGNALS: [i32; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
 /// Headroom was opened by hand. The callback runs on the GTK main loop.
 /// `Break` drops the source, which restores the default action, so the same
 /// signal sent again still kills the app if the teardown hangs.
+/// A signal the process inherited as ignored (`nohup` ignores SIGHUP, a
+/// script's background job ignores SIGINT) stays ignored: GLib would replace
+/// SIG_IGN with its own handler, so closing the terminal would quit the app and
+/// unroute every client.
 #[cfg(target_os = "linux")]
 fn route_signals_to_exit(signals: &[i32], exit: impl Fn() + Clone + Send + 'static) {
     for &signum in signals {
+        if signal_is_ignored(signum) {
+            log::info!("exit: signal {signum} inherited as ignored, not routing it");
+            continue;
+        }
         let exit = exit.clone();
         glib::unix_signal_add(signum, move || {
             log::info!("exit: signal {signum}, quitting");
@@ -6290,6 +6298,14 @@ fn route_signals_to_exit(signals: &[i32], exit: impl Fn() + Clone + Send + 'stat
             glib::ControlFlow::Break
         });
     }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_is_ignored(signum: i32) -> bool {
+    // SAFETY: a null `act` only reads the current disposition into `old`.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::sigaction(signum, std::ptr::null(), &mut old) };
+    read == 0 && old.sa_sigaction == libc::SIG_IGN
 }
 
 fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Value {
@@ -10701,6 +10717,19 @@ mod tests {
             fired.load(Ordering::SeqCst),
             "SIGHUP never reached the exit route"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_exit_signal_inherited_as_ignored_stays_ignored() {
+        // `nohup` hands the app SIGHUP as SIG_IGN; routing it would let GLib
+        // install its own handler, so a closed terminal would quit the app.
+        // SIGUSR2 stands in so the SIGHUP test above cannot race this one.
+        unsafe { libc::signal(libc::SIGUSR2, libc::SIG_IGN) };
+        super::route_signals_to_exit(&[libc::SIGUSR2], || {});
+        let still_ignored = super::signal_is_ignored(libc::SIGUSR2);
+        unsafe { libc::signal(libc::SIGUSR2, libc::SIG_DFL) };
+        assert!(still_ignored, "an inherited SIG_IGN was replaced");
     }
 
     #[test]
