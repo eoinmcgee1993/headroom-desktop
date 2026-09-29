@@ -118,8 +118,8 @@ pub fn gated_bypass_bytes() -> u64 {
 
 /// Account-level gate (trial ended / sign-in required), set by
 /// `AppState::apply_pricing_gate_status`. Unlike the Claude flags it is
-/// honored by EVERY client: OpenCode and Grok keep Python alive (their
-/// third-party upstreams cannot be forwarded direct) and used to sail
+/// honored by EVERY client: OpenCode and Grok keep Python alive (it owns
+/// their third-party upstream routing) and used to sail
 /// through it fully optimized after the wall. Plan-usage metering stays
 /// per product; only the account wall is shared.
 static ACCOUNT_GATE: AtomicBool = AtomicBool::new(false);
@@ -1468,8 +1468,7 @@ async fn handle(
     // backend's OpenAI handler honours `x-headroom-base-url`, so grok traffic
     // gets the full compression pipeline and the correct upstream from the
     // shared backend instance. Stamped BEFORE the bypass branches below so the
-    // no-direct-upstream 503 guard covers grok too - the direct forwarder
-    // only knows the Anthropic/OpenAI bases, and forwarding an xAI key to
+    // direct forwarder sends grok there too: forwarding an xAI key to
     // api.openai.com is the exact misroute this connector was blocked on.
     if is_grok {
         let upstream = grok_upstream_header(extract_bearer(&buf).as_deref());
@@ -1559,26 +1558,14 @@ async fn handle(
     // forwarder picks the upstream from the credential: Claude Code to its
     // configured upstream (Anthropic by default), API-key Codex to
     // api.openai.com, ChatGPT-subscription Codex to chatgpt.com's Codex
-    // backend (the only place its OAuth token is valid).
-    // OpenCode's transport plugin routes third-party providers (Google, custom
-    // gateways) here with the real upstream in `x-headroom-base-url`. The
-    // direct forwarder only knows the Anthropic/OpenAI bases, so forwarding
-    // such a request would send it (and its credential) to the wrong vendor -
-    // the exact grok-class misroute. 503-retry instead; these windows are
-    // short because the backend is kept alive whenever OpenCode is enabled.
-    let is_plugin_routed = request_has_header(&buf, "x-headroom-base-url");
-
+    // backend (the only place its OAuth token is valid). OpenCode's transport
+    // plugin routes third-party providers (Google, custom gateways) here with
+    // the real upstream in `x-headroom-base-url`, and the forwarder sends them
+    // there, like Grok. They used to get 503-retry, which a watchdog give-up
+    // (bypass for as long as the backend stays down) turned into an outage.
     if bypass.load(Ordering::Acquire) {
-        // ChatGPT-authenticated Codex goes through the direct forwarder too
-        // now: it knows chatgpt.com's Codex backend, so the OAuth token lands
-        // where it is valid instead of being answered 503. Only plugin-routed
-        // third-party providers still have no correct direct upstream.
-        if is_plugin_routed {
-            write_retryable_service_unavailable(&mut client).await;
-        } else {
-            record_gated_bypass(&buf);
-            forward_direct_to_anthropic(client, buf, &upstream_base).await;
-        }
+        record_gated_bypass(&buf);
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     }
 
@@ -1671,13 +1658,7 @@ async fn handle(
         // info, not warn: warn would ship to Sentry per request; the watchdog's
         // capture_watchdog_give_up already reports genuine down episodes.
         note_backend_reachability(false, backend_addr);
-        if is_plugin_routed {
-            // See the bypass branch above: no correct direct upstream exists
-            // for plugin-routed third-party providers.
-            write_retryable_service_unavailable(&mut client).await;
-        } else {
-            forward_direct_to_anthropic(client, buf, &upstream_base).await;
-        }
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     };
     note_backend_reachability(true, backend_addr);
@@ -2759,10 +2740,11 @@ fn upstream_client(url: &str) -> &'static reqwest::Client {
 /// the same URL (ANTHROPIC_TARGET_API_URL) and trims a trailing `/v1` off it
 /// (`_normalize_api_url`) before appending the request path, so this does too.
 ///
-/// None when, with no override, the request carries a key Anthropic never
-/// issued: the backend's cc-switch reconciler captured some relay this
-/// process cannot see, and forwarding would hand that relay's key and the
-/// prompt to api.anthropic.com. Such a key would only earn a 401 there anyway.
+/// With no override, a key Anthropic never issued is a cc-switch relay's: the
+/// backend's reconciler records the relay it captured
+/// (`tool_manager::cc_switch_capture_path`), and the key goes there. None when
+/// nothing is recorded, since forwarding would hand that relay's key and the
+/// prompt to api.anthropic.com, where it would only earn a 401 anyway.
 ///
 /// The reverse holds too: with a provider token stored, a request keyed only
 /// with Anthropic credentials is not the override's traffic (OpenCode's native
@@ -2776,14 +2758,60 @@ fn claude_direct_base(default: &str, header_buf: &[u8]) -> Option<String> {
     let foreign_key = keys
         .iter()
         .any(|key| !key.starts_with(ANTHROPIC_CREDENTIAL_PREFIX));
+    let trim = |url: &str| {
+        let url = url.trim_end_matches('/');
+        url.strip_suffix("/v1").unwrap_or(url).to_string()
+    };
     let upstream = crate::upstream_override::get();
     if let Some(url) = upstream.configured_upstream() {
         if foreign_key || keys.is_empty() || !upstream.has_token {
-            let url = url.trim_end_matches('/');
-            return Some(url.strip_suffix("/v1").unwrap_or(url).to_string());
+            return Some(trim(url));
         }
     }
-    (!foreign_key).then(|| default.to_string())
+    if foreign_key {
+        return crate::tool_manager::cc_switch_captured_upstream().map(|url| trim(&url));
+    }
+    Some(default.to_string())
+}
+
+/// A plugin-routed request's upstream: the origin OpenCode's transport plugin
+/// put in `x-headroom-base-url` (the intercept stamps Grok's the same way), and
+/// the provider's own path in `x-headroom-original-path` when the plugin
+/// normalized it to /v1/chat/completions or /v1/responses. Takes both headers,
+/// and our X-Client stamp, out of `buf`: they are for the backend, and the
+/// provider gets what the client would have sent it without Headroom.
+fn take_plugin_route(buf: &mut Vec<u8>) -> Option<(String, Option<String>)> {
+    let origin = extract_header_value(buf, "x-headroom-base-url")?;
+    let original_path = extract_header_value(buf, "x-headroom-original-path");
+    for name in [
+        "x-headroom-base-url",
+        "x-headroom-original-path",
+        "x-client",
+    ] {
+        strip_request_header(buf, name);
+    }
+    Some((origin, original_path))
+}
+
+/// The URL the client would have called without Headroom: the plugin's
+/// origin, then the original path (an absolute one only, as the backend
+/// accepts) with this request's query, else this request's path. https only:
+/// the plugin routes remote providers, and plain http could name this
+/// intercept and loop.
+fn plugin_direct_url(origin: &str, original_path: Option<&str>, path: &str) -> Option<String> {
+    let origin = reqwest::Url::parse(origin.trim())
+        .ok()
+        .filter(|url| url.scheme() == "https" && url.host_str().is_some())?;
+    let path = match original_path {
+        Some(original) if original.starts_with('/') && !original.starts_with("//") => {
+            match path.split_once('?') {
+                Some((_, query)) => format!("{original}?{query}"),
+                None => original.to_string(),
+            }
+        }
+        _ => path.to_string(),
+    };
+    Some(format!("{}{path}", origin.origin().ascii_serialization()))
 }
 
 async fn write_retryable_service_unavailable(client: &mut TcpStream) {
@@ -2795,8 +2823,8 @@ async fn write_retryable_service_unavailable(client: &mut TcpStream) {
 }
 
 /// Forward the request that produced `header_buf` directly to the provider:
-/// the Claude upstream from `claude_direct_base`, or OpenAI/chatgpt.com for
-/// Codex.
+/// the Claude upstream from `claude_direct_base`, OpenAI/chatgpt.com for
+/// Codex, or a plugin-routed request's own upstream (`plugin_direct_url`).
 ///
 /// Used when the pricing gate has stopped the local Python proxy. The CC
 /// session keeps speaking HTTP/1.1 to 127.0.0.1:6767; we re-issue the same
@@ -2804,9 +2832,10 @@ async fn write_retryable_service_unavailable(client: &mut TcpStream) {
 /// the response back as HTTP/1.1 chunked transfer.
 async fn forward_direct_to_anthropic(
     mut client: TcpStream,
-    header_buf: Vec<u8>,
+    mut header_buf: Vec<u8>,
     upstream_base: &str,
 ) {
+    let plugin_route = take_plugin_route(&mut header_buf);
     let header_end = match find_header_end(&header_buf) {
         Some(pos) => pos + 4,
         None => {
@@ -2846,21 +2875,27 @@ async fn forward_direct_to_anthropic(
     // Three upstreams, keyed on what the request carries: a ChatGPT OAuth
     // token is only valid at chatgpt.com's Codex backend, an API key at
     // api.openai.com, anything else is Claude Code on `upstream_base`.
-    let chatgpt_codex = is_codex_request_head(&parsed) && request_uses_chatgpt_auth(&header_buf);
-    let effective_base: String = if chatgpt_codex {
-        chatgpt_codex_direct_base()
+    // A plugin-routed request (Grok, OpenCode's third-party providers) names
+    // its own upstream, and goes there first: by path it looks like Codex.
+    let chatgpt_codex = plugin_route.is_none()
+        && is_codex_request_head(&parsed)
+        && request_uses_chatgpt_auth(&header_buf);
+    let url = if let Some((origin, original_path)) = &plugin_route {
+        plugin_direct_url(origin, original_path.as_deref(), &parsed.path)
+    } else if chatgpt_codex {
+        Some(format!(
+            "{}{}",
+            chatgpt_codex_direct_base(),
+            chatgpt_codex_direct_path(&parsed.path)
+        ))
     } else if is_codex_request_head(&parsed) {
-        OPENAI_DIRECT_BASE.to_string()
-    } else if let Some(base) = claude_direct_base(upstream_base, &header_buf) {
-        base
+        Some(format!("{OPENAI_DIRECT_BASE}{}", parsed.path))
     } else {
+        claude_direct_base(upstream_base, &header_buf).map(|base| format!("{base}{}", parsed.path))
+    };
+    let Some(url) = url else {
         write_retryable_service_unavailable(&mut client).await;
         return;
-    };
-    let effective_path: &str = if chatgpt_codex {
-        chatgpt_codex_direct_path(&parsed.path)
-    } else {
-        &parsed.path
     };
 
     let header_value = |name: &str| {
@@ -2877,7 +2912,6 @@ async fn forward_direct_to_anthropic(
     // bypass modes meant to keep it alive. Tunnel the upgrade via hyper's
     // connection takeover instead.
     if header_value("upgrade").is_some() {
-        let url = format!("{}{}", effective_base, effective_path);
         tunnel_upgrade_direct(client, &parsed, leftover_body, &url).await;
         return;
     }
@@ -2951,7 +2985,6 @@ async fn forward_direct_to_anthropic(
         sanitize_stale_tool_references(body, &parsed.path)
     };
 
-    let url = format!("{}{}", effective_base, effective_path);
     let method = match reqwest::Method::from_bytes(parsed.method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -2996,7 +3029,8 @@ async fn forward_direct_to_anthropic(
             return;
         }
     };
-    if resp.status().as_u16() == 429 {
+    // Plugin-routed 429s are OpenCode's or Grok's, not Codex's or Claude's.
+    if resp.status().as_u16() == 429 && plugin_route.is_none() {
         crate::usage_counters::record_429(if is_codex_request_head(&parsed) {
             "codex"
         } else {
@@ -3710,12 +3744,13 @@ mod tests {
         is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
         is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
-        response_content_type, run, sanitize_stale_tool_references, should_report_throttled,
-        should_report_upstream_error, stamp_client_header, stamp_codex_client_header,
-        stamp_headroom_bypass_header, stamp_request_header, strip_request_header,
-        verdict_permits_reuse, BypassFlag, CodexTerminalReader, HeldPortVerdict, ParsedRequestHead,
-        ResponseSniffer, SharedToken, FIRST_OPTIMIZED_REQUEST_REPORTED,
+        plugin_direct_url, read_http_headers, request_has_header, request_is_loopback_safe,
+        request_uses_chatgpt_auth, response_content_type, run, sanitize_stale_tool_references,
+        should_report_throttled, should_report_upstream_error, stamp_client_header,
+        stamp_codex_client_header, stamp_headroom_bypass_header, stamp_request_header,
+        strip_request_header, take_plugin_route, verdict_permits_reuse, BypassFlag,
+        CodexTerminalReader, HeldPortVerdict, ParsedRequestHead, ResponseSniffer, SharedToken,
+        FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -5744,6 +5779,7 @@ mod tests {
     #[serial]
     fn claude_direct_base_follows_the_configured_upstream() {
         use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+        let _data = TempDataDir::new();
         let glm = b"POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer glm.key\r\n\r\n";
         let kimi = b"POST /v1/messages HTTP/1.1\r\nx-api-key: sk-kimi\r\n\r\n";
         let oauth = b"POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer sk-ant-oat01-x\r\n\r\n";
@@ -5751,9 +5787,23 @@ mod tests {
 
         crate::upstream_override::publish(UpstreamOverride::default());
         assert_eq!(base(oauth).as_deref(), Some("https://api.anthropic.com"));
-        // A relay only the backend knows (cc-switch capture): no direct target.
+        // A relay nothing recorded (no cc-switch capture): no direct target.
         assert_eq!(base(glm), None);
         assert_eq!(base(kimi), None);
+        // The relay the reconciler recorded; Anthropic keys never go there.
+        let capture = crate::tool_manager::cc_switch_capture_path();
+        std::fs::create_dir_all(capture.parent().expect("config dir")).expect("mkdir");
+        std::fs::write(
+            &capture,
+            r#"{"url":"https://open.bigmodel.cn/api/anthropic/"}"#,
+        )
+        .expect("write capture");
+        assert_eq!(
+            base(kimi).as_deref(),
+            Some("https://open.bigmodel.cn/api/anthropic")
+        );
+        assert_eq!(base(oauth).as_deref(), Some("https://api.anthropic.com"));
+        crate::tool_manager::clear_cc_switch_capture();
 
         // The backend's `_normalize_api_url` drops a trailing `/v1`.
         crate::upstream_override::publish(UpstreamOverride {
@@ -5787,6 +5837,8 @@ mod tests {
     #[serial]
     async fn direct_forward_never_sends_a_third_party_key_to_anthropic() {
         use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+        // No cc-switch capture recorded, whatever the real profile holds.
+        let _data = TempDataDir::new();
         // Dead backend: the third branch falls back direct because of it.
         backend_port::set(1);
         for (branch, bypass, claude_only) in [
@@ -5865,6 +5917,207 @@ mod tests {
                 token_slot.lock().is_none(),
                 "{branch}: a provider key landed in the Claude bearer slot"
             );
+            run_task.abort();
+        }
+        backend_port::reset_for_tests();
+    }
+
+    /// Points HEADROOM_DATA_DIR at a fresh temp dir while alive, so the
+    /// cc-switch capture `claude_direct_base` reads is never the real profile's.
+    struct TempDataDir {
+        _dir: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TempDataDir {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("temp data dir");
+            let prev = std::env::var_os("HEADROOM_DATA_DIR");
+            std::env::set_var("HEADROOM_DATA_DIR", dir.path());
+            Self { _dir: dir, prev }
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("HEADROOM_DATA_DIR", v),
+                None => std::env::remove_var("HEADROOM_DATA_DIR"),
+            }
+        }
+    }
+
+    /// An intercept on an ephemeral port with the given bypass flags, whose
+    /// default Claude upstream refuses instantly.
+    async fn spawn_direct_intercept(
+        bypass: bool,
+        claude_only: bool,
+    ) -> (SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let (probe, intercept_addr) = bind_ephemeral().await;
+        drop(probe);
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(run(
+            intercept_addr,
+            false,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(bypass)),
+            Arc::new(AtomicBool::new(claude_only)),
+            Arc::new(AtomicBool::new(false)),
+            fresh_bearer_tx,
+            Arc::new("http://127.0.0.1:1".to_string()),
+            Arc::new(Mutex::new(None)),
+        ));
+        (intercept_addr, run_task)
+    }
+
+    async fn send_to_intercept(addr: SocketAddr, request: &[u8]) -> Vec<u8> {
+        for _ in 0..50 {
+            if let Ok(mut c) = TcpStream::connect(addr).await {
+                c.write_all(request).await.expect("write request");
+                return read_until_header_end(&mut c).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("intercept unreachable");
+    }
+
+    /// A cc-switch relay key got 503-retry on every direct path (full bypass,
+    /// claude-only bypass, backend down), because only the stopped backend
+    /// knew the relay: a lapsed trial left Claude Code failing, not merely
+    /// unoptimized. The backend records its capture for the desktop, so the
+    /// forwarder sends the key there, trimming `/v1` like the override.
+    #[tokio::test]
+    #[serial]
+    async fn direct_forward_sends_a_cc_switch_relay_key_to_the_captured_relay() {
+        let _data = TempDataDir::new();
+        crate::upstream_override::publish(crate::state::UpstreamOverride::default());
+        backend_port::set(1);
+        for (branch, bypass, claude_only) in [
+            ("bypass", true, false),
+            ("claude-only bypass", false, true),
+            ("backend unreachable", false, false),
+        ] {
+            let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+            let upstream_task = tokio::spawn(async move {
+                let (mut sock, _) = upstream_listener.accept().await.expect("upstream accept");
+                let received = read_until_header_end(&mut sock).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                received
+            });
+            let capture = crate::tool_manager::cc_switch_capture_path();
+            std::fs::create_dir_all(capture.parent().expect("config dir")).expect("mkdir");
+            std::fs::write(
+                &capture,
+                format!(
+                    r#"{{"url":"http://127.0.0.1:{}/api/anthropic/v1/"}}"#,
+                    upstream_addr.port()
+                ),
+            )
+            .expect("write capture");
+            let (intercept_addr, run_task) = spawn_direct_intercept(bypass, claude_only).await;
+
+            let response = send_to_intercept(
+                intercept_addr,
+                b"POST /v1/messages?beta=true HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer glm.key\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 200"),
+                "{branch}: {:?}",
+                String::from_utf8_lossy(&response)
+            );
+            let received = timeout(Duration::from_secs(5), upstream_task)
+                .await
+                .expect("relay got the request in time")
+                .expect("relay task ok");
+            let received = String::from_utf8_lossy(&received);
+            assert!(
+                received.starts_with("POST /api/anthropic/v1/messages?beta=true HTTP/1.1"),
+                "{branch}: {received:?}"
+            );
+            run_task.abort();
+        }
+        backend_port::reset_for_tests();
+    }
+
+    /// Plugin-routed requests (OpenCode's third-party providers, and Grok, whose
+    /// upstream the intercept stamps) got 503-retry for the whole of a bypass
+    /// or backend outage, so a watchdog give-up left them failing until the
+    /// backend came back. They go direct to the https origin the plugin named.
+    #[tokio::test]
+    #[serial]
+    async fn plugin_routed_requests_go_direct_to_their_own_upstream() {
+        // The provider's own URL, without Headroom's headers.
+        let mut buf = b"POST /v1/chat/completions?alt=sse HTTP/1.1\r\nHost: 127.0.0.1\r\nx-headroom-base-url: https://generativelanguage.googleapis.com\r\nx-headroom-original-path: /v1beta/openai/chat/completions\r\nX-Client: grok_build\r\nContent-Length: 2\r\n\r\n{}".to_vec();
+        let (origin, original) = take_plugin_route(&mut buf).expect("plugin-routed");
+        assert_eq!(
+            plugin_direct_url(&origin, original.as_deref(), "/v1/chat/completions?alt=sse")
+                .as_deref(),
+            Some(
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions?alt=sse"
+            )
+        );
+        for name in [
+            "x-headroom-base-url",
+            "x-headroom-original-path",
+            "x-client",
+        ] {
+            assert!(
+                !request_has_header(&buf, name),
+                "{name} reached the provider"
+            );
+        }
+        assert!(buf.ends_with(b"Content-Length: 2\r\n\r\n{}"));
+        let mut claude = b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_vec();
+        assert!(take_plugin_route(&mut claude).is_none());
+        // Grok: the origin the intercept stamped, on the client's own path.
+        assert_eq!(
+            plugin_direct_url("https://api.x.ai", None, "/v1/chat/completions").as_deref(),
+            Some("https://api.x.ai/v1/chat/completions")
+        );
+        // https only (plain http could name this intercept), and a relative
+        // original path is ignored like the backend ignores it.
+        assert_eq!(
+            plugin_direct_url("http://127.0.0.1:6767", None, "/v1/x"),
+            None
+        );
+        assert_eq!(plugin_direct_url("not a url", None, "/v1/x"), None);
+        assert_eq!(
+            plugin_direct_url("https://h.example", Some("evil.example/x"), "/v1/responses")
+                .as_deref(),
+            Some("https://h.example/v1/responses")
+        );
+
+        backend_port::set(1);
+        for (branch, bypass) in [("bypass", true), ("backend unreachable", false)] {
+            // Plain TCP: a TLS ClientHello reaching it proves the forwarder
+            // dialed the plugin's origin; the handshake then fails (502).
+            let (tls_listener, tls_addr) = bind_ephemeral().await;
+            let dialed = tokio::spawn(async move {
+                let (mut sock, _) = tls_listener.accept().await.expect("origin accept");
+                let mut first = [0u8; 1];
+                sock.read_exact(&mut first).await.ok().map(|_| first[0])
+            });
+            let (intercept_addr, run_task) = spawn_direct_intercept(bypass, false).await;
+            let request = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: opencode/1.18.5\r\nx-headroom-base-url: https://127.0.0.1:{}\r\nx-headroom-original-path: /v1beta/openai/chat/completions\r\nContent-Length: 0\r\n\r\n",
+                tls_addr.port()
+            );
+            let response = send_to_intercept(intercept_addr, request.as_bytes()).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 502"),
+                "{branch}: {:?}",
+                String::from_utf8_lossy(&response)
+            );
+            let first = timeout(Duration::from_secs(5), dialed)
+                .await
+                .expect("the plugin's origin was dialed in time")
+                .expect("origin task ok");
+            assert_eq!(first, Some(0x16), "{branch}: no TLS handshake reached it");
             run_task.abort();
         }
         backend_port::reset_for_tests();
