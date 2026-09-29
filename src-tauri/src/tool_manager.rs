@@ -370,7 +370,9 @@ own address (localhost, the internal port) as an upstream. And it records
 each capture in HEADROOM_CC_SWITCH_CAPTURE_PATH: the desktop restores
 settings.json on quit and pause after this process is gone, so an
 in-memory capture was lost and the provider's key went to
-api.anthropic.com; the next instance reseeds from the same file.
+api.anthropic.com; the next instance reseeds from the same file. It
+reconciles only while the cc-switch-routed file beside it exists, which the
+desktop keeps in step with the Claude Code connector.
 
 Also stops the traffic learner writing "Learned: error recovery" into the
 user's Claude Code MEMORY.md. It pairs any failed tool call with the next
@@ -1260,6 +1262,12 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             raise RuntimeError(
                 "HEADROOM_CC_SWITCH_CAPTURE_PATH missing or relative: %r" % (_hd_ccs_capture,)
             )
+        # Beside it, present only while the desktop routes Claude Code's
+        # settings.json (cc_switch_routed_path): a disable hands the file back,
+        # and reconciling it then undid the connector toggle within 0.3s.
+        _hd_ccs_routed = _hd_os.path.join(
+            _hd_os.path.dirname(_hd_ccs_capture), "cc-switch-routed"
+        )
 
         def _hd_ccs_save_capture(url):
             tmp = "%s.%d.tmp" % (_hd_ccs_capture, _hd_os.getpid())
@@ -1343,6 +1351,16 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 
         def _hd_ccs_tick(self):
             global _hd_ccs_warned
+            if not _hd_os.path.exists(_hd_ccs_routed):
+                # Neither capture nor rewrite, and let go of a live capture:
+                # nothing routes to it now, and a switch to Official would go
+                # unseen. None, so routing again reseeds from the file.
+                target = _hd_ccs_pinned or self.default_upstream
+                if self.current_upstream not in (None, target):
+                    self._set_upstream(target)
+                    _hd_ccs_log.info("event=cc_switch_upstream_released upstream=%s", target)
+                self.current_upstream = None
+                return False
             prev = self.current_upstream
             seen = getattr(self, "_last_mtime_ns", None)
             rewrote = _hd_ccs_orig_tick(self)
@@ -10167,8 +10185,31 @@ pub(crate) fn cc_switch_captured_upstream() -> Option<String> {
 }
 
 pub(crate) fn clear_cc_switch_capture() {
-    let path = cc_switch_capture_path();
-    if let Err(err) = std::fs::remove_file(&path) {
+    remove_cc_switch_file(&cc_switch_capture_path());
+}
+
+/// Present while Headroom routes Claude Code's settings.json (the Claude Code
+/// or VS Code connector applied it), absent once a disable (connector off,
+/// pause, quit) hands it back. The cc-switch guard in `SITECUSTOMIZE_PY` reads
+/// it beside the capture file: without it, the reconciler took the URL a
+/// disable restored straight back, so the card said disconnected while every
+/// request still went through Headroom.
+pub(crate) fn cc_switch_routed_path() -> PathBuf {
+    cc_switch_capture_path().with_file_name("cc-switch-routed")
+}
+
+pub(crate) fn set_cc_switch_routed(routed: bool) {
+    let path = cc_switch_routed_path();
+    if !routed {
+        return remove_cc_switch_file(&path);
+    }
+    if let Err(err) = crate::client_adapters::atomic_write(&path, b"") {
+        log::warn!("writing {} failed: {err:#}", path.display());
+    }
+}
+
+fn remove_cc_switch_file(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
         if err.kind() != std::io::ErrorKind::NotFound {
             log::warn!("removing {} failed: {err}", path.display());
         }
@@ -17349,8 +17390,9 @@ time.sleep(30)
 
     /// Runs `script` against the installed wheel's real CCSwitchReconciler with
     /// the shipped sitecustomize on PYTHONPATH, the env the backend spawn sets,
-    /// and a scratch dir (argv[1]) holding settings.json and the capture file.
-    /// The internal port is 6768 and the intercept 6767. Skips without a
+    /// and a scratch dir (argv[1]) holding settings.json, the capture file and
+    /// the routed flag (present). The internal port is 6768 and the intercept
+    /// 6767. Skips without a
     /// managed runtime to run it on.
     fn run_cc_switch_probe(name: &str, script: &str) {
         let python =
@@ -17369,6 +17411,7 @@ time.sleep(30)
             assert os.environ['HEADROOM_CC_SWITCH_RECONCILE'] == '1', 'cc-switch guard did not bind'\n\
             import headroom.proxy.cc_switch_reconciler as m\n\
             d = Path(sys.argv[1]); settings = d / 'settings.json'; capture = d / 'capture.json'\n\
+            routed = d / 'cc-switch-routed'; routed.touch()\n\
             ANTHROPIC = 'https://api.anthropic.com'; RELAY = 'https://api.relay.example/anthropic'\n\
             n = [0]\n\
             def write(env):\n    \
@@ -17427,6 +17470,31 @@ time.sleep(30)
              capture.write_text(json.dumps({'url': RELAY}))\n\
              write({}); stale = []; r3 = recon(stale); r3.tick()\n\
              assert stale == [] and r3.current_upstream is None, ('reseeded onto official', stale)",
+        );
+    }
+
+    /// The reconciler follows the Claude Code connector, which the desktop
+    /// signals with `cc_switch_routed_path`. Ungated, turning the connector off
+    /// restored the relay and the reconciler took it back within 0.3s, so the
+    /// card said disconnected while every request still went through Headroom.
+    /// Unrouted it must neither capture nor rewrite, and must let go of a live
+    /// capture (nothing routes to it, and a switch to Official would go
+    /// unseen); routed again, it reseeds from the capture file.
+    #[test]
+    fn cc_switch_only_reconciles_while_claude_is_routed_against_the_installed_wheel() {
+        run_cc_switch_probe(
+            "routed",
+            "seen = []; r = recon(seen)\n\
+             write({'ANTHROPIC_BASE_URL': RELAY}); r.tick()\n\
+             assert seen == [RELAY] and base_url() == 'http://127.0.0.1:6767', seen\n\
+             routed.unlink(); write({'ANTHROPIC_BASE_URL': RELAY}); r.tick()\n\
+             assert base_url() == RELAY, 'rewrote an unrouted settings.json'\n\
+             assert seen == [RELAY, ANTHROPIC] and r.current_upstream is None, ('kept the capture live', seen)\n\
+             write({'ANTHROPIC_BASE_URL': 'https://api.other.example'}); r.tick()\n\
+             assert base_url() == 'https://api.other.example', 'rewrote an unrouted settings.json'\n\
+             assert json.loads(capture.read_text()) == {'url': RELAY}, 'captured while unrouted'\n\
+             write({'ANTHROPIC_BASE_URL': 'http://127.0.0.1:6767'}); routed.touch(); r.tick()\n\
+             assert seen[-1] == RELAY and r.current_upstream == RELAY, ('no reseed once routed', seen)",
         );
     }
 

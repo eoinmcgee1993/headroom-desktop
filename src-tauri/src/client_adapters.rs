@@ -1420,7 +1420,9 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // shell profile below must not leave Claude on the dead port.
             // Restore any pre-Headroom gateway/proxy URL instead of deleting
             // the key — deleting it pointed gateway users at api.anthropic.com
-            // where their credentials may not even work.
+            // where their credentials may not even work. The reconciler stops
+            // first, or it takes the restored URL straight back.
+            crate::tool_manager::set_cc_switch_routed(false);
             let restored = remove_claude_settings_env(
                 "ANTHROPIC_BASE_URL",
                 HEADROOM_ANTHROPIC_BASE_URL,
@@ -1454,6 +1456,8 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             restored?;
         }
         "vscode" => {
+            // Same settings.json key as claude_code: stop the reconciler first.
+            crate::tool_manager::set_cc_switch_routed(false);
             remove_vscode_connector_keys(claude_restore_base_url(&state).as_deref())?;
             let _ = remove_vscode_process_wrapper();
         }
@@ -3493,18 +3497,31 @@ fn remove_json_key_if_matches(
 /// URL (the one the quit restored) or our own. Anything else means the user
 /// moved off it, e.g. to Claude Official, so drop it before the write: the
 /// reconciler reseeds as soon as it sees our URL, and Anthropic OAuth traffic
-/// would follow the stale provider.
+/// would follow the stale provider. A kept capture is never reported as a
+/// replaced gateway: preserved_base_urls would outlive the capture (which the
+/// backend drops on a switch to Official), and a later quit would restore the
+/// relay over Claude Official. Once written, the reconciler may reconcile
+/// again (`tool_manager::cc_switch_routed_path`).
 fn configure_claude_base_url() -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+    let mut kept = None;
     if let Some(captured) = crate::tool_manager::cc_switch_captured_upstream() {
         let current = read_claude_settings_env("ANTHROPIC_BASE_URL")
             .ok()
             .flatten();
-        if !matches!(current.as_deref(), Some(url) if url == captured || url == HEADROOM_ANTHROPIC_BASE_URL)
-        {
-            crate::tool_manager::clear_cc_switch_capture();
+        match current {
+            Some(url) if url == captured => kept = Some(url),
+            Some(url) if url == HEADROOM_ANTHROPIC_BASE_URL => {}
+            _ => crate::tool_manager::clear_cc_switch_capture(),
         }
     }
-    configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)
+    let (changed, backups, replaced) =
+        configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+    crate::tool_manager::set_cc_switch_routed(true);
+    Ok((
+        changed,
+        backups,
+        replaced.filter(|url| Some(url) != kept.as_ref()),
+    ))
 }
 
 /// The URL a Claude Code or VS Code disable puts back in place of Headroom's:
@@ -12550,6 +12567,75 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             Some(relay),
             "relaunch dropped the capture the quit restored"
         );
+    }
+
+    /// The relay a quit restored is the reconciler's, not a pre-Headroom
+    /// gateway. Relaunch recorded it in preserved_base_urls, where it outlived
+    /// the capture: after a switch to Claude Official (the backend drops the
+    /// capture) and a re-route, the next quit wrote the relay over the
+    /// intercept and Claude Code sent its Anthropic OAuth token there.
+    #[test]
+    #[serial_test::serial]
+    fn a_kept_cc_switch_capture_is_never_preserved_as_a_gateway() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings_path = home.path().join(".claude").join("settings.json");
+        let relay = "https://api.relay.example/anthropic";
+        write_cc_switch_capture(relay);
+        fs::write(
+            &settings_path,
+            format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"{relay}"}}}}"#),
+        )
+        .unwrap();
+        seed_installed_rtk();
+
+        let relaunch = super::apply_client_setup("claude_code").expect("relaunch");
+        assert!(relaunch.replaced_base_url.is_none());
+        assert!(
+            !super::load_setup_state()
+                .preserved_base_urls
+                .contains_key("claude_code"),
+            "the reconciler's relay was preserved as a gateway"
+        );
+
+        // cc-switch -> Claude Official mid-session, then the hourly repair.
+        crate::tool_manager::clear_cc_switch_capture();
+        fs::write(&settings_path, r#"{"env":{}}"#).unwrap();
+        super::apply_client_setup("claude_code").expect("repair");
+        super::clear_client_setups().expect("quit");
+        let after_quit = read_settings_json(&settings_path);
+        assert!(
+            after_quit["env"]["ANTHROPIC_BASE_URL"].is_null(),
+            "quit put the relay back over Claude Official, got:\n{after_quit:#}"
+        );
+    }
+
+    /// The backend's cc-switch reconciler rewrites settings.json only while
+    /// Headroom routes it (`cc_switch_routed_path`). Ungated, turning the
+    /// connector off handed the relay back and the reconciler took it again
+    /// within 0.3s: the card said disconnected, every request still went
+    /// through Headroom, and nothing short of quitting took Claude off it.
+    #[test]
+    #[serial_test::serial]
+    fn claude_routing_gates_the_cc_switch_reconciler() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        seed_installed_rtk();
+        let routed = crate::tool_manager::cc_switch_routed_path;
+
+        for client in ["claude_code", "vscode"] {
+            super::apply_client_setup(client).expect("apply");
+            assert!(routed().exists(), "{client} apply left the reconciler off");
+            super::disable_client_setup(client).expect("disable");
+            assert!(
+                !routed().exists(),
+                "{client} disable left the reconciler on"
+            );
+        }
     }
 
     /// A kept capture is only valid while settings.json still names that
