@@ -1614,10 +1614,12 @@ impl AppState {
         }
         // Recovery pip-reinstalls or renames the live venv, so it gets the
         // upgrade's protection: no spawn may start mid-recovery, a start
-        // already in flight is waited out, and whatever runs from the venv
-        // (the updater's orphan proxy, Claude Code's MCP servers) is
-        // cleared first. Only when a marker exists: this sweep on every
-        // launch would kill the user's MCP servers for nothing.
+        // already in flight is waited out, the proxy is stopped, and
+        // kill_venv_lock_holders clears the rest: on Windows whatever runs
+        // from the venv (the updater's orphan proxy, Claude Code's MCP
+        // servers), on Unix only a previous instance's orphaned pip. Only
+        // when a marker exists: the Windows sweep on every launch would kill
+        // the user's MCP servers for nothing.
         let _recovery_guard = UpgradeInstallGuard::engage(self);
         drop(self.lifecycle_lock.lock());
         self.stop_headroom();
@@ -9316,7 +9318,8 @@ fn escape_powershell_like(value: &str) -> String {
 /// lock, which is where that case surfaces today; count failed kills in the
 /// script if that ever stops being true.
 ///
-/// Parent filter (same rule as the unix sweep, see `sweep_should_kill`): under
+/// Parent filter (the unix sweep's rule, see `sweep_should_kill`, minus its
+/// subreaper clause, which Windows never needs): under
 /// `SweepParents::Orphans` a match is killed only when its parent is gone
 /// (Windows never reparents an orphan, so its ParentProcessId names a dead
 /// pid) or, with `own_children`, when its parent is this app (`self_pid`). A match
@@ -9391,10 +9394,50 @@ fn windows_process_sweep_script(
 /// hosts). `own_children` is false when the caller could not take the
 /// lifecycle lock: then a sibling transition in this process is mid-spawn and
 /// its child is likewise off limits.
-fn sweep_should_kill(ppid: u32, self_pid: u32, parents: SweepParents) -> bool {
+///
+/// "Some other live process" means another Headroom desktop
+/// (`parent_is_headroom`), nothing wider: on Linux an orphan reparents to the
+/// nearest subreaper, which on a systemd desktop is the `systemd --user`
+/// manager, not pid 1. Sparing every live parent left that orphan backend
+/// running through every quit, gate pause and runtime upgrade until reboot.
+fn sweep_should_kill(
+    ppid: u32,
+    self_pid: u32,
+    parent_is_headroom: bool,
+    parents: SweepParents,
+) -> bool {
     match parents {
         SweepParents::Any => true,
-        SweepParents::Orphans { own_children } => ppid <= 1 || (own_children && ppid == self_pid),
+        SweepParents::Orphans { own_children } => {
+            ppid <= 1
+                || (own_children && ppid == self_pid)
+                || (ppid != self_pid && !parent_is_headroom)
+        }
+    }
+}
+
+/// Whether `comm` (what `ps -o comm=` reports for a match's parent) names a
+/// Headroom desktop, given `own`, what it reports for this process. An empty
+/// `comm` is a parent that has exited; an unknown `own` matches anything, so
+/// the sweep falls back to sparing every live parent.
+fn comm_is_headroom_desktop(comm: &str, own: &str) -> bool {
+    let comm = comm.trim();
+    !comm.is_empty() && comm.contains(own)
+}
+
+/// `comm_is_headroom_desktop` for a live pid. A `ps` that cannot run spares
+/// the match.
+#[cfg(unix)]
+fn parent_is_headroom_desktop(ppid: u32) -> bool {
+    match crate::proc::command("ps")
+        .args(["-o", "comm=", "-p", &ppid.to_string()])
+        .output()
+    {
+        Ok(out) => comm_is_headroom_desktop(
+            &String::from_utf8_lossy(&out.stdout),
+            &crate::relauncher_expect_name(),
+        ),
+        Err(_) => true,
     }
 }
 
@@ -9472,9 +9515,11 @@ fn kill_processes_by_command_pattern(
             if pid == self_pid {
                 continue;
             }
-            if !sweep_should_kill(ppid, self_pid, parents) {
+            let parent_is_headroom =
+                ppid > 1 && ppid != self_pid && parent_is_headroom_desktop(ppid);
+            if !sweep_should_kill(ppid, self_pid, parent_is_headroom, parents) {
                 log::info!(
-                    "process sweep: leaving pid {pid} (parent {ppid} is alive and not us) for '{pattern}'"
+                    "process sweep: leaving pid {pid} (parent {ppid} is a live Headroom) for '{pattern}'"
                 );
                 continue;
             }
@@ -9561,17 +9606,37 @@ fn kill_processes_by_command_pattern(
 }
 
 /// Kill every process whose command line references the managed venv
-/// directory. Windows-only: pip cannot overwrite files a running process
-/// holds open, so an upgrade's `--force-reinstall` — and the rollback that
-/// retries the same operation — both die with permission errors when an
-/// IDE-spawned MCP server or stray python is still running from the venv
-/// (RUST-6Z/70: install failed, restored=false, runtime bricked).
+/// directory (Windows; Unix reaps less, see below): pip cannot overwrite
+/// files a running process holds open, so an upgrade's `--force-reinstall`
+/// and the rollback that retries the same operation both die with
+/// permission errors when an IDE-spawned MCP server or stray python is
+/// still running from the venv (RUST-6Z/70: install failed, restored=false, runtime bricked).
 /// `stop_headroom` doesn't cover these: it only matches the proxy's own
-/// command patterns. Unix replaces in-use files fine, so this is a no-op
-/// there. Identity is verified by the venv path in the command line, never
-/// by port.
+/// command patterns. Identity is verified by the venv path in the command
+/// line, never by port.
+///
+/// Unix: in-use files are no obstacle, but a second writer is. A pip orphaned
+/// by a quit (or crash) mid-install keeps unpacking into the venv that this
+/// mutation, or `recover_from_interrupted_upgrade`'s remove-and-rename, is
+/// about to rewrite, leaving duplicate dist-info or a half-deleted venv. So
+/// there only an orphaned `python3 -m pip` from this venv is reaped (the
+/// orphan rule spares this app's own pip and a live Headroom's). Killing it
+/// mid-install costs nothing: the mutation about to run rewrites the venv
+/// anyway, and an interrupted upgrade's marker makes recovery restore it.
+/// ponytail: SIGTERM is not awaited, so a pip mid-write can land one more
+/// file within milliseconds; poll the pids if that ever shows up.
 pub(crate) fn kill_venv_lock_holders(venv_dir: &std::path::Path) {
     if !cfg!(target_os = "windows") {
+        // `tool_manager`'s `managed_python` on unix.
+        if let Err(err) = kill_processes_by_command_pattern(
+            &venv_dir.join("bin").join("python3"),
+            "-m pip",
+            SweepParents::Orphans {
+                own_children: false,
+            },
+        ) {
+            log::warn!("reaping orphaned pip before venv mutation failed: {err:#}");
+        }
         return;
     }
     // Empty args pattern makes the exe-path clause the only real filter:
@@ -12551,21 +12616,37 @@ mod tests {
             own_children: false,
         };
         // Orphan of a previous instance (reparented to launchd/init).
-        assert!(sweep_should_kill(1, me, held));
-        assert!(sweep_should_kill(1, me, unheld));
-        assert!(sweep_should_kill(0, me, unheld));
+        assert!(sweep_should_kill(1, me, false, held));
+        assert!(sweep_should_kill(1, me, false, unheld));
+        assert!(sweep_should_kill(0, me, false, unheld));
         // Our own untracked child: ours to kill only when we hold the
         // lifecycle lock; otherwise a sibling transition is mid-spawn on it.
-        assert!(sweep_should_kill(me, me, held));
-        assert!(!sweep_should_kill(me, me, unheld));
-        // Another live process's child (a relaunched Headroom instance, or a
-        // shell running the venv by hand): never ours.
-        assert!(!sweep_should_kill(777, me, held));
-        assert!(!sweep_should_kill(777, me, unheld));
+        assert!(sweep_should_kill(me, me, false, held));
+        assert!(!sweep_should_kill(me, me, false, unheld));
+        // A relaunched Headroom instance's child: never ours (RUST-CA/CB).
+        assert!(!sweep_should_kill(777, me, true, held));
+        assert!(!sweep_should_kill(777, me, true, unheld));
+        // Orphan reparented to a live subreaper (Linux `systemd --user`):
+        // still an orphan.
+        assert!(sweep_should_kill(777, me, false, held));
+        assert!(sweep_should_kill(777, me, false, unheld));
         // RUST-HY: the venv-lock sweep's targets are MCP servers a live
         // Claude Code / Codex spawned. Sparing them left pip facing a locked
         // Scripts\headroom.exe, so that sweep ignores the parent.
-        assert!(sweep_should_kill(777, me, SweepParents::Any));
+        assert!(sweep_should_kill(777, me, false, SweepParents::Any));
+
+        use super::comm_is_headroom_desktop as is_headroom;
+        assert!(!is_headroom("systemd\n", "headroom"));
+        assert!(is_headroom("headroom\n", "headroom"));
+        // macOS `ps -o comm=` prints the full executable path.
+        assert!(is_headroom(
+            "/Applications/Headroom.app/Contents/MacOS/headroom-desktop",
+            "headroom-desktop"
+        ));
+        // Parent already gone: an orphan.
+        assert!(!is_headroom("", "headroom"));
+        // Own name unknown: spare every live parent, the old rule.
+        assert!(is_headroom("systemd", ""));
     }
 
     #[test]
@@ -12576,6 +12657,114 @@ mod tests {
             vec![(501, 1), (502, 501), (503, 4242)]
         );
         assert!(super::parse_pid_ppid("").is_empty());
+    }
+
+    /// Writes `<venv>/bin/python3`, a script that records its pid and then
+    /// idles (bounded, so a failing run leaves nothing behind for long), and
+    /// returns its path plus the pid file it writes.
+    #[cfg(unix)]
+    fn fake_venv_python(venv: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = venv.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let python = bin.join("python3");
+        let pid_file = venv.join("pid");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\ni=0\nwhile [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write script");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (python, pid_file)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(pid_file: &std::path::Path) -> u32 {
+        for _ in 0..100 {
+            if let Some(pid) = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("fake python never started");
+    }
+
+    #[cfg(unix)]
+    fn pid_exits_within(pid: u32, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !alive {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Linux orphans reparent to the systemd --user subreaper, not pid 1, so a
+    /// live parent that is not a Headroom desktop must not spare a match: the
+    /// orphan backend then survived every quit and upgrade until reboot.
+    #[cfg(unix)]
+    #[test]
+    fn unix_sweep_reaps_a_match_whose_live_parent_is_not_headroom() {
+        let venv = tempfile::tempdir().expect("tempdir");
+        let (python, pid_file) = fake_venv_python(venv.path());
+        // `sh` stands in for the subreaper: alive, not us, not Headroom. The
+        // script path goes in as $0 so the sh's own argv never matches.
+        let mut parent = std::process::Command::new("/bin/sh")
+            .args(["-c", "\"$0\" -m headroom.proxy.server; true"])
+            .arg(&python)
+            .spawn()
+            .expect("spawn sh");
+        let pid = wait_for_pid_file(&pid_file);
+        super::kill_processes_by_command_pattern(
+            &python,
+            "-m headroom.proxy.server",
+            super::SweepParents::Orphans {
+                own_children: false,
+            },
+        )
+        .expect("sweep");
+        let reaped = pid_exits_within(pid, std::time::Duration::from_secs(5));
+        let _ = parent.kill();
+        let _ = parent.wait();
+        assert!(
+            reaped,
+            "sweep spared pid {pid} under a live non-Headroom parent"
+        );
+    }
+
+    /// A pip orphaned by a quit mid-upgrade keeps writing into the venv that
+    /// recovery is about to restore; on Unix the lock-holder sweep reaps it.
+    #[cfg(unix)]
+    #[test]
+    fn venv_lock_holder_sweep_reaps_an_orphaned_pip_on_unix() {
+        let venv = tempfile::tempdir().expect("tempdir");
+        let (python, pid_file) = fake_venv_python(venv.path());
+        // Background it and exit: the fake pip's parent is gone.
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "\"$0\" -m pip install x >/dev/null 2>&1 &"])
+            .arg(&python)
+            .status()
+            .expect("spawn sh");
+        assert!(status.success());
+        let pid = wait_for_pid_file(&pid_file);
+        super::kill_venv_lock_holders(venv.path());
+        assert!(
+            pid_exits_within(pid, std::time::Duration::from_secs(5)),
+            "orphaned pip {pid} survived the venv lock-holder sweep"
+        );
     }
 
     #[test]

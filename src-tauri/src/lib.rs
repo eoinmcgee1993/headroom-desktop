@@ -1437,9 +1437,10 @@ fn detached_script(script: &str) -> String {
 /// the file name never fires and the gate silently blocks every force-kill. Read
 /// the value the kernel will actually report instead. macOS has no `/proc`, but
 /// its `ps -o comm=` prints the full executable path, so the file name matches as
-/// a substring there.
-#[cfg(target_os = "macos")]
-fn relauncher_expect_name() -> String {
+/// a substring there. The unix process sweep (`state::sweep_should_kill`)
+/// uses the same value to tell a Headroom parent from a subreaper.
+#[cfg(unix)]
+pub(crate) fn relauncher_expect_name() -> String {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_to_string("/proc/self/comm")
