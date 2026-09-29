@@ -456,14 +456,14 @@ jobs:
         run: |
           set -euo pipefail
           runs="repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=1"
-          for _ in $(seq 60); do
+          for _ in $(seq 180); do
             read -r status conclusion url < <(gh api "$runs" --jq '.workflow_runs[0] | "\(.status) \(.conclusion) \(.html_url)"') || true
             if [ "$status" = completed ]; then
               [ "$conclusion" = success ] && exit 0
               echo "::error::Test finished $conclusion for $GITHUB_SHA: $url. Fix it (or re-run it), then re-run this job."
               exit 1
             fi
-            sleep 30
+            sleep 10
           done
           echo "::error::no finished Test run for $GITHUB_SHA after 30 minutes (last status: $status)"
           exit 1
@@ -552,11 +552,12 @@ jobs:
 
           # Bundles first, latest.json last, so the endpoint never names an
           # asset that has not finished uploading.
-          shopt -s nullglob
+          # One call so gh uploads them concurrently.
+          bundles=()
           for asset in "$workdir"/*; do
-            [[ "$(basename "$asset")" == "latest.json" ]] && continue
-            gh release upload staging-rolling "$asset" --clobber --repo "$GITHUB_REPOSITORY"
+            [[ "$(basename "$asset")" == "latest.json" ]] || bundles+=("$asset")
           done
+          gh release upload staging-rolling "${bundles[@]}" --clobber --repo "$GITHUB_REPOSITORY"
           gh release upload staging-rolling "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
 
           # Prune assets left over from previous rc versions.
