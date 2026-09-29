@@ -200,4 +200,38 @@ describe("UpstreamPanel", () => {
     });
     expect(await screen.findByText(/restarted on Anthropic/)).toBeInTheDocument();
   });
+
+  /// Audit #72: the stored token belongs to the provider it was entered for,
+  /// and the backend no longer carries it to another one -- so the field must
+  /// ask for a new token instead of claiming one is stored.
+  it("asks for a new token after switching provider", async () => {
+    respond(configured);
+    const user = userEvent.setup();
+    render(<UpstreamPanel />);
+
+    await screen.findByRole("button", { name: "Remove stored token" });
+    await user.selectOptions(screen.getByLabelText("Provider"), "kimi");
+
+    expect(screen.getByLabelText("Provider auth token")).toHaveAttribute(
+      "placeholder",
+      "Paste the provider token"
+    );
+    expect(screen.queryByRole("button", { name: "Remove stored token" })).not.toBeInTheDocument();
+  });
+
+  /// Audit #108: a save while the user paused Headroom no longer restarts it,
+  /// so the panel must not say it did.
+  it("saves without claiming a restart while paused", async () => {
+    respond(off, configured);
+    const user = userEvent.setup();
+    render(<UpstreamPanel paused />);
+
+    await screen.findByLabelText("Provider");
+    await user.selectOptions(screen.getByLabelText("Provider"), "glm");
+    await user.type(screen.getByLabelText("Provider auth token"), "secret-token");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByText(/when you resume/)).toBeInTheDocument();
+    expect(screen.queryByText(/restarted/)).not.toBeInTheDocument();
+  });
 });

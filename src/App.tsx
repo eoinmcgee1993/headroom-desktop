@@ -8314,7 +8314,9 @@ export default function App() {
               <details className="advanced-section">
                 <summary>Advanced</summary>
                 <div className="advanced-section__body">
-                  <UpstreamPanel />
+                  <UpstreamPanel
+                    paused={Boolean(runtimeStatus?.paused && !runtimeStatus.autoPaused)}
+                  />
                   {/* The statusline is not installed on Windows (untested there). */}
                   {!navigator.userAgent.includes("Windows") && <ClaudeStatuslinePanel />}
                 </div>

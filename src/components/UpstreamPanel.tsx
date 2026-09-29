@@ -11,14 +11,16 @@ const CUSTOM = "custom";
 /// that Headroom should route to. Picking one writes its URL, model slots and
 /// context window, so the user only supplies a token; picking Anthropic clears
 /// all of it. Saving restarts the proxy -- the upstream is read at boot, so a
-/// running proxy keeps serving the previous one.
-export function UpstreamPanel() {
+/// running proxy keeps serving the previous one -- unless the user paused
+/// Headroom, in which case Resume picks it up.
+export function UpstreamPanel({ paused = false }: { paused?: boolean }) {
   const [providers, setProviders] = useState<ProviderPresetView[]>([]);
   const [provider, setProvider] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
   const [contextWindow, setContextWindow] = useState("");
   const [hasToken, setHasToken] = useState(false);
+  const [savedBaseUrl, setSavedBaseUrl] = useState("");
   // Empty means "leave the stored token alone", which is why the field starts
   // blank even when one is set. Only a touched field is ever sent.
   const [token, setToken] = useState("");
@@ -36,6 +38,7 @@ export function UpstreamPanel() {
     setModel(next.model);
     setContextWindow(next.contextWindow);
     setHasToken(next.hasToken);
+    setSavedBaseUrl(next.baseUrl);
     setToken("");
     setTokenTouched(false);
   }, []);
@@ -69,6 +72,11 @@ export function UpstreamPanel() {
   );
   // Custom without a URL is not a provider, same as picking Anthropic.
   const configured = preset !== undefined || (provider === CUSTOM && baseUrl.trim() !== "");
+  // The backend only re-applies a stored token to the endpoint it was entered
+  // for (same normalisation: trimmed, no trailing slash), so after a switch
+  // the field has to ask for one.
+  const endpoint = preset ? preset.baseUrl : baseUrl.trim().replace(/\/+$/, "");
+  const tokenStored = hasToken && endpoint === savedBaseUrl;
 
   const save = useCallback(async () => {
     setBusy(true);
@@ -89,16 +97,18 @@ export function UpstreamPanel() {
       });
       apply(saved);
       setNotice(
-        saved.mode === "off"
-          ? "Provider removed. Headroom restarted on Anthropic."
-          : "Saved. Headroom restarted on this provider.",
+        paused
+          ? "Saved. Takes effect when you resume Headroom."
+          : saved.mode === "off"
+            ? "Provider removed. Headroom restarted on Anthropic."
+            : "Saved. Headroom restarted on this provider.",
       );
     } catch (err) {
       setError(String(err));
     } finally {
       setBusy(false);
     }
-  }, [apply, baseUrl, configured, contextWindow, model, preset, token, tokenTouched]);
+  }, [apply, baseUrl, configured, contextWindow, model, paused, preset, token, tokenTouched]);
 
   return (
     <article className="soft-card panel-card">
@@ -204,7 +214,7 @@ export function UpstreamPanel() {
                     setToken(event.target.value);
                     setTokenTouched(true);
                   }}
-                  placeholder={hasToken ? "Stored. Type to replace" : "Paste the provider token"}
+                  placeholder={tokenStored ? "Stored. Type to replace" : "Paste the provider token"}
                   spellCheck={false}
                   type="password"
                   value={token}
@@ -226,9 +236,15 @@ export function UpstreamPanel() {
               onClick={() => void save()}
               type="button"
             >
-              {busy ? "Restarting Headroom…" : "Save and restart"}
+              {busy
+                ? paused
+                  ? "Saving…"
+                  : "Restarting Headroom…"
+                : paused
+                  ? "Save"
+                  : "Save and restart"}
             </button>
-            {hasToken && configured ? (
+            {tokenStored && configured ? (
               <button
                 className="addon-card__link"
                 disabled={busy}

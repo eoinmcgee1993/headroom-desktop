@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::models::{
     ClientConnectorStatus, ClientHealth, ClientSetupResult, ClientSetupVerification, ClientStatus,
 };
+use crate::state::{UpstreamOverride, UpstreamOverrideMode};
 use crate::storage::{app_data_dir, config_file};
 
 // Raw proxy base — use provider-specific constants below when configuring client endpoints.
@@ -3718,10 +3719,15 @@ fn ensure_claude_settings_hook(
 /// whatever the client sent rather than injecting credentials of its own, so
 /// there is no path that puts this token on the wire from the desktop.
 ///
-/// `None` removes the key -- used when the override is cleared, so a stale
-/// provider token cannot outlive the endpoint it belonged to.
-pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
-    set_or_clear_claude_settings_env("ANTHROPIC_AUTH_TOKEN", token)?;
+/// `None` takes Headroom's own token (`ours`) back out -- used when the
+/// override is cleared, so a stale provider token cannot outlive the endpoint
+/// it belonged to.
+pub fn apply_upstream_auth_token(
+    token: Option<&str>,
+    ours: Option<&str>,
+    replaced: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    set_or_clear_claude_settings_env(AUTH_TOKEN_ENV, token, ours, replaced)?;
     // settings.json now holds a provider credential, and Claude Code creates it
     // 0644 inside a home that other local accounts can traverse (macOS homes
     // are 0750 group staff, and every user is in staff). Only the owner, who
@@ -3743,17 +3749,33 @@ pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Set one `env` key in the client's settings, or remove it when the value is
-/// absent or empty. Removal goes through `remove_claude_settings_env`, so a key
-/// the user has since changed by hand is left alone rather than deleted.
-fn set_or_clear_claude_settings_env(env_key: &str, value: Option<&str>) -> Result<()> {
-    match value {
-        Some(value) if !value.is_empty() => {
+const AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
+
+/// Set one `env` key in the client's settings, or, when the value is absent or
+/// empty, take out `ours`: the value Headroom itself wrote there last save. A
+/// key Headroom never wrote, or one the user has since changed by hand, is left
+/// alone. A set records in `replaced` the user's own value it overwrote (first
+/// take only), so turning the provider off can put it back.
+fn set_or_clear_claude_settings_env(
+    env_key: &str,
+    value: Option<&str>,
+    ours: Option<&str>,
+    replaced: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let ours = ours.filter(|ours| !ours.is_empty());
+    match value.filter(|value| !value.is_empty()) {
+        Some(value) => {
+            let current = read_claude_settings_env(env_key)?;
             configure_claude_settings_env(env_key, value)?;
+            if let Some(current) =
+                current.filter(|current| !current.is_empty() && Some(current.as_str()) != ours)
+            {
+                replaced.entry(env_key.to_string()).or_insert(current);
+            }
             Ok(())
         }
-        _ => match read_claude_settings_env(env_key)? {
-            Some(current) => remove_claude_settings_env(env_key, &current, None),
+        None => match ours {
+            Some(ours) => remove_claude_settings_env(env_key, ours, None),
             None => Ok(()),
         },
     }
@@ -3853,22 +3875,147 @@ pub struct ProviderClientEnv<'a> {
 
 /// Write the rest of the client config a configured provider needs, or clear
 /// all of it with `None` -- a stale model id must not outlive the endpoint that
-/// served it, same rule as the token.
-pub fn apply_upstream_provider_env(env: Option<ProviderClientEnv<'_>>) -> Result<()> {
+/// served it, same rule as the token. `previous` is what the last save wrote,
+/// the only values a clear takes back out.
+pub fn apply_upstream_provider_env(
+    env: Option<ProviderClientEnv<'_>>,
+    previous: Option<ProviderClientEnv<'_>>,
+    replaced: &mut BTreeMap<String, String>,
+) -> Result<()> {
     for (env_key, value) in PROVIDER_CLIENT_ENV {
-        set_or_clear_claude_settings_env(env_key, env.is_some().then_some(*value))?;
+        set_or_clear_claude_settings_env(
+            env_key,
+            env.is_some().then_some(*value),
+            previous.is_some().then_some(*value),
+            replaced,
+        )?;
     }
     for env_key in PROVIDER_MODEL_SLOT_ENV {
-        set_or_clear_claude_settings_env(env_key, env.as_ref().map(|env| env.model))?;
+        set_or_clear_claude_settings_env(
+            env_key,
+            env.as_ref().map(|env| env.model),
+            previous.as_ref().map(|env| env.model),
+            replaced,
+        )?;
     }
     set_or_clear_claude_settings_env(
         PROVIDER_SMALL_MODEL_SLOT_ENV,
         env.as_ref().map(|env| env.small_model),
+        previous.as_ref().map(|env| env.small_model),
+        replaced,
     )?;
     set_or_clear_claude_settings_env(
         "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
         env.as_ref().map(|env| env.context_window),
+        previous.as_ref().map(|env| env.context_window),
+        replaced,
     )
+}
+
+/// What the last save wrote for the provider beyond the token.
+fn written_provider_env(previous: &UpstreamOverride) -> Option<ProviderClientEnv<'_>> {
+    (previous.mode != UpstreamOverrideMode::Off).then(|| ProviderClientEnv {
+        model: &previous.model,
+        // Saved before `small_model` was kept: re-derive it the way that save
+        // did, the preset's, or the one model a hand-entered endpoint got.
+        small_model: if previous.small_model.is_empty() {
+            provider_preset(&previous.provider)
+                .map_or(previous.model.as_str(), |preset| preset.small_model)
+        } else {
+            &previous.small_model
+        },
+        context_window: &previous.context_window,
+    })
+}
+
+/// Write a saved provider into the client config and the keychain.
+///
+/// `previous` is the last save: what Headroom wrote then is the only thing a
+/// clear may take back out, so a key the user set themselves (a cc-switch
+/// token, their own model pins, the privacy flag) is never deleted. `next`
+/// arrives resolved and leaves with `has_token` and `replaced_env` set.
+/// `token`: `None` keeps the stored one, `Some("")` clears it.
+pub fn apply_upstream_client_config(
+    previous: &UpstreamOverride,
+    next: &mut UpstreamOverride,
+    token: Option<&str>,
+) -> Result<(), String> {
+    // Checked before the keychain or settings.json is touched: a rejected
+    // field must not leave a provider token live in the client config.
+    if !next.context_window.chars().all(|c| c.is_ascii_digit()) {
+        return Err("The context window must be a whole number of tokens.".into());
+    }
+    let configured = next.mode != UpstreamOverrideMode::Off;
+    let stored = crate::upstream_override::read_token();
+    let token = match token {
+        _ if !configured => Some(""),
+        // Untouched: re-apply the stored one, because cc-switch or a hand edit
+        // may have overwritten the copy in the client's settings -- but only on
+        // the endpoint it was entered for. Another provider must never be sent
+        // this one's credential.
+        None if next.base_url == previous.base_url => stored.as_deref(),
+        None => Some(""),
+        Some(token) => Some(token),
+    };
+    if let Some(token) = token {
+        if token.is_empty() {
+            crate::upstream_override::delete_token()?;
+        } else if stored.as_deref() != Some(token) {
+            crate::upstream_override::write_token(token)?;
+        }
+        // A keychain that will not read back (locked, or an ACL from another
+        // app signature) cannot say which token Headroom wrote, so the one in
+        // the client config is taken to be it rather than stranded there.
+        let ours = match &stored {
+            Some(stored) => Some(stored.clone()),
+            None if previous.has_token => {
+                read_claude_settings_env(AUTH_TOKEN_ENV).map_err(|err| err.to_string())?
+            }
+            None => None,
+        };
+        let mut replaced = BTreeMap::new();
+        apply_upstream_auth_token(Some(token), ours.as_deref(), &mut replaced)
+            .map_err(|err| err.to_string())?;
+        // The user's own token is a credential: it waits in the keychain, not
+        // in launch-profile.json with the rest.
+        if let Some(original) = replaced.remove(AUTH_TOKEN_ENV) {
+            if crate::upstream_override::read_replaced_token().is_none() {
+                crate::upstream_override::write_replaced_token(&original)?;
+            }
+        }
+    }
+    next.has_token = token.is_some_and(|token| !token.is_empty());
+
+    let mut replaced = previous.replaced_env.clone();
+    apply_upstream_provider_env(
+        configured.then_some(ProviderClientEnv {
+            model: &next.model,
+            small_model: &next.small_model,
+            context_window: &next.context_window,
+        }),
+        written_provider_env(previous),
+        &mut replaced,
+    )
+    .map_err(|err| err.to_string())?;
+    if !configured {
+        // Back on Anthropic: put back what the user had before the provider,
+        // unless they have set that key again since.
+        let replaced_token = crate::upstream_override::read_replaced_token();
+        replaced.extend(
+            replaced_token
+                .clone()
+                .map(|token| (AUTH_TOKEN_ENV.to_string(), token)),
+        );
+        for (env_key, original) in std::mem::take(&mut replaced) {
+            configure_claude_settings_env_if_absent(&env_key, &original)
+                .map_err(|err| err.to_string())?;
+        }
+        if replaced_token.is_some() {
+            crate::upstream_override::delete_replaced_token()?;
+        }
+    }
+    next.replaced_env = replaced;
+    Ok(())
 }
 
 /// Current value of one `env` key in `~/.claude/settings.json`, if any.
@@ -9837,7 +9984,8 @@ mod tests {
         std::fs::write(&path, "{}").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        super::apply_upstream_auth_token(Some("sk-provider")).expect("apply");
+        super::apply_upstream_auth_token(Some("sk-provider"), None, &mut BTreeMap::new())
+            .expect("apply");
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("sk-provider"));
@@ -9845,7 +9993,8 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         // A later rewrite (clearing it) must not widen it again.
-        super::apply_upstream_auth_token(None).expect("clear");
+        super::apply_upstream_auth_token(None, Some("sk-provider"), &mut BTreeMap::new())
+            .expect("clear");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
@@ -17463,12 +17612,13 @@ sys.exit(3)
         fs::write(&settings, r#"{"env": {"USER_KEY": "keep me"}}"#).unwrap();
 
         let glm = super::provider_preset("glm").expect("glm preset exists");
-        super::apply_upstream_provider_env(Some(super::ProviderClientEnv {
+        let glm_env = || super::ProviderClientEnv {
             model: glm.model,
             small_model: glm.small_model,
             context_window: glm.context_window,
-        }))
-        .unwrap();
+        };
+        let mut replaced = BTreeMap::new();
+        super::apply_upstream_provider_env(Some(glm_env()), None, &mut replaced).unwrap();
         let written = read_settings_json(&settings);
         assert_eq!(written["env"]["API_TIMEOUT_MS"].as_str(), Some("3000000"));
         assert_eq!(
@@ -17488,7 +17638,7 @@ sys.exit(3)
             Some(glm.small_model)
         );
 
-        super::apply_upstream_provider_env(None).unwrap();
+        super::apply_upstream_provider_env(None, Some(glm_env()), &mut replaced).unwrap();
         let cleared = read_settings_json(&settings);
         let env = cleared["env"].as_object().expect("env survives");
         for key in super::PROVIDER_MODEL_SLOT_ENV.iter().chain(
@@ -17502,5 +17652,150 @@ sys.exit(3)
             assert!(!env.contains_key(*key), "{key} still set after clearing");
         }
         assert_eq!(env["USER_KEY"].as_str(), Some("keep me"));
+    }
+
+    fn preset_override(id: &str) -> crate::state::UpstreamOverride {
+        let preset = super::provider_preset(id).expect("preset exists");
+        crate::state::UpstreamOverride {
+            mode: crate::state::UpstreamOverrideMode::Override,
+            base_url: preset.base_url.into(),
+            provider: id.into(),
+            model: preset.model.into(),
+            small_model: preset.small_model.into(),
+            context_window: preset.context_window.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Env a cc-switch or gateway user keeps in ~/.claude/settings.json that
+    /// Headroom never wrote.
+    const USER_CLAUDE_ENV: &str = r#"{"env": {
+        "ANTHROPIC_AUTH_TOKEN": "sk-user-gateway",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "API_TIMEOUT_MS": "600000",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "user-bedrock-opus"
+    }}"#;
+
+    fn assert_user_claude_env(settings: &Path) {
+        let env = read_settings_json(settings)["env"].clone();
+        assert_eq!(
+            env["ANTHROPIC_AUTH_TOKEN"].as_str(),
+            Some("sk-user-gateway")
+        );
+        assert_eq!(
+            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"].as_str(),
+            Some("1")
+        );
+        assert_eq!(env["API_TIMEOUT_MS"].as_str(), Some("600000"));
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"].as_str(),
+            Some("user-bedrock-opus")
+        );
+        for key in [
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+        ] {
+            assert!(env.get(key).is_none(), "{key} left behind: {env}");
+        }
+    }
+
+    /// Audit #30: saving the panel as "Anthropic (default)" with no provider
+    /// ever configured deleted the user's own token and env keys, because the
+    /// clear matched whatever value was there.
+    #[test]
+    #[serial_test::serial]
+    fn saving_anthropic_from_off_keeps_the_users_own_claude_env() {
+        let home = TestHome::new();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, USER_CLAUDE_ENV).unwrap();
+
+        let mut next = crate::state::UpstreamOverride::default();
+        super::apply_upstream_client_config(&Default::default(), &mut next, None).unwrap();
+
+        assert_user_claude_env(&settings);
+        assert!(!next.has_token);
+    }
+
+    /// Audit #17: a provider round trip overwrote the user's own values on the
+    /// way in and deleted Headroom's on the way out, so the originals never
+    /// came back.
+    #[test]
+    #[serial_test::serial]
+    fn a_provider_round_trip_puts_the_users_claude_env_back() {
+        let home = TestHome::new();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, USER_CLAUDE_ENV).unwrap();
+
+        let mut glm = preset_override("glm");
+        super::apply_upstream_client_config(&Default::default(), &mut glm, Some("sk-glm")).unwrap();
+        let env = read_settings_json(&settings)["env"].clone();
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"].as_str(), Some("sk-glm"));
+        assert_eq!(env["API_TIMEOUT_MS"].as_str(), Some("3000000"));
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"].as_str(),
+            Some(glm.model.as_str())
+        );
+        // The credential it replaced is not written to launch-profile.json.
+        assert!(!glm.replaced_env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+
+        let mut off = crate::state::UpstreamOverride::default();
+        super::apply_upstream_client_config(&glm, &mut off, None).unwrap();
+
+        assert_user_claude_env(&settings);
+        assert!(off.replaced_env.is_empty());
+        assert_eq!(crate::upstream_override::read_token(), None);
+    }
+
+    /// Audit #31: the token was written before the context window was
+    /// checked, so a rejected save left a provider token live in the client
+    /// config with the upstream still on Anthropic.
+    #[test]
+    #[serial_test::serial]
+    fn a_rejected_context_window_writes_no_token() {
+        let home = TestHome::new();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, "{}").unwrap();
+
+        let mut custom = crate::state::UpstreamOverride {
+            mode: crate::state::UpstreamOverrideMode::Override,
+            base_url: "https://gateway.example.com/anthropic".into(),
+            context_window: "200k".into(),
+            ..Default::default()
+        };
+        let err =
+            super::apply_upstream_client_config(&Default::default(), &mut custom, Some("sk-x"))
+                .unwrap_err();
+
+        assert!(err.contains("context window"), "{err}");
+        assert!(read_settings_json(&settings)["env"]["ANTHROPIC_AUTH_TOKEN"].is_null());
+        assert_eq!(crate::upstream_override::read_token(), None);
+    }
+
+    /// Audit #72: switching provider with the token field untouched re-applied
+    /// the previous provider's key, which then went to the new provider.
+    #[test]
+    #[serial_test::serial]
+    fn an_untouched_token_is_not_carried_to_another_provider() {
+        let home = TestHome::new();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, "{}").unwrap();
+
+        let mut glm = preset_override("glm");
+        super::apply_upstream_client_config(&Default::default(), &mut glm, Some("sk-glm")).unwrap();
+        // Same provider, field untouched: still re-applied.
+        let mut again = preset_override("glm");
+        super::apply_upstream_client_config(&glm, &mut again, None).unwrap();
+        assert!(again.has_token);
+
+        let mut kimi = preset_override("kimi");
+        super::apply_upstream_client_config(&again, &mut kimi, None).unwrap();
+
+        assert!(!kimi.has_token);
+        assert!(read_settings_json(&settings)["env"]["ANTHROPIC_AUTH_TOKEN"].is_null());
+        assert_eq!(crate::upstream_override::read_token(), None);
     }
 }

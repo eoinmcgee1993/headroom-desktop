@@ -5750,36 +5750,6 @@ async fn save_upstream_override(
         }
     };
 
-    let has_token = if mode == UpstreamOverrideMode::Off {
-        upstream_override::delete_token()?;
-        client_adapters::apply_upstream_auth_token(None).map_err(|err| err.to_string())?;
-        false
-    } else {
-        match token.as_deref() {
-            Some("") => {
-                upstream_override::delete_token()?;
-                client_adapters::apply_upstream_auth_token(None).map_err(|err| err.to_string())?;
-                false
-            }
-            Some(value) => {
-                upstream_override::write_token(value)?;
-                client_adapters::apply_upstream_auth_token(Some(value))
-                    .map_err(|err| err.to_string())?;
-                true
-            }
-            // Untouched: re-apply the stored one, because cc-switch or a hand
-            // edit may have overwritten the copy in the client's settings.
-            None => match upstream_override::read_token() {
-                Some(stored) => {
-                    client_adapters::apply_upstream_auth_token(Some(&stored))
-                        .map_err(|err| err.to_string())?;
-                    true
-                }
-                None => false,
-            },
-        }
-    };
-
     // Same rule as base_url and the token: Off keeps nothing, so a stale model
     // id cannot outlive the endpoint that served it.
     let configured = mode != UpstreamOverrideMode::Off;
@@ -5796,46 +5766,50 @@ async fn save_upstream_override(
             // smaller model it serves.
             let model = model.unwrap_or_default().trim().to_string();
             let window = context_window.unwrap_or_default().trim().to_string();
-            if !window.is_empty() && !window.chars().all(|c| c.is_ascii_digit()) {
-                return Err("The context window must be a whole number of tokens.".into());
-            }
             (model.clone(), model, window)
         }
     };
-    client_adapters::apply_upstream_provider_env(configured.then_some(
-        client_adapters::ProviderClientEnv {
-            model: &model,
-            small_model: &small_model,
-            context_window: &context_window,
-        },
-    ))
-    .map_err(|err| err.to_string())?;
 
-    let next = UpstreamOverride {
+    let mut next = UpstreamOverride {
         mode,
         base_url,
-        has_token,
+        has_token: false,
         provider: if configured { provider } else { String::new() },
         model,
+        small_model,
         context_window,
+        replaced_env: Default::default(),
     };
     let state: tauri::State<'_, AppState> = app.state();
+    // Validates the rest before the keychain or settings.json is touched, and
+    // only ever takes back out what Headroom itself wrote there.
+    client_adapters::apply_upstream_client_config(
+        &state.upstream_override(),
+        &mut next,
+        token.as_deref(),
+    )?;
     state.set_upstream_override(next.clone());
 
     // ANTHROPIC_TARGET_API_URL is read at boot, so the running proxy is still
     // pointed at the old upstream until it is replaced. Same hard restart the
     // paused-banner button uses: stop_headroom kills the group so a wedged
     // process cannot survive the change.
-    run_lifecycle_command(app.clone(), |app| {
-        let state: tauri::State<'_, AppState> = app.state();
-        state.stop_headroom();
-        state.set_runtime_auto_paused(false);
-        state.resume_runtime().map_err(|err| err.to_string())
-    })
-    .await?;
-    std::thread::spawn(|| {
-        client_adapters::restore_client_setups();
-    });
+    if !keeps_user_pause(&state) {
+        let resumed = run_lifecycle_command(app.clone(), |app| {
+            let state: tauri::State<'_, AppState> = app.state();
+            state.stop_headroom();
+            state.set_runtime_auto_paused(false);
+            state.resume_runtime().map_err(|err| err.to_string())
+        })
+        .await;
+        // Clients go back through Headroom whatever resume returned: the
+        // intercept forwards direct while the backend is down, and nothing else
+        // would put them back.
+        std::thread::spawn(|| {
+            client_adapters::restore_client_setups();
+        });
+        resumed?;
+    }
     analytics::track_event(
         &app,
         "upstream_override_saved",
@@ -5855,6 +5829,13 @@ async fn save_upstream_override(
         })),
     );
     Ok(next.into())
+}
+
+/// Whether an upstream save must leave the runtime alone: the user paused
+/// Headroom on purpose, and the saved upstream is read at the next boot, which
+/// Resume does. An auto-pause (a crashed proxy) is not the user's and restarts.
+fn keeps_user_pause(state: &AppState) -> bool {
+    state.runtime_is_paused() && !state.runtime_is_auto_paused()
 }
 
 #[tauri::command]
@@ -13477,6 +13458,22 @@ Some unrelated content.
         ] {
             assert_eq!(learn_step_label(line), None, "line leaked: {line:?}");
         }
+    }
+
+    /// Audit #108: saving the provider panel while paused restarted the proxy
+    /// and re-routed every client, silently undoing the user's pause. An
+    /// auto-pause (crashed proxy) still restarts.
+    #[test]
+    fn an_upstream_save_keeps_only_a_user_pause() {
+        let base_dir =
+            std::env::temp_dir().join(format!("headroom-upstream-pause-{}", uuid::Uuid::new_v4()));
+        let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
+        assert!(!super::keeps_user_pause(&state));
+        state.set_runtime_paused(true);
+        assert!(super::keeps_user_pause(&state));
+        state.set_runtime_auto_paused(true);
+        assert!(!super::keeps_user_pause(&state));
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
