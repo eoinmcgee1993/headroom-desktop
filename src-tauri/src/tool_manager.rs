@@ -10059,31 +10059,64 @@ fn pid_is_headroom_desktop_twin(pid: u32) -> bool {
     else {
         return false;
     };
-    // Native on Windows, for the same reasons as `pid_is_headroom_backend`.
-    #[cfg(windows)]
-    let theirs = {
-        let Some(path) = crate::winproc::process_image_path(pid) else {
-            return false;
-        };
-        path
+    same_user_process_command(pid).is_some_and(|theirs| exe_identity_matches(&theirs, &me))
+}
+
+/// Whether `pid` is a Headroom desktop build this same user runs, from ANY
+/// path: the twin above, or a second copy installed elsewhere (a renamed
+/// `Headroom 2.app`, a dev build). It manages this same user's client files,
+/// so the intercept's bind loop leaves the clients wired to it rather than
+/// fight it over them; any other holder of 6767 gets them unwired.
+pub(crate) fn pid_is_same_user_headroom_desktop(pid: u32) -> bool {
+    let Some(name) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name()?.to_str().map(str::to_owned))
+    else {
+        return false;
     };
+    same_user_process_command(pid).is_some_and(|theirs| runs_executable_named(&theirs, &name))
+}
+
+/// `pid`'s executable path (Windows) or argv line (unix `ps -o command=`),
+/// when this same user runs it. Windows is native, for the same reasons as
+/// `pid_is_headroom_backend`, and needs no owner check: OpenProcess is denied
+/// on another user's process (see `ps_row_command_if_owned_by`).
+fn same_user_process_command(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    return crate::winproc::process_image_path(pid);
     #[cfg(not(windows))]
-    let theirs = {
-        let Ok(output) = crate::proc::command("/bin/ps")
+    {
+        let output = crate::proc::command("/bin/ps")
             .args(["-o", "uid=", "-o", "command=", "-p", &pid.to_string()])
             .output()
-        else {
-            return false;
-        };
+            .ok()?;
         // SAFETY: getuid has no preconditions and cannot fail.
         let my_uid = unsafe { libc::getuid() };
         let row = String::from_utf8_lossy(&output.stdout);
-        let Some(command) = ps_row_command_if_owned_by(&row, my_uid) else {
-            return false;
-        };
-        command.to_owned()
-    };
-    exe_identity_matches(&theirs, &me)
+        ps_row_command_if_owned_by(&row, my_uid).map(str::to_owned)
+    }
+}
+
+/// Whether `command` -- a bare exe path or an argv line, as
+/// `same_user_process_command` returns them -- runs an executable named
+/// `exe_name` from any directory. Case-insensitive, and the name must be a
+/// whole path component, so `headroom-desktop-old` and `my-headroom-desktop`
+/// do not pass.
+///
+/// ponytail: matches the name anywhere in argv, so a same-user listener whose
+/// ARGUMENTS end in `/headroom-desktop` passes too (the bind loop then keeps
+/// today's no-unwire behaviour for it). Paths with spaces make argv[0]
+/// ambiguous; read `/proc/<pid>/exe` or `ps -o comm=` per platform if that
+/// ever matters.
+fn runs_executable_named(command: &str, exe_name: &str) -> bool {
+    let command = command.trim().to_lowercase();
+    let name = exe_name.to_lowercase();
+    !name.is_empty()
+        && command.match_indices(&name).any(|(at, _)| {
+            let before = command[..at].chars().next_back();
+            let after = command[at + name.len()..].chars().next();
+            matches!(before, None | Some('/' | '\\')) && matches!(after, None | Some(' '))
+        })
 }
 
 /// The command of a `ps -o uid= -o command=` row, when `uid` owns it.
@@ -17343,6 +17376,37 @@ assert g.done"#,
             None
         );
         assert_eq!(super::ps_row_command_if_owned_by("", 501), None);
+    }
+
+    /// A second copy of Headroom this same user runs from another path (a
+    /// renamed `Headroom 2.app`, a dev build, a .deb launched through PATH)
+    /// is still this user's Headroom, so the 6767 bind loop leaves the clients
+    /// wired to it rather than fight it over the same client files.
+    #[test]
+    fn a_headroom_build_at_any_path_is_named_by_its_executable() {
+        let name = "headroom-desktop";
+        for theirs in [
+            "/Applications/Headroom 2.app/Contents/MacOS/headroom-desktop",
+            "/Users/x/Code/headroom-desktop/src-tauri/target/debug/headroom-desktop --flag\n",
+            "headroom-desktop",
+        ] {
+            assert!(super::runs_executable_named(theirs, name), "{theirs}");
+        }
+        assert!(super::runs_executable_named(
+            r"C:\Users\x\AppData\Local\Headroom Beta\HEADROOM-DESKTOP.EXE",
+            "headroom-desktop.exe"
+        ));
+        for stranger in [
+            "/usr/bin/headroom-desktop-old",
+            "/usr/bin/my-headroom-desktop",
+            "/usr/bin/python3 -m http.server 6767 --directory /x/headroom-desktop/dist",
+            "",
+        ] {
+            assert!(!super::runs_executable_named(stranger, name), "{stranger}");
+        }
+        assert!(!super::runs_executable_named(name, ""));
+        // This test process runs its own executable, as this user.
+        assert!(super::pid_is_same_user_headroom_desktop(std::process::id()));
     }
 
     #[test]

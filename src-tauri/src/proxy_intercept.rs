@@ -727,6 +727,12 @@ pub(crate) enum PortProbe {
 const UNIDENTIFIED_HOLDER: &str =
     "a program Headroom cannot identify, such as another signed-in user's Headroom";
 
+/// The `bind_error` holder for a `HeldPortVerdict::Foreign` that is another
+/// copy of Headroom this same user runs (see
+/// `tool_manager::pid_is_same_user_headroom_desktop`), the one holder the bind
+/// loop leaves the clients wired to. `state::intercept_bind_hint` keys on it.
+pub(crate) const OTHER_HEADROOM_COPY: &str = "another copy of Headroom";
+
 /// Whether the port's holder is another window of this same Headroom, run by
 /// this same user: the one holder a second window may stand beside as a
 /// spectator, because clients reaching it are still optimized for this user.
@@ -752,6 +758,25 @@ fn held_by_our_other_window(probe: PortProbe, is_twin: impl FnOnce() -> bool) ->
 /// nothing is listening.
 pub(crate) fn verdict_permits_reuse(verdict: &HeldPortVerdict) -> bool {
     matches!(verdict, HeldPortVerdict::Draining)
+}
+
+/// Whether a verdict unwires every client until the port is ours again.
+///
+/// Any live holder that is not this user's Headroom does: every wired client's
+/// requests fail there, and its bearer and prompts go to that program. The
+/// exception is another copy of Headroom this same user runs (`is_own_copy`,
+/// which shells out, so it only runs for a named holder): it manages the same
+/// client files, and unwiring them would fight it. `Draining` and `Stuck` have
+/// nothing listening, and a draining update relaunch must never unwire.
+pub(crate) fn verdict_unwires_clients(
+    verdict: &HeldPortVerdict,
+    is_own_copy: impl FnOnce(u32) -> bool,
+) -> bool {
+    match verdict {
+        HeldPortVerdict::Unidentified => true,
+        HeldPortVerdict::Foreign { pid, .. } => !is_own_copy(*pid),
+        HeldPortVerdict::Draining | HeldPortVerdict::Stuck => false,
+    }
 }
 
 pub(crate) fn classify_held_port(
@@ -1076,6 +1101,20 @@ pub fn spawn(
                                 if verdict_permits_reuse(&verdict) {
                                     reuse_addr = true;
                                 }
+                                let unwire = verdict_unwires_clients(
+                                    &verdict,
+                                    crate::tool_manager::pid_is_same_user_headroom_desktop,
+                                );
+                                // Every wired client still sends this user's
+                                // bearer and prompts to that listener. Unwire
+                                // them; `run` wires them back once the port
+                                // is ours.
+                                if unwire && crate::client_adapters::unwire_clients_for_port_holder()
+                                {
+                                    log::warn!(
+                                        "[proxy_intercept] unwired clients from the holder of port {INTERCEPT_PORT}"
+                                    );
+                                }
                                 match verdict {
                                     HeldPortVerdict::Draining => {
                                         // Still a real outage from the user's
@@ -1151,12 +1190,20 @@ pub fn spawn(
                                     HeldPortVerdict::Foreign { name, pid } => {
                                         // Actionable: the user can quit this.
                                         // Reclaim already declined it, so it
-                                        // is not one of ours.
+                                        // is not this install. Not unwiring
+                                        // means it is another copy of this
+                                        // user's Headroom, and the hint must
+                                        // not say the tools connect directly.
                                         log::warn!(
                                             "[proxy_intercept] port {INTERCEPT_PORT} is held by {name} (pid {pid}); retrying in 15s ({e})"
                                         );
+                                        let holder = if unwire {
+                                            name.as_str()
+                                        } else {
+                                            OTHER_HEADROOM_COPY
+                                        };
                                         *bind_error.lock() = Some(format!(
-                                            "port {INTERCEPT_PORT} is held by {name} (pid {pid})"
+                                            "port {INTERCEPT_PORT} is held by {holder} (pid {pid})"
                                         ));
                                         if reported_errors.insert(format!("foreign:{key}:{name}")) {
                                             sentry::with_scope(
@@ -1200,16 +1247,6 @@ pub fn spawn(
                                         *bind_error.lock() = Some(format!(
                                             "port {INTERCEPT_PORT} is held by {UNIDENTIFIED_HOLDER}"
                                         ));
-                                        // Every wired client still sends this
-                                        // user's bearer and prompts to that
-                                        // listener. Unwire them; `run` wires
-                                        // them back once the port is ours.
-                                        if crate::client_adapters::unwire_clients_for_port_holder()
-                                        {
-                                            log::warn!(
-                                                "[proxy_intercept] unwired clients from the unidentified holder of port {INTERCEPT_PORT}"
-                                            );
-                                        }
                                         if reported_errors.insert(format!("unidentified:{key}")) {
                                             sentry::with_scope(
                                                 |scope| {
@@ -1384,9 +1421,9 @@ async fn run(
     // Serving again: clear whatever the previous attempt recorded so a
     // recovered port stops showing a stale cause in the UI.
     *bind_error.lock() = None;
-    // And wire back any clients the bind loop unwired from an unidentified
-    // holder of this port. Off this single-threaded runtime, which must
-    // accept; tests bind other ports and never reach it.
+    // And wire back any clients the bind loop unwired from another holder of
+    // this port. Off this single-threaded runtime, which must accept; tests
+    // bind other ports and never reach it.
     if bind_addr.port() == INTERCEPT_PORT {
         std::thread::spawn(crate::client_adapters::rewire_clients_after_port_reclaimed);
     }
@@ -3858,8 +3895,9 @@ mod tests {
         sanitize_stale_tool_references, should_report_throttled, should_report_upstream_error,
         stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
         stamp_request_header, strip_request_header, take_plugin_route, verdict_permits_reuse,
-        BypassFlag, CodexTerminalReader, HeldPortVerdict, ParsedRequestHead, PortProbe,
-        ResponseSniffer, SharedToken, FIRST_OPTIMIZED_REQUEST_REPORTED,
+        verdict_unwires_clients, BypassFlag, CodexTerminalReader, HeldPortVerdict,
+        ParsedRequestHead, PortProbe, ResponseSniffer, SharedToken,
+        FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -3943,6 +3981,30 @@ mod tests {
             name: "Affinity".into(),
             pid: 54915
         }));
+    }
+
+    /// A foreign 6767 holder gets every wired client's bearer and prompts, so
+    /// it unwires them the way an unidentified one does; another copy of this
+    /// user's Headroom manages the same client files, so it is spared, and a
+    /// port with nothing listening (a draining relaunch) never unwires.
+    #[test]
+    fn a_foreign_holder_unwires_the_clients_unless_it_is_this_users_headroom() {
+        let squatter = HeldPortVerdict::Foreign {
+            name: "Affinity".into(),
+            pid: 54915,
+        };
+        let stranger = |_: u32| false;
+        assert!(verdict_unwires_clients(&squatter, stranger));
+        assert!(!verdict_unwires_clients(&squatter, |pid| pid == 54915));
+        assert!(verdict_unwires_clients(
+            &HeldPortVerdict::Unidentified,
+            stranger
+        ));
+        assert!(!verdict_unwires_clients(
+            &HeldPortVerdict::Draining,
+            stranger
+        ));
+        assert!(!verdict_unwires_clients(&HeldPortVerdict::Stuck, stranger));
     }
 
     /// Off Windows the flag is inert (Unix already sets SO_REUSEADDR), so both

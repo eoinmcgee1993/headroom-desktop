@@ -9071,8 +9071,15 @@ pub(crate) fn intercept_bind_hint(raw: &str) -> String {
     let port = crate::proxy_intercept::INTERCEPT_PORT;
     if let Some((_, holder)) = raw.split_once(" is held by ") {
         let holder = holder.trim_end_matches('.').replace("(pid ", "(PID ");
+        // The bind loop unwires every client from any holder but another copy
+        // of this user's Headroom (`proxy_intercept::verdict_unwires_clients`).
+        let direct = if holder.starts_with(crate::proxy_intercept::OTHER_HEADROOM_COPY) {
+            ""
+        } else {
+            "Your coding tools connect directly until the port is free. "
+        };
         return format!(
-            "Port {port} is in use by {holder}. \
+            "Port {port} is in use by {holder}. {direct}\
              Quit that program, or end it in Task Manager, and Headroom reconnects on its own."
         );
     }
@@ -11604,6 +11611,28 @@ mod tests {
             assert!(first.starts_with("Port 6767"), "{first}");
             assert!(first.len() < 110, "headline too long: {first}");
         }
+    }
+
+    /// The bind loop unwires every client from a 6767 holder that is not this
+    /// user's Headroom, so the hint says the tools connect directly until the
+    /// port is free. Another copy of this user's Headroom keeps them wired, so
+    /// its hint must not claim that.
+    #[test]
+    fn intercept_bind_hint_says_the_tools_connect_directly_while_a_stranger_holds_the_port() {
+        for raw in [
+            "port 6767 is held by Affinity (pid 54915)",
+            "port 6767 is held by a program Headroom cannot identify, such as another signed-in user's Headroom",
+        ] {
+            let hint = intercept_bind_hint(raw);
+            assert!(hint.contains("connect directly until the port is free"), "{hint}");
+            assert!(hint.contains("Task Manager"), "{hint}");
+        }
+        let own = intercept_bind_hint(&format!(
+            "port 6767 is held by {} (pid 7)",
+            crate::proxy_intercept::OTHER_HEADROOM_COPY
+        ));
+        assert!(own.contains("another copy of Headroom (PID 7)"), "{own}");
+        assert!(!own.contains("directly"), "{own}");
     }
 
     /// RUST-DR: a Windows 11 host whose 6767 bind returns WSAEACCES on every

@@ -1571,8 +1571,8 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Set while the clients are unwired because 6767 is held by a listener
-/// Headroom cannot identify (see `unwire_clients_for_port_holder`).
+/// Set while the clients are unwired because 6767 is held by a listener that
+/// is not this user's Headroom (see `unwire_clients_for_port_holder`).
 static CLIENTS_UNWIRED_FOR_PORT_HOLDER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1596,10 +1596,11 @@ pub fn clear_client_setups() -> Result<()> {
     clear_and_remember_client_setups()
 }
 
-/// The intercept's bind loop found 6767 held by a live listener it cannot
-/// name, which is what another signed-in user's Headroom looks like. Every
-/// wired client would keep sending this user's bearer and prompts to it, so
-/// unwire them the way a pause does, remembered for
+/// The intercept's bind loop found 6767 held by a live listener that is not
+/// this user's Headroom (`proxy_intercept::verdict_unwires_clients`): one it
+/// cannot name, which is what another signed-in user's Headroom looks like, or
+/// another program. Every wired client would keep sending this user's bearer
+/// and prompts to it, so unwire them the way a pause does, remembered for
 /// `rewire_clients_after_port_reclaimed`. Returns whether anything was wired;
 /// with nothing wired (already paused, say) this claims nothing.
 pub fn unwire_clients_for_port_holder() -> bool {
@@ -1608,7 +1609,7 @@ pub fn unwire_clients_for_port_holder() -> bool {
     }
     CLIENTS_UNWIRED_FOR_PORT_HOLDER.store(true, std::sync::atomic::Ordering::Release);
     if let Err(err) = clear_and_remember_client_setups() {
-        log::warn!("unwiring clients from an unidentified port holder: {err:#}");
+        log::warn!("unwiring clients from a port holder: {err:#}");
     }
     true
 }
