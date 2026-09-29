@@ -1032,8 +1032,11 @@ impl AppState {
                 Some(plan) => plan,
                 None => {
                     // App version changed but no runtime maintenance is actually
-                    // needed — just stamp the version.
-                    self.stamp_app_version(&current_app_version);
+                    // needed: stamp the version, under the launch path's guard
+                    // (a Retry after a failed rollback lands here too).
+                    if self.can_stamp_no_maintenance(&current_app_version) {
+                        self.stamp_app_version(&current_app_version);
+                    }
                     return;
                 }
             };
@@ -1174,6 +1177,7 @@ impl AppState {
                     "run_upgrade_with_ui: install failed after {duration_ms}ms (restored={restored}): {error:#}"
                 );
                 let restarted = self.ensure_headroom_running().is_ok();
+                self.stop_python_if_any_gate();
                 let hint = crate::classify_upgrade_error(&error);
                 let fallback_hint = match maintenance_kind {
                     RuntimeMaintenanceKind::Upgrade if restored && restarted => {
@@ -1375,29 +1379,7 @@ impl AppState {
                 })),
             );
             analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
-            // ensure_headroom_running's gate guards were suppressed during
-            // validation so a gated user's brand-new venv could actually be
-            // validated (otherwise we'd commit untested or roll back a
-            // perfectly good install). Now that the upgrade has committed,
-            // restore the gate state by stopping the validation Python if any
-            // gate is asserting Python should be down. Client-side routing is
-            // already pointed direct-to-Anthropic by whoever asserted the
-            // gate, so the validation Python wasn't receiving traffic anyway.
-            // Claude-only gate (Codex enabled) keeps Python up for Codex —
-            // same carve-out as stop_python_if_gated / ensure_headroom_running
-            // (RUST-53); without it every upgrade bounces the backend for
-            // gated Codex users (stop here, watchdog respawn ~5-10s later).
-            let gate_wants_python_down =
-                self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
-                    || (!self.pricing_allows_optimization()
-                        && !crate::client_adapters::any_gate_exempt_client_enabled())
-                    || self.runtime_is_paused();
-            if gate_wants_python_down {
-                log::info!(
-                    "run_upgrade_with_ui: validation succeeded; stopping validation Python because a gate is active"
-                );
-                self.stop_headroom();
-            }
+            self.stop_python_if_any_gate();
             return;
         }
 
@@ -1464,6 +1446,7 @@ impl AppState {
         }
         analytics::set_headroom_ai_version(app, self.tool_manager.installed_headroom_version());
         let restarted = self.ensure_headroom_running().is_ok();
+        self.stop_python_if_any_gate();
 
         let err_msg = match log_tail.as_deref() {
             Some(tail) => format!(
@@ -1895,8 +1878,14 @@ impl AppState {
     /// Refuses to stamp when:
     /// - the stamp already matches (no work; avoids a redundant disk write), or
     /// - there's an unresolved upgrade failure for this exact app version
-    ///   (stamping would mask the failure record the retry banner relies on).
+    ///   (stamping would mask the failure record the retry banner relies on), or
+    /// - an upgrade marker is still on disk: the receipt may read the pin only
+    ///   because rollback failed, and the next recovery restores the old one,
+    ///   which a stamped version would then never upgrade again.
     fn can_stamp_no_maintenance(&self, current_app_version: &str) -> bool {
+        if self.tool_manager.upgrade_interrupted() {
+            return false;
+        }
         let profile = self.launch_profile.lock();
         if profile.last_launched_app_version.as_deref() == Some(current_app_version) {
             return false;
@@ -3320,9 +3309,10 @@ impl AppState {
         // configuration (`disable_client_setup`/`clear_client_setups`) is
         // mutated by whoever asserted the gate, so Claude Code is already
         // pointed direct-to-Anthropic regardless of whether Python is
-        // bound on :6768. After validation, `run_upgrade_with_ui` calls
-        // `stop_headroom()` if a gate is still active so we don't leave
-        // the validation Python running where the user expected it down.
+        // bound on :6768. Every exit of `run_upgrade_with_ui` that started
+        // Python (validation success, install failure, rollback) calls
+        // `stop_python_if_any_gate` so we don't leave that Python running
+        // where the user expected it down.
         let in_upgrade_validation = *self.runtime_upgrade_in_progress.lock();
 
         if !in_upgrade_validation {
@@ -4087,6 +4077,32 @@ impl AppState {
             Err(err) => {
                 log::warn!("enforce_pricing_gate: pricing status unavailable, leaving gate flags unchanged: {err}");
             }
+        }
+    }
+
+    /// Every exit of `run_upgrade_with_ui` that (re)started Python ends here.
+    /// ensure_headroom_running's gate guards are suppressed while the upgrade
+    /// runs so a gated user's new venv can be validated (otherwise we'd commit
+    /// untested or roll back a perfectly good install) and so a failure can
+    /// prove the fallback still boots. Nothing stops that Python later (the
+    /// watchdog skips under bypass, the pricing poll acts only on edges), so
+    /// restore the gate state here. Client-side routing is already pointed
+    /// direct by whoever asserted the gate, so that Python got no traffic.
+    /// Claude-only gate (Codex enabled) keeps Python up for Codex -- same
+    /// carve-out as stop_python_if_gated / ensure_headroom_running (RUST-53);
+    /// without it every upgrade bounces the backend for gated Codex users
+    /// (stop here, watchdog respawn ~5-10s later).
+    /// Acquires `lifecycle_lock`, so callers MUST NOT already hold it.
+    fn stop_python_if_any_gate(&self) {
+        let gate_wants_python_down = self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
+            || (!self.pricing_allows_optimization()
+                && !crate::client_adapters::any_gate_exempt_client_enabled())
+            || self.runtime_is_paused();
+        if gate_wants_python_down {
+            log::info!(
+                "run_upgrade_with_ui: stopping the upgrade's Python because a gate is active"
+            );
+            self.stop_headroom();
         }
     }
 
@@ -13379,6 +13395,25 @@ mod tests {
         // Still allows stamping for an unrelated future version, since the
         // failure record is keyed on the specific version that failed.
         assert!(state.can_stamp_no_maintenance("0.3.13"));
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn can_stamp_no_maintenance_skips_stamp_while_upgrade_marker_is_pending() {
+        // A failed rollback leaves the receipt at the pin and the marker on
+        // disk, so the plan finds no work. Stamping then would make the next
+        // launch's recovery (which restores the OLD receipt) look current.
+        let base_dir = temp_test_dir("can-stamp-with-marker");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        state.stamp_app_version("0.3.6-rc.3");
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&base_dir);
+        fs::create_dir_all(&runtime.runtime_dir).expect("create runtime dir");
+        fs::write(
+            runtime.runtime_dir.join("upgrade.in_progress.json"),
+            r#"{"target_version":"0.39.0"}"#,
+        )
+        .expect("write marker");
+        assert!(!state.can_stamp_no_maintenance("0.3.12-rc.3"));
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }
 

@@ -3707,14 +3707,33 @@ pub(crate) fn endpoint_protection_hint_runtime() -> String {
 
 /// Map common runtime-upgrade failure modes to a short user-facing hint.
 pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
-    let chain_raw = format!("{err:#}");
+    // The chain as `{err:#}` renders it, but a pip failure contributes only
+    // its stderr: stdout is one line per locked package, and `networkx` read
+    // as a network error on every failed dependency pass (disk full, file
+    // lock), telling those users PyPI was unreachable.
+    let chain_raw = err
+        .chain()
+        .map(
+            |cause| match cause.downcast_ref::<tool_manager::CommandFailure>() {
+                Some(failure) => failure.stderr.clone(),
+                None => cause.to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(": ");
     // Endpoint protection check uses the raw chain (the matcher does its own
     // case-folding) so signal patterns like "signal=9" match exactly.
     if is_endpoint_protection_signal(&chain_raw) {
         return Some(endpoint_protection_hint_install());
     }
     let chain = chain_raw.to_ascii_lowercase();
-    if chain.contains("network")
+    // "network" as a word (or `NetworkError`), not as the head of a name:
+    // stderr still names the file pip failed on, often under `networkx/`.
+    let mentions_network = chain.match_indices("network").any(|(at, word)| {
+        let rest = &chain[at + word.len()..];
+        rest.starts_with("error") || !rest.starts_with(|c: char| c.is_ascii_alphanumeric())
+    });
+    if mentions_network
         || chain.contains("timed out")
         || chain.contains("dns")
         || chain.contains("connection refused")
@@ -14351,6 +14370,45 @@ Some unrelated content.
             hint.contains("endpoint protection"),
             "expected EDR hint, got: {hint}"
         );
+    }
+
+    #[test]
+    fn classify_upgrade_error_ignores_the_networkx_package_name() {
+        // pip lists every pin on stdout (networkx among them) and names the
+        // file it failed on in stderr; neither is a network error.
+        let pip_failure = |stderr: &str| {
+            anyhow::Error::new(crate::tool_manager::CommandFailure {
+                program: "python".into(),
+                args: vec!["-m".into(), "pip".into(), "install".into()],
+                stdout: "Requirement already satisfied: networkx==3.6.1 in /v/site-packages\n"
+                    .into(),
+                stderr: stderr.into(),
+                exit_code: Some(1),
+                signal: None,
+            })
+            .context("upgrading Headroom's bundled dependencies in place")
+        };
+        let disk_full = pip_failure(
+            "ERROR: Could not install packages due to an OSError: [Errno 28] \
+             No space left on device: '/v/site-packages/networkx/__init__.py'",
+        );
+        let hint = classify_upgrade_error(&disk_full).expect("must classify");
+        assert!(
+            hint.contains("disk space"),
+            "expected disk hint, got: {hint}"
+        );
+
+        let file_lock = pip_failure(
+            "ERROR: Could not install packages due to an OSError: [WinError 32] \
+             The process cannot access the file because it is being used by another \
+             process: 'C:\\v\\site-packages\\networkx\\__init__.py'",
+        );
+        assert_eq!(classify_upgrade_error(&file_lock), None);
+
+        // A real network failure still gets the PyPI hint.
+        let offline = pip_failure("OSError: [Errno 51] Network is unreachable");
+        let hint = classify_upgrade_error(&offline).expect("must classify");
+        assert!(hint.contains("PyPI"), "expected network hint, got: {hint}");
     }
 
     /// The gate is only as good as the name it matches on, and that name is not
