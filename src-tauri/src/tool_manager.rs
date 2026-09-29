@@ -7213,6 +7213,8 @@ impl ToolManager {
                 "@echo off\r\n\
                  setlocal\r\n\
                  rem Headroom-managed markitdown shim. Runs the real binary, then counts a conversion that succeeded.\r\n\
+                 rem UTF-8 stdout: the locale codepage (cp950, cp1252) garbles or drops non-ASCII document text.\r\n\
+                 set PYTHONUTF8=1\r\n\
                  \"{real}\" %*\r\n\
                  if %errorlevel% neq 0 exit /b %errorlevel%\r\n\
                  if \"%~1\"==\"\" exit /b 0\r\n\

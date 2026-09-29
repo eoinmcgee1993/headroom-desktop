@@ -124,7 +124,9 @@ fn ensure_rtk_integrations_for_targets(
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
 
-    let mut path_updates = ensure_managed_rtk_on_path(managed_rtk_path, shell_targets)?;
+    let mut path_updates =
+        shell_step_best_effort(ensure_managed_rtk_on_path(managed_rtk_path, shell_targets))?
+            .unwrap_or_default();
     let mut hook_updates = ensure_claude_code_rtk_hook(managed_rtk_path, managed_python_path)?;
     changed_files.append(&mut path_updates.0);
     backup_files.append(&mut path_updates.1);
@@ -138,7 +140,7 @@ fn ensure_rtk_integrations_for_targets(
     if is_codex_enabled() {
         let agents = rtk_codex_agents_path();
         let (codex_changed, codex_backup) =
-            upsert_managed_block(&agents, "rtk", &build_rtk_codex_nudge(managed_rtk_path))?;
+            upsert_nudge_block(&agents, "rtk", &build_rtk_codex_nudge(managed_rtk_path))?;
         if codex_changed {
             changed_files.push(agents.display().to_string());
         }
@@ -3069,7 +3071,7 @@ pub fn enable_markitdown_integration(
         backup_files.extend(settings_backups);
 
         let claude_md = markitdown_claude_md_path();
-        let (md_changed, md_backup) = upsert_managed_block(
+        let (md_changed, md_backup) = upsert_nudge_block(
             &claude_md,
             "markitdown_office",
             &build_markitdown_office_nudge(markitdown_shim),
@@ -3089,7 +3091,7 @@ pub fn enable_markitdown_integration(
 
     if is_codex_enabled() {
         let agents = markitdown_codex_agents_path();
-        let (codex_changed, codex_backup) = upsert_managed_block(
+        let (codex_changed, codex_backup) = upsert_nudge_block(
             &agents,
             "markitdown",
             &build_markitdown_codex_nudge(markitdown_shim),
@@ -3153,7 +3155,7 @@ pub fn refresh_markitdown_integration(
     let claude_md = markitdown_claude_md_path();
     if file_has_managed_block(&claude_md, "markitdown_office")? {
         let nudge = build_markitdown_office_nudge(markitdown_shim);
-        upsert_managed_block(&claude_md, "markitdown_office", &nudge)?;
+        upsert_nudge_block(&claude_md, "markitdown_office", &nudge)?;
     }
     // The Bash rule follows the shim it names, in one write, and only while the
     // Claude integration (its hook) is on: a disable that raced this launch
@@ -3169,7 +3171,7 @@ pub fn refresh_markitdown_integration(
     let agents = markitdown_codex_agents_path();
     if file_has_managed_block(&agents, "markitdown")? {
         let nudge = build_markitdown_codex_nudge(markitdown_shim);
-        upsert_managed_block(&agents, "markitdown", &nudge)?;
+        upsert_nudge_block(&agents, "markitdown", &nudge)?;
     }
     Ok(())
 }
@@ -5662,9 +5664,12 @@ def toml_fallback(text):
 
 
 def load_config():
+    # Explicit UTF-8 (TOML's mandated encoding): the default is the locale
+    # codec, and on a CP950 Windows box a non-ASCII config raised
+    # UnicodeDecodeError, which escaped as "hook exited with code 1".
     try:
-        text = CONFIG.read_text()
-    except OSError:
+        text = CONFIG.read_text(encoding="utf-8")
+    except (OSError, ValueError):
         return None
     if tomllib is not None:
         try:
@@ -5695,6 +5700,9 @@ def reachable():
 
 
 def main():
+    # Clients read hook output as UTF-8; the locale codec (cp950 on a Chinese
+    # Windows) mangles non-ASCII and raises on what it cannot encode.
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     issues = []
     config = load_config()
     if config is None:
@@ -6125,7 +6133,7 @@ def reachable():
 def settings_base(path):
     # env.ANTHROPIC_BASE_URL from a Claude settings file, or None if absent/unreadable.
     try:
-        with open(path) as handle:
+        with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
     except Exception:
         return None
@@ -6159,6 +6167,9 @@ def diagnose_route(effective):
 
 
 def main():
+    # Clients read hook output as UTF-8; the locale codec (cp950 on a Chinese
+    # Windows) mangles non-ASCII and raises on what it cannot encode.
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     issues = []
     route_issue = diagnose_route(os.environ.get("ANTHROPIC_BASE_URL"))
     if route_issue:
@@ -7339,6 +7350,24 @@ fn upsert_managed_block(
     Ok((true, backup))
 }
 
+/// `upsert_managed_block` for an instruction nudge (CLAUDE.md, AGENTS.md). A
+/// file a Windows editor saved as ANSI/UTF-16 is skipped, not failed: the
+/// rewrite would mangle the user's bytes, and a missing nudge must not take the
+/// hook and the rest of the integration down with it.
+fn upsert_nudge_block(
+    file_path: &Path,
+    block_id: &str,
+    block_body: &str,
+) -> Result<(bool, Option<PathBuf>)> {
+    match upsert_managed_block(file_path, block_id, block_body) {
+        Err(err) if is_invalid_utf8(&err) => {
+            log::warn!("leaving {} alone: not valid UTF-8", file_path.display());
+            Ok((false, None))
+        }
+        other => other,
+    }
+}
+
 fn write_file_if_changed(
     file_path: &Path,
     content: &str,
@@ -8339,7 +8368,8 @@ if [ -z "$INPUT" ]; then
   exit 0
 fi
 
-"$HEADROOM_PYTHON" -c 'import sys; sys.path[:] = [p for p in sys.path if p] # cwd off sys.path: a project json.py must not run
+# -X utf8: the hook JSON on stdin/stdout is UTF-8, not the Windows locale codepage.
+"$HEADROOM_PYTHON" -X utf8 -c 'import sys; sys.path[:] = [p for p in sys.path if p] # cwd off sys.path: a project json.py must not run
 import json, os, subprocess, hashlib, stat, tempfile, time
 ALLOWED = {{".pdf"}}
 MAX_BYTES = 25 * 1024 * 1024
@@ -8578,7 +8608,7 @@ def settings():
     ask, deny, blocks = [], [], False
     for path in files:
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 perms = json.load(f).get("permissions") or {}
             more_ask, more_deny = perms.get("ask") or [], perms.get("deny") or []
             if not isinstance(more_ask, list) or not isinstance(more_deny, list):
@@ -8643,7 +8673,7 @@ if [ -z "$INPUT" ]; then
   exit 0
 fi
 
-CMD="$("$HEADROOM_PYTHON" -c 'import sys; sys.path[:] = [p for p in sys.path if p]; import json; data = json.load(sys.stdin); cmd = data.get("tool_input", {{}}).get("command", ""); print(cmd if isinstance(cmd, str) else "")' <<<"$INPUT" 2>/dev/null || true)"
+CMD="$("$HEADROOM_PYTHON" -X utf8 -c 'import sys; sys.path[:] = [p for p in sys.path if p]; import json; data = json.load(sys.stdin); cmd = data.get("tool_input", {{}}).get("command", ""); print(cmd if isinstance(cmd, str) else "")' <<<"$INPUT" 2>/dev/null || true)"
 if [ -z "$CMD" ]; then
   exit 0
 fi
@@ -8736,7 +8766,7 @@ fi
 REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\"; $REWRITTEN"
 
 HEADROOM_RTK_RC="$RTK_RC" HEADROOM_RTK_OUT="$RTK_OUT" HEADROOM_RTK_REWRITTEN="$REWRITTEN" \
-  "$HEADROOM_PYTHON" -c '{verdict}' <<<"$INPUT" 2>/dev/null || exit 0
+  "$HEADROOM_PYTHON" -X utf8 -c '{verdict}' <<<"$INPUT" 2>/dev/null || exit 0
 "#,
         verdict = RTK_HOOK_VERDICT_PY
     )
@@ -13266,6 +13296,28 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "codex guard must never block (exit 2)"
         );
         assert!(script.contains("return 0"));
+    }
+
+    #[test]
+    fn guard_scripts_read_config_as_utf8_not_the_locale_codec() {
+        // Regression: on a CP950 Windows box `read_text()` decoded a non-ASCII
+        // config.toml with the locale codec and the Codex guard exited 1.
+        for script in [
+            super::build_codex_guard_script(),
+            super::build_claude_guard_script(),
+        ] {
+            assert!(!script.contains("read_text()"), "{script}");
+            assert!(!script.contains("open(path)"), "{script}");
+        }
+        assert!(super::build_codex_guard_script().contains("read_text(encoding=\"utf-8\")"));
+        // Hook JSON on stdin/stdout must not go through the locale codec either.
+        let (tool, py) = (Path::new("/x/tool"), Path::new("/x/python"));
+        for hook in [
+            super::build_headroom_markitdown_hook(tool, py),
+            super::build_headroom_rtk_hook(tool, py),
+        ] {
+            assert!(!hook.contains("\"$HEADROOM_PYTHON\" -c"), "{hook}");
+        }
     }
 
     #[test]
