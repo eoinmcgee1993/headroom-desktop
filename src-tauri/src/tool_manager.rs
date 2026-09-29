@@ -9350,42 +9350,43 @@ pub(crate) fn listener_process(port: u16) -> Option<(String, u32)> {
 /// Windows since XP and need no elevation for our own processes.
 #[cfg(windows)]
 fn windows_listener(port: u16) -> Option<(String, u32)> {
-    let output = crate::proc::command("netstat")
-        .args(["-ano"])
-        .output()
-        .ok()?;
+    // Bounded, both: this runs ahead of the lifecycle lock (the argv gate)
+    // and inside it (the spawn pre-flight), and tasklist enumerates processes
+    // through the same WMI a wedged host stalls, which is why `kill_pid` and
+    // `ps_command_uncached` are bounded too. A tasklist that timed out keeps
+    // the pid under the placeholder, like one that could not run.
+    let mut netstat = crate::proc::command("netstat");
+    netstat.args(["-ano"]);
+    let output = crate::proc::output_with_timeout(netstat, Duration::from_secs(10)).ok()?;
     if !output.status.success() {
         return None;
     }
     let pid = parse_netstat_listener(&String::from_utf8_lossy(&output.stdout), port)?;
 
-    let listed = crate::proc::command("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-        .ok();
-    let image = occupant_image(
-        listed
-            .as_ref()
-            .map(|out| String::from_utf8_lossy(&out.stdout))
-            .as_deref(),
-    )?;
+    let mut tasklist = crate::proc::command("tasklist");
+    tasklist.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    let listed = crate::proc::output_with_timeout(tasklist, Duration::from_secs(10)).ok();
+    let image = occupant_image(listed.as_ref())?;
     Some((image, pid))
 }
 
-/// The occupant name for `pid`, from `tasklist` stdout (`None` argument when
-/// tasklist itself could not be run).
+/// The occupant name for `pid`, from `tasklist`'s output (`None` argument when
+/// tasklist itself could not be run or timed out).
 ///
 /// A pid we could not name is still worth reporting and gating a kill on, so a
-/// tasklist we could not run keeps the pid under a placeholder. A tasklist that
-/// RAN and matched nothing is the opposite: proof that netstat's row named a
-/// holder which has since exited, so there is no listener to report. That case
-/// used to arrive as `Foreign { name: "unnamed process" }`, which told the user
-/// to end a pid their Task Manager no longer had (RUST-EE, an update relaunch)
-/// and blocked the `SO_REUSEADDR` rebind that clears a draining port.
+/// tasklist we could not run keeps the pid under a placeholder, and so does one
+/// that exited non-zero: a broken WMI fails it fast with no CSV row, and
+/// reading that as "gone" let the intercept `SO_REUSEADDR`-bind over a live
+/// listener. A tasklist that SUCCEEDED and matched nothing is the opposite:
+/// proof that netstat's row named a holder which has since exited, so there is
+/// no listener to report. That case used to arrive as
+/// `Foreign { name: "unnamed process" }`, which told the user to end a pid
+/// their Task Manager no longer had (RUST-EE, an update relaunch) and blocked
+/// the `SO_REUSEADDR` rebind that clears a draining port.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn occupant_image(tasklist_stdout: Option<&str>) -> Option<String> {
-    match tasklist_stdout {
-        Some(text) => parse_tasklist_image(text),
+fn occupant_image(tasklist: Option<&std::process::Output>) -> Option<String> {
+    match tasklist.filter(|out| out.status.success()) {
+        Some(out) => parse_tasklist_image(&String::from_utf8_lossy(&out.stdout)),
         None => Some("unnamed process".to_string()),
     }
 }
@@ -9445,7 +9446,9 @@ fn netstat_rows_on_port(text: &str, port: u16) -> Vec<String> {
 /// `netstat_rows_on_port` for the live machine, as one Sentry-extra string.
 #[cfg(windows)]
 pub(crate) fn port_socket_rows(port: u16) -> String {
-    match crate::proc::command("netstat").args(["-ano"]).output() {
+    let mut netstat = crate::proc::command("netstat");
+    netstat.args(["-ano"]);
+    match crate::proc::output_with_timeout(netstat, Duration::from_secs(10)) {
         Ok(out) => {
             let rows = netstat_rows_on_port(&String::from_utf8_lossy(&out.stdout), port);
             if rows.is_empty() {
@@ -9454,7 +9457,7 @@ pub(crate) fn port_socket_rows(port: u16) -> String {
                 rows.join("\n")
             }
         }
-        Err(e) => format!("netstat failed: {e}"),
+        Err(e) => format!("netstat failed: {e:?}"),
     }
 }
 
@@ -9567,13 +9570,21 @@ pub(crate) fn probe_backend_readyz_ok(port: u16) -> bool {
     )
 }
 
-/// Poll until `port` is bindable or `timeout` elapses. Returns true once the
-/// port is free. A killed listener's socket is released as soon as the owning
+/// Poll until `pid` has let go of `port` or `timeout` elapses. Returns true
+/// once it has. A killed listener's socket is released as soon as the owning
 /// process dies, so this normally returns within a couple of poll intervals.
-fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
+///
+/// A bindable port alone is no proof: on macOS std's SO_REUSEADDR lets the
+/// 127.0.0.1 bind succeed over a WILDCARD listener (see `diagnose_proxy_port`),
+/// so a SIGTERM-deaf HEADROOM_HOST=0.0.0.0 orphan read as gone straight after
+/// the SIGTERM and never got the forced kill. The listener lookup only runs
+/// once the bind succeeds, so it normally costs one lookup per wait.
+fn wait_for_port_free(port: u16, pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && listener_process(port).map(|(_, holder)| holder) != Some(pid)
+        {
             return true;
         }
         if Instant::now() >= deadline {
@@ -9656,9 +9667,16 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     // NOT done for the intercept reclaim, whose target can be a desktop twin
     // that does own a window and needs the clean shutdown to flush state.
     kill_pid(pid, cfg!(windows));
-    if !wait_for_port_free(port, Duration::from_secs(3)) {
-        kill_pid(pid, true);
-        if !wait_for_port_free(port, Duration::from_secs(2)) {
+    if !wait_for_port_free(port, pid, Duration::from_secs(3)) {
+        // Re-verify before forcing: the first kill can have worked (Windows
+        // goes straight to /F) and left the port held only by sockets still
+        // closing, while the pid went to an unrelated process in those 3s,
+        // and `taskkill /T /F` would take that process's whole tree. The wait
+        // still runs, so a draining port gets the same 5s it always had.
+        if pid_is_headroom_backend(pid) {
+            kill_pid(pid, true);
+        }
+        if !wait_for_port_free(port, pid, Duration::from_secs(2)) {
             bail!("{}", format_already_running_bail(port));
         }
     }
@@ -9716,7 +9734,7 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
     // Sentry path -- same split `reclaim_orphan_proxy` already uses.
     log::info!("[proxy_intercept] reclaiming stranded Headroom process pid {pid} on port {port}");
     kill_pid(pid, false);
-    if !wait_for_port_free(port, Duration::from_secs(3)) {
+    if !wait_for_port_free(port, pid, Duration::from_secs(3)) {
         // Re-verify before forcing: in those 3s the pid can exit and be
         // reused by an unrelated process, and the identity check above was
         // about the old one.
@@ -9724,7 +9742,7 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
             return false;
         }
         kill_pid(pid, true);
-        if !wait_for_port_free(port, Duration::from_secs(2)) {
+        if !wait_for_port_free(port, pid, Duration::from_secs(2)) {
             return false;
         }
     }
@@ -10374,9 +10392,10 @@ pub fn running_proxy_argv() -> Option<String> {
 /// readyz gate (a 404 there deliberately counts as reachable), so the listener
 /// is the one fact that resolves the ambiguity. The identity string alone
 /// cannot: "python3.12 (pid 7)" is our managed runtime on one host and an
-/// unrelated venv on the next, so ownership goes through
-/// `pid_is_headroom_backend`, which checks argv (or the executable path on
-/// Windows) rather than the process name.
+/// unrelated venv on the next, so ownership goes through the identity checks
+/// (argv, or the executable path on Windows) rather than the process name.
+/// "Ours" includes this very process: the desktop's own intercept is what
+/// normally holds 6767, and reading it as foreign silenced every real 4xx.
 ///
 /// Best-effort: `None` where lsof is unavailable (Windows) or no listener could
 /// be resolved. That is "unknown", not "foreign" -- callers must not read it as
@@ -10384,7 +10403,10 @@ pub fn running_proxy_argv() -> Option<String> {
 pub(crate) fn listener_identity_and_ownership(port: u16) -> Option<(String, bool)> {
     let (cmd, pid) = listener_process(port)?;
     let identity = format_listener_identity(&cmd, pid, ps_command(pid).as_deref());
-    Some((identity, pid_is_headroom_backend(pid)))
+    let ours = pid == std::process::id()
+        || pid_is_headroom_desktop_twin(pid)
+        || pid_is_headroom_backend(pid);
+    Some((identity, ours))
 }
 
 fn format_listener_identity(cmd: &str, pid: u32, argv: Option<&str>) -> String {
@@ -13677,23 +13699,24 @@ mod tests {
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
-        looks_like_corrupt_venv_error, netstat_rows_on_port, occupant_image, parse_lsof_listener,
-        parse_major_minor_patch, parse_netstat_listener, parse_pid_from_lsof_detail,
-        parse_ss_listener, parse_tasklist_image, path_with_binary_dir, pending_addon_update,
-        pinned_headroom_release, pip_failure_category, pip_line_to_progress, plugin_addon,
-        plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
-        proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
-        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_package_count,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        savings_profile_for_runtime, settle_plugin_hosts, settle_unowned_port, sha256_bytes,
-        summarize_kompress_prefetch_failure, upstream_spawn_env, verify_sha256_file,
-        wait_for_port_free, wheel_download_failure_category, widen_silence_for_unpack,
-        CommandFailure, HeadroomRelease, ManagedRuntime, OutdatedClaudeCli, PipOutputCapture,
-        PluginHost, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
-        HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION, HEADROOM_REQUIREMENTS_LOCK,
-        HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION, PIP_UNPACK_SILENCE_TIMEOUT,
-        PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION, UNKNOWN_OCCUPANT,
+        listener_identity_and_ownership, looks_like_corrupt_venv_error, netstat_rows_on_port,
+        occupant_image, parse_lsof_listener, parse_major_minor_patch, parse_netstat_listener,
+        parse_pid_from_lsof_detail, parse_ss_listener, parse_tasklist_image, path_with_binary_dir,
+        pending_addon_update, pinned_headroom_release, pip_failure_category, pip_line_to_progress,
+        plugin_addon, plugin_install_failure_category, pre_upstream_concurrency,
+        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        purge_legacy_output_savings_control_arm_once, read_headroom_learn_metadata_from_path,
+        receipt_requires_atomic_rebuild, reclaim_orphan_proxy, redact_sensitive,
+        requirements_lock_package_count, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_plugin_hosts,
+        settle_unowned_port, sha256_bytes, summarize_kompress_prefetch_failure, upstream_spawn_env,
+        verify_sha256_file, wait_for_port_free, wheel_download_failure_category,
+        widen_silence_for_unpack, CommandFailure, HeadroomRelease, ManagedRuntime,
+        OutdatedClaudeCli, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
+        ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
+        HEADROOM_REQUIREMENTS_LOCK, HEADROOM_WINDOWS_REQUIREMENTS_LOCK, MARKITDOWN_PINNED_VERSION,
+        PIP_UNPACK_SILENCE_TIMEOUT, PLUGIN_ADDONS, PLUGIN_DISPLAY_VERSION, RTK_VERSION,
+        UNKNOWN_OCCUPANT,
     };
     use super::{is_python_interpreter, log_tail, path_without_dirs};
     use crate::backend_port;
@@ -16792,24 +16815,55 @@ mod tests {
         );
     }
 
+    fn tasklist_output(succeeded: bool, stdout: &str) -> std::process::Output {
+        let status = if succeeded {
+            std::process::ExitStatus::default()
+        } else {
+            #[cfg(unix)]
+            let failed = std::os::unix::process::ExitStatusExt::from_raw(1 << 8);
+            #[cfg(windows)]
+            let failed = std::os::windows::process::ExitStatusExt::from_raw(1);
+            failed
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
     #[test]
     fn occupant_image_reports_no_holder_once_the_pid_is_gone() {
         // tasklist ran and matched nothing: netstat's row was the exiting
         // instance, so the port has no listener to name at the user.
         assert_eq!(
-            occupant_image(Some(
+            occupant_image(Some(&tasklist_output(
+                true,
                 "INFO: No tasks are running which match the specified criteria."
-            )),
+            ))),
             None
         );
         assert_eq!(
-            occupant_image(Some(
+            occupant_image(Some(&tasklist_output(
+                true,
                 "\"python.exe\",\"9876\",\"Console\",\"1\",\"45,678 K\"\r\n"
-            )),
+            ))),
             Some("python.exe".to_string())
         );
         // tasklist itself could not run: the pid stands, the name does not.
         assert_eq!(occupant_image(None), Some("unnamed process".to_string()));
+    }
+
+    /// A tasklist that FAILED (broken WMI, the RUST-9A class) printed no CSV
+    /// row either, but that is no proof the holder exited. Reading it as gone
+    /// made the intercept `SO_REUSEADDR`-bind over a live listener and left
+    /// our own orphan on 6768 unreclaimed.
+    #[test]
+    fn occupant_image_keeps_the_pid_when_tasklist_failed() {
+        assert_eq!(
+            occupant_image(Some(&tasklist_output(false, ""))),
+            Some("unnamed process".to_string())
+        );
     }
 
     #[test]
@@ -16924,14 +16978,127 @@ mod tests {
     fn wait_for_port_free_detects_release() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let me = std::process::id();
         assert!(
-            !wait_for_port_free(port, Duration::from_millis(200)),
+            !wait_for_port_free(port, me, Duration::from_millis(200)),
             "port held by a live listener must not report free"
         );
         drop(listener);
         assert!(
-            wait_for_port_free(port, Duration::from_secs(2)),
+            wait_for_port_free(port, me, Duration::from_secs(2)),
             "port must report free shortly after the listener is dropped"
+        );
+    }
+
+    /// The desktop's own intercept is what holds 6767 on a normal host, so a
+    /// /stats 4xx resolved to this process read as a foreign squatter and the
+    /// RUST-87 gate dropped every real 4xx from Sentry.
+    #[test]
+    fn listener_identity_counts_this_desktop_process_as_ours() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (who, ours) = listener_identity_and_ownership(port).expect("listener resolved");
+        assert!(ours, "our own listener read as foreign: {who}");
+    }
+
+    /// Poll for up to 2s: SIGKILL is asynchronous, and the port can come free
+    /// a moment before the exit status is reapable.
+    #[cfg(unix)]
+    fn child_exits_within(child: &mut std::process::Child, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_standin_until_bound(script: &str, port: u16) -> std::process::Child {
+        let child = crate::proc::command("/usr/bin/python3")
+            .arg("-c")
+            .arg(script)
+            .arg(port.to_string())
+            .arg("--headroom-proxy-test-standin")
+            .spawn()
+            .expect("spawn stand-in");
+        // Generous: python startup on a loaded CI box has taken over 5s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stand-in never bound {port}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child
+    }
+
+    /// A SIGTERM-deaf orphan on a wildcard bind (HEADROOM_HOST=0.0.0.0). On
+    /// macOS the 127.0.0.1 probe bind succeeds over it, so the reclaim read
+    /// the port as free straight after the SIGTERM, reported success, and
+    /// never sent the forced kill: the orphan kept the port for good.
+    #[test]
+    #[cfg(unix)]
+    fn reclaim_orphan_proxy_forces_a_sigterm_deaf_wildcard_orphan() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let script = r#"
+import signal, socket, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+s = socket.socket(); s.bind(('0.0.0.0', int(sys.argv[1]))); s.listen(8)
+time.sleep(30)
+"#;
+        let mut child = spawn_standin_until_bound(script, port);
+        let result = reclaim_orphan_proxy(port, false);
+        let exited = child_exits_within(&mut child, Duration::from_secs(2));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            exited,
+            "reclaim reported success with the orphan still alive"
+        );
+    }
+
+    /// The pid resolved from the port can stop being our backend before the
+    /// forced kill: Windows reuses a pid within seconds, and here the
+    /// stand-in execs into a stranger that keeps the socket. The forced kill
+    /// must re-check identity, not land on whatever runs as that pid now.
+    #[test]
+    #[cfg(unix)]
+    fn reclaim_orphan_proxy_rechecks_identity_before_forcing() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let script = r#"
+import os, signal, socket, sys, time
+s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(8)
+os.set_inheritable(s.fileno(), True)
+def become_stranger(*_):
+    os.execv(sys.executable, [sys.executable, '-c', 'import time; time.sleep(30)'])
+signal.signal(signal.SIGTERM, become_stranger)
+time.sleep(30)
+"#;
+        let mut child = spawn_standin_until_bound(script, port);
+        let result = reclaim_orphan_proxy(port, false);
+        let alive = !child_exits_within(&mut child, Duration::from_millis(200));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            alive,
+            "the forced kill landed on a pid that is no longer ours"
+        );
+        assert!(
+            result.is_err(),
+            "the port is still held, so the reclaim failed"
         );
     }
 
@@ -17003,7 +17170,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             "force=true must reclaim even a healthy occupant"
         );
         assert!(
-            wait_for_port_free(port, Duration::from_secs(3)),
+            wait_for_port_free(port, child.id(), Duration::from_secs(3)),
             "force=true must free the port"
         );
 

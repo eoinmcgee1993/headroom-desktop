@@ -3925,10 +3925,11 @@ fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize
         // tasklist reports image names only, so npm installs running under
         // node.exe are invisible here. ponytail: undercount accepted; teach
         // this Get-CimInstance CommandLine matching if Windows verify data
-        // says the callout stays too quiet.
-        let output = crate::proc::command("tasklist")
-            .args(["/NH", "/FO", "CSV"])
-            .output()
+        // says the callout stays too quiet. Bounded: a wedged WMI stalls
+        // tasklist, and this poll would strand one more thread every 5s.
+        let mut tasklist = crate::proc::command("tasklist");
+        tasklist.args(["/NH", "/FO", "CSV"]);
+        let output = crate::proc::output_with_timeout(tasklist, std::time::Duration::from_secs(10))
             .ok()
             .filter(|out| out.status.success())
             .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
