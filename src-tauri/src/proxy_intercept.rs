@@ -1514,6 +1514,27 @@ async fn handle(
         // in the backend's `handle_openai_responses_ws` (covers OSS-direct users
         // too). Remove this line once the bundled package includes that fix.
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
+        // A thread created on Codex's built-in `openai` provider (before setup,
+        // or resumed from before it) reaches us through the root
+        // `openai_base_url`, and that provider speaks WebSocket: the transport
+        // our own `headroom` provider turns off (`supports_websockets = false`).
+        // Its failures were invisible: the 101 is no error, and a socket closed
+        // mid-turn left Codex retrying into a bare "System error" (user 3277,
+        // 2026-09-29). 426 is Codex's own signal to move the session to HTTPS
+        // at once, without retrying, so every Codex turn takes the transport
+        // `splice_with_codex_capture` watches.
+        if request_has_header(&buf, "upgrade")
+            && parsed_head
+                .as_ref()
+                .is_some_and(|head| head.path.starts_with("/v1/responses"))
+        {
+            let _ = client
+                .write_all(
+                    b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return;
+        }
     }
 
     // When the pricing gate has bypassed Headroom, the Python proxy on
@@ -4209,6 +4230,72 @@ mod tests {
         assert!(
             !FIRST_OPTIMIZED_REQUEST_REPORTED.load(Ordering::Acquire),
             "/stats is the app polling itself, not client traffic"
+        );
+
+        run_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    /// A Codex WebSocket handshake gets 426, Codex's cue to use HTTPS for the
+    /// session, and never reaches the backend.
+    #[tokio::test]
+    #[serial]
+    async fn codex_websocket_handshake_gets_426() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                false,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                Arc::new("http://127.0.0.1:1".to_string()),
+                Arc::new(Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(stream) = TcpStream::connect(intercept_addr).await {
+                client = Some(stream);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("connect to intercept");
+        client
+            .write_all(
+                b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            )
+            .await
+            .expect("write handshake");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .expect("intercept answers and closes")
+            .expect("read response");
+        assert!(
+            response.starts_with(b"HTTP/1.1 426 "),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), backend_listener.accept())
+                .await
+                .is_err(),
+            "the handshake must not be forwarded to the backend"
         );
 
         run_task.abort();

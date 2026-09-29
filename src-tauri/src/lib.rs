@@ -6303,6 +6303,97 @@ fn show_cannot_start_dialog(text: &str, buttons: u32) -> i32 {
     }
 }
 
+/// tauri-plugin-single-instance 2.4.1 on Windows hands a second launch off
+/// only if it finds the first instance's message window. When the mutex
+/// already exists but that window does not yet (launches in the same instant
+/// land in the gap between the owner's CreateMutexW and CreateWindowExW), the
+/// plugin falls through and the process runs as a full second instance: its
+/// webview fails to create and it sits beside the real proxy as a spectator
+/// (one host: six RUST-FW in one second, then three RUST-FE). The owner is the
+/// only process with that window, so a process without one fell through:
+/// finish the hand-off the plugin skipped. Runs after `build()`, where plugin
+/// setup has already run, and before any window is created.
+#[cfg(target_os = "windows")]
+fn finish_single_instance_hand_off(app: &tauri::App) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::{
+        System::{DataExchange::COPYDATASTRUCT, Threading::GetCurrentProcessId},
+        UI::WindowsAndMessaging::{
+            FindWindowExW, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
+            WM_COPYDATA,
+        },
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    // The plugin's names and WM_COPYDATA payload, verbatim (2.4.1, no semver
+    // feature): the owner's window proc parses exactly this.
+    let id = &app.config().identifier;
+    let class = wide(&format!("{id}-sic"));
+    let name = wide(&format!("{id}-siw"));
+    let me = unsafe { GetCurrentProcessId() };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let owner = loop {
+        let mut foreign = std::ptr::null_mut();
+        let mut after = std::ptr::null_mut();
+        loop {
+            let hwnd = unsafe {
+                FindWindowExW(std::ptr::null_mut(), after, class.as_ptr(), name.as_ptr())
+            };
+            if hwnd.is_null() {
+                break;
+            }
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+            if pid == me {
+                return;
+            }
+            foreign = hwnd;
+            after = hwnd;
+        }
+        if !foreign.is_null() {
+            break foreign;
+        }
+        // No window anywhere: the owner has not created it yet. Past the
+        // deadline, run as before rather than never starting.
+        if Instant::now() >= deadline {
+            log::warn!("single-instance: no hand-off window after 5s; starting anyway");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let args = std::env::args().collect::<Vec<String>>().join("|");
+    let data = format!("{}|{args}\0", cwd.to_str().unwrap_or_default());
+    let cds = COPYDATASTRUCT {
+        dwData: 1542,
+        cbData: data.len() as _,
+        lpData: data.as_ptr() as _,
+    };
+    log::info!("single-instance: plugin fell through; handing off to the running instance");
+    // A timeout, unlike the plugin's SendMessageW: a hung owner must not leave
+    // an invisible process behind.
+    unsafe {
+        SendMessageTimeoutW(
+            owner,
+            WM_COPYDATA,
+            0,
+            &cds as *const _ as _,
+            SMTO_ABORTIFHUNG,
+            5_000,
+            std::ptr::null_mut(),
+        )
+    };
+    app.cleanup_before_exit();
+    std::process::exit(0);
+}
+
 pub fn run() {
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
@@ -6459,7 +6550,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init());
 
-    builder
+    let app = builder
         .setup(|app| {
             // First thing in setup, before anything that can pump the Windows
             // message loop (set_size/center below re-enter the webview and can
@@ -6878,59 +6969,61 @@ pub fn run() {
             debug_force_proxy_bypass
         ])
         .build(tauri::generate_context!())
-        .unwrap_or_else(|err| fatal_build_error(err))
-        .run(|app, event| {
-            // macOS never spawns a second process when the user opens an
-            // already-running app from Finder or a pinned Dock icon, so the
-            // single-instance hand-off above never fires there; AppKit sends
-            // applicationShouldHandleReopen instead. Without this arm a
-            // relaunch did nothing visible while the app sat in the menu bar.
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
-                if let Err(err) = show_primary_window(app) {
-                    log::warn!("reopen: could not show window: {err}");
-                }
-                return;
+        .unwrap_or_else(|err| fatal_build_error(err));
+    #[cfg(target_os = "windows")]
+    finish_single_instance_hand_off(&app);
+    app.run(|app, event| {
+        // macOS never spawns a second process when the user opens an
+        // already-running app from Finder or a pinned Dock icon, so the
+        // single-instance hand-off above never fires there; AppKit sends
+        // applicationShouldHandleReopen instead. Without this arm a
+        // relaunch did nothing visible while the app sat in the menu bar.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            if let Err(err) = show_primary_window(app) {
+                log::warn!("reopen: could not show window: {err}");
             }
-            // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
-            // or our explicit quit/restart commands). Without this, the proxy
-            // outlives the desktop and the next launch reuses an orphan.
-            if matches!(
-                event,
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-            ) {
-                SHUTTING_DOWN.store(true, Ordering::Release);
-                // Step markers: this teardown runs on the UI thread, so a step
-                // that blocks freezes the app mid-quit and emits nothing (Sentry
-                // only receives warn!/error!). The last marker in the log names
-                // the step that hung.
-                log::info!("exit: stop_headroom");
-                let state: tauri::State<'_, AppState> = app.state();
-                state.stop_headroom();
-                // Gracefully reverse every client's base-URL override (and shell
-                // blocks) on quit so Claude Code / Codex fall back to talking
-                // directly to their native providers while Headroom is not
-                // running, instead of pointing at a now-dead proxy on 6767. The
-                // snapshot is remembered so the next launch's
-                // restore_client_setups re-applies it. Guarded to run once: the
-                // exit handler fires for both ExitRequested and Exit, and a
-                // second clear_client_setups wipes the remembered snapshot.
-                if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
-                    log::info!("exit: clear_client_setups");
-                    if let Err(err) = client_adapters::clear_client_setups() {
-                        log::warn!("exit: clear_client_setups failed: {err}");
-                    }
+            return;
+        }
+        // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
+        // or our explicit quit/restart commands). Without this, the proxy
+        // outlives the desktop and the next launch reuses an orphan.
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            SHUTTING_DOWN.store(true, Ordering::Release);
+            // Step markers: this teardown runs on the UI thread, so a step
+            // that blocks freezes the app mid-quit and emits nothing (Sentry
+            // only receives warn!/error!). The last marker in the log names
+            // the step that hung.
+            log::info!("exit: stop_headroom");
+            let state: tauri::State<'_, AppState> = app.state();
+            state.stop_headroom();
+            // Gracefully reverse every client's base-URL override (and shell
+            // blocks) on quit so Claude Code / Codex fall back to talking
+            // directly to their native providers while Headroom is not
+            // running, instead of pointing at a now-dead proxy on 6767. The
+            // snapshot is remembered so the next launch's
+            // restore_client_setups re-applies it. Guarded to run once: the
+            // exit handler fires for both ExitRequested and Exit, and a
+            // second clear_client_setups wipes the remembered snapshot.
+            if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+                log::info!("exit: clear_client_setups");
+                if let Err(err) = client_adapters::clear_client_setups() {
+                    log::warn!("exit: clear_client_setups failed: {err}");
                 }
-                // Hand Codex threads back to the native provider so its history
-                // menu stays whole while Headroom is not running. Cmd-Q / dock
-                // quit / signals skip exit_headroom -> clear_client_setups, so
-                // this is the only retag they get; the next launch re-applies the
-                // headroom tag via restore_client_setups. Best-effort.
-                log::info!("exit: retag_codex_threads_to_native");
-                client_adapters::retag_codex_threads_to_native();
-                log::info!("exit: teardown complete");
             }
-        });
+            // Hand Codex threads back to the native provider so its history
+            // menu stays whole while Headroom is not running. Cmd-Q / dock
+            // quit / signals skip exit_headroom -> clear_client_setups, so
+            // this is the only retag they get; the next launch re-applies the
+            // headroom tag via restore_client_setups. Best-effort.
+            log::info!("exit: retag_codex_threads_to_native");
+            client_adapters::retag_codex_threads_to_native();
+            log::info!("exit: teardown complete");
+        }
+    });
 }
 
 fn subscription_tier_label(tier: &HeadroomSubscriptionTier) -> &'static str {
