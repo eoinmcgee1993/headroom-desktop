@@ -1516,6 +1516,127 @@ if _hd_lrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- Learn: a git worktree is its repo, not a project (vendor, upstream owed) --
+# Claude Code files each working directory's sessions under its own
+# ~/.claude/projects folder, so every linked worktree (a Conductor workspace,
+# .claude/worktrees/*) became its own learn project: a few sessions each, too
+# thin to cross a pattern threshold, with learnings written into a checkout
+# that is deleted with the workspace. Merge each linked worktree into its main
+# checkout: one ProjectInfo per repo that scans every member folder, writes the
+# repo's MEMORY.md (the auto-memory folder Claude Code shares across a repo's
+# worktrees) and CLAUDE.local.md, and that the traffic learner buckets worktree
+# paths into. A worktree whose checkout is gone stays separate: nothing is left
+# to resolve it from. The desktop resolves the same root for its project list
+# (`state::main_worktree_root`). Exact-pin gated to wheel 0.39.0;
+# self-neutralizes once the plugin carries `_main_worktree_root`. Kill switch:
+# HEADROOM_LEARN_WORKTREE_MERGE=0.
+_hd_lwm_flag = _hd_os.environ.get("HEADROOM_LEARN_WORKTREE_MERGE", "1")
+if _hd_lwm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
+    try:
+        import importlib.metadata as _hd_lwm_meta
+
+        if _hd_lwm_meta.version("headroom-ai") == "0.39.0":
+            import dataclasses as _hd_lwm_dc
+            import re as _hd_lwm_re
+            from pathlib import Path as _hd_lwm_Path
+
+            from headroom.learn.plugins import claude as _hd_lwm_mod
+            from headroom.memory import traffic_learner as _hd_lwm_tl
+
+            if not hasattr(_hd_lwm_mod, "_main_worktree_root"):
+                _hd_lwm_cls = _hd_lwm_mod.ClaudeCodePlugin
+                _hd_lwm_discover = _hd_lwm_cls.discover_projects
+                _hd_lwm_scan = _hd_lwm_cls.scan_project
+                _hd_lwm_pick = _hd_lwm_tl._project_for_pattern
+
+                def _hd_lwm_root(path):
+                    # A linked worktree's .git is a file naming its gitdir, and
+                    # only a linked worktree's gitdir has `commondir` (a
+                    # submodule's does not). A bare repo has no checkout.
+                    try:
+                        path = _hd_lwm_Path(path)
+                        for d in (path, *path.parents):
+                            if (d / ".git").exists():
+                                break
+                        else:
+                            return None
+                        text = (d / ".git").read_text(encoding="utf-8").strip()
+                        if not text.startswith("gitdir:"):
+                            return None
+                        gitdir = d / text[len("gitdir:") :].strip()
+                        rel = (gitdir / "commondir").read_text(encoding="utf-8").strip()
+                        common = (gitdir / rel).resolve()
+                        return common.parent if common.name == ".git" else None
+                    except Exception:
+                        # Includes reading a .git directory: a main checkout.
+                        return None
+
+                def _hd_lwm_discover_projects(self):
+                    groups = {}
+                    for p in _hd_lwm_discover(self):
+                        root = _hd_lwm_root(p.project_path)
+                        try:
+                            key = root or _hd_lwm_Path(p.project_path).resolve()
+                        except Exception:
+                            key = p.project_path
+                        groups.setdefault(key, []).append((p, root))
+                    out = []
+                    for key, members in groups.items():
+                        if all(root is None for _, root in members):
+                            out.extend(p for p, _ in members)
+                            continue
+                        own = next((p for p, root in members if root is None), None)
+                        data_path = (
+                            own.data_path
+                            if own
+                            else self.projects_dir
+                            / _hd_lwm_re.sub(r"[^A-Za-z0-9]", "-", str(key))
+                        )
+                        memory = data_path / "memory" / "MEMORY.md"
+                        claude_md = key / "CLAUDE.md"
+                        merged = _hd_lwm_dc.replace(
+                            own or members[0][0],
+                            name=key.name or str(key),
+                            project_path=key,
+                            data_path=data_path,
+                            context_file=claude_md if claude_md.exists() else None,
+                            memory_file=memory if memory.exists() else None,
+                        )
+                        merged._hd_lwm_data_paths = [p.data_path for p, _ in members]
+                        merged._hd_lwm_aliases = [
+                            p.project_path for p, root in members if root is not None
+                        ]
+                        out.append(merged)
+                    return out
+
+                def _hd_lwm_scan_project(self, project, *args, **kwargs):
+                    data_paths = getattr(project, "_hd_lwm_data_paths", None)
+                    if not data_paths:
+                        return _hd_lwm_scan(self, project, *args, **kwargs)
+                    sessions = []
+                    for dp in data_paths:
+                        one = _hd_lwm_dc.replace(project, data_path=dp)
+                        sessions.extend(_hd_lwm_scan(self, one, *args, **kwargs))
+                    return sessions
+
+                def _hd_lwm_project_for_pattern(pattern, roots):
+                    # Offer each worktree path as an alias root, then map a hit
+                    # back to its repo so the flush buckets by repo path.
+                    ext, back = list(roots), {}
+                    for r in roots:
+                        for alias_path in getattr(r, "_hd_lwm_aliases", ()):
+                            alias = _hd_lwm_dc.replace(r, project_path=alias_path)
+                            back[id(alias)] = r
+                            ext.append(alias)
+                    hit = _hd_lwm_pick(pattern, ext)
+                    return back.get(id(hit), hit)
+
+                _hd_lwm_cls.discover_projects = _hd_lwm_discover_projects
+                _hd_lwm_cls.scan_project = _hd_lwm_scan_project
+                _hd_lwm_tl._project_for_pattern = _hd_lwm_project_for_pattern
+    except Exception:
+        pass
+
 # --- Traffic learner: no error-recovery section in MEMORY.md (posture) ---------
 # The recommendation builder skips any category missing from this routing table,
 # so dropping ERROR_RECOVERY stops the section at the source. Not version-gated:
@@ -14277,6 +14398,49 @@ mod tests {
         assert!(
             off_err.contains("has no attribute 'strip'"),
             "kill switch did not unbind:\n{off_err}"
+        );
+    }
+
+    #[test]
+    fn learn_worktree_merge_behaves_against_the_installed_wheel() {
+        // A linked worktree's sessions belong to its repo: one project, both
+        // folders scanned, live-traffic patterns bucketed to the repo. The kill
+        // switch restores the wheel's one-project-per-worktree.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-learn-wt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .arg(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../scripts/verify-learn-worktree-merge.py"),
+                )
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_LEARN_WORKTREE_MERGE", kill)
+                .output()
+                .expect("run worktree-merge probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            on, "only=repo both=repo scanned=2 hit=repo",
+            "stderr:\n{on_err}"
+        );
+        assert_eq!(
+            off, "only=wt both=repo,wt scanned=1 hit=wt",
+            "stderr:\n{off_err}"
         );
     }
 

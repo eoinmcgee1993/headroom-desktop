@@ -2663,13 +2663,19 @@ impl AppState {
                 let today_key = local_day_key(Local::now());
                 let utc_today_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
                 let mut tracker = self.savings_tracker.lock();
-                if tracker.ingest_native_rollups(
+                // Before ingest: a native overwrite of the live bucket already
+                // contains this delta, so it must land first and be superseded.
+                let sampled = history
+                    .lifetime_output
+                    .is_some_and(|reading| tracker.sample_backend_output(reading));
+                let ingested = tracker.ingest_native_rollups(
                     &native_daily,
                     &native_hourly,
                     &cutoff_date,
                     &today_key,
                     &utc_today_key,
-                ) {
+                );
+                if sampled || ingested {
                     let _ = tracker.persist_state();
                 }
             }
@@ -3027,9 +3033,11 @@ impl AppState {
             // ghost shares a basename with a real project — makes the Activity
             // tile look like it's nagging about the working copy.
             let project_path = match std::fs::canonicalize(&project_path) {
-                Ok(p) => strip_extended_length_prefix(p.to_string_lossy().into_owned()),
+                Ok(p) => main_worktree_root(&p).unwrap_or(p),
                 Err(_) => continue,
             };
+            let project_path =
+                strip_extended_length_prefix(project_path.to_string_lossy().into_owned());
             if project_path.trim().is_empty() {
                 continue;
             }
@@ -4509,6 +4517,27 @@ fn strip_extended_length_prefix(path: String) -> String {
     }
 }
 
+/// The main checkout of the linked git worktree `path` sits in, or None for
+/// anything else. Claude Code files every worktree's sessions under its own
+/// `~/.claude/projects` folder, but a worktree (a Conductor workspace,
+/// `.claude/worktrees/*`) is ephemeral: its learnings belong to the repo. The
+/// sitecustomize learn worktree-merge vendor resolves the same root for
+/// `headroom learn`, so a Train run on the repo scans every worktree's sessions.
+fn main_worktree_root(path: &Path) -> Option<PathBuf> {
+    let dir = path.ancestors().find(|dir| dir.join(".git").exists())?;
+    // A main checkout's .git is a directory, so the read fails there.
+    let text = std::fs::read_to_string(dir.join(".git")).ok()?;
+    let gitdir = dir.join(text.trim().strip_prefix("gitdir:")?.trim());
+    // Only a linked worktree's gitdir has `commondir` (a submodule's does not).
+    let rel = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = std::fs::canonicalize(gitdir.join(rel.trim())).ok()?;
+    // A bare repo has no checkout to merge into.
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    common.parent().map(Path::to_path_buf)
+}
+
 fn canonical_session_file_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -5117,6 +5146,10 @@ struct SavingsTracker {
     /// same way. Deliberately not persisted -- it describes a backend process,
     /// not the user's history.
     tool_schema_process_total: Option<u64>,
+    /// Last (output_tokens_saved, output_savings_usd) reading of the backend's
+    /// lifetime output-shaping counters. See `sample_backend_output`. Not
+    /// persisted, for the same reason as `tool_schema_process_total`.
+    backend_output_watermark: Option<(u64, f64)>,
     last_observation: Option<SavingsObservation>,
     display_session_baseline: Option<SavingsObservation>,
     session_savings_history: Vec<HeadroomSavingsHistoryPoint>,
@@ -5244,6 +5277,7 @@ impl SavingsTracker {
                 .as_ref()
                 .map_or(0, |state| state.lifetime_tool_schema_tokens_saved),
             tool_schema_process_total: None,
+            backend_output_watermark: None,
             last_observation: persisted_state
                 .as_ref()
                 .and_then(|state| state.last_observation.clone()),
@@ -5613,6 +5647,51 @@ impl SavingsTracker {
         }
     }
 
+    /// Bank the poll-over-poll delta of the backend's lifetime output-shaping
+    /// counters into this local hour's and day's buckets. Per-hour output
+    /// otherwise comes only from the rollup series, which the backend derives
+    /// from a 5000-point checkpoint ring: at heavy volume that ring spans about
+    /// an hour (2026-09-29: ~70 min), so every earlier hour fell back to a
+    /// tracker bucket with no output and its chart bar vanished while its
+    /// input bar stayed. Rollups still win wherever they cover a bucket
+    /// (`merge_hourly_savings`, `ingest_native_rollups`); this only fills the
+    /// buckets they have lost.
+    ///
+    /// Watermark rules match `sample_output_reduction`: the first reading
+    /// seeds, a shallow dip (restart onto a lagging checkpoint) holds the mark
+    /// so the catch-up is not counted twice, and a wipe rebases it. Returns
+    /// true when a delta was banked.
+    fn sample_backend_output(&mut self, current: (u64, f64)) -> bool {
+        let Some((prev_tokens, prev_usd)) = self.backend_output_watermark else {
+            self.backend_output_watermark = Some(current);
+            return false;
+        };
+        if current.0 < prev_tokens || current.1 < prev_usd {
+            if current.0 < prev_tokens / 2 {
+                self.backend_output_watermark = Some(current);
+            }
+            return false;
+        }
+        self.backend_output_watermark = Some(current);
+        let delta_tokens = current.0 - prev_tokens;
+        let delta_usd = current.1 - prev_usd;
+        if delta_tokens == 0 && delta_usd <= 0.0 {
+            return false;
+        }
+        // Local keys on both maps, same as the tracker's own input deltas.
+        let hour_key = local_hour_key(Local::now());
+        let day_key = day_key_from_hour_key(&hour_key);
+        for (map, key) in [
+            (&mut self.hourly_savings, hour_key),
+            (&mut self.daily_savings, day_key),
+        ] {
+            let entry = map.entry(key).or_default();
+            entry.output_tokens_saved = entry.output_tokens_saved.saturating_add(delta_tokens);
+            entry.output_savings_usd += delta_usd;
+        }
+        true
+    }
+
     fn observe(&mut self, stats: &HeadroomDashboardStats) -> Option<SavingsTotalsSnapshot> {
         if let Some(reading) = stats.tool_schema_tokens_saved {
             self.accumulate_tool_schema_tokens(reading);
@@ -5980,7 +6059,9 @@ impl SavingsTracker {
             should_remove = entry.estimated_savings_usd <= 0.0
                 && entry.estimated_tokens_saved == 0
                 && entry.actual_cost_usd <= 0.0
-                && entry.total_tokens_sent == 0;
+                && entry.total_tokens_sent == 0
+                && entry.output_tokens_saved == 0
+                && entry.output_savings_usd <= 0.0;
         }
         if should_remove {
             self.daily_savings.remove(day_key);
@@ -6026,7 +6107,9 @@ impl SavingsTracker {
             should_remove = entry.estimated_savings_usd <= 0.0
                 && entry.estimated_tokens_saved == 0
                 && entry.actual_cost_usd <= 0.0
-                && entry.total_tokens_sent == 0;
+                && entry.total_tokens_sent == 0
+                && entry.output_tokens_saved == 0
+                && entry.output_savings_usd <= 0.0;
         }
         if should_remove {
             self.hourly_savings.remove(hour_key);
@@ -6523,6 +6606,9 @@ struct HeadroomSavingsHistoryResponse {
     /// genuine first day), large when counters survived a reset or trim.
     /// None when the payload carries no raw history.
     ring_start: Option<RingStartTotals>,
+    /// (output_tokens_saved, output_savings_usd) from the `lifetime` block:
+    /// the durable cumulative the rollup's output deltas are diffed from.
+    lifetime_output: Option<(u64, f64)>,
 }
 
 impl HeadroomSavingsHistoryResponse {
@@ -7551,6 +7637,12 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
             lifetime,
             backfill_bucket_dropped,
             ring_start: ring_start_totals(&root),
+            lifetime_output: value_at_path_f64(&root, &["lifetime", "output_savings_usd"]).map(
+                |usd| {
+                    let tokens = value_at_path_u64(&root, &["lifetime", "output_tokens_saved"]);
+                    (tokens.unwrap_or(0), usd)
+                },
+            ),
         })
     }
 }
@@ -9870,6 +9962,33 @@ mod tests {
     }
 
     #[test]
+    fn main_worktree_root_resolves_linked_worktrees_only() {
+        use super::main_worktree_root;
+        let base = std::env::temp_dir().join(format!("hd-wt-root-{}", std::process::id()));
+        let main = base.join("repo");
+        let gitdir = main.join(".git/worktrees/san-salvador");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        let wt = base.join("ws/san-salvador");
+        fs::create_dir_all(wt.join("src")).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        // A submodule's .git file points at a gitdir with no `commondir`.
+        let sub = main.join("vendor/lib");
+        let sub_gitdir = main.join(".git/modules/lib");
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(&sub_gitdir).unwrap();
+        fs::write(sub.join(".git"), "gitdir: ../../.git/modules/lib\n").unwrap();
+
+        let canonical_main = fs::canonicalize(&main).unwrap();
+        assert_eq!(main_worktree_root(&wt), Some(canonical_main.clone()));
+        assert_eq!(main_worktree_root(&wt.join("src")), Some(canonical_main));
+        assert_eq!(main_worktree_root(&main), None);
+        assert_eq!(main_worktree_root(&sub), None);
+        assert_eq!(main_worktree_root(&base), None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn strip_extended_length_prefix_handles_windows_and_unix_forms() {
         let f = super::strip_extended_length_prefix;
         assert_eq!(
@@ -10153,6 +10272,42 @@ mod tests {
         // No priced buckets yet: nothing to extrapolate a rate from.
         let empty = vec![daily("2026-08-04", 0, 0.0)];
         assert_eq!(lifetime_output_savings_usd(&empty, Some(1_000_000)), 0.0);
+    }
+
+    #[test]
+    fn backend_output_samples_fill_buckets_without_double_counting() {
+        let mut tracker = make_tracker();
+        let output = |map: &std::collections::BTreeMap<String, DailySavingsBucket>| {
+            map.values().fold((0u64, 0.0f64), |(t, u), b| {
+                (t + b.output_tokens_saved, u + b.output_savings_usd)
+            })
+        };
+
+        // First reading seeds: the lifetime total is not this hour's work.
+        assert!(!tracker.sample_backend_output((1_000, 10.0)));
+        assert!(tracker.hourly_savings.is_empty());
+
+        assert!(tracker.sample_backend_output((1_050, 10.5)));
+        // Shallow dip (restart onto a lagging checkpoint) holds the mark, so
+        // the climb back to 1_050 is not banked a second time.
+        assert!(!tracker.sample_backend_output((1_040, 10.4)));
+        assert!(tracker.sample_backend_output((1_060, 10.6)));
+        // A wipe rebases, so real work after it still lands.
+        assert!(!tracker.sample_backend_output((10, 0.1)));
+        assert!(tracker.sample_backend_output((30, 0.3)));
+
+        for map in [&tracker.hourly_savings, &tracker.daily_savings] {
+            let (tokens, usd) = output(map);
+            assert_eq!(tokens, 80);
+            assert!((usd - 0.8).abs() < 1e-9, "{usd}");
+        }
+
+        // Replacing session input buckets must not evict a bucket that still
+        // carries output.
+        let hour = tracker.hourly_savings.keys().next().unwrap().clone();
+        tracker.add_hourly_delta(&hour, 1.0, 100, 0.0, 0, 0);
+        tracker.subtract_hourly_delta(&hour, 1.0, 100, 0.0, 0, 0);
+        assert!(tracker.hourly_savings.contains_key(&hour));
     }
 
     #[test]
@@ -11628,6 +11783,7 @@ mod tests {
             lifetime_token_milestone_high_water: 0,
             lifetime_tool_schema_tokens_saved: 0,
             tool_schema_process_total: None,
+            backend_output_watermark: None,
             last_observation: None,
             display_session_baseline: None,
             session_savings_history: Vec::new(),
@@ -13830,7 +13986,9 @@ mod tests {
             r#"{
                 "lifetime": {
                     "tokens_saved": 205,
-                    "compression_savings_usd": 0.205
+                    "compression_savings_usd": 0.205,
+                    "output_tokens_saved": 40,
+                    "output_savings_usd": 0.6
                 },
                 "series": {
                     "hourly": [
@@ -13863,6 +14021,7 @@ mod tests {
         )
         .expect("parsed history");
 
+        assert_eq!(parsed.lifetime_output, Some((40, 0.6)));
         assert_eq!(parsed.hourly.len(), 2);
         assert_eq!(parsed.hourly[0].tokens_saved, 150);
         assert!((parsed.hourly[0].compression_savings_usd_delta - 0.15).abs() < 1e-9);
