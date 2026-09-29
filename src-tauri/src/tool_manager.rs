@@ -4294,13 +4294,18 @@ impl ToolManager {
     }
 
     pub fn headroom_kompress_enabled(&self) -> Option<bool> {
+        self.headroom_kompress_state(fetch_backend_readyz(crate::backend_port::get()).as_ref())
+    }
+
+    /// Kompress state from a `/readyz` body the caller already holds (the
+    /// status poll reads one to decide reachability).
+    pub fn headroom_kompress_state(&self, readyz: Option<&Value>) -> Option<bool> {
         // The backend reports Kompress on `/readyz` (`checks.kompress`, lazy
         // loads included). The log scan below went blind once the wheel's log
         // rotated past the last marker and reread up to 10 MB per status poll,
-        // so it only runs for a wheel without that field. No answer at all is
-        // unknown, not a reason to scan.
-        let readyz = fetch_backend_readyz(crate::backend_port::get())?;
-        if let Some(state) = readyz_kompress_state(&readyz) {
+        // so it only runs for a wheel without that field, or when no body came
+        // back: a last-known marker beats flipping the dot to unknown.
+        if let Some(state) = readyz.and_then(readyz_kompress_state) {
             return Some(state);
         }
 
@@ -9812,12 +9817,13 @@ pub(crate) fn probe_backend_readyz_ok(port: u16) -> bool {
 }
 
 /// The backend's `/readyz` body, whatever the status: a 503 (a gating check
-/// down) carries the same `checks`. None when nothing answers with JSON.
+/// down) carries the same `checks`. None when nothing answers with JSON. 5s,
+/// the reachability probe's budget: a busy backend answers /readyz slowly.
 fn fetch_backend_readyz(port: u16) -> Option<Value> {
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .tls_built_in_root_certs(false)
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
         .build()
         .ok()?;
     client
@@ -9832,7 +9838,7 @@ fn fetch_backend_readyz(port: u16) -> Option<Value> {
 /// 0.35.0): `Some(true)` once the model is loaded, eagerly or lazily;
 /// `Some(false)` while disabled, not installed or still warming. None when the
 /// wheel predates the field.
-fn readyz_kompress_state(body: &Value) -> Option<bool> {
+pub(crate) fn readyz_kompress_state(body: &Value) -> Option<bool> {
     let check = body.get("checks")?.get("kompress")?;
     // A disabled component reads `ready: true`, so `enabled` decides first.
     Some(check.get("enabled")?.as_bool()? && check.get("ready")?.as_bool()?)
