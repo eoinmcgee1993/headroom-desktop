@@ -1732,7 +1732,8 @@ impl AppState {
         // avoids re-acquiring the lock every 500ms.
         let tracked_pid: Option<u32> = self.headroom_process.lock().as_ref().map(|c| c.id());
 
-        let start = Instant::now();
+        let mut start = Instant::now();
+        let mut last_tick = start;
         let mut last_log_activity = start;
         let mut last_seen_mtime = newest_proxy_log_mtime(&logs_dir);
         let mut last_hf_size = hf_cache
@@ -1763,6 +1764,15 @@ impl AppState {
                     "wait_for_boot_validation: tracked proxy child exited with status {exit_status}"
                 );
                 return BootValidationOutcome::ProcessExited;
+            }
+
+            // Windows counts a sleep in `Instant`: without this the first tick
+            // after wake read the sleep as silence and rolled back a good
+            // upgrade. Checked after the probe so a sleep inside it counts.
+            if let Some(gap) = crate::proc::suspend_gap(&mut last_tick) {
+                start = crate::proc::past_suspend(start, gap);
+                last_log_activity = crate::proc::past_suspend(last_log_activity, gap);
+                last_hf_growth_at = last_hf_growth_at.map(|at| crate::proc::past_suspend(at, gap));
             }
 
             // A download is "active" if the HF cache grew within the silence

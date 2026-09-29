@@ -8015,7 +8015,7 @@ impl ToolManager {
             cli,
             args,
             &self.runtime.root_dir,
-            None,
+            Some(PLUGIN_CMD_SILENCE_TIMEOUT),
             &mut |line: &str| log::info!("{id} [{label}]: {line}"),
         )
     }
@@ -8164,7 +8164,7 @@ impl ToolManager {
             cli,
             &["plugin", "list", "-m", plugin.marketplace_name],
             &self.runtime.root_dir,
-            None,
+            Some(PLUGIN_CMD_SILENCE_TIMEOUT),
             &mut |line: &str| listed |= codex_list_line_installed(line, plugin.plugin_ref),
         );
         listed
@@ -11638,6 +11638,12 @@ fn bootstrap_requirements_lock_for_target(os: &str) -> &'static str {
 /// Ceiling for `headroom mcp install` (see `install_headroom_mcp`).
 const MCP_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Silence ceiling for a `claude`/`codex` plugin verb. At worst a verb clones
+/// a small marketplace repo; one quiet for three minutes is stuck, not slow,
+/// and without a bound it held addon install, and Uninstall before its
+/// cleanup, for good.
+const PLUGIN_CMD_SILENCE_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Ceiling for one venv/ensurepip/pip-probe step. Minutes on a Defender-
 /// scanned fresh install is normal; never finishing is not, and before this
 /// a stalled interpreter (AV hold, DLL-load deadlock) hung bootstrap forever
@@ -13117,6 +13123,7 @@ where
 
     let mut cmd = build_command(binary, args, cwd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::proc::own_process_group(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -13130,7 +13137,9 @@ where
     let tx_stderr = tx.clone();
     drop(tx);
 
-    let stdout_handle = std::thread::spawn(move || {
+    // Never joined: a descendant that inherited the pipes can hold them open
+    // long after the child is gone. They end when its last writer closes.
+    std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             let _ = tx_stdout.send(StreamedLine {
                 line,
@@ -13138,7 +13147,7 @@ where
             });
         }
     });
-    let stderr_handle = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             let _ = tx_stderr.send(StreamedLine {
                 line,
@@ -13159,11 +13168,17 @@ where
     // old wait-forever behavior for callers whose children are legitimately
     // quiet for long stretches.
     let mut last_output = Instant::now();
-    // Every caller of this function runs pip, so the unpack-phase check lives
-    // here rather than behind a caller knob.
+    let mut last_tick = last_output;
+    let mut exited_at: Option<Instant> = None;
+    // The unpack-phase check lives here rather than behind a caller knob: it
+    // only matches pip's own output, so the plugin CLI callers never trip it.
     let mut silence_limit = silence_timeout;
     loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        let received = rx.recv_timeout(Duration::from_millis(500));
+        if let Some(gap) = crate::proc::suspend_gap(&mut last_tick) {
+            last_output = crate::proc::past_suspend(last_output, gap);
+        }
+        match received {
             Ok(streamed) => {
                 last_output = Instant::now();
                 silence_limit = widen_silence_for_unpack(silence_limit, &streamed.line);
@@ -13179,40 +13194,43 @@ where
             }
             // Pipes closed: the child is exiting; fall through to wait().
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let Some(limit) = silence_limit else {
-                    continue;
-                };
-                if last_output.elapsed() >= limit {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // Do NOT join the reader threads here: an orphaned
-                    // grandchild (sh's `sleep`, a wedged pip subprocess) can
-                    // hold the pipe open indefinitely after the kill, and a
-                    // blocked join would re-create the very hang this branch
-                    // exists to end. The buffers already hold everything
-                    // received; the readers exit on their own when the pipe
-                    // finally closes.
-                    stderr_buf.push_str(&format!(
-                        "\n[headroom] killed: no output for {}s (stalled installer)\n",
-                        limit.as_secs()
-                    ));
-                    return Err(anyhow::Error::new(CommandFailure {
-                        program: binary.display().to_string(),
-                        args: args.iter().map(|s| s.to_string()).collect(),
-                        stdout: stdout_buf,
-                        stderr: stderr_buf,
-                        exit_code: None,
-                        signal: None,
-                    }));
-                }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        // Exit, not EOF, ends the wait: a descendant that inherited the pipes
+        // (an agent CLI's background updater, sh's `sleep`) keeps them open
+        // for as long as it lives (RUST-BH). What the child itself wrote is in
+        // the pipe by then; the grace lets the readers hand it over.
+        if exited_at.is_none() && matches!(child.try_wait(), Ok(Some(_))) {
+            exited_at = Some(Instant::now());
+        }
+        if let Some(at) = exited_at {
+            if at.elapsed() >= crate::proc::PIPE_DRAIN_GRACE {
+                break;
             }
+            continue;
+        }
+        let Some(limit) = silence_limit else {
+            continue;
+        };
+        if last_output.elapsed() >= limit {
+            crate::proc::kill_tree(&mut child);
+            let _ = child.wait();
+            stderr_buf.push_str(&format!(
+                "\n[headroom] killed: no output for {}s (stalled installer)\n",
+                limit.as_secs()
+            ));
+            return Err(anyhow::Error::new(CommandFailure {
+                program: binary.display().to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+                exit_code: None,
+                signal: None,
+            }));
         }
     }
 
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
-
+    // Already reaped when it exited above; `wait` then returns that status.
     let status = child
         .wait()
         .with_context(|| format!("waiting for {} {}", binary.display(), args.join(" ")))?;
@@ -13244,6 +13262,7 @@ fn run_command_with_timeout(
 ) -> Result<()> {
     let mut cmd = build_command(binary, args, cwd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    crate::proc::own_process_group(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -13251,9 +13270,13 @@ fn run_command_with_timeout(
     let stdout_drain = crate::proc::PipeDrain::spawn(child.stdout.take());
     let stderr_drain = crate::proc::PipeDrain::spawn(child.stderr.take());
 
-    let started = Instant::now();
+    let mut started = Instant::now();
+    let mut last_tick = started;
     let mut timed_out = false;
     let status = loop {
+        if let Some(gap) = crate::proc::suspend_gap(&mut last_tick) {
+            started = crate::proc::past_suspend(started, gap);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
@@ -20896,6 +20919,33 @@ exit 0
             failure.stdout.contains("hi"),
             "output before the stall is preserved"
         );
+    }
+
+    /// RUST-BH on the plugin CLI path: the child exits but a background
+    /// descendant (an agent CLI's updater) inherited the pipes, so waiting
+    /// for EOF blocked addon install and Uninstall for as long as it lived.
+    #[test]
+    #[cfg(unix)]
+    fn run_command_streaming_returns_when_the_child_exits_but_a_grandchild_holds_the_pipes() {
+        let started = std::time::Instant::now();
+        let err = super::run_command_streaming(
+            std::path::Path::new("/bin/sh"),
+            &["-c", "echo hi; sleep 20 & exit 3"],
+            &std::env::temp_dir(),
+            None,
+            &mut |_| {},
+        )
+        .expect_err("exit 3 is a failure");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited on the grandchild: {:?}",
+            started.elapsed()
+        );
+        let failure = err
+            .downcast_ref::<CommandFailure>()
+            .expect("exit reports as CommandFailure");
+        assert_eq!(failure.exit_code, Some(3), "the child's own status is kept");
+        assert!(failure.stdout.contains("hi"), "output is kept");
     }
 
     #[test]
