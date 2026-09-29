@@ -4892,10 +4892,13 @@ impl ToolManager {
         if let Err(err) = self.ensure_msvc_runtime_dlls() {
             log::warn!("MSVC runtime DLL vendoring failed during bootstrap: {err:#}");
         }
+        // A repair that recreated a pip-less venv dropped markitdown with it.
+        self.restore_markitdown_after_rebuild();
 
         self.clear_bootstrap_attempt();
         self.write_ready_flag()?;
         self.write_bootstrap_receipt()?;
+        self.prune_headroom_wheels();
         log::info!("bootstrap: managed runtime install complete (ready flag written)");
         progress(BootstrapStepUpdate {
             step: "Install complete",
@@ -4982,6 +4985,35 @@ impl ToolManager {
              (system redistributable missing)"
         );
         Ok(true)
+    }
+
+    /// Every wheel, rtk and codebase-memory bump downloaded a new archive and
+    /// nothing removed the old ones (290 MB on one machine). Deletes the
+    /// regular files named `family*` except `keep*`. Best-effort; call only
+    /// once the `keep` artifact is installed.
+    fn prune_downloads(&self, family: &str, keep: &str) {
+        let Ok(entries) = std::fs::read_dir(&self.runtime.downloads_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with(family)
+                && !name.starts_with(keep)
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Wheels cached for any headroom-ai other than the installed one.
+    fn prune_headroom_wheels(&self) {
+        if let Some(version) = self.installed_headroom_version() {
+            self.prune_downloads("headroom_ai-", &format!("headroom_ai-{version}-"));
+        }
     }
 
     fn wheel_download_path(&self, wheel_url: &str) -> PathBuf {
@@ -6075,6 +6107,7 @@ impl ToolManager {
         if let Err(err) = self.ensure_msvc_runtime_dlls() {
             log::warn!("MSVC runtime DLL vendoring failed during upgrade: {err:#}");
         }
+        self.restore_markitdown_after_rebuild();
 
         progress(BootstrapStepUpdate {
             step: "Verifying install",
@@ -6747,6 +6780,7 @@ impl ToolManager {
         }
         let _ = std::fs::remove_file(self.headroom_receipt_backup_path());
         let _ = std::fs::remove_file(self.lock_backup_path());
+        self.prune_headroom_wheels();
         Ok(())
     }
 
@@ -7190,6 +7224,7 @@ impl ToolManager {
             }
             return Err(anyhow!("renaming {} into place: {err}", staged.display()));
         }
+        self.prune_downloads("rtk-v", &format!("rtk-v{RTK_VERSION}-"));
 
         self.write_tool_receipt(
             "rtk",
@@ -7479,30 +7514,44 @@ impl ToolManager {
         }
         #[cfg(target_os = "windows")]
         {
-            let script = format!(
-                "@echo off\r\n\
-                 setlocal\r\n\
-                 rem Headroom-managed markitdown shim. Runs the real binary, then counts a conversion that succeeded.\r\n\
-                 rem UTF-8 stdout: the locale codepage (cp950, cp1252) garbles or drops non-ASCII document text.\r\n\
-                 set PYTHONUTF8=1\r\n\
-                 \"{real}\" %*\r\n\
-                 if %errorlevel% neq 0 exit /b %errorlevel%\r\n\
-                 if \"%~1\"==\"\" exit /b 0\r\n\
-                 if \"%~1\"==\"--help\" exit /b 0\r\n\
-                 set \"C={counter}\"\r\n\
-                 set /p n=<\"%C%\" 2>nul\r\n\
-                 if not defined n set n=0\r\n\
-                 set /a n+=1 >nul 2>nul\r\n\
-                 >\"%C%.tmp\" echo %n%\r\n\
-                 move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
-                 exit /b 0\r\n",
-                counter = self.markitdown_conversion_counter_path().display(),
-                real = self.markitdown_entrypoint().display(),
-            );
+            let script = self.markitdown_cmd_script();
             crate::client_adapters::atomic_write(&shim, script.as_bytes())
                 .with_context(|| format!("writing markitdown shim {}", shim.display()))?;
         }
         Ok(())
+    }
+
+    /// cmd.exe decodes a batch file in the OEM codepage, so an absolute path
+    /// under a non-ASCII profile (C:\Users\José) written as UTF-8 names a file
+    /// that does not exist. Paths are relative to the shim's folder instead:
+    /// `%~dp0` expands from cmd's UTF-16 command line, and the body stays ASCII.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn markitdown_cmd_script(&self) -> String {
+        // The shim sits in bin_dir, which is root_dir\bin.
+        let from_shim = |path: PathBuf| match path.strip_prefix(&self.runtime.root_dir) {
+            Ok(rel) => format!("%~dp0..\\{}", rel.display()),
+            Err(_) => path.display().to_string(),
+        };
+        format!(
+            "@echo off\r\n\
+             setlocal\r\n\
+             rem Headroom-managed markitdown shim. Runs the real binary, then counts a conversion that succeeded.\r\n\
+             rem UTF-8 stdout: the locale codepage (cp950, cp1252) garbles or drops non-ASCII document text.\r\n\
+             set PYTHONUTF8=1\r\n\
+             \"{real}\" %*\r\n\
+             if %errorlevel% neq 0 exit /b %errorlevel%\r\n\
+             if \"%~1\"==\"\" exit /b 0\r\n\
+             if \"%~1\"==\"--help\" exit /b 0\r\n\
+             set \"C={counter}\"\r\n\
+             set /p n=<\"%C%\" 2>nul\r\n\
+             if not defined n set n=0\r\n\
+             set /a n+=1 >nul 2>nul\r\n\
+             >\"%C%.tmp\" echo %n%\r\n\
+             move /y \"%C%.tmp\" \"%C%\" >nul 2>nul\r\n\
+             exit /b 0\r\n",
+            counter = from_shim(self.markitdown_conversion_counter_path()),
+            real = from_shim(self.markitdown_entrypoint()),
+        )
     }
 
     pub fn markitdown_installed(&self) -> bool {
@@ -7576,6 +7625,38 @@ impl ToolManager {
                 .with_context(|| format!("removing {}", receipt.display()))?;
         }
         Ok(())
+    }
+
+    /// markitdown[all] lives in the runtime venv, so a rebuilt venv drops it
+    /// while its receipt, shim and agent nudges survive and send every Office
+    /// read to a command that dies with ModuleNotFoundError. Reinstall it,
+    /// keeping the user's enabled flag; if that fails, take the integration
+    /// down like an uninstall. Never fails the caller: it is an optional addon.
+    fn restore_markitdown_after_rebuild(&self) {
+        if !self.runtime.tools_dir.join("markitdown.json").exists()
+            || self.markitdown_entrypoint().exists()
+        {
+            return;
+        }
+        let enabled = self.tool_enabled("markitdown");
+        let restored = self.install_markitdown().and_then(|()| {
+            if enabled {
+                Ok(())
+            } else {
+                self.set_markitdown_enabled(false)
+            }
+        });
+        if let Err(err) = restored {
+            log::warn!("markitdown reinstall after a venv rebuild failed, removing it: {err:#}");
+            if let Err(err) =
+                crate::client_adapters::disable_markitdown_integration(&self.markitdown_shim_path())
+            {
+                log::warn!("markitdown integration removal failed: {err:#}");
+            }
+            if let Err(err) = self.uninstall_markitdown() {
+                log::warn!("markitdown receipt removal failed: {err:#}");
+            }
+        }
     }
 
     /// Serena lives in its own venv: its LSP dependency tree must never
@@ -7881,6 +7962,10 @@ impl ToolManager {
             "codebase-memory",
             json!({ "version": CODEBASE_MEMORY_VERSION, "enabled": true }),
         )?;
+        self.prune_downloads(
+            "codebase-memory-mcp-v",
+            &format!("codebase-memory-mcp-v{CODEBASE_MEMORY_VERSION}-"),
+        );
         Ok(())
     }
 
@@ -8734,10 +8819,35 @@ fn apply_serena_gitignore(existing: &str, present: bool) -> Option<String> {
 /// serena, so failures are logged at info (never Sentry-escalated) and the
 /// install continues.
 fn set_serena_global_gitignore(present: bool) {
+    // Without the Command Line Tools /usr/bin/git is the xcrun stub, and
+    // spawning it pops the "install developer tools" dialog. There is no git
+    // for the ignore entry to serve then, so skip it (same probe as
+    // configure_vscode_process_wrapper).
+    if cfg!(target_os = "macos")
+        && !crate::proc::command("/usr/bin/xcode-select")
+            .arg("-p")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    {
+        return;
+    }
     let Some(path) = global_git_excludes_path() else {
         return;
     };
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    update_serena_gitignore_file(&path, present);
+}
+
+fn update_serena_gitignore_file(path: &Path, present: bool) {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            // Unreadable or not UTF-8: it is the user's file, and rewriting it
+            // from "" would drop every global ignore pattern they have.
+            log::info!("serena: reading {} failed: {err:#}", path.display());
+            return;
+        }
+    };
     let Some(updated) = apply_serena_gitignore(&existing, present) else {
         return;
     };
@@ -8747,7 +8857,7 @@ fn set_serena_global_gitignore(present: bool) {
             return;
         }
     }
-    if let Err(err) = crate::client_adapters::atomic_write(&path, updated.as_bytes()) {
+    if let Err(err) = crate::client_adapters::atomic_write(path, updated.as_bytes()) {
         log::info!("serena: updating {} failed: {err:#}", path.display());
     } else {
         log::info!(
@@ -13709,6 +13819,7 @@ mod tests {
     use super::python_distribution_artifact;
     use super::rotate_log_if_large;
     use super::stalled_prefetch_cause;
+    use super::update_serena_gitignore_file;
     use super::{
         acquire_artifact_download_lock, publish_inflight_download, ARTIFACT_DOWNLOAD_LOCK,
     };
@@ -13856,6 +13967,30 @@ mod tests {
 
         // A hand-written pattern with no marker is the user's - left alone.
         assert!(apply_serena_gitignore(".serena/\n*.log\n", false).is_none());
+    }
+
+    #[test]
+    fn serena_gitignore_never_clobbers_an_excludes_file_it_cannot_read() {
+        let root = unique_temp_dir("serena-gitignore-unreadable");
+        fs::create_dir_all(&root).expect("root");
+        // A cp1252 "e acute" from a Windows editor: not UTF-8, so
+        // read_to_string fails. Reading that as "" replaced every global
+        // ignore pattern (.env, *.pem) with our two lines.
+        let path = root.join("ignore");
+        let original = b"# caf\xe9 secrets\n.env\n*.pem\n".to_vec();
+        fs::write(&path, &original).expect("seed");
+        update_serena_gitignore_file(&path, true);
+        assert_eq!(fs::read(&path).expect("read back"), original);
+        update_serena_gitignore_file(&path, false);
+        assert_eq!(fs::read(&path).expect("read back"), original);
+
+        // A file that does not exist yet still gets the block.
+        let fresh = root.join("git").join("ignore");
+        update_serena_gitignore_file(&fresh, true);
+        assert!(fs::read_to_string(&fresh)
+            .expect("created")
+            .ends_with(".serena/\n"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -20546,6 +20681,103 @@ after
         assert!(!is_outdated_codex(&anyhow::anyhow!(
             "unrecognized subcommand"
         )));
+    }
+
+    /// cmd.exe decodes a .cmd in the OEM codepage, so an absolute path under
+    /// C:\Users\José written as UTF-8 named a file that does not exist and
+    /// every conversion through the shim failed.
+    #[test]
+    fn markitdown_cmd_shim_stays_ascii_under_a_non_ascii_profile() {
+        let runtime = ManagedRuntime::bootstrap_root(&unique_temp_dir("José 山田"));
+        let manager = ToolManager::new(runtime);
+        let script = manager.markitdown_cmd_script();
+        assert!(script.is_ascii(), "{script}");
+        assert!(script.contains("\"%~dp0..\\runtime"), "{script}");
+        assert!(script.contains("set \"C=%~dp0..\\tools"), "{script}");
+    }
+
+    /// markitdown[all] lives in the runtime venv, so a full rebuild dropped it
+    /// while its receipt and the CLAUDE.md nudge kept sending agents to a shim
+    /// that died with ModuleNotFoundError.
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script interpreter
+    fn venv_rebuild_reinstalls_markitdown_or_takes_its_nudge_down() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-rebuild");
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".claude")).expect("home");
+        let _home = HomeGuard::new(&home);
+        let receipt = runtime.tools_dir.join("markitdown.json");
+        let entrypoint = manager.markitdown_entrypoint();
+
+        // pip lays the entrypoint back down: the addon returns, still disabled.
+        fs::write(&receipt, br#"{"version":"0.1.5","enabled":false}"#).expect("receipt");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\nmkdir -p '{dir}'\nprintf '#!/bin/sh\\nexit 0\\n' > '{e}'\nchmod +x '{e}'\n",
+                dir = entrypoint.parent().expect("bin").display(),
+                e = entrypoint.display()
+            ),
+        );
+        manager.restore_markitdown_after_rebuild();
+        assert!(manager.markitdown_installed());
+        assert!(
+            !manager.tool_enabled("markitdown"),
+            "disabled stays disabled"
+        );
+
+        // The reinstall fails: nothing may keep pointing agents at the shim.
+        fs::remove_file(&entrypoint).expect("drop entrypoint");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
+        let claude_md = home.join(".claude").join("CLAUDE.md");
+        fs::write(
+            &claude_md,
+            "mine\n# >>> headroom:markitdown_office >>>\nrun the shim\n# <<< headroom:markitdown_office <<<\n",
+        )
+        .expect("nudge");
+        manager.restore_markitdown_after_rebuild();
+        assert!(!receipt.exists(), "receipt removed");
+        assert!(!manager.markitdown_shim_path().exists(), "shim removed");
+        let md = fs::read_to_string(&claude_md).expect("CLAUDE.md");
+        assert!(!md.contains("markitdown_office"), "{md}");
+        assert!(md.starts_with("mine\n"), "{md}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Every wheel bump downloaded a new wheel and nothing removed the old
+    /// ones (290 MB of headroom_ai 0.5.17..0.39.0 on one machine).
+    #[test]
+    fn commit_headroom_upgrade_prunes_superseded_wheels() {
+        let (root, runtime, manager) = seed_test_runtime("prune-downloads");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            br#"{"version":"0.39.0"}"#,
+        )
+        .expect("receipt");
+        let downloads = &runtime.downloads_dir;
+        let kept = [
+            "headroom_ai-0.39.0-cp310-abi3-macosx_11_0_arm64.whl",
+            "headroom_ai-0.39.0-py3-none-any.whl",
+            "python-standalone.tar.gz",
+            "headroom-requirements.lock",
+            "msvc_runtime-14.44.35208-py3-none-win_amd64.whl",
+        ];
+        let stale = [
+            "headroom_ai-0.38.0-py3-none-any.whl",
+            "headroom_ai-0.39.01-py3-none-any.whl",
+            "headroom_ai-0.5.17-py3-none-any.whl",
+        ];
+        for name in kept.iter().chain(&stale) {
+            fs::write(downloads.join(name), b"x").expect("seed download");
+        }
+        manager.commit_headroom_upgrade().expect("commit");
+        for name in kept {
+            assert!(downloads.join(name).exists(), "{name} must be kept");
+        }
+        for name in stale {
+            assert!(!downloads.join(name).exists(), "{name} must be pruned");
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
