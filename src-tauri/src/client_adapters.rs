@@ -4975,12 +4975,18 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Vec<Cod
 /// the table by header rather than the Headroom marker block, which the
 /// upstream registrar can mis-place around unrelated user tables.
 pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
-    let path = codex_config_toml_path();
+    pin_toml_mcp_command(&codex_config_toml_path(), entrypoint)
+}
+
+/// The shared rewrite behind [`pin_codex_mcp_command`] and
+/// [`pin_grok_mcp_command`]: both CLIs read the same `[mcp_servers.headroom]`
+/// table shape.
+fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
     let content =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let target_line = format!(
         "command = {}",
@@ -5049,8 +5055,8 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
             path.display()
         )
     })?;
-    let _ = backup_if_exists(&path)?;
-    atomic_write(&path, rebuilt.as_bytes())?;
+    let _ = backup_if_exists(path)?;
+    atomic_write(path, rebuilt.as_bytes())?;
     Ok(Some(path.display().to_string()))
 }
 
@@ -5778,54 +5784,7 @@ fn opencode_user_state_exists() -> bool {
 /// `command = "headroom"` that relies on PATH, which dangles when the managed
 /// runtime relocates.
 pub fn pin_grok_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
-    let path = grok_config_toml_path();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-
-    let target_line = format!(
-        "command = {}",
-        toml_basic_string(&entrypoint.to_string_lossy())
-    );
-
-    let mut in_headroom_table = false;
-    let mut replaced = false;
-    let mut out: Vec<String> = Vec::with_capacity(content.lines().count());
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_headroom_table = trimmed == "[mcp_servers.headroom]";
-            out.push(line.to_string());
-            continue;
-        }
-        if in_headroom_table
-            && !replaced
-            && trimmed
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "command")
-        {
-            out.push(target_line.clone());
-            replaced = true;
-            continue;
-        }
-        out.push(line.to_string());
-    }
-
-    if !replaced {
-        return Ok(None);
-    }
-    let mut rebuilt = out.join("\n");
-    if content.ends_with('\n') {
-        rebuilt.push('\n');
-    }
-    if rebuilt == content {
-        return Ok(None);
-    }
-    let _ = backup_if_exists(&path)?;
-    atomic_write(&path, rebuilt.as_bytes())?;
-    Ok(Some(path.display().to_string()))
+    pin_toml_mcp_command(&grok_config_toml_path(), entrypoint)
 }
 
 fn toml_basic_string(value: &str) -> String {
@@ -5948,20 +5907,52 @@ fn codex_guard_hook_path() -> PathBuf {
     codex_home().join("hooks").join("headroom-codex-guard.py")
 }
 
-/// Interpreter used by the Claude/Codex session-start guard hooks. On macOS
-/// and Linux the system `/usr/bin/python3` (>=3.9) is always present. On
-/// Windows there's no such guarantee -- bare `python` on a stock box is
-/// either absent from PATH or the Microsoft Store stub that opens the Store
-/// instead of running -- so point at the managed runtime's own bundled
-/// interpreter, which this app installs regardless of what's on PATH.
+/// Interpreter used by the Claude/Codex session-start guard hooks: the system
+/// `/usr/bin/python3` when it actually runs, else the managed runtime's own
+/// interpreter, which this app installs regardless of what's on PATH. Windows
+/// always takes the managed one -- bare `python` on a stock box is either
+/// absent from PATH or the Microsoft Store stub that opens the Store instead of
+/// running -- as does a Mac without the Command Line Tools (the xcode-select
+/// shim) or a Linux distro without /usr/bin/python3.
 fn guard_python_command() -> String {
-    if cfg!(target_os = "windows") {
-        let managed =
-            crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir()).managed_python();
-        format!("\"{}\"", managed.display())
-    } else {
-        "/usr/bin/python3".to_string()
+    guard_python_for(!cfg!(target_os = "windows") && system_python_usable())
+}
+
+/// Quoted in the fallback: the macOS path has "Application Support".
+fn guard_python_for(system_python_ok: bool) -> String {
+    if system_python_ok {
+        return "/usr/bin/python3".to_string();
     }
+    let managed =
+        crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir()).managed_python();
+    format!("\"{}\"", managed.display())
+}
+
+/// Whether `/usr/bin/python3` runs, probed once per process (the guard command
+/// is rebuilt on every verify).
+fn system_python_usable() -> bool {
+    static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USABLE.get_or_init(|| {
+        python_usable(
+            Path::new("/usr/bin/xcode-select"),
+            Path::new("/usr/bin/python3"),
+        )
+    })
+}
+
+/// On macOS `xcode-select -p` goes first: it is the only check that does not
+/// pop the "install developer tools" dialog when the Command Line Tools are
+/// missing. It is not enough on its own -- a macOS upgrade can leave the
+/// tools without xcrun, an Xcode license can be unaccepted -- so the
+/// interpreter itself must also run.
+fn python_usable(xcode_select: &Path, python: &Path) -> bool {
+    let runs = |program: &Path, args: &[&str]| {
+        let mut command = crate::proc::command(program);
+        command.args(args);
+        crate::proc::output_with_timeout(command, Duration::from_secs(10))
+            .is_ok_and(|out| out.status.success())
+    };
+    (!cfg!(target_os = "macos") || runs(xcode_select, &["-p"])) && runs(python, &["-S", "-c", ""])
 }
 
 /// Join the guard interpreter and its script into a command string the host
@@ -5996,7 +5987,7 @@ fn join_guard_command(python: &str, script: &str, windows: bool, powershell: boo
     match (windows, powershell) {
         (true, true) => format!("& {python} \"{script}\""),
         (true, false) => format!("{python} \"{script}\""),
-        (false, _) => format!("{python} {script}"),
+        (false, _) => format!("{python} {}", shell_word(Path::new(script))),
     }
 }
 
@@ -6703,30 +6694,35 @@ fn report_unparseable_guard_command(command: &str) {
     static CHECKED: Once = Once::new();
     CHECKED.call_once(|| {
         let bash = windows_bash_command();
-        let status = crate::proc::command(bash.trim_matches('"'))
-            .arg("-n")
-            .arg("-c")
-            .arg(command)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if let Ok(status) = status {
-            // bash reports a syntax error as exit 2. Any other failure is the
-            // resolved `bash.exe` not being a bash at all -- the WSL launcher
-            // on a box without Git for Windows exits 1 without parsing
-            // (RUST-C6, two hosts) -- and says nothing about the command.
-            if status.code() == Some(2) {
-                log::warn!(
+        let mut probe = crate::proc::command(bash.trim_matches('"'));
+        probe.arg("-n").arg("-c").arg(command);
+        // Bounded: a bash that is the WSL launcher boots the user's WSL VM to
+        // parse this, and a wedged WSL never returns -- inside this Once that
+        // blocked every later Claude Code setup for the life of the process.
+        match crate::proc::output_with_timeout(probe, Duration::from_secs(10)) {
+            Err(crate::proc::OutputError::TimedOut) => {
+                log::info!("claude guard bash canary skipped: bash timed out");
+            }
+            Err(crate::proc::OutputError::Spawn(_)) => {}
+            Ok(out) => {
+                let status = out.status;
+                // bash reports a syntax error as exit 2. Any other failure is the
+                // resolved `bash.exe` not being a bash at all -- the WSL launcher
+                // on a box without Git for Windows exits 1 without parsing
+                // (RUST-C6, two hosts) -- and says nothing about the command.
+                if status.code() == Some(2) {
+                    log::warn!(
                     "claude guard command does not parse under bash (exit {:?}, call_operator={}); \
                      SessionStart hooks will fail until the command form is fixed",
                     status.code(),
                     command.starts_with('&')
                 );
-            } else if !status.success() {
-                log::info!(
-                    "claude guard bash canary skipped: bash exited {:?} without parsing",
-                    status.code()
-                );
+                } else if !status.success() {
+                    log::info!(
+                        "claude guard bash canary skipped: bash exited {:?} without parsing",
+                        status.code()
+                    );
+                }
             }
         }
     });
@@ -7093,11 +7089,7 @@ fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
         // creating the file would claim a config the user never made.
         return Ok((Vec::new(), Vec::new()));
     }
-    let python_ok = crate::proc::command("/usr/bin/xcode-select")
-        .arg("-p")
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !python_ok {
+    if !system_python_usable() {
         remove_vscode_process_wrapper()?;
         return Ok((Vec::new(), Vec::new()));
     }
@@ -9788,14 +9780,12 @@ fn chatgpt_app_path() -> Option<PathBuf> {
     }
 }
 
-/// Locate the Codex CLI binary the same way [`detect_codex_client`] does: known
-/// install locations first, then a PATH lookup. Used as the Headroom Learn
-/// analysis backend (`codex exec`) for Codex sessions.
+/// Locate a Codex CLI that actually runs, for the Headroom Learn analysis
+/// backend (`codex exec`). Smoke-tested like the MCP/plugin paths: the first
+/// `codex` that merely exists can be an x86_64 leftover in /usr/local that
+/// fails with ENOEXEC on an arm64 Mac without Rosetta.
 pub(crate) fn detect_codex_cli() -> Option<PathBuf> {
-    codex_candidate_paths()
-        .into_iter()
-        .find(|path| path.exists())
-        .or_else(|| find_on_path(&["codex"]))
+    crate::claude_cli::detect_codex_cli()
 }
 
 /// True once the user has signed in to Codex with their ChatGPT account — the
@@ -14420,10 +14410,73 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
-    fn unix_guard_command_is_unquoted() {
+    fn unix_guard_command_quotes_only_a_spaced_script_path() {
         let cmd =
             super::join_guard_command("/usr/bin/python3", "/home/g/.claude/guard.py", false, false);
         assert_eq!(cmd, "/usr/bin/python3 /home/g/.claude/guard.py");
+        // A home dir with a space would split the argument and python exits 2.
+        let cmd = super::join_guard_command(
+            "/usr/bin/python3",
+            "/Users/Jane Doe/.claude/guard.py",
+            false,
+            false,
+        );
+        assert_eq!(cmd, "/usr/bin/python3 '/Users/Jane Doe/.claude/guard.py'");
+    }
+
+    /// Regression: on a Mac without the Command Line Tools /usr/bin/python3 is
+    /// the xcode-select shim, and on some Linux distros it does not exist, so a
+    /// hardcoded system interpreter failed the guard at every session start.
+    /// Without a usable system python the guard runs on the managed runtime's
+    /// interpreter, quoted because the macOS path has "Application Support".
+    #[test]
+    fn guard_python_falls_back_to_the_managed_interpreter_without_system_python() {
+        let _home = TestHome::new();
+        let managed =
+            crate::tool_manager::ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir())
+                .managed_python();
+        assert_eq!(
+            super::guard_python_for(false),
+            format!("\"{}\"", managed.display())
+        );
+        if !cfg!(target_os = "windows") {
+            assert_eq!(super::guard_python_for(true), "/usr/bin/python3");
+        }
+    }
+
+    /// Regression: after a macOS upgrade left the Command Line Tools without
+    /// xcrun, `xcode-select -p` still passed while the /usr/bin/python3 shim
+    /// exited 1, so the VS Code wrapper (shebang /usr/bin/python3) stayed set
+    /// and every panel session failed to start. The interpreter itself must run.
+    #[cfg(unix)]
+    #[test]
+    fn system_python_probe_requires_the_interpreter_to_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = tmp.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let select_ok = script("xcode-select", "exit 0");
+        let select_missing = script("xcode-select-missing", "exit 2");
+        let shim = script(
+            "python3-shim",
+            "echo 'xcrun: error: invalid active developer path, missing xcrun' >&2; exit 1",
+        );
+        let python = script("python3", "exit 0");
+        assert!(!super::python_usable(&select_ok, &shim));
+        assert!(!super::python_usable(
+            &select_ok,
+            &tmp.path().join("absent")
+        ));
+        assert!(super::python_usable(&select_ok, &python));
+        if cfg!(target_os = "macos") {
+            // Without the Command Line Tools the shim is never run: running it
+            // pops the "install developer tools" dialog.
+            assert!(!super::python_usable(&select_missing, &python));
+        }
     }
 
     /// Regression: Claude Code moved to bash for hook commands on Windows
@@ -17662,6 +17715,64 @@ sys.exit(3)
         );
         assert!(after.contains("[mcp_servers.headroom.env]"));
         assert!(!after.contains("headroom.cli"));
+    }
+
+    /// Regression: the Grok pin rewrote only `command`, so a registrar that
+    /// wrote `<python> -m headroom.cli mcp serve` left Grok spawning
+    /// `headroom -m headroom.cli ...`, which click rejects, and the MCP server
+    /// never started in Grok.
+    #[test]
+    #[serial_test::serial]
+    fn pin_grok_mcp_command_normalizes_python_module_args() {
+        let home = TestHome::new();
+        let grok = home.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        let config = grok.join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.headroom]\n\
+             command = \"/somewhere/venv/bin/python3\"\n\
+             args = [\n  \"-m\",\n  \"headroom.cli\",\n  \"mcp\",\n  \"serve\",\n]\n\
+             \n\
+             [mcp_servers.headroom.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n",
+        )
+        .unwrap();
+
+        let entrypoint = home.path().join("venv/bin/headroom");
+        assert!(super::pin_grok_mcp_command(&entrypoint).unwrap().is_some());
+
+        let after = std::fs::read_to_string(&config).unwrap();
+        let parsed: toml::Value = toml::from_str(&after).expect("rebuilt config parses");
+        let server = &parsed["mcp_servers"]["headroom"];
+        assert_eq!(
+            server["command"].as_str(),
+            Some(entrypoint.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            server["args"],
+            toml::Value::Array(vec!["mcp".into(), "serve".into()]),
+            "python -m args must be normalized, got:\n{after}"
+        );
+        assert!(after.contains("[mcp_servers.headroom.env]"));
+    }
+
+    /// Regression: the Learn backend took the first `codex` that merely
+    /// existed, so an x86_64 leftover on an arm64 Mac without Rosetta (or any
+    /// binary that cannot run) was handed to `headroom learn` and failed every
+    /// run. Candidates must pass the same smoke test the MCP/plugin paths use.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn detect_codex_cli_skips_a_codex_that_does_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        let bin = home.path().join(".local").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let broken = bin.join("codex");
+        std::fs::write(&broken, b"\x00\x01\x02\x03not a binary").unwrap();
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(super::detect_codex_cli(), Some(broken));
     }
 
     #[test]
