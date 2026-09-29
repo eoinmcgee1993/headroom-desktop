@@ -66,6 +66,15 @@ fn known_path_candidates_for_platform(home: PathBuf, name: &str, windows: bool) 
         home.join(".npm-global").join("bin").join(name),
         home.join(".volta").join("bin").join(name),
         home.join(".bun").join("bin").join(name),
+        // The rest of the dirs Codex client detection (`codex_candidate_paths`)
+        // checks, so Learn and the plugin host resolve every codex the UI
+        // reports as installed.
+        home.join(".cargo").join("bin").join(name),
+        home.join("bin").join(name),
+        home.join(".yarn").join("bin").join(name),
+        home.join(".asdf").join("shims").join(name),
+        home.join(".mise").join("shims").join(name),
+        home.join(".nodenv").join("shims").join(name),
         PathBuf::from(format!("/usr/bin/{name}")),
     ];
     if !windows {
@@ -487,6 +496,35 @@ mod tests {
 
         let candidates = vec![tmp.path().join("missing"), broken];
         assert!(first_runnable(candidates.into_iter()).is_none());
+    }
+
+    /// Regression: Codex Learn moved onto this resolver, which skipped the
+    /// yarn/cargo/~/bin dirs and the asdf/mise/nodenv shims that Codex client
+    /// detection checks. From the Dock (launchd's bare PATH, login-shell probe
+    /// missed) a yarn-global codex showed as installed while Learn refused it.
+    #[test]
+    #[cfg(unix)]
+    fn known_path_candidates_find_a_cli_in_user_bin_and_shim_dirs() {
+        let tmp = ScopedTempDir::new("known_user_dirs");
+        // Unique name: no real install in /opt/homebrew or /usr/local shadows it.
+        let name = "headroom-test-known-dir-cli";
+        for dir in [
+            ".cargo/bin",
+            "bin",
+            ".yarn/bin",
+            ".asdf/shims",
+            ".mise/shims",
+            ".nodenv/shims",
+        ] {
+            let bin = tmp.path().join(dir);
+            fs::create_dir_all(&bin).unwrap();
+            let cli = bin.join(name);
+            make_executable(&cli);
+            let found =
+                first_runnable(known_path_candidates(tmp.path().to_path_buf(), name).into_iter());
+            assert_eq!(found, Some(cli.clone()), "{dir}");
+            fs::remove_file(&cli).unwrap();
+        }
     }
 
     #[test]
