@@ -6056,7 +6056,8 @@ async fn save_upstream_override(
 /// before either is touched, and only ever takes back out what Headroom itself
 /// wrote there.
 ///
-/// A provider is refused while the user has Headroom paused: the pause took
+/// A provider is refused while the user has Headroom paused (or the clients
+/// are unwired from an unidentified 6767 holder): the pause took
 /// Headroom's ANTHROPIC_BASE_URL out of ~/.claude/settings.json, so its token
 /// and model ids would go to Anthropic (or the user's own gateway) until
 /// Resume. Off still saves, it only takes Headroom's values back out.
@@ -6065,8 +6066,15 @@ fn apply_upstream_save(
     next: &mut crate::state::UpstreamOverride,
     token: Option<&str>,
 ) -> Result<(), String> {
-    if next.mode != crate::state::UpstreamOverrideMode::Off && keeps_user_pause(state) {
-        return Err("Resume Headroom to change provider.".into());
+    if next.mode != crate::state::UpstreamOverrideMode::Off {
+        if keeps_user_pause(state) {
+            return Err("Resume Headroom to change provider.".into());
+        }
+        // Same leak as a pause: the port-holder unwire took Headroom's
+        // ANTHROPIC_BASE_URL out too, without pausing.
+        if client_adapters::clients_unwired_for_port_holder() {
+            return Err(client_adapters::PORT_HOLDER_REFUSAL.into());
+        }
     }
     client_adapters::apply_upstream_client_config(&state.upstream_override(), next, token)
 }
@@ -9151,9 +9159,14 @@ static LAST_USER_CONNECTOR_DISABLE: Mutex<Option<std::time::Instant>> = Mutex::n
 /// they did it. The window covers the loop's lag in noticing (a 2s connector
 /// re-check plus a 5s idle tick); a real disconnect inside it still changes
 /// the icon and tooltip, it only goes unannounced.
+///
+/// Nor while the clients are unwired from an unidentified 6767 holder:
+/// reconnecting would route them to that listener, and the port-reclaim
+/// rewire brings them back on its own.
 fn disconnect_notice_due(last_non_booting: Option<TrayRuntimeVisual>) -> bool {
     const USER_DISABLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
     last_non_booting == Some(TrayRuntimeVisual::Running)
+        && !client_adapters::clients_unwired_for_port_holder()
         && !LAST_USER_CONNECTOR_DISABLE
             .lock()
             .is_some_and(|at| at.elapsed() < USER_DISABLE_WINDOW)
@@ -11131,6 +11144,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn switching_a_connector_off_does_not_announce_a_disconnect() {
         assert!(
             super::disconnect_notice_due(Some(TrayRuntimeVisual::Running)),
@@ -11142,6 +11156,15 @@ mod tests {
             "the user just switched it off in the app"
         );
         *super::LAST_USER_CONNECTOR_DISABLE.lock() = None;
+        // "Open Headroom to reconnect them" would route the clients to the
+        // unidentified 6767 holder the unwire keeps them from.
+        // Under the HOME lock: an apply_client_setup elsewhere is refused
+        // while the flag is set.
+        let _env_lock = crate::test_env_lock::lock_home();
+        crate::client_adapters::set_clients_unwired_for_port_holder(true);
+        let due = super::disconnect_notice_due(Some(TrayRuntimeVisual::Running));
+        crate::client_adapters::set_clients_unwired_for_port_holder(false);
+        assert!(!due, "announced a port-holder unwire as a disconnect");
     }
 
     #[test]
@@ -14466,6 +14489,22 @@ Some unrelated content.
     #[test]
     #[serial_test::serial]
     fn a_user_paused_provider_save_writes_no_token() {
+        assert_provider_save_writes_no_token(|state| state.set_runtime_paused(true));
+    }
+
+    /// Integration review: the port-holder unwire takes ANTHROPIC_BASE_URL out
+    /// the same way without pausing, so the same save leaked the same token.
+    #[test]
+    #[serial_test::serial]
+    fn a_provider_save_during_a_port_holder_unwire_writes_no_token() {
+        assert_provider_save_writes_no_token(|_| {
+            crate::client_adapters::set_clients_unwired_for_port_holder(true)
+        });
+    }
+
+    /// Runs `setup` under the HOME lock, which every test that wires a client
+    /// holds, so the port-holder flag it may set reaches no other test.
+    fn assert_provider_save_writes_no_token(setup: impl FnOnce(&crate::state::AppState)) {
         let _env_lock = crate::test_env_lock::lock_home();
         let home = tempfile::tempdir().expect("temp home");
         let prev_home = std::env::var_os("HOME");
@@ -14477,7 +14516,7 @@ Some unrelated content.
         std::fs::write(&settings, "{}").unwrap();
 
         let state = crate::state::AppState::new_in(home.path().join("state")).expect("app state");
-        state.set_runtime_paused(true);
+        setup(&state);
         let preset = crate::client_adapters::provider_preset("glm").expect("glm preset");
         let mut glm = crate::state::UpstreamOverride {
             mode: crate::state::UpstreamOverrideMode::Override,
@@ -14496,6 +14535,7 @@ Some unrelated content.
         let token = crate::upstream_override::read_token();
         let mut off = crate::state::UpstreamOverride::default();
         let off_saved = super::apply_upstream_save(&state, &mut off, None);
+        crate::client_adapters::set_clients_unwired_for_port_holder(false);
 
         match prev_home {
             Some(value) => std::env::set_var("HOME", value),

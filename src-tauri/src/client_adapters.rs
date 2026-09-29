@@ -384,6 +384,13 @@ fn shell_step_best_effort(
 }
 
 pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
+    // Every path that wires a client lands here (Resume, a provider save's
+    // restart, the Connectors page, the self-heal), and each would hand the
+    // unidentified 6767 holder this user's credentials. Only
+    // `rewire_clients_after_port_reclaimed` wires them back, after the port is ours.
+    if clients_unwired_for_port_holder() {
+        return Err(anyhow!(PORT_HOLDER_REFUSAL));
+    }
     let first = apply_client_setup_once(client_id)?;
     if first.verification.verified {
         return Ok(first);
@@ -1525,6 +1532,19 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
 /// Headroom cannot identify (see `unwire_clients_for_port_holder`).
 static CLIENTS_UNWIRED_FOR_PORT_HOLDER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Why a wiring or provider save is refused while the port-holder unwire holds.
+pub const PORT_HOLDER_REFUSAL: &str = "Another program is holding Headroom's port 6767. Headroom reconnects your coding tools once it is free; try again then.";
+
+/// Whether the clients are off because an unidentified listener holds 6767.
+pub fn clients_unwired_for_port_holder() -> bool {
+    CLIENTS_UNWIRED_FOR_PORT_HOLDER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn set_clients_unwired_for_port_holder(unwired: bool) {
+    CLIENTS_UNWIRED_FOR_PORT_HOLDER.store(unwired, std::sync::atomic::Ordering::Release);
+}
 
 /// Pause and quit. Also ends a port-holder unwire: the user's decision now
 /// stands, so reclaiming the port must not wire the clients back over it.
@@ -13926,6 +13946,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !super::unwire_clients_for_port_holder(),
             "nothing left wired, so a repeat claims nothing"
         );
+        // Resume, a provider save's restart and the Connectors page all wire
+        // through apply_client_setup; none may hand the holder the bearer.
+        super::restore_client_setups();
+        assert!(!super::is_claude_code_enabled(), "restore wired it back");
+        assert!(super::apply_client_setup("claude_code").is_err());
+        assert!(!super::is_claude_code_enabled(), "a manual apply wired it");
         super::rewire_clients_after_port_reclaimed();
         assert!(super::is_claude_code_enabled(), "the bind wires it back");
 
