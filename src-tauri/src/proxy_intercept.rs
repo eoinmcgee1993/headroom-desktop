@@ -181,8 +181,9 @@ static UPSTREAM_ERROR_LAST_REPORTED: Mutex<Vec<((&'static str, u16), u64)>> =
 const UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS: u64 = 300;
 /// Epoch-second of the last backend 502 whose body said the provider's TLS
 /// certificate could not be verified (a corporate proxy / antivirus re-signing
-/// HTTPS). Read by `runtime_status` to show the user what to do: the failure
-/// is otherwise invisible to them (Claude Code shows a generic 502) and to us
+/// HTTPS), or of a bypass forward that failed its own handshake that way.
+/// Read by `runtime_status` to show the user what to do: the failure is
+/// otherwise invisible to them (Claude Code shows a generic 502) and to us
 /// (5xx is not captured). 0 = never seen.
 static UPSTREAM_TLS_INTERCEPTION_LAST_SEEN: AtomicU64 = AtomicU64::new(0);
 const UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS: u64 = 15 * 60;
@@ -200,6 +201,17 @@ fn is_tls_interception_error(body: &[u8]) -> bool {
     contains(body, b"CERTIFICATE_VERIFY_FAILED")
         || contains(body, b"self-signed certificate in certificate chain")
         || contains(body, b"self signed certificate in certificate chain")
+}
+
+/// The same diagnosis for the bypass forwarder's own reqwest send: rustls
+/// found no trusted root for the provider's chain, which with the OS store
+/// loaded means an inspection root the machine does not trust either. The
+/// rustls error sits a few sources down (reqwest > hyper > io::Error).
+fn is_untrusted_certificate_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(err), |e| e.source()).any(|e| {
+        e.to_string()
+            .contains("invalid peer certificate: UnknownIssuer")
+    })
 }
 
 /// User-facing hint while certificate-verification failures are recent (within
@@ -2692,16 +2704,16 @@ static UPSTREAM_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLo
 
 fn upstream_client() -> &'static reqwest::Client {
     UPSTREAM_CLIENT.get_or_init(|| {
+        // Provider traffic takes the same env/system proxy and OS trust store
+        // the backend's httpx does: going around the proxy turned every gated
+        // request on a proxy-only network into a 502.
+        // proxy-ok: direct-to-provider forwarder, not loopback
         reqwest::Client::builder()
             // Connect timeout only — no overall timeout, since bypassed SSE
             // streams legitimately run for minutes. Without it, a
             // SYN-blackholed network hangs every bypass request until the
             // client's own deadline.
             .connect_timeout(std::time::Duration::from_secs(10))
-            // reqwest honors HTTP(S)_PROXY env vars by default, which would
-            // silently route "direct to provider" traffic through a corporate
-            // proxy the intercept path never uses.
-            .no_proxy()
             .build()
             .expect("reqwest client for bypass forwarder")
     })
@@ -2940,6 +2952,9 @@ async fn forward_direct_to_anthropic(
     let mut resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
+            if is_untrusted_certificate_error(&e) {
+                UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(now_epoch_secs(), Ordering::Relaxed);
+            }
             log::warn!("proxy_intercept bypass forward failed: {e}");
             let _ = client
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -3032,6 +3047,9 @@ async fn tunnel_upgrade_direct(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
+            if is_untrusted_certificate_error(&e) {
+                UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(now_epoch_secs(), Ordering::Relaxed);
+            }
             log::warn!("proxy_intercept bypass upgrade forward failed: {e}");
             let _ = client
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -4899,6 +4917,103 @@ mod tests {
             "hint must expire"
         );
         super::UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The bypass forwarder's own handshake failure is the same diagnosis as
+    /// the backend's CERTIFICATE_VERIFY_FAILED body, and used to leave the
+    /// user with a bare 502. rustls says it through an io::Error inside the
+    /// reqwest error, so the check walks the source chain.
+    #[test]
+    fn bypass_certificate_rejection_is_recognised_through_the_error_chain() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request for url (https://api.anthropic.com/v1/messages)")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let rejected = Outer(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert!(super::is_untrusted_certificate_error(&rejected));
+        let refused = Outer(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(!super::is_untrusted_certificate_error(&refused));
+    }
+
+    /// Gated and backend-down traffic goes direct through `upstream_client`.
+    /// It ignored every proxy, so on a network whose only way out is the proxy
+    /// each Claude Code and Codex request got a 502 for as long as the gate
+    /// held, while the backend's httpx used that proxy fine. Child process:
+    /// HTTPS_PROXY would reroute every other test's internet clients.
+    #[test]
+    fn direct_forwarder_goes_through_the_configured_proxy() {
+        if std::env::var_os("HEADROOM_TEST_PROXY_CHILD").is_some() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            // The fake proxy refuses the tunnel, so this errors either way;
+            // the parent checks where the connection went.
+            let _ = rt.block_on(
+                super::upstream_client()
+                    .get("https://upstream.invalid/v1/messages")
+                    .send(),
+            );
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let _ = std::io::Write::write_all(&mut stream, b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        });
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        child.args([
+            "proxy_intercept::tests::direct_forwarder_goes_through_the_configured_proxy",
+            "--exact",
+            "--test-threads=1",
+        ]);
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            child.env_remove(name);
+        }
+        let out = child
+            .env("HEADROOM_TEST_PROXY_CHILD", "1")
+            .env("HTTPS_PROXY", format!("http://127.0.0.1:{port}"))
+            .output()
+            .expect("run child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let seen = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_default();
+        assert!(
+            seen.starts_with("CONNECT upstream.invalid:443"),
+            "direct forward bypassed the proxy; proxy saw {seen:?}"
+        );
     }
 
     #[test]

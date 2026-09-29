@@ -8494,6 +8494,7 @@ const SERENA_DASHBOARD_PORT_SCAN: u16 = 4;
 fn fetch_serena_output_tokens(base_url: &str) -> Option<u64> {
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_millis(300))
         .build()
         .ok()?;
@@ -9547,6 +9548,7 @@ fn find_listener_command(port: u16) -> String {
 pub(crate) fn probe_backend_readyz_ok(port: u16) -> bool {
     let Ok(client) = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_millis(800))
         .build()
     else {
@@ -18795,6 +18797,92 @@ after
             super::fetch_serena_output_tokens(&format!("http://127.0.0.1:{dead_port}")),
             None
         );
+    }
+
+    /// A TLS-inspecting network (Zscaler, antivirus HTTPS scanning, a school
+    /// filter) re-signs github.com with a root the OS trusts and reqwest's
+    /// bundled webpki list does not, so the runtime download failed with
+    /// UnknownIssuer on every attempt and the install never finished.
+    /// rustls-native-certs reads SSL_CERT_FILE in place of the OS store, so a
+    /// file holding one unparsable certificate makes exactly the clients that
+    /// consult the OS store fail to build. Loopback probes run every few
+    /// seconds and must not pay that ~130ms load. Child process: the variable
+    /// would break every other test's clients while set.
+    #[test]
+    fn downloads_consult_the_os_trust_store_and_loopback_probes_do_not() {
+        if std::env::var_os("HEADROOM_TEST_UNPARSABLE_CA_CHILD").is_some() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    let mut buf = [0u8; 1024];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    );
+                }
+            });
+            assert!(
+                super::probe_backend_readyz_ok(port),
+                "a loopback probe loaded the OS trust store"
+            );
+            let dir = tempfile::tempdir().expect("tempdir");
+            let err = super::download_to_path_with_progress(
+                &format!("http://127.0.0.1:{port}/python.tar.gz"),
+                &dir.path().join("python.tar.gz"),
+                None,
+                |_, _| {},
+            )
+            .expect_err("the download client never consulted the OS trust store");
+            assert!(
+                format!("{err:#}").contains("building download client"),
+                "{err:#}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pem = dir.path().join("unparsable.pem");
+        fs::write(
+            &pem,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write pem");
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "tool_manager::tests::downloads_consult_the_os_trust_store_and_loopback_probes_do_not",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env("HEADROOM_TEST_UNPARSABLE_CA_CHILD", "1")
+            .env("SSL_CERT_FILE", &pem)
+            .env_remove("SSL_CERT_DIR")
+            .output()
+            .expect("run child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Finder, Login Items and Start launch the app with no HTTPS_PROXY, so on
+    /// a network whose only way out is the proxy set in System Settings or
+    /// WinINET, the runtime download, sign-in and the updater all went direct
+    /// and failed while the backend (httpx) and pip used that proxy.
+    /// `default-features = false` had dropped reqwest's system-proxy; the
+    /// OS proxy store cannot be injected from a test, so pin the manifest.
+    #[test]
+    fn reqwest_reads_the_os_proxy_settings_and_trust_store() {
+        let manifest = include_str!("../Cargo.toml");
+        let reqwest = manifest
+            .lines()
+            .find(|line| line.starts_with("reqwest = "))
+            .expect("reqwest dependency line");
+        for feature in ["\"system-proxy\"", "\"rustls-tls-native-roots\""] {
+            assert!(reqwest.contains(feature), "{feature} missing: {reqwest}");
+        }
     }
 
     #[test]

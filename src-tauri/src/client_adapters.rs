@@ -7857,6 +7857,7 @@ fn is_headroom_proxy_reachable() -> bool {
 fn probe_headroom_proxy() -> bool {
     let client = match reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_millis(500))
         .build()
     {

@@ -2104,6 +2104,10 @@ fn classify_bootstrap_failure(err: &anyhow::Error) -> BootstrapFailureKind {
     if haystack.contains("CERTIFICATE_VERIFY_FAILED")
         || haystack.contains("self-signed certificate in certificate chain")
         || haystack.contains("self signed certificate in certificate chain")
+        // rustls, for our own reqwest downloads: no root in the OS store or
+        // the bundled list signs the chain. Checked before the network needles
+        // because the same chain also says "error sending request".
+        || haystack.contains("invalid peer certificate: UnknownIssuer")
     {
         BootstrapFailureKind::SslInterception
     } else if is_ssl_library_conflict_signal(&haystack) {
@@ -2945,6 +2949,7 @@ fn probe_backend_readyz_with_body(timeout: std::time::Duration) -> (String, Opti
     let port = crate::backend_port::get();
     let client = match reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(timeout)
         .build()
     {
@@ -7486,6 +7491,7 @@ fn fetch_transformations_feed_from(
 ) -> Result<TransformationFeedResponse, String> {
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(TRANSFORMATIONS_FEED_TIMEOUT)
         .build()
         .map_err(|err| err.to_string())?;
@@ -12230,6 +12236,22 @@ mod tests {
         ));
     }
 
+    /// Our own reqwest download (python-build-standalone) says it the rustls
+    /// way. It also carries "error sending request", which read as a
+    /// temporary network hiccup and sent the user to Try again forever.
+    #[test]
+    fn classify_bootstrap_failure_flags_rustls_unknown_issuer_as_ssl_interception() {
+        let err = anyhow::anyhow!(
+            "error sending request for url (https://github.com/astral-sh/python-build-standalone/releases/x.tar.gz): \
+             client error (Connect): invalid peer certificate: UnknownIssuer"
+        )
+        .context("downloading https://github.com/astral-sh/python-build-standalone/releases/x.tar.gz");
+        assert!(matches!(
+            classify_bootstrap_failure(&err),
+            BootstrapFailureKind::SslInterception
+        ));
+    }
+
     #[test]
     fn classify_bootstrap_failure_flags_no_usable_temporary_directory() {
         let err: anyhow::Error = make_command_failure(
@@ -12535,6 +12557,10 @@ Some unrelated content.
     /// talks to the internet must keep honoring the proxy (corporate networks
     /// need it) and says so with a `// proxy-ok:` comment above the builder.
     /// Adding a client without either is the regression this guards.
+    ///
+    /// Loopback clients also call `.tls_built_in_root_certs(false)`: every
+    /// other build loads the OS trust store (~130ms on macOS), and the /stats,
+    /// feed and readyz polls build a client every few seconds over plain http.
     #[test]
     fn every_reqwest_client_decides_about_the_system_proxy() {
         // Split so this needle does not match its own source line.
@@ -12550,6 +12576,7 @@ Some unrelated content.
         ];
 
         let mut undecided = Vec::new();
+        let mut loads_trust_store = Vec::new();
         let mut decided = 0usize;
         for (name, source) in sources {
             let lines: Vec<&str> = source.lines().collect();
@@ -12569,8 +12596,18 @@ Some unrelated content.
                 } else {
                     undecided.push(format!("{name}:{}", i + 1));
                 }
+                if chain.contains(".no_proxy()")
+                    && !chain.contains(".tls_built_in_root_certs(false)")
+                {
+                    loads_trust_store.push(format!("{name}:{}", i + 1));
+                }
             }
         }
+        assert!(
+            loads_trust_store.is_empty(),
+            "loopback reqwest client(s) loading the OS trust store: {loads_trust_store:?}. \
+             Add .tls_built_in_root_certs(false) next to .no_proxy()."
+        );
 
         assert!(
             undecided.is_empty(),

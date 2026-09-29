@@ -1711,6 +1711,7 @@ impl AppState {
         // previous 1.5s timeout false-fired during those bursts.
         let client = match reqwest::blocking::Client::builder()
             .no_proxy()
+            .tls_built_in_root_certs(false)
             .timeout(Duration::from_secs(5))
             .build()
         {
@@ -7037,6 +7038,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     // fetch that still times out means the backend is genuinely starved.
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
         .build()
         .ok()?;
@@ -7118,6 +7120,7 @@ fn scrape_compression_quarantine() {
 
     let Ok(client) = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_secs(2))
         .build()
     else {
@@ -7149,6 +7152,7 @@ fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
 
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(Duration::from_millis(500))
         .build()
         .ok()?;
@@ -8761,6 +8765,7 @@ fn runtime_already_serving(
 fn probe_proxy_readyz(timeout: Duration) -> bool {
     let client = match reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .timeout(timeout)
         .build()
     {
