@@ -2795,13 +2795,27 @@ fn take_plugin_route(buf: &mut Vec<u8>) -> Option<(String, Option<String>)> {
 
 /// The URL the client would have called without Headroom: the plugin's
 /// origin, then the original path (an absolute one only, as the backend
-/// accepts) with this request's query, else this request's path. https only:
-/// the plugin routes remote providers, and plain http could name this
-/// intercept and loop.
+/// accepts) with this request's query, else this request's path. https, or
+/// plain http (a LAN Ollama or LiteLLM) to another host only, as the plugin
+/// routes: http to a loopback or unspecified host could name this intercept
+/// and loop.
 fn plugin_direct_url(origin: &str, original_path: Option<&str>, path: &str) -> Option<String> {
-    let origin = reqwest::Url::parse(origin.trim())
-        .ok()
-        .filter(|url| url.scheme() == "https" && url.host_str().is_some())?;
+    let origin = reqwest::Url::parse(origin.trim()).ok().filter(|url| {
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        match url.scheme() {
+            "https" => true,
+            "http" => {
+                !url_is_loopback(url.as_str())
+                    && !host
+                        .trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.to_canonical().is_unspecified())
+            }
+            _ => false,
+        }
+    })?;
     let path = match original_path {
         Some(original) if original.starts_with('/') && !original.starts_with("//") => {
             match path.split_once('?') {
@@ -3686,7 +3700,8 @@ fn request_is_loopback_safe(buf: &[u8]) -> bool {
     }
 }
 
-/// Whether `url` names this machine: localhost, 127.0.0.0/8 or ::1.
+/// Whether `url` names this machine: localhost, 127.0.0.0/8 or ::1, also
+/// written IPv4-mapped (::ffff:127.0.0.1).
 fn url_is_loopback(url: &str) -> bool {
     let Some(host) = reqwest::Url::parse(url).ok().and_then(|url| {
         url.host_str()
@@ -3697,7 +3712,7 @@ fn url_is_loopback(url: &str) -> bool {
     host == "localhost"
         || host
             .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 fn host_is_loopback(host: &str) -> bool {
@@ -5294,6 +5309,7 @@ mod tests {
             "http://127.0.0.2:3456/v1",
             "http://LOCALHOST:4000",
             "https://[::1]:8443/v1",
+            "http://[::ffff:127.0.0.1]:3456",
         ] {
             assert!(super::url_is_loopback(url), "{url}");
         }
@@ -6047,7 +6063,7 @@ mod tests {
     /// Plugin-routed requests (OpenCode's third-party providers, and Grok, whose
     /// upstream the intercept stamps) got 503-retry for the whole of a bypass
     /// or backend outage, so a watchdog give-up left them failing until the
-    /// backend came back. They go direct to the https origin the plugin named.
+    /// backend came back. They go direct to the origin the plugin named.
     #[tokio::test]
     #[serial]
     async fn plugin_routed_requests_go_direct_to_their_own_upstream() {
@@ -6079,12 +6095,23 @@ mod tests {
             plugin_direct_url("https://api.x.ai", None, "/v1/chat/completions").as_deref(),
             Some("https://api.x.ai/v1/chat/completions")
         );
-        // https only (plain http could name this intercept), and a relative
-        // original path is ignored like the backend ignores it.
+        // Plain http to a LAN gateway (Ollama, LiteLLM) goes direct too, but
+        // never to this machine, which could name this intercept and loop;
+        // and a relative original path is ignored like the backend ignores it.
         assert_eq!(
-            plugin_direct_url("http://127.0.0.1:6767", None, "/v1/x"),
-            None
+            plugin_direct_url("http://192.168.1.20:11434", None, "/v1/chat/completions").as_deref(),
+            Some("http://192.168.1.20:11434/v1/chat/completions")
         );
+        for origin in [
+            "http://127.0.0.1:6767",
+            "http://0.0.0.0:6767",
+            "http://[::]:6767",
+            "http://[::ffff:127.0.0.1]:6767",
+            "http://localhost:6767",
+            "ftp://h.example",
+        ] {
+            assert_eq!(plugin_direct_url(origin, None, "/v1/x"), None, "{origin}");
+        }
         assert_eq!(plugin_direct_url("not a url", None, "/v1/x"), None);
         assert_eq!(
             plugin_direct_url("https://h.example", Some("evil.example/x"), "/v1/responses")
