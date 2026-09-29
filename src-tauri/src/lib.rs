@@ -5781,13 +5781,7 @@ async fn save_upstream_override(
         replaced_env: Default::default(),
     };
     let state: tauri::State<'_, AppState> = app.state();
-    // Validates the rest before the keychain or settings.json is touched, and
-    // only ever takes back out what Headroom itself wrote there.
-    client_adapters::apply_upstream_client_config(
-        &state.upstream_override(),
-        &mut next,
-        token.as_deref(),
-    )?;
+    apply_upstream_save(&state, &mut next, token.as_deref())?;
     state.set_upstream_override(next.clone());
 
     // ANTHROPIC_TARGET_API_URL is read at boot, so the running proxy is still
@@ -5829,6 +5823,25 @@ async fn save_upstream_override(
         })),
     );
     Ok(next.into())
+}
+
+/// Write a save into the client config and the keychain. Validates the rest
+/// before either is touched, and only ever takes back out what Headroom itself
+/// wrote there.
+///
+/// A provider is refused while the user has Headroom paused: the pause took
+/// Headroom's ANTHROPIC_BASE_URL out of ~/.claude/settings.json, so its token
+/// and model ids would go to Anthropic (or the user's own gateway) until
+/// Resume. Off still saves, it only takes Headroom's values back out.
+fn apply_upstream_save(
+    state: &AppState,
+    next: &mut crate::state::UpstreamOverride,
+    token: Option<&str>,
+) -> Result<(), String> {
+    if next.mode != crate::state::UpstreamOverrideMode::Off && keeps_user_pause(state) {
+        return Err("Resume Headroom to change provider.".into());
+    }
+    client_adapters::apply_upstream_client_config(&state.upstream_override(), next, token)
 }
 
 /// Whether an upstream save must leave the runtime alone: the user paused
@@ -13474,6 +13487,59 @@ Some unrelated content.
         state.set_runtime_auto_paused(true);
         assert!(!super::keeps_user_pause(&state));
         let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    /// Review of #108: pausing takes Headroom's ANTHROPIC_BASE_URL out of
+    /// ~/.claude/settings.json, so a provider saved while paused wrote its
+    /// token and model ids for Claude Code to send straight to Anthropic (or
+    /// the user's own gateway) until Resume. Off still saves: it only takes
+    /// Headroom's values back out.
+    #[test]
+    #[serial_test::serial]
+    fn a_user_paused_provider_save_writes_no_token() {
+        let _env_lock = crate::test_env_lock::lock_home();
+        let home = tempfile::tempdir().expect("temp home");
+        let prev_home = std::env::var_os("HOME");
+        let prev_data_dir = std::env::var_os("HEADROOM_DATA_DIR");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("HEADROOM_DATA_DIR", home.path().join("data"));
+        let settings = home.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "{}").unwrap();
+
+        let state = crate::state::AppState::new_in(home.path().join("state")).expect("app state");
+        state.set_runtime_paused(true);
+        let preset = crate::client_adapters::provider_preset("glm").expect("glm preset");
+        let mut glm = crate::state::UpstreamOverride {
+            mode: crate::state::UpstreamOverrideMode::Override,
+            base_url: preset.base_url.into(),
+            provider: "glm".into(),
+            model: preset.model.into(),
+            small_model: preset.small_model.into(),
+            context_window: preset.context_window.into(),
+            ..Default::default()
+        };
+        let refused = super::apply_upstream_save(&state, &mut glm, Some("sk-glm"));
+        let env =
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&settings).unwrap())
+                .unwrap()["env"]
+                .clone();
+        let token = crate::upstream_override::read_token();
+        let mut off = crate::state::UpstreamOverride::default();
+        let off_saved = super::apply_upstream_save(&state, &mut off, None);
+
+        match prev_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_data_dir {
+            Some(value) => std::env::set_var("HEADROOM_DATA_DIR", value),
+            None => std::env::remove_var("HEADROOM_DATA_DIR"),
+        }
+        assert!(refused.is_err(), "a paused provider save went through");
+        assert!(env["ANTHROPIC_AUTH_TOKEN"].is_null(), "{env}");
+        assert_eq!(token, None);
+        assert_eq!(off_saved, Ok(()));
     }
 
     #[test]

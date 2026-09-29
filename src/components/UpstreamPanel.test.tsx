@@ -220,17 +220,27 @@ describe("UpstreamPanel", () => {
   });
 
   /// Audit #108: a save while the user paused Headroom no longer restarts it,
-  /// so the panel must not say it did.
-  it("saves without claiming a restart while paused", async () => {
-    respond(off, configured);
+  /// so the panel must not say it did. Review of #108: pausing took Headroom's
+  /// base URL out of Claude Code's settings, so a provider token written now
+  /// would go to Anthropic until Resume -- only turning it off can be saved.
+  it("only lets a paused user turn the provider off", async () => {
+    respond(configured, off);
     const user = userEvent.setup();
     render(<UpstreamPanel paused />);
 
     await screen.findByLabelText("Provider");
-    await user.selectOptions(screen.getByLabelText("Provider"), "glm");
-    await user.type(screen.getByLabelText("Provider auth token"), "secret-token");
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    expect(screen.getByText(/Resume Headroom to change provider/)).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("Provider"), "");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith(
+        "save_upstream_override",
+        expect.objectContaining({ mode: "off" })
+      );
+    });
     expect(await screen.findByText(/when you resume/)).toBeInTheDocument();
     expect(screen.queryByText(/restarted/)).not.toBeInTheDocument();
   });

@@ -12,7 +12,9 @@ const CUSTOM = "custom";
 /// context window, so the user only supplies a token; picking Anthropic clears
 /// all of it. Saving restarts the proxy -- the upstream is read at boot, so a
 /// running proxy keeps serving the previous one -- unless the user paused
-/// Headroom, in which case Resume picks it up.
+/// Headroom, in which case Resume picks it up. While paused only Off saves:
+/// the pause took Headroom's base URL out of Claude Code's settings, so a
+/// provider token written then would go to Anthropic until Resume.
 export function UpstreamPanel({ paused = false }: { paused?: boolean }) {
   const [providers, setProviders] = useState<ProviderPresetView[]>([]);
   const [provider, setProvider] = useState("");
@@ -77,6 +79,8 @@ export function UpstreamPanel({ paused = false }: { paused?: boolean }) {
   // the field has to ask for one.
   const endpoint = preset ? preset.baseUrl : baseUrl.trim().replace(/\/+$/, "");
   const tokenStored = hasToken && endpoint === savedBaseUrl;
+  // The backend refuses this too; disabling says why before the round trip.
+  const blockedByPause = paused && configured;
 
   const save = useCallback(async () => {
     setBusy(true);
@@ -98,7 +102,7 @@ export function UpstreamPanel({ paused = false }: { paused?: boolean }) {
       apply(saved);
       setNotice(
         paused
-          ? "Saved. Takes effect when you resume Headroom."
+          ? "Provider removed. Takes effect when you resume Headroom."
           : saved.mode === "off"
             ? "Provider removed. Headroom restarted on Anthropic."
             : "Saved. Headroom restarted on this provider.",
@@ -232,7 +236,7 @@ export function UpstreamPanel({ paused = false }: { paused?: boolean }) {
           <div className="upstream-panel__actions">
             <button
               className="secondary-button secondary-button--small"
-              disabled={busy}
+              disabled={busy || blockedByPause}
               onClick={() => void save()}
               type="button"
             >
@@ -259,6 +263,9 @@ export function UpstreamPanel({ paused = false }: { paused?: boolean }) {
             ) : null}
           </div>
 
+          {blockedByPause ? (
+            <p className="upstream-panel__meta">Resume Headroom to change provider.</p>
+          ) : null}
           {error ? <p className="install-progress__error">{error}</p> : null}
           {notice ? <p className="install-progress__notice">{notice}</p> : null}
         </div>
