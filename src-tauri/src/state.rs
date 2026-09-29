@@ -8934,7 +8934,8 @@ fn windows_process_sweep_script(
         format!(
             "try {{ Get-Process -ErrorAction Stop \
              | Where-Object {{ $_.Id -ne $PID -and $_.Id -ne $me -and $_.Path -like '*{exe_pattern}*' }} \
-             | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; exit 0 }} "
+             | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; exit 0 }} \
+             catch {{ }} "
         )
     } else {
         String::new()
@@ -13347,6 +13348,55 @@ mod tests {
     /// must carry the parent rule, and must drop our own children when the
     /// caller does not hold the lifecycle lock.
     #[test]
+    #[cfg(target_os = "windows")]
+    fn every_windows_sweep_script_runs_in_real_powershell() {
+        // String assertions cannot catch a PowerShell parse error: rc10 shipped
+        // a fallback `try` without its `catch`, so the whole venv-lock sweep
+        // failed to parse and never killed a holder. Run each shape for real
+        // against an exe nothing is running from; exit 0 means it parsed and
+        // the query ran.
+        let exe = std::path::Path::new(r"C:\headroom-sweep-test\none\headroom.exe");
+        for (args, parents) in [
+            ("", super::SweepParents::Any),
+            ("proxy --port", super::SweepParents::Any),
+            ("", super::SweepParents::Orphans { own_children: true }),
+            (
+                "proxy --port",
+                super::SweepParents::Orphans {
+                    own_children: false,
+                },
+            ),
+        ] {
+            let script =
+                super::windows_process_sweep_script(exe, args, std::process::id(), parents);
+            for (label, prefix) in [
+                ("wmi", ""),
+                // The fallback path, and both of its exits.
+                ("no-wmi", "function Get-CimInstance { throw 'broken' }; "),
+                (
+                    "no-wmi-no-get-process",
+                    "function Get-CimInstance { throw 'broken' }; function Get-Process { throw 'broken' }; ",
+                ),
+            ] {
+                let output = crate::proc::command("powershell")
+                    .args(["-NoProfile", "-NonInteractive", "-Command"])
+                    .arg(format!("{prefix}{script}"))
+                    .output()
+                    .expect("run powershell");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("ParserError"), "{label} {args:?}: {stderr}\n{script}");
+                let fallback = matches!(parents, super::SweepParents::Any) && args.is_empty();
+                let want = match label {
+                    "wmi" => 0,
+                    "no-wmi" if fallback => 0,
+                    _ => super::PS_SWEEP_ENUMERATION_FAILED,
+                };
+                assert_eq!(output.status.code(), Some(want), "{label} {args:?}: {stderr}\n{script}");
+            }
+        }
+    }
+
+    #[test]
     fn the_windows_sweep_script_filters_on_parent() {
         use super::windows_process_sweep_script;
         let exe = std::path::Path::new(r"C:\Users\a\venv\Scripts\headroom.exe");
@@ -13399,7 +13449,7 @@ mod tests {
                 "catch {{ try {{ Get-Process -ErrorAction Stop | Where-Object {{ $_.Id -ne $PID \
                  -and $_.Id -ne $me -and $_.Path -like '*C:\\Users\\a\\venv\\Scripts\\headroom.exe*' }} \
                  | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; \
-                 exit 0 }} exit {} }}; exit 0",
+                 exit 0 }} catch {{ }} exit {} }}; exit 0",
                 super::PS_SWEEP_ENUMERATION_FAILED
             )),
             "{any}"
