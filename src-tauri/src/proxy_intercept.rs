@@ -702,6 +702,43 @@ pub(crate) enum HeldPortVerdict {
     /// A live foreign listener. Does not clear on its own, and we can name it,
     /// so this is the one the user can actually act on.
     Foreign { name: String, pid: u32 },
+    /// A live listener we could not name: the probe's connect was accepted,
+    /// but `listener_process` found nobody. Another user's socket does this
+    /// (lsof and ss only see the caller's own processes), and so does a
+    /// Windows host whose policy blocks netstat. Never `Draining`: that would
+    /// turn on `SO_REUSEADDR`, which on Windows binds beside a live listener.
+    Unidentified,
+}
+
+/// What answered a connect to 127.0.0.1 on the probed port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortProbe {
+    /// Nothing accepted the connect within the timeout.
+    Refused,
+    /// A listener answered `GET /health` with HTTP. Says nothing about WHO:
+    /// see `held_by_our_other_window`.
+    Http,
+    /// A listener accepted the connect but did not answer with HTTP.
+    NonHttp,
+}
+
+/// The `bind_error` holder for `HeldPortVerdict::Unidentified`, worded for the
+/// ` is held by ` arm of `state::intercept_bind_hint`.
+const UNIDENTIFIED_HOLDER: &str =
+    "a program Headroom cannot identify, such as another signed-in user's Headroom";
+
+/// Whether the port's holder is another window of this same Headroom, run by
+/// this same user: the one holder a second window may stand beside as a
+/// spectator, because clients reaching it are still optimized for this user.
+///
+/// An HTTP answer alone proves only that something speaks HTTP. Bazarr's
+/// default port is 6767, and another signed-in user's Headroom answers exactly
+/// like ours; calling either a spectator told this user their traffic was
+/// being optimized while it went to that process, credentials included, and
+/// skipped the diagnosis that names the holder. `is_twin` shells out, so it
+/// only runs once the probe has answered.
+fn held_by_our_other_window(probe: PortProbe, is_twin: impl FnOnce() -> bool) -> bool {
+    probe == PortProbe::Http && is_twin()
 }
 
 /// Whether a verdict makes a `SO_REUSEADDR` rebind safe.
@@ -719,11 +756,13 @@ pub(crate) fn verdict_permits_reuse(verdict: &HeldPortVerdict) -> bool {
 
 pub(crate) fn classify_held_port(
     occupant: Option<(String, u32)>,
+    probe: PortProbe,
     elapsed: std::time::Duration,
     drain_grace: std::time::Duration,
 ) -> HeldPortVerdict {
     match occupant {
         Some((name, pid)) => HeldPortVerdict::Foreign { name, pid },
+        None if probe != PortProbe::Refused => HeldPortVerdict::Unidentified,
         None if elapsed < drain_grace => HeldPortVerdict::Draining,
         None => HeldPortVerdict::Stuck,
     }
@@ -843,13 +882,16 @@ pub fn spawn(
                         Ok(()) => return,
                         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                             consecutive_failures += 1;
-                            // If /health responds over HTTP, an existing
-                            // Headroom proxy owns the port (single-instance
-                            // plugin should normally prevent this, but a
-                            // crashed or still-exiting prior process can leave
-                            // it held) — benign, just wait for it to go away.
-                            // Otherwise the port is foreign; escalate once.
-                            if probe_existing_intercept().await {
+                            // If our other window serves the port (the
+                            // single-instance plugin should normally prevent
+                            // this, but a crashed or still-exiting prior
+                            // process can leave it held) it is benign, just
+                            // wait for it to go away. Anything else, HTTP or
+                            // not, goes through the diagnosis below.
+                            let probe = probe_port(INTERCEPT_PORT).await;
+                            if held_by_our_other_window(probe, || {
+                                crate::tool_manager::port_held_by_desktop_twin(INTERCEPT_PORT)
+                            }) {
                                 // Name the real cause. `bind_error` is only
                                 // ever cleared by a successful bind and this
                                 // arm never binds, so whatever an earlier
@@ -1023,6 +1065,7 @@ pub fn spawn(
                                 let key = os_error_key(&e);
                                 let verdict = classify_held_port(
                                     occupant,
+                                    probe,
                                     launched_at.elapsed(),
                                     DRAIN_GRACE,
                                 );
@@ -1150,6 +1193,37 @@ pub fn spawn(
                                             );
                                         }
                                     }
+                                    HeldPortVerdict::Unidentified => {
+                                        log::warn!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} has a live listener that could not be identified; retrying in 15s ({e})"
+                                        );
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} is held by {UNIDENTIFIED_HOLDER}"
+                                        ));
+                                        if reported_errors.insert(format!("unidentified:{key}")) {
+                                            sentry::with_scope(
+                                                |scope| {
+                                                    scope.set_extra(
+                                                        "os_error", e.to_string().into());
+                                                    scope.set_extra(
+                                                        "probe", format!("{probe:?}").into());
+                                                    scope.set_fingerprint(Some(&[
+                                                        "proxy_intercept_bind_failed",
+                                                        "unidentified",
+                                                        key.as_str(),
+                                                    ]));
+                                                },
+                                                || {
+                                                    sentry::capture_message(
+                                                        &format!(
+                                                            "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} held by a listener that could not be identified; retrying)"
+                                                        ),
+                                                        sentry::Level::Error,
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1247,10 +1321,11 @@ fn reap_orphans_holding_intercept() -> bool {
 /// `SO_REUSEADDR` on Windows also lets a bind succeed over a socket that is
 /// actively LISTENING, so using it unconditionally would let a second Headroom
 /// bind 6767 alongside the first and split traffic between two proxies -- the
-/// `probe_existing_intercept` branch relies on that bind failing. `Draining`
-/// is only reached when `listener_process` found nothing in LISTENING state,
-/// which rules out both another Headroom and a foreign holder, leaving the
-/// kernel's TIME_WAIT reservation as the only thing this can bind over.
+/// spectator branch relies on that bind failing. `Draining` is only reached
+/// when `listener_process` found nothing in LISTENING state AND the probe's
+/// connect was refused, which rules out both another Headroom and a foreign
+/// holder, leaving the kernel's TIME_WAIT reservation as the only thing this
+/// can bind over.
 #[cfg(windows)]
 fn reuse_bound_std_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -3336,24 +3411,27 @@ fn is_hop_by_hop_response_header(name: &str) -> bool {
     )
 }
 
-/// Return true if something at 127.0.0.1:INTERCEPT_PORT answers /health with a
-/// response that begins with `HTTP/` — that matches both our intercept (which
-/// forwards to the python backend and may return 200 or 502) and no realistic
-/// foreign process we expect to encounter on this port.
-async fn probe_existing_intercept() -> bool {
-    let connect = TcpStream::connect(("127.0.0.1", INTERCEPT_PORT));
+/// Connect to 127.0.0.1:`port` and ask `/health`. Only a completed connect
+/// proves a live listener; an answer beginning `HTTP/` proves it speaks HTTP,
+/// which our intercept does (200 or 502) and so does any other web server.
+async fn probe_port(port: u16) -> PortProbe {
+    let connect = TcpStream::connect(("127.0.0.1", port));
     let Ok(Ok(mut stream)) = tokio::time::timeout(PROBE_TIMEOUT, connect).await else {
-        return false;
+        return PortProbe::Refused;
     };
     let req = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
     if stream.write_all(req).await.is_err() {
-        return false;
+        return PortProbe::NonHttp;
     }
     let mut buf = [0u8; 16];
     let Ok(Ok(n)) = tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut buf)).await else {
-        return false;
+        return PortProbe::NonHttp;
     };
-    buf.get(..n).is_some_and(|b| b.starts_with(b"HTTP/"))
+    if buf.get(..n).is_some_and(|b| b.starts_with(b"HTTP/")) {
+        PortProbe::Http
+    } else {
+        PortProbe::NonHttp
+    }
 }
 
 /// Read through the end of the HTTP headers from `stream` into `buf`.
@@ -3753,19 +3831,19 @@ mod tests {
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
         codex_error_summary, codex_prompt_failed, codex_snapshot_from_usage_payload,
         codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
-        find_header_end, grok_upstream_header, intercept_request_counts, is_claude_session_id,
-        is_client_probe_path, is_codex_request_head, is_codex_sse_response,
+        find_header_end, grok_upstream_header, held_by_our_other_window, intercept_request_counts,
+        is_claude_session_id, is_client_probe_path, is_codex_request_head, is_codex_sse_response,
         is_compression_refused_error, is_geo_blocked_codex_error, is_hop_by_hop_request_header,
         is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
         is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        plugin_direct_url, read_http_headers, request_has_header, request_is_loopback_safe,
-        request_uses_chatgpt_auth, response_content_type, run, sanitize_stale_tool_references,
-        should_report_throttled, should_report_upstream_error, stamp_client_header,
-        stamp_codex_client_header, stamp_headroom_bypass_header, stamp_request_header,
-        strip_request_header, take_plugin_route, verdict_permits_reuse, BypassFlag,
-        CodexTerminalReader, HeldPortVerdict, ParsedRequestHead, ResponseSniffer, SharedToken,
-        FIRST_OPTIMIZED_REQUEST_REPORTED,
+        plugin_direct_url, probe_port, read_http_headers, request_has_header,
+        request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type, run,
+        sanitize_stale_tool_references, should_report_throttled, should_report_upstream_error,
+        stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
+        stamp_request_header, strip_request_header, take_plugin_route, verdict_permits_reuse,
+        BypassFlag, CodexTerminalReader, HeldPortVerdict, ParsedRequestHead, PortProbe,
+        ResponseSniffer, SharedToken, FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -3810,7 +3888,12 @@ mod tests {
     #[test]
     fn a_listener_less_port_inside_the_grace_is_draining_not_an_error() {
         assert_eq!(
-            classify_held_port(None, std::time::Duration::from_secs(120), HELD_GRACE),
+            classify_held_port(
+                None,
+                PortProbe::Refused,
+                std::time::Duration::from_secs(120),
+                HELD_GRACE
+            ),
             HeldPortVerdict::Draining
         );
     }
@@ -3821,7 +3904,12 @@ mod tests {
     #[test]
     fn the_relaunch_grace_alone_does_not_cover_the_windows_drain() {
         assert_eq!(
-            classify_held_port(None, std::time::Duration::from_secs(91), HELD_GRACE),
+            classify_held_port(
+                None,
+                PortProbe::Refused,
+                std::time::Duration::from_secs(91),
+                HELD_GRACE
+            ),
             HeldPortVerdict::Draining
         );
     }
@@ -3860,7 +3948,12 @@ mod tests {
     #[test]
     fn a_listener_less_port_past_the_grace_is_stuck() {
         assert_eq!(
-            classify_held_port(None, std::time::Duration::from_secs(301), HELD_GRACE),
+            classify_held_port(
+                None,
+                PortProbe::Refused,
+                std::time::Duration::from_secs(301),
+                HELD_GRACE
+            ),
             HeldPortVerdict::Stuck
         );
     }
@@ -3872,6 +3965,7 @@ mod tests {
         assert_eq!(
             classify_held_port(
                 Some(("Affinity".into(), 54915)),
+                PortProbe::Http,
                 std::time::Duration::from_secs(1),
                 HELD_GRACE
             ),
@@ -3887,6 +3981,7 @@ mod tests {
         assert_eq!(
             classify_held_port(
                 Some(("node".into(), 99)),
+                PortProbe::NonHttp,
                 std::time::Duration::from_secs(9_999),
                 HELD_GRACE
             ),
@@ -3895,6 +3990,43 @@ mod tests {
                 pid: 99
             }
         );
+    }
+
+    /// Finding 41: Bazarr's default port is 6767, and another signed-in
+    /// user's Headroom answers HTTP exactly like ours. Only our own twin makes
+    /// this window a spectator; any other HTTP holder goes to the diagnosis
+    /// that names it.
+    #[test]
+    fn an_http_answer_alone_does_not_make_this_window_a_spectator() {
+        assert!(!held_by_our_other_window(PortProbe::Http, || false));
+        assert!(held_by_our_other_window(PortProbe::Http, || true));
+        assert!(!held_by_our_other_window(PortProbe::NonHttp, || true));
+        assert!(!held_by_our_other_window(PortProbe::Refused, || true));
+    }
+
+    /// Finding 131: a listener that accepted the probe but that netstat (or
+    /// lsof, for another user's socket) could not name is still live, so it
+    /// must never read as a draining port and turn on SO_REUSEADDR beside it.
+    #[tokio::test]
+    async fn an_unnamed_listener_that_accepted_the_probe_is_never_draining() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = sock.write_all(b"SSH-2.0-OpenSSH\r\n").await;
+        });
+        let probe = probe_port(port).await;
+        server.await.expect("server");
+        assert_eq!(probe, PortProbe::NonHttp);
+        let verdict =
+            classify_held_port(None, probe, std::time::Duration::from_secs(1), HELD_GRACE);
+        assert_eq!(verdict, HeldPortVerdict::Unidentified);
+        assert!(!verdict_permits_reuse(&verdict));
+        // Unchanged: a refused connect with nobody named is still draining.
+        let closed = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let closed_port = closed.local_addr().expect("local_addr").port();
+        drop(closed);
+        assert_eq!(probe_port(closed_port).await, PortProbe::Refused);
     }
     use tokio::time::{timeout, Duration};
 

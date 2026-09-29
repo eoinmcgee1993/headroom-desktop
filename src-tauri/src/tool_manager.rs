@@ -9743,9 +9743,10 @@ pub(crate) fn reclaim_stranded_intercept_holder(port: u16) -> bool {
     true
 }
 
-/// True when `pid` runs the same executable as this process. The strictest
-/// identity claim available: an updater-stranded old instance runs from the
-/// exact same install path as us, while any foreign process cannot.
+/// True when `pid` runs the same executable as this process, as this same user
+/// (see `ps_row_command_if_owned_by`). The strictest identity claim available:
+/// an updater-stranded old instance runs from the exact same install path as
+/// us, while any foreign process cannot.
 fn pid_is_headroom_desktop_twin(pid: u32) -> bool {
     let Some(me) = std::env::current_exe()
         .ok()
@@ -9764,14 +9765,43 @@ fn pid_is_headroom_desktop_twin(pid: u32) -> bool {
     #[cfg(not(windows))]
     let theirs = {
         let Ok(output) = crate::proc::command("/bin/ps")
-            .args(["-o", "command=", "-p", &pid.to_string()])
+            .args(["-o", "uid=", "-o", "command=", "-p", &pid.to_string()])
             .output()
         else {
             return false;
         };
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let my_uid = unsafe { libc::getuid() };
+        let row = String::from_utf8_lossy(&output.stdout);
+        let Some(command) = ps_row_command_if_owned_by(&row, my_uid) else {
+            return false;
+        };
+        command.to_owned()
     };
     exe_identity_matches(&theirs, &me)
+}
+
+/// The command of a `ps -o uid= -o command=` row, when `uid` owns it.
+///
+/// One install serves every user of a Mac (/Applications) or a .deb, so the
+/// same executable path is not the same owner: another signed-in user's
+/// Headroom passes the path check, and treating it as our twin would make this
+/// window its spectator (routing this user's credentials into it) or point a
+/// reclaim kill at it. Windows needs no such check: the NSIS install is per
+/// user, so the path already differs, and OpenProcess is denied on another
+/// user's process anyway.
+#[cfg_attr(windows, allow(dead_code))]
+fn ps_row_command_if_owned_by(row: &str, uid: u32) -> Option<&str> {
+    let (owner, command) = row.trim_start().split_once(char::is_whitespace)?;
+    (owner.parse::<u32>().ok()? == uid).then_some(command)
+}
+
+/// Whether `port` is served by another window of this same Headroom, run by
+/// this same user. `listener_process` names only what it can see, so `None`
+/// (another user's socket, which lsof and ss cannot see, or a host whose
+/// policy blocks netstat) is never ours.
+pub(crate) fn port_held_by_desktop_twin(port: u16) -> bool {
+    listener_process(port).is_some_and(|(_, pid)| pid_is_headroom_desktop_twin(pid))
 }
 
 /// True when `listener_exe` -- a bare exe path (Windows `Get-Process .Path`)
@@ -16566,6 +16596,23 @@ mod tests {
         ));
         assert!(!super::exe_identity_matches("", me));
         assert!(!super::exe_identity_matches(me, ""));
+    }
+
+    /// Finding 38: every user of a Mac runs the same /Applications binary, so
+    /// the path alone would make another signed-in user's Headroom our twin
+    /// and this window its spectator, with this user's traffic going into it.
+    #[test]
+    fn a_same_path_headroom_run_by_another_user_is_not_our_twin() {
+        let me = "/Applications/Headroom.app/Contents/MacOS/headroom-desktop";
+        assert_eq!(
+            super::ps_row_command_if_owned_by(&format!("  501 {me} --flag\n"), 501),
+            Some(format!("{me} --flag\n").as_str())
+        );
+        assert_eq!(
+            super::ps_row_command_if_owned_by(&format!("  502 {me}\n"), 501),
+            None
+        );
+        assert_eq!(super::ps_row_command_if_owned_by("", 501), None);
     }
 
     #[test]
