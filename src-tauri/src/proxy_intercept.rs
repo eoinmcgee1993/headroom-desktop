@@ -163,6 +163,12 @@ static BACKEND_DOWN_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 static CODEX_INFLIGHT_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 static CODEX_STREAM_NO_TERMINAL_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 const CODEX_RECONNECT_REPORT_MIN_INTERVAL_SECS: u64 = 60;
+/// Consecutive failed Codex prompts; any success resets it. See
+/// `note_codex_prompt_outcome`.
+static CODEX_PROMPT_FAILURE_STREAK: AtomicU64 = AtomicU64::new(0);
+/// Codex retries a 5xx or dropped stream about five times before it gives up on
+/// a turn, so ten in a row is at least one turn the user saw fail.
+const CODEX_FAILURE_STREAK_REPORT_AT: u64 = 10;
 /// Last-reported epoch-seconds per (client, status) for `report_upstream_error`:
 /// one Sentry event per error class per interval. A client looping on a 4xx
 /// (RUST-BT: one host, 472 events of the same 400 in 19h, 4/min in bursts)
@@ -520,6 +526,7 @@ struct CodexTerminalReader<R> {
     inner: R,
     tail: Vec<u8>,
     saw_terminal: bool,
+    failed: bool,
 }
 
 impl<R> CodexTerminalReader<R> {
@@ -528,6 +535,7 @@ impl<R> CodexTerminalReader<R> {
             inner,
             tail: Vec::new(),
             saw_terminal: false,
+            failed: false,
         }
     }
 
@@ -549,14 +557,22 @@ impl<R> CodexTerminalReader<R> {
         ];
         const TAIL_BYTES: usize = 32;
 
+        // The subset of terminals that end the turn in an error Codex shows
+        // the user (a bare "System error" in the ChatGPT app).
+        const FAILURE_EVENTS: &[&[u8]] = &[b"response.failed", b"event: error"];
+
         let mut combined = Vec::with_capacity(self.tail.len() + bytes.len());
         combined.extend_from_slice(&self.tail);
         combined.extend_from_slice(bytes);
-        self.saw_terminal = TERMINAL_EVENTS.iter().any(|needle| {
-            combined
-                .windows(needle.len())
-                .any(|window| window == *needle)
-        });
+        let hit = |needles: &[&[u8]]| {
+            needles.iter().any(|needle| {
+                combined
+                    .windows(needle.len())
+                    .any(|window| window == *needle)
+            })
+        };
+        self.saw_terminal = hit(TERMINAL_EVENTS);
+        self.failed = self.saw_terminal && hit(FAILURE_EVENTS);
         let keep_from = combined.len().saturating_sub(TAIL_BYTES);
         self.tail.clear();
         self.tail.extend_from_slice(&combined[keep_from..]);
@@ -564,6 +580,10 @@ impl<R> CodexTerminalReader<R> {
 
     fn saw_terminal(&self) -> bool {
         self.saw_terminal
+    }
+
+    fn failed(&self) -> bool {
+        self.failed
     }
 }
 
@@ -1695,7 +1715,8 @@ async fn handle(
         splice_with_models_lite_rewrite(client, backend).await;
     } else if is_codex && !is_opencode && !is_grok {
         let req_path = parse_request_head(&buf).map(|p| p.path).unwrap_or_default();
-        splice_with_codex_capture(client, backend, &codex_slot, &req_path).await;
+        let prompt = parsed_head.as_ref().is_some_and(is_prompt_request_head);
+        splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt).await;
     } else {
         // Same shape as copy_bidirectional, split so the backend->client half
         // can stamp traffic liveness for the watchdog.
@@ -1971,6 +1992,7 @@ async fn splice_with_codex_capture(
     mut backend: TcpStream,
     codex_slot: &CodexRateLimitSlot,
     req_path: &str,
+    prompt: bool,
 ) {
     let (mut client_rd, mut client_wr) = client.split();
     let (mut backend_rd, mut backend_wr) = backend.split();
@@ -2018,11 +2040,13 @@ async fn splice_with_codex_capture(
         if client_wr.write_all(&head).await.is_err() {
             return;
         }
+        let status = parse_response_status(&head);
+        let mut error_body = Vec::new();
         // On an upstream error status, peek one bounded chunk of the error
         // body for a Sentry report and forward it immediately. Codex error
         // responses are small JSON (not the SSE stream), so the streaming
         // happy path never takes this branch.
-        if let Some(status) = parse_response_status(&head).filter(is_reportable_upstream_error) {
+        if let Some(status) = status.filter(is_reportable_upstream_error) {
             let mut chunk = vec![0u8; MAX_ERROR_BODY];
             let n = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, backend_rd.read(&mut chunk))
                 .await
@@ -2035,6 +2059,10 @@ async fn splice_with_codex_capture(
                 return;
             }
             report_upstream_error("codex", status, req_path, &head, &chunk);
+            if let Some(end) = find_header_end(&head) {
+                error_body.extend_from_slice(&head[(end + 4).min(head.len())..]);
+            }
+            error_body.extend_from_slice(&chunk);
         }
         let monitor_terminal = is_codex_sse_response(&head, req_path);
         let mut streamed = CodexTerminalReader::new(backend_rd);
@@ -2061,10 +2089,94 @@ async fn splice_with_codex_capture(
         {
             report_codex_stream_without_terminal(req_path, copy_result.unwrap_or(0));
         }
+        if prompt {
+            note_codex_prompt_outcome(
+                status,
+                streamed.failed(),
+                client_gone.load(Ordering::Relaxed),
+                req_path,
+                &error_body,
+            );
+        }
         let _ = client_wr.shutdown().await;
     };
 
     tokio::join!(upstream, downstream);
+}
+
+/// Whether a Codex prompt failed in a way the user saw: `Some(true)` failed,
+/// `Some(false)` succeeded, `None` says nothing either way. 402/429 are the
+/// user's plan, which Codex names itself; a response that never started
+/// because the client left first is a cancel.
+fn codex_prompt_failed(
+    status: Option<u16>,
+    stream_failed: bool,
+    client_gone: bool,
+) -> Option<bool> {
+    match status {
+        Some(200..=299) => Some(stream_failed),
+        Some(402 | 429) => None,
+        Some(_) => Some(true),
+        None if client_gone => None,
+        None => Some(true),
+    }
+}
+
+/// Report a Codex user who cannot get any prompt through. Codex retries a 5xx
+/// or a dropped stream on its own and, once that budget is spent, shows a bare
+/// "System error" in the ChatGPT app. Each of those classes stays out of Sentry
+/// per request on purpose (5xx is provider noise, see `report_upstream_error`;
+/// an in-band `response.failed` rides a 200), which left a user whose every
+/// prompt failed with no trace at all (user 3277, 2026-09-29: one RUST-KC,
+/// then nothing). An unbroken run is the signal: report once when the run
+/// reaches the threshold, and the next success re-arms it.
+fn note_codex_prompt_outcome(
+    status: Option<u16>,
+    stream_failed: bool,
+    client_gone: bool,
+    req_path: &str,
+    error_body: &[u8],
+) {
+    match codex_prompt_failed(status, stream_failed, client_gone) {
+        None => return,
+        Some(false) => {
+            CODEX_PROMPT_FAILURE_STREAK.store(0, Ordering::Relaxed);
+            return;
+        }
+        Some(true) => {}
+    }
+    if CODEX_PROMPT_FAILURE_STREAK.fetch_add(1, Ordering::AcqRel) + 1
+        != CODEX_FAILURE_STREAK_REPORT_AT
+    {
+        return;
+    }
+    let kind = match status {
+        None => "no_response",
+        Some(200..=299) => "stream_error",
+        Some(_) => "status",
+    };
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("codex_failure_kind", kind);
+            if let Some(status) = status {
+                scope.set_tag("upstream_status", status);
+            }
+            scope.set_tag("upstream_request_path", req_path);
+            if !error_body.is_empty() {
+                scope.set_tag("upstream_error_shape", codex_error_shape_tag(error_body));
+                scope.set_extra("error_body", codex_error_summary(error_body).into());
+            }
+            scope.set_fingerprint(Some(&["codex-prompts-failing", kind]));
+        },
+        || {
+            sentry::capture_message(
+                &format!(
+                    "Codex prompts failing: {CODEX_FAILURE_STREAK_REPORT_AT} in a row ({kind})"
+                ),
+                sentry::Level::Warning,
+            );
+        },
+    );
 }
 
 /// Bound on the error-body slice we peek for a Sentry report (and forward).
@@ -3736,13 +3848,13 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
-        codex_error_summary, codex_snapshot_from_usage_payload, codex_window_label,
-        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
-        grok_upstream_header, intercept_request_counts, is_claude_session_id, is_client_probe_path,
-        is_codex_request_head, is_codex_sse_response, is_compression_refused_error,
-        is_geo_blocked_codex_error, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
-        is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
-        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        codex_error_summary, codex_prompt_failed, codex_snapshot_from_usage_payload,
+        codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
+        find_header_end, grok_upstream_header, intercept_request_counts, is_claude_session_id,
+        is_client_probe_path, is_codex_request_head, is_codex_sse_response,
+        is_compression_refused_error, is_geo_blocked_codex_error, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
+        is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
         response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
@@ -4755,6 +4867,21 @@ mod tests {
         assert!(!errored.saw_terminal());
         errored.observe(b"event: error\ndata: {\"type\":\"error\"}\n\n");
         assert!(errored.saw_terminal());
+        assert!(errored.failed());
+        assert!(!reader.failed(), "response.completed is not a failure");
+    }
+
+    #[test]
+    fn codex_prompt_outcome_counts_only_what_the_user_saw_fail() {
+        // The classes the per-request capture drops are exactly the ones counted.
+        assert_eq!(codex_prompt_failed(Some(502), false, false), Some(true));
+        assert_eq!(codex_prompt_failed(Some(200), true, false), Some(true));
+        assert_eq!(codex_prompt_failed(None, false, false), Some(true));
+        // Success re-arms; plan limits and cancels say nothing.
+        assert_eq!(codex_prompt_failed(Some(200), false, false), Some(false));
+        assert_eq!(codex_prompt_failed(Some(429), false, false), None);
+        assert_eq!(codex_prompt_failed(Some(402), false, false), None);
+        assert_eq!(codex_prompt_failed(None, false, true), None);
     }
 
     #[test]

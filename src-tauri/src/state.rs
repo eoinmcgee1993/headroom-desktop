@@ -593,6 +593,8 @@ pub struct AppState {
     /// FETCH (and must expire fast on success, slowly on failure), this one
     /// stamps the last real ANSWER.
     last_good_headroom_stats: Mutex<Option<(HeadroomDashboardStats, Instant)>>,
+    /// Set while a `/stats` fetch is in flight; see `polled_headroom_stats`.
+    headroom_stats_fetch_in_flight: AtomicBool,
     /// `(history, fetched_at, fresh)` — `fresh` is false when `history` is a
     /// retained last-good value served because the latest fetch failed (proxy
     /// paused/unreachable), so it re-probes on the short miss TTL.
@@ -758,6 +760,7 @@ impl AppState {
             cached_clients: Mutex::new(None),
             cached_headroom_stats: Mutex::new(None),
             last_good_headroom_stats: Mutex::new(None),
+            headroom_stats_fetch_in_flight: AtomicBool::new(false),
             cached_headroom_history: Mutex::new(None),
             cached_rtk_gain_summary: Mutex::new(None),
             cached_rtk_today_stats: Mutex::new(None),
@@ -2314,15 +2317,31 @@ impl AppState {
         // Fetch with the guard dropped: holding it across the network call
         // (readyz probe + stats request, several seconds when the proxy is
         // down) serialized every concurrent dashboard builder behind one
-        // stalled fetch. A rare duplicate fetch is cheaper than that.
-        let started = Instant::now();
-        let stats = fetch_headroom_dashboard_stats();
-        let mut cache = self.cached_headroom_stats.lock();
-        // A timeout that outlived a concurrent success must not replace it:
-        // that held a miss for MISS_TTL over a fresh answer.
-        if stats.is_some() || !matches!(cache.as_ref(), Some((Some(_), at)) if *at > started) {
-            *cache = Some((stats.clone(), Instant::now()));
+        // stalled fetch. But only ONE fetch at a time: the cache is written
+        // when a fetch returns, so during a stall every poll (tray updater,
+        // dashboard) used to start its own. The backend single-flights its
+        // snapshot build, so those all waited on the same slow rebuild and
+        // timed out with it, and the second timeout read as a repeat and got
+        // past `lone_stats_stall` (RUST-86 on 0.9.26: secs_since_last_ok 35,
+        // zero requests). A caller arriving mid-fetch gets a miss, which the
+        // retained last-good payload covers.
+        if self
+            .headroom_stats_fetch_in_flight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return None;
         }
+        // Cleared on every exit, panics included: a stuck flag would stop
+        // `/stats` fetching for the process lifetime.
+        struct InFlight<'a>(&'a AtomicBool);
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _in_flight = InFlight(&self.headroom_stats_fetch_in_flight);
+        let stats = fetch_headroom_dashboard_stats();
+        *self.cached_headroom_stats.lock() = Some((stats.clone(), Instant::now()));
         stats
     }
 
@@ -6638,16 +6657,6 @@ fn lone_stats_stall(category: &str, since_previous_failure: Option<Duration>) ->
         && since_previous_failure.is_none_or(|gap| gap >= STATS_FETCH_RECOVERY_WINDOW)
 }
 
-/// Whether a `/stats` timeout was overtaken by a fetch that succeeded while it
-/// was still waiting. Callers fetch independently, so
-/// a slow request can time out after a newer one already refreshed the
-/// dashboard: RUST-86's only 0.9.25 event carried `secs_since_last_ok: 0`.
-/// The user saw fresh data, so there is nothing to report.
-fn stats_timeout_overtaken(category: &str, since_last_ok: Option<Duration>) -> bool {
-    category == "timeout"
-        && since_last_ok.is_some_and(|age| age < Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
-}
-
 fn total_intercept_requests() -> u64 {
     crate::proxy_intercept::intercept_request_counts()
         .values()
@@ -6701,13 +6710,6 @@ fn stats_fetch_failure_category(reason: &str) -> String {
 
 fn warn_stats_fetch_failed(reason: &str) {
     let category = stats_fetch_failure_category(reason);
-    let last_ok_age = (*STATS_FETCH_LAST_OK.lock()).map(|(at, _)| at.elapsed());
-    if stats_timeout_overtaken(&category, last_ok_age) {
-        // Not a failure the dashboard shows: leave the stall and recovery
-        // state exactly as the newer success left it.
-        log::info!("headroom /stats fetch failed ({reason}); a newer fetch already succeeded");
-        return;
-    }
     let previous_failure = STATS_FETCH_LAST_FAILED_AT.lock().replace(Instant::now());
     if lone_stats_stall(&category, previous_failure.map(|at| at.elapsed())) {
         // Still breaks a recovery run, but does not arm the backoff, so the
@@ -9943,15 +9945,15 @@ mod tests {
         pick_cache_fields, proxy_readyz_503_body_is_upstream_only,
         proxy_readyz_status_is_reachable, rebuild_persisted_savings_from_records,
         savings_rate_implausible, settle_rollup_backfill, stats_fetch_stall_context,
-        stats_fetch_warn_interval, stats_timeout_overtaken, support_tier_for_platform,
-        tcp_port_accepts_connection, tool_schema_savings_usd, top_models_by_requests,
-        total_dir_size_bytes, warn_stats_fetch_failed, AppState, BackfillSettle,
-        BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
-        PersistedSavingsState, RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
+        stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
+        tool_schema_savings_usd, top_models_by_requests, total_dir_size_bytes,
+        warn_stats_fetch_failed, AppState, BackfillSettle, BootValidationOutcome,
+        ClaudeProjectScan, DailySavingsBucket, Duration, HeadroomDashboardStats,
+        HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket, PersistedSavingsState,
+        RingStartTotals, SavingsObservation, SavingsRecord, SavingsTracker,
         OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_LAST_OK,
-        STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_TIMEOUT_SECS,
-        STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
+        STATS_FETCH_RECOVERED_AT, STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT,
+        STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -13505,18 +13507,6 @@ mod tests {
         );
     }
 
-    /// A sequential poll never fails within `STATS_FETCH_TIMEOUT_SECS` of a
-    /// success (12s cache TTL, then a 15s timeout), so age the last success
-    /// past that; a fresher one would read as an overtaken timeout.
-    fn age_last_stats_ok() {
-        let mut last_ok = STATS_FETCH_LAST_OK.lock();
-        if let Some((at, requests)) = *last_ok {
-            *last_ok = at
-                .checked_sub(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
-                .map(|aged| (aged, requests));
-        }
-    }
-
     #[test]
     #[serial_test::serial(stats_fetch_warn)]
     fn stats_fetch_warn_is_throttled_within_the_window() {
@@ -13595,7 +13585,6 @@ mod tests {
 
         // The next failure warns only when the window has elapsed, and it
         // breaks the recovery run.
-        age_last_stats_ok();
         warn_stats_fetch_failed("timed out after 15s");
         assert_eq!(
             (*STATS_FETCH_WARNED_AT.lock()).expect("still stamped").0,
@@ -13617,7 +13606,6 @@ mod tests {
                 "a sustained recovery clears the backoff"
             );
 
-            age_last_stats_ok();
             warn_stats_fetch_failed("timed out after 15s");
             let (_, streak) = (*STATS_FETCH_WARNED_AT.lock()).expect("loud again");
             assert_eq!(streak, 1, "a healed-then-broken cause warns immediately");
@@ -13628,21 +13616,19 @@ mod tests {
     }
 
     #[test]
-    fn a_stats_timeout_overtaken_by_a_newer_success_is_not_a_failure() {
-        // RUST-86 on 0.9.25: secs_since_last_ok was 0 -- a concurrent fetch
-        // had just refreshed the dashboard when this one gave up.
-        assert!(stats_timeout_overtaken("timeout", Some(Duration::ZERO)));
-        assert!(stats_timeout_overtaken(
-            "timeout",
-            Some(Duration::from_secs(14))
-        ));
-        assert!(!stats_timeout_overtaken(
-            "timeout",
-            Some(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
-        ));
-        assert!(!stats_timeout_overtaken("timeout", None));
-        // A 500 is our backend misbehaving whatever a sibling fetch saw.
-        assert!(!stats_timeout_overtaken("http-500", Some(Duration::ZERO)));
+    fn a_stats_poll_during_an_in_flight_fetch_does_not_start_another() {
+        // RUST-86 on 0.9.26: the tray updater and the dashboard each started
+        // a fetch during one slow rebuild, both timed out, and the second
+        // read as a repeat stall.
+        let state = AppState::new().expect("state");
+        state
+            .headroom_stats_fetch_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(state.polled_headroom_stats().is_none());
+        assert!(
+            state.cached_headroom_stats.lock().is_none(),
+            "a poll that did not fetch must not cache a miss"
+        );
     }
 
     #[test]
