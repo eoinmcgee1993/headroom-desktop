@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import * as Sentry from "@sentry/react";
 import App from "./App";
+import { CrashFallback } from "./components/CrashFallback";
 import "./styles.css";
 
 // Only macOS puts a vibrancy layer behind the webview. Elsewhere the window is
@@ -45,21 +46,6 @@ window.addEventListener("headroom:boot-complete", () => {
     hideBootLoading();
   });
 });
-
-// The window is frameless, undecorated and non-resizable, so a bare message
-// leaves the user with no way out but force-quitting from the tray. Reload is
-// the one recovery that works from inside the webview. `showDialog` is gone: it
-// pulls Sentry's report dialog from their CDN, which script-src 'self' blocks.
-function CrashFallback() {
-  return (
-    <div className="crash-fallback">
-      <p>Headroom hit an unexpected error.</p>
-      <button type="button" onClick={() => window.location.reload()}>
-        Reload
-      </button>
-    </div>
-  );
-}
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

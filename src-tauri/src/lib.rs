@@ -1943,7 +1943,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                 capture_headroom_start_failure("headroom auto-start failed after bootstrap", &err);
             }
             // Fall through so the user is not stuck on the install loader
-            // indefinitely. The test screen will show a retry option.
+            // indefinitely. The install screen shows the startup error instead.
         } else {
             port_conflict::note_proxy_started(&app_handle);
             // The intercept layer on 6767 is always bound by the Rust app, so

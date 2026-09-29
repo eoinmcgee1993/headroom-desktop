@@ -130,6 +130,7 @@ import {
   newInputSavingsRate,
   allTimeCacheHitPair,
   cacheHitPair,
+  calloutBannerFor,
   outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
@@ -142,6 +143,7 @@ import {
   dayOfMonthTickFormatter,
   earliestHourlyDay,
   earliestSavingsMonth,
+  endSentence,
   formatDateTime,
   formatDayKey,
   formatLearnStatus,
@@ -154,6 +156,7 @@ import {
   providerSpentTokens,
   percent1,
   sortClientConnectors,
+  splitIssue,
   startOfDay,
   startOfMonth,
   type SavingsChartDatum
@@ -1627,6 +1630,10 @@ export default function App() {
   // annual share of new subscriptions fell from 36% to 12%, with Max x20 annual
   // going to zero. Do not flip it without a measured reason.
   const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
+  // `lastAttemptAt` of the upgrade failure the user chose to continue past in
+  // the launcher. The record stays persisted (the dashboard banner still offers
+  // Retry and Dismiss); a newer failed attempt shows the screen again.
+  const [ackedUpgradeFailureAt, setAckedUpgradeFailureAt] = useState<string | null>(null);
   // Launcher stage is a single source of truth for which onboarding screen
   // is showing. Only one screen can be active at a time; transitions go
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
@@ -5127,6 +5134,8 @@ export default function App() {
     !runtimeUpgradeProgress.failed;
   const showUpgradeBanner =
     !runtimeUpgradeProgress.running && upgradeFailure !== null;
+  const upgradeFailureAcked =
+    upgradeFailure !== null && upgradeFailure.lastAttemptAt === ackedUpgradeFailureAt;
   const upgradeExhausted =
     upgradeFailure !== null && upgradeFailure.attempts >= MAX_UPGRADE_AUTO_RETRIES;
   const canDismissUpgradeFailure =
@@ -5249,7 +5258,9 @@ export default function App() {
   // launcher instead.
   if (
     windowLabel === "launcher" &&
-    (showUpgradeModal || showUpgradeSuccess || (showUpgradeBanner && upgradeFailure))
+    (showUpgradeModal ||
+      showUpgradeSuccess ||
+      (showUpgradeBanner && upgradeFailure && !upgradeFailureAcked))
   ) {
     return (
       <LauncherShell
@@ -5327,15 +5338,16 @@ export default function App() {
               >
                 Retry update
               </button>
+              {/* Hands the launcher back to its own stage. This screen
+                  outranks every stage while the failure is unacknowledged, so
+                  running the stage's Continue flow from here changed nothing
+                  on screen (and re-enabled connectors the user had turned off). */}
               <button
                 type="button"
                 className="secondary-button"
-                disabled={connectorsBusy}
-                onClick={() => void handleFirstLaunchContinue()}
+                onClick={() => setAckedUpgradeFailureAt(upgradeFailure.lastAttemptAt)}
               >
-                {connectorsBusy
-                  ? "Connecting your coding agents…"
-                  : "Continue with previous version"}
+                Continue with previous version
               </button>
               {upgradeFailure.failurePhase === "boot_validation" && (
                 <button
@@ -5375,6 +5387,12 @@ export default function App() {
     const stepProgress = Math.round(getStepProgress(bootstrapProgress) * 100);
     const renderPercent = animatedOverallPercent(bootstrapProgress);
     const installComplete = bootstrapProgress.complete || dashboard.bootstrapComplete;
+    // Why Headroom has not come up, once bootstrap is done: a 6767 bind hint or
+    // the backend's start error (both clear on success). Without it this screen
+    // sat on a disabled "Starting Headroom" button forever with the cause unsaid.
+    const startupDiagnosis = bootstrapProgress.running
+      ? null
+      : (runtimeStatus?.startupErrorHint ?? runtimeStatus?.startupError ?? null);
     const failedInstallUpdateLabel = appUpdateRestartBusy
       ? "Restarting…"
       : appUpdateInstallBusy
@@ -5454,7 +5472,16 @@ export default function App() {
             {bootstrapProgress.running ||
             (runtimeStatus?.running !== true && runtimeStatus?.bypassed !== true) ? (
               <>
-                <p className="launcher-install-notice">Starting Headroom for the first time (this can take 1-2 minutes)…</p>
+                <p className="launcher-install-notice">
+                  {startupDiagnosis
+                    ? "Headroom can't start yet:"
+                    : "Starting Headroom for the first time (this can take 1-2 minutes)…"}
+                </p>
+                {startupDiagnosis ? (
+                  <p className="launcher-install-notice install-progress__error">
+                    {startupDiagnosis}
+                  </p>
+                ) : null}
                 <button
                   className="primary-button primary-button--large primary-button--install launcher-step1-continue"
                   disabled
@@ -6205,20 +6232,8 @@ export default function App() {
     runtimeIssues.push("Kompress disabled");
   }
 
-  // A startup hint is prose: "what is wrong. What to do." The headline
-  // carries its first sentence and the rest renders underneath it. Short
-  // issue fragments ("proxy unreachable") have no sentence break and stay
-  // inline, joined as before.
-  const splitIssue = (issue: string): { lead: string; detail: string } => {
-    const cut = issue.search(/[.!?] (?=[A-Z])/);
-    return cut === -1
-      ? { lead: issue, detail: "" }
-      : { lead: issue.slice(0, cut + 1), detail: issue.slice(cut + 2) };
-  };
-  const endSentence = (text: string): string => (/[.!?]$/.test(text) ? text : `${text}.`);
   const primaryIssue = runtimeIssues.length > 0 ? splitIssue(runtimeIssues[0]) : null;
   const runtimeIssueDetail = primaryIssue?.detail ?? "";
-  const issueSummary = primaryIssue?.detail ? primaryIssue.lead : runtimeIssues.join(", ");
 
   const runtimeHealthy = Boolean(
     runtimeStatus &&
@@ -6237,109 +6252,14 @@ export default function App() {
     runtimeStatus?.headroomLearnDisabledReason ??
     "Headroom Learn is unavailable on this platform.";
 
-  const calloutBanner = (() => {
-    if (!runtimeStatus) {
-      return {
-        tone: "disconnected",
-        title: "Headroom status is unavailable."
-      } as const;
-    }
-
-    if (runtimeStatus.paused) {
-      if (runtimeStatus.autoPaused) {
-        return {
-          tone: "auto-paused",
-          title: "Headroom stopped unexpectedly. Traffic is passing through unoptimized."
-        } as const;
-      }
-      return {
-        tone: "paused",
-        title: "Headroom is paused."
-      } as const;
-    }
-
-    if (runtimeStatus.starting) {
-      return {
-        tone: "starting",
-        title: "Headroom is starting up."
-      } as const;
-    }
-
-    if (pricingStatus?.needsAuthentication) {
-      return {
-        tone: "degraded",
-        title: pricingStatus.gateMessage
-      } as const;
-    }
-
-    if (pricingStatus && !pricingStatus.optimizationAllowed) {
-      return {
-        tone: "disabled",
-        title: pricingStatus.gateMessage
-      } as const;
-    }
-
-    if (pricingStatus?.shouldNudge) {
-      return {
-        tone: "starting",
-        title: pricingStatus.gateMessage
-      } as const;
-    }
-
-    // Codex-only gate: surface in the top banner only when the Claude side isn't
-    // itself gating/nudging (handled above), so mixed users never get a double
-    // banner. Codex billing/pausing is scoped to Codex traffic.
-    const codexUsage = pricingStatus?.codex;
-    if (codexUsage && codexUsage.optimizationAllowed === false) {
-      return {
-        tone: "disabled",
-        title: codexUsage.gateMessage
-      } as const;
-    }
-    if (codexUsage?.shouldNudge) {
-      return {
-        tone: "starting",
-        title: codexUsage.gateMessage
-      } as const;
-    }
-
-    if (runtimeHealthy) {
-      if (connectorPhase === "disabled") {
-        return {
-          tone: "disabled",
-          title: "No coding tools connected, so Headroom isn't saving anything."
-        } as const;
-      }
-      if (connectorPhase === "verifying") {
-        return {
-          tone: "starting",
-          title: "Send a message in a connected tool to verify the connection is working. You may need to restart it first."
-        } as const;
-      }
-      if (kompressWarming) {
-        return {
-          tone: "healthy",
-          title: "Headroom is running while finishing setup."
-        } as const;
-      }
-      return {
-        tone: "healthy",
-        title: "Headroom is running and trimming prompt bloat."
-      } as const;
-    }
-
-    const disconnected = !runtimeStatus.installed || !runtimeStatus.running || !runtimeStatus.proxyReachable;
-    return {
-      tone: disconnected ? "disconnected" : "degraded",
-      title: disconnected
-        ? runtimeIssues.length > 0
-          ? endSentence(`Headroom is not hooked up right now: ${issueSummary}`)
-          : "Headroom is not hooked up right now."
-        : runtimeIssues.length > 0
-          ? endSentence(`Headroom needs attention: ${issueSummary}`)
-          : "Headroom is running, but something needs attention."
-    } as const;
-  })();
+  const calloutBanner = calloutBannerFor({
+    runtimeStatus,
+    pricingStatus,
+    runtimeIssues,
+    runtimeHealthy,
+    kompressWarming,
+    connectorPhase
+  });
 
   // A never-routed install sits in connectorPhase "verifying" indefinitely, so
   // this cannot key off the healthy tone alone - see shouldShowStallBannerLine.

@@ -3608,6 +3608,13 @@ impl AppState {
             headroom_learn_disabled_reason,
             startup_error,
             startup_error_hint,
+            // The spectator verdict is not a failure for the banner: another
+            // Headroom holds 6767 and its traffic still flows.
+            intercept_bind_failed: self
+                .intercept_bind_error
+                .lock()
+                .as_deref()
+                .is_some_and(|e| !e.contains("served by another Headroom instance")),
             upstream_tls_interception_hint: crate::proxy_intercept::upstream_tls_interception_hint(
             )
             .map(str::to_string),
