@@ -2002,8 +2002,8 @@ if failures:
 /// Same ledger-guarded register/unregister flow as `SERENA_MCP_HELPER`, for
 /// the Context7 MCP entry. The registered command is a bare `npx` (resolved
 /// from the agent session's own PATH, so nvm version switches don't strand an
-/// absolute path) running the pinned package. argv: `register <package-spec>`
-/// | `unregister`.
+/// absolute path) running the pinned package, wrapped in `cmd /c` on Windows.
+/// argv: `register <package-spec>` | `unregister`.
 const CONTEXT7_MCP_HELPER: &str = r#"
 import sys
 
@@ -2022,6 +2022,9 @@ from headroom.mcp_registry.ledger import (
 )
 
 action = sys.argv[1]
+# On Windows npx is an npx.cmd shim, which agents that spawn MCP servers
+# without a shell cannot start ("Windows requires 'cmd /c' wrapper").
+npx = ("cmd", "/c", "npx") if sys.platform == "win32" else ("npx",)
 failures = []
 for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
     if not registrar.detect():
@@ -2030,8 +2033,8 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
     if action == "register":
         spec = ServerSpec(
             name="context7",
-            command="npx",
-            args=("-y", sys.argv[2]),
+            command=npx[0],
+            args=(*npx[1:], "-y", sys.argv[2]),
         )
         result = registrar.register_server(spec)
         if result.status == RegisterStatus.MISMATCH and headroom_installed_matching(
@@ -5651,6 +5654,14 @@ impl ToolManager {
     /// drop the registration entirely on disable, so absence is expected
     /// there, not a failure (RUST-22 false positive).
     pub fn smoke_test_plugin(&self, id: &str) -> Result<()> {
+        self.smoke_test_plugin_on(id, PluginHost::detected)
+    }
+
+    fn smoke_test_plugin_on(
+        &self,
+        id: &str,
+        detect: impl FnOnce() -> Vec<(PluginHost, PathBuf)>,
+    ) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         let Some(receipt) = self.read_tool_receipt(plugin.id) else {
             return Ok(());
@@ -5666,6 +5677,25 @@ impl ToolManager {
             .iter()
             .any(|host| host.plugin_present(plugin))
         {
+            // Only a definite "not registered" drops the receipt, the rule
+            // install_plugin_into applies: an unreadable registry of a host
+            // whose CLI is here, or a Codex registry its own listing
+            // contradicts (RUST-HT), is "cannot tell", and install kept the
+            // receipt in exactly those states.
+            if detect()
+                .iter()
+                .any(|(host, cli)| match host.plugin_registration(plugin) {
+                    None => true,
+                    Some(_) => {
+                        matches!(host, PluginHost::Codex) && self.codex_lists_installed(plugin, cli)
+                    }
+                })
+            {
+                log::info!(
+                    "{id}: no host registry confirms or rules out the plugin; keeping its receipt"
+                );
+                return Ok(());
+            }
             // The plugin was removed behind our back (host-native `/plugin`
             // uninstall or a host registry migration). Drop the stale receipt
             // so this warns once instead of on every future upgrade;
@@ -8276,14 +8306,9 @@ impl ToolManager {
     /// a version skew the user can only fix by updating that CLI.
     pub fn install_plugin(&self, id: &str) -> Result<Option<&'static str>> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        let hosts: Vec<(PluginHost, PathBuf)> = PluginHost::ALL
-            .into_iter()
-            .filter_map(|host| host.cli().map(|cli| (host, cli)))
-            .collect();
+        let hosts = PluginHost::detected();
         if hosts.is_empty() {
-            bail!(
-                "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again."
-            );
+            bail!(NO_PLUGIN_HOST_CLI);
         }
         let (mut outdated, errors) = settle_plugin_hosts(
             id,
@@ -8320,6 +8345,15 @@ impl ToolManager {
     }
 
     pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        self.set_plugin_enabled_on(id, enabled, &PluginHost::detected())
+    }
+
+    fn set_plugin_enabled_on(
+        &self,
+        id: &str,
+        enabled: bool,
+        hosts: &[(PluginHost, PathBuf)],
+    ) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         // Guard on the receipt, not host presence: disabling on a host without a
         // disable verb (Codex) removes the plugin, so `plugin_installed()`
@@ -8327,16 +8361,32 @@ impl ToolManager {
         if !self.plugin_receipt_exists(plugin) {
             bail!("{id} is not installed");
         }
+        // No CLI means no host was toggled; flipping the receipt anyway would
+        // show the card off while the plugin keeps running in every session.
+        if hosts.is_empty() {
+            bail!(NO_PLUGIN_HOST_CLI);
+        }
         let mut errors: Vec<String> = Vec::new();
         let mut changed_any = false;
-        for host in PluginHost::ALL {
-            let Some(cli) = host.cli() else { continue };
+        for &(host, ref cli) in hosts {
             // Codex has no enable/disable verb, so enabling re-installs and
             // disabling removes. Skip disabling a host that isn't present.
-            let result = if enabled {
-                self.install_plugin_into(plugin, host, &cli)
+            // Claude Code's disable keeps the plugin registered and only flips
+            // `enabledPlugins`, which the install path's `update` never flips
+            // back, so a registered plugin is enabled, not reinstalled.
+            let result = if enabled && host.plugin_present(plugin) {
+                self.run_plugin_cmd(plugin, cli, host, &host.enable_args(plugin))
+                    .or_else(|err| {
+                        if format!("{err:#}").contains("is already enabled") {
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
+                    })
+            } else if enabled {
+                self.install_plugin_into(plugin, host, cli)
             } else if host.plugin_present(plugin) {
-                self.run_plugin_cmd(plugin, &cli, host, &host.disable_args(plugin))
+                self.run_plugin_cmd(plugin, cli, host, &host.disable_args(plugin))
             } else {
                 continue;
             };
@@ -8427,6 +8477,8 @@ impl ToolManager {
     }
 }
 
+const NO_PLUGIN_HOST_CLI: &str = "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again.";
+
 /// Plugin addons ship marketplace plugins that both Claude Code and Codex can
 /// install through their own `<cli> plugin ...` managers. Their verbs differ
 /// (Claude has enable/disable/install/uninstall; Codex only add/remove), so
@@ -8452,6 +8504,14 @@ impl PluginHost {
             PluginHost::ClaudeCode => crate::claude_cli::detect_claude_cli(),
             PluginHost::Codex => crate::claude_cli::detect_codex_cli(),
         }
+    }
+
+    /// Every host whose CLI is on PATH, paired with that CLI.
+    fn detected() -> Vec<(PluginHost, PathBuf)> {
+        PluginHost::ALL
+            .into_iter()
+            .filter_map(|host| host.cli().map(|cli| (host, cli)))
+            .collect()
     }
 
     fn marketplace_add_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
@@ -8488,6 +8548,14 @@ impl PluginHost {
             // than the flag reject the whole command with "unknown option".
             PluginHost::ClaudeCode => vec!["plugin", "install", plugin.plugin_ref],
             PluginHost::Codex => vec!["plugin", "add", plugin.plugin_ref],
+        }
+    }
+
+    /// Codex has no enable verb; `add` on a registered plugin is a no-op.
+    fn enable_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
+        match self {
+            PluginHost::ClaudeCode => vec!["plugin", "enable", plugin.plugin_ref],
+            PluginHost::Codex => self.install_args(plugin),
         }
     }
 
@@ -20516,15 +20584,170 @@ after
             assert!(receipt.exists(), "disabled receipt must be kept");
 
             // Enabled but deregistered behind our back: warn once, then
-            // self-heal by dropping the stale receipt.
+            // self-heal by dropping the stale receipt. No host CLI, so no
+            // registry is left that could still hold it.
             fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
             let err = manager
-                .smoke_test_plugin(plugin.id)
+                .smoke_test_plugin_on(plugin.id, Vec::new)
                 .expect_err("enabled but unregistered must fail");
             assert!(err.to_string().contains("no longer registered"));
             assert!(!receipt.exists(), "stale receipt must be removed");
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn smoke_test_plugin_keeps_the_receipt_when_no_registry_rules_the_plugin_out() {
+        // Install keeps the receipt when Claude's registry is unreadable or
+        // Codex lists a plugin our config.toml read misses (RUST-HT); the
+        // upgrade smoke test must not then delete it as "removed".
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("plugin-smoke-unsure");
+        let _home = HomeGuard::new(&root);
+        let receipt = runtime.tools_dir.join("caveman.json");
+        let cli = root.join("cli");
+        fs::write(
+            &cli,
+            "#!/bin/sh\necho 'caveman@caveman  installed, enabled  1.0.0  caveman'\n",
+        )
+        .expect("fake cli");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
+        // Claude CLI present, installed_plugins.json unreadable.
+        let claude =
+            manager.smoke_test_plugin_on("caveman", || vec![(PluginHost::ClaudeCode, cli.clone())]);
+        let kept_unreadable = receipt.exists();
+        // Codex: config.toml lacks the table, but `codex plugin list` has it.
+        fs::create_dir_all(root.join(".codex")).expect("codex home");
+        fs::write(root.join(".codex").join("config.toml"), "").expect("config");
+        let codex =
+            manager.smoke_test_plugin_on("caveman", || vec![(PluginHost::Codex, cli.clone())]);
+        let kept_listed = receipt.exists();
+        let _ = fs::remove_dir_all(&root);
+        claude.expect("an unreadable registry is not a failure");
+        assert!(kept_unreadable, "unreadable registry must keep the receipt");
+        codex.expect("a plugin Codex lists is not a failure");
+        assert!(kept_listed, "a plugin Codex lists must keep the receipt");
+    }
+
+    #[test]
+    fn plugin_toggle_without_a_host_cli_fails_and_keeps_the_receipt() {
+        // No `plugin disable` can run, so reporting success would show the
+        // card off while the plugin keeps shaping every session.
+        let (root, runtime, manager) = seed_test_runtime("plugin-toggle-no-cli");
+        let receipt = runtime.tools_dir.join("caveman.json");
+        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("receipt");
+        let result = manager.set_plugin_enabled_on("caveman", false, &[]);
+        let enabled = manager
+            .read_tool_receipt("caveman")
+            .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_bool));
+        let _ = fs::remove_dir_all(&root);
+        assert!(result
+            .expect_err("no host CLI means nothing was toggled")
+            .to_string()
+            .contains("was found on PATH"));
+        assert_eq!(enabled, Some(true), "receipt must not flip");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn plugin_reenable_on_claude_runs_enable_not_update() {
+        // Claude Code's `plugin disable` keeps the registry entry and only
+        // flips enabledPlugins, which `plugin update` never flips back.
+        use std::os::unix::fs::PermissionsExt;
+        let (root, runtime, manager) = seed_test_runtime("plugin-reenable-claude");
+        let _home = HomeGuard::new(&root);
+        let registry = root.join(".claude").join("plugins");
+        fs::create_dir_all(&registry).expect("registry dir");
+        fs::write(
+            registry.join("installed_plugins.json"),
+            br#"{"plugins":{"ponytail@ponytail":[{"scope":"user"}]}}"#,
+        )
+        .expect("registry");
+        fs::write(
+            runtime.tools_dir.join("ponytail.json"),
+            br#"{"version":"latest","enabled":false}"#,
+        )
+        .expect("receipt");
+        let cli = root.join("claude");
+        fs::write(
+            &cli,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo '2.1.284 (Claude Code)'; exit 0; }\n\
+             echo \"$*\" >> \"$(dirname \"$0\")/argv\"\n\
+             [ \"$2\" = enable ] && { echo \"Plugin \\\"$3\\\" is already enabled\" >&2; exit 1; }\n\
+             exit 0\n",
+        )
+        .expect("fake claude");
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let result =
+            manager.set_plugin_enabled_on("ponytail", true, &[(PluginHost::ClaudeCode, cli)]);
+        let argv = fs::read_to_string(root.join("argv")).unwrap_or_default();
+        let enabled = manager
+            .read_tool_receipt("ponytail")
+            .and_then(|r| r.get("enabled").and_then(serde_json::Value::as_bool));
+        let _ = fs::remove_dir_all(&root);
+        result.expect("an already-enabled plugin is a successful enable");
+        assert!(argv.contains("plugin enable ponytail@ponytail"), "{argv}");
+        assert!(!argv.contains("plugin update"), "{argv}");
+        assert_eq!(enabled, Some(true));
+    }
+
+    #[test]
+    fn context7_helper_wraps_npx_in_cmd_on_windows() {
+        // Native Windows agents spawn MCP servers without a shell, and there
+        // npx is an npx.cmd shim ("Windows requires 'cmd /c' wrapper").
+        // Stub registrars print the spec the real helper registers.
+        let probe = r#"import os, sys, types, enum
+S = enum.Enum("S", {"REGISTERED": "registered", "MISMATCH": "mismatch", "FAILED": "failed"})
+class R:
+    name = "claude"
+    def detect(self): return True
+    def register_server(self, spec, force=False):
+        print("SPEC", spec.command, *spec.args)
+        return types.SimpleNamespace(status=S.REGISTERED, detail=None)
+class Off(R):
+    def detect(self): return False
+reg = types.ModuleType("headroom.mcp_registry")
+reg.ClaudeRegistrar, reg.CodexRegistrar, reg.GrokRegistrar, reg.OpencodeRegistrar = R, Off, Off, Off
+reg.ServerSpec = types.SimpleNamespace
+base = types.ModuleType("base"); base.RegisterStatus = S
+led = types.ModuleType("ledger")
+led.clear_install = led.record_install = lambda *a: None
+led.headroom_installed_matching = lambda *a: False
+sys.modules.update({"headroom": types.ModuleType("headroom"), "headroom.mcp_registry": reg,
+    "headroom.mcp_registry.base": base, "headroom.mcp_registry.ledger": led})
+sys.platform = sys.argv.pop(1)
+exec(os.environ["HELPER"])
+"#;
+        let spec = |platform: &str| {
+            let out = crate::proc::command("python3")
+                .args(["-c", probe, platform, "register", "@upstash/context7-mcp@9"])
+                .env("HELPER", super::CONTEXT7_MCP_HELPER)
+                .output()
+                .ok()?;
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(
+                out.status.success(),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            stdout
+                .lines()
+                .find(|l| l.starts_with("SPEC "))
+                .map(str::to_owned)
+        };
+        let Some(windows) = spec("win32") else {
+            eprintln!("skipping: no python3 on PATH");
+            return;
+        };
+        assert_eq!(windows, "SPEC cmd /c npx -y @upstash/context7-mcp@9");
+        assert_eq!(
+            spec("darwin").as_deref(),
+            Some("SPEC npx -y @upstash/context7-mcp@9")
+        );
     }
 
     #[test]
