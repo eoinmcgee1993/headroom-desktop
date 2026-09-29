@@ -261,12 +261,19 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          # test-macos's toolchain, so its cache below is compatible.
+          toolchain: 1.98.1
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: |
             src-tauri -> target
+          # Reuse test-macos's dependency build instead of keeping a second
+          # ~0.8 GB copy; the repo's Actions cache is already at its 10 GB cap.
+          shared-key: test-macos
+          save-if: false
 
       - name: Vendored patches against the pinned wheel
         # Every *_behaves_against_the_installed_wheel test self-skips without
