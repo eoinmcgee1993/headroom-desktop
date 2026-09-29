@@ -562,11 +562,18 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         return self.flush()
                     out = bytearray()
                     while not self.done:
-                        cut = self.buf.find(b"\n\n")
-                        if cut == -1:
+                        # Same terminators as the wheel's SSE splitter: a
+                        # CRLF-framed gateway never sends b"\n\n".
+                        hits = [
+                            (i, len(t))
+                            for t in (b"\n\n", b"\r\n\r\n")
+                            if (i := self.buf.find(t)) != -1
+                        ]
+                        if not hits:
                             break
-                        event = bytes(self.buf[: cut + 2])
-                        del self.buf[: cut + 2]
+                        cut, n = min(hits)
+                        event = bytes(self.buf[: cut + n])
+                        del self.buf[: cut + n]
                         out += self._event(event)
                     if self.done:
                         out += self.flush()
@@ -590,10 +597,12 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         return rewritten
                     if b"message_delta" not in event:
                         return event
-                    self.done = True
+                    # _rewrite_delta disarms only on a real message_delta, so
+                    # content that merely quotes the name leaves us armed.
                     try:
                         return self._rewrite_delta(event)
                     except Exception:
+                        self.done = True
                         return event
 
                 def _rewrite_start(self, event):
@@ -627,9 +636,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                             target,
                             self.believed,
                         )
-                        lines[i] = b"data: " + _hd_cg_json.dumps(
-                            payload, separators=(",", ":")
-                        ).encode()
+                        lines[i] = (
+                            b"data: "
+                            + _hd_cg_json.dumps(payload, separators=(",", ":")).encode()
+                            + (b"\r" if line.endswith(b"\r") else b"")
+                        )
                         return b"\n".join(lines)
                     return event
 
@@ -641,6 +652,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         payload = _hd_cg_json.loads(line[5:].strip())
                         if payload.get("type") != "message_delta":
                             return event
+                        self.done = True
                         usage = payload.get("usage")
                         # A delta without cumulative input usage cannot
                         # override the already-nudged message_start.
@@ -654,9 +666,11 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         if int(usage.get("input_tokens") or 0) >= new_input:
                             return event
                         usage["input_tokens"] = new_input
-                        lines[i] = b"data: " + _hd_cg_json.dumps(
-                            payload, separators=(",", ":")
-                        ).encode()
+                        lines[i] = (
+                            b"data: "
+                            + _hd_cg_json.dumps(payload, separators=(",", ":")).encode()
+                            + (b"\r" if line.endswith(b"\r") else b"")
+                        )
                         return b"\n".join(lines)
                     return event
 
@@ -14331,6 +14345,99 @@ mod tests {
         assert!(py.contains("_rewrite_delta"));
         // ...and the kill switch is honored.
         assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
+    }
+
+    /// Runs `body` against the shipped `_HdCgGuard` bound into the installed
+    /// wheel. The probe gets `G` (the class), `ev(name, payload, nl)` (one SSE
+    /// event) and `start`/`nudged` (an armed 185k message_start on a 200k
+    /// window, and its 190k rewrite). None when there is no managed runtime.
+    fn run_context_guard_probe(tag: &str, body: &str) -> Option<std::process::Output> {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return None;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-cg-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let script = format!(
+            r#"import json, sitecustomize
+G = sitecustomize._HdCgGuard
+def ev(name, payload, nl):
+    data = json.dumps(payload, separators=(",", ":"))
+    return f"event: {{name}}{{nl}}data: {{data}}{{nl}}{{nl}}".encode()
+def usage(n):
+    return {{"input_tokens": n, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}
+start = {{"type": "message_start", "message": {{"id": "m", "usage": usage(185000)}}}}
+nudged = {{"type": "message_start", "message": {{"id": "m", "usage": usage(190000)}}}}
+{body}
+print("OK context guard")
+"#
+        );
+        let out = crate::proc::command(&python)
+            .arg("-c")
+            .arg(script)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            .output()
+            .expect("run context guard probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(out)
+    }
+
+    fn assert_context_guard_probe(out: std::process::Output) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("OK context guard"),
+            "context guard misbehaved against the installed wheel.\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn context_guard_streams_crlf_framed_events_against_the_installed_wheel() {
+        // A gateway that frames SSE with CRLF never sends b"\n\n"; the guard
+        // must still release each event as it completes (and keep its
+        // framing) instead of holding the whole response back.
+        let Some(out) = run_context_guard_probe(
+            "crlf",
+            r#"g = G(200000, 200000)
+out = g.feed(ev("message_start", start, "\r\n"))
+assert out == ev("message_start", nudged, "\r\n"), out
+ping = b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n"
+assert g.feed(ping) == ping and not g.done"#,
+        ) else {
+            return;
+        };
+        assert_context_guard_probe(out);
+    }
+
+    #[test]
+    fn context_guard_nudges_real_message_delta_after_one_quoted_in_content_against_the_installed_wheel(
+    ) {
+        // Content that merely mentions message_delta must not disarm the
+        // guard: the real final usage delta still has to be nudged.
+        let Some(out) = run_context_guard_probe(
+            "delta",
+            r#"g = G(200000, 200000)
+assert g.feed(ev("message_start", start, "\n")) == ev("message_start", nudged, "\n")
+text = {"type": "content_block_delta", "index": 0,
+        "delta": {"type": "text_delta", "text": "wait for the message_delta event"}}
+assert g.feed(ev("content_block_delta", text, "\n")) == ev("content_block_delta", text, "\n")
+assert not g.done, "guard disarmed by content text"
+delta = {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"input_tokens": 185000, "output_tokens": 5}}
+out = g.feed(ev("message_delta", delta, "\n"))
+delta["usage"]["input_tokens"] = 190000
+assert out == ev("message_delta", delta, "\n"), out
+assert g.done"#,
+        ) else {
+            return;
+        };
+        assert_context_guard_probe(out);
     }
 
     /// Exact-pin vendors only bind on the pinned wheel; a dev machine whose
