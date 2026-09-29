@@ -5851,39 +5851,16 @@ impl ToolManager {
                  reinstalling previous headroom-ai {previous_version}"
             );
             // Both pip helpers need PyPI. Offline (laptop died mid-upgrade,
-            // reopened on a plane) they fail — and discarding those failures
-            // used to clear the marker anyway, leaving a mixed venv (new dep
-            // pins, unknown headroom-ai version) that the restored receipt
-            // declared healthy. On failure keep the marker AND the lock
-            // backup untouched so the next launch retries recovery; mirror
-            // `rollback_headroom_upgrade`, which propagates the same errors.
-            if let Some(ref backup) = previous_lock_backup {
-                if let Err(err) = self.pip_restore_deps_from_backup(backup) {
-                    log::warn!(
-                        "recover_from_interrupted_upgrade: dep restore failed ({err:#}); \
-                         keeping upgrade marker for retry"
-                    );
-                    return false;
-                }
-            }
-            if let Err(err) = self.pip_force_reinstall_headroom_version(&previous_version) {
+            // reopened on a plane) they fail, and the helper then keeps the
+            // marker and its recovery data so the next launch retries.
+            if let Err(err) =
+                self.restore_in_place_previous(&previous_version, previous_lock_backup.as_deref())
+            {
                 log::warn!(
-                    "recover_from_interrupted_upgrade: reinstalling headroom-ai \
-                     {previous_version} failed ({err:#}); keeping upgrade marker for retry"
+                    "recover_from_interrupted_upgrade: {err:#}; keeping upgrade marker for retry"
                 );
                 return false;
             }
-            if let Some(ref backup) = previous_lock_backup {
-                let _ = std::fs::copy(backup, self.active_lock_path());
-                let _ = std::fs::remove_file(backup);
-            }
-            let receipt_backup = self.headroom_receipt_backup_path();
-            if receipt_backup.exists() {
-                if let Err(err) = self.restore_receipt_from_backup() {
-                    log::warn!("recover_from_interrupted_upgrade: {err:#}");
-                }
-            }
-            self.clear_upgrade_marker();
             return true;
         }
 
@@ -6152,28 +6129,9 @@ impl ToolManager {
         // previous headroom-ai and restore the receipt.
         if let Some((previous_version, _target, previous_lock_backup)) = self.read_in_place_marker()
         {
-            if let Some(ref backup) = previous_lock_backup {
-                self.pip_restore_deps_from_backup(backup).with_context(|| {
-                    format!(
-                        "rollback failed — could not restore dependencies from {}",
-                        backup.display()
-                    )
-                })?;
-                let _ = std::fs::copy(backup, self.active_lock_path());
-                let _ = std::fs::remove_file(backup);
-            }
-            self.pip_force_reinstall_headroom_version(&previous_version)
-                .with_context(|| {
-                    format!(
-                        "rollback failed — could not reinstall previous Headroom version {previous_version}"
-                    )
-                })?;
-            let receipt_backup = self.headroom_receipt_backup_path();
-            if receipt_backup.exists() {
-                self.restore_receipt_from_backup()?;
-            }
-            self.clear_upgrade_marker();
-            return Ok(());
+            return self
+                .restore_in_place_previous(&previous_version, previous_lock_backup.as_deref())
+                .context("rollback failed");
         }
 
         let backup_dir = self.venv_backup_dir();
@@ -6220,7 +6178,8 @@ impl ToolManager {
     /// either there is no prior install to upgrade, the previously-installed
     /// version is below `ATOMIC_REBUILD_FLOOR_VERSION` (in-place pip across
     /// that delta leaves stale native libs), or the lock churned but the
-    /// active lock file is missing on disk so we can't safely snapshot for
+    /// active lock file is missing on disk, or is not the lock the receipt
+    /// says the venv was built from, so we can't safely snapshot for
     /// rollback.
     ///
     /// When `Some`, the caller owns `previous_lock_backup` (if set): on
@@ -6238,13 +6197,22 @@ impl ToolManager {
             return None;
         }
         let previous_lock_backup = if self.lock_pins_differ_from_installed() {
-            let active = self.active_lock_path();
-            if !active.exists() {
+            // The snapshot is what a failed upgrade rolls back to. A full
+            // rebuild that failed validation (or a requirements repair that
+            // died mid-pip) leaves the NEW lock on disk under the old
+            // receipt, and snapshotting that made rollback "restore" the new
+            // pins under the old headroom-ai. Only the full rebuild keeps an
+            // exact copy of the old venv then.
+            let installed = std::fs::read_to_string(self.active_lock_path()).ok()?;
+            if Some(requirements_lock_sha(&installed)) != self.installed_requirements_lock_sha() {
+                log::info!(
+                    "prepare_in_place_upgrade: on-disk lock is not the installed one; \
+                     forcing full venv rebuild"
+                );
                 return None;
             }
             let backup = self.lock_backup_path();
-            let _ = std::fs::remove_file(&backup);
-            std::fs::copy(&active, &backup).ok()?;
+            crate::client_adapters::atomic_write(&backup, installed.as_bytes()).ok()?;
             Some(backup)
         } else {
             None
@@ -6671,28 +6639,47 @@ impl ToolManager {
         // hits the same Windows file locks reports restored=false and leaves
         // the runtime bricked (RUST-70).
         crate::state::kill_venv_lock_holders(&self.runtime.venv_dir);
-        // Restore deps first so headroom-ai lands on a consistent dep set.
-        let deps_ok = match ctx.previous_lock_backup.as_deref() {
-            Some(backup) => {
-                let ok = self.pip_restore_deps_from_backup(backup).is_ok();
-                let active = self.active_lock_path();
-                let _ = std::fs::copy(backup, &active);
-                let _ = std::fs::remove_file(backup);
-                ok
+        match self
+            .restore_in_place_previous(&ctx.previous_version, ctx.previous_lock_backup.as_deref())
+        {
+            Ok(()) => true,
+            Err(err) => {
+                log::warn!(
+                    "in-place upgrade rollback failed ({err:#}); keeping upgrade marker \
+                     for recovery on next launch"
+                );
+                false
             }
-            None => true,
-        };
-        let wheel_ok = self
-            .pip_force_reinstall_headroom_version(&ctx.previous_version)
-            .is_ok();
-        let receipt_backup = self.headroom_receipt_backup_path();
-        let receipt_ok = if receipt_backup.exists() {
-            self.restore_receipt_from_backup().is_ok()
-        } else {
-            true
-        };
+        }
+    }
+
+    /// Undo an in-place upgrade: reinstall the lock snapshot's pins (so
+    /// headroom-ai lands on a consistent dep set) and the previous
+    /// headroom-ai, restore the receipt, and only then consume the snapshot
+    /// and clear the marker. Any failure returns early with the marker, the
+    /// snapshot and the receipt backup untouched, so the next launch's
+    /// recovery retries. A marker naming a snapshot that was already deleted
+    /// can never finish (each launch re-ran `pip -r` on the missing file),
+    /// and a cleared marker left a mixed venv that the restored receipt
+    /// declared healthy.
+    fn restore_in_place_previous(
+        &self,
+        previous_version: &str,
+        previous_lock_backup: Option<&Path>,
+    ) -> Result<()> {
+        if let Some(backup) = previous_lock_backup {
+            self.pip_restore_deps_from_backup(backup)?;
+        }
+        self.pip_force_reinstall_headroom_version(previous_version)?;
+        if self.headroom_receipt_backup_path().exists() {
+            self.restore_receipt_from_backup()?;
+        }
+        if let Some(backup) = previous_lock_backup {
+            let _ = std::fs::copy(backup, self.active_lock_path());
+            let _ = std::fs::remove_file(backup);
+        }
         self.clear_upgrade_marker();
-        deps_ok && wheel_ok && receipt_ok
+        Ok(())
     }
 
     fn update_headroom_receipt_after_in_place_upgrade(
@@ -6724,6 +6711,16 @@ impl ToolManager {
     /// receipt snapshot. Non-fatal if cleanup fails — a future upgrade's
     /// "purge stale backup" step will clean up whatever we left behind.
     pub fn commit_headroom_upgrade(&self) -> Result<()> {
+        // Clear the in-progress marker FIRST: it is the commit point, and the
+        // new runtime already passed boot validation. Deleting the backups
+        // before it let a crash mid-delete (seconds on a big venv) leave the
+        // marker beside a half-deleted venv.backup, which the next launch's
+        // recovery swapped over the validated venv. A marker that could not
+        // be cleared keeps the backups too: they are what its recovery uses.
+        self.clear_upgrade_marker();
+        if self.upgrade_interrupted() {
+            return Ok(());
+        }
         let backup_dir = self.venv_backup_dir();
         if backup_dir.exists() {
             if let Err(err) = std::fs::remove_dir_all(&backup_dir) {
@@ -6735,11 +6732,6 @@ impl ToolManager {
         }
         let _ = std::fs::remove_file(self.headroom_receipt_backup_path());
         let _ = std::fs::remove_file(self.lock_backup_path());
-        // Clear the in-progress marker last, so a mid-commit crash (e.g.,
-        // between the remove_dir_all of the backup and the marker cleanup)
-        // still looks like an interrupted upgrade on the next launch and
-        // triggers recovery rather than a potentially-unsafe purge.
-        self.clear_upgrade_marker();
         Ok(())
     }
 
@@ -19445,6 +19437,112 @@ after
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Seeds the disk state of an in-place upgrade that installed 0.11.0 over
+    /// 0.10.8 with churned lock pins: the NEW lock is active, the old one is
+    /// snapshotted, and the marker plus receipt backup name the way back.
+    fn seed_in_place_upgrade_with_lock_snapshot(manager: &ToolManager) -> PathBuf {
+        let lock_backup = manager.lock_backup_path();
+        fs::write(manager.active_lock_path(), b"new-lock==2.0\n").expect("seed active lock");
+        fs::write(&lock_backup, b"old-lock==1.0\n").expect("seed lock backup");
+        manager
+            .write_upgrade_marker("0.11.0", Some("0.10.8"), Some(&lock_backup))
+            .expect("marker");
+        fs::write(
+            manager.headroom_receipt_backup_path(),
+            br#"{"version":"0.10.8"}"#,
+        )
+        .expect("receipt snapshot");
+        lock_backup
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn rollback_headroom_upgrade_keeps_lock_snapshot_until_the_reinstall_lands() {
+        // Crash-injection: the dep restore succeeds, the previous headroom-ai
+        // reinstall fails (PyPI timeout). Consuming the lock snapshot before
+        // that step left the kept marker naming a missing file, so every
+        // later launch's recovery failed `pip -r` on it and never finished.
+        let (root, runtime, manager) = seed_test_runtime("rollback-reinstall-fails");
+        let lock_backup = seed_in_place_upgrade_with_lock_snapshot(&manager);
+        let python = runtime.managed_python();
+        write_executable(
+            &python,
+            "#!/bin/sh\ncase \"$*\" in *--force-reinstall*) exit 1;; esac\nexit 0\n",
+        );
+
+        assert!(manager.rollback_headroom_upgrade().is_err());
+        assert!(manager.upgrade_interrupted(), "marker kept for recovery");
+        assert_eq!(
+            fs::read(&lock_backup).expect("lock snapshot kept for recovery"),
+            b"old-lock==1.0\n"
+        );
+
+        // Back online: the next launch's recovery can now finish the job.
+        write_executable(&python, "#!/bin/sh\nexit 0\n");
+        assert!(manager.recover_from_interrupted_upgrade());
+        assert!(!manager.upgrade_interrupted(), "marker cleared");
+        assert!(!lock_backup.exists(), "lock snapshot consumed");
+        assert_eq!(
+            fs::read(manager.active_lock_path()).expect("active lock"),
+            b"old-lock==1.0\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn rollback_in_place_upgrade_inner_keeps_marker_and_snapshots_when_pip_fails() {
+        // An install-step failure whose own rollback cannot reach PyPI must
+        // leave the recovery data behind: clearing the marker and restoring
+        // the old receipt declared a mixed venv healthy with nothing left to
+        // drive another recovery.
+        let (root, runtime, manager) = seed_test_runtime("inner-rollback-pip-fails");
+        let lock_backup = seed_in_place_upgrade_with_lock_snapshot(&manager);
+        write_executable(
+            &runtime.managed_python(),
+            "#!/bin/sh\ncase \"$*\" in *--force-reinstall*) exit 1;; esac\nexit 0\n",
+        );
+        let ctx = super::InPlaceUpgradeContext {
+            previous_version: "0.10.8".into(),
+            previous_lock_backup: Some(lock_backup.clone()),
+        };
+
+        assert!(!manager.rollback_in_place_upgrade_inner(&ctx));
+        assert!(manager.upgrade_interrupted(), "marker kept for recovery");
+        assert!(lock_backup.exists(), "lock snapshot kept for recovery");
+        assert!(
+            manager.headroom_receipt_backup_path().exists(),
+            "receipt backup kept for recovery"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_headroom_upgrade_deletes_no_backup_while_the_marker_survives() {
+        // The marker is the commit point: backups go only once it is gone. A
+        // delete first let a crash mid-remove_dir_all (seconds on a big venv)
+        // leave the marker beside a half-deleted venv.backup, which the next
+        // launch's recovery swapped over the validated venv. A directory at
+        // the marker path stands in for a marker that cannot be removed.
+        let (root, _runtime, manager) = seed_test_runtime("commit-marker-first");
+        let backup = manager.venv_backup_dir();
+        fs::create_dir_all(&backup).expect("backup dir");
+        fs::write(backup.join("old-marker"), b"old").expect("old venv file");
+        let lock_backup = seed_in_place_upgrade_with_lock_snapshot(&manager);
+        let marker = manager.upgrade_marker_path();
+        fs::remove_file(&marker).expect("drop marker file");
+        fs::create_dir_all(marker.join("stuck")).expect("unremovable marker");
+
+        manager
+            .commit_headroom_upgrade()
+            .expect("commit is non-fatal");
+
+        assert!(backup.join("old-marker").exists(), "venv backup kept");
+        assert!(lock_backup.exists(), "lock snapshot kept");
+        assert!(manager.headroom_receipt_backup_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn atomic_upgrade_purges_stale_backup_and_reports_failure_without_python() {
         // Without a real standalone python available, create_managed_venv()
@@ -19600,12 +19698,15 @@ after
         let (root, runtime, manager) = seed_test_runtime("in-place-lock-churn");
         // Receipt must be ≥ ATOMIC_REBUILD_FLOOR_VERSION; this test is about
         // the lock-snapshot path, not the version-floor path (covered by
-        // `receipt_requires_atomic_rebuild_below_floor`).
+        // `receipt_requires_atomic_rebuild_below_floor`). Its sha is the
+        // on-disk lock's: that lock is what the installed venv was built from.
         fs::write(
             runtime.tools_dir.join("headroom.json"),
             serde_json::to_vec(&serde_json::json!({
                 "version": "0.20.0",
-                "artifact": { "requirementsLockSha256": "deadbeef".repeat(8) },
+                "artifact": {
+                    "requirementsLockSha256": requirements_lock_sha("old-lock-content==1.0\n"),
+                },
             }))
             .unwrap(),
         )
@@ -19646,6 +19747,29 @@ after
         .expect("receipt");
         // no active lock written
         assert!(manager.prepare_in_place_upgrade().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_in_place_falls_back_to_atomic_when_on_disk_lock_is_not_the_installed_one() {
+        // A full rebuild that failed boot validation (or a requirements repair
+        // that died mid-pip) leaves the NEW lock on disk under the old
+        // receipt. Snapshotting it as the rollback baseline made a failed
+        // in-place upgrade "restore" the new pins under the old headroom-ai.
+        let (root, runtime, manager) = seed_test_runtime("in-place-foreign-lock");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.20.0",
+                "artifact": { "requirementsLockSha256": requirements_lock_sha("old-lock==1.0\n") },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+        fs::write(manager.active_lock_path(), b"new-lock==2.0\n").expect("seed active lock");
+
+        assert!(manager.prepare_in_place_upgrade().is_none());
+        assert!(!manager.lock_backup_path().exists(), "no snapshot taken");
         let _ = fs::remove_dir_all(root);
     }
 
