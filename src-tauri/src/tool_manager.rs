@@ -2039,6 +2039,12 @@ pub struct BootstrapStepUpdate {
 pub struct AbandonedBootstrap {
     pub step: String,
     pub percent: u8,
+    /// App version that ran the attempt. The report is filed by the NEXT
+    /// launch, usually an updated build, so without this every update filed
+    /// the old build's death under the new release and reopened the issue
+    /// against the build carrying the fix (RUST-BH on 0.9.26-rc.5). Empty on
+    /// markers written before this field existed.
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6956,6 +6962,7 @@ impl ToolManager {
         let marker = AbandonedBootstrap {
             step: step.to_string(),
             percent,
+            version: env!("CARGO_PKG_VERSION").to_string(),
         };
         if let Ok(json) = serde_json::to_vec(&marker) {
             let _ =
@@ -15338,6 +15345,7 @@ mod tests {
         let taken = manager.take_abandoned_bootstrap().expect("marker reported");
         assert_eq!(taken.step, "Downloading Python");
         assert_eq!(taken.percent, 18);
+        assert_eq!(taken.version, env!("CARGO_PKG_VERSION"));
         // Consumed on read: a second launch must not double-report.
         assert!(manager.take_abandoned_bootstrap().is_none());
 

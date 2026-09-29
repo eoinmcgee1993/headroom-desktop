@@ -6336,6 +6336,14 @@ pub fn run() {
                 scope.set_tag("abandoned_step", &abandoned.step);
                 scope.set_extra("percent", u64::from(abandoned.percent).into());
                 scope.set_extra("app_log_tail", log_tail.into());
+                // File it under the build that died, not this one.
+                if !abandoned.version.is_empty() {
+                    let release = format!("{}@{}", env!("CARGO_PKG_NAME"), abandoned.version);
+                    scope.add_event_processor(move |mut event| {
+                        event.release = Some(release.clone().into());
+                        Some(event)
+                    });
+                }
             },
             || {
                 sentry::capture_message(
