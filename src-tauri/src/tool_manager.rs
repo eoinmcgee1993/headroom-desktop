@@ -6662,11 +6662,26 @@ impl ToolManager {
     /// can never finish (each launch re-ran `pip -r` on the missing file),
     /// and a cleared marker left a mixed venv that the restored receipt
     /// declared healthy.
+    ///
+    /// A marker that already names a missing snapshot (left by builds that
+    /// consumed it before the reinstall, or by a failed marker clear) skips
+    /// the dep restore: those paths deleted it only once the deps were
+    /// restored or the marker was meant to go.
     fn restore_in_place_previous(
         &self,
         previous_version: &str,
         previous_lock_backup: Option<&Path>,
     ) -> Result<()> {
+        let previous_lock_backup = previous_lock_backup.filter(|backup| {
+            let present = backup.exists();
+            if !present {
+                log::warn!(
+                    "lock snapshot {} is gone; skipping the dependency restore",
+                    backup.display()
+                );
+            }
+            present
+        });
         if let Some(backup) = previous_lock_backup {
             self.pip_restore_deps_from_backup(backup)?;
         }
@@ -19514,6 +19529,34 @@ after
             manager.headroom_receipt_backup_path().exists(),
             "receipt backup kept for recovery"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn recover_from_interrupted_upgrade_finishes_when_the_lock_snapshot_is_already_gone() {
+        // Pre-fix builds consumed the lock snapshot after the dep restore and
+        // then kept the marker when the headroom-ai reinstall failed. Every
+        // later recovery ran `pip -r` on the missing file, failed, and never
+        // reached the reinstall. The stub fails `--requirement` on a missing
+        // file, as pip does.
+        let (root, runtime, manager) = seed_test_runtime("recover-lock-backup-gone");
+        write_executable(
+            &runtime.managed_python(),
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  \
+             if [ \"$1\" = --requirement ] && [ ! -f \"$2\" ]; then exit 1; fi\n  \
+             shift\ndone\nexit 0\n",
+        );
+        let lock_backup = seed_in_place_upgrade_with_lock_snapshot(&manager);
+        fs::remove_file(&lock_backup).expect("drop lock snapshot");
+
+        assert!(manager.recover_from_interrupted_upgrade());
+        assert!(!manager.upgrade_interrupted(), "marker cleared");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(runtime.tools_dir.join("headroom.json")).expect("read receipt"),
+        )
+        .expect("parse receipt");
+        assert_eq!(receipt["version"], "0.10.8", "receipt restored to previous");
         let _ = fs::remove_dir_all(root);
     }
 
