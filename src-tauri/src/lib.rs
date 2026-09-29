@@ -216,10 +216,8 @@ struct AppUpdateConfiguration {
     endpoint_count: usize,
     configuration_error: Option<String>,
     beta_channel_enabled: bool,
-    // macOS install() swaps the .app in place with no privilege prompt, so the
-    // frontend may stage updates silently. Windows install() exits the app to
-    // run the installer, and Linux .deb raises a polkit prompt - both must
-    // stay behind an explicit user click.
+    // Whether the frontend may stage updates with no click. Only a macOS
+    // bundle whose folder takes writes qualifies: see silent_install_supported.
     silent_install_supported: bool,
 }
 
@@ -967,6 +965,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
 fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
     let current_version = app.package_info().version.to_string();
     let beta_channel_enabled = beta_channel_enabled();
+    let silent_install_supported = silent_install_supported();
     match release_updater_config(&current_version, beta_channel_enabled) {
         Ok(Some(config)) => AppUpdateConfiguration {
             enabled: true,
@@ -974,7 +973,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
             endpoint_count: config.endpoints.len(),
             configuration_error: None,
             beta_channel_enabled,
-            silent_install_supported: cfg!(target_os = "macos"),
+            silent_install_supported,
         },
         Ok(None) => AppUpdateConfiguration {
             enabled: false,
@@ -982,7 +981,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
             endpoint_count: 0,
             configuration_error: None,
             beta_channel_enabled,
-            silent_install_supported: cfg!(target_os = "macos"),
+            silent_install_supported,
         },
         Err(ref err) => {
             sentry::capture_message(
@@ -995,7 +994,7 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
                 endpoint_count: 0,
                 configuration_error: Some(err.clone()),
                 beta_channel_enabled,
-                silent_install_supported: cfg!(target_os = "macos"),
+                silent_install_supported,
             }
         }
     }
@@ -1265,15 +1264,18 @@ const READ_ONLY_BUNDLE_MESSAGE: &str =
 /// `EROFS` is the dead end, so only `EROFS` may block.
 #[cfg(target_os = "macos")]
 fn dir_is_read_only(dir: &std::path::Path) -> bool {
+    probe_dir_write(dir).is_err_and(|err| is_read_only_filesystem(&err))
+}
+
+/// Creates and removes a throwaway file in `dir`: the only honest answer to
+/// "can this folder be written", since mode bits miss read-only mounts and ACLs.
+#[cfg(target_os = "macos")]
+fn probe_dir_write(dir: &std::path::Path) -> std::io::Result<()> {
     let probe = dir.join(format!(".headroom-write-probe-{}", std::process::id()));
     // direct-write: throwaway write probe, removed right after
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            false
-        }
-        Err(err) => is_read_only_filesystem(&err),
-    }
+    std::fs::File::create(&probe)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// `EROFS` (30). Raw errno rather than `io::ErrorKind::ReadOnlyFilesystem` so
@@ -1281,6 +1283,35 @@ fn dir_is_read_only(dir: &std::path::Path) -> bool {
 #[cfg(target_os = "macos")]
 fn is_read_only_filesystem(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(30)
+}
+
+/// Whether the frontend may stage an update with no click. Windows install()
+/// exits the app to run the installer and Linux .deb raises a polkit prompt, so
+/// both stay behind an explicit click; macOS qualifies only when the in-place
+/// swap needs no privileges.
+fn silent_install_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        bundle_folder_accepts_writes(current_app_bundle_path().as_deref())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// True only when a real file create in the folder holding `bundle` succeeds.
+/// On `PermissionDenied` (a standard account under the root:admin
+/// `/Applications`, the managed-Mac case) the updater plugin retries the swap
+/// under an AppleScript admin prompt it runs on the main thread, so a quiet
+/// hourly install froze the app behind a password dialog nobody asked for, and
+/// cancelling it only queued the next one. Those installs notify instead and
+/// prompt only after a click.
+#[cfg(target_os = "macos")]
+fn bundle_folder_accepts_writes(bundle: Option<&std::path::Path>) -> bool {
+    bundle
+        .and_then(std::path::Path::parent)
+        .is_some_and(|dir| probe_dir_write(dir).is_ok())
 }
 
 /// `true` when the running `.app` cannot be replaced in place because the folder
@@ -2373,15 +2404,16 @@ fn user_message_for(kind: BootstrapFailureKind) -> &'static str {
              the app. Contact support@extraheadroom.com if you need help."
         }
         BootstrapFailureKind::NoUsableTempDir => {
-            "Installation failed: Headroom can't create temporary files on this Mac. \
-             This usually means your disk is full, or security software (like an MDM \
-             profile or endpoint protection) is blocking writes to /tmp and \
-             /var/folders. Free up disk space, restart your Mac, and try again. \
-             If it still fails, contact support@extraheadroom.com."
+            "Installation failed: Headroom can't create temporary files on this \
+             computer. This usually means your disk is full, or security software \
+             (like an MDM profile or endpoint protection) is blocking writes to the \
+             system temporary folder (%TEMP% on Windows, /tmp and /var/folders on a \
+             Mac, /tmp on Linux). Free up disk space, restart your computer, and try \
+             again. If it still fails, contact support@extraheadroom.com."
         }
         BootstrapFailureKind::NetworkDownload => {
             "Couldn't reach the download server. This is usually a temporary \
-             network or server hiccup, not a problem with your Mac. Check your \
+             network or server hiccup, not a problem with your computer. Check your \
              internet connection and click Try again. If it keeps failing, a \
              firewall, VPN, or corporate proxy may be blocking pypi.org and \
              files.pythonhosted.org - try another network or contact \
@@ -6624,51 +6656,6 @@ pub fn run() {
 
     let state = AppState::new().unwrap_or_else(|err| fatal_app_state_error(err));
 
-    // A previous bootstrap attempt that never reached a verdict: the app was
-    // quit, crashed, or killed mid-install, so neither bootstrap_completed nor
-    // the error branch ever ran. Production funnel data (2026-08-26) shows
-    // these silent deaths outnumber classified failures ~4:1; this is the only
-    // signal they leave.
-    let abandoned_bootstrap = state.tool_manager.take_abandoned_bootstrap();
-    let report_bootstrap_abandoned = abandoned_bootstrap.is_some();
-    if let Some(abandoned) = abandoned_bootstrap {
-        // The tail of the previous run's app log usually holds the last thing
-        // the install did before dying. Same 12KB cap as
-        // capture_upgrade_failure: Sentry drops extras past ~16KB. Connection-
-        // pool debug lines are dropped first so the budget goes to the install
-        // rather than to health polling (RUST-9Y).
-        let log_tail = std::fs::read_to_string(logging::log_path())
-            .ok()
-            .map(|s| tail_bytes_for_sentry(&strip_connection_noise(&s), SENTRY_EXTRA_TAIL_BYTES))
-            .unwrap_or_else(|| "app log unreadable".into());
-        sentry::with_scope(
-            |scope| {
-                let fp = ["bootstrap_abandoned", abandoned.step.as_str()];
-                scope.set_fingerprint(Some(fp.as_slice()));
-                scope.set_tag("abandoned_step", &abandoned.step);
-                scope.set_extra("percent", u64::from(abandoned.percent).into());
-                scope.set_extra("app_log_tail", log_tail.into());
-                // File it under the build that died, not this one.
-                if !abandoned.version.is_empty() {
-                    let release = format!("{}@{}", env!("CARGO_PKG_NAME"), abandoned.version);
-                    scope.add_event_processor(move |mut event| {
-                        event.release = Some(release.clone().into());
-                        Some(event)
-                    });
-                }
-            },
-            || {
-                sentry::capture_message(
-                    &format!(
-                        "bootstrap_abandoned (died at \"{}\" {}%)",
-                        abandoned.step, abandoned.percent
-                    ),
-                    sentry::Level::Warning,
-                );
-            },
-        );
-    }
-
     let mut builder =
         tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Second launch: focus the existing window and exit the new process.
@@ -6719,12 +6706,61 @@ pub fn run() {
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
             ));
-            // Funnel mirror of the bootstrap_abandoned capture, so the server-
-            // side stall query can tell "died mid-install but came back" from
-            // "gone for good". Sent from here because the beacon builds its
-            // identity from the managed state. Unknown step names are ignored
-            // by servers that predate this one.
-            if report_bootstrap_abandoned {
+            // A previous bootstrap attempt that never reached a verdict: the
+            // app was quit, crashed, or killed mid-install, so neither
+            // bootstrap_completed nor the error branch ever ran. Production
+            // funnel data (2026-08-26) shows these silent deaths outnumber
+            // classified failures ~4:1; this is the only signal they leave.
+            //
+            // Taken here, not before the builder: single-instance exits a
+            // second launch from its plugin setup, which runs before this
+            // closure. A second process on Windows/Linux (a shortcut clicked
+            // during a slow install, any headroom:// link) used to take the
+            // running install's marker first and file a false abandon.
+            let state: tauri::State<'_, AppState> = app.state();
+            if let Some(abandoned) = state.tool_manager.take_abandoned_bootstrap() {
+                // The tail of the previous run's app log usually holds the last
+                // thing the install did before dying. Same 12KB cap as
+                // capture_upgrade_failure: Sentry drops extras past ~16KB.
+                // Connection-pool debug lines are dropped first so the budget
+                // goes to the install rather than to health polling (RUST-9Y).
+                let log_tail = std::fs::read_to_string(logging::log_path())
+                    .ok()
+                    .map(|s| {
+                        tail_bytes_for_sentry(&strip_connection_noise(&s), SENTRY_EXTRA_TAIL_BYTES)
+                    })
+                    .unwrap_or_else(|| "app log unreadable".into());
+                sentry::with_scope(
+                    |scope| {
+                        let fp = ["bootstrap_abandoned", abandoned.step.as_str()];
+                        scope.set_fingerprint(Some(fp.as_slice()));
+                        scope.set_tag("abandoned_step", &abandoned.step);
+                        scope.set_extra("percent", u64::from(abandoned.percent).into());
+                        scope.set_extra("app_log_tail", log_tail.into());
+                        // File it under the build that died, not this one.
+                        if !abandoned.version.is_empty() {
+                            let release =
+                                format!("{}@{}", env!("CARGO_PKG_NAME"), abandoned.version);
+                            scope.add_event_processor(move |mut event| {
+                                event.release = Some(release.clone().into());
+                                Some(event)
+                            });
+                        }
+                    },
+                    || {
+                        sentry::capture_message(
+                            &format!(
+                                "bootstrap_abandoned (died at \"{}\" {}%)",
+                                abandoned.step, abandoned.percent
+                            ),
+                            sentry::Level::Warning,
+                        );
+                    },
+                );
+                // Funnel mirror of the capture, so the server-side stall query
+                // can tell "died mid-install but came back" from "gone for
+                // good". Needs the AnalyticsClient managed above. Unknown step
+                // names are ignored by servers that predate this one.
                 pricing::report_funnel_step(app.handle(), "bootstrap_abandoned");
             }
             // A WebView2 runtime that is registered but broken passes Tauri's
@@ -10472,7 +10508,7 @@ mod tests {
         PENDING_MAGIC_LINK,
     };
     #[cfg(target_os = "macos")]
-    use super::{dir_is_read_only, is_read_only_filesystem};
+    use super::{bundle_folder_accepts_writes, dir_is_read_only, is_read_only_filesystem};
     use parking_lot::Mutex;
     use serde_json::json;
     use std::sync::Arc;
@@ -12545,6 +12581,33 @@ mod tests {
             .contains("internet connection"));
     }
 
+    /// These messages show on every platform, so none may assume a Mac.
+    #[test]
+    fn cross_platform_failure_messages_do_not_assume_a_mac() {
+        for kind in [
+            BootstrapFailureKind::SslInterception,
+            BootstrapFailureKind::NoUsableTempDir,
+            BootstrapFailureKind::NetworkDownload,
+            BootstrapFailureKind::UnsupportedPin,
+            BootstrapFailureKind::Permission,
+            BootstrapFailureKind::SourceBuild,
+            BootstrapFailureKind::Other,
+        ] {
+            let msg = user_message_for(kind);
+            for mac_only in ["your Mac", "this Mac"] {
+                assert!(
+                    !msg.contains(mac_only),
+                    "{} message says {mac_only}: {msg}",
+                    kind.as_str()
+                );
+            }
+        }
+        assert!(
+            user_message_for(BootstrapFailureKind::NoUsableTempDir).contains("%TEMP%"),
+            "Windows users need the folder that actually applies to them"
+        );
+    }
+
     #[test]
     fn unsupported_pin_wins_over_the_network_heuristic() {
         // pip echoes every index it consulted before reporting the resolution
@@ -12895,6 +12958,27 @@ Some unrelated content.
     #[test]
     fn watchdog_should_be_up_skips_when_pricing_gate_bypassed() {
         assert!(!watchdog_should_be_up(true, false, false, false, true));
+    }
+
+    /// A second launch on Windows/Linux (a shortcut clicked during a slow first
+    /// install, or any headroom:// link) runs until single-instance exits it
+    /// from its plugin setup, which Tauri runs before the app's own `.setup`.
+    /// Taking the bootstrap marker any earlier let that side process delete a
+    /// running install's marker and file a false bootstrap_abandoned. Needs a
+    /// real second process, so pinned in source.
+    #[test]
+    fn abandoned_bootstrap_is_taken_only_after_single_instance_can_exit() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, run) = source.split_once("\npub fn run() {").expect("run present");
+        let run = &run[..run.find("\n}\n").expect("run end")];
+        let setup = run.find(".setup(move |app| {").expect("setup closure");
+        let take = run
+            .find(".take_abandoned_bootstrap()")
+            .expect("run takes the marker");
+        assert!(
+            setup < take,
+            "the marker must be taken inside .setup, after plugin setup"
+        );
     }
 
     /// The watchdog loop needs a running app, so these pin its ordering in
@@ -14967,6 +15051,33 @@ Some unrelated content.
         assert!(!is_read_only_filesystem(
             &std::io::Error::from_raw_os_error(13)
         ));
+    }
+
+    /// The counterpart of the guard above: EACCES does install, but only
+    /// through the plugin's admin prompt, so it must never be the silent path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn silent_install_needs_a_bundle_folder_that_takes_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(bundle_folder_accepts_writes(Some(
+            &dir.path().join("Headroom.app")
+        )));
+
+        let locked = dir.path().join("Applications");
+        std::fs::create_dir(&locked).expect("create");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let accepts = bundle_folder_accepts_writes(Some(&locked.join("Headroom.app")));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            !accepts,
+            "an unwritable folder installs only via an admin prompt, never silently"
+        );
+        assert!(
+            !bundle_folder_accepts_writes(None),
+            "no bundle found means nothing to swap"
+        );
     }
 }
 
