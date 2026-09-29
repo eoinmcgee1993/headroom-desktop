@@ -476,7 +476,7 @@ fn maybe_fire_onboarding_recovery_nudge(
     if first_polled_at.elapsed() < std::time::Duration::from_secs(10 * 60) {
         return;
     }
-    if dashboard.lifetime_requests > 0 {
+    if dashboard.lifetime_requests > 0 || unrouted_usage_expected(state) {
         return;
     }
     if !state.try_mark_onboarding_recovery_notified() {
@@ -549,9 +549,8 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         return;
     }
     // Sessions growing while nothing reaches the proxy proves a leak, not its
-    // cause. With 6767 unbound the cause is ours, and "restart your terminal"
-    // is advice that cannot work -- same reasoning as the hourly detector.
-    if state.intercept_bind_failed() {
+    // cause. See `unrouted_usage_expected`.
+    if unrouted_usage_expected(state) {
         return;
     }
     // Cached (~90s warmer cadence), so polling this every 5s costs nothing.
@@ -592,7 +591,10 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
             client_adapters::routed_since(client_id, since.into()).into();
         (Utc::now() - at >= chrono::Duration::minutes(3)).then_some(at)
     };
+    // The Claude-only gate sends Claude Code direct on purpose while Codex
+    // stays routed, so only the Codex half can still be a leak.
     let claude = claude
+        && !state.claude_only_bypass.load(Ordering::Acquire)
         && routed("claude_code").is_some_and(|at| claude_sessions_touched_since(&projects, at));
     let codex_routed_since =
         routed("codex").filter(|at| codex_active_at.is_some_and(|active| active > *at));
@@ -616,7 +618,12 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
             report_first_run_unrouted_codex(state, routed_since);
         }
     }
-    if !state.try_mark_unrouted_usage_notified() {
+    // The beacons count an agent whose connector is off as well, as the hourly
+    // detector does (its `enabled` tag), but restarting a terminal only helps
+    // an agent Headroom routes: with the connector off there is no route.
+    let claude = claude && client_adapters::is_claude_code_enabled();
+    let codex = codex && client_adapters::is_codex_enabled();
+    if !(claude || codex) || !state.try_mark_unrouted_usage_notified() {
         return;
     }
     let (title, body) = unrouted_usage_copy(claude, codex);
@@ -626,6 +633,17 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         "unrouted_usage_nudge_shown",
         Some(json!({ "claude": claude, "codex": codex })),
     );
+}
+
+/// True when an agent going direct is expected, so "active locally, nothing
+/// proxied" is no leak and "restart your terminal" is advice that cannot work:
+/// paused (the watchdog's give-up auto-pause included), the pricing gate's
+/// full bypass, or 6767 never bound, which makes the cause ours. Shared by the
+/// hourly detector and both first-run nudges.
+fn unrouted_usage_expected(state: &AppState) -> bool {
+    state.runtime_is_paused()
+        || state.intercept_bind_failed()
+        || state.proxy_bypass.load(Ordering::Acquire)
 }
 
 /// First-run twin of the hourly `unrouted_client` report, with the same Codex
@@ -4592,6 +4610,16 @@ fn feed_failure_is_persistent(elapsed: std::time::Duration) -> bool {
     elapsed >= FEED_FETCH_FAILURE_GRACE
 }
 
+/// Whether the app itself is holding the backend (or 6767) down, so a failing
+/// feed pull is expected. See the stand-down in `run_activity_observation`.
+fn feed_canary_stands_down(state: &AppState) -> bool {
+    state.runtime_is_paused()
+        || state.runtime_is_auto_paused()
+        || state.runtime_is_starting()
+        || state.intercept_bind_failed()
+        || state.proxy_bypass.load(Ordering::Acquire)
+}
+
 fn transformations_feed_pull_limit() -> Option<u32> {
     static LAST_PULL: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
     let forwarded: u64 = crate::proxy_intercept::intercept_request_counts()
@@ -4629,13 +4657,10 @@ fn run_activity_observation(app: &AppHandle) {
     // cannot bind 6767 (RUST-EQ, Windows refusing the socket outright), every
     // fetch is refused for as long as that lasts -- and the bind loop already
     // reports it, with the OS code and the occupant. The canary would only add
-    // a second, blinder issue for the same machine (RUST-DT).
-    let intercept_bind_failed = state.intercept_bind_failed();
-    if state.runtime_is_paused()
-        || state.runtime_is_auto_paused()
-        || state.runtime_is_starting()
-        || intercept_bind_failed
-    {
+    // a second, blinder issue for the same machine (RUST-DT). The pricing
+    // gate's full bypass stops the backend on purpose too, for as long as the
+    // gate holds (the Claude-only gate keeps it up, so it still counts).
+    if feed_canary_stands_down(&state) {
         *FEED_FAILING_SINCE.lock() = None;
     } else if let Some(limit) = transformations_feed_pull_limit() {
         match fetch_transformations_feed(limit) {
@@ -5537,12 +5562,7 @@ async fn detect_unrouted_clients(
         // the client, re-applies a setup that was never wrong, and shows the
         // user a "ran without Headroom" affordance pointing at their terminal.
         // The bind loop already reports the real cause, with the OS code.
-        if state.runtime_is_paused()
-            || state.intercept_bind_failed()
-            || state
-                .proxy_bypass
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if unrouted_usage_expected(&state) {
             return Vec::new();
         }
         // ponytail: process-wide hourly throttle, same shape as
@@ -5682,6 +5702,9 @@ async fn get_client_connectors(
 
 #[tauri::command]
 async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), String> {
+    // Before the disable, so the tray loop cannot see the connector gone
+    // first and announce the user's own change as a disconnect.
+    *LAST_USER_CONNECTOR_DISABLE.lock() = Some(std::time::Instant::now());
     client_adapters::disable_client_setup(&client_id).map_err(|err| err.to_string())?;
     analytics::track_event(
         &app,
@@ -8885,6 +8908,9 @@ enum TrayRuntimeVisual {
     Paused,
     Unhealthy,
     Disconnected,
+    /// The pricing gate's full bypass: the backend is stopped on purpose and
+    /// traffic goes direct, so nothing is broken and nothing is restarting.
+    Gated,
 }
 
 struct TrayRuntimeIcons {
@@ -8917,6 +8943,67 @@ fn debounced_tray_runtime_visual(
 
     *unhealthy_streak = 0;
     raw_visual
+}
+
+/// The tray state `runtime` reads as, before debouncing. `backend_answers`
+/// re-probes the backend directly and runs only on a missed proxy probe.
+fn tray_raw_visual(
+    runtime: &crate::models::RuntimeStatus,
+    connector_enabled: bool,
+    backend_answers: impl FnOnce() -> bool,
+) -> TrayRuntimeVisual {
+    let connected = if connector_enabled {
+        TrayRuntimeVisual::Running
+    } else {
+        TrayRuntimeVisual::Disconnected
+    };
+    if runtime.running {
+        connected
+    } else if runtime.starting {
+        TrayRuntimeVisual::Booting
+    } else if runtime.paused {
+        TrayRuntimeVisual::Paused
+    } else if runtime.bypassed {
+        // The gate stopped the backend on purpose, so both probes miss. Not
+        // Paused: its Resume clears the bypass only for the next pricing poll
+        // to set it again.
+        TrayRuntimeVisual::Gated
+    } else if runtime.installed && !runtime.proxy_reachable {
+        // The fast reachability probe (1.5s via the 6767 intercept) missed,
+        // but it flaps on transient upstream-connectivity blips and brief
+        // backend busyness (compression / embedding) while the process is
+        // perfectly alive. Mirror the watchdog's tolerance instead of
+        // immediately flashing "proxy unreachable, attempting restart":
+        // re-probe the backend /readyz directly, and treat an `ok` or
+        // upstream-only-503 outcome as healthy (the process is fine; only the
+        // cached upstream probe is down). Only a genuinely non-answering
+        // backend shows Unhealthy. This probe runs only on the rare
+        // !proxy_reachable tick, so its cost is off the happy path.
+        if backend_answers() {
+            connected
+        } else {
+            TrayRuntimeVisual::Unhealthy
+        }
+    } else {
+        TrayRuntimeVisual::Off
+    }
+}
+
+/// When the user last switched a connector off in the app.
+static LAST_USER_CONNECTOR_DISABLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Whether a tray move into Disconnected from `last_non_booting` deserves the
+/// "your coding tools were disconnected" notification. Not when the user just
+/// switched their last connector off: they are looking at the window where
+/// they did it. The window covers the loop's lag in noticing (a 2s connector
+/// re-check plus a 5s idle tick); a real disconnect inside it still changes
+/// the icon and tooltip, it only goes unannounced.
+fn disconnect_notice_due(last_non_booting: Option<TrayRuntimeVisual>) -> bool {
+    const USER_DISABLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+    last_non_booting == Some(TrayRuntimeVisual::Running)
+        && !LAST_USER_CONNECTOR_DISABLE
+            .lock()
+            .is_some_and(|at| at.elapsed() < USER_DISABLE_WINDOW)
 }
 
 fn spawn_tray_runtime_icon_updater(app: AppHandle) {
@@ -8971,45 +9058,12 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
 
             let raw_visual = {
                 let state: tauri::State<'_, AppState> = app.state();
-                let runtime = state.runtime_status();
-                if runtime.running {
-                    if cached_connector_enabled {
-                        TrayRuntimeVisual::Running
-                    } else {
-                        TrayRuntimeVisual::Disconnected
-                    }
-                } else if runtime.starting {
-                    TrayRuntimeVisual::Booting
-                } else if runtime.paused {
-                    TrayRuntimeVisual::Paused
-                } else if runtime.installed && !runtime.proxy_reachable {
-                    // The fast reachability probe (1.5s via the 6767 intercept)
-                    // missed, but it flaps on transient upstream-connectivity
-                    // blips and brief backend busyness (compression /
-                    // embedding) while the process is perfectly alive. Mirror
-                    // the watchdog's tolerance instead of immediately flashing
-                    // "proxy unreachable, attempting restart": re-probe the
-                    // backend /readyz directly, and treat an `ok` or
-                    // upstream-only-503 outcome as healthy (the process is fine;
-                    // only the cached upstream probe is down). Only a genuinely
-                    // non-answering backend shows Unhealthy. This probe runs
-                    // only on the rare !proxy_reachable tick, so its cost is off
-                    // the happy path.
+                tray_raw_visual(&state.runtime_status(), cached_connector_enabled, || {
                     let outcome = probe_backend_readyz_outcome_with_timeout(
                         std::time::Duration::from_secs(5),
                     );
-                    if outcome == "ok" || readyz_failure_is_upstream_only(&outcome) {
-                        if cached_connector_enabled {
-                            TrayRuntimeVisual::Running
-                        } else {
-                            TrayRuntimeVisual::Disconnected
-                        }
-                    } else {
-                        TrayRuntimeVisual::Unhealthy
-                    }
-                } else {
-                    TrayRuntimeVisual::Off
-                }
+                    outcome == "ok" || readyz_failure_is_upstream_only(&outcome)
+                })
             };
             let visual =
                 debounced_tray_runtime_visual(raw_visual, last_non_booting, &mut unhealthy_streak);
@@ -9036,6 +9090,9 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                     // No connector enabled at all (any_gate_exempt_client_enabled
                     // covers Codex, OpenCode and Grok), not just Claude/Codex.
                     TrayRuntimeVisual::Disconnected => "Headroom: no coding tools connected".into(),
+                    TrayRuntimeVisual::Gated => {
+                        "Headroom: paused by your plan, your coding tools connect directly".into()
+                    }
                     TrayRuntimeVisual::Off => "Headroom: off".into(),
                 };
 
@@ -9118,6 +9175,15 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             last_displayed_dollars = None;
                         }
                     }
+                    // No red badge: that means broken, and the gate is not.
+                    TrayRuntimeVisual::Gated => {
+                        if last_non_booting != Some(TrayRuntimeVisual::Gated) {
+                            let _ = tray.set_icon(Some(icons.paused.clone()));
+                            icon_changed = true;
+                            last_non_booting = Some(TrayRuntimeVisual::Gated);
+                            last_displayed_dollars = None;
+                        }
+                    }
                     TrayRuntimeVisual::Unhealthy => {
                         if last_non_booting != Some(TrayRuntimeVisual::Unhealthy) {
                             let _ = tray.set_icon(Some(icons.off.clone()));
@@ -9132,7 +9198,7 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
                             icon_changed = true;
                             // Only notify when transitioning from a healthy running
                             // state — not on first boot or from other non-running states.
-                            if last_non_booting == Some(TrayRuntimeVisual::Running) {
+                            if disconnect_notice_due(last_non_booting) {
                                 let _ = show_notification_impl(
                                     &app,
                                     "Headroom",
@@ -10870,6 +10936,87 @@ mod tests {
             TrayRuntimeVisual::Running
         );
         assert_eq!(unhealthy_streak, 0);
+    }
+
+    fn runtime_status_for_tray(json: serde_json::Value) -> crate::models::RuntimeStatus {
+        let mut status = serde_json::json!({
+            "platform": "macos", "supportTier": "supported", "installed": true,
+            "running": false, "starting": false, "paused": false, "autoPaused": false,
+            "bypassed": false, "proxyReachable": false, "headroomLearnSupported": true,
+            "rtk": { "installed": false, "enabled": false, "pathConfigured": false,
+                     "hookConfigured": false },
+        });
+        status
+            .as_object_mut()
+            .unwrap()
+            .extend(json.as_object().unwrap().clone());
+        serde_json::from_value(status).expect("runtime status")
+    }
+
+    #[test]
+    fn tray_shows_a_gated_backend_as_gated_not_unhealthy() {
+        // Full bypass stops the backend on purpose, so both probes miss. That
+        // is the plan pausing Headroom, not a proxy that is restarting.
+        let gated = runtime_status_for_tray(serde_json::json!({ "bypassed": true }));
+        assert_eq!(
+            super::tray_raw_visual(&gated, true, || false),
+            TrayRuntimeVisual::Gated
+        );
+        // A backend that is supposed to be up and does not answer still is.
+        let down = runtime_status_for_tray(serde_json::json!({}));
+        assert_eq!(
+            super::tray_raw_visual(&down, true, || false),
+            TrayRuntimeVisual::Unhealthy
+        );
+        // A user pause (the watchdog's give-up sets bypass too) keeps Resume.
+        let paused =
+            runtime_status_for_tray(serde_json::json!({ "bypassed": true, "paused": true }));
+        assert_eq!(
+            super::tray_raw_visual(&paused, true, || false),
+            TrayRuntimeVisual::Paused
+        );
+    }
+
+    #[test]
+    fn switching_a_connector_off_does_not_announce_a_disconnect() {
+        assert!(
+            super::disconnect_notice_due(Some(TrayRuntimeVisual::Running)),
+            "a disconnect nobody asked for is announced"
+        );
+        *super::LAST_USER_CONNECTOR_DISABLE.lock() = Some(std::time::Instant::now());
+        assert!(
+            !super::disconnect_notice_due(Some(TrayRuntimeVisual::Running)),
+            "the user just switched it off in the app"
+        );
+        *super::LAST_USER_CONNECTOR_DISABLE.lock() = None;
+    }
+
+    #[test]
+    fn unrouted_nudge_and_feed_canary_stand_down_while_paused_or_gated() {
+        let base_dir =
+            std::env::temp_dir().join(format!("headroom-unrouted-gate-{}", uuid::Uuid::new_v4()));
+        let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
+        assert!(!super::unrouted_usage_expected(&state));
+        assert!(!super::feed_canary_stands_down(&state));
+
+        state.set_runtime_paused(true);
+        assert!(
+            super::unrouted_usage_expected(&state),
+            "paused: going direct is the intended state"
+        );
+        state.set_runtime_paused(false);
+
+        // The pricing gate's full bypass stops the backend on purpose, so the
+        // agent goes direct and every feed pull is a 503.
+        state
+            .proxy_bypass
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(super::unrouted_usage_expected(&state), "gated: no leak");
+        assert!(
+            super::feed_canary_stands_down(&state),
+            "gated: a dead feed is expected"
+        );
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
