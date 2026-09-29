@@ -21,8 +21,15 @@ fn main() {
         }
     }
 
-    println!("cargo:rerun-if-changed=../.env");
-    println!("cargo:rerun-if-changed=../.env.local");
+    // Watch only the files that exist: cargo treats a missing rerun-if-changed
+    // path as always stale, so it reran this script and recompiled the crate
+    // on every cargo call (a full minute each in CI, which has neither file).
+    // ponytail: creating a first .env is not noticed; `touch src-tauri/build.rs`.
+    for path in ["../.env", "../.env.local"] {
+        if Path::new(path).exists() {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
     tauri_build::build()
 }
 

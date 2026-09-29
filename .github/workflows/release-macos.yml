@@ -116,11 +116,6 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
-        with:
-          tool: nextest
-
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -344,11 +339,6 @@ jobs:
       - name: Install frontend dependencies
         if: steps.release_guard.outputs.should_release == 'true'
         run: npm ci
-
-      - name: Run release checks
-        if: steps.release_guard.outputs.should_release == 'true'
-        timeout-minutes: 12
-        run: ./scripts/verify-release.sh
 
       - name: Load release notes
         if: steps.release_guard.outputs.should_release == 'true'

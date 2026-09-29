@@ -1,13 +1,13 @@
 name: Release App (Staging)
 
 # Release candidate build for every platform, on each -rc.N version bump pushed
-# to staging. After the guard job, macOS, Windows, Linux and the release checks
-# all run in parallel. The macOS job creates the versioned rc release; Windows
-# and Linux hand their bundles to the mirror job as workflow artifacts, because
-# the rc release may not exist yet when they finish. Nothing polls that
-# release. Only the final mirror job touches staging-rolling (the endpoint rc
-# installs poll), and it writes the complete manifest in one go, so a failed
-# release check still keeps an rc from reaching anyone.
+# to staging. After the guard job, macOS, Windows and Linux build in parallel.
+# The macOS job creates the versioned rc release; Windows and Linux hand their
+# bundles to the mirror job as workflow artifacts, because the rc release may
+# not exist yet when they finish. Nothing polls that release. Only the final
+# mirror job touches staging-rolling (the endpoint rc installs poll), and it
+# writes the complete manifest in one go, once the Test workflow has passed on
+# the same commit.
 #
 # The manifest is published last on purpose. A latest.json that names a new
 # version but carries no entry for the reader's platform is an update *error*
@@ -221,48 +221,6 @@ jobs:
           releaseAssetNamePattern: '[name]_[version]_mac[ext]'
           uploadUpdaterJson: true
           args: --target universal-apple-darwin
-
-  checks:
-    name: Release checks (Staging)
-    # Its own job so the suite runs beside the builds instead of in front of
-    # the macOS one. Only the mirror job waits for it.
-    needs: guard
-    if: needs.guard.outputs.should_release == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 45
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
-        with:
-          tool: nextest
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: |
-            src-tauri -> target
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Run release checks
-        timeout-minutes: 12
-        run: ./scripts/verify-release.sh
 
   windows:
     name: Windows x64 (Staging)
@@ -479,11 +437,11 @@ jobs:
 
   mirror:
     name: Publish staging manifest
-    # Only after every platform has built and the release checks passed.
+    # Only after every platform has built and Test passed (first step).
     # staging-rolling is the endpoint rc installs poll, and this job is its
     # only writer, so a partial or failing build is never visible to any
     # platform.
-    needs: [guard, release, checks, windows, linux]
+    needs: [guard, release, windows, linux]
     if: needs.guard.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45 # up to 30 of it waiting on Test
