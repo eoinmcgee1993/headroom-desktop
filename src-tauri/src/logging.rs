@@ -665,11 +665,47 @@ pub(crate) fn sanitize_event(
             .iter()
             .filter_map(|exception| exception.value.as_deref())
             .any(is_unreportable);
-    if environmental {
+    if environmental || warning_repeat(&event) {
         return None;
     }
     attach_sentry_user(&mut event);
     Some(scrub_event(event))
+}
+
+/// Warnings (and below) already filed by this process in the last 24h, keyed by
+/// fingerprint or digit-stripped message. Warnings were ~95% of the error
+/// quota (week to 2026-09-29, ~550/day against a 5k/month Developer plan), and
+/// most of it was one host repeating one warning: RUST-1H sent 710 from a single
+/// Mac. Once per host per day keeps the issue's host count, which is the signal.
+/// Errors and fatals are never throttled.
+static WARNINGS_SENT: Mutex<Option<std::collections::HashMap<String, std::time::Instant>>> =
+    Mutex::new(None);
+
+fn warning_repeat(event: &sentry::protocol::Event<'static>) -> bool {
+    if event.level > sentry::Level::Warning {
+        return false;
+    }
+    let key = if event.fingerprint.iter().any(|part| part != "{{ default }}") {
+        event.fingerprint.join("|")
+    } else {
+        let message = event
+            .message
+            .as_deref()
+            .or(event.logentry.as_ref().map(|entry| entry.message.as_str()))
+            .unwrap_or_default();
+        // Timestamps and counts in the text would otherwise make every repeat new.
+        message.chars().filter(|c| !c.is_ascii_digit()).collect()
+    };
+    let now = std::time::Instant::now();
+    let mut sent = WARNINGS_SENT.lock().unwrap_or_else(|e| e.into_inner());
+    let sent = sent.get_or_insert_with(Default::default);
+    match sent.get(&key) {
+        Some(at) if now.duration_since(*at) < std::time::Duration::from_secs(24 * 3600) => true,
+        _ => {
+            sent.insert(key, now);
+            false
+        }
+    }
 }
 
 /// Replace the home directory with `~` in every free-text field, including the
@@ -1656,5 +1692,23 @@ mod tests {
         let mut other = sentry::protocol::Event::new();
         other.message = Some("Could not persist reconciled grace state: Permission denied".into());
         assert!(super::sanitize_event(other).is_some());
+    }
+
+    #[test]
+    fn sanitize_event_sends_each_warning_once_per_day() {
+        let event = |message: &str, level| {
+            let mut event = sentry::protocol::Event::new();
+            event.message = Some(message.into());
+            event.level = level;
+            event
+        };
+        let warn = sentry::Level::Warning;
+        // The shape of RUST-D9: the same warning with a fresh timestamp each time.
+        assert!(super::sanitize_event(event("unrouted at 2026-09-29 06:15:09", warn)).is_some());
+        assert!(super::sanitize_event(event("unrouted at 2026-09-29 07:15:09", warn)).is_none());
+        assert!(super::sanitize_event(event("unrouted since yesterday", warn)).is_some());
+        let error = sentry::Level::Error;
+        assert!(super::sanitize_event(event("bootstrap failed 1", error)).is_some());
+        assert!(super::sanitize_event(event("bootstrap failed 1", error)).is_some());
     }
 }
