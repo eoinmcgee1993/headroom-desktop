@@ -2633,13 +2633,23 @@ fn summarize_kompress_prefetch_failure(log_path: &Path) -> String {
 /// Bucket a prefetch-log tail into a coarse, stable failure category.
 fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
     let t = tail.to_lowercase();
+    // A dropped socket says "aborted" too (WinError 10053 "An established
+    // connection was aborted ...", requests' "Connection aborted."). Strip
+    // those so only a process abort reads as native; the drop is network.
+    let process_text = t
+        .replace("connectionabortederror", "")
+        .replace("connection was aborted", "")
+        .replace("connection aborted", "");
     if t.is_empty() {
         "no output"
-    } else if t.contains("sigabrt") || t.contains("aborted") {
+    } else if process_text.contains("sigabrt") || process_text.contains("aborted") {
         "native abort"
     } else if t.contains("no space left") || t.contains("disk full") || t.contains("errno 28") {
         "disk full"
     } else if t.contains("connection")
+        // WSAECONNABORTED / WSAECONNRESET: the number survives the locale.
+        || t.contains("winerror 10053")
+        || t.contains("winerror 10054")
         || t.contains("timed out")
         || t.contains("timeout")
         || t.contains("name resolution")
@@ -4120,7 +4130,13 @@ impl ToolManager {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .map(|name| name.starts_with(&prefix) && name.ends_with(".log"))
+                    // Learn runs write `headroom-learn-*.log` beside the
+                    // proxy's logs (see `cap_live_proxy_logs`).
+                    .map(|name| {
+                        name.starts_with(&prefix)
+                            && name.ends_with(".log")
+                            && !name.starts_with("headroom-learn-")
+                    })
                     .unwrap_or(false)
             })
             .filter_map(|path| {
@@ -4278,7 +4294,17 @@ impl ToolManager {
     }
 
     pub fn headroom_kompress_enabled(&self) -> Option<bool> {
-        // The `headroom` Python package attaches a RotatingFileHandler to its
+        // The backend reports Kompress on `/readyz` (`checks.kompress`, lazy
+        // loads included). The log scan below went blind once the wheel's log
+        // rotated past the last marker and reread up to 10 MB per status poll,
+        // so it only runs for a wheel without that field. No answer at all is
+        // unknown, not a reason to scan.
+        let readyz = fetch_backend_readyz(crate::backend_port::get())?;
+        if let Some(state) = readyz_kompress_state(&readyz) {
+            return Some(state);
+        }
+
+        // Fallback. The `headroom` Python package attaches a RotatingFileHandler to its
         // `headroom` root logger with `propagate = False` (see helpers.py:
         // `_setup_file_logging`). Proxy-logger INFO lines — including the
         // `Kompress: ENABLED/not installed/disabled` startup markers — go to
@@ -9785,6 +9811,33 @@ pub(crate) fn probe_backend_readyz_ok(port: u16) -> bool {
     )
 }
 
+/// The backend's `/readyz` body, whatever the status: a 503 (a gating check
+/// down) carries the same `checks`. None when nothing answers with JSON.
+fn fetch_backend_readyz(port: u16) -> Option<Value> {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .tls_built_in_root_certs(false)
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()?;
+    client
+        .get(format!("http://127.0.0.1:{port}/readyz"))
+        .send()
+        .ok()?
+        .json()
+        .ok()
+}
+
+/// Kompress state from a `/readyz` body's `checks.kompress` (every wheel since
+/// 0.35.0): `Some(true)` once the model is loaded, eagerly or lazily;
+/// `Some(false)` while disabled, not installed or still warming. None when the
+/// wheel predates the field.
+fn readyz_kompress_state(body: &Value) -> Option<bool> {
+    let check = body.get("checks")?.get("kompress")?;
+    // A disabled component reads `ready: true`, so `enabled` decides first.
+    Some(check.get("enabled")?.as_bool()? && check.get("ready")?.as_bool()?)
+}
+
 /// Poll until `pid` has let go of `port` or `timeout` elapses. Returns true
 /// once it has. A killed listener's socket is released as soon as the owning
 /// process dies, so this normally returns within a couple of poll intervals.
@@ -10786,9 +10839,11 @@ fn log_tail(path: &Path, max_bytes: u64) -> String {
         use std::io::Seek;
         let _ = f.seek(std::io::SeekFrom::Start(len - max_bytes));
     }
-    let mut buf = String::new();
-    let _ = f.read_to_string(&mut buf);
-    buf.trim().to_string()
+    // Bytes, not read_to_string: the seek can land inside a multi-byte
+    // character, and read_to_string then returns nothing at all.
+    let mut buf = Vec::new();
+    let _ = f.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).trim().to_string()
 }
 
 fn rotate_log_if_large(path: &Path) {
@@ -15286,6 +15341,36 @@ assert g.done"#,
         );
     }
 
+    /// A socket drop says "aborted" too, and filing it as a native abort
+    /// skipped the network retry after one attempt.
+    #[test]
+    fn classify_kompress_prefetch_failure_files_connection_aborts_as_network() {
+        for tail in [
+            "httpx.ReadError: [WinError 10053] An established connection was aborted \
+             by the software in your host machine",
+            "ConnectionAbortedError: [WinError 10053] An established connection was \
+             aborted by the software in your host machine",
+            "requests.exceptions.ConnectionError: ('Connection aborted.', \
+             RemoteDisconnected('Remote end closed connection without response'))",
+            // Localized: only the errno survives.
+            "httpx.ReadError: [WinError 10053] Eine bestehende Verbindung wurde \
+             softwaregesteuert durch den Hostcomputer abgebrochen",
+        ] {
+            assert_eq!(
+                classify_kompress_prefetch_failure(tail),
+                "network",
+                "{tail}"
+            );
+        }
+        // A process abort after a logged connection drop is still native.
+        assert_eq!(
+            classify_kompress_prefetch_failure(
+                "WARNING: connection aborted, retrying\nFatal Python error: Aborted"
+            ),
+            "native abort"
+        );
+    }
+
     #[test]
     fn summarize_kompress_prefetch_failure_uses_last_meaningful_line() {
         let dir = std::env::temp_dir().join(format!(
@@ -16360,6 +16445,68 @@ assert g.done"#,
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Kompress status comes from the backend's own `/readyz` report, so it
+    /// survives the wheel's log rotating past the last startup marker.
+    #[test]
+    fn kompress_state_comes_from_readyz_checks() {
+        // A 503 (a gating check down) still carries `checks`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = r#"{"ready":false,"checks":{"kompress":{"enabled":true,"ready":true,"status":"healthy","optional":true,"backend":"onnx"}}}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write");
+        });
+        let body = super::fetch_backend_readyz(port).expect("readyz body");
+        handle.join().expect("server thread");
+        assert_eq!(super::readyz_kompress_state(&body), Some(true));
+
+        let state = |check: &str| {
+            super::readyz_kompress_state(
+                &serde_json::from_str(&format!(r#"{{"checks":{{"kompress":{check}}}}}"#))
+                    .expect("json"),
+            )
+        };
+        // Enabled but the model is not loaded yet: the UI's "warming up".
+        assert_eq!(state(r#"{"enabled":true,"ready":false}"#), Some(false));
+        // Disabled components read `ready: true`; `enabled` decides.
+        assert_eq!(state(r#"{"enabled":false,"ready":true}"#), Some(false));
+        // A wheel without the field falls back to the log scan.
+        assert_eq!(
+            super::readyz_kompress_state(&serde_json::json!({"checks": {}})),
+            None
+        );
+    }
+
+    /// Learn runs write `headroom-learn-*.log` beside the proxy's logs; "Show
+    /// logs" must keep showing the proxy's.
+    #[test]
+    fn latest_headroom_log_skips_learn_run_logs() {
+        let (root, runtime, manager) = seed_test_runtime("latest-log-learn");
+        let logs = runtime.logs_dir();
+        fs::create_dir_all(&logs).expect("logs dir");
+        let proxy = logs.join("headroom-proxy---port-6768.log");
+        fs::write(&proxy, "proxy\n").expect("write proxy log");
+        let learn = logs.join("headroom-learn-app-0123456789ab.log");
+        fs::write(&learn, "learn\n").expect("write learn log");
+        // The learn log is the newest `headroom-*.log`.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&learn)
+            .and_then(|f| f.set_modified(SystemTime::now() + Duration::from_secs(60)))
+            .expect("bump learn mtime");
+
+        assert_eq!(manager.latest_tool_log_path("headroom"), Some(proxy));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn rtk_distribution_artifact_is_pinned_to_current_release_with_checksum() {
         let artifact = rtk_distribution_artifact().expect("supported RTK target");
@@ -17076,6 +17223,17 @@ assert g.done"#,
 
         fs::write(&log, b"0123456789").expect("write");
         assert_eq!(log_tail(&log, 4), "6789", "seeks to last N bytes");
+    }
+
+    /// A tail cut inside a multi-byte character (a non-ASCII home path in a
+    /// traceback) must keep the traceback, not come back empty.
+    #[test]
+    fn log_tail_keeps_the_tail_when_the_cut_splits_a_character() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("t.log");
+        fs::write(&log, "é".repeat(600)).expect("write");
+        let tail = log_tail(&log, 1023);
+        assert_eq!(tail, format!("\u{FFFD}{}", "é".repeat(511)));
     }
 
     #[test]
