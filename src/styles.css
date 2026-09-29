@@ -6164,17 +6164,6 @@ html.window-hiding {
   text-align: center;
 }
 
-.tray-footnote {
-  color: var(--text-muted);
-  font-size: var(--text-xs);
-  margin: 0;
-  text-align: center;
-}
-
-.tray-footnote .link-button {
-  margin-left: 0;
-}
-
 .paywall__sale-banner {
   align-self: center;
   background: var(--accent-tint);

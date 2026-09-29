@@ -4881,7 +4881,11 @@ impl ToolManager {
             // inside it is open without share-delete, and real-time AV scans
             // every freshly unpacked file, outlasting the retry window on
             // slow machines. Reading the files is still allowed, so copy.
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            // A sharing violation (os error 32) has no ErrorKind of its own.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    || (cfg!(windows) && err.raw_os_error() == Some(32)) =>
+            {
                 log::info!("publishing extracted python by rename denied ({err}); copying instead");
                 let interpreter = expected_python
                     .strip_prefix(&extracted_root)
@@ -4902,7 +4906,11 @@ impl ToolManager {
                 )));
             }
         }
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        // After a copy the scanner that denied the rename may still hold the
+        // staging files; a silent failure strands a second ~100 MB tree.
+        let _ = Self::retry_fs("removing python staging", || {
+            std::fs::remove_dir_all(&staging_dir)
+        });
 
         if !self.runtime.standalone_python().exists() {
             bail!(
@@ -7183,7 +7191,8 @@ impl ToolManager {
                  case \"${{1%%:*}}\" in \"$1\"|?|*[!A-Za-z0-9+.-]*) ;; [A-Za-z]*) refuse 'URLs are not supported';; esac\n\
                  # No more than the Read tool allows unprompted: the file, symlinks resolved, under the project.\n\
                  # $(...) strips trailing newlines, which would name another file: the \".\" keeps them.\n\
-                 d=$(pwd -P && echo .) && [ \"${{d#/}}\" != \"$d\" ] || refuse 'cannot resolve the current directory'\n\
+                 # realpath on both sides: bash 3.2's `pwd -P` keeps an inherited $PWD's letter case.\n\
+                 d=$(realpath . && echo .) && [ \"${{d#/}}\" != \"$d\" ] || refuse 'cannot resolve the current directory'\n\
                  f=$(realpath \"$1\" 2>/dev/null && echo .) || refuse \"no such file: $1\"\n\
                  d=${{d%?.}} f=${{f%?.}}\n\
                  case \"$d$f\" in *'\n'*) refuse 'paths with newlines are not supported';; esac\n\
@@ -12873,7 +12882,7 @@ fn run_command_with_timeout(
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     timed_out = true;
-                    let _ = child.kill();
+                    crate::proc::kill_tree(&mut child);
                     break child.wait().with_context(|| {
                         format!("waiting for {} {}", binary.display(), args.join(" "))
                     })?;

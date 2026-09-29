@@ -12,6 +12,7 @@ import {
 import {
   ArrowClockwise,
   Bell,
+  BookOpen,
   Brain,
   CaretLeft,
   Cpu,
@@ -6779,6 +6780,18 @@ export default function App() {
               </span>
             </button>
           ))}
+          <button
+            className="tray-nav__item"
+            onClick={() => void openExternalLink(DOCS_URL)}
+            type="button"
+          >
+            <span className="tray-nav__icon" aria-hidden="true">
+              <BookOpen className="tray-nav__icon-svg" size={26} />
+            </span>
+            <span className="tray-nav__text">
+              <strong>Docs</strong>
+            </span>
+          </button>
         </nav>
         <div className="tray-sidebar__footer">
           <button
@@ -7030,16 +7043,6 @@ export default function App() {
                 <p className="loading-copy">Loading savings history…</p>
               </div>
             )}
-
-            <p className="tray-footnote">
-              <button
-                className="link-button"
-                onClick={() => void openExternalLink(DOCS_URL)}
-                type="button"
-              >
-                Docs and guides
-              </button>
-            </p>
 
           </div>
 

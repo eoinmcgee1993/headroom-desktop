@@ -5846,8 +5846,10 @@ def reachable():
 
 def main():
     # Clients read hook output as UTF-8; the locale codec (cp950 on a Chinese
-    # Windows) mangles non-ASCII and raises on what it cannot encode.
-    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    # Windows) mangles non-ASCII and raises on what it cannot encode. Guarded:
+    # a Linux /usr/bin/python3 can be 3.6, which has no reconfigure.
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     issues = []
     config = load_config()
     if config is None:
@@ -6313,8 +6315,10 @@ def diagnose_route(effective):
 
 def main():
     # Clients read hook output as UTF-8; the locale codec (cp950 on a Chinese
-    # Windows) mangles non-ASCII and raises on what it cannot encode.
-    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    # Windows) mangles non-ASCII and raises on what it cannot encode. Guarded:
+    # a Linux /usr/bin/python3 can be 3.6, which has no reconfigure.
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     issues = []
     route_issue = diagnose_route(os.environ.get("ANTHROPIC_BASE_URL"))
     if route_issue:
@@ -8482,10 +8486,11 @@ pub(crate) fn fake_markitdown_pythonpath(root: &Path) -> PathBuf {
 /// since the shim and the Read hook embed it in single quotes.
 ///
 /// It opens, like every `python -c` Headroom runs in a project dir, by dropping
-/// the `""` (cwd) that `-c` puts first on sys.path: otherwise a cloned repo's
-/// `markitdown/` or `json.py` runs with no prompt. Not `-P`, which needs 3.11:
+/// the `""` (cwd) that `-c` puts first on sys.path, and the absolute cwd an
+/// empty PYTHONPATH entry adds: otherwise a cloned repo's `markitdown/` or
+/// `json.py` runs with no prompt. Not `-P`, which needs 3.11:
 /// the tests run these snippets under a 3.9 system python.
-pub(crate) const MARKITDOWN_MAIN_NO_AUDIO: &str = r#"import sys; sys.path[:] = [p for p in sys.path if p]; sys.modules["speech_recognition"] = None; from markitdown.__main__ import main; sys.argv[0] = "markitdown"; sys.exit(main())"#;
+pub(crate) const MARKITDOWN_MAIN_NO_AUDIO: &str = r#"import sys; import os; _cwd = os.path.realpath(os.getcwd()); sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _cwd]; sys.modules["speech_recognition"] = None; from markitdown.__main__ import main; sys.argv[0] = "markitdown"; sys.exit(main())"#;
 
 /// PreToolUse(Read) hook: when Claude reads a PDF, convert it to Markdown via
 /// the managed `markitdown` and redirect the read at the converted file through
@@ -8518,7 +8523,7 @@ if [ -z "$INPUT" ]; then
 fi
 
 # -X utf8: the hook JSON on stdin/stdout is UTF-8, not the Windows locale codepage.
-"$HEADROOM_PYTHON" -X utf8 -c 'import sys; sys.path[:] = [p for p in sys.path if p] # cwd off sys.path: a project json.py must not run
+"$HEADROOM_PYTHON" -X utf8 -c 'import sys; import os; _cwd = os.path.realpath(os.getcwd()); sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _cwd] # cwd off sys.path: a project json.py must not run
 import json, os, subprocess, hashlib, stat, tempfile, time
 ALLOWED = {{".pdf"}}
 MAX_BYTES = 25 * 1024 * 1024
@@ -8620,7 +8625,7 @@ fn msys_path(value: &str) -> String {
 /// The rtk hook's last step: prints allow-with-the-rewrite, or nothing. It runs
 /// as `python -c '...'`, so it must never contain a single quote. First line:
 /// see MARKITDOWN_MAIN_NO_AUDIO.
-const RTK_HOOK_VERDICT_PY: &str = r##"import sys; sys.path[:] = [p for p in sys.path if p]
+const RTK_HOOK_VERDICT_PY: &str = r##"import sys; import os; _cwd = os.path.realpath(os.getcwd()); sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _cwd]
 import glob, json, os, re, shlex, subprocess
 
 data = json.load(sys.stdin)
@@ -8664,13 +8669,17 @@ def lists_branches(args):
 
 def inside(arg, roots):
     # Claude Code prompts for reads outside the working directories, so must we.
-    if arg.startswith("-") and "=" not in arg:
-        return True
-    path = arg.split("=", 1)[1] if arg.startswith("-") else arg
-    if path.startswith("~"):
+    if len(arg) > 512:
+        return False
+    if arg.startswith("--"):
+        return "=" not in arg or inside(arg.split("=", 1)[1], roots)
+    if arg.startswith("-"):
+        # A short flag takes its value attached after any letter (-f/x, -rflink).
+        return all(inside(arg[k:], roots) for k in range(2, len(arg)))
+    if arg.startswith("~"):
         return False
     base = roots[0] if roots else os.getcwd()
-    full = os.path.realpath(os.path.join(base, path))
+    full = os.path.realpath(os.path.join(base, arg))
     return any(full == r or full.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
 
 
@@ -8690,11 +8699,10 @@ def read_only(cmd, out):
     name, args = argv[0], argv[1:]
     # An unquoted glob can expand to a file named -delete or --pre=sh, or to a
     # symlink out of the project that `inside` only saw as the literal pattern.
-    if re.search(r"[*?\[]", re.sub(r"\x27[^\x27]*\x27|\"[^\"]*\"", "", cmd)):
+    # A backslash hides flags from the check and fakes quotes (\x27 z* \x27)
+    # the quote strip below would pair, so it refuses outright.
+    if "\\" in cmd or re.search(r"[*?\[]", re.sub(r"\x27[^\x27]*\x27|\"[^\"]*\"", "", cmd)):
         return False
-    if name in FLAG_DENY or name == "find":
-        if "\\" in cmd:
-            return False
     if name == "find":
         return not FIND_DENY.intersection(args)
     if name == "git":
@@ -8833,7 +8841,7 @@ if [ -z "$INPUT" ]; then
   exit 0
 fi
 
-CMD="$("$HEADROOM_PYTHON" -X utf8 -c 'import sys; sys.path[:] = [p for p in sys.path if p]; import json; data = json.load(sys.stdin); cmd = data.get("tool_input", {{}}).get("command", ""); print(cmd if isinstance(cmd, str) else "")' <<<"$INPUT" 2>/dev/null || true)"
+CMD="$("$HEADROOM_PYTHON" -X utf8 -c 'import sys; import os; _cwd = os.path.realpath(os.getcwd()); sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _cwd]; import json; data = json.load(sys.stdin); cmd = data.get("tool_input", {{}}).get("command", ""); print(cmd if isinstance(cmd, str) else "")' <<<"$INPUT" 2>/dev/null || true)"
 if [ -z "$CMD" ]; then
   exit 0
 fi
@@ -10927,7 +10935,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .arg(&hook_path)
                 .current_dir(&project)
                 .env("HOME", &home)
-                .env("PYTHONPATH", super::fake_markitdown_pythonpath(&root))
+                // The leading empty entry (`$PYTHONPATH:/x` with it unset)
+                // puts the cwd on sys.path as an absolute path, not as "".
+                .env(
+                    "PYTHONPATH",
+                    format!(":{}", super::fake_markitdown_pythonpath(&root).display()),
+                )
                 .env_remove("XDG_CACHE_HOME")
                 .env_remove("CLAUDE_PROJECT_DIR")
                 .stdin(std::process::Stdio::piped())
@@ -11387,6 +11400,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             fs::create_dir_all(dir).expect("create dirs");
         }
         fs::create_dir_all(project.join(".claude")).expect("create project");
+        std::os::unix::fs::symlink(&victim, project.join("link_out")).expect("symlink out");
         let system_python = PathBuf::from("/usr/bin/python3");
 
         // The updated command when the hook allowed, None when it stayed silent.
@@ -11496,6 +11510,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "head z?txt",
             "cat /etc/hosts",
             "cat ../x",
+            // An attached short-flag value is a path too, symlinks resolved.
+            "grep -f/etc/hosts x",
+            "grep -rflink_out x",
+            // An escaped quote is not a quote: the glob below is live.
+            "cat \\' z* \\'",
         ] {
             let command = run(3, &project, original, "default");
             assert_eq!(command, None, "{original:?} must stay silent on 3");

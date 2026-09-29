@@ -57,13 +57,15 @@ pub const PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// Reads a child pipe on its own thread and hands back what arrived, without
 /// ever waiting on EOF past a deadline. See [`PIPE_DRAIN_GRACE`].
 pub struct PipeDrain {
-    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// `None` once `finish` took it: an abandoned reader keeps draining the
+    /// pipe (closing it would hand the writer a broken pipe) but stores nothing.
+    buf: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     done: std::sync::mpsc::Receiver<()>,
 }
 
 impl PipeDrain {
     pub fn spawn<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Self {
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
         let (tx, done) = std::sync::mpsc::channel();
         let sink = buf.clone();
         std::thread::spawn(move || {
@@ -72,10 +74,13 @@ impl PipeDrain {
                 loop {
                     match pipe.read(&mut chunk) {
                         Ok(0) => break,
-                        Ok(n) => sink
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .extend_from_slice(&chunk[..n]),
+                        Ok(n) => {
+                            if let Some(buf) =
+                                sink.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+                            {
+                                buf.extend_from_slice(&chunk[..n]);
+                            }
+                        }
                         Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(_) => break,
                     }
@@ -92,8 +97,42 @@ impl PipeDrain {
     pub fn finish(self, deadline: std::time::Instant) -> Vec<u8> {
         let wait = deadline.saturating_duration_since(std::time::Instant::now());
         let _ = self.done.recv_timeout(wait);
-        std::mem::take(&mut *self.buf.lock().unwrap_or_else(|e| e.into_inner()))
+        self.buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default()
     }
+}
+
+/// Kills `child` and, on Windows, everything it started. A venv `python.exe`
+/// or an npm `.cmd` shim is only a launcher: killing it alone leaves the real
+/// process running beside the caller's retry, holding the venv and the pipes.
+/// Naming the pid is safe while we still hold the unreaped handle.
+pub fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        use std::process::Stdio;
+        let spawned = command("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut taskkill) = spawned {
+            // Bounded, and not via output_with_timeout (which calls this):
+            // taskkill /T enumerates through the machinery a wedged WMI stalls.
+            let started = std::time::Instant::now();
+            while matches!(taskkill.try_wait(), Ok(None))
+                && started.elapsed() < std::time::Duration::from_secs(5)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            let _ = taskkill.kill();
+            let _ = taskkill.wait();
+        }
+    }
+    let _ = child.kill();
 }
 
 /// Why a spawned child did not produce an `Output`.
@@ -131,7 +170,7 @@ pub fn output_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
+                kill_tree(&mut child);
                 let _ = child.wait();
                 return Err(OutputError::TimedOut);
             }

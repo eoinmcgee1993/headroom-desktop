@@ -697,11 +697,17 @@ fn warning_repeat(event: &sentry::protocol::Event<'static>) -> bool {
         message.chars().filter(|c| !c.is_ascii_digit()).collect()
     };
     let now = std::time::Instant::now();
+    let day = std::time::Duration::from_secs(24 * 3600);
     let mut sent = WARNINGS_SENT.lock().unwrap_or_else(|e| e.into_inner());
     let sent = sent.get_or_insert_with(Default::default);
     match sent.get(&key) {
-        Some(at) if now.duration_since(*at) < std::time::Duration::from_secs(24 * 3600) => true,
+        Some(at) if now.duration_since(*at) < day => true,
         _ => {
+            // Paths and hex ids survive the digit strip, so keys can be unique
+            // per event; drop expired ones before the map grows for weeks.
+            if sent.len() >= 1024 {
+                sent.retain(|_, at| now.duration_since(*at) < day);
+            }
             sent.insert(key, now);
             false
         }

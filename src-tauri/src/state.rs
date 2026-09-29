@@ -13343,10 +13343,6 @@ mod tests {
         );
     }
 
-    /// RUST-CD: `Stop-Process` on a sibling instance's (or sibling thread's)
-    /// in-flight backend is the 0xffffffff-after-banner failure. The script
-    /// must carry the parent rule, and must drop our own children when the
-    /// caller does not hold the lifecycle lock.
     #[test]
     #[cfg(target_os = "windows")]
     fn every_windows_sweep_script_runs_in_real_powershell() {
@@ -13396,6 +13392,10 @@ mod tests {
         }
     }
 
+    /// RUST-CD: `Stop-Process` on a sibling instance's (or sibling thread's)
+    /// in-flight backend is the 0xffffffff-after-banner failure. The script
+    /// must carry the parent rule, and must drop our own children when the
+    /// caller does not hold the lifecycle lock.
     #[test]
     fn the_windows_sweep_script_filters_on_parent() {
         use super::windows_process_sweep_script;
