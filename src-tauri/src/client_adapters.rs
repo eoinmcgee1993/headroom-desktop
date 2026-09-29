@@ -1119,7 +1119,7 @@ pub fn client_local_activity_at(client_id: &str) -> Option<SystemTime> {
 /// Newest `*.jsonl` under `root` by mtime, visiting at most `cap` entries.
 /// A resumed thread appends to its original day's rollout, so the date-named
 /// directories cannot be trusted to hold the newest one.
-fn newest_jsonl_under(root: &Path, cap: usize) -> Option<PathBuf> {
+fn newest_jsonl_under(root: &Path, cap: usize) -> Option<(SystemTime, PathBuf)> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     let mut stack = vec![root.to_path_buf()];
     let mut visited = 0usize;
@@ -1130,7 +1130,7 @@ fn newest_jsonl_under(root: &Path, cap: usize) -> Option<PathBuf> {
         for entry in entries.flatten() {
             visited += 1;
             if visited > cap {
-                return newest.map(|(_, path)| path);
+                return newest;
             }
             let Ok(meta) = entry.metadata() else {
                 continue;
@@ -1147,7 +1147,7 @@ fn newest_jsonl_under(root: &Path, cap: usize) -> Option<PathBuf> {
             }
         }
     }
-    newest.map(|(_, path)| path)
+    newest
 }
 
 /// What a Codex rollout's first line (`session_meta`) says about the session.
@@ -1184,12 +1184,22 @@ fn parse_codex_session_meta(first_line: &str) -> Option<CodexSessionMeta> {
 /// config and its traffic still never arrived, while one created with
 /// "openai" after Headroom started never read the config at all. `resumed`
 /// marks a thread older than `app_started_at`, whose provider predates us.
+/// `rollout_fresh` says whether that rollout was written this run at all:
+/// activity can come from the GUI thread store alone, and then the newest
+/// rollout is some older session whose provider says nothing about this one.
+/// Call it BEFORE re-applying the setup, or `codex_config_routed` reports
+/// our own repair instead of what Codex read.
 pub(crate) fn codex_unrouted_diagnostics(
     app_started_at: SystemTime,
 ) -> Vec<(&'static str, String)> {
     use std::io::{BufRead, Read};
-    let meta = newest_jsonl_under(&codex_home().join("sessions"), LOCAL_ACTIVITY_WALK_CAP)
-        .and_then(|path| {
+    let newest = newest_jsonl_under(&codex_home().join("sessions"), LOCAL_ACTIVITY_WALK_CAP);
+    let rollout_fresh = match &newest {
+        Some((modified, _)) => (*modified > app_started_at).to_string(),
+        None => "unknown".into(),
+    };
+    let meta = newest
+        .and_then(|(_, path)| {
             let file = std::fs::File::open(path).ok()?;
             let mut line = String::new();
             // session_meta carries the base instructions (tens of KB); the cap
@@ -1219,6 +1229,7 @@ pub(crate) fn codex_unrouted_diagnostics(
         ),
         ("codex_session_provider", provider.into()),
         ("codex_session_resumed", resumed),
+        ("codex_rollout_fresh", rollout_fresh),
         (
             "codex_config_routed",
             codex_provider_block_matches().map_or_else(|_| "error".into(), |ok| ok.to_string()),
@@ -8501,6 +8512,12 @@ if not isinstance(fp, str) or not fp:
     sys.exit(0)
 if os.path.splitext(fp)[1].lower() not in ALLOWED:
     sys.exit(0)
+# The allow below skips the prompt Claude Code shows for reads outside the
+# working directories, so only answer for files inside them.
+roots = [os.path.realpath(d) for d in (data.get("cwd"), os.environ.get("CLAUDE_PROJECT_DIR")) if isinstance(d, str) and d]
+full = os.path.realpath(os.path.join(roots[0], fp) if roots else fp)
+if not any(full == r or full.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+    sys.exit(0)
 try:
     st = os.stat(fp)
 except OSError:
@@ -8649,9 +8666,12 @@ def read_only(cmd, out):
     if not roots or not all(inside(a, roots) for a in argv[1:]):
         return False
     name, args = argv[0], argv[1:]
-    # An unquoted glob can expand to a file named -delete or --pre=sh.
+    # An unquoted glob can expand to a file named -delete or --pre=sh, or to a
+    # symlink out of the project that `inside` only saw as the literal pattern.
+    if re.search(r"[*?\[]", re.sub(r"\x27[^\x27]*\x27|\"[^\"]*\"", "", cmd)):
+        return False
     if name in FLAG_DENY or name == "find":
-        if "\\" in cmd or re.search(r"[*?\[]", re.sub(r"\x27[^\x27]*\x27|\"[^\"]*\"", "", cmd)):
+        if "\\" in cmd:
             return False
     if name == "find":
         return not FIND_DENY.intersection(args)
@@ -8688,6 +8708,8 @@ def cli_rules():
         if pid not in procs:
             return True
         pid, command = procs[pid]
+        # The Headroom remote-control relaunch (CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE) sets env only.
+        command = command.replace("--settings {\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.anthropic.com\"}}", "")
         if re.search(r"--(managed-)?settings|--disallowed", command):
             return True
     return True
@@ -9926,18 +9948,20 @@ mod tests {
         )
         .expect("hook");
 
-        let run = || {
+        let run_for = |pdf: &Path| {
             let output = crate::proc::command("bash")
                 .arg(&hook_path)
                 .env("HOME", &home)
                 .env("PYTHONPATH", &pythonpath)
                 .env_remove("XDG_CACHE_HOME")
+                .env_remove("CLAUDE_PROJECT_DIR")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
                 .and_then(|mut child| {
                     use std::io::Write;
-                    let input = json!({ "tool_input": { "file_path": pdf } }).to_string();
+                    let input =
+                        json!({ "cwd": root, "tool_input": { "file_path": pdf } }).to_string();
                     child
                         .stdin
                         .as_mut()
@@ -9955,6 +9979,15 @@ mod tests {
                     .map(PathBuf::from)
             })
         };
+        let run = || run_for(&pdf);
+
+        // The allow skips Claude Code's prompt for reads outside the working
+        // directories, so a PDF outside the session's cwd is left to it.
+        let outside = unique_temp_dir("headroom-md-hook-outside");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let outside = outside.join("other.pdf");
+        fs::write(&outside, "%PDF-1.4").expect("outside pdf");
+        assert_eq!(run_for(&outside), None);
 
         // A week-old entry goes on the next conversion: nothing else ever
         // deletes these copies of the user's documents.
@@ -10897,7 +10930,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(out.contains("\"allow\""), "{out}");
         let out = run(
             build_headroom_markitdown_hook(&md, python),
-            json!({ "tool_input": { "file_path": pdf } }),
+            json!({ "cwd": project, "tool_input": { "file_path": pdf } }),
         );
         assert!(out.contains("updatedInput"), "{out}");
         for name in ["ran-json", "ran-markitdown"] {
@@ -11299,6 +11332,16 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[cfg(unix)]
+    fn rtk_hook_ignores_only_headrooms_own_remote_control_settings() {
+        // The relaunch's env-only --settings must not read as user rules (it
+        // turned RTK off for every remote-control session); any other does.
+        assert!(super::RTK_HOOK_VERDICT_PY.contains(&format!(
+            "--settings {}",
+            super::CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE.replace('"', "\\\"")
+        )));
+    }
+
+    #[test]
     fn hook_script_auto_allows_only_what_claude_code_would_not_ask() {
         // `rtk rewrite`'s exit code is its verdict against the user's Claude
         // Code permission rules. Exit 3 ("rewrite, but ask") used to be turned
@@ -11425,6 +11468,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "git branch newbranch",
             "git branch -D main",
             "tree -o out",
+            // An unquoted glob can reach a symlink out of the project.
+            "cat z*",
+            "head z?txt",
+            "cat /etc/hosts",
+            "cat ../x",
         ] {
             let command = run(3, &project, original, "default");
             assert_eq!(command, None, "{original:?} must stay silent on 3");
@@ -13930,13 +13978,23 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let root = tmp.path().join("sessions");
         fs::create_dir_all(root.join("2026/09/01")).unwrap();
         fs::create_dir_all(root.join("2026/09/29")).unwrap();
-        // The older day's rollout is written LAST: a resumed thread.
-        fs::write(root.join("2026/09/29/rollout-a.jsonl"), b"{}").unwrap();
-        fs::write(root.join("2026/09/29/notes.txt"), b"x").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        fs::write(root.join("2026/09/01/rollout-b.jsonl"), b"{}").unwrap();
+        // The older day's rollout is written LAST: a resumed thread. Explicit
+        // mtimes, not a sleep: coarse-mtime filesystems would tie the two.
+        let touch = |rel: &str, age_secs: u64| {
+            let path = root.join(rel);
+            fs::write(&path, b"{}").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(SystemTime::now() - std::time::Duration::from_secs(age_secs))
+                .unwrap();
+        };
+        touch("2026/09/29/rollout-a.jsonl", 60);
+        touch("2026/09/29/notes.txt", 0);
+        touch("2026/09/01/rollout-b.jsonl", 10);
         assert_eq!(
-            super::newest_jsonl_under(&root, 1_000),
+            super::newest_jsonl_under(&root, 1_000).map(|(_, path)| path),
             Some(root.join("2026/09/01/rollout-b.jsonl"))
         );
         assert_eq!(

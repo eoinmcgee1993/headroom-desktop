@@ -5530,6 +5530,12 @@ async fn detect_unrouted_clients(
                 "codex" => client_adapters::is_codex_enabled(),
                 _ => client_adapters::is_claude_code_enabled(),
             };
+            // Before the re-apply: it rewrites the config these tags describe.
+            let codex_diagnostics = if client_id == "codex" {
+                client_adapters::codex_unrouted_diagnostics(app_started_at)
+            } else {
+                Vec::new()
+            };
             let reapplied = enabled && client_adapters::apply_client_setup(client_id).is_ok();
             // Re-applying our own config is only a fix when our own config was
             // the problem. Ask the guard what the agent actually saw.
@@ -5540,11 +5546,6 @@ async fn detect_unrouted_clients(
             log::info!(
                 "unrouted client {client_id}: active locally at {active_at}, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
             );
-            let codex_diagnostics = if client_id == "codex" {
-                client_adapters::codex_unrouted_diagnostics(app_started_at)
-            } else {
-                Vec::new()
-            };
             // The only fleet-wide trace of an agent silently running outside
             // Headroom. Captured explicitly under a fixed fingerprint: as a
             // warn through the log bridge it grouped on the caller stack,
@@ -7730,7 +7731,8 @@ fn learn_failure_is_agent_unparseable_output(text: &str) -> bool {
 /// `/usr/local/bin/claude`). Same class as RUST-DE's too-old-for-the-model
 /// line: the user's install, fixed by updating it, not by a release of ours.
 fn learn_failure_is_agent_cli_outdated(text: &str) -> bool {
-    text.contains("error: unknown option '--")
+    // Commander (Claude Code) and clap (Codex) wording, respectively.
+    text.contains("error: unknown option '--") || text.contains("error: unexpected argument '--")
 }
 
 /// The user-facing remedy for [`learn_failure_is_agent_cli_outdated`].
@@ -13133,6 +13135,9 @@ Some unrelated content.
         // RUST-K9 verbatim: a stale CLI that predates upstream's stream flag.
         assert!(learn_failure_is_agent_cli_outdated(
             "LLM analysis failed: `claude -p --output-format stream-json --verbose --include-partial-messages` failed (exit 1):\nerror: unknown option '--include-partial-messages'\n"
+        ));
+        assert!(learn_failure_is_agent_cli_outdated(
+            "LLM analysis failed: `codex exec --json` failed (exit 2):\nerror: unexpected argument '--json' found\n"
         ));
         for stderr in [
             "Error: No such option: --foo",
