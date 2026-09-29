@@ -18867,22 +18867,41 @@ after
         );
     }
 
-    /// Finder, Login Items and Start launch the app with no HTTPS_PROXY, so on
-    /// a network whose only way out is the proxy set in System Settings or
-    /// WinINET, the runtime download, sign-in and the updater all went direct
-    /// and failed while the backend (httpx) and pip used that proxy.
-    /// `default-features = false` had dropped reqwest's system-proxy; the
-    /// OS proxy store cannot be injected from a test, so pin the manifest.
+    /// Finder and Login Items launch the app with no HTTPS_PROXY, so on a
+    /// network whose only way out is the proxy set in System Settings, the
+    /// runtime download, sign-in and the updater all went direct and failed
+    /// while the backend (httpx) and pip used that proxy.
+    /// `default-features = false` had dropped reqwest's system-proxy.
+    ///
+    /// Windows must not get it: hyper-util hands HKCU ProxyServer to the URI
+    /// parser raw. v2rayN's keyed `socks=127.0.0.1:10808` has one colon and
+    /// `=` is a legal URI character, so it became an HTTP proxy at host
+    /// `socks=127.0.0.1`; `socks4://` became a SOCKS port that reqwest (no
+    /// socks feature) sends CONNECT to. Every internet client, the updater
+    /// included, then failed on machines that worked direct (the fleet values
+    /// `registry_proxy_env_overrides` already handles for the backend).
+    /// Neither OS proxy store can be injected from a test, so pin the manifest.
     #[test]
-    fn reqwest_reads_the_os_proxy_settings_and_trust_store() {
-        let manifest = include_str!("../Cargo.toml");
-        let reqwest = manifest
-            .lines()
-            .find(|line| line.starts_with("reqwest = "))
-            .expect("reqwest dependency line");
-        for feature in ["\"system-proxy\"", "\"rustls-tls-native-roots\""] {
-            assert!(reqwest.contains(feature), "{feature} missing: {reqwest}");
+    fn reqwest_reads_the_os_proxy_settings_on_macos_only() {
+        let mut section = "";
+        let mut system_proxy_in = Vec::new();
+        let mut native_roots = false;
+        for line in include_str!("../Cargo.toml").lines() {
+            if line.starts_with('[') {
+                section = line;
+            } else if line.starts_with("reqwest = ") {
+                if line.contains("\"system-proxy\"") {
+                    system_proxy_in.push(section);
+                }
+                native_roots |=
+                    section == "[dependencies]" && line.contains("\"rustls-tls-native-roots\"");
+            }
         }
+        assert_eq!(
+            system_proxy_in,
+            ["[target.'cfg(target_os = \"macos\")'.dependencies]"]
+        );
+        assert!(native_roots, "rustls-tls-native-roots missing from reqwest");
     }
 
     #[test]

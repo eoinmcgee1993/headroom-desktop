@@ -2701,19 +2701,34 @@ fn codex_window_label(window_minutes: i64) -> String {
 }
 
 static UPSTREAM_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+static LOOPBACK_UPSTREAM_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
-fn upstream_client() -> &'static reqwest::Client {
+// Connect timeout only: no overall timeout, since bypassed SSE streams
+// legitimately run for minutes. Without it, a SYN-blackholed network hangs
+// every bypass request until the client's own deadline.
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The shared client for a bypass forward to `url`. Provider traffic takes
+/// the same env/system proxy and OS trust store the backend's httpx does:
+/// going around the proxy turned every gated request on a proxy-only network
+/// into a 502. A loopback upstream override (a local LiteLLM or
+/// claude-code-router) goes direct: hyper-util exempts no loopback address,
+/// and a corporate proxy cannot reach the user's 127.0.0.1.
+fn upstream_client(url: &str) -> &'static reqwest::Client {
+    if url_is_loopback(url) {
+        return LOOPBACK_UPSTREAM_CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+                .no_proxy()
+                // roots-ok: built once, and a local gateway may serve https
+                .build()
+                .expect("reqwest client for loopback bypass forwarder")
+        });
+    }
     UPSTREAM_CLIENT.get_or_init(|| {
-        // Provider traffic takes the same env/system proxy and OS trust store
-        // the backend's httpx does: going around the proxy turned every gated
-        // request on a proxy-only network into a 502.
         // proxy-ok: direct-to-provider forwarder, not loopback
         reqwest::Client::builder()
-            // Connect timeout only — no overall timeout, since bypassed SSE
-            // streams legitimately run for minutes. Without it, a
-            // SYN-blackholed network hangs every bypass request until the
-            // client's own deadline.
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
             .build()
             .expect("reqwest client for bypass forwarder")
     })
@@ -2928,7 +2943,7 @@ async fn forward_direct_to_anthropic(
         }
     };
 
-    let mut req = upstream_client().request(method, &url);
+    let mut req = upstream_client(&url).request(method, &url);
     // Same fallback the backend's `resolve_codex_routing` applies: a Codex
     // build that omits the account header on some request still carries the
     // account id in its JWT, and chatgpt.com wants it as a header.
@@ -3033,7 +3048,7 @@ async fn tunnel_upgrade_direct(
         }
     };
 
-    let mut req = upstream_client().request(method, url);
+    let mut req = upstream_client(url).request(method, url);
     for (name, value) in &parsed.headers {
         // Unlike the plain forward, Connection/Upgrade/Sec-WebSocket-* must
         // survive: hyper needs the upgrade intent to keep the connection for
@@ -3610,6 +3625,20 @@ fn request_is_loopback_safe(buf: &[u8]) -> bool {
         Some(value) => host_is_loopback(value),
         None => false,
     }
+}
+
+/// Whether `url` names this machine: localhost, 127.0.0.0/8 or ::1.
+fn url_is_loopback(url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(url).ok().and_then(|url| {
+        url.host_str()
+            .map(|h| h.trim_matches(['[', ']']).to_string())
+    }) else {
+        return false;
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn host_is_loopback(host: &str) -> bool {
@@ -4960,11 +4989,8 @@ mod tests {
                 .expect("runtime");
             // The fake proxy refuses the tunnel, so this errors either way;
             // the parent checks where the connection went.
-            let _ = rt.block_on(
-                super::upstream_client()
-                    .get("https://upstream.invalid/v1/messages")
-                    .send(),
-            );
+            let url = "https://upstream.invalid/v1/messages";
+            let _ = rt.block_on(super::upstream_client(url).get(url).send());
             return;
         }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -5014,6 +5040,85 @@ mod tests {
             seen.starts_with("CONNECT upstream.invalid:443"),
             "direct forward bypassed the proxy; proxy saw {seen:?}"
         );
+    }
+
+    /// The upstream override can be a gateway on this machine (a local
+    /// LiteLLM or claude-code-router at http://127.0.0.1:3456). hyper-util
+    /// exempts no loopback address from an env or system proxy, and a
+    /// corporate proxy cannot reach the user's 127.0.0.1, so each gated or
+    /// backend-down request to it got a 502. The proxy here is a closed port:
+    /// only a direct send reaches the fake gateway. Child process, as above.
+    #[test]
+    fn loopback_upstream_skips_the_configured_proxy() {
+        if std::env::var_os("HEADROOM_TEST_LOOPBACK_CHILD").is_some() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    let mut buf = [0u8; 1024];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    );
+                }
+            });
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let url = format!("http://127.0.0.1:{port}/v1/messages");
+            let status = rt
+                .block_on(super::upstream_client(&url).get(&url).send())
+                .map(|resp| resp.status());
+            assert_eq!(status.ok(), Some(reqwest::StatusCode::OK));
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        child.args([
+            "proxy_intercept::tests::loopback_upstream_skips_the_configured_proxy",
+            "--exact",
+            "--test-threads=1",
+        ]);
+        for name in ["NO_PROXY", "no_proxy"] {
+            child.env_remove(name);
+        }
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            child.env(name, "http://127.0.0.1:1");
+        }
+        let out = child
+            .env("HEADROOM_TEST_LOOPBACK_CHILD", "1")
+            .output()
+            .expect("run child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "loopback upstream went through the proxy:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for url in [
+            "http://127.0.0.1:3456",
+            "http://127.0.0.2:3456/v1",
+            "http://LOCALHOST:4000",
+            "https://[::1]:8443/v1",
+        ] {
+            assert!(super::url_is_loopback(url), "{url}");
+        }
+        for url in [
+            "https://api.anthropic.com",
+            "http://localhost.example.com",
+            "https://10.0.0.5:4000",
+            "not a url",
+        ] {
+            assert!(!super::url_is_loopback(url), "{url}");
+        }
     }
 
     #[test]

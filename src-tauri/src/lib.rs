@@ -12561,6 +12561,7 @@ Some unrelated content.
     /// Loopback clients also call `.tls_built_in_root_certs(false)`: every
     /// other build loads the OS trust store (~130ms on macOS), and the /stats,
     /// feed and readyz polls build a client every few seconds over plain http.
+    /// A `// roots-ok: <why>` comment in the chain exempts one that needs them.
     #[test]
     fn every_reqwest_client_decides_about_the_system_proxy() {
         // Split so this needle does not match its own source line.
@@ -12598,6 +12599,7 @@ Some unrelated content.
                 }
                 if chain.contains(".no_proxy()")
                     && !chain.contains(".tls_built_in_root_certs(false)")
+                    && !chain.contains("roots-ok:")
                 {
                     loads_trust_store.push(format!("{name}:{}", i + 1));
                 }
