@@ -186,6 +186,7 @@ import { mockDashboard } from "./lib/mockData";
 import {
   cachePricingStatus,
   type CachedPricing,
+  createPricingStatusOrder,
   formatRemainingDays,
   readCachedPricing,
   subscriptionTierLabel,
@@ -1762,13 +1763,11 @@ export default function App() {
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
   const [pricingError, setPricingError] = useState<string | null>(null);
-  const pricingRefreshInFlightRef = useRef(false);
-  // When the last authoritative status (verify / sign-out) was applied. A slow
-  // pricing fetch issued before it must not land afterwards and overwrite it:
+  // A slow pricing fetch must not land after a newer status and overwrite it:
   // on a fresh install the very first fetch is the slowest, and it was still in
   // flight when the magic link signed the user in, so it clobbered the signed-in
   // status with its own stale signed-out one.
-  const pricingStatusStampRef = useRef(0);
+  const pricingStatusOrderRef = useRef(createPricingStatusOrder());
   const [authEmail, setAuthEmail] = useState("");
   const [authCode, setAuthCode] = useState("");
   const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
@@ -3451,6 +3450,9 @@ export default function App() {
   // needs to enter. Keyed on the status flag so every path that lands a signed-
   // in status is covered, including the payload path of `pricing-refreshed`.
   useEffect(() => {
+    // The signed-in rows show authFlowError for a failed sign-out, and the code
+    // form shows it for a failed sign-in: neither must inherit the other's.
+    setAuthFlowError(null);
     if (!pricingStatus?.authenticated) {
       return;
     }
@@ -3475,7 +3477,7 @@ export default function App() {
       // refetch that the in-flight guard may drop outright, leaving this window
       // stale until the next poll tick (60s focused, 600s not).
       if (event.payload) {
-        pricingStatusStampRef.current = Date.now();
+        pricingStatusOrderRef.current.wrote();
         setPricingStatus(event.payload);
         return;
       }
@@ -3557,6 +3559,7 @@ export default function App() {
     void invoke<HeadroomPricingStatus>("activate_headroom_account")
       .then((status) => {
         desktopActivationAttemptsRef.current = 0;
+        pricingStatusOrderRef.current.wrote();
         setPricingStatus(status);
       })
       .catch(() => {
@@ -4057,16 +4060,21 @@ export default function App() {
     }
   }
 
-  async function refreshPricingStatus() {
-    if (pricingRefreshInFlightRef.current) {
+  // `authoritative` is for the refresh right after a plan change or
+  // reactivation: a scheduled poll still in flight read the account before the
+  // change, so this one must not be skipped for it, and must outrank it.
+  async function refreshPricingStatus(authoritative = false) {
+    const fetched = pricingStatusOrderRef.current.fetch(
+      () => invoke<HeadroomPricingStatus>("get_headroom_pricing_status"),
+      authoritative
+    );
+    if (!fetched) {
       return;
     }
-    pricingRefreshInFlightRef.current = true;
     setPricingBusy(true);
-    const issuedAt = Date.now();
     try {
-      const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
-      if (pricingStatusStampRef.current > issuedAt) {
+      const status = await fetched;
+      if (!status) {
         return;
       }
       setPricingStatus(status);
@@ -4085,7 +4093,6 @@ export default function App() {
         describeInvokeError(error, "Could not load pricing status.")
       );
     } finally {
-      pricingRefreshInFlightRef.current = false;
       setPricingBusy(false);
     }
   }
@@ -4460,7 +4467,7 @@ export default function App() {
         code,
         inviteCode: null
       });
-      pricingStatusStampRef.current = Date.now();
+      pricingStatusOrderRef.current.wrote();
       setPricingStatus(status);
       setAuthCode("");
       setAuthCodeRequestedFor(null);
@@ -4552,7 +4559,7 @@ export default function App() {
     try {
       await invoke("sign_out_headroom_account");
       const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
-      pricingStatusStampRef.current = Date.now();
+      pricingStatusOrderRef.current.wrote();
       setPricingStatus(status);
       setAuthCode("");
       setAuthCodeRequestedFor(null);
@@ -4736,7 +4743,7 @@ export default function App() {
         subscriptionTier: pendingPlanChange.toTier,
         billingPeriod: pendingPlanChange.billingPeriod
       });
-      await refreshPricingStatus();
+      await refreshPricingStatus(true);
       setPendingPlanChange(null);
       setActiveView("home");
     } catch (error) {
@@ -4803,7 +4810,7 @@ export default function App() {
     setReactivateError(null);
     try {
       await invoke("reactivate_headroom_subscription");
-      await refreshPricingStatus();
+      await refreshPricingStatus(true);
     } catch (error) {
       setReactivateError(
         error instanceof Error
@@ -5089,17 +5096,22 @@ export default function App() {
         authSection={
           paywallFirstFlow && windowLabel === "launcher" ? (
             pricingStatus?.authenticated === true ? (
-              <p className="paywall__account-row">
-                Signed in as {pricingStatus?.account?.email ?? authEmail}
-                {" • "}
-                <button
-                  className="link-button"
-                  onClick={() => void handleSignOutHeadroomAccount()}
-                  type="button"
-                >
-                  or use a different email
-                </button>
-              </p>
+              <>
+                <p className="paywall__account-row">
+                  Signed in as {pricingStatus?.account?.email ?? authEmail}
+                  {" • "}
+                  <button
+                    className="link-button"
+                    onClick={() => void handleSignOutHeadroomAccount()}
+                    type="button"
+                  >
+                    or use a different email
+                  </button>
+                </p>
+                {authFlowError ? (
+                  <p className="install-progress__error">{authFlowError}</p>
+                ) : null}
+              </>
             ) : (
               <AuthCodeForm
                 email={authEmail}
@@ -6035,6 +6047,9 @@ export default function App() {
                 or use a different email
               </button>
             </p>
+          ) : null}
+          {signedIn && authFlowError ? (
+            <p className="install-progress__error">{authFlowError}</p>
           ) : null}
         </div>
       </LauncherShell>
@@ -7936,6 +7951,9 @@ export default function App() {
                     </button>
                   )}
                 </div>
+                {pricingStatus?.authenticated && authFlowError ? (
+                  <p className="settings-account-notice">{authFlowError}</p>
+                ) : null}
                 {pricingStatus?.claude?.profileFetchError ? (
                   <p className="settings-account-notice">
                     {pricingStatus.claude.profileFetchError}
