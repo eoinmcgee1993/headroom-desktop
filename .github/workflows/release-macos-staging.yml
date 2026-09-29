@@ -445,6 +445,13 @@ jobs:
     if: needs.guard.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45 # up to 30 of it waiting on Test
+    # A job-level block replaces the workflow's, so restate both of those.
+    # id-token + attestations are only for the provenance step below.
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
 
     steps:
       - name: Wait for the Test workflow on this commit
@@ -474,6 +481,29 @@ jobs:
           pattern: bundles-*
           path: release-bundles
           merge-multiple: true
+
+      - name: Collect the installers for attestation
+        # Same subjects as the stable publish job: the Windows and Linux
+        # bundles from the artifacts above, the macOS ones from the rc release
+        # the macOS job created. Before the mirror on purpose: a failed
+        # attestation leaves staging-rolling untouched, like a failed Test gate.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC_TAG: v${{ needs.guard.outputs.package_version }}
+        run: |
+          set -euo pipefail
+          gh release download "$RC_TAG" --repo "$GITHUB_REPOSITORY" --dir attest \
+            -p '*.dmg' -p '*_mac.app.tar.gz'
+          shopt -s nullglob
+          cp release-bundles/*-setup.exe release-bundles/*.AppImage \
+            release-bundles/*.AppImage.tar.gz release-bundles/*.deb attest/
+          ls -l attest
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: attest/*
 
       - name: Mirror the rc release to staging-rolling
         shell: bash

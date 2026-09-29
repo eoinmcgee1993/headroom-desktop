@@ -11349,16 +11349,49 @@ fn collect_native_extensions(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Hash a requirements lock file ignoring comments and blank lines, so that
-/// header/comment churn does not force a full `pip install` on upgrade.
-fn requirements_lock_sha(lock: &str) -> String {
-    let mut hasher = Sha256::new();
+/// The requirement entries of a lock, one per pin, without comments, blank
+/// lines or `--hash` options. A hashed entry spans several physical lines
+/// joined by trailing backslashes (scripts/hash-python-locks.py). The hashes
+/// are integrity metadata for the same pin, so dropping them keeps the lock
+/// sha of an unchanged pin set identical to its pre-hash value: otherwise
+/// every install would read its receipt as stale and re-sync for nothing.
+fn lock_requirements(lock: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut pending = String::new();
+    let mut finish = |pending: &mut String| {
+        let requirement = pending.split("--hash").next().unwrap_or_default().trim();
+        if !requirement.is_empty() {
+            entries.push(requirement.to_string());
+        }
+        pending.clear();
+    };
     for line in lock.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if pending.is_empty() && (trimmed.is_empty() || trimmed.starts_with('#')) {
             continue;
         }
-        hasher.update(trimmed.as_bytes());
+        match trimmed.strip_suffix('\\') {
+            Some(head) => {
+                pending.push_str(head);
+                pending.push(' ');
+            }
+            None => {
+                pending.push_str(trimmed);
+                finish(&mut pending);
+            }
+        }
+    }
+    finish(&mut pending);
+    entries
+}
+
+/// Hash a requirements lock file ignoring comments, blank lines and `--hash`
+/// options, so that header/comment churn and rehashing do not force a full
+/// `pip install` on upgrade.
+fn requirements_lock_sha(lock: &str) -> String {
+    let mut hasher = Sha256::new();
+    for requirement in lock_requirements(lock) {
+        hasher.update(requirement.as_bytes());
         hasher.update(b"\n");
     }
     format!("{:x}", hasher.finalize())
@@ -12058,17 +12091,12 @@ fn run_pip_install_with_retries(python: &Path, args: &[&str], cwd: &Path) -> Res
     run_pip_install_with_retries_streaming(python, args, cwd, |_| {})
 }
 
-/// Number of requirement lines in a lock, i.e. how many packages pip will
-/// resolve. `requirements_lock_sha` already defines what counts as a
-/// requirement line (non-blank, non-comment); this is the same rule, so the
-/// two can never disagree about the file's contents.
+/// Number of requirement entries in a lock, i.e. how many packages pip will
+/// resolve. Counts `lock_requirements`, the same entries
+/// `requirements_lock_sha` hashes, so the two can never disagree about the
+/// file's contents (and a pin's `--hash` lines are not packages).
 fn requirements_lock_package_count(lock: &str) -> u32 {
-    lock.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX)
+    lock_requirements(lock).len().try_into().unwrap_or(u32::MAX)
 }
 
 /// Translate a pip stdout/stderr line into a progress update, or None for
@@ -13989,7 +14017,9 @@ mod tests {
             super::HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
         ] {
             assert!(
-                lock.lines().any(|l| l.trim() == "truststore==0.10.4"),
+                super::lock_requirements(lock)
+                    .iter()
+                    .any(|r| r == "truststore==0.10.4"),
                 "truststore pin missing from a lock"
             );
         }
@@ -15421,6 +15451,60 @@ mod tests {
             requirements_lock_sha(a),
             requirements_lock_sha(a_more_comments)
         );
+    }
+
+    #[test]
+    fn requirements_lock_sha_and_count_ignore_hashes() {
+        // Hashing an unchanged pin set must not read as a lock change, or
+        // every install re-syncs its dependencies on the update that adds them.
+        let plain = "# header\nabsl-py==2.4.0\ncryptography==50.0.0; sys_platform != \"darwin\"\n";
+        let hashed = "# header\nabsl-py==2.4.0 \\\n    --hash=sha256:aa \\\n    --hash=sha256:bb\n\
+                      cryptography==50.0.0; sys_platform != \"darwin\" \\\n    --hash=sha256:cc\n";
+        assert_eq!(requirements_lock_sha(plain), requirements_lock_sha(hashed));
+        assert_eq!(requirements_lock_package_count(hashed), 2);
+        assert_eq!(
+            super::lock_requirements(hashed),
+            [
+                "absl-py==2.4.0",
+                "cryptography==50.0.0; sys_platform != \"darwin\""
+            ]
+        );
+        // A different pin still changes the sha when both sides are hashed.
+        let bumped = hashed.replace("absl-py==2.4.0", "absl-py==2.4.1");
+        assert_ne!(
+            requirements_lock_sha(hashed),
+            requirements_lock_sha(&bumped)
+        );
+    }
+
+    #[test]
+    fn bundled_locks_carry_a_hash_for_every_requirement() {
+        // One --hash anywhere puts pip in hash-checking mode, which then
+        // rejects every requirement without one: a pin added without
+        // rerunning scripts/hash-python-locks.py fails every bootstrap.
+        for lock in [
+            HEADROOM_REQUIREMENTS_LOCK,
+            HEADROOM_LINUX_REQUIREMENTS_LOCK,
+            HEADROOM_WINDOWS_REQUIREMENTS_LOCK,
+        ] {
+            let mut in_entry = false;
+            for line in lock.lines().map(str::trim) {
+                if line.starts_with("--hash=sha256:") {
+                    assert!(in_entry, "hash line outside a requirement: {line}");
+                } else {
+                    assert!(!in_entry, "requirement ends in a backslash but has no hash");
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    assert!(
+                        line.ends_with('\\'),
+                        "unhashed requirement, run scripts/hash-python-locks.py: {line}"
+                    );
+                }
+                in_entry = line.ends_with('\\');
+            }
+            assert!(!in_entry, "lock ends inside a requirement");
+        }
     }
 
     #[test]
