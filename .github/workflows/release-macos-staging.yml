@@ -438,9 +438,9 @@ jobs:
   mirror:
     name: Publish staging manifest
     # Only after every platform has built and Test passed (first step).
-    # staging-rolling is the endpoint rc installs poll, and this job is its
-    # only writer, so a partial or failing build is never visible to any
-    # platform.
+    # staging-rolling is the endpoint rc installs poll, and this job is this
+    # workflow's only writer of it (the stable publish is the other), so a
+    # partial or failing build is never visible to any platform.
     needs: [guard, release, windows, linux]
     if: needs.guard.outputs.should_release == 'true'
     runs-on: ubuntu-latest
@@ -524,6 +524,23 @@ jobs:
           mv "$workdir/latest.merged.json" "$workdir/latest.json"
           gh release upload "$RC_TAG" "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
 
+          # The stable publish (release-macos.yml, another concurrency group,
+          # same check) also writes staging-rolling, and this rc can finish after
+          # its stable, which has by then deleted this rc's release: writing on
+          # would roll beta back onto 404ing URLs. Checked here and again right
+          # before the manifest upload, since the two can overlap.
+          staging_rolling_is_newer_than() {
+            gh release download staging-rolling --repo "$GITHUB_REPOSITORY" -p latest.json -O - 2>/dev/null \
+              | jq -e --arg new "$1" '
+                  def key: ltrimstr("v") | capture("^(?<a>[0-9]+)\\.(?<b>[0-9]+)\\.(?<c>[0-9]+)(-rc\\.(?<r>[0-9]+))?$")
+                    | [(.a, .b, .c | tonumber), (if .r then 0 else 1 end), ((.r // "0") | tonumber)];
+                  (.version | key) > ($new | key)' >/dev/null
+          }
+          if staging_rolling_is_newer_than "${RC_TAG#v}"; then
+            echo "::notice::staging-rolling already serves a version newer than ${RC_TAG}; leaving it alone."
+            exit 0
+          fi
+
           # Point the staging-rolling tag at this build's commit (create or force-move).
           if gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/staging-rolling" >/dev/null 2>&1; then
             gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/staging-rolling" \
@@ -558,6 +575,10 @@ jobs:
             [[ "$(basename "$asset")" == "latest.json" ]] || bundles+=("$asset")
           done
           gh release upload staging-rolling "${bundles[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          if staging_rolling_is_newer_than "${RC_TAG#v}"; then
+            echo "::notice::a newer version reached staging-rolling during the upload; leaving its manifest and assets alone."
+            exit 0
+          fi
           gh release upload staging-rolling "$workdir/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
 
           # Prune assets left over from previous rc versions.
