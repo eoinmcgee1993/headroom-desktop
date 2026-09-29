@@ -699,6 +699,7 @@ pub struct AppliedPatterns {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RtkTodayStats {
+    /// UTC date: rtk's own day bucket, which cannot be re-cut to local days.
     pub date: String,
     pub saved_tokens: u64,
     pub commands: u64,

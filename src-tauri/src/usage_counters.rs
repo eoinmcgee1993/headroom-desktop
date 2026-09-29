@@ -96,9 +96,11 @@ impl Store {
         }
     }
 
-    fn maybe_save(&mut self) {
+    /// Bookkeeping only: returns the snapshot to write when a flush is due.
+    /// The caller writes it after releasing STORE (see `with_store`).
+    fn maybe_save(&mut self) -> Option<(PathBuf, Vec<u8>)> {
         if !self.dirty || self.last_saved.elapsed() < SAVE_INTERVAL {
-            return;
+            return None;
         }
         let persisted = PersistedCounters {
             schema_version: SCHEMA_VERSION,
@@ -106,11 +108,15 @@ impl Store {
         };
         let bytes = serde_json::to_vec(&persisted).unwrap_or_default();
         self.days = persisted.days;
-        if let Err(err) = crate::client_adapters::atomic_write(&self.path, &bytes) {
-            log::warn!("failed to persist {FILE_NAME}: {err}");
-        }
         self.dirty = false;
         self.last_saved = Instant::now();
+        Some((self.path.clone(), bytes))
+    }
+}
+
+fn persist(path: &Path, bytes: &[u8]) {
+    if let Err(err) = crate::client_adapters::atomic_write(path, bytes) {
+        log::warn!("failed to persist {FILE_NAME}: {err}");
     }
 }
 
@@ -119,13 +125,28 @@ fn today_key() -> String {
 }
 
 fn with_store(f: impl FnOnce(&mut Store)) {
-    let mut guard = match STORE.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let pending = {
+        let mut guard = match STORE.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let store =
+            guard.get_or_insert_with(|| Store::load_or_create(&crate::storage::app_data_dir()));
+        f(store);
+        store.maybe_save()
     };
-    let store = guard.get_or_insert_with(|| Store::load_or_create(&crate::storage::app_data_dir()));
-    f(store);
-    store.maybe_save();
+    // atomic_write fsyncs (and retries on Windows): keep it off STORE and off
+    // the intercept's single runtime thread that records every request. The
+    // 30s SAVE_INTERVAL keeps two snapshots from racing to the rename.
+    let Some((path, bytes)) = pending else {
+        return;
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(move || persist(&path, &bytes));
+        }
+        Err(_) => persist(&path, &bytes),
+    }
 }
 
 fn bump(days: &mut BTreeMap<String, DayCounters>, day: String, client: &str, is_429: bool) {
@@ -167,11 +188,7 @@ pub fn record_429(client: &str) {
 /// days). Two buckets so a request just before midnight still reads as
 /// recent at 00:05.
 pub fn requests_since_yesterday(client: &str) -> u64 {
-    let now = chrono::Local::now();
-    let keys = [
-        crate::storage::user_day_key(now),
-        crate::storage::user_day_key(now - chrono::Duration::days(1)),
-    ];
+    let keys = since_yesterday_keys(chrono::Local::now());
     let mut total = 0;
     with_store(|store| {
         for key in &keys {
@@ -181,6 +198,14 @@ pub fn requests_since_yesterday(client: &str) -> u64 {
         }
     });
     total
+}
+
+/// Today's and yesterday's local day keys. Calendar-day arithmetic: `now -
+/// 24h` skips yesterday in the first hour after a spring-forward day.
+fn since_yesterday_keys(now: chrono::DateTime<chrono::Local>) -> [String; 2] {
+    let today = crate::storage::user_day(now);
+    let yesterday = today.pred_opt().unwrap_or(today);
+    [today, yesterday].map(|day| day.format("%Y-%m-%d").to_string())
 }
 
 /// Snapshot of all retained days, for joining into the savings payload.
@@ -250,6 +275,54 @@ mod tests {
                 .expect("backup kept"),
             newer
         );
+    }
+
+    #[test]
+    fn maybe_save_leaves_the_write_to_the_caller() {
+        // maybe_save runs under STORE on the intercept's single runtime
+        // thread; the fsync'd write must happen after both are released.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = crate::storage::config_file(dir.path(), FILE_NAME);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+        let mut days = BTreeMap::new();
+        bump(&mut days, "2026-08-17".into(), "codex", false);
+        let mut store = Store {
+            path: path.clone(),
+            days,
+            dirty: true,
+            last_saved: Instant::now()
+                .checked_sub(SAVE_INTERVAL + Duration::from_secs(1))
+                .expect("instant"),
+        };
+
+        let (pending_path, bytes) = store.maybe_save().expect("flush due");
+
+        assert!(!path.exists(), "maybe_save wrote the file under the lock");
+        assert!(!store.dirty);
+        assert!(store.maybe_save().is_none(), "throttle restarts");
+        persist(&pending_path, &bytes);
+        let back: PersistedCounters =
+            serde_json::from_slice(&std::fs::read(&path).expect("written")).expect("parse");
+        assert_eq!(back.days["2026-08-17"].client_requests["codex"], 1);
+    }
+
+    #[test]
+    fn since_yesterday_keys_use_calendar_days_across_spring_forward() {
+        // 00:30 on the day after a spring-forward day is only 23.5h after
+        // that day's 00:00, so `now - 24h` lands two calendar days back.
+        // US (03-08) and EU (03-29) 2026 transitions, so the local zone of
+        // either kind of machine hits one of them.
+        for (today, yesterday) in [("2026-03-09", "2026-03-08"), ("2026-03-30", "2026-03-29")] {
+            let local = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d")
+                .expect("date")
+                .and_hms_opt(0, 30, 0)
+                .expect("time");
+            let now = chrono::TimeZone::from_local_datetime(&chrono::Local, &local)
+                .earliest()
+                .expect("local time exists");
+
+            assert_eq!(since_yesterday_keys(now), [today, yesterday]);
+        }
     }
 
     #[test]

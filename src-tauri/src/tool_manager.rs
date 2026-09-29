@@ -4696,7 +4696,13 @@ impl ToolManager {
     }
 
     pub fn rtk_today_stats(&self) -> Option<RtkTodayStats> {
-        let today = Local::now().date_naive().to_string();
+        self.rtk_today_stats_at(Utc::now())
+    }
+
+    /// rtk buckets by SQLite `DATE(timestamp)`, the UTC date, and has no
+    /// timezone option, so "today" here is today in UTC and the tile says so.
+    fn rtk_today_stats_at(&self, now: DateTime<Utc>) -> Option<RtkTodayStats> {
+        let today = now.date_naive().to_string();
         self.rtk_gain_output()?
             .daily
             .into_iter()
@@ -14022,7 +14028,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use chrono::Local;
+    use chrono::{DateTime, Utc};
 
     use super::codex_list_line_installed;
     #[cfg(windows)]
@@ -16712,7 +16718,7 @@ assert g.done"#,
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn rtk_today_stats_returns_matching_daily_row() {
         let (root, runtime, manager) = seed_test_runtime("rtk-today");
-        let today = Local::now().date_naive().to_string();
+        let today = Utc::now().date_naive().to_string();
         let script = format!(
             "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  cat <<'EOF'\n{{\"daily\":[{{\"date\":\"1999-01-01\",\"commands\":1,\"saved_tokens\":2}},{{\"date\":\"{today}\",\"commands\":7,\"saved_tokens\":1234}}]}}\nEOF\n  exit 0\nfi\nexit 9\n",
         );
@@ -16724,6 +16730,31 @@ assert g.done"#,
         let stats = manager.rtk_today_stats().expect("today stats");
         assert_eq!(stats.date, today);
         assert_eq!(stats.commands, 7);
+        assert_eq!(stats.saved_tokens, 1234);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn rtk_today_stats_reads_rtks_utc_day_bucket() {
+        // rtk groups by SQLite DATE(timestamp), which is the UTC date. At
+        // 23:30 UTC most zones east of UTC are already on the next local
+        // day; the tile must still read rtk's 09-29 row, not 09-30's.
+        let (root, runtime, manager) = seed_test_runtime("rtk-today-utc");
+        write_executable(
+            &runtime.bin_dir.join("rtk"),
+            "#!/usr/bin/env bash\nif [ \"$1\" = \"gain\" ]; then\n  echo '{\"daily\":[{\"date\":\"2026-09-28\",\"commands\":1,\"saved_tokens\":2},{\"date\":\"2026-09-29\",\"commands\":7,\"saved_tokens\":1234},{\"date\":\"2026-09-30\",\"commands\":3,\"saved_tokens\":5}]}';\n  exit 0\nfi\nexit 9\n",
+        );
+        manager
+            .write_tool_receipt("rtk", serde_json::json!({ "version": RTK_VERSION }))
+            .expect("rtk receipt");
+        let now = DateTime::parse_from_rfc3339("2026-09-29T23:30:00Z")
+            .expect("instant")
+            .with_timezone(&Utc);
+
+        let stats = manager.rtk_today_stats_at(now).expect("today stats");
+        assert_eq!(stats.date, "2026-09-29");
         assert_eq!(stats.saved_tokens, 1234);
 
         let _ = fs::remove_dir_all(root);
