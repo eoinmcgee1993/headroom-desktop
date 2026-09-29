@@ -1,10 +1,13 @@
 name: Release App (Staging)
 
 # Release candidate build for every platform, on each -rc.N version bump pushed
-# to staging. The macOS job creates the versioned rc release, then Windows and
-# Linux build in parallel and add their bundles to it. Nothing polls that
+# to staging. After the guard job, macOS, Windows, Linux and the release checks
+# all run in parallel. The macOS job creates the versioned rc release; Windows
+# and Linux hand their bundles to the mirror job as workflow artifacts, because
+# the rc release may not exist yet when they finish. Nothing polls that
 # release. Only the final mirror job touches staging-rolling (the endpoint rc
-# installs poll), and it writes the complete manifest in one go.
+# installs poll), and it writes the complete manifest in one go, so a failed
+# release check still keeps an rc from reaching anyone.
 #
 # The manifest is published last on purpose. A latest.json that names a new
 # version but carries no entry for the reader's platform is an update *error*
@@ -29,33 +32,13 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: macOS Universal (Staging)
-    runs-on: macos-latest
-    timeout-minutes: 45
+  guard:
+    name: Check for a version bump
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       should_release: ${{ steps.release_guard.outputs.should_release }}
       package_version: ${{ steps.release_guard.outputs.package_version }}
-
-    env:
-      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
-      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging-rolling/latest.json"]'
-      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      APPLE_API_PRIVATE_KEY_P8: ${{ secrets.APPLE_API_PRIVATE_KEY_P8 }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
-      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
-      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
-      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
-      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
-      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
 
     steps:
       - name: Checkout
@@ -63,29 +46,6 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
-        with:
-          tool: nextest
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspaces: |
-            src-tauri -> target
-          env-vars: HEADROOM_SENTRY_DSN
 
       - name: Validate staging version state
         id: release_guard
@@ -130,8 +90,59 @@ jobs:
           echo "package_version=${package_version}" >> "$GITHUB_OUTPUT"
           echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
 
+  release:
+    name: macOS Universal (Staging)
+    needs: guard
+    if: needs.guard.outputs.should_release == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    env:
+      HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/latest/download/latest.json"]'
+      HEADROOM_UPDATER_STAGING_ENDPOINTS: '["https://github.com/gglucass/headroom-desktop/releases/download/staging-rolling/latest.json"]'
+      HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_PRIVATE_KEY_P8: ${{ secrets.APPLE_API_PRIVATE_KEY_P8 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      HEADROOM_ACCOUNT_API_BASE_URL: ${{ vars.HEADROOM_ACCOUNT_API_BASE_URL }}
+      HEADROOM_APTABASE_APP_KEY: ${{ vars.HEADROOM_APTABASE_APP_KEY }}
+      VITE_HEADROOM_SALES_CONTACT_URL: ${{ vars.VITE_HEADROOM_SALES_CONTACT_URL }}
+      VITE_HEADROOM_CONTACT_FORM_URL: ${{ vars.VITE_HEADROOM_CONTACT_FORM_URL }}
+      HEADROOM_SENTRY_DSN: ${{ secrets.HEADROOM_SENTRY_DSN }}
+      VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            src-tauri -> target
+          env-vars: HEADROOM_SENTRY_DSN
+
       - name: Validate release configuration
-        if: steps.release_guard.outputs.should_release == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -168,7 +179,7 @@ jobs:
           exit 1
 
       - name: Prepare App Store Connect API key
-        if: steps.release_guard.outputs.should_release == 'true' && env.APPLE_API_PRIVATE_KEY_P8 != ''
+        if: env.APPLE_API_PRIVATE_KEY_P8 != ''
         shell: bash
         run: |
           set -euo pipefail
@@ -177,16 +188,9 @@ jobs:
           echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
       - name: Install frontend dependencies
-        if: steps.release_guard.outputs.should_release == 'true'
         run: npm ci
 
-      - name: Run release checks
-        if: steps.release_guard.outputs.should_release == 'true'
-        timeout-minutes: 12
-        run: ./scripts/verify-release.sh
-
       - name: Build and publish versioned rc release
-        if: steps.release_guard.outputs.should_release == 'true'
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -217,10 +221,52 @@ jobs:
           uploadUpdaterJson: true
           args: --target universal-apple-darwin
 
+  checks:
+    name: Release checks (Staging)
+    # Its own job so the suite runs beside the builds instead of in front of
+    # the macOS one. Only the mirror job waits for it.
+    needs: guard
+    if: needs.guard.outputs.should_release == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
+        with:
+          tool: nextest
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run release checks
+        timeout-minutes: 12
+        run: ./scripts/verify-release.sh
+
   windows:
     name: Windows x64 (Staging)
-    needs: release
-    if: needs.release.outputs.should_release == 'true'
+    needs: guard
+    if: needs.guard.outputs.should_release == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
 
@@ -282,11 +328,8 @@ jobs:
         # the installer; SmartScreen still warns until reputation accrues.
         run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
-      - name: Publish Windows installer to the rc release
+      - name: Collect Windows installer
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RC_TAG: v${{ needs.release.outputs.package_version }}
         run: |
           set -euo pipefail
           bundle_dir="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
@@ -294,14 +337,27 @@ jobs:
           sig="${setup}.sig"
           [ -f "$sig" ] || { echo "updater signature missing: $sig" >&2; exit 1; }
 
-          # rc tag only: nothing polls it, so a half-built release is invisible.
-          # The mirror job reads this .sig back out to build the manifest.
-          gh release upload "$RC_TAG" "$setup" "$sig" --clobber --repo "$GITHUB_REPOSITORY"
+          # The mirror job uploads these to the rc tag and reads this .sig
+          # back out to build the manifest.
+          mkdir -p release-bundles
+          cp "$setup" "$sig" release-bundles/
+
+      - name: Hand the Windows bundles to the mirror job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundles-windows
+          path: release-bundles
+          if-no-files-found: error
+          # Already compressed; re-zipping only costs time.
+          compression-level: 0
+          # "Re-run all jobs" uploads the same name again.
+          overwrite: true
+          retention-days: 7
 
   linux:
     name: Linux x86_64 (Staging)
-    needs: release
-    if: needs.release.outputs.should_release == 'true'
+    needs: guard
+    if: needs.guard.outputs.should_release == 'true'
     # ubuntu-22.04 would give a lower glibc floor, but it enters brownout
     # deprecation on 2026-09-17 (actions/runner-images#14254), so builds would
     # start failing within weeks. 24.04 sets the floor at glibc 2.39: this
@@ -377,11 +433,8 @@ jobs:
         # entry in the manifest (see the publish step below).
         run: npx tauri build --target x86_64-unknown-linux-gnu --bundles deb,appimage
 
-      - name: Publish Linux bundles to the rc release
+      - name: Collect Linux bundles
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RC_TAG: v${{ needs.release.outputs.package_version }}
         run: |
           set -euo pipefail
           bundle_dir="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
@@ -407,28 +460,52 @@ jobs:
           assets=("$appimage" "$sig" "$deb" "$deb_sig")
           [ "$updater_artifact" = "$appimage" ] || assets+=("$updater_artifact")
 
-          # rc tag only, same as the windows job: the mirror job composes the
-          # manifest once every platform has landed here.
-          gh release upload "$RC_TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          # Same as the windows job: the mirror job uploads these to the rc tag.
+          mkdir -p release-bundles
+          cp "${assets[@]}" release-bundles/
+
+      - name: Hand the Linux bundles to the mirror job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bundles-linux
+          path: release-bundles
+          if-no-files-found: error
+          # Already compressed; re-zipping only costs time.
+          compression-level: 0
+          # "Re-run all jobs" uploads the same name again.
+          overwrite: true
+          retention-days: 7
 
   mirror:
     name: Publish staging manifest
-    # Only after every platform bundle is in the rc release. staging-rolling is
-    # the endpoint rc installs poll, and this job is its only writer, so a
-    # partial build is never visible to any platform.
-    needs: [release, windows, linux]
-    if: needs.release.outputs.should_release == 'true'
+    # Only after every platform has built and the release checks passed.
+    # staging-rolling is the endpoint rc installs poll, and this job is its
+    # only writer, so a partial or failing build is never visible to any
+    # platform.
+    needs: [guard, release, checks, windows, linux]
+    if: needs.guard.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
+      - name: Download the Windows and Linux bundles
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bundles-*
+          path: release-bundles
+          merge-multiple: true
+
       - name: Mirror the rc release to staging-rolling
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RC_TAG: v${{ needs.release.outputs.package_version }}
+          RC_TAG: v${{ needs.guard.outputs.package_version }}
         run: |
           set -euo pipefail
+          # The macOS job created the rc release; complete it first, so the
+          # download below sees every platform exactly as before.
+          gh release upload "$RC_TAG" release-bundles/* --clobber --repo "$GITHUB_REPOSITORY"
+
           workdir="$(mktemp -d)"
           gh release download "$RC_TAG" --repo "$GITHUB_REPOSITORY" --dir "$workdir"
 
