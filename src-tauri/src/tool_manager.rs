@@ -53,6 +53,14 @@ const MARKITDOWN_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// seeds in ~3s); the cap only trips on pathological corpora, after which the
 /// proxy starts anyway and seeding retries next launch.
 const HEADROOM_BASELINE_SEED_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest transcript corpus the seed run is pointed at. `learn --verbosity`
+/// reads it three times (~2.2s per 100MB on Apple Silicon, 2-3x that on slower
+/// disks and CPUs), so a heavy user's busiest project (1GB+) always hit the
+/// timeout above, seeded nothing, and retried on every launch, holding proxy
+/// start back 30s each time. The busiest project under this cap seeds instead.
+// ponytail: fixed cap; if outlier machines still time out, stamp the failed
+// size beside the ledger and halve the cap from it on the next launch.
+const HEADROOM_BASELINE_SEED_MAX_BYTES: u64 = 400 * 1024 * 1024;
 /// Index of pre-built wheels for sdist-only PyPI packages (e.g. hnswlib).
 /// GitHub's expanded_assets endpoint serves HTML anchors pip can consume via --find-links.
 const VENDOR_WHEELS_INDEX_URL: &str =
@@ -3105,7 +3113,9 @@ impl ToolManager {
         }
         log::info!("seeding output-shaper verbosity baseline (no baseline present yet)");
         let Some(project_cwd) = busiest_claude_project_cwd() else {
-            log::info!("verbosity baseline seeding skipped: no Claude transcripts found");
+            log::info!(
+                "verbosity baseline seeding skipped: no Claude transcripts under the size cap"
+            );
             return;
         };
         let args = [
@@ -11771,11 +11781,39 @@ pub fn claude_project_memory_file(project_path: &str) -> PathBuf {
         .join("MEMORY.md")
 }
 
+/// Claude Code's `~/.claude/projects` folder name for `project_path`, ported
+/// from its sanitizer (2.1.284): every UTF-16 unit outside [a-zA-Z0-9] becomes
+/// '-', and a name over 200 characters is truncated with a base-36 hash of the
+/// path appended. Mapping only '/' missed every Windows project and any path
+/// with a '.', '_' or space, so MEMORY.md was never found for them.
 fn encode_claude_project_folder_name(project_path: &str) -> String {
-    format!(
-        "-{}",
-        project_path.trim_start_matches('/').replace('/', "-")
-    )
+    const MAX_LEN: usize = 200;
+    let units: Vec<u16> = project_path.encode_utf16().collect();
+    let name: String = units
+        .iter()
+        .map(|&u| match char::from_u32(u32::from(u)) {
+            Some(c) if c.is_ascii_alphanumeric() => c,
+            _ => '-',
+        })
+        .collect();
+    if name.len() <= MAX_LEN {
+        return name;
+    }
+    // JS `(h << 5) - h + charCode | 0`, then `Math.abs(h).toString(36)`.
+    let hash = units.iter().fold(0i32, |h, &u| {
+        (h << 5).wrapping_sub(h).wrapping_add(i32::from(u))
+    });
+    let mut n = hash.unsigned_abs();
+    let mut digits = Vec::new();
+    loop {
+        digits.push(char::from_digit(n % 36, 36).unwrap_or('0'));
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    let hash36: String = digits.into_iter().rev().collect();
+    format!("{}-{hash36}", &name[..MAX_LEN])
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -11980,10 +12018,11 @@ fn verbosity_baseline_present() -> bool {
 }
 
 /// Real project root (the transcript `cwd`) of the Claude Code project with the
-/// most transcript bytes under `~/.claude/projects`. Reading `cwd` from a
-/// transcript avoids lossily decoding the mangled `~/.claude/projects` dir name
-/// — it is exactly the path headroom's plugin resolves to, so `--project <cwd>`
-/// matches. Returns `None` when no non-empty transcript exists.
+/// most transcript bytes under `~/.claude/projects`, among those no bigger than
+/// `HEADROOM_BASELINE_SEED_MAX_BYTES`. Reading `cwd` from a transcript avoids
+/// lossily decoding the mangled `~/.claude/projects` dir name; it is exactly
+/// the path headroom's plugin resolves to, so `--project <cwd>` matches.
+/// Returns `None` when no non-empty transcript fits the cap.
 fn busiest_claude_project_cwd() -> Option<String> {
     // client_adapters::home_dir, not a bare $HOME: a Windows GUI process has
     // no HOME env var, and bailing here silently skipped verbosity-baseline
@@ -11991,9 +12030,12 @@ fn busiest_claude_project_cwd() -> Option<String> {
     let projects_dir = crate::client_adapters::home_dir()
         .join(".claude")
         .join("projects");
+    busiest_claude_project_cwd_in(&projects_dir, HEADROOM_BASELINE_SEED_MAX_BYTES)
+}
 
+fn busiest_claude_project_cwd_in(projects_dir: &Path, max_bytes: u64) -> Option<String> {
     let mut best: Option<(u64, PathBuf)> = None;
-    for entry in std::fs::read_dir(&projects_dir).ok()?.flatten() {
+    for entry in std::fs::read_dir(projects_dir).ok()?.flatten() {
         let dir = entry.path();
         if !dir.is_dir() {
             continue;
@@ -12009,7 +12051,7 @@ fn busiest_claude_project_cwd() -> Option<String> {
                 }
             }
         }
-        if bytes > 0 && best.as_ref().is_none_or(|(b, _)| bytes > *b) {
+        if bytes > 0 && bytes <= max_bytes && best.as_ref().is_none_or(|(b, _)| bytes > *b) {
             best = Some((bytes, dir));
         }
     }
@@ -18480,9 +18522,6 @@ after
 
     #[test]
     fn encode_claude_project_folder_name_replaces_slashes_preserving_hyphens() {
-        // Claude Code's on-disk encoding only substitutes '/' with '-'; literal
-        // hyphens in the path are preserved verbatim. Verified against real
-        // ~/.claude/projects/ folder names.
         assert_eq!(
             super::encode_claude_project_folder_name("/Users/alice/my-project"),
             "-Users-alice-my-project"
@@ -18492,6 +18531,57 @@ after
     #[test]
     fn encode_claude_project_folder_name_handles_root_slash() {
         assert_eq!(super::encode_claude_project_folder_name("/foo"), "-foo");
+    }
+
+    #[test]
+    fn encode_claude_project_folder_name_matches_claude_code_for_every_non_alphanumeric() {
+        // Golden values from Claude Code 2.1.284's own sanitizer, run in node.
+        // It maps every non-[a-zA-Z0-9] UTF-16 unit to '-', so dots, underscores,
+        // spaces, Windows drive colons and backslashes all become hyphens.
+        let encode = super::encode_claude_project_folder_name;
+        assert_eq!(
+            encode("/Users/alice/Code/headroom/.worktrees/learn_prompt too-long"),
+            "-Users-alice-Code-headroom--worktrees-learn-prompt-too-long"
+        );
+        assert_eq!(encode("C:\\Users\\x\\my_proj"), "C--Users-x-my-proj");
+        // One hyphen per UTF-16 unit: an accented letter is one, an emoji two.
+        assert_eq!(encode("/tmp/caf\u{e9}/\u{1F600}"), "-tmp-caf----");
+        // Over 200 characters Claude Code truncates and appends a base-36 hash.
+        let long = format!("/Users/alice/{}proj", "very_long.dir name/".repeat(12));
+        assert_eq!(
+            encode(&long),
+            format!(
+                "-Users-alice-{}very-long-dir-na-d2ey4e",
+                "very-long-dir-name-".repeat(9)
+            )
+        );
+    }
+
+    #[test]
+    fn busiest_claude_project_cwd_skips_projects_over_the_seed_byte_cap() {
+        let root = unique_temp_dir("headroom-seed-pick");
+        for (dir, cwd, size) in [("-big", "/big", 3000), ("-small", "/small", 1000)] {
+            let line = format!("{{\"cwd\":\"{cwd}\"}}\n");
+            fs::create_dir_all(root.join(dir)).expect("create project dir");
+            fs::write(
+                root.join(dir).join("s.jsonl"),
+                format!("{line}{}", " ".repeat(size - line.len())),
+            )
+            .expect("write transcript");
+        }
+        // The busiest project wins while it fits the cap...
+        assert_eq!(
+            super::busiest_claude_project_cwd_in(&root, 10_000).as_deref(),
+            Some("/big")
+        );
+        // ...but one the seed run could not finish in time is passed over for
+        // the busiest one that fits, instead of timing out on every launch.
+        assert_eq!(
+            super::busiest_claude_project_cwd_in(&root, 2000).as_deref(),
+            Some("/small")
+        );
+        assert_eq!(super::busiest_claude_project_cwd_in(&root, 500), None);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
