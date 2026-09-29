@@ -12133,10 +12133,13 @@ fn path_with_binary_dir(binary: &Path) -> std::ffi::OsString {
 /// `ValueError: Unknown scheme for proxy URL` for anything outside
 /// http/https/socks5/socks5h -- socks4 in particular (v2rayN-style local
 /// proxies advertise socks4://127.0.0.1:10808). An empty value is how users
-/// disable a proxy; httpx ignores it, so it passes.
+/// disable a proxy; httpx ignores it, so it passes. A value without `://`
+/// passes too: httpx's `get_environment_proxies` mounts it as `http://<value>`,
+/// so `HTTPS_PROXY=proxy.corp:3128` is a working proxy, not a crash.
 fn httpx_supports_proxy_url(value: &str) -> bool {
     let v = value.trim().to_ascii_lowercase();
     v.is_empty()
+        || !v.contains("://")
         || ["http://", "https://", "socks5://", "socks5h://"]
             .iter()
             .any(|scheme| v.starts_with(scheme))
@@ -12278,7 +12281,8 @@ fn reg_dword_is_set(value: &str) -> bool {
 /// urllib's `getproxies_registry` expansion of the `ProxyServer` string,
 /// restricted to the keys httpx mounts (http/https). A value without `=`
 /// applies to every protocol; `proto=addr` pairs are per-protocol; an address
-/// without a scheme inherits its protocol name as the scheme. A keyed
+/// without a scheme gets `http://` for http/https ("the default proxy type of
+/// Windows is HTTP") and `socks://` for socks, never `https://`. A keyed
 /// `socks=` entry is NOT harmless: CPython backfills missing http/https keys
 /// with `socks4://addr` ("the default SOCKS proxy type of Windows is SOCKS4",
 /// urllib/request.py getproxies_registry) -- the RUST-B3 crash was exactly
@@ -12310,14 +12314,17 @@ fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, Strin
             continue;
         }
         // urllib keeps an existing scheme (`^([^/:]+)://`) and otherwise
-        // prefixes the protocol name.
+        // prefixes http:// (socks:// for socks). An https:// prefix would
+        // make httpx speak TLS to a plain CONNECT proxy.
         let has_scheme = addr
             .split_once("://")
             .is_some_and(|(scheme, _)| !scheme.contains('/') && !scheme.contains(':'));
         let url = if has_scheme {
             addr.to_string()
+        } else if proto == "socks" {
+            format!("socks://{addr}")
         } else {
-            format!("{proto}://{addr}")
+            format!("http://{addr}")
         };
         if proto == "socks" {
             // urllib's backfill rewrites a bare `socks://` to `socks4://`;
@@ -18761,11 +18768,28 @@ after
             "socks4://127.0.0.1:10808",
             "socks4a://127.0.0.1:1080",
             "socks://127.0.0.1:1080",
-            "127.0.0.1:8080",
         ] {
             assert!(
                 !super::httpx_supports_proxy_url(bad),
                 "{bad:?} should be stripped"
+            );
+        }
+    }
+
+    /// httpx mounts a schemeless proxy env value as `http://<value>`
+    /// (`get_environment_proxies`), so `HTTPS_PROXY=proxy.corp:3128` is a
+    /// working proxy. Stripping it sent the backend direct, and behind a
+    /// mandatory proxy every upstream request failed to connect.
+    #[test]
+    fn httpx_proxy_url_support_keeps_schemeless_values() {
+        for schemeless in [
+            "127.0.0.1:8080",
+            "proxy.corp:3128",
+            " user:pass@proxy.corp:3128 ",
+        ] {
+            assert!(
+                super::httpx_supports_proxy_url(schemeless),
+                "{schemeless:?} should pass through (httpx prefixes http://)"
             );
         }
     }
@@ -18853,7 +18877,22 @@ after
             super::registry_proxy_env_overrides("http=socks4://127.0.0.1:10808;https=1.2.3.4:8080"),
             Some(vec![(
                 "https_proxy".to_string(),
-                "https://1.2.3.4:8080".to_string()
+                "http://1.2.3.4:8080".to_string()
+            )])
+        );
+    }
+
+    /// CPython's getproxies_registry prefixes a schemeless http/https entry
+    /// with `http://` ("the default proxy type of Windows is HTTP"), never
+    /// with the protocol name: `https://proxy` would make httpx speak TLS to
+    /// a plain CONNECT proxy and fail every upstream request.
+    #[test]
+    fn registry_schemeless_https_entry_mirrors_as_http_like_cpython() {
+        assert_eq!(
+            super::registry_proxy_env_overrides("https=proxy.corp:8080;socks=proxy.corp:1080"),
+            Some(vec![(
+                "https_proxy".to_string(),
+                "http://proxy.corp:8080".to_string()
             )])
         );
     }
