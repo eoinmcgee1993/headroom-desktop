@@ -1671,12 +1671,14 @@ fn show_notification_impl(
 }
 
 #[tauri::command]
-async fn install_addon(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<DashboardState, String> {
-    match id.as_str() {
+async fn install_addon(app: AppHandle, id: String) -> Result<DashboardState, String> {
+    // pip, npx and asset downloads run for minutes; see run_lifecycle_command.
+    run_lifecycle_command(app, move |app| install_addon_blocking(&app, &id)).await
+}
+
+fn install_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, String> {
+    let state: State<'_, AppState> = app.state();
+    match id {
         "markitdown" => {
             // markitdown[all] shares the runtime venv; a pip run beside the
             // upgrade's replaces the same files twice.
@@ -1709,7 +1711,7 @@ async fn install_addon(
         "ponytail" | "caveman" => {
             let outdated = state
                 .tool_manager
-                .install_plugin(&id)
+                .install_plugin(id)
                 .map_err(|err| err.to_string())?;
             if let Some(host) = outdated {
                 let name = if id == "caveman" {
@@ -1723,7 +1725,7 @@ async fn install_addon(
                     "Codex"
                 };
                 let _ = show_notification_impl(
-                    &app,
+                    app,
                     &format!("Update the {host} CLI to finish {name} setup"),
                     &format!("{name} is installed for {other}. Your {host} CLI is too old to add it -- update the {host} CLI, then re-install {name} to enable it there too."),
                     None,
@@ -1750,18 +1752,29 @@ async fn install_addon(
         }
         other => return Err(format!("unknown addon: {other}")),
     }
-    analytics::track_event(&app, &format!("{id}_installed"), None);
+    analytics::track_event(app, &format!("{id}_installed"), None);
     Ok(state.dashboard())
 }
 
 #[tauri::command]
 async fn set_addon_enabled(
     app: AppHandle,
-    state: State<'_, AppState>,
     id: String,
     enabled: bool,
 ) -> Result<DashboardState, String> {
-    match id.as_str() {
+    run_lifecycle_command(app, move |app| {
+        set_addon_enabled_blocking(&app, &id, enabled)
+    })
+    .await
+}
+
+fn set_addon_enabled_blocking(
+    app: &AppHandle,
+    id: &str,
+    enabled: bool,
+) -> Result<DashboardState, String> {
+    let state: State<'_, AppState> = app.state();
+    match id {
         "markitdown" => {
             state
                 .tool_manager
@@ -1784,7 +1797,7 @@ async fn set_addon_enabled(
         "ponytail" | "caveman" => {
             state
                 .tool_manager
-                .set_plugin_enabled(&id, enabled)
+                .set_plugin_enabled(id, enabled)
                 .map_err(|err| err.to_string())?;
         }
         "serena" => {
@@ -1808,17 +1821,18 @@ async fn set_addon_enabled(
         other => return Err(format!("unknown addon: {other}")),
     }
     let action = if enabled { "enabled" } else { "disabled" };
-    analytics::track_event(&app, &format!("{id}_{action}"), None);
+    analytics::track_event(app, &format!("{id}_{action}"), None);
     Ok(state.dashboard())
 }
 
 #[tauri::command]
-async fn uninstall_addon(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<DashboardState, String> {
-    match id.as_str() {
+async fn uninstall_addon(app: AppHandle, id: String) -> Result<DashboardState, String> {
+    run_lifecycle_command(app, move |app| uninstall_addon_blocking(&app, &id)).await
+}
+
+fn uninstall_addon_blocking(app: &AppHandle, id: &str) -> Result<DashboardState, String> {
+    let state: State<'_, AppState> = app.state();
+    match id {
         "markitdown" => {
             refuse_venv_cli_during_upgrade(&state)?;
             let _ = client_adapters::disable_markitdown_integration(
@@ -1844,7 +1858,7 @@ async fn uninstall_addon(
         "ponytail" | "caveman" => {
             state
                 .tool_manager
-                .uninstall_plugin(&id)
+                .uninstall_plugin(id)
                 .map_err(|err| err.to_string())?;
         }
         "serena" => {
@@ -1867,7 +1881,7 @@ async fn uninstall_addon(
         }
         other => return Err(format!("unknown addon: {other}")),
     }
-    analytics::track_event(&app, &format!("{id}_uninstalled"), None);
+    analytics::track_event(app, &format!("{id}_uninstalled"), None);
     Ok(state.dashboard())
 }
 
@@ -3997,22 +4011,30 @@ fn get_gated_bypass_bytes() -> u64 {
 /// Code that has sat dormant since March gets a "Waiting for a prompt..."
 /// spinner that can never resolve -- and because the success button needs
 /// every row green, the screen reads as "your setup failed" forever.
+///
+/// On the blocking pool: the walk visits up to 20k transcript entries per
+/// client, which froze every webview and the tray as a sync command.
 #[tauri::command]
-fn get_client_local_activity_ages(
+async fn get_client_local_activity_ages(
     client_ids: Vec<String>,
 ) -> std::collections::HashMap<String, u64> {
-    let now = std::time::SystemTime::now();
-    client_ids
-        .into_iter()
-        .filter_map(|client_id| {
-            let at = client_adapters::client_local_activity_at(&client_id)?;
-            // A clock that moved backwards yields no reading rather than a
-            // wrapped one: "never used" is the safe answer, since it only ever
-            // removes a row from the test, never fails one.
-            let age = now.duration_since(at).ok()?.as_secs();
-            Some((client_id, age))
-        })
-        .collect()
+    tauri::async_runtime::spawn_blocking(move || {
+        let now = std::time::SystemTime::now();
+        client_ids
+            .into_iter()
+            .filter_map(|client_id| {
+                let at = client_adapters::client_local_activity_at(&client_id)?;
+                // A clock that moved backwards yields no reading rather than a
+                // wrapped one: "never used" is the safe answer, since it only ever
+                // removes a row from the test, never fails one.
+                let age = now.duration_since(at).ok()?.as_secs();
+                Some((client_id, age))
+            })
+            .collect()
+    })
+    .await
+    // Same safe answer for a walk that panicked: no reading, never a failure.
+    .unwrap_or_default()
 }
 
 /// Running agent processes keyed by connector id, for the verify screen's
@@ -4246,18 +4268,34 @@ fn get_claude_profile(state: State<'_, AppState>) -> ClaudeAccountProfile {
 }
 
 #[tauri::command]
-async fn get_headroom_pricing_status(
-    state: State<'_, AppState>,
-) -> Result<HeadroomPricingStatus, String> {
-    let status = pricing::get_pricing_status(&state)?;
-    // Reconcile the runtime with the freshly evaluated status. Bridges the
-    // gap between "user just upgraded" (subscription_active flips on) and
-    // "Headroom optimization actually resumes" — without this, the pricing
-    // gate's bypass flag would stay set and Python would stay down until
-    // the next app launch.
-    state.apply_pricing_gates(&status);
-    state.report_weekly_limit_transitions(&status);
-    Ok(status)
+async fn get_headroom_pricing_status(app: AppHandle) -> Result<HeadroomPricingStatus, String> {
+    // The fetch is blocking HTTP (8s timeout per call), polled every 5-60s.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        let status = pricing::get_pricing_status(&state)?;
+        // Reconcile the runtime with the freshly evaluated status. Bridges the
+        // gap between "user just upgraded" (subscription_active flips on) and
+        // "Headroom optimization actually resumes" - without this, the pricing
+        // gate's bypass flag would stay set and Python would stay down until
+        // the next app launch.
+        //
+        // On its own thread for the reason `verify_headroom_auth_code` gives:
+        // an ungate starts the backend and `ensure_headroom_running` waits out
+        // a cold boot (minutes), which kept the paywall up and made the UI
+        // skip every other pricing refresh until Python opened its port.
+        {
+            let app_handle = app.clone();
+            let status = status.clone();
+            std::thread::spawn(move || {
+                let state: State<'_, AppState> = app_handle.state();
+                state.apply_pricing_gates(&status);
+            });
+        }
+        state.report_weekly_limit_transitions(&status);
+        Ok(status)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 /// Fire-and-forget install-wizard funnel beacon from the frontend. Returns
@@ -4499,15 +4537,23 @@ fn get_headroom_learn_status(
     state.headroom_learn_status(project_path.as_deref())
 }
 
+/// On the blocking pool: a cold cache smoke-tests each CLI and falls back to a
+/// `$SHELL -ilc` probe per missing one (up to 2s each with a heavy rc file),
+/// which froze the window on every Re-check as a sync command.
 #[tauri::command]
-fn get_headroom_learn_prereq_status(
-    state: State<'_, AppState>,
+async fn get_headroom_learn_prereq_status(
+    app: AppHandle,
     force: Option<bool>,
-) -> HeadroomLearnPrereqStatus {
-    if force.unwrap_or(false) {
-        state.invalidate_headroom_learn_prereq_cache();
-    }
-    state.headroom_learn_prereq_status()
+) -> Result<HeadroomLearnPrereqStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        if force.unwrap_or(false) {
+            state.invalidate_headroom_learn_prereq_cache();
+        }
+        state.headroom_learn_prereq_status()
+    })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -4523,14 +4569,19 @@ async fn get_transformations_feed(limit: Option<u32>) -> TransformationFeedRespo
 /// Read-only snapshot of the activity feed. Observation — fetching the proxy,
 /// writing to ActivityFacts, persisting — happens on a dedicated background
 /// timer (see `spawn_activity_observer`), so this command never mutates state.
-/// That keeps the IPC hot path short: one in-memory lock + a cheap /readyz
-/// ping to the local proxy.
+/// Still on the blocking pool: the /readyz ping waits up to 5s, and a Serena
+/// stats cache miss runs `ps`, reads today's logs and probes four ports.
 #[tauri::command]
-async fn get_activity_feed(state: State<'_, AppState>) -> Result<ActivityFeedResponse, String> {
-    Ok(ActivityFeedResponse {
-        tiles: state.activity_feed_snapshot(),
-        proxy_reachable: crate::state::headroom_proxy_reachable(),
+async fn get_activity_feed(app: AppHandle) -> Result<ActivityFeedResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        ActivityFeedResponse {
+            tiles: state.activity_feed_snapshot(),
+            proxy_reachable: crate::state::headroom_proxy_reachable(),
+        }
     })
+    .await
+    .map_err(|err| err.to_string())
 }
 
 /// Observation cadence for background activity milestones. A modest delay is
@@ -13183,6 +13234,91 @@ Some unrelated content.
                 "{name} must restore clients before propagating a resume error: {body}"
             );
         }
+    }
+
+    /// Attribute and body of one Tauri command. Where a command runs (main
+    /// thread, async worker, blocking pool) needs a running app to observe, so
+    /// the tests below pin it in source. Note that `#[tauri::command(async)]`
+    /// on a sync fn runs the body inline on an async worker, not the blocking
+    /// pool, so it only trades a UI freeze for worker starvation.
+    fn tauri_command_source<'a>(source: &'a str, name: &str) -> (&'a str, &'a str) {
+        let at = source
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} present"));
+        let attr = source[..at]
+            .rfind("#[tauri::command")
+            .unwrap_or_else(|| panic!("{name} attribute"));
+        let end = at + source[at..].find("\n}\n").expect("command end");
+        (&source[attr..at], &source[at..end])
+    }
+
+    /// pip, npx and asset downloads run for minutes; on an async worker two
+    /// clicks on a 2-core machine froze the dashboard and runtime status.
+    #[test]
+    fn addon_commands_run_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        for name in ["install_addon", "set_addon_enabled", "uninstall_addon"] {
+            let (_, body) = tauri_command_source(&source, name);
+            assert!(
+                body.contains("run_lifecycle_command("),
+                "{name} must run on the blocking pool: {body}"
+            );
+        }
+    }
+
+    /// The transcript walk visits up to 40k entries; as a sync command it
+    /// froze every webview and the tray on entering post_install.
+    #[test]
+    fn local_activity_ages_walk_runs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (attr, body) = tauri_command_source(&source, "get_client_local_activity_ages");
+        assert!(
+            attr.trim_end().ends_with("async") && body.contains("spawn_blocking("),
+            "the walk must leave the main thread for the blocking pool: {body}"
+        );
+    }
+
+    /// An ungate starts the backend, and `ensure_headroom_running` waits out a
+    /// cold boot (minutes). Awaited inline, the paywall stayed up and every
+    /// other pricing refresh was skipped until Python opened its port.
+    #[test]
+    fn pricing_status_poll_applies_gates_off_the_ipc_path() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, body) = tauri_command_source(&source, "get_headroom_pricing_status");
+        let detached = body
+            .find("std::thread::spawn(")
+            .expect("gates run on a detached thread");
+        let gates = body
+            .find("apply_pricing_gates(")
+            .expect("gates still applied");
+        assert!(
+            body.contains("spawn_blocking(") && detached < gates,
+            "the fetch belongs on the blocking pool and the gate on its own thread: {body}"
+        );
+    }
+
+    /// A forced Re-check runs the CLI smoke tests and a `$SHELL -ilc` probe
+    /// per missing CLI (up to 2s each with a heavy rc file).
+    #[test]
+    fn learn_prereq_probe_runs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (attr, body) = tauri_command_source(&source, "get_headroom_learn_prereq_status");
+        assert!(
+            attr.trim_end().ends_with("async") && body.contains("spawn_blocking("),
+            "the probe must leave the main thread for the blocking pool: {body}"
+        );
+    }
+
+    /// Serena stats run `ps`, read today's logs and probe four ports on a
+    /// cache miss, and the /readyz probe waits up to 5s; polled every 4s.
+    #[test]
+    fn activity_feed_runs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, body) = tauri_command_source(&source, "get_activity_feed");
+        assert!(
+            body.contains("spawn_blocking("),
+            "the snapshot must not block an async worker: {body}"
+        );
     }
 
     #[test]
