@@ -786,19 +786,7 @@ impl AppState {
         // run was killed between move-aside and commit, the venv.backup/
         // dir holds the real working environment and the live venv is a
         // partial install. Restore before doing anything else.
-        if self.tool_manager.upgrade_interrupted() {
-            // Recovery pip-reinstalls or renames the live venv, so it gets the
-            // upgrade's protection: no spawn may start mid-recovery, a start
-            // already in flight is waited out, and whatever runs from the venv
-            // (the updater's orphan proxy, Claude Code's MCP servers) is
-            // cleared first. Only when a marker exists: this sweep on every
-            // launch would kill the user's MCP servers for nothing.
-            let _recovery_guard = UpgradeInstallGuard::engage(self);
-            drop(self.lifecycle_lock.lock());
-            self.stop_headroom();
-            kill_venv_lock_holders(&self.tool_manager.venv_dir());
-            let _ = self.tool_manager.recover_from_interrupted_upgrade();
-        }
+        self.recover_interrupted_upgrade();
 
         if !self.tool_manager.python_runtime_installed() {
             // First-run; start_bootstrap (wizard) handles install.
@@ -1601,7 +1589,41 @@ impl AppState {
             }
             persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         }
+        // A failed rollback leaves its marker and a receipt that already reads
+        // the pin, so the plan finds no work and Retry did nothing. Recover as
+        // launch does: the old receipt comes back and the upgrade replans.
+        let recovery_stopped_python = self.recover_interrupted_upgrade();
         self.run_upgrade_with_ui(app, force_rebuild);
+        if recovery_stopped_python {
+            // run_upgrade_with_ui restarts Python only when it ran; a recovery
+            // that failed again (still offline) left nothing to run. Gates apply.
+            let _ = self.ensure_headroom_running();
+        }
+    }
+
+    /// Restore the pre-upgrade runtime when an upgrade marker is on disk (an
+    /// upgrade died mid-install, or its rollback failed). Returns true when a
+    /// marker was found, which stopped Python, whether or not recovery worked.
+    fn recover_interrupted_upgrade(&self) -> bool {
+        // A running upgrade wrote the marker itself: never recover under it.
+        let Some(_upgrade) = self.upgrade_lock.try_lock() else {
+            return false;
+        };
+        if !self.tool_manager.upgrade_interrupted() {
+            return false;
+        }
+        // Recovery pip-reinstalls or renames the live venv, so it gets the
+        // upgrade's protection: no spawn may start mid-recovery, a start
+        // already in flight is waited out, and whatever runs from the venv
+        // (the updater's orphan proxy, Claude Code's MCP servers) is
+        // cleared first. Only when a marker exists: this sweep on every
+        // launch would kill the user's MCP servers for nothing.
+        let _recovery_guard = UpgradeInstallGuard::engage(self);
+        drop(self.lifecycle_lock.lock());
+        self.stop_headroom();
+        kill_venv_lock_holders(&self.tool_manager.venv_dir());
+        let _ = self.tool_manager.recover_from_interrupted_upgrade();
+        true
     }
 
     pub fn runtime_upgrade_in_progress(&self) -> bool {
@@ -13414,6 +13436,49 @@ mod tests {
         )
         .expect("write marker");
         assert!(!state.can_stamp_no_maintenance("0.3.12-rc.3"));
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn recover_interrupted_upgrade_lets_retry_replan_after_a_failed_rollback() {
+        // A failed rollback: new venv live, old one aside, receipt at the pin,
+        // marker on disk. Retry's plan found nothing to do until recovery put
+        // the old receipt back.
+        let base_dir = temp_test_dir("retry-recovers-failed-rollback");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&base_dir);
+        write_headroom_receipt(&base_dir, "0.38.0", "stale");
+        fs::rename(
+            runtime.tools_dir.join("headroom.json"),
+            runtime.tools_dir.join("headroom.json.backup"),
+        )
+        .expect("receipt backup");
+        write_headroom_receipt(
+            &base_dir,
+            crate::tool_manager::HEADROOM_PINNED_VERSION,
+            "stale",
+        );
+        fs::create_dir_all(&runtime.venv_dir).expect("new venv");
+        fs::create_dir_all(runtime.runtime_dir.join("venv.backup")).expect("old venv");
+        fs::write(
+            runtime.runtime_dir.join("upgrade.in_progress.json"),
+            r#"{"target_version":"0.39.0"}"#,
+        )
+        .expect("write marker");
+
+        // An upgrade holding the lock wrote that marker itself: hands off.
+        {
+            let _running = state.upgrade_lock.lock();
+            assert!(!state.recover_interrupted_upgrade());
+            assert!(state.tool_manager.upgrade_interrupted());
+        }
+
+        assert!(state.recover_interrupted_upgrade());
+        assert!(!state.tool_manager.upgrade_interrupted());
+        assert!(matches!(
+            state.runtime_maintenance_plan_for_app_version(env!("CARGO_PKG_VERSION")),
+            Some(super::RuntimeMaintenancePlan::Upgrade(_))
+        ));
         fs::remove_dir_all(base_dir).expect("remove temp dir");
     }
 

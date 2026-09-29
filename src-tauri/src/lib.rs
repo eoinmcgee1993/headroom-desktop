@@ -3754,6 +3754,25 @@ pub(crate) fn classify_upgrade_error(err: &anyhow::Error) -> Option<String> {
             "The new Headroom version couldn't be imported. Try retrying or reinstalling.".into(),
         );
     }
+    // pip offline never says "network": it retries through a DNS or connect
+    // error (the markers tool_manager's pip categories read), then reports
+    // "No matching distribution found". Checked after the disk and checksum
+    // hints, which a retry that recovered would otherwise mask.
+    let pip_offline = [
+        "temporary failure in name resolution",
+        "nodename nor servname",
+        "getaddrinfo failed",
+        "newconnectionerror",
+        "failed to establish a new connection",
+    ]
+    .iter()
+    .any(|marker| chain.contains(marker))
+        || tool_manager::pip_index_fetch_failed(
+            &tool_manager::pip_failure_evidence(err, &chain).to_ascii_lowercase(),
+        );
+    if pip_offline {
+        return Some("Couldn't reach PyPI. Check your network and retry.".into());
+    }
     if chain.contains("resolution") || chain.contains("no matching distribution") {
         return Some(
             "Pip couldn't resolve dependencies for the new version. Please report this.".into(),
@@ -14409,6 +14428,47 @@ Some unrelated content.
         let offline = pip_failure("OSError: [Errno 51] Network is unreachable");
         let hint = classify_upgrade_error(&offline).expect("must classify");
         assert!(hint.contains("PyPI"), "expected network hint, got: {hint}");
+    }
+
+    #[test]
+    fn classify_upgrade_error_reads_pips_offline_stderr_as_unreachable_pypi() {
+        // pip's stderr when DNS is down, per platform: the retry warning, then
+        // a "no matching distribution" that must not read as a resolver bug.
+        for errno in [
+            "[Errno -3] Temporary failure in name resolution",
+            "[Errno 8] nodename nor servname provided, or not known",
+            "[Errno 11001] getaddrinfo failed",
+        ] {
+            let stderr = format!(
+                "WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, \
+                 status=None)) after connection broken by 'NewConnectionError('<pip._vendor.\
+                 urllib3.connection.HTTPSConnection object at 0x7f2c1c3b5a90>: Failed to \
+                 establish a new connection: {errno}')': /simple/headroom-ai/\n\
+                 ERROR: Could not find a version that satisfies the requirement \
+                 headroom-ai==0.39.0 (from versions: none)\n\
+                 ERROR: No matching distribution found for headroom-ai==0.39.0\n"
+            );
+            let err = anyhow::Error::new(crate::tool_manager::CommandFailure {
+                program: "python".into(),
+                args: vec!["-m".into(), "pip".into(), "install".into()],
+                stdout: String::new(),
+                stderr,
+                exit_code: Some(1),
+                signal: None,
+            })
+            .context("upgrading Headroom's bundled dependencies in place");
+            let hint = classify_upgrade_error(&err).expect("must classify");
+            assert!(
+                hint.contains("PyPI"),
+                "{errno}: expected network hint, got: {hint}"
+            );
+        }
+
+        // A genuine resolver conflict keeps its own hint.
+        let conflict =
+            anyhow::anyhow!("ERROR: ResolutionImpossible: for help visit https://pip.pypa.io");
+        let hint = classify_upgrade_error(&conflict).expect("must classify");
+        assert!(hint.contains("resolve dependencies"), "got: {hint}");
     }
 
     /// The gate is only as good as the name it matches on, and that name is not
