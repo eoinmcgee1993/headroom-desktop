@@ -360,6 +360,20 @@ describe("ActivityFeed", () => {
     expect(markup).toContain('aria-expanded="false"');
   });
 
+  // The detail exists so support IDs can be copied: a click that ends a text
+  // selection there must not bubble to the row toggle and collapse it.
+  it("keeps an expanded row open when its detail is clicked", async () => {
+    const feed = feedWith({ transformation: transformation({ requestId: "req-abc-123" }) });
+    const { container } = render(<ActivityFeed feed={feed} error={null} />);
+    const row = container.querySelector(".activity-feed__item--clickable") as HTMLElement;
+
+    await userEvent.click(row);
+    await userEvent.click(screen.getByText("req-abc-123"));
+
+    expect(row).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("req-abc-123")).toBeInTheDocument();
+  });
+
   it("renders tiles in the fixed TILE_ORDER (record → transformation → learningsMilestone → trainSuggestion → rtkToday → serenaToday → weeklyRecap)", () => {
     // With all kinds as empty placeholders on an empty feed, the TILE_ORDER
     // dictates DOM order: the record card lands first, then transformation,

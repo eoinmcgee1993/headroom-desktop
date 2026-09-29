@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::models::{
     ClientConnectorStatus, ClientHealth, ClientSetupResult, ClientSetupVerification, ClientStatus,
 };
+use crate::state::{UpstreamOverride, UpstreamOverrideMode};
 use crate::storage::{app_data_dir, config_file};
 
 // Raw proxy base — use provider-specific constants below when configuring client endpoints.
@@ -100,6 +101,7 @@ pub fn ensure_rtk_integrations(
     managed_rtk_path: &Path,
     managed_python_path: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
+    let _setup = setup_write_lock();
     ensure_rtk_integrations_for_targets(
         managed_rtk_path,
         managed_python_path,
@@ -159,7 +161,7 @@ fn rtk_codex_agents_path() -> PathBuf {
 /// Codex nudge: Codex has no command-rewrite hook, so it routes shell commands
 /// through the managed `rtk` binary by being told to prefix them with it.
 fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
-    let bin = managed_rtk_path.display();
+    let bin = shell_word(managed_rtk_path);
     format!(
         "## Token-saving shell commands (Headroom RTK)\n\
          Run shell commands through RTK to get compact, token-optimized output:\n\
@@ -184,6 +186,24 @@ pub fn rtk_integration_status() -> Result<(bool, bool)> {
     Ok((path_configured, hook_configured))
 }
 
+/// Serialises the public writers of client-setup.json and of the client configs
+/// setup rewrites (~/.claude/settings.json, shell rc files). Each one loads the
+/// file, changes its part and writes the whole thing back, and they run on
+/// different threads: launch restore, the warm-runtime RTK/MarkItDown refresh
+/// and the UI toggles each wrote a stale copy over the others' changes (a lost
+/// configured_clients stamp, preserved gateway URL, opt-out flag or hook).
+/// Only the public entry points take it, never the helpers they share, so no
+/// thread takes it twice.
+// ponytail: one global lock held across a whole apply (up to seconds while
+// Codex holds its thread DB); per-file locks if a toggle ever visibly waits.
+static SETUP_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn setup_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    SETUP_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// True when the user turned RTK off via the tool status toggle.
 pub fn is_rtk_disabled() -> bool {
     load_setup_state().rtk_disabled
@@ -199,6 +219,7 @@ pub fn is_auto_learn_disabled() -> bool {
 /// Persist the auto-learning opt-out. Only read when the proxy is spawned, so
 /// the caller restarts the backend for it to take effect.
 pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
+    let _setup = setup_write_lock();
     let mut state = load_setup_state();
     state.auto_learn_disabled = !enabled;
     write_setup_state(&state)
@@ -212,6 +233,7 @@ pub fn is_statusline_disabled() -> bool {
 /// Persist the statusline opt-out and apply it now: install it when Claude
 /// Code routes through Headroom, remove it otherwise.
 pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
+    let _setup = setup_write_lock();
     let mut state = load_setup_state();
     let was_disabled = state.statusline_disabled;
     state.statusline_disabled = !enabled;
@@ -249,12 +271,17 @@ pub fn set_rtk_enabled(
     managed_rtk_path: &Path,
     managed_python_path: &Path,
 ) -> Result<()> {
+    let _setup = setup_write_lock();
     let mut state = load_setup_state();
     state.rtk_disabled = !enabled;
     write_setup_state(&state)?;
 
     if enabled {
-        ensure_rtk_integrations(managed_rtk_path, managed_python_path)?;
+        ensure_rtk_integrations_for_targets(
+            managed_rtk_path,
+            managed_python_path,
+            &resolve_default_shell_targets(),
+        )?;
     } else {
         let shell_targets = resolve_client_shell_targets_for_cleanup(&state, "claude_code")?;
         remove_shell_block(&shell_targets, "managed_rtk")?;
@@ -383,6 +410,7 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
 }
 
 fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
+    let _setup = setup_write_lock();
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
     let mut state = load_setup_state();
@@ -407,6 +435,9 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                     .preserved_base_urls
                     .insert(state_id.clone(), original.clone());
                 replaced_base_url = Some(original);
+                // Persist now: settings.json already holds our URL, so if a
+                // later step fails the gateway would otherwise be lost for good.
+                write_setup_state(&state)?;
             }
             // Ride ENABLE_TOOL_SEARCH alongside the base URL so Claude Code keeps
             // deferring tool schemas (issue #746). If-absent so a user's own value
@@ -417,7 +448,7 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             )?;
             updates.0.append(&mut tool_search.0);
             updates.1.append(&mut tool_search.1);
-            let mut legacy_updates = remove_legacy_vscode_base_url_keys()?;
+            let mut legacy_updates = remove_legacy_vscode_base_url_keys();
             updates.0.append(&mut legacy_updates.0);
             updates.1.append(&mut legacy_updates.1);
 
@@ -463,8 +494,8 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                 }
             }
 
-            // Shell profile (RTK PATH + env export) is convenience; tolerate an
-            // unwritable profile rather than failing the whole setup.
+            // Shell profile (RTK PATH + `claude` function) is convenience;
+            // tolerate an unwritable profile rather than failing the whole setup.
             let env_block = claude_code_shell_block();
             let shell_step = ensure_rtk_integrations_for_targets(
                 &default_headroom_rtk_path(),
@@ -503,18 +534,25 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             }
         }
         "codex" | "codex_cli" => {
-            let shell_targets = resolve_client_shell_targets(&state, client_id)?;
             // Critical, app-owned write first: the ~/.codex/config.toml provider
             // block is what routes Codex through Headroom.
-            let (changed, backups, preserved_provider) = configure_codex_provider_block()?;
+            let (changed, backups, preserved) = configure_codex_provider_block()?;
             let mut updates = (changed, backups);
-            if let Some(original) = preserved_provider {
-                // A custom root `model_provider` (gateway/alternate provider) was
-                // routing Codex before us: remember it for restore-on-disable so
-                // we don't silently drop the user onto api.openai.com. Restored
-                // silently (no takeover notice — that copy is Claude/base_url
-                // specific).
-                state.preserved_base_urls.insert(state_id.clone(), original);
+            let captured = !preserved.is_empty();
+            for (entry, original) in preserved {
+                // A custom root `model_provider` or `openai_base_url` (gateway,
+                // LM Studio) was routing Codex before us: remember it for
+                // restore-on-disable so we don't silently drop the user onto
+                // api.openai.com. Restored silently (no takeover notice: that
+                // copy is Claude/base_url specific).
+                state
+                    .preserved_base_urls
+                    .insert(entry.to_string(), original);
+            }
+            // Persist now: config.toml no longer holds the user's value, so if
+            // a later step fails (malformed hooks.json) it would be lost for good.
+            if captured {
+                write_setup_state(&state)?;
             }
 
             // Loud-fail guard so a closed app or clobbered config surfaces in
@@ -523,23 +561,13 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             updates.0.append(&mut guard.0);
             updates.1.append(&mut guard.1);
 
-            let env_block = format!("export OPENAI_BASE_URL={}", HEADROOM_OPENAI_BASE_URL);
-            match shell_step_best_effort(configure_shell_block(
-                &shell_targets,
-                "codex_cli",
-                &env_block,
-            ))? {
-                Some(mut shell) => {
-                    updates.0.append(&mut shell.0);
-                    updates.1.append(&mut shell.1);
-                }
-                None => shell_unwritable = true,
-            }
+            // No OPENAI_BASE_URL shell export: config.toml routes Codex, and an
+            // export appended to the rc overrode the user's own (Ollama,
+            // OpenRouter) for every other OpenAI client, then outlived quit.
+            // Drop the block older builds wrote.
+            let _ = remove_shell_block(&all_shell_paths(), "codex_cli");
             changed_files.extend(updates.0);
             backup_files.extend(updates.1);
-            state
-                .managed_shell_files
-                .insert(state_id.clone(), serialize_paths(&shell_targets));
             // Pull existing native threads into the headroom-provider menu so the
             // Codex history list stays whole once it routes through Headroom.
             retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
@@ -651,12 +679,6 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
         "claude_code" => {
             let state = load_setup_state();
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
-            let shell_ok = shell_block_contains_in_files(
-                &shell_targets,
-                "claude_code",
-                "ANTHROPIC_BASE_URL",
-                HEADROOM_ANTHROPIC_BASE_URL,
-            )?;
             let rtk_path_ok =
                 shell_block_contains_text_in_files(&shell_targets, "managed_rtk", "export PATH=")?;
             let claude_settings_ok =
@@ -664,11 +686,6 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             let rtk_hook_ok = claude_settings_hook_matches("headroom-rtk-rewrite.sh")?
                 && headroom_rtk_hook_path().exists();
 
-            if shell_ok {
-                checks.push(
-                    "Found Claude Code ANTHROPIC_BASE_URL export in managed shell block.".into(),
-                );
-            }
             if rtk_path_ok {
                 checks.push("Found Headroom-managed RTK PATH export in shell profiles.".into());
             }
@@ -683,9 +700,9 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                     "Found Headroom-managed RTK Claude hook in ~/.claude/settings.json.".into(),
                 );
             }
-            if !shell_ok && !claude_settings_ok {
+            if !claude_settings_ok {
                 failures.push(
-                    "Claude Code ANTHROPIC_BASE_URL was not found in shell blocks or ~/.claude/settings.json."
+                    "Claude Code ANTHROPIC_BASE_URL was not found in ~/.claude/settings.json."
                         .into(),
                 );
             }
@@ -695,12 +712,9 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             // `ensure_rtk_integrations_for_targets`), so its absence must not
             // fail Claude Code verification when RTK isn't installed or the user
             // disabled it — routing is what "connected" means here.
+            // The PATH export is shell convenience apply skips on an unwritable
+            // profile; the hook is the RTK wiring, so only it can fail setup.
             let rtk_required = !state.rtk_disabled && default_headroom_rtk_path().exists();
-            if rtk_required && !rtk_path_ok {
-                failures.push(
-                    "Headroom-managed RTK PATH export was not found in shell profiles.".into(),
-                );
-            }
             if rtk_required && !rtk_hook_ok {
                 failures.push(
                     "Headroom-managed RTK Claude hook was not found in ~/.claude/settings.json."
@@ -724,21 +738,8 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             return Ok(delegated);
         }
         "codex" | "codex_cli" => {
-            let state = load_setup_state();
-            let shell_targets = resolve_client_shell_targets(&state, client_id)?;
-            let shell_ok = shell_block_contains_in_files(
-                &shell_targets,
-                "codex_cli",
-                "OPENAI_BASE_URL",
-                HEADROOM_OPENAI_BASE_URL,
-            )?;
             let toml_ok = codex_provider_block_matches()?;
 
-            if shell_ok {
-                checks.push(
-                    "Found ChatGPT Codex OPENAI_BASE_URL export in managed shell block.".into(),
-                );
-            }
             if toml_ok {
                 checks
                     .push("Found Headroom-managed provider block in ~/.codex/config.toml.".into());
@@ -748,11 +749,6 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                     "Headroom-managed provider block in ~/.codex/config.toml is missing or stale (e.g. Codex login state changed since it was written).".into(),
                 );
             }
-            // Shell export is convenience, not routing: config.toml is what routes
-            // Codex (apply tolerates an unwritable shell profile). A missing export
-            // must not fail verification -- mirrors Claude, which only fails when
-            // *no* routing source is present.
-
             if codex_guard_hook_path().exists() && codex_guard_registered()? {
                 checks
                     .push("Found Headroom routing guard registered in ~/.codex/hooks.json.".into());
@@ -1392,20 +1388,24 @@ pub fn list_client_connectors(
 }
 
 pub fn disable_client_setup(client_id: &str) -> Result<()> {
+    let _setup = setup_write_lock();
     let mut state = load_setup_state();
 
     match client_id {
         "codex" | "codex_cli" => {
-            let preserved_provider = state
-                .preserved_base_urls
-                .get(normalized_setup_id(client_id))
-                .cloned();
+            let preserved: Vec<(&str, String)> = CODEX_ROOT_KEYS
+                .iter()
+                .filter_map(|&(key, _, entry)| {
+                    Some((key, state.preserved_base_urls.get(entry)?.clone()))
+                })
+                .collect();
             disable_codex_cli()?;
-            // Restore any pre-Headroom root model_provider instead of leaving the
-            // key deleted -- deleting it silently drops a gateway user onto
-            // api.openai.com (mirrors the Claude base_url restore).
-            if let Some(provider) = preserved_provider {
-                let _ = restore_codex_model_provider(&provider);
+            // Restore any pre-Headroom root model_provider/openai_base_url
+            // instead of leaving the key deleted -- deleting it silently drops a
+            // gateway user onto api.openai.com (mirrors the Claude base_url
+            // restore).
+            for (key, value) in preserved {
+                let _ = restore_codex_root_key(key, &value);
             }
             disable_codex_gui()?;
             // Hand the threads back to the native-provider menu so the full
@@ -1416,12 +1416,10 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             disable_codex_gui()?;
         }
         "claude_code" => {
-            let shell_targets = resolve_client_shell_targets_for_cleanup(&state, client_id)?;
-            remove_shell_block(&shell_targets, "claude_code")?;
-            // Also drop the managed_rtk PATH block so `rtk` isn't exported from
-            // shell profiles after quit — otherwise the user's next shell still
-            // has Headroom binaries shadowing whatever's on PATH.
-            remove_shell_block(&shell_targets, "managed_rtk")?;
+            // Routing first, shell profiles best-effort (as codex and grok_build
+            // do): the block routes nothing, and a shell cleanup failure that
+            // returned early left settings.json pointing Claude Code at the
+            // stopped proxy after quit.
             // Restore any pre-Headroom gateway/proxy URL instead of deleting
             // the key — deleting it pointed gateway users at api.anthropic.com
             // where their credentials may not even work.
@@ -1440,7 +1438,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
                 HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
                 None,
             );
-            let _ = remove_legacy_vscode_base_url_keys()?;
+            remove_legacy_vscode_base_url_keys();
             // Strip the PreToolUse hook entry and delete the hook script so CC
             // behaves exactly as it did before Headroom was launched.
             for settings_path in claude_settings_candidates() {
@@ -1453,6 +1451,13 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             let _ = remove_claude_guard_hook();
             let _ = remove_claude_remote_control_command();
             let _ = remove_claude_statusline();
+            if let Ok(shell_targets) = resolve_client_shell_targets_for_cleanup(&state, client_id) {
+                let _ = remove_shell_block(&shell_targets, "claude_code");
+                // Also drop the managed_rtk PATH block so `rtk` isn't exported
+                // from shell profiles after quit; otherwise the user's next
+                // shell still has Headroom binaries shadowing whatever's on PATH.
+                let _ = remove_shell_block(&shell_targets, "managed_rtk");
+            }
         }
         "vscode" => {
             let preserved = state
@@ -1485,9 +1490,11 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             state.remembered_shell_files.remove("codex");
             state.remembered_shell_files.remove("codex_cli");
             state.remembered_shell_files.remove("codex_gui");
-            // Consumed: the provider is back in the user's config now. The next
-            // apply re-captures it if Headroom is re-enabled.
-            state.preserved_base_urls.remove("codex_cli");
+            // Consumed: the values are back in the user's config now. The next
+            // apply re-captures them if Headroom is re-enabled.
+            for (_, _, entry) in CODEX_ROOT_KEYS {
+                state.preserved_base_urls.remove(entry);
+            }
             state.setup_versions.remove("codex_cli");
         }
         "opencode" => {
@@ -1541,6 +1548,8 @@ pub fn clear_client_setups() -> Result<()> {
 
     // Re-save the remembered snapshot so restore_client_setups works on next launch.
     if !snapshot_clients.is_empty() {
+        // Only here: disable_client_setup above takes the lock itself.
+        let _setup = setup_write_lock();
         let mut state = load_setup_state();
         state.remembered_clients = snapshot_clients;
         state.remembered_shell_files = snapshot_shell_files;
@@ -1837,6 +1846,17 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     // handles env/shell blocks but not these managed Markdown blocks).
     if let Err(err) = remove_managed_block(&rtk_codex_agents_path(), "rtk") {
         log::warn!("cleanup: removing rtk AGENTS.md block failed: {err}");
+    }
+    // MarkItDown's nudges, Bash rule and conversion cache: uninstall_and_quit
+    // removes them through the ToolManager, which `--uninstall` does not have.
+    // The unix shim path (ToolManager::markitdown_shim_path); Windows has no
+    // Bash rule to match, and the rest does not depend on the path.
+    let markitdown_shim = home_dir()
+        .join(".headroom")
+        .join("bin")
+        .join("headroom-markitdown");
+    if let Err(err) = disable_markitdown_integration(&markitdown_shim) {
+        log::warn!("cleanup: removing the MarkItDown integration failed: {err}");
     }
 
     // MCP server registrations live in the agents' own configs, outside
@@ -2218,6 +2238,8 @@ fn strip_headroom_mcp_from_opencode() -> Option<String> {
 fn strip_headroom_mcp_toml(content: &str) -> String {
     fn mcp_table_name(line: &str) -> Option<&str> {
         let inner = line
+            .split('#')
+            .next()?
             .trim()
             .strip_prefix("[mcp_servers.")?
             .strip_suffix(']')?;
@@ -2335,8 +2357,9 @@ fn strip_headroom_hook_from_settings(settings_path: &Path) -> Result<bool> {
     )
 }
 
-/// Removes every PreToolUse hook entry whose command contains one of `markers`,
-/// pruning empty `PreToolUse`/`hooks` containers. Returns whether the file changed.
+/// Removes every PreToolUse hook whose command contains one of `markers` (a
+/// user hook in the same matcher group stays), pruning empty `PreToolUse`/`hooks`
+/// containers. Returns whether the file changed.
 fn remove_pre_tool_use_markers(settings_path: &Path, markers: &[&str]) -> Result<bool> {
     if !settings_path.exists() {
         return Ok(false);
@@ -2362,15 +2385,7 @@ fn remove_pre_tool_use_markers(settings_path: &Path, markers: &[&str]) -> Result
         .get_mut("PreToolUse")
         .and_then(|value| value.as_array_mut())
     {
-        let before = pre_tool_use.len();
-        pre_tool_use.retain(|entry| {
-            !markers
-                .iter()
-                .any(|marker| entry_contains_hook(entry, marker))
-        });
-        if pre_tool_use.len() != before {
-            changed = true;
-        }
+        changed = strip_hook_from_groups(pre_tool_use, markers);
         if pre_tool_use.is_empty() {
             hooks_obj.remove("PreToolUse");
         }
@@ -2751,6 +2766,12 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         return atomic_write_at(path, contents);
     }
     atomic_write_at(&resolved, contents).or_else(|err| {
+        // A dangling link into a tree we cannot create (a dotfiles volume not
+        // mounted yet): the caller built `contents` from an empty file, so
+        // replacing the link would leave a copy holding only our part.
+        if std::fs::symlink_metadata(&resolved).is_err() {
+            return Err(err);
+        }
         // A link into a tree we cannot write (Nix home-manager points
         // ~/.claude/settings.json into the read-only /nix/store) can't be
         // written through. Replacing the link is what every write did before,
@@ -3164,10 +3185,10 @@ fn markitdown_codex_agents_path() -> PathBuf {
     codex_home().join("AGENTS.md")
 }
 
-/// The shim as a shell word: quoted only when a path with whitespace (a home
-/// dir with a space) would otherwise split. Such a path gets no Bash rule.
-fn markitdown_shim_word(shim_path: &Path) -> String {
-    let bin = shim_path.display().to_string();
+/// A path as a shell word: quoted only when a path with whitespace (a home
+/// dir with a space, macOS "Application Support") would otherwise split.
+fn shell_word(path: &Path) -> String {
+    let bin = path.display().to_string();
     if bin.contains(char::is_whitespace) {
         format!("'{bin}'")
     } else {
@@ -3196,7 +3217,7 @@ fn markitdown_rule_allowed(shim_path: &Path) -> bool {
 /// Office-only nudge for Claude Code, where PDFs are already handled by the
 /// PreToolUse(Read) hook.
 fn build_markitdown_office_nudge(shim_path: &Path) -> String {
-    let bin = markitdown_shim_word(shim_path);
+    let bin = shell_word(shim_path);
     format!(
         "## Reading Office documents (Headroom MarkItDown)\n\
          The Read tool cannot open .docx, .doc, .pptx, .ppt, .xlsx, or .xls files.\n\
@@ -3208,7 +3229,7 @@ fn build_markitdown_office_nudge(shim_path: &Path) -> String {
 /// Codex nudge: Codex has no PreToolUse-style hook, so it covers PDF *and*
 /// Office formats through the `markitdown` CLI.
 fn build_markitdown_codex_nudge(shim_path: &Path) -> String {
-    let bin = markitdown_shim_word(shim_path);
+    let bin = shell_word(shim_path);
     format!(
         "## Reading documents (Headroom MarkItDown)\n\
          To read a .pdf, .docx, .doc, .pptx, .ppt, .xlsx, or .xls file, run\n\
@@ -3227,6 +3248,7 @@ pub fn enable_markitdown_integration(
     markitdown_shim: &Path,
     python_path: &Path,
 ) -> Result<(Vec<String>, Vec<String>)> {
+    let _setup = setup_write_lock();
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
 
@@ -3288,18 +3310,24 @@ pub fn enable_markitdown_integration(
 /// nudge), leaving any RTK hook untouched. Cleanup runs unconditionally so a
 /// client that was later disconnected is still scrubbed.
 pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
-    let mut changed =
-        remove_pre_tool_use_markers(&claude_settings_path(), &["headroom-markitdown-read.sh"])?;
+    let _setup = setup_write_lock();
     let hook_path = headroom_markitdown_hook_path();
     if hook_path.exists() {
         let _ = std::fs::remove_file(&hook_path);
     }
-    changed |= remove_managed_block(&markitdown_claude_md_path(), "markitdown_office")?;
-    changed |= set_markitdown_bash_permission(markitdown_shim, &[], |_| Some(false))?;
-    changed |= remove_managed_block(&markitdown_codex_agents_path(), "markitdown")?;
+    // Every step runs before the first error is returned: an unparseable
+    // settings.json used to leave both nudges and the cache behind.
+    let steps = [
+        remove_pre_tool_use_markers(&claude_settings_path(), &["headroom-markitdown-read.sh"]),
+        remove_managed_block(&markitdown_claude_md_path(), "markitdown_office"),
+        set_markitdown_bash_permission(markitdown_shim, &[], |_| Some(false)),
+        remove_managed_block(&markitdown_codex_agents_path(), "markitdown"),
+    ];
     // Converted document text must not outlive the integration.
     let _ = std::fs::remove_dir_all(markitdown_cache_dir());
-    Ok(changed)
+    steps
+        .into_iter()
+        .try_fold(false, |changed, step| Ok(changed | step?))
 }
 
 /// The Read hook's conversion cache; mirrors the path the hook computes.
@@ -3323,6 +3351,7 @@ pub fn refresh_markitdown_integration(
     legacy_shims: &[PathBuf],
     python_path: &Path,
 ) -> Result<()> {
+    let _setup = setup_write_lock();
     let hook_path = headroom_markitdown_hook_path();
     if hook_path.exists() {
         let hook_body = build_headroom_markitdown_hook(markitdown_entrypoint, python_path);
@@ -3451,7 +3480,7 @@ fn configure_vscode_settings() -> Result<(Vec<String>, Vec<String>, Option<Strin
     )?;
     changed_files.extend(ts_changed);
     backup_files.extend(ts_backups);
-    let (legacy_changed, legacy_backups) = remove_legacy_vscode_base_url_keys()?;
+    let (legacy_changed, legacy_backups) = remove_legacy_vscode_base_url_keys();
     changed_files.extend(legacy_changed);
     backup_files.extend(legacy_backups);
     Ok((changed_files, backup_files, replaced))
@@ -3468,7 +3497,7 @@ fn remove_vscode_connector_keys(restore_value: Option<&str>) -> Result<()> {
         HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
         None,
     );
-    let _ = remove_legacy_vscode_base_url_keys()?;
+    remove_legacy_vscode_base_url_keys();
     Ok(())
 }
 
@@ -3700,7 +3729,7 @@ fn ensure_claude_settings_hook(
         return Err(anyhow!("unable to write Claude PreToolUse hooks"));
     };
 
-    pre_tool_use.retain(|entry| !entry_contains_hook(entry, marker));
+    strip_hook_from_groups(pre_tool_use, &[marker]);
     pre_tool_use.push(serde_json::json!({
         "matcher": matcher,
         "hooks": [{
@@ -3743,10 +3772,15 @@ fn ensure_claude_settings_hook(
 /// whatever the client sent rather than injecting credentials of its own, so
 /// there is no path that puts this token on the wire from the desktop.
 ///
-/// `None` removes the key -- used when the override is cleared, so a stale
-/// provider token cannot outlive the endpoint it belonged to.
-pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
-    set_or_clear_claude_settings_env("ANTHROPIC_AUTH_TOKEN", token)?;
+/// `None` takes Headroom's own token (`ours`) back out -- used when the
+/// override is cleared, so a stale provider token cannot outlive the endpoint
+/// it belonged to.
+pub fn apply_upstream_auth_token(
+    token: Option<&str>,
+    ours: Option<&str>,
+    replaced: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    set_or_clear_claude_settings_env(AUTH_TOKEN_ENV, token, ours, replaced)?;
     // settings.json now holds a provider credential, and Claude Code creates it
     // 0644 inside a home that other local accounts can traverse (macOS homes
     // are 0750 group staff, and every user is in staff). Only the owner, who
@@ -3768,17 +3802,33 @@ pub fn apply_upstream_auth_token(token: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Set one `env` key in the client's settings, or remove it when the value is
-/// absent or empty. Removal goes through `remove_claude_settings_env`, so a key
-/// the user has since changed by hand is left alone rather than deleted.
-fn set_or_clear_claude_settings_env(env_key: &str, value: Option<&str>) -> Result<()> {
-    match value {
-        Some(value) if !value.is_empty() => {
+const AUTH_TOKEN_ENV: &str = "ANTHROPIC_AUTH_TOKEN";
+
+/// Set one `env` key in the client's settings, or, when the value is absent or
+/// empty, take out `ours`: the value Headroom itself wrote there last save. A
+/// key Headroom never wrote, or one the user has since changed by hand, is left
+/// alone. A set records in `replaced` the user's own value it overwrote (first
+/// take only), so turning the provider off can put it back.
+fn set_or_clear_claude_settings_env(
+    env_key: &str,
+    value: Option<&str>,
+    ours: Option<&str>,
+    replaced: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let ours = ours.filter(|ours| !ours.is_empty());
+    match value.filter(|value| !value.is_empty()) {
+        Some(value) => {
+            let current = read_claude_settings_env(env_key)?;
             configure_claude_settings_env(env_key, value)?;
+            if let Some(current) =
+                current.filter(|current| !current.is_empty() && Some(current.as_str()) != ours)
+            {
+                replaced.entry(env_key.to_string()).or_insert(current);
+            }
             Ok(())
         }
-        _ => match read_claude_settings_env(env_key)? {
-            Some(current) => remove_claude_settings_env(env_key, &current, None),
+        None => match ours {
+            Some(ours) => remove_claude_settings_env(env_key, ours, None),
             None => Ok(()),
         },
     }
@@ -3878,22 +3928,148 @@ pub struct ProviderClientEnv<'a> {
 
 /// Write the rest of the client config a configured provider needs, or clear
 /// all of it with `None` -- a stale model id must not outlive the endpoint that
-/// served it, same rule as the token.
-pub fn apply_upstream_provider_env(env: Option<ProviderClientEnv<'_>>) -> Result<()> {
+/// served it, same rule as the token. `previous` is what the last save wrote,
+/// the only values a clear takes back out.
+pub fn apply_upstream_provider_env(
+    env: Option<ProviderClientEnv<'_>>,
+    previous: Option<ProviderClientEnv<'_>>,
+    replaced: &mut BTreeMap<String, String>,
+) -> Result<()> {
     for (env_key, value) in PROVIDER_CLIENT_ENV {
-        set_or_clear_claude_settings_env(env_key, env.is_some().then_some(*value))?;
+        set_or_clear_claude_settings_env(
+            env_key,
+            env.is_some().then_some(*value),
+            previous.is_some().then_some(*value),
+            replaced,
+        )?;
     }
     for env_key in PROVIDER_MODEL_SLOT_ENV {
-        set_or_clear_claude_settings_env(env_key, env.as_ref().map(|env| env.model))?;
+        set_or_clear_claude_settings_env(
+            env_key,
+            env.as_ref().map(|env| env.model),
+            previous.as_ref().map(|env| env.model),
+            replaced,
+        )?;
     }
     set_or_clear_claude_settings_env(
         PROVIDER_SMALL_MODEL_SLOT_ENV,
         env.as_ref().map(|env| env.small_model),
+        previous.as_ref().map(|env| env.small_model),
+        replaced,
     )?;
     set_or_clear_claude_settings_env(
         "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
         env.as_ref().map(|env| env.context_window),
+        previous.as_ref().map(|env| env.context_window),
+        replaced,
     )
+}
+
+/// What the last save wrote for the provider beyond the token.
+fn written_provider_env(previous: &UpstreamOverride) -> Option<ProviderClientEnv<'_>> {
+    (previous.mode != UpstreamOverrideMode::Off).then(|| ProviderClientEnv {
+        model: &previous.model,
+        // Saved before `small_model` was kept: re-derive it the way that save
+        // did, the preset's, or the one model a hand-entered endpoint got.
+        small_model: if previous.small_model.is_empty() {
+            provider_preset(&previous.provider)
+                .map_or(previous.model.as_str(), |preset| preset.small_model)
+        } else {
+            &previous.small_model
+        },
+        context_window: &previous.context_window,
+    })
+}
+
+/// Write a saved provider into the client config and the keychain.
+///
+/// `previous` is the last save: what Headroom wrote then is the only thing a
+/// clear may take back out, so a key the user set themselves (a cc-switch
+/// token, their own model pins, the privacy flag) is never deleted. `next`
+/// arrives resolved and leaves with `has_token` and `replaced_env` set.
+/// `token`: `None` keeps the stored one, `Some("")` clears it.
+pub fn apply_upstream_client_config(
+    previous: &UpstreamOverride,
+    next: &mut UpstreamOverride,
+    token: Option<&str>,
+) -> Result<(), String> {
+    let _setup = setup_write_lock();
+    // Checked before the keychain or settings.json is touched: a rejected
+    // field must not leave a provider token live in the client config.
+    if !next.context_window.chars().all(|c| c.is_ascii_digit()) {
+        return Err("The context window must be a whole number of tokens.".into());
+    }
+    let configured = next.mode != UpstreamOverrideMode::Off;
+    let stored = crate::upstream_override::read_token();
+    let token = match token {
+        _ if !configured => Some(""),
+        // Untouched: re-apply the stored one, because cc-switch or a hand edit
+        // may have overwritten the copy in the client's settings -- but only on
+        // the endpoint it was entered for. Another provider must never be sent
+        // this one's credential.
+        None if next.base_url == previous.base_url => stored.as_deref(),
+        None => Some(""),
+        Some(token) => Some(token),
+    };
+    if let Some(token) = token {
+        if token.is_empty() {
+            crate::upstream_override::delete_token()?;
+        } else if stored.as_deref() != Some(token) {
+            crate::upstream_override::write_token(token)?;
+        }
+        // A keychain that will not read back (locked, or an ACL from another
+        // app signature) cannot say which token Headroom wrote, so the one in
+        // the client config is taken to be it rather than stranded there.
+        let ours = match &stored {
+            Some(stored) => Some(stored.clone()),
+            None if previous.has_token => {
+                read_claude_settings_env(AUTH_TOKEN_ENV).map_err(|err| err.to_string())?
+            }
+            None => None,
+        };
+        let mut replaced = BTreeMap::new();
+        apply_upstream_auth_token(Some(token), ours.as_deref(), &mut replaced)
+            .map_err(|err| err.to_string())?;
+        // The user's own token is a credential: it waits in the keychain, not
+        // in launch-profile.json with the rest.
+        if let Some(original) = replaced.remove(AUTH_TOKEN_ENV) {
+            if crate::upstream_override::read_replaced_token().is_none() {
+                crate::upstream_override::write_replaced_token(&original)?;
+            }
+        }
+    }
+    next.has_token = token.is_some_and(|token| !token.is_empty());
+
+    let mut replaced = previous.replaced_env.clone();
+    apply_upstream_provider_env(
+        configured.then_some(ProviderClientEnv {
+            model: &next.model,
+            small_model: &next.small_model,
+            context_window: &next.context_window,
+        }),
+        written_provider_env(previous),
+        &mut replaced,
+    )
+    .map_err(|err| err.to_string())?;
+    if !configured {
+        // Back on Anthropic: put back what the user had before the provider,
+        // unless they have set that key again since.
+        let replaced_token = crate::upstream_override::read_replaced_token();
+        replaced.extend(
+            replaced_token
+                .clone()
+                .map(|token| (AUTH_TOKEN_ENV.to_string(), token)),
+        );
+        for (env_key, original) in std::mem::take(&mut replaced) {
+            configure_claude_settings_env_if_absent(&env_key, &original)
+                .map_err(|err| err.to_string())?;
+        }
+        if replaced_token.is_some() {
+            crate::upstream_override::delete_replaced_token()?;
+        }
+    }
+    next.replaced_env = replaced;
+    Ok(())
 }
 
 /// Current value of one `env` key in `~/.claude/settings.json`, if any.
@@ -3984,6 +4160,32 @@ fn claude_hook_present_in_value(content: &Value, hook_path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Removes the handlers whose `command` contains one of `fragments` from each
+/// matcher group, and drops a group only when that empties it. Claude Code's
+/// hook editor appends a user's hook to the first group with the same matcher,
+/// which can be ours, so dropping the whole group deleted the user's hook too.
+/// Returns whether anything was removed.
+fn strip_hook_from_groups(entries: &mut Vec<Value>, fragments: &[&str]) -> bool {
+    let mut changed = false;
+    entries.retain_mut(|entry| {
+        let Some(hooks) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let before = hooks.len();
+        hooks.retain(|hook| {
+            !hook
+                .get("command")
+                .is_some_and(|c| fragments.iter().any(|f| command_contains(c, f)))
+        });
+        if hooks.len() == before {
+            return true;
+        }
+        changed = true;
+        !hooks.is_empty()
+    });
+    changed
+}
+
 fn entry_contains_hook(entry: &Value, hook_fragment: &str) -> bool {
     entry
         .get("hooks")
@@ -4013,7 +4215,18 @@ fn command_contains(command: &Value, fragment: &str) -> bool {
     }
 }
 
-fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
+/// Best-effort: the keys route nothing today, and VS Code tolerates a
+/// settings.json this parser refuses (a pasted shell command), so a failure
+/// here aborted Claude Code connect after the routing write and disconnect
+/// before the hooks were stripped. An unparseable file is left untouched.
+fn remove_legacy_vscode_base_url_keys() -> (Vec<String>, Vec<String>) {
+    try_remove_legacy_vscode_base_url_keys().unwrap_or_else(|err| {
+        log::warn!("skipping legacy VS Code base URL cleanup: {err:#}");
+        Default::default()
+    })
+}
+
+fn try_remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
     // Deliberately the macOS path only. These keys were written into VS Code's
     // settings.json by macOS-only builds; the connector has since moved to
     // ~/.claude/settings.json, which is where every platform reads and writes
@@ -4331,6 +4544,25 @@ pub fn retag_codex_threads_to_headroom() {
     retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
 }
 
+/// The root keys the managed `codex_cli` block owns, Headroom's value for each,
+/// and the `preserved_base_urls` entry that holds a user's own value until
+/// disable restores it. `model_provider` keeps the bare `codex_cli` entry older
+/// builds persisted.
+const CODEX_ROOT_KEYS: [(&str, &str, &str); 2] = [
+    ("model_provider", "headroom", "codex_cli"),
+    (
+        "openai_base_url",
+        HEADROOM_OPENAI_BASE_URL,
+        "codex_cli_openai_base_url",
+    ),
+];
+
+/// Whether a comment-stripped TOML line assigns one of [`CODEX_ROOT_KEYS`].
+fn is_codex_root_key_line(code: &str) -> bool {
+    code.split_once('=')
+        .is_some_and(|(key, _)| CODEX_ROOT_KEYS.iter().any(|(k, ..)| key.trim() == *k))
+}
+
 fn codex_root_keys_body() -> String {
     format!(
         "model_provider = \"headroom\"\n\
@@ -4424,13 +4656,14 @@ fn strip_codex_managed_toml(content: &str) -> String {
         &strip_marker_block(&rescued, CODEX_ROOT_BLOCK_ID),
         CODEX_TABLE_BLOCK_ID,
     );
-    let openai_orphan_prefix = "openai_base_url = \"http://127.0.0.1:";
+    // Exact values only: this runs on every quit, and a loopback URL of the
+    // user's own (LM Studio on :1234) is not ours to delete.
+    let openai_orphan = format!("openai_base_url = \"{HEADROOM_OPENAI_BASE_URL}\"");
     without_blocks
         .lines()
         .filter(|line| {
             let trimmed = line.trim();
-            !(trimmed == "model_provider = \"headroom\""
-                || (trimmed.starts_with(openai_orphan_prefix) && trimmed.ends_with("/v1\"")))
+            !(trimmed == "model_provider = \"headroom\"" || trimmed == openai_orphan)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -4439,9 +4672,11 @@ fn strip_codex_managed_toml(content: &str) -> String {
 /// Move every TOML table we do not own out of a managed marker block, re-emitting
 /// it after the closing marker (byte-preserved, order kept). `owned_table` is the
 /// one table header the block legitimately contains (`None` for the root-keys
-/// block). Lines before the first header inside the block stay put: they are root
-/// keys, which are ours by construction. Handles repeated blocks in one pass
-/// since classification is line-state based, not index based.
+/// block). The root-keys block owns only the [`CODEX_ROOT_KEYS`] assignments:
+/// any other root key in it is Codex's (see below) and is moved out the same
+/// way, landing right after the end marker, still in root scope. Handles
+/// repeated blocks in one pass since classification is line-state based, not
+/// index based.
 // ponytail: a comment line directly above a trapped table stays with the block
 // (and is dropped on strip); attach comment-carrying to the following header if
 // a real config ever shows up with one.
@@ -4478,7 +4713,12 @@ fn rescue_foreign_toml_from_block(
             if code.starts_with('[') && code.ends_with(']') {
                 in_foreign_table = owned_table != Some(code);
             }
-            if in_foreign_table {
+            // Codex's TOML writer appends a new root key (/model's `model`,
+            // `model_reasoning_effort`) after the last root key -- our
+            // openai_base_url -- so it lands before our end marker too.
+            let foreign_root_line =
+                owned_table.is_none() && !code.is_empty() && !is_codex_root_key_line(code);
+            if in_foreign_table || foreign_root_line {
                 rescued.push(line);
                 continue;
             }
@@ -4540,39 +4780,40 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
     out
 }
 
-/// The root-scope `model_provider` value in a Codex config, if set to something
-/// other than our managed `headroom`. Root scope only: a `model_provider` inside
-/// a `[profiles.x]`/`[model_providers.x]` table belongs to that table, not the
-/// global route. This is the Codex analog of a foreign `ANTHROPIC_BASE_URL` --
-/// captured on apply and restored on disable.
-fn codex_foreign_model_provider(content: &str) -> Option<String> {
+/// Root-scope lines assigning `key` in a Codex config. Root scope only: the
+/// same key inside a `[profiles.x]`/`[model_providers.x]` table belongs to that
+/// table, not the global route.
+fn codex_root_key_lines<'a>(content: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
     let mut in_root = true;
-    for raw in content.lines() {
+    content.lines().filter(move |raw| {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.starts_with('[') && line.ends_with(']') {
             in_root = false;
-            continue;
         }
-        if !in_root {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim() == "model_provider" {
-                let name = value.trim().trim_matches('"');
-                if !name.is_empty() && name != "headroom" {
-                    return Some(name.to_string());
-                }
-            }
-        }
-    }
-    None
+        in_root && line.split_once('=').is_some_and(|(k, _)| k.trim() == key)
+    })
 }
 
-/// Drop any root-scope `model_provider = ...` line so the managed block's
-/// `model_provider = "headroom"` isn't a duplicate root key (which is invalid
-/// TOML and makes Codex refuse to load its config). A `model_provider` inside a
-/// table is left untouched.
-fn strip_codex_root_model_provider(content: &str) -> String {
+/// The root-scope value of `key` in a Codex config when set to something other
+/// than Headroom's `ours`. This is the Codex analog of a foreign
+/// `ANTHROPIC_BASE_URL` -- captured on apply and restored on disable. Each line
+/// is read as TOML, so a literal ('single-quoted') string or a trailing comment
+/// yields the value Codex itself sees.
+fn codex_foreign_root_value(content: &str, key: &str, ours: &str) -> Option<String> {
+    codex_root_key_lines(content, key)
+        .filter_map(|raw| {
+            let line = toml::from_str::<toml::Table>(raw).ok()?;
+            line.get(key)?.as_str().map(str::to_owned)
+        })
+        .find(|value| !value.is_empty() && value != ours)
+}
+
+/// Drop every root-scope assignment of a [`CODEX_ROOT_KEYS`] key, whatever its
+/// value or spacing, so the managed block's copies aren't duplicate root keys
+/// (invalid TOML: Codex refuses to load its config). The user's own values are
+/// captured by [`codex_foreign_root_value`] before this runs. The same keys
+/// inside a table are left untouched.
+fn strip_codex_root_keys(content: &str) -> String {
     let mut in_root = true;
     content
         .lines()
@@ -4582,11 +4823,7 @@ fn strip_codex_root_model_provider(content: &str) -> String {
                 in_root = false;
                 return true;
             }
-            !(in_root
-                && line
-                    .split_once('=')
-                    .map(|(key, _)| key.trim() == "model_provider")
-                    .unwrap_or(false))
+            !(in_root && is_codex_root_key_line(line))
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -4594,7 +4831,7 @@ fn strip_codex_root_model_provider(content: &str) -> String {
 
 /// Drop an unmarked `[model_providers.headroom]` table so the managed block's
 /// copy isn't a duplicate table key. This is the table-scope analog of
-/// [`strip_codex_root_model_provider`]: a second `[model_providers.headroom]`
+/// [`strip_codex_root_keys`]: a second `[model_providers.headroom]`
 /// makes Codex refuse to load its *entire* config, so one stale table breaks
 /// every `codex` invocation, not just our routing (Sentry RUST-6K).
 ///
@@ -4624,20 +4861,21 @@ fn strip_codex_headroom_provider_table(content: &str) -> String {
         .join("\n")
 }
 
-/// Restore a preserved pre-Headroom root `model_provider` after teardown, so a
-/// gateway/alternate-provider user isn't silently left on api.openai.com. No-op
-/// if the config already has a root `model_provider` (user re-added their own).
-fn restore_codex_model_provider(provider: &str) -> Result<()> {
+/// Restore a preserved pre-Headroom root key (`model_provider`,
+/// `openai_base_url`) after teardown, so a gateway/alternate-provider user
+/// isn't silently left on api.openai.com. No-op if the config already has that
+/// root key (user re-added their own): a second one is invalid TOML.
+fn restore_codex_root_key(key: &str, value: &str) -> Result<()> {
     let path = codex_config_toml_path();
     let existing = if path.exists() {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
     } else {
         String::new()
     };
-    if codex_foreign_model_provider(&existing).is_some() {
+    if codex_root_key_lines(&existing, key).next().is_some() {
         return Ok(());
     }
-    let line = format!("model_provider = {}", toml_basic_string(provider));
+    let line = format!("{key} = {}", toml_basic_string(value));
     let trimmed = existing.trim();
     let rebuilt = if trimmed.is_empty() {
         format!("{line}\n")
@@ -4657,9 +4895,9 @@ fn restore_codex_model_provider(provider: &str) -> Result<()> {
 /// the provider table appended at the end, around the user's other content.
 fn render_codex_config(existing: &str) -> String {
     let mid = strip_codex_managed_toml(existing);
-    // Drop a foreign root model_provider too, else our managed
-    // `model_provider = "headroom"` collides with it as a duplicate root key.
-    let mid = strip_codex_root_model_provider(&mid);
+    // Drop a foreign root model_provider/openai_base_url too, else our managed
+    // copies collide with them as duplicate root keys.
+    let mid = strip_codex_root_keys(&mid);
     // Same collision one scope down: an unmarked `[model_providers.headroom]`
     // table would duplicate the one in the managed block below.
     let mid = strip_codex_headroom_provider_table(&mid);
@@ -4679,11 +4917,14 @@ fn render_codex_config(existing: &str) -> String {
     out
 }
 
-/// Returns `(changed_files, backup_files, preserved_provider)`. The third
-/// element is a pre-existing *foreign* root `model_provider` this write replaced
-/// -- callers must preserve it and restore it on disable instead of dropping the
-/// user onto api.openai.com (mirrors [`configure_claude_settings_env`]).
-fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+/// A [`CODEX_ROOT_KEYS`] state entry and the user's own root value it holds.
+type CodexPreservedKey = (&'static str, String);
+
+/// Returns `(changed_files, backup_files, preserved)`: the pre-existing
+/// *foreign* root values this write replaced -- callers must preserve them and
+/// restore them on disable instead of dropping the user onto api.openai.com
+/// (mirrors [`configure_claude_settings_env`]).
+fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Vec<CodexPreservedKey>)> {
     let path = codex_config_toml_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -4695,10 +4936,23 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Option<
         String::new()
     };
 
-    let preserved = codex_foreign_model_provider(&existing);
+    let preserved: Vec<CodexPreservedKey> = CODEX_ROOT_KEYS
+        .iter()
+        .filter_map(|&(key, ours, entry)| {
+            Some((entry, codex_foreign_root_value(&existing, key, ours)?))
+        })
+        .collect();
     let updated = render_codex_config(&existing);
     if updated == existing {
-        return Ok((Vec::new(), Vec::new(), None));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+    // Never turn a config Codex loads into one it refuses (a duplicate root key
+    // or table makes Codex reject the whole file): keep the user's file.
+    if existing.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
+        return Err(anyhow!(
+            "rendered {} is not valid TOML; refusing to overwrite",
+            path.display()
+        ));
     }
 
     let backup = backup_if_exists(&path)?;
@@ -4721,12 +4975,18 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>, Option<
 /// the table by header rather than the Headroom marker block, which the
 /// upstream registrar can mis-place around unrelated user tables.
 pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
-    let path = codex_config_toml_path();
+    pin_toml_mcp_command(&codex_config_toml_path(), entrypoint)
+}
+
+/// The shared rewrite behind [`pin_codex_mcp_command`] and
+/// [`pin_grok_mcp_command`]: both CLIs read the same `[mcp_servers.headroom]`
+/// table shape.
+fn pin_toml_mcp_command(path: &Path, entrypoint: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
     let content =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     let target_line = format!(
         "command = {}",
@@ -4795,8 +5055,8 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
             path.display()
         )
     })?;
-    let _ = backup_if_exists(&path)?;
-    atomic_write(&path, rebuilt.as_bytes())?;
+    let _ = backup_if_exists(path)?;
+    atomic_write(path, rebuilt.as_bytes())?;
     Ok(Some(path.display().to_string()))
 }
 
@@ -4846,8 +5106,9 @@ fn find_grok_build_table(lines: &[&str]) -> Option<(usize, Option<usize>)> {
     let mut header_idx = None;
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if trimmed == "[model.grok-build]" {
+        let code = trimmed.split('#').next().unwrap_or("").trim_end();
+        if code.starts_with('[') && code.ends_with(']') {
+            if code == "[model.grok-build]" {
                 header_idx = Some(idx);
             } else if let Some(header) = header_idx {
                 // Next table started: the grok-build table had no base_url.
@@ -4867,13 +5128,12 @@ fn find_grok_build_table(lines: &[&str]) -> Option<(usize, Option<usize>)> {
     header_idx.map(|h| (h, None))
 }
 
-/// Extract the quoted string value of a `key = "value"` TOML line, ignoring
-/// any trailing comment.
+/// Extract the string value of a `key = "value"` TOML line. The line is read
+/// as TOML, so escapes (`\\` in a Windows path), a literal ('single-quoted')
+/// string or a trailing comment yield the value the client itself sees.
 fn toml_line_value(line: &str) -> Option<String> {
-    let (_, rest) = line.split_once('=')?;
-    let rest = rest.trim_start().strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    let table = toml::from_str::<toml::Table>(line).ok()?;
+    table.values().next()?.as_str().map(str::to_owned)
 }
 
 /// Rewrite `base_url` inside a user-owned `[model.grok-build]` table (e.g.
@@ -4927,7 +5187,7 @@ fn restore_grok_build_base_url(content: &str) -> String {
     let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
     if let Some((_, was)) = line.split_once("# was: ") {
         let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-        out[idx] = format!("{indent}base_url = \"{}\"", was.trim());
+        out[idx] = format!("{indent}base_url = {}", toml_basic_string(was.trim()));
     } else {
         out.remove(idx);
     }
@@ -4969,6 +5229,14 @@ fn configure_grok_proxy_block() -> Result<(Vec<String>, Vec<String>)> {
     let updated = render_grok_config(&existing);
     if updated == existing {
         return Ok((Vec::new(), Vec::new()));
+    }
+    // A table header the text scan misses (quoted key, odd spacing) would get
+    // a duplicate [model.grok-build], which Grok refuses: keep the user's file.
+    if existing.parse::<toml::Value>().is_ok() && updated.parse::<toml::Value>().is_err() {
+        return Err(anyhow!(
+            "rendered {} is not valid TOML; refusing to overwrite",
+            path.display()
+        ));
     }
 
     let backup = backup_if_exists(&path)?;
@@ -5113,15 +5381,18 @@ fn read_opencode_config(path: &Path) -> Result<serde_json::Value> {
 /// be parsed with serde_json. String contents (including escapes) survive.
 fn strip_jsonc(text: &str) -> String {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    // Bytes, not chars: `byte as char` turned each UTF-8 byte of a non-ASCII
+    // character into its own Latin-1 char. Only whole ASCII bytes and whole
+    // comments are dropped, so the output stays valid UTF-8.
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
     let mut i = 0;
     let mut in_string = false;
     while i < bytes.len() {
         let c = bytes[i] as char;
         if in_string {
-            out.push(c);
+            out.push(bytes[i]);
             if c == '\\' && i + 1 < bytes.len() {
-                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 1]);
                 i += 2;
                 continue;
             }
@@ -5134,7 +5405,7 @@ fn strip_jsonc(text: &str) -> String {
         match c {
             '"' => {
                 in_string = true;
-                out.push(c);
+                out.push(b'"');
                 i += 1;
             }
             '/' if bytes.get(i + 1) == Some(&b'/') => {
@@ -5174,17 +5445,17 @@ fn strip_jsonc(text: &str) -> String {
                     break;
                 }
                 if !matches!(bytes.get(j), Some(b'}') | Some(b']')) {
-                    out.push(',');
+                    out.push(b',');
                 }
                 i += 1;
             }
             _ => {
-                out.push(c);
+                out.push(bytes[i]);
                 i += 1;
             }
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn opencode_provider_base_url(config: &serde_json::Value, provider: &str) -> Option<String> {
@@ -5513,54 +5784,7 @@ fn opencode_user_state_exists() -> bool {
 /// `command = "headroom"` that relies on PATH, which dangles when the managed
 /// runtime relocates.
 pub fn pin_grok_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
-    let path = grok_config_toml_path();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-
-    let target_line = format!(
-        "command = {}",
-        toml_basic_string(&entrypoint.to_string_lossy())
-    );
-
-    let mut in_headroom_table = false;
-    let mut replaced = false;
-    let mut out: Vec<String> = Vec::with_capacity(content.lines().count());
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_headroom_table = trimmed == "[mcp_servers.headroom]";
-            out.push(line.to_string());
-            continue;
-        }
-        if in_headroom_table
-            && !replaced
-            && trimmed
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "command")
-        {
-            out.push(target_line.clone());
-            replaced = true;
-            continue;
-        }
-        out.push(line.to_string());
-    }
-
-    if !replaced {
-        return Ok(None);
-    }
-    let mut rebuilt = out.join("\n");
-    if content.ends_with('\n') {
-        rebuilt.push('\n');
-    }
-    if rebuilt == content {
-        return Ok(None);
-    }
-    let _ = backup_if_exists(&path)?;
-    atomic_write(&path, rebuilt.as_bytes())?;
-    Ok(Some(path.display().to_string()))
+    pin_toml_mcp_command(&grok_config_toml_path(), entrypoint)
 }
 
 fn toml_basic_string(value: &str) -> String {
@@ -5683,20 +5907,52 @@ fn codex_guard_hook_path() -> PathBuf {
     codex_home().join("hooks").join("headroom-codex-guard.py")
 }
 
-/// Interpreter used by the Claude/Codex session-start guard hooks. On macOS
-/// and Linux the system `/usr/bin/python3` (>=3.9) is always present. On
-/// Windows there's no such guarantee -- bare `python` on a stock box is
-/// either absent from PATH or the Microsoft Store stub that opens the Store
-/// instead of running -- so point at the managed runtime's own bundled
-/// interpreter, which this app installs regardless of what's on PATH.
+/// Interpreter used by the Claude/Codex session-start guard hooks: the system
+/// `/usr/bin/python3` when it actually runs, else the managed runtime's own
+/// interpreter, which this app installs regardless of what's on PATH. Windows
+/// always takes the managed one -- bare `python` on a stock box is either
+/// absent from PATH or the Microsoft Store stub that opens the Store instead of
+/// running -- as does a Mac without the Command Line Tools (the xcode-select
+/// shim) or a Linux distro without /usr/bin/python3.
 fn guard_python_command() -> String {
-    if cfg!(target_os = "windows") {
-        let managed =
-            crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir()).managed_python();
-        format!("\"{}\"", managed.display())
-    } else {
-        "/usr/bin/python3".to_string()
+    guard_python_for(!cfg!(target_os = "windows") && system_python_usable())
+}
+
+/// Quoted in the fallback: the macOS path has "Application Support".
+fn guard_python_for(system_python_ok: bool) -> String {
+    if system_python_ok {
+        return "/usr/bin/python3".to_string();
     }
+    let managed =
+        crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir()).managed_python();
+    format!("\"{}\"", managed.display())
+}
+
+/// Whether `/usr/bin/python3` runs, probed once per process (the guard command
+/// is rebuilt on every verify).
+fn system_python_usable() -> bool {
+    static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *USABLE.get_or_init(|| {
+        python_usable(
+            Path::new("/usr/bin/xcode-select"),
+            Path::new("/usr/bin/python3"),
+        )
+    })
+}
+
+/// On macOS `xcode-select -p` goes first: it is the only check that does not
+/// pop the "install developer tools" dialog when the Command Line Tools are
+/// missing. It is not enough on its own -- a macOS upgrade can leave the
+/// tools without xcrun, an Xcode license can be unaccepted -- so the
+/// interpreter itself must also run.
+fn python_usable(xcode_select: &Path, python: &Path) -> bool {
+    let runs = |program: &Path, args: &[&str]| {
+        let mut command = crate::proc::command(program);
+        command.args(args);
+        crate::proc::output_with_timeout(command, Duration::from_secs(10))
+            .is_ok_and(|out| out.status.success())
+    };
+    (!cfg!(target_os = "macos") || runs(xcode_select, &["-p"])) && runs(python, &["-S", "-c", ""])
 }
 
 /// Join the guard interpreter and its script into a command string the host
@@ -5731,7 +5987,7 @@ fn join_guard_command(python: &str, script: &str, windows: bool, powershell: boo
     match (windows, powershell) {
         (true, true) => format!("& {python} \"{script}\""),
         (true, false) => format!("{python} \"{script}\""),
-        (false, _) => format!("{python} {script}"),
+        (false, _) => format!("{python} {}", shell_word(Path::new(script))),
     }
 }
 
@@ -6066,11 +6322,7 @@ fn remove_guard_hook_entries(
                 }
             }
             if let Some(entries) = hooks_obj.get_mut(&event).and_then(Value::as_array_mut) {
-                let before = entries.len();
-                entries.retain(|entry| !entry_contains_hook(entry, command));
-                if entries.len() != before {
-                    changed = true;
-                }
+                changed |= strip_hook_from_groups(entries, &[command]);
             }
         }
         hooks_obj.retain(|_, value| !value.as_array().map(|arr| arr.is_empty()).unwrap_or(false));
@@ -6442,30 +6694,35 @@ fn report_unparseable_guard_command(command: &str) {
     static CHECKED: Once = Once::new();
     CHECKED.call_once(|| {
         let bash = windows_bash_command();
-        let status = crate::proc::command(bash.trim_matches('"'))
-            .arg("-n")
-            .arg("-c")
-            .arg(command)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if let Ok(status) = status {
-            // bash reports a syntax error as exit 2. Any other failure is the
-            // resolved `bash.exe` not being a bash at all -- the WSL launcher
-            // on a box without Git for Windows exits 1 without parsing
-            // (RUST-C6, two hosts) -- and says nothing about the command.
-            if status.code() == Some(2) {
-                log::warn!(
+        let mut probe = crate::proc::command(bash.trim_matches('"'));
+        probe.arg("-n").arg("-c").arg(command);
+        // Bounded: a bash that is the WSL launcher boots the user's WSL VM to
+        // parse this, and a wedged WSL never returns -- inside this Once that
+        // blocked every later Claude Code setup for the life of the process.
+        match crate::proc::output_with_timeout(probe, Duration::from_secs(10)) {
+            Err(crate::proc::OutputError::TimedOut) => {
+                log::info!("claude guard bash canary skipped: bash timed out");
+            }
+            Err(crate::proc::OutputError::Spawn(_)) => {}
+            Ok(out) => {
+                let status = out.status;
+                // bash reports a syntax error as exit 2. Any other failure is the
+                // resolved `bash.exe` not being a bash at all -- the WSL launcher
+                // on a box without Git for Windows exits 1 without parsing
+                // (RUST-C6, two hosts) -- and says nothing about the command.
+                if status.code() == Some(2) {
+                    log::warn!(
                     "claude guard command does not parse under bash (exit {:?}, call_operator={}); \
                      SessionStart hooks will fail until the command form is fixed",
                     status.code(),
                     command.starts_with('&')
                 );
-            } else if !status.success() {
-                log::info!(
-                    "claude guard bash canary skipped: bash exited {:?} without parsing",
-                    status.code()
-                );
+                } else if !status.success() {
+                    log::info!(
+                        "claude guard bash canary skipped: bash exited {:?} without parsing",
+                        status.code()
+                    );
+                }
             }
         }
     });
@@ -6492,17 +6749,23 @@ fn claude_remote_control_command_path() -> PathBuf {
         .join("remote-control.md")
 }
 
-/// The managed `claude_code` shell block: the routing export plus a `claude`
-/// function that (a) adds the api.anthropic.com settings layer whenever the
-/// user passes `--remote-control`, (b) tags the session with
+/// The managed `claude_code` shell block. No ANTHROPIC_BASE_URL export: the
+/// settings.json env routes Claude Code, and an export outlives quit in every
+/// shell, tmux server and VS Code opened meanwhile, pointing them at the dead
+/// port. Just a `claude` function that (a) adds the api.anthropic.com settings
+/// layer whenever the user passes `--remote-control`, (b) tags the session with
 /// `HEADROOM_RC_RELAUNCHER=tty` so the script only ends sessions this function
 /// will bring back (an alias, `command claude` or a shell opened before setup
-/// skips it), and (c) after the wrapped session exits,
-/// resumes the session named in the relaunch marker for this tty. The marker
-/// is written by the /remote-control script (`build_claude_remote_control_script`),
-/// keyed by tty so two terminals never swap sessions, and ignored once stale so
-/// a terminal without the function (opened before setup) cannot leave a marker
-/// that hijacks some later exit.
+/// skips it), (c) after the wrapped session exits, resumes the session named
+/// in the relaunch marker for this tty, and (d) routes a
+/// `CLAUDE_CONFIG_DIR=~/.claude-work` session, which reads that dir's
+/// settings.json instead of ours, by setting ANTHROPIC_BASE_URL for that one
+/// process while ~/.claude/settings.json still routes through Headroom and the
+/// user set no base URL of their own; checked per call, so it ends with quit.
+/// The marker is written by the /remote-control script
+/// (`build_claude_remote_control_script`), keyed by tty so two terminals never
+/// swap sessions, and ignored once stale so a terminal without the function
+/// (opened before setup) cannot leave a marker that hijacks some later exit.
 ///
 /// The function is defined through `eval`, and only when `claude` is not an
 /// alias: zsh and bash alias-expand a function name at parse time, so a bare
@@ -6516,7 +6779,12 @@ fn claude_remote_control_command_path() -> PathBuf {
 fn claude_code_shell_block() -> String {
     let function = r#"claude() {
   local a; for a in "$@"; do [ "$a" = --remote-control ] && { set -- --settings '__OVERRIDE__' "$@"; break; }; done
-  HEADROOM_RC_RELAUNCHER=tty command claude "$@"
+  if [ -n "$CLAUDE_CONFIG_DIR" ] && [ "${CLAUDE_CONFIG_DIR%/}" != "$HOME/.claude" ] && [ -z "$ANTHROPIC_BASE_URL" ] &&
+    command grep -qs '"ANTHROPIC_BASE_URL"[[:space:]]*:[[:space:]]*"__BASE__"' "$HOME/.claude/settings.json"; then
+    ANTHROPIC_BASE_URL=__BASE__ HEADROOM_RC_RELAUNCHER=tty command claude "$@"
+  else
+    HEADROOM_RC_RELAUNCHER=tty command claude "$@"
+  fi
   local rc=$?
   local m="$HOME/.headroom/remote-control/$(command basename "$(command tty 2>/dev/null)" 2>/dev/null)"
   if [ -s "$m" ] && [ -n "$(command find "$m" -mmin -2 2>/dev/null)" ]; then
@@ -6545,10 +6813,10 @@ fn claude_code_shell_block() -> String {
             .collect::<Vec<_>>()
             .join("|"),
     )
-    .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE);
+    .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE)
+    .replace("__BASE__", HEADROOM_ANTHROPIC_BASE_URL);
     format!(
-        "export ANTHROPIC_BASE_URL={HEADROOM_ANTHROPIC_BASE_URL}\n\
-         # /remote-control needs api.anthropic.com; this relaunches the same session without Headroom.\n\
+        "# /remote-control needs api.anthropic.com; this relaunches the same session without Headroom.\n\
          if ! alias claude >/dev/null 2>&1; then eval '{}'; fi",
         function.replace('\'', r"'\''")
     )
@@ -6821,11 +7089,7 @@ fn configure_vscode_process_wrapper() -> Result<(Vec<String>, Vec<String>)> {
         // creating the file would claim a config the user never made.
         return Ok((Vec::new(), Vec::new()));
     }
-    let python_ok = crate::proc::command("/usr/bin/xcode-select")
-        .arg("-p")
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !python_ok {
+    if !system_python_usable() {
         remove_vscode_process_wrapper()?;
         return Ok((Vec::new(), Vec::new()));
     }
@@ -7106,6 +7370,15 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
             true,
         ),
     ] {
+        // Our commands carry the marker; a same-name file without it is the
+        // user's own and stays, as remove_claude_remote_control_command leaves it.
+        if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER)
+            && std::fs::read_to_string(&path)
+                .is_ok_and(|existing| !existing.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER))
+        {
+            log::info!("keeping the user's own {}", path.display());
+            continue;
+        }
         let (did_change, backup) = write_file_if_changed(&path, &content, executable)?;
         if did_change {
             changed.push(path.display().to_string());
@@ -7499,14 +7772,16 @@ fn upsert_managed_block(
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
     let block = format!("{start}\n{block_body}\n{end}\n");
-    let updated = match (existing.find(&start), existing.find(&end)) {
-        // Only rewrite in place when the markers are well-ordered. A stray or
-        // reordered end-before-start (leftover from an interrupted write, or a
-        // hand-pasted/duplicated half-block) makes `end_with_marker < start_idx`,
-        // so `existing[..start_idx]` re-emits the region the suffix also carries
-        // and the old opening marker gets duplicated. Mirror strip_marker_block:
-        // treat a malformed block as absent and append a fresh one instead.
-        (Some(start_idx), Some(end_idx)) if end_idx >= start_idx => {
+    // The end marker is searched AFTER the start, as marker_block_contains does.
+    // Searched from the top, a stray end marker ahead of the block (a
+    // hand-deleted opener, an interrupted write) read as "end before start",
+    // so every launch appended another copy of the block. A start with no end
+    // after it is treated as absent and a fresh block is appended.
+    let updated = match existing
+        .find(&start)
+        .and_then(|s| existing[s..].find(&end).map(|rel| (s, s + rel)))
+    {
+        Some((start_idx, end_idx)) => {
             let end_with_marker = end_idx + end.len();
             let mut rebuilt = String::with_capacity(existing.len() + block.len());
             rebuilt.push_str(&existing[..start_idx]);
@@ -7631,21 +7906,14 @@ fn remove_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
         );
         return Ok(false);
     };
-    let start = format!("# >>> headroom:{block_id} >>>");
-    let end = format!("# <<< headroom:{block_id} <<<");
-
-    let (Some(start_idx), Some(end_idx)) = (existing.find(&start), existing.find(&end)) else {
+    // strip_marker_block pairs each start with the end AFTER it; the two
+    // independent finds here duplicated the file instead of removing the block
+    // when a stray end marker came first. It also removes every copy an older
+    // upsert appended behind such a marker, and the stray marker itself.
+    let mut rebuilt = strip_marker_block(&existing, block_id);
+    if rebuilt == existing {
         return Ok(false);
-    };
-
-    let end_with_marker = end_idx + end.len();
-    let tail = existing[end_with_marker..].trim_start_matches('\n');
-    let mut rebuilt = String::with_capacity(existing.len());
-    rebuilt.push_str(existing[..start_idx].trim_end());
-    if !rebuilt.is_empty() && !tail.is_empty() {
-        rebuilt.push('\n');
     }
-    rebuilt.push_str(tail);
     if !rebuilt.is_empty() && !rebuilt.ends_with('\n') {
         rebuilt.push('\n');
     }
@@ -7662,6 +7930,12 @@ pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
 
     let stamp = Utc::now().format("%Y%m%d%H%M%S");
     let backup_path = PathBuf::from(format!("{}.headroom-backup-{}", path.display(), stamp));
+    // One apply rewrites a file several times within a second. The first
+    // backup of the second holds the user's original; a later copy would
+    // replace it with our own intermediate rewrite.
+    if backup_path.exists() {
+        return Ok(Some(backup_path));
+    }
     retry_transient_denied(|| std::fs::copy(path, &backup_path))
         .with_context(|| format!("creating backup {}", backup_path.display()))?;
 
@@ -7684,7 +7958,15 @@ pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
                         .unwrap_or(false)
                 })
                 .collect();
-            backups.sort();
+            // nommer backups predate every headroom one (the app's old name);
+            // sorted by path they came last and got each new backup pruned.
+            backups.sort_by_key(|p| {
+                let ours = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&headroom_prefix));
+                (ours, p.clone())
+            });
             if backups.len() > 3 {
                 for old in &backups[..backups.len() - 3] {
                     let _ = std::fs::remove_file(old);
@@ -7711,24 +7993,11 @@ fn shell_block_contains_in_files(
     var_name: &str,
     expected_value: &str,
 ) -> Result<bool> {
-    for file in shell_targets {
-        if !file.exists() {
-            continue;
-        }
-        let content = read_to_string_lossy(file)?;
-        let start = format!("# >>> headroom:{block_id} >>>");
-        let end = format!("# <<< headroom:{block_id} <<<");
-
-        if let (Some(start_idx), Some(end_idx)) = (content.find(&start), content.find(&end)) {
-            let block = &content[start_idx..end_idx];
-            let expected_line = format!("export {var_name}={expected_value}");
-            if block.contains(&expected_line) {
-                return Ok(true);
-            }
-        }
-    }
-
-    Ok(false)
+    shell_block_contains_text_in_files(
+        shell_targets,
+        block_id,
+        &format!("export {var_name}={expected_value}"),
+    )
 }
 
 fn shell_block_contains_text_in_files(
@@ -7740,15 +8009,11 @@ fn shell_block_contains_text_in_files(
         if !file.exists() {
             continue;
         }
-
-        let content = read_to_string_lossy(file)?;
-        let start = format!("# >>> headroom:{block_id} >>>");
-        let end = format!("# <<< headroom:{block_id} <<<");
-
-        if let (Some(start_idx), Some(end_idx)) = (content.find(&start), content.find(&end)) {
-            if content[start_idx..end_idx].contains(expected_text) {
-                return Ok(true);
-            }
+        // marker_block_contains searches the end marker after the start. Two
+        // independent finds sliced `content[start..end]` and panicked when a
+        // stray end marker came first, killing the watchdog and tray threads.
+        if marker_block_contains(&read_to_string_lossy(file)?, block_id, expected_text) {
+            return Ok(true);
         }
     }
 
@@ -8326,12 +8591,40 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 /// Dedupe a shell-target list and drop anything that already exists as a
 /// directory. Such a path is neither readable nor rewritable: `read_to_string`
 /// fails with `EISDIR` ("Is a directory", os error 21), which aborted the whole
-/// client setup for a user whose `~/.profile` is a directory (RUST-5X/5Y/5Z —
-/// it broke claude_code, codex and grok_build alike). Paths that do not exist
-/// yet stay eligible; we create those.
+/// client setup for a user whose `~/.profile` is a directory (RUST-5X/5Y/5Z:
+/// it broke claude_code, codex and grok_build alike). A file we may not open
+/// (chmod 000, a root-owned copy, a dotfiles symlink macOS privacy protection
+/// denies) failed the same way, and at quit stopped disable before it removed
+/// Claude Code's routing, so it is dropped too. Paths that do not exist yet
+/// stay eligible; we create those.
 fn dedupe_shell_targets(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    dedupe_paths(paths.into_iter().filter(|path| !path.is_dir()).collect())
+    dedupe_paths(
+        paths
+            .into_iter()
+            .filter(|path| {
+                if path.is_dir() {
+                    return false;
+                }
+                match std::fs::File::open(path) {
+                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                        // Once per path: the status poll resolves targets every tick.
+                        let mut logged = UNREADABLE_SHELL_TARGETS_LOGGED
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if logged.insert(path.clone()) {
+                            log::warn!("skipping shell profile {}: {err}", path.display());
+                        }
+                        false
+                    }
+                    _ => true,
+                }
+            })
+            .collect(),
+    )
 }
+
+static UNREADABLE_SHELL_TARGETS_LOGGED: std::sync::Mutex<BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(BTreeSet::new());
 
 fn dedupe_strings(values: &mut Vec<String>) {
     let mut seen = BTreeSet::new();
@@ -8370,7 +8663,7 @@ fn shell_path(name: &str) -> PathBuf {
 /// Directory zsh reads its rc/profile files from. zsh honors `$ZDOTDIR`
 /// (falling back to `$HOME`); a Finder-launched app rarely inherits `$ZDOTDIR`
 /// from the login shell, so when it's absent from our own env we recover it
-/// from `~/.zshenv` — the file zsh always sources from `$HOME` and the
+/// from `~/.zshenv`, the file zsh always sources from `$HOME` and the
 /// conventional place users set ZDOTDIR.
 fn zsh_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("ZDOTDIR").filter(|v| !v.is_empty()) {
@@ -8381,7 +8674,44 @@ fn zsh_dir() -> PathBuf {
             return dir;
         }
     }
-    zdotdir_from_zshenv(&home_dir()).unwrap_or_else(home_dir)
+    // Asked once per home: every status poll resolves shell targets, and the
+    // home only changes under TestHome.
+    static ASKED: std::sync::Mutex<Option<(PathBuf, Option<PathBuf>)>> =
+        std::sync::Mutex::new(None);
+    let home = home_dir();
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    if asked
+        .as_ref()
+        .is_none_or(|(asked_home, _)| *asked_home != home)
+    {
+        *asked = Some((home.clone(), zdotdir_from_zsh(&home)));
+    }
+    let from_zsh = asked.as_ref().and_then(|(_, dir)| dir.clone());
+    drop(asked);
+    from_zsh
+        .or_else(|| zdotdir_from_zshenv(&home))
+        .unwrap_or(home)
+}
+
+/// Ask zsh itself. A non-interactive `zsh -c` sources only the zshenv files,
+/// so every way of setting ZDOTDIR there resolves as the user's shells see it
+/// (`"$HOME"/.config/zsh`, `${XDG_CONFIG_HOME:-$HOME/.config}/zsh`, a value
+/// built on an earlier line), which the line parser below gets wrong. Only an
+/// absolute, existing directory is trusted; no zsh, a slow zshenv or odd
+/// output falls back to the parser.
+fn zdotdir_from_zsh(home: &Path) -> Option<PathBuf> {
+    let mut command = crate::proc::command("zsh");
+    command
+        .args(["-c", "print -rn -- \"${ZDOTDIR:-$HOME}\""])
+        .env("HOME", home)
+        .env_remove("ZDOTDIR");
+    let output = crate::proc::output_with_timeout(command, Duration::from_secs(3)).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Last line: a zshenv that prints a banner puts it ahead of the answer.
+    let dir = PathBuf::from(String::from_utf8(output.stdout).ok()?.lines().last()?);
+    (dir.is_absolute() && dir.is_dir()).then_some(dir)
 }
 
 /// Expand `$VAR` / `${VAR}` from the process env. Unset vars are left as the
@@ -8393,8 +8723,11 @@ fn expand_env_vars(raw: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'$' {
-            out.push(bytes[i] as char);
-            i += 1;
+            // Copy up to the next `$` as a str slice: `byte as char` mangled
+            // every non-ASCII character in the path.
+            let end = raw[i..].find('$').map_or(raw.len(), |o| i + o);
+            out.push_str(&raw[i..end]);
+            i = end;
             continue;
         }
         let (name, next) = if bytes.get(i + 1) == Some(&b'{') {
@@ -9447,14 +9780,12 @@ fn chatgpt_app_path() -> Option<PathBuf> {
     }
 }
 
-/// Locate the Codex CLI binary the same way [`detect_codex_client`] does: known
-/// install locations first, then a PATH lookup. Used as the Headroom Learn
-/// analysis backend (`codex exec`) for Codex sessions.
+/// Locate a Codex CLI that actually runs, for the Headroom Learn analysis
+/// backend (`codex exec`). Smoke-tested like the MCP/plugin paths: the first
+/// `codex` that merely exists can be an x86_64 leftover in /usr/local that
+/// fails with ENOEXEC on an arm64 Mac without Rosetta.
 pub(crate) fn detect_codex_cli() -> Option<PathBuf> {
-    codex_candidate_paths()
-        .into_iter()
-        .find(|path| path.exists())
-        .or_else(|| find_on_path(&["codex"]))
+    crate::claude_cli::detect_codex_cli()
 }
 
 /// True once the user has signed in to Codex with their ChatGPT account — the
@@ -9465,6 +9796,12 @@ pub(crate) fn codex_logged_in() -> bool {
 }
 
 fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, Value>> {
+    // An empty file (a `touch`, a writer that died mid-write) holds no settings
+    // to protect, and both parsers reject it: that blocked setup until the user
+    // fixed the file by hand.
+    if raw.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
     let value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
         Err(_) => {
@@ -9796,7 +10133,8 @@ mod tests {
         std::fs::write(&path, "{}").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        super::apply_upstream_auth_token(Some("sk-provider")).expect("apply");
+        super::apply_upstream_auth_token(Some("sk-provider"), None, &mut BTreeMap::new())
+            .expect("apply");
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("sk-provider"));
@@ -9804,7 +10142,8 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         // A later rewrite (clearing it) must not widen it again.
-        super::apply_upstream_auth_token(None).expect("clear");
+        super::apply_upstream_auth_token(None, Some("sk-provider"), &mut BTreeMap::new())
+            .expect("clear");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
@@ -10290,6 +10629,19 @@ print(settings(data) is None, settings(data, windows=True) is None)
             super::set_markitdown_bash_permission(old, &[], |_| Some(true)).unwrap();
         }
         let pre_migration = fs::read_to_string(&settings_path).unwrap();
+        // The writes above share the stamp second, whose first backup is kept.
+        for entry in fs::read_dir(settings_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+        {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("settings.json.headroom-backup-")
+            {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
 
         super::refresh_markitdown_integration(md, &shim, &legacy, py).expect("refresh");
         // One write, so its backup is the settings from before the move (two
@@ -10358,6 +10710,21 @@ print(settings(data) is None, settings(data, windows=True) is None)
         assert!(!settings.contains("markitdown"), "{settings}");
         assert!(build_markitdown_office_nudge(shim)
             .contains("`'/Users/Jane Doe/.headroom/bin/headroom-markitdown' <path>`"));
+    }
+
+    #[test]
+    fn rtk_codex_nudge_quotes_a_path_with_a_space() {
+        // macOS keeps rtk under "Application Support"; unquoted, the shell
+        // split the example at the space and the command exited 127.
+        let nudge = super::build_rtk_codex_nudge(Path::new(
+            "/Users/u/Library/Application Support/Headroom/headroom/bin/rtk",
+        ));
+        assert!(
+            nudge.contains(
+                "`'/Users/u/Library/Application Support/Headroom/headroom/bin/rtk' git status`"
+            ),
+            "{nudge}"
+        );
     }
 
     #[test]
@@ -10655,6 +11022,33 @@ print(settings(data) is None, settings(data, windows=True) is None)
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A hand-deleted opener leaves a stray end marker ahead of the block. The
+    /// verify helpers sliced `content[start..end]` from two independent finds
+    /// and panicked on it, killing the proxy watchdog and tray threads through
+    /// rtk_integration_status. Upsert appended a fresh copy on every launch and
+    /// remove duplicated the file instead of removing the block.
+    #[test]
+    fn shell_block_ops_tolerate_a_stray_end_marker_before_the_block() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".zshrc");
+        let content = "# <<< headroom:managed_rtk <<<\n# >>> headroom:managed_rtk >>>\nexport PATH=/x:$PATH\n# <<< headroom:managed_rtk <<<\n";
+        fs::write(&path, content).unwrap();
+        let targets = std::slice::from_ref(&path);
+
+        assert!(
+            shell_block_contains_text_in_files(targets, "managed_rtk", "export PATH=").unwrap()
+        );
+        assert!(shell_block_contains_in_files(targets, "managed_rtk", "PATH", "/x:$PATH").unwrap());
+
+        let (changed, _) =
+            upsert_managed_block(&path, "managed_rtk", "export PATH=/x:$PATH").unwrap();
+        assert!(!changed, "an intact block behind a stray end is current");
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+
+        assert!(remove_managed_block(&path, "managed_rtk").unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    }
+
     #[test]
     fn write_file_if_changed_skips_backups_when_content_is_unchanged() {
         let root = unique_temp_dir("headroom-write-file");
@@ -10827,6 +11221,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn expand_env_vars_keeps_non_ascii_text() {
+        assert_eq!(
+            super::expand_env_vars("/Users/j\u{f6}rg/\u{65e5}\u{672c}/zsh"),
+            "/Users/j\u{f6}rg/\u{65e5}\u{672c}/zsh"
+        );
+    }
+
+    #[test]
     fn zdotdir_unresolved_env_var_falls_back_to_none() {
         // TestHome sets XDG_CONFIG_HOME under this lock, so without it the
         // remove_var below races those tests (~1 run in 6 of the full suite).
@@ -10842,6 +11244,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         )
         .unwrap();
         assert_eq!(super::zdotdir_from_zshenv(&home), None);
+    }
+
+    /// `ZDOTDIR="$HOME"/.config/zsh` (quote then bare tail) resolved to $HOME
+    /// through the line parser, so the managed blocks went into a ~/.zshrc zsh
+    /// never reads. zsh itself answers every form correctly.
+    #[test]
+    #[serial_test::serial]
+    fn zsh_dir_asks_zsh_for_a_zdotdir_the_parser_cannot_read() {
+        if super::find_on_path(&["zsh"]).is_none() {
+            eprintln!("skipping: no zsh on PATH");
+            return;
+        }
+        let home = TestHome::new();
+        let zdotdir = home.path().join(".config").join("zsh");
+        fs::create_dir_all(&zdotdir).unwrap();
+        fs::write(
+            home.path().join(".zshenv"),
+            "export ZDOTDIR=\"$HOME\"/.config/zsh\n",
+        )
+        .unwrap();
+
+        assert_eq!(super::zsh_dir(), zdotdir);
+        assert_eq!(super::shell_path(".zshrc"), zdotdir.join(".zshrc"));
     }
 
     #[test]
@@ -10905,6 +11330,77 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hook_removal_keeps_a_user_hook_sharing_our_matcher_group() {
+        // Claude Code's hook editor appends a new Bash hook to the first group
+        // with that matcher, which can be ours. Strip, reinstall and guard
+        // removal must take only our handler out of the group.
+        let _home = TestHome::new();
+        let settings = super::claude_settings_path();
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let user = json!({ "type": "command", "command": "/u/block-rm-rf.sh" });
+        let seed = |ours: &str| {
+            let content = json!({ "hooks": { "PreToolUse": [{ "matcher": "Bash", "hooks": [
+                { "type": "command", "command": ours }, user.clone()
+            ]}]}});
+            fs::write(&settings, serde_json::to_string_pretty(&content).unwrap()).unwrap();
+        };
+        let commands = || -> Vec<String> {
+            read_settings_json(&settings)["hooks"]["PreToolUse"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|group| group["hooks"].as_array().cloned().unwrap_or_default())
+                .map(|hook| hook["command"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+
+        seed("/h/.claude/hooks/headroom-rtk-rewrite.sh");
+        assert!(strip_headroom_hook_from_settings(&settings).unwrap());
+        assert_eq!(commands(), ["/u/block-rm-rf.sh"]);
+
+        seed("/old/headroom-rtk-rewrite.sh");
+        super::ensure_claude_settings_hook(
+            Path::new("/new/headroom-rtk-rewrite.sh"),
+            "Bash",
+            "headroom-rtk-rewrite.sh",
+        )
+        .unwrap();
+        let after = commands();
+        assert!(after.iter().any(|c| c == "/u/block-rm-rf.sh"), "{after:?}");
+        assert!(after.iter().all(|c| !c.contains("/old/")), "{after:?}");
+
+        seed("/h/.claude/hooks/headroom-guard.py");
+        super::remove_guard_hook_entries(&settings, "headroom-guard.py", false, None).unwrap();
+        assert_eq!(commands(), ["/u/block-rm-rf.sh"]);
+    }
+
+    #[test]
+    fn backup_keeps_the_pre_burst_copy_and_outlives_nommer_backups() {
+        // One apply writes settings.json several times within a second; the
+        // backup must hold the user's original, not the next-to-last rewrite.
+        // Backups from the app's old name sort after ours by path, and used to
+        // get each new backup pruned the moment it was made.
+        let dir = tempfile::tempdir().unwrap();
+        for stamp in ["20250101000000", "20250102000000", "20250103000000"] {
+            let old = dir
+                .path()
+                .join(format!("settings.json.nommer-backup-{stamp}"));
+            fs::write(old, "{}").unwrap();
+        }
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, "{ // mine\n}").unwrap();
+        // Both calls must land in one stamp second.
+        while chrono::Utc::now().timestamp_subsec_millis() > 500 {
+            std::thread::yield_now();
+        }
+        let first = super::backup_if_exists(&settings).unwrap().unwrap();
+        fs::write(&settings, "{}").unwrap();
+        let second = super::backup_if_exists(&settings).unwrap().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fs::read_to_string(&first).unwrap(), "{ // mine\n}");
     }
 
     #[test]
@@ -11946,6 +12442,124 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::verify_client_setup("claude_code").expect("verification tolerates bad profile");
     }
 
+    /// A shell rc Headroom may not read (chmod 000, a root-owned copy, a
+    /// dotfiles symlink macOS privacy protection denies) failed shell-target
+    /// discovery, so every client setup aborted before settings.json was
+    /// written, and a quit-time disable returned before it stripped
+    /// ANTHROPIC_BASE_URL, leaving Claude Code on the stopped proxy.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_shell_rc_blocks_neither_setup_nor_quit_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        let zshrc = home.path().join(".zshrc");
+        fs::write(&zshrc, "# user zshrc\n").unwrap();
+        fs::set_permissions(&zshrc, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&zshrc).is_ok() {
+            eprintln!("skipping: running as root, permissions are not enforced");
+            return;
+        }
+        let settings = home.path().join(".claude").join("settings.json");
+        let base_url = |settings: &Path| {
+            read_settings_json(settings)["env"]["ANTHROPIC_BASE_URL"]
+                .as_str()
+                .map(str::to_owned)
+        };
+
+        super::apply_client_setup("claude_code").expect("setup succeeds despite unreadable rc");
+        assert_eq!(
+            base_url(&settings).as_deref(),
+            Some("http://127.0.0.1:6767")
+        );
+        super::clear_client_setups().expect("clear");
+        assert_eq!(base_url(&settings), None);
+
+        // A readable profile holds our block, but the shell cleanup still
+        // fails (no backup can be written next to it). Routing is removed first.
+        super::apply_client_setup("claude_code").expect("re-apply");
+        assert!(fs::read_to_string(home.path().join(".zprofile"))
+            .unwrap()
+            .contains("# >>> headroom:claude_code >>>"));
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let disabled = super::disable_client_setup("claude_code");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        disabled.expect("disable tolerates a shell cleanup failure");
+        assert_eq!(base_url(&settings), None);
+    }
+
+    /// A shell export of ANTHROPIC_BASE_URL outlives quit: shells, tmux and VS
+    /// Code opened while Headroom ran keep it, and once quit strips the
+    /// settings.json env Claude Code falls back to it and hits the dead
+    /// 127.0.0.1:6767. settings.json alone routes Claude Code, so the managed
+    /// block must not export it, and a re-apply must drop an older block's
+    /// export.
+    #[test]
+    #[serial_test::serial]
+    fn apply_claude_code_drops_the_routing_export_from_the_shell_block() {
+        let home = TestHome::new();
+        let zshrc = home.path().join(".zshrc");
+        fs::write(
+            &zshrc,
+            "# user zshrc\n# >>> headroom:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6767\n# <<< headroom:claude_code <<<\n",
+        )
+        .unwrap();
+
+        let result = super::apply_client_setup("claude_code").expect("apply");
+        assert!(
+            result.verification.verified,
+            "{:?}",
+            result.verification.failures
+        );
+
+        let combined = format!(
+            "{}\n{}",
+            fs::read_to_string(&zshrc).unwrap(),
+            fs::read_to_string(home.path().join(".zprofile")).unwrap_or_default()
+        );
+        assert!(
+            combined.contains("# >>> headroom:claude_code >>>"),
+            "the claude function block is still written, got:\n{combined}"
+        );
+        assert!(
+            !combined.contains("export ANTHROPIC_BASE_URL"),
+            "no routing export in shell profiles, got:\n{combined}"
+        );
+        let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"].as_str(),
+            Some("http://127.0.0.1:6767")
+        );
+    }
+
+    /// The RTK PATH export is shell convenience that apply skips when the first
+    /// profile is unwritable or not UTF-8; verification must not then fail
+    /// Claude Code forever ("Setup incomplete", a useless re-apply every
+    /// repair pass) while settings.json and the RTK hook route it fine.
+    #[test]
+    #[serial_test::serial]
+    fn claude_code_verifies_when_the_rtk_path_export_cannot_be_written() {
+        let home = TestHome::new();
+        let zprofile = home.path().join(".zprofile");
+        fs::write(&zprofile, b"# caf\xe9\n\xff\n").unwrap();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        seed_installed_rtk();
+
+        let result = super::apply_client_setup("claude_code").expect("apply");
+        assert!(result.shell_profile_unwritable, "shell step was skipped");
+        assert!(
+            !fs::read_to_string(home.path().join(".zshrc"))
+                .unwrap()
+                .contains("headroom:managed_rtk"),
+            "precondition: no RTK PATH export anywhere"
+        );
+        assert!(
+            result.verification.verified,
+            "{:?}",
+            result.verification.failures
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn apply_then_verify_claude_code_writes_expected_files() {
@@ -11996,14 +12610,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "PreToolUse hook entry exists, got: {settings}"
         );
 
-        // Shell block in zshenv (or whichever profile the writer chose) should
-        // export ANTHROPIC_BASE_URL pointing at the loopback proxy.
+        // The managed shell block carries the `claude` function, never a
+        // routing export (settings.json routes Claude Code).
         let zshrc = fs::read_to_string(home.path().join(".zshrc")).unwrap();
-        let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
-        let combined = format!("{zshrc}\n{zshenv}");
         assert!(
-            combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6767"),
-            "ANTHROPIC_BASE_URL exported from a managed shell block, got:\n{combined}"
+            zshrc.contains("# >>> headroom:claude_code >>>")
+                && !zshrc.contains("export ANTHROPIC_BASE_URL"),
+            "claude_code block without a routing export, got:\n{zshrc}"
         );
 
         // verify_client_setup should report all the configured checks.
@@ -12309,6 +12922,38 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn revert_external_mutations_strips_markitdown_nudges_and_cache() {
+        // `--uninstall` (NSIS, the Homebrew cask) has no ToolManager, so the
+        // disable uninstall_and_quit runs never happens there. A settings.json
+        // no parser accepts must not keep the nudges or the cache either.
+        let home = TestHome::new();
+        let claude_md = home.path().join(".claude").join("CLAUDE.md");
+        let agents = home.path().join(".codex").join("AGENTS.md");
+        fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        fs::create_dir_all(agents.parent().unwrap()).unwrap();
+        fs::write(home.path().join(".claude").join("settings.json"), "{ nope").unwrap();
+        fs::write(&claude_md, "# mine\n").unwrap();
+        upsert_managed_block(&claude_md, "markitdown_office", "run the shim").unwrap();
+        upsert_managed_block(&agents, "markitdown", "run the shim").unwrap();
+        let cache = home.path().join(".cache").join("headroom-markitdown");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("0123.md"), "contract text").unwrap();
+
+        super::revert_external_mutations();
+
+        let md = fs::read_to_string(&claude_md).unwrap();
+        assert!(
+            md.contains("# mine") && !md.contains("headroom:markitdown"),
+            "{md}"
+        );
+        assert!(!fs::read_to_string(&agents)
+            .unwrap()
+            .contains("headroom:markitdown"));
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn full_cleanup_sweeps_our_hf_models_but_spares_shared_ones() {
         // Regression: this used to remove only models--chopratejas--kompress-v2-base
         // and orphaned every other model the runtime pulls (~788MB measured on a
@@ -12509,6 +13154,155 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::disable_markitdown_integration(&md).expect("disable markitdown");
         super::apply_client_setup("claude_code").expect("apply after md off");
         assert!(!registered());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_apply_failing_after_the_settings_write_still_persists_the_captured_base_url() {
+        // Review of A-2: settings.json already holds Headroom's URL once the
+        // env write lands, so a later failing step (here the guard script)
+        // must not drop the captured gateway, or the next launch captures
+        // nothing and quit deletes it for good.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let gateway = "https://gateway.corp.example/anthropic";
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"{gateway}"}}}}"#),
+        )
+        .unwrap();
+        seed_installed_rtk();
+        // A directory where the guard script goes makes that step fail.
+        fs::create_dir_all(super::claude_guard_hook_path().join("blocker")).unwrap();
+
+        assert!(super::apply_client_setup("claude_code").is_err());
+        assert_eq!(
+            super::load_setup_state()
+                .preserved_base_urls
+                .get("claude_code")
+                .map(String::as_str),
+            Some(gateway)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_connect_and_disconnect_survive_an_unparseable_vscode_settings_file() {
+        // Audit #11: VS Code tolerates a settings.json it cannot parse (here a
+        // pasted shell command), but the legacy base-URL cleanup refused it and
+        // aborted connect after the routing write, and disconnect before the
+        // hooks were stripped and the client was marked off.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        let vscode = home
+            .path()
+            .join("Library/Application Support/Code/User/settings.json");
+        fs::create_dir_all(vscode.parent().unwrap()).unwrap();
+        fs::write(&vscode, "cd /x\n").unwrap();
+
+        super::apply_client_setup("claude_code").expect("apply");
+        assert!(super::claude_guard_registered().unwrap());
+        assert!(super::load_setup_state()
+            .configured_clients
+            .contains_key("claude_code"));
+
+        super::disable_client_setup("claude_code").expect("disable");
+        assert!(!super::claude_guard_registered().unwrap());
+        assert!(!super::load_setup_state()
+            .configured_clients
+            .contains_key("claude_code"));
+        assert_eq!(fs::read_to_string(&vscode).unwrap(), "cd /x\n");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_connect_routes_through_a_whitespace_only_settings_file() {
+        // Audit #98: a 0-byte or whitespace-only settings.json (a `touch`, or
+        // a writer that died mid-write) failed both parsers, so setup refused
+        // it as "potentially valid user settings" until fixed by hand.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, "  \n").unwrap();
+
+        super::apply_client_setup("claude_code").expect("apply");
+        assert_eq!(
+            read_settings_json(&settings)["env"]["ANTHROPIC_BASE_URL"],
+            super::HEADROOM_ANTHROPIC_BASE_URL
+        );
+    }
+
+    /// Runs `write` on another thread while this one holds the setup write
+    /// lock, as an apply in flight on the launch-restore thread does, and
+    /// asserts the write waits for it instead of interleaving.
+    fn assert_waits_for_setup_writes(write: impl FnOnce() + Send + 'static) {
+        let in_flight = super::setup_write_lock();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            write();
+            let _ = done_tx.send(());
+        });
+        assert_eq!(
+            done.recv_timeout(std::time::Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "wrote while another setup write was in flight"
+        );
+        drop(in_flight);
+        writer.join().expect("writer thread");
+        done.recv().expect("write finished");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn setup_state_toggles_wait_for_an_apply_in_flight() {
+        // Audit #86: each writer loads client-setup.json, changes one field and
+        // writes the whole state back, so a toggle landing inside a launch
+        // restore's apply was overwritten by the apply's stale copy (the
+        // statusline or RTK opt-out silently reverted, a connector lost its
+        // configured stamp).
+        let home = TestHome::new();
+        let tools = home.path().to_path_buf();
+        assert_waits_for_setup_writes(|| super::set_statusline_enabled(false).unwrap());
+        assert_waits_for_setup_writes(|| super::set_auto_learn_enabled(false).unwrap());
+        assert_waits_for_setup_writes(move || {
+            super::set_rtk_enabled(false, &tools, &tools).unwrap()
+        });
+        assert_waits_for_setup_writes(|| super::disable_client_setup("claude_code").unwrap());
+        let state = super::load_setup_state();
+        assert!(state.statusline_disabled && state.auto_learn_disabled && state.rtk_disabled);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn launch_refreshes_of_claude_settings_wait_for_an_apply_in_flight() {
+        // Audit #134: the warm-runtime thread's RTK hook and MarkItDown writes
+        // rewrote ~/.claude/settings.json from a copy read before the restore
+        // thread's apply wrote its routing env and hooks, dropping them.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        seed_installed_rtk();
+        let py = home.path().join("python3");
+        let shim = home.path().join("markitdown");
+        let (rtk, rtk_py) = (super::default_headroom_rtk_path(), py.clone());
+        assert_waits_for_setup_writes(move || {
+            super::ensure_rtk_integrations(&rtk, &rtk_py).unwrap();
+        });
+        let (md, md_shim, md_py) = (shim.clone(), shim.clone(), py.clone());
+        assert_waits_for_setup_writes(move || {
+            super::refresh_markitdown_integration(&md, &md_shim, &[], &md_py).unwrap()
+        });
+        let (md, md_shim, md_py) = (shim.clone(), shim.clone(), py.clone());
+        assert_waits_for_setup_writes(move || {
+            super::enable_markitdown_integration(&md, &md_shim, &md_py).unwrap();
+        });
+        assert_waits_for_setup_writes(move || {
+            super::disable_markitdown_integration(&shim).unwrap();
+        });
+        assert!(super::claude_settings_hook_matches("headroom-rtk-rewrite.sh").unwrap());
     }
 
     #[test]
@@ -12782,8 +13576,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
         let combined = format!("{zshrc}\n{zshenv}");
         assert!(
-            !combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6767"),
-            "ANTHROPIC_BASE_URL export removed, got:\n{combined}"
+            !combined.contains("headroom:claude_code"),
+            "claude_code shell block removed, got:\n{combined}"
         );
 
         // settings.json no longer points env at the proxy and no longer carries
@@ -12961,14 +13755,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "requires_openai_auth must NOT be written without ChatGPT auth, got:\n{toml}"
         );
 
-        // OPENAI_BASE_URL exported from a managed shell block.
+        // No OPENAI_BASE_URL shell export: config.toml alone routes Codex.
         let zshrc = fs::read_to_string(home.path().join(".zshrc")).unwrap();
-        let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
-        let combined = format!("{zshrc}\n{zshenv}");
-        assert!(
-            combined.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
-            "OPENAI_BASE_URL exported from a managed shell block, got:\n{combined}"
-        );
+        assert_eq!(zshrc, "# user zshrc\n");
 
         // verify_client_setup reports the configured checks and passes.
         let verification =
@@ -12988,7 +13777,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             verification.checks
         );
 
-        // Disable strips both the toml block and the shell export.
+        // Disable strips the toml block and any shell export an older build left.
         super::disable_client_setup("codex").expect("disable_client_setup succeeds");
         let toml_after = fs::read_to_string(&config_toml).unwrap_or_default();
         assert!(
@@ -13004,6 +13793,36 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !combined_after.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
             "shell export removed on disable, got:\n{combined_after}"
         );
+    }
+
+    /// A Headroom OPENAI_BASE_URL export appended to ~/.zshrc overrode the
+    /// user's own earlier value (Ollama, OpenRouter), sending their prompts
+    /// and third-party key to api.openai.com. config.toml alone routes Codex:
+    /// apply writes no shell block, and drops one an older build left.
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_removes_its_shell_export_and_keeps_the_users_base_url() {
+        let home = TestHome::new();
+        let user_line = "export OPENAI_BASE_URL=http://localhost:11434/v1\n";
+        let zshrc = home.path().join(".zshrc");
+        fs::write(
+            &zshrc,
+            format!("{user_line}# >>> headroom:codex_cli >>>\nexport OPENAI_BASE_URL=http://127.0.0.1:6767/v1\n# <<< headroom:codex_cli <<<\n"),
+        )
+        .unwrap();
+
+        let result = super::apply_client_setup("codex").expect("apply");
+        assert!(
+            result.verification.verified,
+            "{:?}",
+            result.verification.failures
+        );
+
+        assert_eq!(fs::read_to_string(&zshrc).unwrap(), user_line);
+        assert!(!home.path().join(".zprofile").exists());
+        assert!(!super::load_setup_state()
+            .managed_shell_files
+            .contains_key("codex_cli"));
     }
 
     #[test]
@@ -13200,6 +14019,20 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn strip_jsonc_keeps_non_ascii_strings_intact() {
+        // Bytes pushed as chars turned every non-ASCII character into Latin-1
+        // mojibake, which the OpenCode rewrite then saved to disk.
+        let src = "{\"p\": \"Pr\u{fc}fe - \u{65e5}\u{672c} // \u{e9}\", // c\u{f6}mment\n /* \u{e4} */ \"q\": 1,\n}";
+        let parsed: serde_json::Value =
+            serde_json::from_str(&super::strip_jsonc(src)).expect("stripped source parses");
+        assert_eq!(
+            parsed["p"],
+            serde_json::json!("Pr\u{fc}fe - \u{65e5}\u{672c} // \u{e9}")
+        );
+        assert_eq!(parsed["q"], serde_json::json!(1));
+    }
+
+    #[test]
     #[serial_test::serial]
     fn opencode_apply_tolerates_jsonc_config() {
         let _home = TestHome::new(); // env guard
@@ -13339,6 +14172,55 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !after.contains("# was:"),
             "redirect comment removed, got:\n{after}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn grok_config_reads_commented_header_and_literal_base_url() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        let grok_dir = home.path().join(".grok");
+        fs::create_dir_all(&grok_dir).unwrap();
+        let config = grok_dir.join("config.toml");
+        // A trailing comment on the header hid the table (a second
+        // [model.grok-build] made the file invalid TOML), and a literal
+        // ('single-quoted') base_url was overwritten with no `# was:` record.
+        fs::write(
+            &config,
+            "[model.grok-build] # my gateway\nbase_url = 'https://gw.example/v1'\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+        let toml = fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            toml.matches("[model.grok-build]").count(),
+            1,
+            "no duplicate table, got:\n{toml}"
+        );
+        assert!(
+            toml.parse::<toml::Value>().is_ok(),
+            "valid TOML, got:\n{toml}"
+        );
+        assert!(
+            toml.contains("# was: https://gw.example/v1"),
+            "previous base_url recorded, got:\n{toml}"
+        );
+
+        super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
+        let after = fs::read_to_string(&config).unwrap();
+        assert!(
+            after.contains("base_url = \"https://gw.example/v1\""),
+            "original base_url restored, got:\n{after}"
+        );
+
+        // A spelling the text scan still misses must not be turned into a
+        // duplicate table: refuse and keep the user's file.
+        let quoted = "[model.\"grok-build\"]\nbase_url = \"https://gw.example/v1\"\n";
+        fs::write(&config, quoted).unwrap();
+        assert!(super::apply_client_setup("grok_build").is_err());
+        assert_eq!(fs::read_to_string(&config).unwrap(), quoted);
     }
 
     #[test]
@@ -13528,10 +14410,73 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
-    fn unix_guard_command_is_unquoted() {
+    fn unix_guard_command_quotes_only_a_spaced_script_path() {
         let cmd =
             super::join_guard_command("/usr/bin/python3", "/home/g/.claude/guard.py", false, false);
         assert_eq!(cmd, "/usr/bin/python3 /home/g/.claude/guard.py");
+        // A home dir with a space would split the argument and python exits 2.
+        let cmd = super::join_guard_command(
+            "/usr/bin/python3",
+            "/Users/Jane Doe/.claude/guard.py",
+            false,
+            false,
+        );
+        assert_eq!(cmd, "/usr/bin/python3 '/Users/Jane Doe/.claude/guard.py'");
+    }
+
+    /// Regression: on a Mac without the Command Line Tools /usr/bin/python3 is
+    /// the xcode-select shim, and on some Linux distros it does not exist, so a
+    /// hardcoded system interpreter failed the guard at every session start.
+    /// Without a usable system python the guard runs on the managed runtime's
+    /// interpreter, quoted because the macOS path has "Application Support".
+    #[test]
+    fn guard_python_falls_back_to_the_managed_interpreter_without_system_python() {
+        let _home = TestHome::new();
+        let managed =
+            crate::tool_manager::ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir())
+                .managed_python();
+        assert_eq!(
+            super::guard_python_for(false),
+            format!("\"{}\"", managed.display())
+        );
+        if !cfg!(target_os = "windows") {
+            assert_eq!(super::guard_python_for(true), "/usr/bin/python3");
+        }
+    }
+
+    /// Regression: after a macOS upgrade left the Command Line Tools without
+    /// xcrun, `xcode-select -p` still passed while the /usr/bin/python3 shim
+    /// exited 1, so the VS Code wrapper (shebang /usr/bin/python3) stayed set
+    /// and every panel session failed to start. The interpreter itself must run.
+    #[cfg(unix)]
+    #[test]
+    fn system_python_probe_requires_the_interpreter_to_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = tmp.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let select_ok = script("xcode-select", "exit 0");
+        let select_missing = script("xcode-select-missing", "exit 2");
+        let shim = script(
+            "python3-shim",
+            "echo 'xcrun: error: invalid active developer path, missing xcrun' >&2; exit 1",
+        );
+        let python = script("python3", "exit 0");
+        assert!(!super::python_usable(&select_ok, &shim));
+        assert!(!super::python_usable(
+            &select_ok,
+            &tmp.path().join("absent")
+        ));
+        assert!(super::python_usable(&select_ok, &python));
+        if cfg!(target_os = "macos") {
+            // Without the Command Line Tools the shim is never run: running it
+            // pops the "install developer tools" dialog.
+            assert!(!super::python_usable(&select_missing, &python));
+        }
     }
 
     /// Regression: Claude Code moved to bash for hook commands on Windows
@@ -14151,21 +15096,40 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     fn codex_foreign_model_provider_is_root_scope_only() {
+        let codex_foreign_model_provider =
+            |content| super::codex_foreign_root_value(content, "model_provider", "headroom");
         assert_eq!(
-            super::codex_foreign_model_provider("model_provider = \"gateway\"\n").as_deref(),
+            codex_foreign_model_provider("model_provider = \"gateway\"\n").as_deref(),
             Some("gateway"),
         );
         // Our own managed value is not "foreign".
         assert_eq!(
-            super::codex_foreign_model_provider("model_provider = \"headroom\"\n"),
+            codex_foreign_model_provider("model_provider = \"headroom\"\n"),
             None,
         );
         // A model_provider inside a table belongs to that table, not the route.
         assert_eq!(
-            super::codex_foreign_model_provider("[profiles.work]\nmodel_provider = \"gateway\"\n"),
+            codex_foreign_model_provider("[profiles.work]\nmodel_provider = \"gateway\"\n"),
             None,
         );
-        assert_eq!(super::codex_foreign_model_provider(""), None);
+        assert_eq!(codex_foreign_model_provider(""), None);
+    }
+
+    #[test]
+    fn codex_foreign_model_provider_reads_the_value_as_toml() {
+        let codex_foreign_model_provider =
+            |content| super::codex_foreign_root_value(content, "model_provider", "headroom");
+        // Audit #90: the value was trimmed of `"` only, so a single-quoted
+        // (literal string) provider was preserved as `'azure'` and restored
+        // as a provider named with quotes, which Codex cannot find.
+        assert_eq!(
+            codex_foreign_model_provider("model_provider = 'azure'\n").as_deref(),
+            Some("azure"),
+        );
+        assert_eq!(
+            codex_foreign_model_provider("model_provider = \"gw\" # corp gateway\n").as_deref(),
+            Some("gw"),
+        );
     }
 
     #[test]
@@ -14598,6 +15562,144 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn apply_then_disable_codex_restores_a_foreign_root_openai_base_url() {
+        // Audit #2: the managed root block also sets openai_base_url, so a
+        // user's own root value (LM Studio, a gateway) became a duplicate root
+        // key and Codex refused to load its config. A loopback value was
+        // instead deleted outright by the orphan filter.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "openai_base_url=\"http://127.0.0.1:1234/v1\" # LM Studio\nmodel = \"qwen\"\n",
+        )
+        .unwrap();
+
+        super::apply_client_setup("codex").expect("apply succeeds");
+
+        let after_apply = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = after_apply
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after apply: {e}\n{after_apply}"));
+        assert_eq!(
+            parsed.get("openai_base_url").and_then(|v| v.as_str()),
+            Some(super::HEADROOM_OPENAI_BASE_URL),
+            "Headroom takes over routing while enabled, got:\n{after_apply}"
+        );
+
+        super::disable_client_setup("codex").expect("disable succeeds");
+
+        let after_disable = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = after_disable
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after disable: {e}\n{after_disable}"));
+        assert_eq!(
+            parsed.get("openai_base_url").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:1234/v1"),
+            "the pre-Headroom base URL is restored on disable, got:\n{after_disable}"
+        );
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("qwen"),
+            "other root keys survive the round trip, got:\n{after_disable}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_apply_failing_after_the_config_write_still_persists_the_captured_base_url() {
+        // Review of A-2: the config.toml write strips the user's root
+        // openai_base_url, so a later failing step (a malformed hooks.json
+        // breaks the guard hook) must not drop the captured value, or quit
+        // strips with nothing to restore.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_toml = codex_dir.join("config.toml");
+        fs::write(
+            &config_toml,
+            "openai_base_url = \"http://127.0.0.1:1234/v1\"\n",
+        )
+        .unwrap();
+        let hooks_json = codex_dir.join("hooks.json");
+        fs::write(&hooks_json, "{ not json").unwrap();
+
+        assert!(super::apply_client_setup("codex").is_err());
+        assert_eq!(
+            super::load_setup_state()
+                .preserved_base_urls
+                .get("codex_cli_openai_base_url")
+                .map(String::as_str),
+            Some("http://127.0.0.1:1234/v1")
+        );
+
+        // Once hooks.json is fixed, quit hands the user's value back.
+        fs::remove_file(&hooks_json).unwrap();
+        super::disable_client_setup("codex").expect("disable succeeds");
+        let after: toml::Value = fs::read_to_string(&config_toml).unwrap().parse().unwrap();
+        assert_eq!(
+            after.get("openai_base_url").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:1234/v1")
+        );
+    }
+
+    #[test]
+    fn strip_codex_managed_toml_keeps_root_keys_codex_appended_inside_the_root_block() {
+        // Audit #18: Codex's /model writes `model` and `model_reasoning_effort`
+        // through toml_edit, which appends them after the last root key --
+        // our openai_base_url -- so they land before our end marker. Every
+        // launch and quit then deleted the user's model choice with the block.
+        let existing = "# >>> headroom:codex_cli >>>\n\
+                        model_provider = \"headroom\"\n\
+                        openai_base_url = \"http://127.0.0.1:6767/v1\"\n\
+                        model = \"gpt-5.5\"\n\
+                        model_reasoning_effort = \"high\"\n\
+                        # <<< headroom:codex_cli <<<\n\
+                        [projects.'/Users/me/code']\n\
+                        trust_level = \"trusted\"\n\
+                        \n\
+                        # >>> headroom:codex_cli_provider >>>\n\
+                        [model_providers.headroom]\n\
+                        name = \"Headroom persistent proxy\"\n\
+                        base_url = \"http://127.0.0.1:6767/v1\"\n\
+                        supports_websockets = false\n\
+                        # <<< headroom:codex_cli_provider <<<\n";
+
+        for (label, out) in [
+            ("render", render_codex_config(existing)),
+            ("strip", super::strip_codex_managed_toml(existing)),
+        ] {
+            let parsed: toml::Value = out
+                .parse()
+                .unwrap_or_else(|e| panic!("{label}: valid toml: {e}\n{out}"));
+            assert_eq!(
+                parsed.get("model").and_then(|v| v.as_str()),
+                Some("gpt-5.5"),
+                "{label}: /model's choice stays a root key, got:\n{out}"
+            );
+            assert_eq!(
+                parsed
+                    .get("model_reasoning_effort")
+                    .and_then(|v| v.as_str()),
+                Some("high"),
+                "{label}: reasoning effort stays a root key, got:\n{out}"
+            );
+            if let Some(start) = out.find("# >>> headroom:codex_cli >>>") {
+                let end = out.find("# <<< headroom:codex_cli <<<").unwrap();
+                assert!(
+                    !out[start..end].contains("model ="),
+                    "{label}: rescued keys sit outside the managed block, got:\n{out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn apply_codex_repairs_a_previously_corrupted_features_block() {
         // A machine upgraded mid-bug: the old single block sits at end-of-file,
         // its root keys absorbed into [features]. Re-applying must repair it so
@@ -14838,6 +15940,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "/Users/jo/.headroom",
             false
         ));
+    }
+
+    #[test]
+    fn toml_line_value_unescapes_windows_command_paths() {
+        // The registrar TOML-escapes backslashes, so a Windows config.toml
+        // holds `C:\\Users\\...`. Compared raw, the uninstall fallback never
+        // matched Headroom-owned MCP tables and left them behind.
+        let line = r#"command = "C:\\Users\\Jo\\AppData\\Local\\Headroom\\headroom\\serena-venv\\Scripts\\serena.exe""#;
+        let command = super::toml_line_value(line).expect("string value");
+        assert_eq!(
+            command,
+            r"C:\Users\Jo\AppData\Local\Headroom\headroom\serena-venv\Scripts\serena.exe"
+        );
+        assert!(super::command_under_dir_for(
+            &command,
+            r"C:\Users\Jo\AppData\Local\Headroom",
+            true
+        ));
+        // Literal strings and trailing comments read as the client sees them.
+        assert_eq!(
+            super::toml_line_value("command = 'C:\\x\\y.exe'  # note").as_deref(),
+            Some(r"C:\x\y.exe")
+        );
     }
 
     #[test]
@@ -15118,8 +16243,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "my own command\n"
         );
 
+        // ...and install, which used to replace it with ours.
         ensure_claude_remote_control_command().expect("install again");
         remove_claude_remote_control_command().expect("remove again");
+        assert_eq!(
+            std::fs::read_to_string(claude_remote_control_command_path()).unwrap(),
+            "my own command\n"
+        );
+        std::fs::remove_file(claude_remote_control_command_path()).unwrap();
 
         // A wrapper the user configured themselves is neither replaced nor removed.
         if cfg!(target_os = "macos") {
@@ -15535,6 +16666,93 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
     }
 
+    /// Claude Code under `CLAUDE_CONFIG_DIR=~/.claude-work` reads that dir's
+    /// settings.json, not the one Headroom routes, and the rc export that
+    /// used to route it outlived quit. The `claude` function routes such a
+    /// session for its own process only, and only while ~/.claude/settings.json
+    /// still routes through Headroom and the user set no base URL of their own.
+    #[cfg(unix)]
+    #[test]
+    fn claude_shell_function_routes_another_config_dir_only_while_headroom_routes() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("claude"),
+            "#!/bin/sh\necho \"${ANTHROPIC_BASE_URL:-unset}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let block = home.path().join("block.sh");
+        std::fs::write(&block, claude_code_shell_block()).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let work = home.path().join(".claude-work");
+        let default_dir = format!("{}/", home.path().join(".claude").display());
+        let shells: Vec<&str> = ["bash", "zsh"]
+            .into_iter()
+            .filter(|sh| crate::proc::command(sh).arg("-c").arg(":").status().is_ok())
+            .collect();
+        for shell in shells {
+            let run = |config_dir: Option<&str>, base_url: Option<&str>| {
+                let mut cmd = crate::proc::command(shell);
+                cmd.arg("-c")
+                    .arg(format!(
+                        ". '{}'; claude; echo \"after=${{ANTHROPIC_BASE_URL:-unset}}\"",
+                        block.display()
+                    ))
+                    .env("HOME", home.path())
+                    .env("PATH", &path)
+                    .env_remove("CLAUDE_CONFIG_DIR")
+                    .env_remove("ANTHROPIC_BASE_URL");
+                if let Some(dir) = config_dir {
+                    cmd.env("CLAUDE_CONFIG_DIR", dir);
+                }
+                if let Some(url) = base_url {
+                    cmd.env("ANTHROPIC_BASE_URL", url);
+                }
+                String::from_utf8(cmd.output().expect("run shell").stdout).unwrap()
+            };
+            let work = work.to_str().unwrap();
+
+            super::configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)
+                .expect("route settings.json");
+            assert_eq!(
+                run(Some(work), None),
+                format!("{HEADROOM_ANTHROPIC_BASE_URL}\nafter=unset\n"),
+                "{shell}: another config dir is routed for that process only"
+            );
+            assert_eq!(
+                run(None, None),
+                "unset\nafter=unset\n",
+                "{shell}: settings.json routes the default dir"
+            );
+            assert_eq!(
+                run(Some(&default_dir), None),
+                "unset\nafter=unset\n",
+                "{shell}: ~/.claude/ is the default dir"
+            );
+            assert_eq!(
+                run(Some(work), Some("https://gateway.example")),
+                "https://gateway.example\nafter=https://gateway.example\n",
+                "{shell}: the user's own base URL wins"
+            );
+
+            // After quit settings.json no longer routes: never the dead port.
+            std::fs::write(home.path().join(".claude/settings.json"), "{}\n").unwrap();
+            assert_eq!(
+                run(Some(work), None),
+                "unset\nafter=unset\n",
+                "{shell}: not routed once Headroom stops"
+            );
+        }
+    }
+
     /// settings.json is hand-maintained JSONC: the wrapper key goes in and out
     /// as a text edit that keeps comments and key order, and anything that is
     /// not exactly our key is refused rather than rewritten.
@@ -15937,6 +17155,29 @@ sys.exit(3)
             .is_symlink());
         assert_eq!(std::fs::read(&link).unwrap(), b"new");
         assert_eq!(std::fs::read(&target).unwrap(), b"{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_a_dangling_link_into_a_tree_it_cannot_create() {
+        // ~/.zshrc -> /Volumes/Data/dotfiles/zshrc before the volume mounts:
+        // the caller built the contents from an empty file, so replacing the
+        // link would leave a regular file holding only Headroom's block.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = dir.path().join("Volumes");
+        std::fs::create_dir_all(&volumes).unwrap();
+        std::fs::set_permissions(&volumes, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let link = dir.path().join(".zshrc");
+        std::os::unix::fs::symlink(volumes.join("Data").join("zshrc"), &link).unwrap();
+
+        let result = super::atomic_write(&link, b"# headroom block\n");
+        std::fs::set_permissions(&volumes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
@@ -16476,6 +17717,64 @@ sys.exit(3)
         assert!(!after.contains("headroom.cli"));
     }
 
+    /// Regression: the Grok pin rewrote only `command`, so a registrar that
+    /// wrote `<python> -m headroom.cli mcp serve` left Grok spawning
+    /// `headroom -m headroom.cli ...`, which click rejects, and the MCP server
+    /// never started in Grok.
+    #[test]
+    #[serial_test::serial]
+    fn pin_grok_mcp_command_normalizes_python_module_args() {
+        let home = TestHome::new();
+        let grok = home.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        let config = grok.join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.headroom]\n\
+             command = \"/somewhere/venv/bin/python3\"\n\
+             args = [\n  \"-m\",\n  \"headroom.cli\",\n  \"mcp\",\n  \"serve\",\n]\n\
+             \n\
+             [mcp_servers.headroom.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n",
+        )
+        .unwrap();
+
+        let entrypoint = home.path().join("venv/bin/headroom");
+        assert!(super::pin_grok_mcp_command(&entrypoint).unwrap().is_some());
+
+        let after = std::fs::read_to_string(&config).unwrap();
+        let parsed: toml::Value = toml::from_str(&after).expect("rebuilt config parses");
+        let server = &parsed["mcp_servers"]["headroom"];
+        assert_eq!(
+            server["command"].as_str(),
+            Some(entrypoint.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            server["args"],
+            toml::Value::Array(vec!["mcp".into(), "serve".into()]),
+            "python -m args must be normalized, got:\n{after}"
+        );
+        assert!(after.contains("[mcp_servers.headroom.env]"));
+    }
+
+    /// Regression: the Learn backend took the first `codex` that merely
+    /// existed, so an x86_64 leftover on an arm64 Mac without Rosetta (or any
+    /// binary that cannot run) was handed to `headroom learn` and failed every
+    /// run. Candidates must pass the same smoke test the MCP/plugin paths use.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn detect_codex_cli_skips_a_codex_that_does_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        let bin = home.path().join(".local").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let broken = bin.join("codex");
+        std::fs::write(&broken, b"\x00\x01\x02\x03not a binary").unwrap();
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(super::detect_codex_cli(), Some(broken));
+    }
+
     #[test]
     #[serial_test::serial]
     fn discover_codex_state_dbs_finds_any_sqlite_regardless_of_name() {
@@ -16957,12 +18256,13 @@ sys.exit(3)
         fs::write(&settings, r#"{"env": {"USER_KEY": "keep me"}}"#).unwrap();
 
         let glm = super::provider_preset("glm").expect("glm preset exists");
-        super::apply_upstream_provider_env(Some(super::ProviderClientEnv {
+        let glm_env = || super::ProviderClientEnv {
             model: glm.model,
             small_model: glm.small_model,
             context_window: glm.context_window,
-        }))
-        .unwrap();
+        };
+        let mut replaced = BTreeMap::new();
+        super::apply_upstream_provider_env(Some(glm_env()), None, &mut replaced).unwrap();
         let written = read_settings_json(&settings);
         assert_eq!(written["env"]["API_TIMEOUT_MS"].as_str(), Some("3000000"));
         assert_eq!(
@@ -16982,7 +18282,7 @@ sys.exit(3)
             Some(glm.small_model)
         );
 
-        super::apply_upstream_provider_env(None).unwrap();
+        super::apply_upstream_provider_env(None, Some(glm_env()), &mut replaced).unwrap();
         let cleared = read_settings_json(&settings);
         let env = cleared["env"].as_object().expect("env survives");
         for key in super::PROVIDER_MODEL_SLOT_ENV.iter().chain(
@@ -16996,5 +18296,150 @@ sys.exit(3)
             assert!(!env.contains_key(*key), "{key} still set after clearing");
         }
         assert_eq!(env["USER_KEY"].as_str(), Some("keep me"));
+    }
+
+    fn preset_override(id: &str) -> crate::state::UpstreamOverride {
+        let preset = super::provider_preset(id).expect("preset exists");
+        crate::state::UpstreamOverride {
+            mode: crate::state::UpstreamOverrideMode::Override,
+            base_url: preset.base_url.into(),
+            provider: id.into(),
+            model: preset.model.into(),
+            small_model: preset.small_model.into(),
+            context_window: preset.context_window.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Env a cc-switch or gateway user keeps in ~/.claude/settings.json that
+    /// Headroom never wrote.
+    const USER_CLAUDE_ENV: &str = r#"{"env": {
+        "ANTHROPIC_AUTH_TOKEN": "sk-user-gateway",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "API_TIMEOUT_MS": "600000",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "user-bedrock-opus"
+    }}"#;
+
+    fn assert_user_claude_env(settings: &Path) {
+        let env = read_settings_json(settings)["env"].clone();
+        assert_eq!(
+            env["ANTHROPIC_AUTH_TOKEN"].as_str(),
+            Some("sk-user-gateway")
+        );
+        assert_eq!(
+            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"].as_str(),
+            Some("1")
+        );
+        assert_eq!(env["API_TIMEOUT_MS"].as_str(), Some("600000"));
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"].as_str(),
+            Some("user-bedrock-opus")
+        );
+        for key in [
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+        ] {
+            assert!(env.get(key).is_none(), "{key} left behind: {env}");
+        }
+    }
+
+    /// Audit #30: saving the panel as "Anthropic (default)" with no provider
+    /// ever configured deleted the user's own token and env keys, because the
+    /// clear matched whatever value was there.
+    #[test]
+    #[serial_test::serial]
+    fn saving_anthropic_from_off_keeps_the_users_own_claude_env() {
+        let home = TestHome::new();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, USER_CLAUDE_ENV).unwrap();
+
+        let mut next = crate::state::UpstreamOverride::default();
+        super::apply_upstream_client_config(&Default::default(), &mut next, None).unwrap();
+
+        assert_user_claude_env(&settings);
+        assert!(!next.has_token);
+    }
+
+    /// Audit #17: a provider round trip overwrote the user's own values on the
+    /// way in and deleted Headroom's on the way out, so the originals never
+    /// came back.
+    #[test]
+    #[serial_test::serial]
+    fn a_provider_round_trip_puts_the_users_claude_env_back() {
+        let home = TestHome::new();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, USER_CLAUDE_ENV).unwrap();
+
+        let mut glm = preset_override("glm");
+        super::apply_upstream_client_config(&Default::default(), &mut glm, Some("sk-glm")).unwrap();
+        let env = read_settings_json(&settings)["env"].clone();
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"].as_str(), Some("sk-glm"));
+        assert_eq!(env["API_TIMEOUT_MS"].as_str(), Some("3000000"));
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"].as_str(),
+            Some(glm.model.as_str())
+        );
+        // The credential it replaced is not written to launch-profile.json.
+        assert!(!glm.replaced_env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+
+        let mut off = crate::state::UpstreamOverride::default();
+        super::apply_upstream_client_config(&glm, &mut off, None).unwrap();
+
+        assert_user_claude_env(&settings);
+        assert!(off.replaced_env.is_empty());
+        assert_eq!(crate::upstream_override::read_token(), None);
+    }
+
+    /// Audit #31: the token was written before the context window was
+    /// checked, so a rejected save left a provider token live in the client
+    /// config with the upstream still on Anthropic.
+    #[test]
+    #[serial_test::serial]
+    fn a_rejected_context_window_writes_no_token() {
+        let home = TestHome::new();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, "{}").unwrap();
+
+        let mut custom = crate::state::UpstreamOverride {
+            mode: crate::state::UpstreamOverrideMode::Override,
+            base_url: "https://gateway.example.com/anthropic".into(),
+            context_window: "200k".into(),
+            ..Default::default()
+        };
+        let err =
+            super::apply_upstream_client_config(&Default::default(), &mut custom, Some("sk-x"))
+                .unwrap_err();
+
+        assert!(err.contains("context window"), "{err}");
+        assert!(read_settings_json(&settings)["env"]["ANTHROPIC_AUTH_TOKEN"].is_null());
+        assert_eq!(crate::upstream_override::read_token(), None);
+    }
+
+    /// Audit #72: switching provider with the token field untouched re-applied
+    /// the previous provider's key, which then went to the new provider.
+    #[test]
+    #[serial_test::serial]
+    fn an_untouched_token_is_not_carried_to_another_provider() {
+        let home = TestHome::new();
+        let settings = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, "{}").unwrap();
+
+        let mut glm = preset_override("glm");
+        super::apply_upstream_client_config(&Default::default(), &mut glm, Some("sk-glm")).unwrap();
+        // Same provider, field untouched: still re-applied.
+        let mut again = preset_override("glm");
+        super::apply_upstream_client_config(&glm, &mut again, None).unwrap();
+        assert!(again.has_token);
+
+        let mut kimi = preset_override("kimi");
+        super::apply_upstream_client_config(&again, &mut kimi, None).unwrap();
+
+        assert!(!kimi.has_token);
+        assert!(read_settings_json(&settings)["env"]["ANTHROPIC_AUTH_TOKEN"].is_null());
+        assert_eq!(crate::upstream_override::read_token(), None);
     }
 }

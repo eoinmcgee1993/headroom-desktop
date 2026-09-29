@@ -13,6 +13,7 @@ import {
   newInputTokensForBar,
   allTimeCacheHitPair,
   cacheHitPair,
+  calloutBannerFor,
   outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
@@ -29,6 +30,9 @@ import {
   formatDayKey,
   formatLearnStatus,
   hasNeverScanned,
+  historyOverlayCaption,
+  formatMonthLabel,
+  formatSelectedDayLabel,
   getEnabledSupportedConnectors,
   hasEnabledConnector,
   hourOfDayTickFormatter,
@@ -40,6 +44,7 @@ import {
 } from "./dashboardHelpers";
 import type {
   HeadroomPricingStatus,
+  RuntimeStatus,
   ClientConnectorStatus,
   ClientSetupResult,
   DailySavingsPoint,
@@ -486,6 +491,37 @@ describe("dashboard helpers", () => {
     expect(hasNeverScanned({ lastLearnRanAt: "invalid" })).toBe(true);
     expect(hasNeverScanned({ lastLearnRanAt: "2026-03-22T08:00:00Z" })).toBe(false);
   });
+
+  it("dates a learn scan by local calendar day, not elapsed 24h periods", () => {
+    vi.useFakeTimers();
+    // 00:30 local; the scan ran an hour earlier, before local midnight.
+    vi.setSystemTime(new Date(2026, 2, 27, 0, 30));
+    const lateYesterday = new Date(2026, 2, 26, 23, 30).toISOString();
+    expect(formatLearnStatus({ lastLearnRanAt: lateYesterday })).toBe("last scan: yesterday");
+    const lateTwoDaysAgo = new Date(2026, 2, 25, 23, 30).toISOString();
+    expect(formatLearnStatus({ lastLearnRanAt: lateTwoDaysAgo })).toBe("last scan: 2 days ago");
+    // A clock-skewed future stamp still reads as today, never "-1 days ago".
+    const later = new Date(2026, 2, 27, 5, 0).toISOString();
+    expect(formatLearnStatus({ lastLearnRanAt: later })).toBe("last scan: today");
+  });
+});
+
+describe("historyOverlayCaption", () => {
+  const now = new Date(2026, 8, 29, 15, 0);
+
+  it("calls the open period today / this month", () => {
+    expect(historyOverlayCaption("day", new Date(2026, 8, 29), now)).toBe("saved today");
+    expect(historyOverlayCaption("month", new Date(2026, 8, 1), now)).toBe("saved this month");
+  });
+
+  it("names an earlier period instead of calling it today / this month", () => {
+    const pastDay = historyOverlayCaption("day", new Date(2026, 8, 25), now);
+    expect(pastDay).not.toContain("today");
+    expect(pastDay).toBe(`saved on ${formatSelectedDayLabel(new Date(2026, 8, 25))}`);
+    const pastMonth = historyOverlayCaption("month", new Date(2026, 7, 1), now);
+    expect(pastMonth).not.toContain("this month");
+    expect(pastMonth).toBe(`saved in ${formatMonthLabel(new Date(2026, 7, 1))}`);
+  });
 });
 
 describe("mergeProviderSavingsForDisplay", () => {
@@ -848,5 +884,104 @@ describe("providerSpentTokens", () => {
       { totalTokensSent: 12_000, compressibleTokensSent: 1_200 }
     );
     expect(rows).toEqual([1_000, 200]);
+  });
+});
+
+describe("calloutBannerFor", () => {
+  const runtime = (overrides: Partial<RuntimeStatus> = {}): RuntimeStatus => ({
+    platform: "darwin",
+    supportTier: "supported",
+    installed: true,
+    running: true,
+    starting: false,
+    paused: false,
+    autoPaused: false,
+    bypassed: false,
+    proxyReachable: true,
+    headroomLearnSupported: true,
+    rtk: { installed: true, enabled: true, pathConfigured: true, hookConfigured: true },
+    ...overrides
+  });
+  const pricing = (overrides: Partial<HeadroomPricingStatus> = {}) =>
+    ({
+      needsAuthentication: false,
+      optimizationAllowed: true,
+      shouldNudge: false,
+      gateMessage: "Headroom is active.",
+      codex: null,
+      ...overrides
+    }) as unknown as HeadroomPricingStatus;
+  const healthy = {
+    runtimeIssues: [],
+    runtimeHealthy: true,
+    kompressWarming: false,
+    connectorPhase: "healthy" as const
+  };
+  const bindHint =
+    "Port 6767 is in use by python3.12 (PID 4242). Quit that program, or end it in Task Manager, and Headroom reconnects on its own.";
+
+  it("names a failed 6767 bind ahead of any pricing banner, since no client can connect", () => {
+    const status = runtime({
+      running: false,
+      proxyReachable: false,
+      startupErrorHint: bindHint,
+      interceptBindFailed: true
+    });
+    const input = {
+      runtimeStatus: status,
+      runtimeIssues: [bindHint, "proxy unreachable"],
+      runtimeHealthy: false,
+      kompressWarming: false,
+      connectorPhase: "healthy" as const
+    };
+    for (const gate of [
+      pricing({ optimizationAllowed: false, gateMessage: "Your Headroom trial ended." }),
+      pricing({ needsAuthentication: true, gateMessage: "Sign in to keep going." }),
+      pricing({ shouldNudge: true, gateMessage: "You've used 80% of this week." })
+    ]) {
+      expect(calloutBannerFor({ ...input, pricingStatus: gate })).toEqual({
+        tone: "disconnected",
+        title: "Headroom is not hooked up right now: Port 6767 is in use by python3.12 (PID 4242)."
+      });
+    }
+    // Only a bind failure outranks the gate; a backend that is merely down
+    // behind a gated account keeps the gate message.
+    expect(
+      calloutBannerFor({
+        ...input,
+        runtimeStatus: { ...status, interceptBindFailed: false },
+        pricingStatus: pricing({ optimizationAllowed: false, gateMessage: "Your Headroom trial ended." })
+      })
+    ).toEqual({ tone: "disabled", title: "Your Headroom trial ended." });
+  });
+
+  it("keeps the rest of the precedence order", () => {
+    const codexGated = pricing({
+      codex: { optimizationAllowed: false, shouldNudge: false, gateMessage: "Codex limit reached." }
+    } as unknown as Partial<HeadroomPricingStatus>);
+    const codexNudge = pricing({
+      codex: { optimizationAllowed: true, shouldNudge: true, gateMessage: "Codex nearly out." }
+    } as unknown as Partial<HeadroomPricingStatus>);
+    const cases: [Parameters<typeof calloutBannerFor>[0], string, string][] = [
+      [{ ...healthy, runtimeStatus: null, pricingStatus: null }, "disconnected", "Headroom status is unavailable."],
+      [{ ...healthy, runtimeStatus: runtime({ paused: true, autoPaused: true }), pricingStatus: null }, "auto-paused", "Headroom stopped unexpectedly. Traffic is passing through unoptimized."],
+      [{ ...healthy, runtimeStatus: runtime({ paused: true }), pricingStatus: null }, "paused", "Headroom is paused."],
+      [{ ...healthy, runtimeStatus: runtime({ starting: true, interceptBindFailed: true }), pricingStatus: null }, "starting", "Headroom is starting up."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: pricing({ needsAuthentication: true, gateMessage: "Sign in." }) }, "degraded", "Sign in."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: pricing({ shouldNudge: true, gateMessage: "Nudge." }) }, "starting", "Nudge."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: codexGated }, "disabled", "Codex limit reached."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: codexNudge }, "starting", "Codex nearly out."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: null, connectorPhase: "disabled" }, "disabled", "No coding tools connected, so Headroom isn't saving anything."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: null, connectorPhase: "verifying" }, "starting", "Send a message in a connected tool to verify the connection is working. You may need to restart it first."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: null, kompressWarming: true }, "healthy", "Headroom is running while finishing setup."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: pricing() }, "healthy", "Headroom is running and trimming prompt bloat."],
+      [{ ...healthy, runtimeStatus: runtime({ running: false }), pricingStatus: null, runtimeHealthy: false, runtimeIssues: ["runtime offline", "proxy unreachable"] }, "disconnected", "Headroom is not hooked up right now: runtime offline, proxy unreachable."],
+      [{ ...healthy, runtimeStatus: runtime({ running: false }), pricingStatus: null, runtimeHealthy: false }, "disconnected", "Headroom is not hooked up right now."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: null, runtimeHealthy: false, runtimeIssues: ["MCP not configured"] }, "degraded", "Headroom needs attention: MCP not configured."],
+      [{ ...healthy, runtimeStatus: runtime(), pricingStatus: null, runtimeHealthy: false }, "degraded", "Headroom is running, but something needs attention."]
+    ];
+    for (const [input, tone, title] of cases) {
+      expect(calloutBannerFor(input)).toEqual({ tone, title });
+    }
   });
 });

@@ -19,13 +19,18 @@ type PriceRule = { match: RegExp; usdPerMTokens: number };
 // Ordered most-specific → least-specific. First match wins.
 //
 // Anthropic rates verified 2026-09-10. The Opus rows matter most: Opus was
-// $15/M through 4.1, then dropped to $5/M from 4.6 onward. A single /opus/i
-// rule at 15 priced every Opus 4.6+/5 request 3x too high, and Opus is the
+// $15/M through 4.1, then dropped to $5/M from 4.5 onward. A single /opus/i
+// rule at 15 priced every Opus 4.5+/5 request 3x too high, and Opus is the
 // bulk of this fleet's traffic, so the feed's per-compression dollar figure
-// was inflated 3x for most users.
+// was inflated 3x for most users. `[-.]` covers dotted OpenRouter-style ids
+// ("anthropic/claude-opus-4.6").
+//
+// GPT-5 rates follow litellm's price table (2026-09-29), which is what the
+// dashboard's savings use: the family spans $0.05/M (gpt-5-nano) to $5/M
+// (gpt-5.5), so each minor version and its mini/nano tier needs its own row.
 const PRICE_RULES: PriceRule[] = [
   { match: /fable|mythos/i, usdPerMTokens: 10 },
-  { match: /opus-(5|4-[6-9])/i, usdPerMTokens: 5 },
+  { match: /opus-(5|4[-.][5-9])/i, usdPerMTokens: 5 },
   { match: /opus/i, usdPerMTokens: 15 },
   { match: /sonnet-5/i, usdPerMTokens: 2 },
   { match: /sonnet/i, usdPerMTokens: 3 },
@@ -33,7 +38,14 @@ const PRICE_RULES: PriceRule[] = [
   { match: /gpt-4o-mini/i, usdPerMTokens: 0.15 },
   { match: /gpt-4o/i, usdPerMTokens: 2.5 },
   { match: /gpt-4/i, usdPerMTokens: 2.5 },
-  { match: /gpt-5/i, usdPerMTokens: 3 },
+  { match: /gpt-5\.[5-9]/i, usdPerMTokens: 5 },
+  { match: /gpt-5\.4.*nano/i, usdPerMTokens: 0.2 },
+  { match: /gpt-5\.4.*mini/i, usdPerMTokens: 0.75 },
+  { match: /gpt-5\.4/i, usdPerMTokens: 2.5 },
+  { match: /gpt-5\.[23]/i, usdPerMTokens: 1.75 },
+  { match: /gpt-5.*nano/i, usdPerMTokens: 0.05 },
+  { match: /gpt-5.*mini/i, usdPerMTokens: 0.25 },
+  { match: /gpt-5/i, usdPerMTokens: 1.25 },
   { match: /gpt-3\.5/i, usdPerMTokens: 0.5 },
   { match: /gemini.*pro/i, usdPerMTokens: 1.25 },
   { match: /gemini.*flash/i, usdPerMTokens: 0.1 },

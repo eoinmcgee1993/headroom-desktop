@@ -34,6 +34,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   PREVIEW_SUPPORT_EMAIL,
+  claudeCodeInstallCommand,
   platformPreviewNoticeFor,
   platformPreviewSupportMailto,
 } from "./lib/platform";
@@ -77,6 +78,7 @@ import {
   type SetupStallAlert,
   type SetupStallKind,
   maybeFireUnroutedAlert,
+  unroutedAfterReconnect,
 } from "./lib/setupHealthAlert";
 import { SetupStallModal } from "./components/SetupStallModal";
 import { ReconnectModal } from "./components/ReconnectModal";
@@ -130,6 +132,7 @@ import {
   newInputSavingsRate,
   allTimeCacheHitPair,
   cacheHitPair,
+  calloutBannerFor,
   outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
@@ -142,9 +145,11 @@ import {
   dayOfMonthTickFormatter,
   earliestHourlyDay,
   earliestSavingsMonth,
+  endSentence,
   formatDateTime,
   formatDayKey,
   formatLearnStatus,
+  historyOverlayCaption,
   formatMonthLabel,
   formatSelectedDayLabel,
   hasEnabledConnector,
@@ -154,6 +159,7 @@ import {
   providerSpentTokens,
   percent1,
   sortClientConnectors,
+  splitIssue,
   startOfDay,
   startOfMonth,
   type SavingsChartDatum
@@ -161,6 +167,7 @@ import {
 import {
   buildInitialProxyVerificationRows,
   markIdleProxyVerificationRows,
+  proxyVerificationComplete,
   proxyVerificationRowMessage,
   type ProxyVerificationRowState,
   getClaudeConnector,
@@ -182,6 +189,7 @@ import { mockDashboard } from "./lib/mockData";
 import {
   cachePricingStatus,
   type CachedPricing,
+  createPricingStatusOrder,
   formatRemainingDays,
   readCachedPricing,
   subscriptionTierLabel,
@@ -189,8 +197,12 @@ import {
 } from "./lib/pricing";
 import {
   activityFeedSignature,
-  notificationActionView,
+  homeDashboardPoll,
+  loadDashboard,
+  runtimeStatusPollMs,
   serializeState,
+  useWindowFocused,
+  whenWindowVisible,
   type TrayView
 } from "./lib/trayHelpers";
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
@@ -333,9 +345,9 @@ const addonCopy: Record<string, AddonCopy> = {
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
-    "Sets ANTHROPIC_BASE_URL in your shell profile and ~/.claude/settings.json. Claude Code turns off Remote Control behind a proxy, so Headroom adds a /remote-control command (/remote-control-headroom in VS Code) that restarts the session without Headroom.",
+    "Sets ANTHROPIC_BASE_URL in ~/.claude/settings.json. Claude Code turns off Remote Control behind a proxy, so Headroom adds a /remote-control command (/remote-control-headroom in VS Code) that restarts the session without Headroom.",
   codex:
-    "Adds a Headroom provider to ~/.codex/config.toml, which the ChatGPT app, the IDE extension and the CLI share, plus an OPENAI_BASE_URL shell export and a guard that warns if routing breaks. In the Codex CLI, run /hooks once to trust the guard.",
+    "Adds a Headroom provider to ~/.codex/config.toml, which the ChatGPT app, the IDE extension and the CLI share, plus a guard that warns if routing breaks. In the Codex CLI, run /hooks once to trust the guard.",
   grok_build:
     "Adds a proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profile.",
   opencode:
@@ -555,8 +567,6 @@ const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
 };
 
 const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
-const CLAUDE_CODE_INSTALL_CURL_CMD = "curl -fsSL https://claude.ai/install.sh | bash";
-const CLAUDE_CODE_INSTALL_PS_CMD = "irm https://claude.ai/install.ps1 | iex";
 const CODEX_CLI_INSTALL_CMD = "npm install -g @openai/codex";
 const CODEX_CLI_LOGIN_CMD = "codex login";
 const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
@@ -598,14 +608,6 @@ const APP_UPDATE_BACKGROUND_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 const DESKTOP_ACTIVATION_MAX_ATTEMPTS = 5;
 const DESKTOP_ACTIVATION_RETRY_BASE_MS = 30_000;
 const DESKTOP_ACTIVATION_RETRY_MAX_MS = 5 * 60 * 1000;
-
-async function loadDashboard(): Promise<DashboardState> {
-  try {
-    return await invoke<DashboardState>("get_dashboard_state");
-  } catch {
-    return mockDashboard;
-  }
-}
 
 function SavingsChartTooltip({
   active,
@@ -1118,7 +1120,7 @@ function DailySavingsChart({
               {chartMode === "usd" ? currency(chartSaved) : compactNumber(chartSaved)}
             </span>
             <span className="savings-chart__overlay-label">
-              {view === "day" ? "saved today" : "saved this month"}
+              {historyOverlayCaption(view, view === "day" ? visibleDay : visibleMonth)}
               {chartMode === "usd" && chartTokens > 0
                 ? ` across ${compactNumber(chartTokens)} tokens`
                 : ""}
@@ -1627,6 +1629,10 @@ export default function App() {
   // annual share of new subscriptions fell from 36% to 12%, with Max x20 annual
   // going to zero. Do not flip it without a measured reason.
   const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>("annual");
+  // `lastAttemptAt` of the upgrade failure the user chose to continue past in
+  // the launcher. The record stays persisted (the dashboard banner still offers
+  // Retry and Dismiss); a newer failed attempt shows the screen again.
+  const [ackedUpgradeFailureAt, setAckedUpgradeFailureAt] = useState<string | null>(null);
   // Launcher stage is a single source of truth for which onboarding screen
   // is showing. Only one screen can be active at a time; transitions go
   // through `setLauncherStage` so implicit renders from bootstrap/dashboard
@@ -1737,8 +1743,9 @@ export default function App() {
   // empty state and make the tab feel like it's already in an error state.
   const [activityFeedLoaded, setActivityFeedLoaded] = useState(false);
   // Tray window focus proxies for visibility: the window auto-hides on blur
-  // via `triggerHide`, so "not focused" ⇒ "hidden" for polling purposes.
-  const [trayWindowFocused, setTrayWindowFocused] = useState(true);
+  // via `triggerHide`, so "not focused" means "hidden" for polling purposes. The
+  // launcher tracks its own focus too, so its hidden webview slows down.
+  const trayWindowFocused = useWindowFocused();
   // Sticky flag: the user has visited a heavy-data tab (Activity or Optimize)
   // at least once this session. The tray-focus pre-warm is gated on this so
   // users who stay on Home don't pay its IPC/subprocess cost on every focus.
@@ -1751,13 +1758,11 @@ export default function App() {
   const [cachedPricing] = useState<CachedPricing>(() => readCachedPricing());
   const [pricingBusy, setPricingBusy] = useState(false);
   const [pricingError, setPricingError] = useState<string | null>(null);
-  const pricingRefreshInFlightRef = useRef(false);
-  // When the last authoritative status (verify / sign-out) was applied. A slow
-  // pricing fetch issued before it must not land afterwards and overwrite it:
+  // A slow pricing fetch must not land after a newer status and overwrite it:
   // on a fresh install the very first fetch is the slowest, and it was still in
   // flight when the magic link signed the user in, so it clobbered the signed-in
   // status with its own stale signed-out one.
-  const pricingStatusStampRef = useRef(0);
+  const pricingStatusOrderRef = useRef(createPricingStatusOrder());
   const [authEmail, setAuthEmail] = useState("");
   const [authCode, setAuthCode] = useState("");
   const [authCodeRequestedFor, setAuthCodeRequestedFor] = useState<string | null>(null);
@@ -2036,26 +2041,6 @@ export default function App() {
   }
 
   useEffect(() => {
-    const unlistenPromise = listen<{ action: string | null }>(
-      "notification-clicked",
-      (event) => {
-        const action = event.payload?.action ?? null;
-        if (action === "update") {
-          setShowAppUpdateDialog(true);
-          return;
-        }
-        const view = notificationActionView(action);
-        if (view) {
-          setActiveView(view);
-        }
-      }
-    );
-    return () => {
-      void unlistenPromise.then((unlisten) => unlisten());
-    };
-  }, []);
-
-  useEffect(() => {
     setShowAllUpgradePlans(false);
     if (pricingAudience !== "individual") setBillingPeriod("monthly");
   }, [pricingAudience]);
@@ -2194,7 +2179,9 @@ export default function App() {
       }
 
       updateStartup("dashboard", 35, "Loading local dashboard state…");
-      const dashboardResult = await loadDashboard();
+      // No last known state yet: the launch decisions below read the mock,
+      // which is what state already starts as.
+      const dashboardResult = await loadDashboard().catch(() => mockDashboard);
       if (!active) {
         return;
       }
@@ -2329,11 +2316,11 @@ export default function App() {
         completionHandled = true;
         detach();
         setBootstrapping(false);
-        const latestDashboard = await loadDashboard();
+        const latestDashboard = await loadDashboard().catch(() => null);
         if (!active) {
           return;
         }
-        applyDashboardIfChanged(latestDashboard);
+        if (latestDashboard) applyDashboardIfChanged(latestDashboard);
         // Always land on the install step after a bootstrap completes during
         // this session, regardless of launchExperience. The install step's
         // Continue button is gated on runtime.running, so it handles both the
@@ -2474,82 +2461,80 @@ export default function App() {
     }
 
     let active = true;
-    const poll = () => {
-      void (async () => {
-        try {
-          // Counts come from the Rust intercept, never from the backend's
-          // /stats: that endpoint rebuilds its whole payload per call and a
-          // 1/s poll of it saturated the backend (see get_headroom_request_count).
-          const [runtime, counts] = await Promise.all([
-            interceptOnlyVerify
-              ? Promise.resolve<RuntimeStatus | null>(null)
-              : invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
-            invoke<Record<string, number> | null>("get_intercept_request_counts_by_agent").catch(
-              () => null
-            )
-          ]);
+    const poll = whenWindowVisible(async () => {
+      try {
+        // Counts come from the Rust intercept, never from the backend's
+        // /stats: that endpoint rebuilds its whole payload per call and a
+        // 1/s poll of it saturated the backend (see get_headroom_request_count).
+        const [runtime, counts] = await Promise.all([
+          interceptOnlyVerify
+            ? Promise.resolve<RuntimeStatus | null>(null)
+            : invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
+          invoke<Record<string, number> | null>("get_intercept_request_counts_by_agent").catch(
+            () => null
+          )
+        ]);
 
-          if (!active) {
-            return;
-          }
-
-          if ((!interceptOnlyVerify && runtime?.proxyReachable !== true) || counts === null) {
-            // On this screen the runtime is always app-managed and coming up
-            // (the pre-install case routes through interceptOnlyVerify). First
-            // launch synchronously downloads the compression/embedder models
-            // before the backend binds, so `proxyReachable` is false for a
-            // minute or more on a perfectly healthy install. Keep it calm and
-            // informational — only a hard startup fault is a real error.
-            const startupError = interceptOnlyVerify ? null : runtime?.startupError;
-            setProxyVerificationHint(
-              interceptOnlyVerify
-                ? { text: "Waiting for setup traffic. Send a test message from your coding tool.", tone: "info" }
-                : startupError
-                ? { text: `Headroom could not finish starting: ${startupError}`, tone: "error" }
-                : {
-                    text: "Finishing setup. The first launch downloads models and can take a minute. Send your test message once this clears.",
-                    tone: "info"
-                  }
-            );
-            return;
-          }
-
-          setProxyVerificationHint(null);
-
-          // Capture the baseline on the first reachable poll. Anchoring on a
-          // null/unreachable reading would let a later "proxy came up" jump
-          // (0 → N) look like new traffic.
-          if (proxyVerificationRequestAnchorRef.current === null) {
-            proxyVerificationRequestAnchorRef.current = counts;
-            return;
-          }
-
-          // Attribute traffic per client: a prompt sent to Claude Code must not
-          // flip the Codex row (and vice versa). The proxy keys agents as
-          // `claude-code` / `codex`; our rows use `claude_code` / `codex`.
-          const anchor = proxyVerificationRequestAnchorRef.current;
-          setProxyVerificationRows((current) =>
-            current.map((row) => {
-              if (row.state === "verified") {
-                return row;
-              }
-              const agentKey = row.clientId.replace(/_/g, "-");
-              const now = counts[agentKey] ?? 0;
-              const base = anchor[agentKey] ?? 0;
-              return now > base
-                ? { ...row, state: "verified", message: "Request received" }
-                : row;
-            })
-          );
-        } catch {
-          if (active) {
-            setProxyVerificationHint({ text: "Waiting for Headroom proxy activity...", tone: "info" });
-          }
+        if (!active) {
+          return;
         }
-      })();
-    };
-    poll();
-    const interval = window.setInterval(poll, 1000);
+
+        if ((!interceptOnlyVerify && runtime?.proxyReachable !== true) || counts === null) {
+          // On this screen the runtime is always app-managed and coming up
+          // (the pre-install case routes through interceptOnlyVerify). First
+          // launch synchronously downloads the compression/embedder models
+          // before the backend binds, so `proxyReachable` is false for a
+          // minute or more on a perfectly healthy install. Keep it calm and
+          // informational -- only a hard startup fault is a real error.
+          const startupError = interceptOnlyVerify ? null : runtime?.startupError;
+          setProxyVerificationHint(
+            interceptOnlyVerify
+              ? { text: "Waiting for setup traffic. Send a test message from your coding tool.", tone: "info" }
+              : startupError
+              ? { text: `Headroom could not finish starting: ${startupError}`, tone: "error" }
+              : {
+                  text: "Finishing setup. The first launch downloads models and can take a minute. Send your test message once this clears.",
+                  tone: "info"
+                }
+          );
+          return;
+        }
+
+        setProxyVerificationHint(null);
+
+        // Capture the baseline on the first reachable poll. Anchoring on a
+        // null/unreachable reading would let a later "proxy came up" jump
+        // (0 -> N) look like new traffic.
+        if (proxyVerificationRequestAnchorRef.current === null) {
+          proxyVerificationRequestAnchorRef.current = counts;
+          return;
+        }
+
+        // Attribute traffic per client: a prompt sent to Claude Code must not
+        // flip the Codex row (and vice versa). The proxy keys agents as
+        // `claude-code` / `codex`; our rows use `claude_code` / `codex`.
+        const anchor = proxyVerificationRequestAnchorRef.current;
+        setProxyVerificationRows((current) =>
+          current.map((row) => {
+            if (row.state === "verified") {
+              return row;
+            }
+            const agentKey = row.clientId.replace(/_/g, "-");
+            const now = counts[agentKey] ?? 0;
+            const base = anchor[agentKey] ?? 0;
+            return now > base
+              ? { ...row, state: "verified", message: "Request received" }
+              : row;
+          })
+        );
+      } catch {
+        if (active) {
+          setProxyVerificationHint({ text: "Waiting for Headroom proxy activity...", tone: "info" });
+        }
+      }
+    });
+    void poll();
+    const interval = window.setInterval(() => void poll(), 1000);
 
     return () => {
       active = false;
@@ -2566,15 +2551,14 @@ export default function App() {
       return;
     }
     let active = true;
-    const poll = () => {
-      void invoke<Record<string, number>>("get_running_agent_process_counts")
-        .then((counts) => {
-          if (active) setRunningAgentCounts(counts);
-        })
-        .catch(() => {});
-    };
-    poll();
-    const interval = window.setInterval(poll, 5000);
+    const poll = whenWindowVisible(async () => {
+      const counts = await invoke<Record<string, number>>(
+        "get_running_agent_process_counts"
+      ).catch(() => null);
+      if (active && counts) setRunningAgentCounts(counts);
+    });
+    void poll();
+    const interval = window.setInterval(() => void poll(), 5000);
     return () => {
       active = false;
       window.clearInterval(interval);
@@ -2642,7 +2626,8 @@ export default function App() {
     if (signupGateVisible) reportFunnelStep("signup_gate_shown");
   }, [signupGateVisible]);
 
-  // proxy_verified: every enabled client's test traffic reached the proxy.
+  // proxy_verified: every client the user actually uses (idle rows excluded)
+  // had its test traffic reach the proxy.
   // Once per launcher run: the poller rebuilds `proxyVerificationRows` every
   // tick, so without the ref this re-fired the beacon (a grace/start POST) on
   // every poll for as long as the screen stayed open -- one device sent it
@@ -2650,10 +2635,7 @@ export default function App() {
   useEffect(() => {
     if (windowLabel !== "launcher" || launcherStage !== "post_install") return;
     if (proxyVerifiedReportedRef.current) return;
-    if (
-      proxyVerificationRows.length > 0 &&
-      proxyVerificationRows.every((row) => row.state === "verified")
-    ) {
+    if (proxyVerificationComplete(proxyVerificationRows)) {
       proxyVerifiedReportedRef.current = true;
       // Persist for the main window: its own phase poller honors this marker,
       // so the tray doesn't ask the user to verify a second time right after
@@ -2827,15 +2809,17 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
   }, [windowLabel, forcedSetupStall]);
 
+  // Keeps a slow poll while hidden: the "Headroom stopped running"
+  // notification only fires while the window is hidden.
   useEffect(() => {
-    if (windowLabel !== "main" || !trayWindowFocused) {
+    if (windowLabel !== "main") {
       return;
     }
 
     void refreshRuntimeStatus();
     const interval = window.setInterval(() => {
       void refreshRuntimeStatus();
-    }, 3000);
+    }, runtimeStatusPollMs(trayWindowFocused));
 
     return () => window.clearInterval(interval);
   // eslint-disable-next-line react-hooks/exhaustive-deps -- refresh* only touch refs, setters and invoke, so a stale copy behaves the same
@@ -2872,7 +2856,6 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
-        setTrayWindowFocused(focused);
         const now = new Date();
         const nowDayKey = formatDayKey(now);
 
@@ -3047,6 +3030,7 @@ export default function App() {
     setRtkBusy(true);
     setAddonBusyId("rtk");
     setAddonBusyLabel((nextEnabled ? copy?.enabling : copy?.disabling) ?? null);
+    setAddonError(null);
     setAddonResult(null);
     try {
       await invoke<boolean>("set_rtk_enabled", { enabled: nextEnabled });
@@ -3057,7 +3041,7 @@ export default function App() {
       }
     } catch (error) {
       console.error("Failed to update RTK", error);
-      setAddonError("RTK could not be updated.");
+      setAddonError(describeInvokeError(error, "RTK could not be updated."));
     } finally {
       setRtkBusy(false);
       setAddonBusyId(null);
@@ -3079,29 +3063,26 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (activeView !== "home" || !trayWindowFocused) {
+    if (activeView !== "home") {
       return;
     }
 
     let active = true;
-    const refreshDashboard = () => {
-      void loadDashboard()
-        .then((next) => {
-          if (!active) return;
-          applyDashboardIfChanged(next);
-        })
-        .catch(() => {
-          // keep last known state
-        });
-    };
+    const refreshDashboard = homeDashboardPoll(windowLabel, trayWindowFocused, async () => {
+      const next = await loadDashboard().catch(() => null); // keep last known state
+      if (active && next) applyDashboardIfChanged(next);
+    });
+    if (!refreshDashboard) {
+      return;
+    }
 
-    refreshDashboard();
-    const interval = window.setInterval(refreshDashboard, 5000);
+    void refreshDashboard();
+    const interval = window.setInterval(() => void refreshDashboard(), 5000);
     return () => {
       active = false;
       window.clearInterval(interval);
     };
-  }, [activeView, trayWindowFocused]);
+  }, [activeView, trayWindowFocused, windowLabel]);
 
   // Track whether the user has ever visited a heavy-data tab this session.
   // Once true, stays true until app restart — the pre-warm below is gated
@@ -3405,10 +3386,10 @@ export default function App() {
   useEffect(() => {
     // Pricing status hits the remote Headroom API. When the tray is focused,
     // poll at 60s so fresh subscription/trial state is visible on demand.
-    // When hidden, slow to 10 min — still fast enough for trial-expiry and
+    // When hidden, slow to 10 min: still fast enough for trial-expiry and
     // urgent notifications to fire, while cutting hourly API traffic by
-    // ~90%. The launcher window never sets `trayWindowFocused` to false
-    // (its focus listener isn't wired up), so it keeps the 60s cadence.
+    // ~90%. The launcher tracks its own focus, so its webview, hidden all
+    // session on a returning launch, takes the 10 min cadence too.
     const intervalMs = trayWindowFocused ? 60_000 : 600_000;
     void refreshPricingStatus();
     const interval = window.setInterval(() => {
@@ -3444,6 +3425,9 @@ export default function App() {
   // needs to enter. Keyed on the status flag so every path that lands a signed-
   // in status is covered, including the payload path of `pricing-refreshed`.
   useEffect(() => {
+    // The signed-in rows show authFlowError for a failed sign-out, and the code
+    // form shows it for a failed sign-in: neither must inherit the other's.
+    setAuthFlowError(null);
     if (!pricingStatus?.authenticated) {
       return;
     }
@@ -3468,7 +3452,7 @@ export default function App() {
       // refetch that the in-flight guard may drop outright, leaving this window
       // stale until the next poll tick (60s focused, 600s not).
       if (event.payload) {
-        pricingStatusStampRef.current = Date.now();
+        pricingStatusOrderRef.current.wrote();
         setPricingStatus(event.payload);
         return;
       }
@@ -3550,6 +3534,7 @@ export default function App() {
     void invoke<HeadroomPricingStatus>("activate_headroom_account")
       .then((status) => {
         desktopActivationAttemptsRef.current = 0;
+        pricingStatusOrderRef.current.wrote();
         setPricingStatus(status);
       })
       .catch(() => {
@@ -4050,16 +4035,21 @@ export default function App() {
     }
   }
 
-  async function refreshPricingStatus() {
-    if (pricingRefreshInFlightRef.current) {
+  // `authoritative` is for the refresh right after a plan change or
+  // reactivation: a scheduled poll still in flight read the account before the
+  // change, so this one must not be skipped for it, and must outrank it.
+  async function refreshPricingStatus(authoritative = false) {
+    const fetched = pricingStatusOrderRef.current.fetch(
+      () => invoke<HeadroomPricingStatus>("get_headroom_pricing_status"),
+      authoritative
+    );
+    if (!fetched) {
       return;
     }
-    pricingRefreshInFlightRef.current = true;
     setPricingBusy(true);
-    const issuedAt = Date.now();
     try {
-      const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
-      if (pricingStatusStampRef.current > issuedAt) {
+      const status = await fetched;
+      if (!status) {
         return;
       }
       setPricingStatus(status);
@@ -4078,7 +4068,6 @@ export default function App() {
         describeInvokeError(error, "Could not load pricing status.")
       );
     } finally {
-      pricingRefreshInFlightRef.current = false;
       setPricingBusy(false);
     }
   }
@@ -4453,7 +4442,7 @@ export default function App() {
         code,
         inviteCode: null
       });
-      pricingStatusStampRef.current = Date.now();
+      pricingStatusOrderRef.current.wrote();
       setPricingStatus(status);
       setAuthCode("");
       setAuthCodeRequestedFor(null);
@@ -4545,7 +4534,7 @@ export default function App() {
     try {
       await invoke("sign_out_headroom_account");
       const status = await invoke<HeadroomPricingStatus>("get_headroom_pricing_status");
-      pricingStatusStampRef.current = Date.now();
+      pricingStatusOrderRef.current.wrote();
       setPricingStatus(status);
       setAuthCode("");
       setAuthCodeRequestedFor(null);
@@ -4729,7 +4718,7 @@ export default function App() {
         subscriptionTier: pendingPlanChange.toTier,
         billingPeriod: pendingPlanChange.billingPeriod
       });
-      await refreshPricingStatus();
+      await refreshPricingStatus(true);
       setPendingPlanChange(null);
       setActiveView("home");
     } catch (error) {
@@ -4796,7 +4785,7 @@ export default function App() {
     setReactivateError(null);
     try {
       await invoke("reactivate_headroom_subscription");
-      await refreshPricingStatus();
+      await refreshPricingStatus(true);
     } catch (error) {
       setReactivateError(
         error instanceof Error
@@ -4876,8 +4865,9 @@ export default function App() {
         setConnectorsNotice(null);
       }
 
-      const latestDashboard = await loadDashboard();
-      applyDashboardIfChanged(latestDashboard);
+      // The toggle already landed: a failed refresh is not "Failed to update".
+      const latestDashboard = await loadDashboard().catch(() => null);
+      if (latestDashboard) applyDashboardIfChanged(latestDashboard);
       await refreshConnectors();
     } catch (error) {
       setConnectorsError(
@@ -5082,17 +5072,22 @@ export default function App() {
         authSection={
           paywallFirstFlow && windowLabel === "launcher" ? (
             pricingStatus?.authenticated === true ? (
-              <p className="paywall__account-row">
-                Signed in as {pricingStatus?.account?.email ?? authEmail}
-                {" • "}
-                <button
-                  className="link-button"
-                  onClick={() => void handleSignOutHeadroomAccount()}
-                  type="button"
-                >
-                  or use a different email
-                </button>
-              </p>
+              <>
+                <p className="paywall__account-row">
+                  Signed in as {pricingStatus?.account?.email ?? authEmail}
+                  {" • "}
+                  <button
+                    className="link-button"
+                    onClick={() => void handleSignOutHeadroomAccount()}
+                    type="button"
+                  >
+                    or use a different email
+                  </button>
+                </p>
+                {authFlowError ? (
+                  <p className="install-progress__error">{authFlowError}</p>
+                ) : null}
+              </>
             ) : (
               <AuthCodeForm
                 email={authEmail}
@@ -5127,6 +5122,8 @@ export default function App() {
     !runtimeUpgradeProgress.failed;
   const showUpgradeBanner =
     !runtimeUpgradeProgress.running && upgradeFailure !== null;
+  const upgradeFailureAcked =
+    upgradeFailure !== null && upgradeFailure.lastAttemptAt === ackedUpgradeFailureAt;
   const upgradeExhausted =
     upgradeFailure !== null && upgradeFailure.attempts >= MAX_UPGRADE_AUTO_RETRIES;
   const canDismissUpgradeFailure =
@@ -5249,7 +5246,9 @@ export default function App() {
   // launcher instead.
   if (
     windowLabel === "launcher" &&
-    (showUpgradeModal || showUpgradeSuccess || (showUpgradeBanner && upgradeFailure))
+    (showUpgradeModal ||
+      showUpgradeSuccess ||
+      (showUpgradeBanner && upgradeFailure && !upgradeFailureAcked))
   ) {
     return (
       <LauncherShell
@@ -5327,15 +5326,16 @@ export default function App() {
               >
                 Retry update
               </button>
+              {/* Hands the launcher back to its own stage. This screen
+                  outranks every stage while the failure is unacknowledged, so
+                  running the stage's Continue flow from here changed nothing
+                  on screen (and re-enabled connectors the user had turned off). */}
               <button
                 type="button"
                 className="secondary-button"
-                disabled={connectorsBusy}
-                onClick={() => void handleFirstLaunchContinue()}
+                onClick={() => setAckedUpgradeFailureAt(upgradeFailure.lastAttemptAt)}
               >
-                {connectorsBusy
-                  ? "Connecting your coding agents…"
-                  : "Continue with previous version"}
+                Continue with previous version
               </button>
               {upgradeFailure.failurePhase === "boot_validation" && (
                 <button
@@ -5375,6 +5375,12 @@ export default function App() {
     const stepProgress = Math.round(getStepProgress(bootstrapProgress) * 100);
     const renderPercent = animatedOverallPercent(bootstrapProgress);
     const installComplete = bootstrapProgress.complete || dashboard.bootstrapComplete;
+    // Why Headroom has not come up, once bootstrap is done: a 6767 bind hint or
+    // the backend's start error (both clear on success). Without it this screen
+    // sat on a disabled "Starting Headroom" button forever with the cause unsaid.
+    const startupDiagnosis = bootstrapProgress.running
+      ? null
+      : (runtimeStatus?.startupErrorHint ?? runtimeStatus?.startupError ?? null);
     const failedInstallUpdateLabel = appUpdateRestartBusy
       ? "Restarting…"
       : appUpdateInstallBusy
@@ -5454,7 +5460,16 @@ export default function App() {
             {bootstrapProgress.running ||
             (runtimeStatus?.running !== true && runtimeStatus?.bypassed !== true) ? (
               <>
-                <p className="launcher-install-notice">Starting Headroom for the first time (this can take 1-2 minutes)…</p>
+                <p className="launcher-install-notice">
+                  {startupDiagnosis
+                    ? "Headroom can't start yet:"
+                    : "Starting Headroom for the first time (this can take 1-2 minutes)…"}
+                </p>
+                {startupDiagnosis ? (
+                  <p className="launcher-install-notice install-progress__error">
+                    {startupDiagnosis}
+                  </p>
+                ) : null}
                 <button
                   className="primary-button primary-button--large primary-button--install launcher-step1-continue"
                   disabled
@@ -5567,10 +5582,7 @@ export default function App() {
     const requireSelection = availableConnectors.length > 0;
     const noClientsInstalled =
       getLauncherAutoConfigureDecision(launcherConnectors) === "show_client_setup";
-    const agentInstallCommand =
-      runtimeStatus?.platform === "windows"
-        ? CLAUDE_CODE_INSTALL_PS_CMD
-        : CLAUDE_CODE_INSTALL_CURL_CMD;
+    const agentInstallCommand = claudeCodeInstallCommand(runtimeStatus?.platform);
 
     // The no-tier segment: nothing to route, so the connector toggle list is
     // all "not detected" noise and Continue leads nowhere. Guide the install
@@ -6012,6 +6024,9 @@ export default function App() {
               </button>
             </p>
           ) : null}
+          {signedIn && authFlowError ? (
+            <p className="install-progress__error">{authFlowError}</p>
+          ) : null}
         </div>
       </LauncherShell>
     );
@@ -6063,9 +6078,10 @@ export default function App() {
           ))}
         </div>
       ) : null;
-    // The tray's 5s dashboard poll keeps running under the launcher window,
-    // so a first-run user who sends a prompt sees this screen flip from
-    // "waiting" to their first real savings without any interaction — the
+    // The 5s home dashboard poll keeps running while the launcher is visible,
+    // focused or not (homeDashboardPoll), so a first-run user who sends a
+    // prompt from their terminal sees this screen flip from "waiting" to
+    // their first real savings without any interaction. The
     // payoff moment stays inside onboarding instead of being deferred to a
     // later session that a third of signups never have. While waiting,
     // blur-autohide is disarmed (see awaitingFirstPrompt above).
@@ -6205,20 +6221,8 @@ export default function App() {
     runtimeIssues.push("Kompress disabled");
   }
 
-  // A startup hint is prose: "what is wrong. What to do." The headline
-  // carries its first sentence and the rest renders underneath it. Short
-  // issue fragments ("proxy unreachable") have no sentence break and stay
-  // inline, joined as before.
-  const splitIssue = (issue: string): { lead: string; detail: string } => {
-    const cut = issue.search(/[.!?] (?=[A-Z])/);
-    return cut === -1
-      ? { lead: issue, detail: "" }
-      : { lead: issue.slice(0, cut + 1), detail: issue.slice(cut + 2) };
-  };
-  const endSentence = (text: string): string => (/[.!?]$/.test(text) ? text : `${text}.`);
   const primaryIssue = runtimeIssues.length > 0 ? splitIssue(runtimeIssues[0]) : null;
   const runtimeIssueDetail = primaryIssue?.detail ?? "";
-  const issueSummary = primaryIssue?.detail ? primaryIssue.lead : runtimeIssues.join(", ");
 
   const runtimeHealthy = Boolean(
     runtimeStatus &&
@@ -6237,109 +6241,14 @@ export default function App() {
     runtimeStatus?.headroomLearnDisabledReason ??
     "Headroom Learn is unavailable on this platform.";
 
-  const calloutBanner = (() => {
-    if (!runtimeStatus) {
-      return {
-        tone: "disconnected",
-        title: "Headroom status is unavailable."
-      } as const;
-    }
-
-    if (runtimeStatus.paused) {
-      if (runtimeStatus.autoPaused) {
-        return {
-          tone: "auto-paused",
-          title: "Headroom stopped unexpectedly. Traffic is passing through unoptimized."
-        } as const;
-      }
-      return {
-        tone: "paused",
-        title: "Headroom is paused."
-      } as const;
-    }
-
-    if (runtimeStatus.starting) {
-      return {
-        tone: "starting",
-        title: "Headroom is starting up."
-      } as const;
-    }
-
-    if (pricingStatus?.needsAuthentication) {
-      return {
-        tone: "degraded",
-        title: pricingStatus.gateMessage
-      } as const;
-    }
-
-    if (pricingStatus && !pricingStatus.optimizationAllowed) {
-      return {
-        tone: "disabled",
-        title: pricingStatus.gateMessage
-      } as const;
-    }
-
-    if (pricingStatus?.shouldNudge) {
-      return {
-        tone: "starting",
-        title: pricingStatus.gateMessage
-      } as const;
-    }
-
-    // Codex-only gate: surface in the top banner only when the Claude side isn't
-    // itself gating/nudging (handled above), so mixed users never get a double
-    // banner. Codex billing/pausing is scoped to Codex traffic.
-    const codexUsage = pricingStatus?.codex;
-    if (codexUsage && codexUsage.optimizationAllowed === false) {
-      return {
-        tone: "disabled",
-        title: codexUsage.gateMessage
-      } as const;
-    }
-    if (codexUsage?.shouldNudge) {
-      return {
-        tone: "starting",
-        title: codexUsage.gateMessage
-      } as const;
-    }
-
-    if (runtimeHealthy) {
-      if (connectorPhase === "disabled") {
-        return {
-          tone: "disabled",
-          title: "No coding tools connected, so Headroom isn't saving anything."
-        } as const;
-      }
-      if (connectorPhase === "verifying") {
-        return {
-          tone: "starting",
-          title: "Send a message in a connected tool to verify the connection is working. You may need to restart it first."
-        } as const;
-      }
-      if (kompressWarming) {
-        return {
-          tone: "healthy",
-          title: "Headroom is running while finishing setup."
-        } as const;
-      }
-      return {
-        tone: "healthy",
-        title: "Headroom is running and trimming prompt bloat."
-      } as const;
-    }
-
-    const disconnected = !runtimeStatus.installed || !runtimeStatus.running || !runtimeStatus.proxyReachable;
-    return {
-      tone: disconnected ? "disconnected" : "degraded",
-      title: disconnected
-        ? runtimeIssues.length > 0
-          ? endSentence(`Headroom is not hooked up right now: ${issueSummary}`)
-          : "Headroom is not hooked up right now."
-        : runtimeIssues.length > 0
-          ? endSentence(`Headroom needs attention: ${issueSummary}`)
-          : "Headroom is running, but something needs attention."
-    } as const;
-  })();
+  const calloutBanner = calloutBannerFor({
+    runtimeStatus,
+    pricingStatus,
+    runtimeIssues,
+    runtimeHealthy,
+    kompressWarming,
+    connectorPhase
+  });
 
   // A never-routed install sits in connectorPhase "verifying" indefinitely, so
   // this cannot key off the healthy tone alone - see shouldShowStallBannerLine.
@@ -7130,12 +7039,16 @@ export default function App() {
                         </header>
                         <div className="install-prompt__cmd">
                           <code className="install-prompt__cmd-text">
-                            {CLAUDE_CODE_INSTALL_CURL_CMD}
+                            {claudeCodeInstallCommand(runtimeStatus?.platform)}
                           </code>
                           <button
                             className="install-prompt__cmd-copy"
                             type="button"
-                            onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_CURL_CMD)}
+                            onClick={() =>
+                              void copyLearnInstallCommand(
+                                claudeCodeInstallCommand(runtimeStatus?.platform)
+                              )
+                            }
                           >
                             Copy
                           </button>
@@ -7584,7 +7497,7 @@ export default function App() {
                       connectors={connectors}
                       showClients={installed && tool.enabled}
                       savings={tool.savingsLabel ?? null}
-                      actionsDisabled={addonBusyId === tool.id}
+                      actionsDisabled={addonBusyId !== null}
                       updateAvailable={tool.updateAvailable ?? false}
                       availableVersion={tool.availableVersion ?? null}
                       unavailableReason={tool.unavailableReason ?? null}
@@ -7639,7 +7552,7 @@ export default function App() {
                   runtimeStatus?.rtk.installed === true && runtimeStatus.rtk.enabled === true
                 }
                 savings={rtkSavingsChip}
-                actionsDisabled={rtkBusy || addonBusyId === "rtk" || !runtimeStatus}
+                actionsDisabled={rtkBusy || addonBusyId !== null || !runtimeStatus}
                 unavailableReason={
                   dashboard.tools.find((tool) => tool.id === "rtk")?.unavailableReason ??
                   null
@@ -8014,6 +7927,9 @@ export default function App() {
                     </button>
                   )}
                 </div>
+                {pricingStatus?.authenticated && authFlowError ? (
+                  <p className="settings-account-notice">{authFlowError}</p>
+                ) : null}
                 {pricingStatus?.claude?.profileFetchError ? (
                   <p className="settings-account-notice">
                     {pricingStatus.claude.profileFetchError}
@@ -8314,7 +8230,9 @@ export default function App() {
               <details className="advanced-section">
                 <summary>Advanced</summary>
                 <div className="advanced-section__body">
-                  <UpstreamPanel />
+                  <UpstreamPanel
+                    paused={Boolean(runtimeStatus?.paused && !runtimeStatus.autoPaused)}
+                  />
                   {/* The statusline is not installed on Windows (untested there). */}
                   {!navigator.userAgent.includes("Windows") && <ClaudeStatuslinePanel />}
                 </div>
@@ -8389,7 +8307,7 @@ export default function App() {
                 setActiveView("settings");
               }}
               onReconnect={(client) => {
-                setUnroutedClients(null);
+                setUnroutedClients(unroutedAfterReconnect(unroutedClients, client.clientId));
                 const connector = connectorsRef.current?.find(
                   (item) => item.clientId === client.clientId
                 );

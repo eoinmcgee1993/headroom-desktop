@@ -5,6 +5,7 @@ import type {
   HeadroomPricingStatus,
   HourlySavingsPoint,
   ProviderSavingsPoint,
+  RuntimeStatus,
   SavingsBreakdown
 } from "./types";
 
@@ -385,6 +386,23 @@ export function formatSelectedDayLabel(date: Date) {
     month: "short",
     day: "numeric"
   }).format(date);
+}
+
+// Caption under the History overlay total. The total covers whichever period
+// the chart shows, so only the open period may be called today / this month.
+export function historyOverlayCaption(
+  view: "day" | "month",
+  visible: Date,
+  now: Date = new Date()
+): string {
+  if (view === "day") {
+    return visible >= startOfDay(now)
+      ? "saved today"
+      : `saved on ${formatSelectedDayLabel(visible)}`;
+  }
+  return visible >= startOfMonth(now)
+    ? "saved this month"
+    : `saved in ${formatMonthLabel(visible)}`;
 }
 
 export function buildMonthlySavingsWindow(data: DailySavingsPoint[], month: Date) {
@@ -786,8 +804,13 @@ export function formatLearnStatus(project: {
   if (!parsed) {
     return "never scan";
   }
-  const diffMs = Date.now() - parsed.getTime();
-  const diffDays = Math.floor(diffMs / 86_400_000);
+  // Local calendar days, not elapsed 24h periods: a scan at 23:30 is
+  // "yesterday" at 09:00. Math.round absorbs 23h/25h DST days; the clamp keeps
+  // a clock-skewed future stamp at "today".
+  const diffDays = Math.max(
+    0,
+    Math.round((startOfDay(new Date()).getTime() - startOfDay(parsed).getTime()) / 86_400_000)
+  );
   if (diffDays === 0) return "last scan: today";
   if (diffDays === 1) return "last scan: yesterday";
   return `last scan: ${diffDays} days ago`;
@@ -969,4 +992,167 @@ export function connectorDashboardStatus(
       : { label: "Restart needed", tone: "pending" };
   }
   return { label: "Active", tone: "active" };
+}
+
+export type CalloutTone =
+  | "disconnected"
+  | "auto-paused"
+  | "paused"
+  | "starting"
+  | "degraded"
+  | "disabled"
+  | "healthy";
+
+export interface CalloutBanner {
+  tone: CalloutTone;
+  title: string;
+}
+
+// A startup hint is prose: "what is wrong. What to do." The headline
+// carries its first sentence and the rest renders underneath it. Short
+// issue fragments ("proxy unreachable") have no sentence break and stay
+// inline, joined as before.
+export function splitIssue(issue: string): { lead: string; detail: string } {
+  const cut = issue.search(/[.!?] (?=[A-Z])/);
+  return cut === -1
+    ? { lead: issue, detail: "" }
+    : { lead: issue.slice(0, cut + 1), detail: issue.slice(cut + 2) };
+}
+
+export function endSentence(text: string): string {
+  return /[.!?]$/.test(text) ? text : `${text}.`;
+}
+
+// The Home callout banner. Branch order is precedence: the first state that
+// applies owns the headline.
+export function calloutBannerFor({
+  runtimeStatus,
+  pricingStatus,
+  runtimeIssues,
+  runtimeHealthy,
+  kompressWarming,
+  connectorPhase
+}: {
+  runtimeStatus: RuntimeStatus | null;
+  pricingStatus: HeadroomPricingStatus | null;
+  runtimeIssues: string[];
+  runtimeHealthy: boolean;
+  kompressWarming: boolean;
+  connectorPhase: "disabled" | "verifying" | "healthy";
+}): CalloutBanner {
+  const primaryIssue = runtimeIssues.length > 0 ? splitIssue(runtimeIssues[0]) : null;
+  const issueSummary = primaryIssue?.detail ? primaryIssue.lead : runtimeIssues.join(", ");
+
+  if (!runtimeStatus) {
+    return {
+      tone: "disconnected",
+      title: "Headroom status is unavailable."
+    };
+  }
+
+  if (runtimeStatus.paused) {
+    if (runtimeStatus.autoPaused) {
+      return {
+        tone: "auto-paused",
+        title: "Headroom stopped unexpectedly. Traffic is passing through unoptimized."
+      };
+    }
+    return {
+      tone: "paused",
+      title: "Headroom is paused."
+    };
+  }
+
+  if (runtimeStatus.starting) {
+    return {
+      tone: "starting",
+      title: "Headroom is starting up."
+    };
+  }
+
+  // Every client is wired to 127.0.0.1:6767, so a failed intercept bind means
+  // nothing reaches Headroom and the bypass cannot pass traffic through either.
+  // A pricing banner here would claim traffic still flows unoptimized and hide
+  // the one remedy that works (freeing the port).
+  if (runtimeStatus.interceptBindFailed && primaryIssue) {
+    return {
+      tone: "disconnected",
+      title: endSentence(`Headroom is not hooked up right now: ${primaryIssue.lead}`)
+    };
+  }
+
+  if (pricingStatus?.needsAuthentication) {
+    return {
+      tone: "degraded",
+      title: pricingStatus.gateMessage
+    };
+  }
+
+  if (pricingStatus && !pricingStatus.optimizationAllowed) {
+    return {
+      tone: "disabled",
+      title: pricingStatus.gateMessage
+    };
+  }
+
+  if (pricingStatus?.shouldNudge) {
+    return {
+      tone: "starting",
+      title: pricingStatus.gateMessage
+    };
+  }
+
+  // Codex-only gate: surface in the top banner only when the Claude side isn't
+  // itself gating/nudging (handled above), so mixed users never get a double
+  // banner. Codex billing/pausing is scoped to Codex traffic.
+  const codexUsage = pricingStatus?.codex;
+  if (codexUsage && codexUsage.optimizationAllowed === false) {
+    return {
+      tone: "disabled",
+      title: codexUsage.gateMessage
+    };
+  }
+  if (codexUsage?.shouldNudge) {
+    return {
+      tone: "starting",
+      title: codexUsage.gateMessage
+    };
+  }
+
+  if (runtimeHealthy) {
+    if (connectorPhase === "disabled") {
+      return {
+        tone: "disabled",
+        title: "No coding tools connected, so Headroom isn't saving anything."
+      };
+    }
+    if (connectorPhase === "verifying") {
+      return {
+        tone: "starting",
+        title: "Send a message in a connected tool to verify the connection is working. You may need to restart it first."
+      };
+    }
+    if (kompressWarming) {
+      return {
+        tone: "healthy",
+        title: "Headroom is running while finishing setup."
+      };
+    }
+    return {
+      tone: "healthy",
+      title: "Headroom is running and trimming prompt bloat."
+    };
+  }
+
+  const disconnected = !runtimeStatus.installed || !runtimeStatus.running || !runtimeStatus.proxyReachable;
+  return {
+    tone: disconnected ? "disconnected" : "degraded",
+    title: disconnected
+      ? runtimeIssues.length > 0
+        ? endSentence(`Headroom is not hooked up right now: ${issueSummary}`)
+        : "Headroom is not hooked up right now."
+      : runtimeIssues.length > 0
+        ? endSentence(`Headroom needs attention: ${issueSummary}`)
+        : "Headroom is running, but something needs attention."
+  };
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  claudeCodeInstallCommand,
   platformPreviewNoticeFor,
   platformPreviewSupportMailto,
 } from "./platform";
@@ -45,5 +46,21 @@ describe("platformPreviewSupportMailto", () => {
       headroomVersion: "unknown",
     });
     expect(decodeURIComponent(url)).not.toContain("undefined");
+  });
+});
+
+describe("claudeCodeInstallCommand", () => {
+  it("gives Windows the PowerShell installer, not the bash one", () => {
+    const cmd = claudeCodeInstallCommand("windows");
+    expect(cmd).toBe("irm https://claude.ai/install.ps1 | iex");
+    expect(cmd).not.toContain("bash");
+  });
+
+  it("gives macOS, linux and an unknown platform the curl installer", () => {
+    for (const platform of ["macos", "linux", undefined]) {
+      expect(claudeCodeInstallCommand(platform)).toBe(
+        "curl -fsSL https://claude.ai/install.sh | bash",
+      );
+    }
   });
 });

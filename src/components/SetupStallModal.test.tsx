@@ -106,6 +106,14 @@ describe("SetupStallModal", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  // Drift fires only on installs that saved before, so the first-run "yet"
+  // heading contradicted the lead right under it.
+  it("titles the drift branch as stopped saving, not never saved", () => {
+    render(<SetupStallModal kind="drift" onClose={vi.fn()} onOpenSettings={vi.fn()} onContact={vi.fn()} />);
+
+    expect(screen.getByRole("heading", { level: 3 })).toHaveTextContent("Headroom has stopped saving");
+  });
+
   it("hands the user to settings", async () => {
     const onOpenSettings = vi.fn();
     render(

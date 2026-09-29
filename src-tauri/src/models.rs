@@ -497,6 +497,10 @@ pub struct RuntimeStatus {
     pub headroom_learn_disabled_reason: Option<String>,
     pub startup_error: Option<String>,
     pub startup_error_hint: Option<String>,
+    /// True while the intercept cannot bind 6767 and no other Headroom instance
+    /// serves it, so no client reaches Headroom. Outranks the pricing banners.
+    #[serde(default)]
+    pub intercept_bind_failed: bool,
     /// Prose hint while the backend is failing certificate verification against
     /// the provider (TLS-inspecting network); `None` once the failures age out.
     #[serde(default)]

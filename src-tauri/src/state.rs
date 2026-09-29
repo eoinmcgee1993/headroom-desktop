@@ -3608,6 +3608,13 @@ impl AppState {
             headroom_learn_disabled_reason,
             startup_error,
             startup_error_hint,
+            // The spectator verdict is not a failure for the banner: another
+            // Headroom holds 6767 and its traffic still flows.
+            intercept_bind_failed: self
+                .intercept_bind_error
+                .lock()
+                .as_deref()
+                .is_some_and(|e| !e.contains("served by another Headroom instance")),
             upstream_tls_interception_hint: crate::proxy_intercept::upstream_tls_interception_hint(
             )
             .map(str::to_string),
@@ -4634,9 +4641,17 @@ pub struct UpstreamOverride {
     /// Model id the provider serves, written to every big `ANTHROPIC_DEFAULT_*_MODEL`
     /// slot. Empty when unset, which leaves the provider to map Claude ids.
     pub model: String,
+    /// Model id written to the cheap `ANTHROPIC_DEFAULT_HAIKU_MODEL` slot. Kept
+    /// as written so clearing the provider still recognises it after an app
+    /// update changes the preset.
+    pub small_model: String,
     /// Context window in tokens for `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. Kept as
     /// a string because empty means unset; digits are validated on save.
     pub context_window: String,
+    /// The user's own `~/.claude/settings.json` env values that saving a
+    /// provider overwrote, put back when it is turned off. Never the token: a
+    /// replaced credential waits in the keychain instead.
+    pub replaced_env: BTreeMap<String, String>,
 }
 
 impl UpstreamOverride {
