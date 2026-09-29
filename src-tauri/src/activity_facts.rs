@@ -231,6 +231,10 @@ pub struct ActivityFacts {
     last_weekly_recap: Option<WeeklyRecapEvent>,
     last_train_suggestion: Option<TrainSuggestionEvent>,
     dirty: bool,
+    // Set when the file exists but could not be read. The in-memory facts
+    // start empty, so saving them would overwrite the user's real history;
+    // the file is left for the next launch to read instead.
+    read_failed: bool,
 }
 
 impl ActivityFacts {
@@ -251,24 +255,31 @@ impl ActivityFacts {
             }
         }
 
-        // An unreadable file (EACCES/EROFS) must not brick launch any more
-        // than a corrupt one — degrade to a fresh start.
+        // An unreadable file (EACCES/EROFS, a Windows AV lock) must not brick
+        // launch any more than a corrupt one: degrade to a fresh start, but
+        // never save that emptiness over it. An I/O error says nothing about
+        // the bytes, so they are not quarantined either (a second failure
+        // would overwrite the one `.corrupt` slot, see load_setup_state).
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) => {
-                log::warn!("activity-facts.json unreadable ({err}); starting fresh");
-                return Ok(Self::empty(path));
+                log::warn!("activity-facts.json unreadable ({err}); starting fresh without saving");
+                let mut facts = Self::empty(path);
+                facts.read_failed = true;
+                return Ok(facts);
             }
         };
         // A corrupt file (e.g. truncated by a crash mid-write) must never
         // brick launch: an Err here propagates to AppState::new()'s expect()
         // and panics on every start until the user deletes the file by hand.
-        // Recover the same way as a schema mismatch below.
+        // Move the bytes aside (not delete them) and start fresh.
         let persisted = match serde_json::from_slice::<PersistedActivityFacts>(&bytes) {
             Ok(persisted) => persisted,
             Err(err) => {
-                log::warn!("activity-facts.json is corrupt ({err}); starting fresh");
-                let _ = std::fs::remove_file(&path);
+                crate::client_adapters::quarantine_unparsable(
+                    &path,
+                    &format!("activity facts: {err}"),
+                );
                 return Ok(Self::empty(path));
             }
         };
@@ -310,6 +321,7 @@ impl ActivityFacts {
             last_weekly_recap: persisted.last_weekly_recap,
             last_train_suggestion: persisted.last_train_suggestion,
             dirty: false,
+            read_failed: false,
         })
     }
 
@@ -332,6 +344,7 @@ impl ActivityFacts {
             last_weekly_recap: None,
             last_train_suggestion: None,
             dirty: false,
+            read_failed: false,
         }
     }
 
@@ -377,6 +390,10 @@ impl ActivityFacts {
             if savings_percent > TRANSFORMATION_TILE_MIN_SAVINGS_PERCENT
                 && tokens >= TRANSFORMATION_TILE_MIN_TOKENS_SAVED
             {
+                let parse_ts = |ts: Option<&str>| {
+                    ts.and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                        .map(|ts| ts.with_timezone(&Utc))
+                };
                 let should_replace = match self.last_transformation.as_ref() {
                     None => true,
                     Some(prev) => {
@@ -384,23 +401,27 @@ impl ActivityFacts {
                             .tokens_saved
                             .and_then(|n| u64::try_from(n).ok())
                             .unwrap_or(0);
-                        if tokens > prev_tokens {
-                            true
-                        } else {
-                            // Only swap a same-or-smaller event in when the
-                            // tile's current pick has aged past the stale
-                            // window. Comparison is against wall-clock `now`
-                            // so the rule matches the user's experience
-                            // ("tile hasn't moved in 10 minutes, rotate it").
-                            prev.timestamp
-                                .as_deref()
-                                .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                                .map(|prev_ts| {
-                                    now.signed_duration_since(prev_ts.with_timezone(&Utc))
+                        let prev_ts = parse_ts(prev.timestamp.as_deref());
+                        // The feed re-returns the same window on every poll,
+                        // so only a newer event may take the tile. Replaying
+                        // older ones swapped a stale pick for itself, or an
+                        // older bigger event and the rotated pick took turns,
+                        // rewriting activity-facts.json on every idle tick.
+                        let newer = match (parse_ts(event.timestamp.as_deref()), prev_ts) {
+                            (Some(ts), Some(prev_ts)) => ts > prev_ts,
+                            _ => true,
+                        };
+                        // Only swap a same-or-smaller event in when the
+                        // tile's current pick has aged past the stale
+                        // window. Comparison is against wall-clock `now`
+                        // so the rule matches the user's experience
+                        // ("tile hasn't moved in 10 minutes, rotate it").
+                        newer
+                            && (tokens > prev_tokens
+                                || prev_ts.is_none_or(|prev_ts| {
+                                    now.signed_duration_since(prev_ts)
                                         > Duration::minutes(TRANSFORMATION_TILE_STALE_AFTER_MINUTES)
-                                })
-                                .unwrap_or(true)
-                        }
+                                }))
                     }
                 };
                 if should_replace {
@@ -632,16 +653,27 @@ impl ActivityFacts {
             project_display_name,
         };
 
-        if self.last_learnings_milestone.as_ref() != Some(&event) {
+        // Compare without observed_at: it is `now` on every 20s tick, so
+        // including it rewrote activity-facts.json on every tick forever. The
+        // stored observed_at therefore dates the last change.
+        let changed = self.last_learnings_milestone.as_ref().is_none_or(|prev| {
+            *prev
+                != LearningsMilestoneEvent {
+                    observed_at: prev.observed_at,
+                    ..event.clone()
+                }
+        });
+        if changed {
             self.last_learnings_milestone = Some(event.clone());
             self.dirty = true;
         }
         event
     }
 
-    /// Scan project metadata and emit a `TrainSuggestion` for any project that
-    /// matches a trigger. Applies to both kinds only when the user has worked
-    /// on the project within `TRAIN_SUGGESTION_ACTIVE_WINDOW_DAYS` — the tile
+    /// Scan project metadata and emit a `TrainSuggestion` for the first
+    /// (most recently worked) project that matches a trigger. Applies to both
+    /// kinds only when the project's folder still exists and the user has
+    /// worked on it within `TRAIN_SUGGESTION_ACTIVE_WINDOW_DAYS` - the tile
     /// is for ongoing work, not abandoned folders. Two kinds:
     ///
     /// - `"never_trained"` — user has logged `NEVER_TRAINED_MIN_SESSIONS`+
@@ -652,72 +684,16 @@ impl ActivityFacts {
     ///   `STALE_TRAIN_REFIRE_DAYS` per project via
     ///   `stale_train_suggestions_fired_at` so the Activity feed doesn't turn
     ///   into a nag screen.
+    ///
+    /// The tile shows one suggestion, so while the latched one still
+    /// qualifies only that project may re-fire. Every other project keeps its
+    /// fire-once flag and cooldown for when the tile frees up; spending them
+    /// all on one tick meant only one project was ever nudged.
     pub fn observe_train_suggestions(
         &mut self,
         projects: &[ClaudeCodeProject],
         observed_at: DateTime<Utc>,
     ) -> Vec<ActivityEvent> {
-        let mut events: Vec<TrainSuggestionEvent> = Vec::new();
-        for project in projects {
-            if !worked_within_active_window(&project.last_worked_at, observed_at) {
-                continue;
-            }
-            let (kind, active_days) = if project.last_learn_ran_at.is_none() {
-                if project.session_count < NEVER_TRAINED_MIN_SESSIONS {
-                    continue;
-                }
-                if self.train_suggestions_fired.contains(&project.project_path) {
-                    continue;
-                }
-                ("never_trained", 0u32)
-            } else if project.active_days_since_last_learn >= 2 {
-                let throttled = self
-                    .stale_train_suggestions_fired_at
-                    .get(&project.project_path)
-                    .is_some_and(|last| {
-                        observed_at.signed_duration_since(*last)
-                            < Duration::days(STALE_TRAIN_REFIRE_DAYS)
-                    });
-                if throttled {
-                    continue;
-                }
-                ("stale", project.active_days_since_last_learn as u32)
-            } else {
-                continue;
-            };
-
-            events.push(TrainSuggestionEvent {
-                observed_at,
-                project_path: project.project_path.clone(),
-                project_display_name: project.display_name.clone(),
-                session_count: project.session_count as u32,
-                active_days_since_last_learn: active_days,
-                kind: kind.into(),
-            });
-
-            match kind {
-                "never_trained" => {
-                    self.train_suggestions_fired
-                        .insert(project.project_path.clone());
-                }
-                "stale" => {
-                    self.stale_train_suggestions_fired_at
-                        .insert(project.project_path.clone(), observed_at);
-                }
-                _ => {}
-            }
-        }
-
-        if !events.is_empty() {
-            // Tile shows one — latch the latest by observed_at. (All emissions
-            // in a single observe call share the same `observed_at`, so this
-            // effectively keeps the last project iterated.)
-            if let Some(latest) = events.iter().max_by_key(|e| e.observed_at).cloned() {
-                self.last_train_suggestion = Some(latest);
-            }
-            self.dirty = true;
-        }
-
         // Clear a stale latch: the tile should stop showing "no Train run
         // yet" for a project the user has clearly moved past.
         //   - "never_trained" suggestions clear once the project has been
@@ -725,10 +701,10 @@ impl ActivityFacts {
         //   - "stale" suggestions clear once active_days_since_last_learn
         //     drops below the threshold.
         //   - Any suggestion clears if the user hasn't touched the project
-        //     in the active window — same gate that blocks emission, applied
+        //     in the active window - same gate that blocks emission, applied
         //     to the latch so an abandoned project doesn't stay pinned.
         //   - Any suggestion clears if the project's cwd no longer exists on
-        //     disk — `~/.claude/projects/` keeps session files for folders
+        //     disk - `~/.claude/projects/` keeps session files for folders
         //     that have been moved or deleted, so scanning surfaces "ghost"
         //     projects whose display_name collides with the current working
         //     copy and confuses the tile ("23 sessions on headroom-desktop
@@ -756,10 +732,71 @@ impl ActivityFacts {
                 self.dirty = true;
             }
         }
-        events
-            .into_iter()
-            .map(ActivityEvent::TrainSuggestion)
-            .collect()
+        let latched_path = self
+            .last_train_suggestion
+            .as_ref()
+            .map(|s| s.project_path.clone());
+
+        for project in projects {
+            if latched_path
+                .as_ref()
+                .is_some_and(|path| *path != project.project_path)
+            {
+                continue;
+            }
+            if !worked_within_active_window(&project.last_worked_at, observed_at)
+                || !Path::new(&project.project_path).exists()
+            {
+                continue;
+            }
+            let (kind, active_days) = if project.last_learn_ran_at.is_none() {
+                if project.session_count < NEVER_TRAINED_MIN_SESSIONS {
+                    continue;
+                }
+                if self.train_suggestions_fired.contains(&project.project_path) {
+                    continue;
+                }
+                ("never_trained", 0u32)
+            } else if project.active_days_since_last_learn >= 2 {
+                let throttled = self
+                    .stale_train_suggestions_fired_at
+                    .get(&project.project_path)
+                    .is_some_and(|last| {
+                        observed_at.signed_duration_since(*last)
+                            < Duration::days(STALE_TRAIN_REFIRE_DAYS)
+                    });
+                if throttled {
+                    continue;
+                }
+                ("stale", project.active_days_since_last_learn as u32)
+            } else {
+                continue;
+            };
+
+            match kind {
+                "never_trained" => {
+                    self.train_suggestions_fired
+                        .insert(project.project_path.clone());
+                }
+                "stale" => {
+                    self.stale_train_suggestions_fired_at
+                        .insert(project.project_path.clone(), observed_at);
+                }
+                _ => {}
+            }
+            let event = TrainSuggestionEvent {
+                observed_at,
+                project_path: project.project_path.clone(),
+                project_display_name: project.display_name.clone(),
+                session_count: project.session_count as u32,
+                active_days_since_last_learn: active_days,
+                kind: kind.into(),
+            };
+            self.last_train_suggestion = Some(event.clone());
+            self.dirty = true;
+            return vec![ActivityEvent::TrainSuggestion(event)];
+        }
+        Vec::new()
     }
 
     /// True when we haven't checked the weekly recap within the last 24h.
@@ -823,7 +860,7 @@ impl ActivityFacts {
     }
 
     pub fn save_if_dirty(&mut self) -> Result<()> {
-        if !self.dirty {
+        if !self.dirty || self.read_failed {
             return Ok(());
         }
         let persisted = PersistedActivityFacts {
@@ -867,7 +904,46 @@ mod tests {
 
         let facts = ActivityFacts::load_or_create(&base).expect("corrupt file must not error");
         assert_eq!(facts.all_time_record_tokens, 0);
-        assert!(!path.exists(), "corrupt file is removed for a fresh start");
+        assert!(
+            !path.exists(),
+            "corrupt file is moved aside for a fresh start"
+        );
+        assert_eq!(
+            std::fs::read(base.join("config").join("activity-facts.json.corrupt")).unwrap(),
+            b"{\"schemaVersion\": 3, trunc",
+            "the corrupt bytes are kept, not deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_file_is_left_for_the_next_launch_not_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, base) = base_dir();
+        let path = base.join("config").join("activity-facts.json");
+        let original = format!(
+            r#"{{"schemaVersion": {SCHEMA_VERSION}, "allTimeRecordTokens": 91234, "trainSuggestionsFired": ["/x/demo"]}}"#
+        );
+        std::fs::write(&path, &original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            return; // running as root: the mode does not block the read
+        }
+
+        let mut facts =
+            ActivityFacts::load_or_create(&base).expect("unreadable file must not error");
+        // The first observer tick always dirties fresh facts (new-day baseline).
+        facts.observe_learnings_today(0, Vec::new(), None, at(10, 0));
+        facts.save_if_dirty().unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "empty in-memory facts must not be saved over a file we could not read"
+        );
+        let reloaded = ActivityFacts::load_or_create(&base).unwrap();
+        assert_eq!(reloaded.all_time_record_tokens, 91234);
     }
 
     #[test]
@@ -1593,6 +1669,34 @@ mod tests {
     }
 
     #[test]
+    fn learnings_tile_unchanged_counts_do_not_rewrite_the_file() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let input = || vec![mk_learn_input("/x/demo", "demo", &["a"], &["m"])];
+        facts.observe_learnings_today(2, input(), Some("/x/demo"), at(10, 0));
+        facts.save_if_dirty().unwrap();
+
+        // The observer re-reads the same bullets every tick; only the clock moved.
+        facts.observe_learnings_today(2, input(), Some("/x/demo"), at(10, 1));
+        assert!(
+            !facts.dirty,
+            "an unchanged tile must not rewrite activity-facts.json every tick"
+        );
+        let tile = facts.activity_feed_snapshot().learnings_milestone.unwrap();
+        assert_eq!(
+            tile.observed_at,
+            at(10, 0),
+            "observed_at dates the last change"
+        );
+
+        // A real change still repaints the tile.
+        facts.observe_learnings_today(3, input(), Some("/x/demo"), at(10, 2));
+        assert!(facts.dirty);
+        let tile = facts.activity_feed_snapshot().learnings_milestone.unwrap();
+        assert_eq!(tile.observed_at, at(10, 2));
+    }
+
+    #[test]
     fn weekly_recap_window_spans_previous_seven_days() {
         let (_tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
@@ -1641,21 +1745,16 @@ mod tests {
 
     #[test]
     fn train_suggestion_never_trained_fires_once_over_threshold() {
-        let (_tmp, base) = base_dir();
+        let (tmp, base) = base_dir();
+        let demo = project_dir(&tmp, "demo");
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let projects = vec![mk_project(
-            "/Users/u/Code/demo",
-            5,
-            None,
-            0,
-            "2026-04-22T10:00:00Z",
-        )];
+        let projects = vec![mk_project(&demo, 5, None, 0, "2026-04-22T10:00:00Z")];
         let first = facts.observe_train_suggestions(&projects, at(10, 0));
         assert_eq!(first.len(), 1);
         match &first[0] {
             ActivityEvent::TrainSuggestion(e) => {
                 assert_eq!(e.kind, "never_trained");
-                assert_eq!(e.project_path, "/Users/u/Code/demo");
+                assert_eq!(e.project_path, demo);
                 assert_eq!(e.session_count, 5);
             }
             _ => panic!("expected TrainSuggestion"),
@@ -1669,15 +1768,10 @@ mod tests {
 
     #[test]
     fn train_suggestion_never_trained_below_threshold_silent() {
-        let (_tmp, base) = base_dir();
+        let (tmp, base) = base_dir();
+        let demo = project_dir(&tmp, "demo");
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let projects = vec![mk_project(
-            "/Users/u/Code/demo",
-            4,
-            None,
-            0,
-            "2026-04-22T10:00:00Z",
-        )];
+        let projects = vec![mk_project(&demo, 4, None, 0, "2026-04-22T10:00:00Z")];
         assert!(facts
             .observe_train_suggestions(&projects, at(10, 0))
             .is_empty());
@@ -1685,14 +1779,15 @@ mod tests {
 
     #[test]
     fn train_suggestion_stale_throttled_to_weekly() {
-        let (_tmp, base) = base_dir();
+        let (tmp, base) = base_dir();
+        let demo = project_dir(&tmp, "demo");
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
         // Rebuild the project with a fresh last_worked_at at each observation
         // — the active-window gate requires the user to still be touching the
         // project; we're testing the *cooldown*, not the active window.
         let mk = |worked_at: &str| {
             vec![mk_project(
-                "/Users/u/Code/demo",
+                &demo,
                 10,
                 Some("2026-04-15T10:00:00Z"),
                 3,
@@ -1720,15 +1815,10 @@ mod tests {
 
     #[test]
     fn train_suggestion_persists_across_reload() {
-        let (_tmp, base) = base_dir();
+        let (tmp, base) = base_dir();
+        let demo = project_dir(&tmp, "demo");
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
-        let projects = vec![mk_project(
-            "/Users/u/Code/demo",
-            5,
-            None,
-            0,
-            "2026-04-22T10:00:00Z",
-        )];
+        let projects = vec![mk_project(&demo, 5, None, 0, "2026-04-22T10:00:00Z")];
         assert_eq!(
             facts.observe_train_suggestions(&projects, at(10, 0)).len(),
             1
@@ -1743,14 +1833,68 @@ mod tests {
         );
     }
 
+    fn project_dir(tmp: &TempDir, name: &str) -> String {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn train_suggestion_spends_the_fire_once_flag_only_on_the_project_it_shows() {
+        let (tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        let (a, b) = (project_dir(&tmp, "a"), project_dir(&tmp, "b"));
+        // A moved or deleted folder (a ghost) that is still in ~/.claude/projects.
+        let ghost = tmp.path().join("gone").to_string_lossy().into_owned();
+        let untrained = |path: &str| mk_project(path, 5, None, 0, "2026-04-22T10:00:00Z");
+        let shown = |facts: &ActivityFacts| {
+            facts
+                .activity_feed_snapshot()
+                .train_suggestion
+                .map(|s| s.project_path)
+        };
+        // Most recently worked first, as list_claude_code_projects sorts them.
+        let projects = vec![untrained(&ghost), untrained(&a), untrained(&b)];
+
+        let first = facts.observe_train_suggestions(&projects, at(10, 0));
+        assert_eq!(first.len(), 1, "the tile shows one nudge, so fire one");
+        assert_eq!(shown(&facts), Some(a.clone()));
+        assert_eq!(
+            facts.train_suggestions_fired,
+            BTreeSet::from([a.clone()]),
+            "the ghost and b keep their fire-once flags"
+        );
+
+        // While a's nudge holds the tile, b waits with its flag intact.
+        assert!(facts
+            .observe_train_suggestions(&projects, at(10, 1))
+            .is_empty());
+        assert_eq!(shown(&facts), Some(a.clone()));
+
+        // Once a is trained, b takes the tile.
+        let trained_a = mk_project(
+            &a,
+            5,
+            Some("2026-04-22T10:02:00Z"),
+            0,
+            "2026-04-22T10:02:00Z",
+        );
+        let projects = vec![untrained(&ghost), trained_a, untrained(&b)];
+        assert_eq!(
+            facts.observe_train_suggestions(&projects, at(10, 3)).len(),
+            1
+        );
+        assert_eq!(shown(&facts), Some(b));
+    }
+
     #[test]
     fn train_suggestion_skipped_when_project_idle_for_days() {
-        let (_tmp, base) = base_dir();
+        let (tmp, base) = base_dir();
         let mut facts = ActivityFacts::load_or_create(&base).unwrap();
         // Over the never-trained session threshold, but the user hasn't
         // touched the project in 3 days — outside the active window.
         let never_trained = vec![mk_project(
-            "/Users/u/Code/abandoned",
+            &project_dir(&tmp, "abandoned"),
             10,
             None,
             0,
@@ -1764,7 +1908,7 @@ mod tests {
         );
         // Same gate applies to the stale branch.
         let stale = vec![mk_project(
-            "/Users/u/Code/abandoned-stale",
+            &project_dir(&tmp, "abandoned-stale"),
             10,
             Some("2026-04-15T10:00:00Z"),
             5,
@@ -1892,5 +2036,29 @@ mod tests {
             .transformation
             .expect("transformation slot");
         assert_eq!(slot.request_id.as_deref(), Some("req-fresh"));
+    }
+
+    #[test]
+    fn replaying_the_same_feed_window_leaves_the_transformation_tile_clean() {
+        let (_tmp, base) = base_dir();
+        let mut facts = ActivityFacts::load_or_create(&base).unwrap();
+        // The feed re-returns the same window on every poll, oldest first.
+        let big = mk_tile_event("req-big", "2026-04-22T10:00:00Z", 5_000, 80.0);
+        let small = mk_tile_event("req-small", "2026-04-22T10:05:00Z", 1_000, 30.0);
+        let poll = |facts: &mut ActivityFacts, now| {
+            facts.observe_transformation_at(&big, at(10, 0), now);
+            facts.observe_transformation_at(&small, at(10, 5), now);
+        };
+        poll(&mut facts, at(10, 20));
+        facts.save_if_dirty().unwrap();
+
+        // Idle: the pick is past the stale window, but nothing newer arrived.
+        poll(&mut facts, at(10, 40));
+        assert!(
+            !facts.dirty,
+            "a replayed window must not rewrite activity-facts.json every tick"
+        );
+        let slot = facts.activity_feed_snapshot().transformation.unwrap();
+        assert_eq!(slot.request_id.as_deref(), Some("req-small"));
     }
 }
