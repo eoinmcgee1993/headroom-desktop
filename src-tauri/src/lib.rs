@@ -267,6 +267,13 @@ static LOOPBACK_SOCKET_DENIED_CAPTURED: AtomicBool = AtomicBool::new(false);
 // `restore_client_setups()` to bring back.
 static EXIT_CLEAR_DONE: AtomicBool = AtomicBool::new(false);
 
+// Same for the quit-time backend stop. Quit, restart and uninstall stop the
+// backend before `app.exit(0)`, and the exit handler then fires for both
+// `ExitRequested` and `Exit`. Every repeat found no child but still ran the
+// full orphan sweep on the UI thread, three PowerShell CIM queries on Windows,
+// so one quit spawned PowerShell up to nine times in a row.
+static EXIT_STOP_DONE: AtomicBool = AtomicBool::new(false);
+
 // Set at the start of every exit path (settings/tray quit, Cmd-Q / dock quit,
 // restart_app) BEFORE stop_headroom runs. The proxy watchdog polls every 5s
 // and restarts an unreachable backend; without this flag a probe that races
@@ -997,7 +1004,11 @@ async fn check_for_app_update(
     // so macOS/Linux keep tearing down through `restart_app` exactly as before.
     // The installer does not launch until this returns, so it must be bounded:
     // `stop_headroom` caps itself at ~2s on the lifecycle lock plus ~2s on the
-    // child before it force-kills.
+    // child before it force-kills, and the rest rewrites a few client configs.
+    // It runs the full quit teardown, client clear included: without it Claude
+    // Code and Codex stayed on the dead 127.0.0.1:6767 whenever the installer
+    // failed to start or relaunch us. A relaunched build's launch-time
+    // restore_client_setups re-applies the remembered clients.
     let teardown = app.clone();
     let updater = app
         .updater_builder()
@@ -1005,10 +1016,9 @@ async fn check_for_app_update(
         .endpoints(config.endpoints)
         .map_err(|err| err.to_string())?
         .on_before_exit(move || {
-            log::info!("update: stopping the backend before the installer exits the app");
-            SHUTTING_DOWN.store(true, Ordering::Release);
+            log::info!("update: running the exit teardown before the installer exits the app");
             let state: tauri::State<'_, AppState> = teardown.state();
-            state.stop_headroom();
+            run_exit_teardown(&state);
         })
         .build()
         .map_err(|err| err.to_string())?;
@@ -1189,7 +1199,7 @@ async fn restart_app(app: AppHandle) {
     // proxy-arg change shipped by an upgrade silently never takes effect.
     {
         let state: tauri::State<'_, AppState> = app.state();
-        state.stop_headroom();
+        stop_headroom_for_exit(&state);
     }
     analytics::shutdown(&app);
 
@@ -6061,7 +6071,7 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     SHUTTING_DOWN.store(true, Ordering::Release);
     {
         let state: tauri::State<'_, AppState> = app.state();
-        state.stop_headroom();
+        stop_headroom_for_exit(&state);
         // Plugin addons live in the hosts' plugin registries, outside Headroom's
         // own footprint that perform_full_cleanup() wipes, so remove them here
         // while we still have the ToolManager. Best-effort.
@@ -6103,6 +6113,11 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
         let _ = manager.disable();
     }
 
+    // The cleanup reverts every client setup itself. Left unset, the exit
+    // handler's clear_client_setups ran after it and its write_setup_state
+    // recreated `<app data>/config/client-setup.json` in the directory the
+    // cleanup just purged.
+    EXIT_CLEAR_DONE.store(true, Ordering::Release);
     let mut removed = client_adapters::perform_full_cleanup();
 
     // Trash the running .app bundle itself once we exit. Best-effort and
@@ -6190,7 +6205,7 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
     let runtime_paused = {
         let state: tauri::State<'_, AppState> = app.state();
         let runtime_paused = state.runtime_is_paused();
-        state.stop_headroom();
+        stop_headroom_for_exit(&state);
         // Mark the quit-time clear as done so the RunEvent::Exit handler skips
         // its redundant clear_client_setups(). A second call would wipe the
         // remembered_clients snapshot we just saved (configured_clients is now
@@ -6212,6 +6227,69 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         client.flush(Some(std::time::Duration::from_secs(2)));
     }
     app.exit(0);
+}
+
+/// Stops the backend at most once per process. See `EXIT_STOP_DONE`.
+fn stop_headroom_for_exit(state: &AppState) {
+    if !EXIT_STOP_DONE.swap(true, Ordering::AcqRel) {
+        log::info!("exit: stop_headroom");
+        state.stop_headroom();
+    }
+}
+
+/// The teardown every exit runs: the RunEvent exit arm, and the Windows
+/// updater's `on_before_exit`, which exits through `std::process::exit` and so
+/// never reaches that arm.
+fn run_exit_teardown(state: &AppState) {
+    SHUTTING_DOWN.store(true, Ordering::Release);
+    // Step markers: this teardown runs on the UI thread, so a step that blocks
+    // freezes the app mid-quit and emits nothing (Sentry only receives
+    // warn!/error!). The last marker in the log names the step that hung.
+    stop_headroom_for_exit(state);
+    // Gracefully reverse every client's base-URL override (and shell blocks) on
+    // quit so Claude Code / Codex fall back to talking directly to their native
+    // providers while Headroom is not running, instead of pointing at a
+    // now-dead proxy on 6767. The snapshot is remembered so the next launch's
+    // restore_client_setups re-applies it. Guarded to run once: the exit
+    // handler fires for both ExitRequested and Exit, and a second
+    // clear_client_setups wipes the remembered snapshot.
+    if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+        log::info!("exit: clear_client_setups");
+        if let Err(err) = client_adapters::clear_client_setups() {
+            log::warn!("exit: clear_client_setups failed: {err}");
+        }
+    }
+    // Hand Codex threads back to the native provider so its history menu stays
+    // whole while Headroom is not running. Cmd-Q / dock quit / signals skip
+    // exit_headroom -> clear_client_setups, so this is the only retag they
+    // get; the next launch re-applies the headroom tag via
+    // restore_client_setups. Best-effort.
+    log::info!("exit: retag_codex_threads_to_native");
+    client_adapters::retag_codex_threads_to_native();
+    log::info!("exit: teardown complete");
+}
+
+/// What a Linux logout, shutdown, reboot or `kill` sends (SIGTERM), plus a
+/// closed launching terminal (SIGHUP) and Ctrl-C (SIGINT).
+#[cfg(target_os = "linux")]
+const EXIT_SIGNALS: [i32; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
+
+/// Turns each signal into a normal quit. Their default action killed the
+/// process with no RunEvent, so the exit teardown never ran and Claude Code /
+/// Codex stayed routed to a dead 127.0.0.1:6767 after every reboot until
+/// Headroom was opened by hand. The callback runs on the GTK main loop.
+/// `Break` drops the source, which restores the default action, so the same
+/// signal sent again still kills the app if the teardown hangs.
+#[cfg(target_os = "linux")]
+fn route_signals_to_exit(signals: &[i32], exit: impl Fn() + Clone + Send + 'static) {
+    for &signum in signals {
+        let exit = exit.clone();
+        glib::unix_signal_add(signum, move || {
+            log::info!("exit: signal {signum}, quitting");
+            exit();
+            glib::ControlFlow::Break
+        });
+    }
 }
 
 fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Value {
@@ -6633,6 +6711,12 @@ pub fn run() {
             // which avoids triggering macOS's "Background item added" prompt
             // on first launch.
 
+            #[cfg(target_os = "linux")]
+            route_signals_to_exit(&EXIT_SIGNALS, {
+                let handle = app.handle().clone();
+                move || handle.exit(0)
+            });
+
             app.manage(TraySessionSavings(Mutex::new(TraySavingsToday::default())));
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
@@ -6985,43 +7069,16 @@ pub fn run() {
             }
             return;
         }
-        // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
-        // or our explicit quit/restart commands). Without this, the proxy
-        // outlives the desktop and the next launch reuses an orphan.
+        // Tear down the proxy on every exit path (Cmd-Q, dock quit, a Linux
+        // SIGTERM/SIGHUP/SIGINT via route_signals_to_exit, or our explicit
+        // quit/restart commands). Without this, the proxy outlives the
+        // desktop and the next launch reuses an orphan.
         if matches!(
             event,
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
-            SHUTTING_DOWN.store(true, Ordering::Release);
-            // Step markers: this teardown runs on the UI thread, so a step
-            // that blocks freezes the app mid-quit and emits nothing (Sentry
-            // only receives warn!/error!). The last marker in the log names
-            // the step that hung.
-            log::info!("exit: stop_headroom");
             let state: tauri::State<'_, AppState> = app.state();
-            state.stop_headroom();
-            // Gracefully reverse every client's base-URL override (and shell
-            // blocks) on quit so Claude Code / Codex fall back to talking
-            // directly to their native providers while Headroom is not
-            // running, instead of pointing at a now-dead proxy on 6767. The
-            // snapshot is remembered so the next launch's
-            // restore_client_setups re-applies it. Guarded to run once: the
-            // exit handler fires for both ExitRequested and Exit, and a
-            // second clear_client_setups wipes the remembered snapshot.
-            if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
-                log::info!("exit: clear_client_setups");
-                if let Err(err) = client_adapters::clear_client_setups() {
-                    log::warn!("exit: clear_client_setups failed: {err}");
-                }
-            }
-            // Hand Codex threads back to the native provider so its history
-            // menu stays whole while Headroom is not running. Cmd-Q / dock
-            // quit / signals skip exit_headroom -> clear_client_setups, so
-            // this is the only retag they get; the next launch re-applies the
-            // headroom tag via restore_client_setups. Best-effort.
-            log::info!("exit: retag_codex_threads_to_native");
-            client_adapters::retag_codex_threads_to_native();
-            log::info!("exit: teardown complete");
+            run_exit_teardown(&state);
         }
     });
 }
@@ -10595,6 +10652,54 @@ mod tests {
                 "source": "tray_menu",
                 "runtime_paused": true,
             })
+        );
+    }
+
+    #[test]
+    fn exit_paths_stop_the_backend_once_per_exit() {
+        // Quit stops the backend, then the RunEvent arm fires for both
+        // ExitRequested and Exit. Each repeat re-ran the orphan sweep (three
+        // PowerShell CIM queries on Windows) on the UI thread. A lock-held stop
+        // clears `starting`, so a repeat that still ran would clear it again.
+        let base_dir =
+            std::env::temp_dir().join(format!("headroom-exit-stop-once-{}", uuid::Uuid::new_v4()));
+        let state = crate::state::AppState::new_in(base_dir.clone()).expect("app state");
+        super::EXIT_STOP_DONE.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        state.set_runtime_starting(true);
+        super::stop_headroom_for_exit(&state);
+        assert!(
+            !state.runtime_is_starting(),
+            "the first exit path stops the backend"
+        );
+
+        state.set_runtime_starting(true);
+        super::stop_headroom_for_exit(&state);
+        assert!(
+            state.runtime_is_starting(),
+            "a repeat in the same exit must not stop again"
+        );
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_exit_signal_routes_to_the_exit_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+        super::route_signals_to_exit(&[libc::SIGHUP], move || flag.store(true, Ordering::SeqCst));
+        // Without the route, SIGHUP's default action kills this test process.
+        unsafe { libc::raise(libc::SIGHUP) };
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fired.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "SIGHUP never reached the exit route"
         );
     }
 

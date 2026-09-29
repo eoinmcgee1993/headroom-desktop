@@ -72,3 +72,7 @@ socket2 = "0.6"
 # build needs no openssl headers. Declared per-target rather than once with
 # every feature, so Windows and macOS builds do not drag in dbus/zbus.
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+# Already in every Linux build through gtk/tao; named here for
+# `glib::unix_signal_add`, which turns SIGTERM/SIGHUP/SIGINT into a normal quit
+# (see `route_signals_to_exit`).
+glib = "0.18"
