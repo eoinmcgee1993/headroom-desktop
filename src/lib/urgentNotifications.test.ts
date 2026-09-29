@@ -4,13 +4,17 @@ import type { HeadroomPricingStatus, RuntimeStatus } from "./types";
 import {
   __resetRuntimeNotificationState,
   fireUpsellNudge,
+  localDayKey,
   maybeFireUrgentPricingNotifications,
   maybeFireUrgentRuntimeNotification,
 } from "./urgentNotifications";
 
-const { invokeMock, isVisibleMock } = vi.hoisted(() => ({
+const { invokeMock, isVisibleMock, windows } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
   isVisibleMock: vi.fn(),
+  // The calling webview's label, and whether the OTHER Headroom window is on
+  // screen. isVisibleMock is the calling (main) window.
+  windows: { label: "main", otherVisible: false },
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -18,7 +22,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({ isVisible: isVisibleMock }),
+  getCurrentWindow: () => ({ label: windows.label, isVisible: isVisibleMock }),
+  getAllWindows: async () => [
+    { isVisible: isVisibleMock },
+    { isVisible: async () => windows.otherVisible },
+  ],
 }));
 
 function installStorage(initial: Record<string, string> = {}) {
@@ -30,10 +38,18 @@ function installStorage(initial: Record<string, string> = {}) {
       setItem: vi.fn((key: string, value: string) => {
         values.set(key, value);
       }),
+      removeItem: vi.fn((key: string) => {
+        values.delete(key);
+      }),
     },
   });
   return values;
 }
+
+afterEach(() => {
+  windows.label = "main";
+  windows.otherVisible = false;
+});
 
 function makePricing(
   overrides: Partial<HeadroomPricingStatus> = {}
@@ -148,6 +164,54 @@ describe("maybeFireUrgentPricingNotifications", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
+  it("fires only from the main webview, and not while any Headroom window is on screen", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+    const status = makePricing({ needsAuthentication: true });
+
+    // The launcher webview polls pricing too; it must never notify.
+    windows.label = "launcher";
+    await maybeFireUrgentPricingNotifications(status);
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    // Main is hidden but the launcher is on screen (onboarding): stay quiet.
+    windows.label = "main";
+    windows.otherVisible = true;
+    await maybeFireUrgentPricingNotifications(status);
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    windows.otherVisible = false;
+    await maybeFireUrgentPricingNotifications(status);
+    expect(invokeMock).toHaveBeenCalledOnce();
+  });
+
+  it("fires once when two overlapping ticks race for the same day slot", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    invokeMock.mockResolvedValue(undefined);
+    installStorage();
+    const status = makePricing({ needsAuthentication: true });
+
+    await Promise.all([
+      maybeFireUrgentPricingNotifications(status),
+      maybeFireUrgentPricingNotifications(status),
+    ]);
+
+    expect(invokeMock).toHaveBeenCalledOnce();
+  });
+
+  it("hands the day slot back when the notification fails", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    invokeMock.mockRejectedValueOnce(new Error("notifications disabled"));
+    const store = installStorage();
+    const status = makePricing({ needsAuthentication: true });
+
+    await maybeFireUrgentPricingNotifications(status);
+    expect(store.has("headroom_urgent_needs_auth_date")).toBe(false);
+
+    await maybeFireUrgentPricingNotifications(status);
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+
   it("fires the needs-auth notification with the signin action", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
@@ -216,7 +280,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
 
   it("does not repeat a notification already fired today", async () => {
     isVisibleMock.mockResolvedValue(false);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayKey(new Date());
     installStorage({ headroom_urgent_needs_auth_date: today });
 
     await maybeFireUrgentPricingNotifications(
@@ -229,7 +293,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
   it("records today's date after sending", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayKey(new Date());
 
     await maybeFireUrgentPricingNotifications(
       makePricing({ needsAuthentication: true })
@@ -368,7 +432,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
   it("fires the generic reminder at most once per day", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage({
-      headroom_urgent_nudge_date: new Date().toISOString().slice(0, 10),
+      headroom_urgent_nudge_date: localDayKey(new Date()),
     });
 
     await maybeFireUrgentPricingNotifications(
@@ -698,6 +762,20 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
+  it("does not fire while the pricing gate has bypassed the runtime", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    // Reachable first, so neither the first-boot grace nor a hard error is
+    // what keeps it quiet: a gated account stops the backend on purpose.
+    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: true }));
+    await maybeFireUrgentRuntimeNotification(
+      makeRuntime({ running: false, proxyReachable: false, bypassed: true })
+    );
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
   it("does not fire while the window is visible", async () => {
     isVisibleMock.mockResolvedValue(true);
     installStorage();
@@ -711,7 +789,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
 
   it("does not repeat within the same day", async () => {
     isVisibleMock.mockResolvedValue(false);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayKey(new Date());
     installStorage({ headroom_urgent_runtime_down_date: today });
 
     await maybeFireUrgentRuntimeNotification(
@@ -775,6 +853,40 @@ describe("fireUpsellNudge", () => {
     vi.setSystemTime(new Date(2026, 0, 15, 12, 0, 0)); // +3h < 6h gap
     expect(await fireUpsellNudge("t", "b")).toBe(false);
     expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires once when two effect runs overlap", async () => {
+    const store = installStorage();
+    invokeMock.mockResolvedValue(undefined);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    const results = await Promise.all([
+      fireUpsellNudge("t", "b"),
+      fireUpsellNudge("t", "b"),
+    ]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(invokeMock).toHaveBeenCalledOnce();
+    expect(store.get(KEY)).toMatch(/^2026-01-15\|1\|/);
+  });
+
+  it("restores the previous state when the notification fails", async () => {
+    const previous = `2026-01-14|2|${new Date(2026, 0, 14, 20, 0, 0).getTime()}`;
+    const store = installStorage({ [KEY]: previous });
+    invokeMock.mockRejectedValueOnce(new Error("notifications disabled"));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    expect(await fireUpsellNudge("t", "b")).toBe(false);
+    expect(store.get(KEY)).toBe(previous);
+  });
+
+  it("never fires from the launcher webview", async () => {
+    installStorage();
+    invokeMock.mockResolvedValue(undefined);
+    windows.label = "launcher";
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    expect(await fireUpsellNudge("t", "b")).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("resets the next local day", async () => {
