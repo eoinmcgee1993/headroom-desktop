@@ -5050,7 +5050,7 @@ async fn start_headroom_learn(
     };
     {
         let state: tauri::State<'_, AppState> = app.state();
-        state.begin_headroom_learn_run(&run_key)?;
+        state.begin_headroom_learn_run(&run_key, matches!(agent, LearnAgent::Claude))?;
     }
 
     let app_handle = app.clone();
@@ -7587,11 +7587,34 @@ fn normalize_learn_failure_signature(signature: &str) -> String {
     )
 }
 
+/// The agent whose CLI runs a learn scan's analysis, which is what every
+/// failure hint must name. OpenCode and Grok sessions are read plugin-side and
+/// analyzed through Claude Code when it is installed, else Codex (the prereq
+/// check guarantees one of the two).
+fn learn_analysis_agent(agent: LearnAgent, claude_installed: bool) -> LearnAgent {
+    match agent {
+        LearnAgent::Opencode | LearnAgent::Grok if claude_installed => LearnAgent::Claude,
+        LearnAgent::Opencode | LearnAgent::Grok => LearnAgent::Codex,
+        other => other,
+    }
+}
+
+/// A learn failure's stderr up to upstream's `returned unparseable output`
+/// marker. What follows it is the model's answer (RUST-B7), an analysis of the
+/// user's own sessions that can quote an auth or limit line. That dump only
+/// exists when the CLI exited 0, so it never holds the CLI's own verdict, and
+/// the auth, limit and API classifiers must not read it.
+fn learn_failure_diagnosis(stderr: &str) -> &str {
+    stderr
+        .split_once("returned unparseable output")
+        .map_or(stderr, |(head, _)| head)
+}
+
 /// True when a `headroom learn` failure was the coding agent's CLI refusing to
 /// run because nobody is signed in to it on this machine.
 ///
 /// This is a user-environment condition, not an app bug: the analyzer shells
-/// out to `claude`/`codex`/`opencode`, and if that CLI has no session it exits
+/// out to `claude` or `codex`, and if that CLI has no session it exits
 /// non-zero with its own login prompt. RUST-B6 is the whole class -- four
 /// events whose only content was `Not logged in - Please run /login`, which no
 /// change on our side can resolve. It stays out of Sentry and becomes an
@@ -7621,13 +7644,12 @@ fn learn_failure_is_agent_auth(text: &str) -> bool {
 }
 
 /// The user-facing remedy for [`learn_failure_is_agent_auth`], naming the CLI
-/// the run actually shelled out to.
+/// the run actually shelled out to. The hints take [`learn_analysis_agent`],
+/// so only Claude and Codex reach them.
 fn learn_agent_auth_hint(agent: LearnAgent) -> String {
     let (cli, command) = match agent {
-        LearnAgent::Claude => ("Claude Code", "claude"),
         LearnAgent::Codex => ("Codex", "codex"),
-        LearnAgent::Opencode => ("opencode", "opencode"),
-        LearnAgent::Grok => ("Grok", "grok"),
+        _ => ("Claude Code", "claude"),
     };
     format!(
         "{cli} is not signed in on this machine, so headroom learn could not run its analysis. \
@@ -7722,10 +7744,8 @@ fn learn_failure_agent_api_error_line(text: &str) -> Option<&str> {
 /// The user-facing remedy for [`learn_failure_agent_api_error_line`].
 fn learn_agent_api_error_hint(agent: LearnAgent, line: &str) -> String {
     let (cli, command) = match agent {
-        LearnAgent::Claude => ("Claude Code", "claude"),
         LearnAgent::Codex => ("Codex", "codex"),
-        LearnAgent::Opencode => ("opencode", "opencode"),
-        LearnAgent::Grok => ("Grok", "grok"),
+        _ => ("Claude Code", "claude"),
     };
     format!(
         "{cli}'s API refused the request (\"{line}\"), so headroom learn could not run its \
@@ -7738,10 +7758,8 @@ fn learn_agent_api_error_hint(agent: LearnAgent, line: &str) -> String {
 /// CLI's own line so the reset time survives to the UI.
 fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
     let cli = match agent {
-        LearnAgent::Claude => "Claude Code",
         LearnAgent::Codex => "Codex",
-        LearnAgent::Opencode => "opencode",
-        LearnAgent::Grok => "Grok",
+        _ => "Claude Code",
     };
     format!(
         "{cli} hit your plan's usage limit, so headroom learn could not run its analysis \
@@ -7809,10 +7827,8 @@ fn learn_failure_is_agent_api_unreachable(text: &str) -> bool {
 /// The user-facing remedy for [`learn_failure_is_agent_api_unreachable`].
 fn learn_agent_api_unreachable_hint(agent: LearnAgent) -> String {
     let cli = match agent {
-        LearnAgent::Claude => "Claude Code",
         LearnAgent::Codex => "Codex",
-        LearnAgent::Opencode => "opencode",
-        LearnAgent::Grok => "Grok",
+        _ => "Claude Code",
     };
     format!(
         "{cli} could not reach its API -- it retried and gave up -- so headroom learn could not \
@@ -7875,10 +7891,8 @@ fn learn_agent_cli_outdated_hint(agent: LearnAgent) -> String {
 /// The user-facing remedy for [`learn_failure_is_agent_unparseable_output`].
 fn learn_agent_unparseable_output_hint(agent: LearnAgent) -> String {
     let cli = match agent {
-        LearnAgent::Claude => "Claude Code",
         LearnAgent::Codex => "Codex",
-        LearnAgent::Opencode => "opencode",
-        LearnAgent::Grok => "Grok",
+        _ => "Claude Code",
     };
     format!(
         "{cli} answered with something other than the analysis headroom learn asked for, so \
@@ -8110,14 +8124,16 @@ fn execute_headroom_learn_run(
         }
     }
 
-    let cli_path = match agent {
-        LearnAgent::Claude => claude_cli::detect_claude_cli(),
+    // Analysis CLI, not the agent's own binary. Resolved once, so the spawn
+    // below and the failure hints cannot disagree about which CLI ran.
+    let claude_path = match agent {
+        LearnAgent::Codex => None,
+        _ => claude_cli::detect_claude_cli(),
+    };
+    let analysis_agent = learn_analysis_agent(agent, claude_path.is_some());
+    let cli_path = match analysis_agent {
         LearnAgent::Codex => client_adapters::detect_codex_cli(),
-        // Analysis CLI, not the agent's own binary: prefer Claude, fall back
-        // to Codex (prereq check guarantees one exists).
-        LearnAgent::Opencode | LearnAgent::Grok => {
-            claude_cli::detect_claude_cli().or_else(client_adapters::detect_codex_cli)
-        }
+        _ => claude_path,
     };
 
     let mut command = crate::proc::command(&entrypoint);
@@ -8170,7 +8186,7 @@ fn execute_headroom_learn_run(
             });
             // Session parsing is plugin-side; the analysis LLM runs through
             // whichever supported CLI is installed (mirrors the prereq check).
-            if claude_cli::detect_claude_cli().is_some() {
+            if analysis_agent == LearnAgent::Claude {
                 command.env("HEADROOM_LEARN_CLI", "claude");
             } else {
                 command
@@ -8260,21 +8276,24 @@ fn execute_headroom_learn_run(
                     // branch below (RUST-B6, RUST-BF): when the agent CLI has no
                     // signed-in session or its plan hit a usage limit, nothing
                     // on our side can change the outcome.
-                    let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
+                    // Never the model's dumped answer (see
+                    // `learn_failure_diagnosis`).
+                    let diagnosis = learn_failure_diagnosis(&stderr);
+                    let agent_not_signed_in = learn_failure_is_agent_auth(diagnosis);
                     let agent_limit_line =
-                        learn_failure_agent_limit_line(&stderr).map(str::to_string);
+                        learn_failure_agent_limit_line(diagnosis).map(str::to_string);
                     // RUST-EW, third cause in the same class: the CLI never
                     // reached its own API.
-                    let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
+                    let agent_api_unreachable = learn_failure_is_agent_api_unreachable(diagnosis);
                     // RUST-B7, fourth: the model's answer was not the JSON the
                     // analyzer asked for.
                     let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
                     // Fifth: the CLI's own API said no (status, rate limit,
                     // credit balance).
                     let agent_api_error_line =
-                        learn_failure_agent_api_error_line(&stderr).map(str::to_string);
+                        learn_failure_agent_api_error_line(diagnosis).map(str::to_string);
                     // Sixth: the CLI is too old for upstream's flags (RUST-K9).
-                    let agent_cli_outdated = learn_failure_is_agent_cli_outdated(&stderr);
+                    let agent_cli_outdated = learn_failure_is_agent_cli_outdated(diagnosis);
                     if !agent_not_signed_in
                         && agent_limit_line.is_none()
                         && !agent_api_unreachable
@@ -8338,24 +8357,24 @@ fn execute_headroom_learn_run(
                     let (summary, detail) = if agent_not_signed_in {
                         (
                             format!("headroom learn needs a signed-in agent for {project_name}."),
-                            learn_agent_auth_hint(agent),
+                            learn_agent_auth_hint(analysis_agent),
                         )
                     } else if let Some(line) = &agent_limit_line {
                         (
                             format!(
                                 "headroom learn hit the agent's usage limit for {project_name}."
                             ),
-                            learn_agent_limit_hint(agent, line),
+                            learn_agent_limit_hint(analysis_agent, line),
                         )
                     } else if let Some(line) = &agent_api_error_line {
                         (
                             format!("headroom learn could not reach the agent's API for {project_name}."),
-                            learn_agent_api_error_hint(agent, line),
+                            learn_agent_api_error_hint(analysis_agent, line),
                         )
                     } else if agent_cli_outdated {
                         (
                             format!("headroom learn needs a newer agent CLI for {project_name}."),
-                            learn_agent_cli_outdated_hint(agent),
+                            learn_agent_cli_outdated_hint(analysis_agent),
                         )
                     } else {
                         (
@@ -8475,12 +8494,16 @@ fn execute_headroom_learn_run(
                 // Matched against the whole stderr rather than the signature:
                 // upstream's marker line ends before the child's diagnosis,
                 // which can land several lines further down.
-                let agent_not_signed_in = learn_failure_is_agent_auth(&stderr);
-                let agent_limit_line = learn_failure_agent_limit_line(&stderr).map(str::to_string);
-                let agent_model_rejected = learn_failure_is_agent_model_rejected(&stderr);
-                let agent_api_unreachable = learn_failure_is_agent_api_unreachable(&stderr);
+                // Never the model's dumped answer, though (see
+                // `learn_failure_diagnosis`).
+                let diagnosis = learn_failure_diagnosis(&stderr);
+                let agent_not_signed_in = learn_failure_is_agent_auth(diagnosis);
+                let agent_limit_line =
+                    learn_failure_agent_limit_line(diagnosis).map(str::to_string);
+                let agent_model_rejected = learn_failure_is_agent_model_rejected(diagnosis);
+                let agent_api_unreachable = learn_failure_is_agent_api_unreachable(diagnosis);
                 let agent_api_error_line =
-                    learn_failure_agent_api_error_line(&stderr).map(str::to_string);
+                    learn_failure_agent_api_error_line(diagnosis).map(str::to_string);
                 // RUST-3F: this used to read `signature.contains(...)`, which is
                 // exactly the mistake the paragraph above warns about. Click
                 // prints its usage banner FIRST and the diagnosis LAST:
@@ -8494,9 +8517,9 @@ fn execute_headroom_learn_run(
                 // and never the verdict. The suppression never fired and every
                 // ejected external volume filed an event. Match the whole
                 // stderr, like the three siblings below.
-                let path_unreadable = stderr.contains("is not readable");
+                let path_unreadable = diagnosis.contains("is not readable");
                 let agent_unparseable = learn_failure_is_agent_unparseable_output(&stderr);
-                let agent_cli_outdated = learn_failure_is_agent_cli_outdated(&stderr);
+                let agent_cli_outdated = learn_failure_is_agent_cli_outdated(diagnosis);
                 let user_env_condition = path_unreadable
                     || agent_cli_outdated
                     || agent_not_signed_in
@@ -8544,17 +8567,17 @@ fn execute_headroom_learn_run(
                 // A missing agent session has a remedy the user can act on;
                 // the raw exit status and output tail do not name it.
                 let user_error = if agent_not_signed_in {
-                    learn_agent_auth_hint(agent)
+                    learn_agent_auth_hint(analysis_agent)
                 } else if let Some(line) = &agent_limit_line {
-                    learn_agent_limit_hint(agent, line)
+                    learn_agent_limit_hint(analysis_agent, line)
                 } else if let Some(line) = &agent_api_error_line {
-                    learn_agent_api_error_hint(agent, line)
+                    learn_agent_api_error_hint(analysis_agent, line)
                 } else if agent_api_unreachable {
-                    learn_agent_api_unreachable_hint(agent)
+                    learn_agent_api_unreachable_hint(analysis_agent)
                 } else if agent_unparseable {
-                    learn_agent_unparseable_output_hint(agent)
+                    learn_agent_unparseable_output_hint(analysis_agent)
                 } else if agent_cli_outdated {
-                    learn_agent_cli_outdated_hint(agent)
+                    learn_agent_cli_outdated_hint(analysis_agent)
                 } else {
                     format!(
                         "headroom learn exited with {}.\n{}",
@@ -10196,8 +10219,10 @@ mod tests {
         is_disk_full_signal, is_endpoint_protection_signal, is_environmental_startup_key,
         is_loopback_socket_denied_signal, is_missing_headroom_module_signal,
         is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
-        learn_agent_auth_hint, learn_agent_limit_hint, learn_failure_agent_api_error_line,
-        learn_failure_agent_limit_line, learn_failure_is_agent_api_unreachable,
+        learn_agent_auth_hint, learn_agent_cli_outdated_hint, learn_agent_limit_hint,
+        learn_agent_unparseable_output_hint, learn_analysis_agent,
+        learn_failure_agent_api_error_line, learn_failure_agent_limit_line,
+        learn_failure_diagnosis, learn_failure_is_agent_api_unreachable,
         learn_failure_is_agent_auth, learn_failure_is_agent_cli_outdated,
         learn_failure_is_agent_model_rejected, learn_failure_is_agent_unparseable_output,
         learn_failure_signature_source, learn_step_label, lifetime_token_milestone_kind,
@@ -13414,6 +13439,77 @@ Some unrelated content.
         assert!(hint.contains("Claude Code"), "got: {hint}");
         assert!(hint.contains("`claude`"), "got: {hint}");
         assert!(learn_agent_auth_hint(LearnAgent::Codex).contains("`codex`"));
+    }
+
+    /// OpenCode and Grok scans run their analysis on Claude Code, else Codex.
+    /// A failure hint that named the scanned agent sent the user to sign in to
+    /// a CLI the scan never used.
+    #[test]
+    fn learn_hints_name_the_cli_the_analysis_ran_on() {
+        for agent in [LearnAgent::Opencode, LearnAgent::Grok] {
+            let hint = learn_agent_auth_hint(learn_analysis_agent(agent, true));
+            assert!(hint.contains("Claude Code"), "got: {hint}");
+            assert!(hint.contains("`claude`"), "got: {hint}");
+
+            let codex = learn_analysis_agent(agent, false);
+            assert!(learn_agent_auth_hint(codex).contains("`codex`"));
+            let outdated = learn_agent_cli_outdated_hint(codex);
+            assert!(outdated.contains("Codex CLI"), "got: {outdated}");
+        }
+        assert_eq!(
+            learn_analysis_agent(LearnAgent::Claude, false),
+            LearnAgent::Claude
+        );
+        assert_eq!(
+            learn_analysis_agent(LearnAgent::Codex, true),
+            LearnAgent::Codex
+        );
+    }
+
+    /// Upstream dumps the model's unparseable answer after the marker, and
+    /// that answer is an analysis of the user's own sessions: a rule quoting
+    /// "not authenticated" or a usage-limit line is not the CLI's verdict,
+    /// which only exists when the CLI failed and so left no answer to dump.
+    #[test]
+    fn learn_failure_classifiers_ignore_the_dumped_model_answer() {
+        let stderr = "WARNING - LLM analysis failed: `claude -p --output-format stream-json \
+                      --verbose` returned unparseable output. Head and tail of the output:\n\
+                      Rules: `gh` says not authenticated in CI; Invalid API key in .env.\n\
+                      You've hit your usage limit \u{b7} resets 9am\n\
+                      API Error: 500 from the staging deploy\n\
+                      error: unknown option '--verbose'\n\
+                      Path 'fixtures' is not readable.\n\
+                        Analysis failed: `claude -p` returned unparseable output.\n";
+        assert!(learn_failure_is_agent_unparseable_output(stderr));
+        let diagnosis = learn_failure_diagnosis(stderr);
+        assert!(!learn_failure_is_agent_auth(diagnosis), "{diagnosis}");
+        assert_eq!(learn_failure_agent_limit_line(diagnosis), None);
+        assert_eq!(learn_failure_agent_api_error_line(diagnosis), None);
+        assert!(!learn_failure_is_agent_cli_outdated(diagnosis));
+        assert!(!diagnosis.contains("is not readable"), "{diagnosis}");
+        assert!(learn_agent_unparseable_output_hint(LearnAgent::Claude).contains("scan again"));
+
+        // A CLI that failed on its own terms keeps its whole diagnosis.
+        let auth = "LLM analysis failed: `claude -p` failed (exit 1):\nNot logged in \u{b7} Please run /login\n";
+        assert_eq!(learn_failure_diagnosis(auth), auth);
+
+        // The run reads every classifier but the dump marker off the diagnosis.
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, run) = source
+            .split_once("fn execute_headroom_learn_run(")
+            .expect("run fn present");
+        let run = &run[..run.find("\nfn ").expect("run fn end")];
+        for raw in [
+            "learn_failure_is_agent_auth(&stderr)",
+            "learn_failure_agent_limit_line(&stderr)",
+            "learn_failure_agent_api_error_line(&stderr)",
+            "learn_failure_is_agent_model_rejected(&stderr)",
+            "learn_failure_is_agent_api_unreachable(&stderr)",
+            "learn_failure_is_agent_cli_outdated(&stderr)",
+            "stderr.contains(\"is not readable\")",
+        ] {
+            assert!(!run.contains(raw), "{raw} still reads the dumped answer");
+        }
     }
 
     #[test]

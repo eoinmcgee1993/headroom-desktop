@@ -3059,7 +3059,14 @@ impl AppState {
         Ok(projects)
     }
 
-    pub fn begin_headroom_learn_run(&self, project_path: &str) -> Result<(), String> {
+    /// `is_path` is true only for a Claude run, whose key is the project
+    /// directory. Codex, OpenCode and Grok are keyed on a fixed id ("codex"),
+    /// which a path check would resolve against the app's cwd and refuse.
+    pub fn begin_headroom_learn_run(
+        &self,
+        project_path: &str,
+        is_path: bool,
+    ) -> Result<(), String> {
         if project_path.trim().is_empty() {
             return Err("Select a project before running headroom learn.".into());
         }
@@ -3070,13 +3077,13 @@ impl AppState {
             return Err("Headroom runtime is not available yet.".into());
         }
         let project = Path::new(project_path);
-        if !project.exists() {
+        if is_path && !project.exists() {
             return Err(format!(
                 "Project path does not exist: {}",
                 project.display()
             ));
         }
-        if !project.is_dir() {
+        if is_path && !project.is_dir() {
             return Err(format!(
                 "Project path is not a directory: {}",
                 project.display()
@@ -12141,6 +12148,47 @@ mod tests {
             "stop_headroom blocked on the held lifecycle lock for {lock_wait:?} \
              (total {waited:?}, sweep baseline {baseline:?})"
         );
+    }
+
+    /// Codex, OpenCode and Grok runs are keyed on a made-up id, not a
+    /// directory. Checking "codex" as a path resolved it against the app's cwd
+    /// ("/" from Finder), so every non-Claude scan died with "Project path does
+    /// not exist: codex" before it spawned.
+    #[test]
+    fn learn_run_key_is_path_checked_only_for_a_claude_project() {
+        let base_dir = temp_test_dir("headroom-learn-run-key");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let runtime = crate::tool_manager::ManagedRuntime::bootstrap_root(&base_dir);
+        let stdlib = if cfg!(target_os = "windows") {
+            runtime.python_dir.join("Lib")
+        } else {
+            runtime.python_dir.join("lib").join("python3.12")
+        };
+        for file in [
+            runtime.ready_flag(),
+            runtime.managed_python(),
+            runtime.standalone_python(),
+            runtime.venv_dir.join("pyvenv.cfg"),
+            stdlib.join("os.py"),
+            state.tool_manager.headroom_entrypoint(),
+        ] {
+            fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+            fs::write(&file, b"").expect("seed runtime file");
+        }
+        assert!(state.tool_manager.python_runtime_installed());
+
+        let missing = base_dir.join("no-such-project");
+        let err = state
+            .begin_headroom_learn_run(&missing.to_string_lossy(), true)
+            .expect_err("a missing Claude project must still be refused");
+        assert!(err.contains("does not exist"), "got: {err}");
+
+        state
+            .begin_headroom_learn_run("codex", false)
+            .expect("the codex run key is not a path");
+        assert!(state.headroom_learn_status(None).running);
+
+        let _ = fs::remove_dir_all(&base_dir);
     }
 
     #[test]
