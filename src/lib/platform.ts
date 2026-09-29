@@ -35,3 +35,13 @@ export function platformPreviewSupportMailto(context: {
     subject,
   )}&body=${encodeURIComponent(body)}`;
 }
+
+const CLAUDE_CODE_INSTALL_CURL_CMD = "curl -fsSL https://claude.ai/install.sh | bash";
+const CLAUDE_CODE_INSTALL_PS_CMD = "irm https://claude.ai/install.ps1 | iex";
+
+/** The Claude Code install one-liner for this OS. Windows has no bash, and
+ *  PowerShell's `curl` alias rejects -fsSL, so it gets the PowerShell installer.
+ *  Every install prompt goes through here so the prompts cannot drift apart. */
+export function claudeCodeInstallCommand(platform: string | undefined): string {
+  return platform === "windows" ? CLAUDE_CODE_INSTALL_PS_CMD : CLAUDE_CODE_INSTALL_CURL_CMD;
+}

@@ -34,6 +34,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   PREVIEW_SUPPORT_EMAIL,
+  claudeCodeInstallCommand,
   platformPreviewNoticeFor,
   platformPreviewSupportMailto,
 } from "./lib/platform";
@@ -562,8 +563,6 @@ const idleHeadroomLearnPrereqStatus: HeadroomLearnPrereqStatus = {
 };
 
 const CLAUDE_CODE_INSTALL_DOCS_URL = "https://docs.claude.com/en/docs/claude-code/setup";
-const CLAUDE_CODE_INSTALL_CURL_CMD = "curl -fsSL https://claude.ai/install.sh | bash";
-const CLAUDE_CODE_INSTALL_PS_CMD = "irm https://claude.ai/install.ps1 | iex";
 const CODEX_CLI_INSTALL_CMD = "npm install -g @openai/codex";
 const CODEX_CLI_LOGIN_CMD = "codex login";
 const CODEX_INSTALL_DOCS_URL = "https://developers.openai.com/codex/cli";
@@ -3057,6 +3056,7 @@ export default function App() {
     setRtkBusy(true);
     setAddonBusyId("rtk");
     setAddonBusyLabel((nextEnabled ? copy?.enabling : copy?.disabling) ?? null);
+    setAddonError(null);
     setAddonResult(null);
     try {
       await invoke<boolean>("set_rtk_enabled", { enabled: nextEnabled });
@@ -3067,7 +3067,7 @@ export default function App() {
       }
     } catch (error) {
       console.error("Failed to update RTK", error);
-      setAddonError("RTK could not be updated.");
+      setAddonError(describeInvokeError(error, "RTK could not be updated."));
     } finally {
       setRtkBusy(false);
       setAddonBusyId(null);
@@ -5594,10 +5594,7 @@ export default function App() {
     const requireSelection = availableConnectors.length > 0;
     const noClientsInstalled =
       getLauncherAutoConfigureDecision(launcherConnectors) === "show_client_setup";
-    const agentInstallCommand =
-      runtimeStatus?.platform === "windows"
-        ? CLAUDE_CODE_INSTALL_PS_CMD
-        : CLAUDE_CODE_INSTALL_CURL_CMD;
+    const agentInstallCommand = claudeCodeInstallCommand(runtimeStatus?.platform);
 
     // The no-tier segment: nothing to route, so the connector toggle list is
     // all "not detected" noise and Continue leads nowhere. Guide the install
@@ -7051,12 +7048,16 @@ export default function App() {
                         </header>
                         <div className="install-prompt__cmd">
                           <code className="install-prompt__cmd-text">
-                            {CLAUDE_CODE_INSTALL_CURL_CMD}
+                            {claudeCodeInstallCommand(runtimeStatus?.platform)}
                           </code>
                           <button
                             className="install-prompt__cmd-copy"
                             type="button"
-                            onClick={() => void copyLearnInstallCommand(CLAUDE_CODE_INSTALL_CURL_CMD)}
+                            onClick={() =>
+                              void copyLearnInstallCommand(
+                                claudeCodeInstallCommand(runtimeStatus?.platform)
+                              )
+                            }
                           >
                             Copy
                           </button>
@@ -7505,7 +7506,7 @@ export default function App() {
                       connectors={connectors}
                       showClients={installed && tool.enabled}
                       savings={tool.savingsLabel ?? null}
-                      actionsDisabled={addonBusyId === tool.id}
+                      actionsDisabled={addonBusyId !== null}
                       updateAvailable={tool.updateAvailable ?? false}
                       availableVersion={tool.availableVersion ?? null}
                       unavailableReason={tool.unavailableReason ?? null}
@@ -7560,7 +7561,7 @@ export default function App() {
                   runtimeStatus?.rtk.installed === true && runtimeStatus.rtk.enabled === true
                 }
                 savings={rtkSavingsChip}
-                actionsDisabled={rtkBusy || addonBusyId === "rtk" || !runtimeStatus}
+                actionsDisabled={rtkBusy || addonBusyId !== null || !runtimeStatus}
                 unavailableReason={
                   dashboard.tools.find((tool) => tool.id === "rtk")?.unavailableReason ??
                   null
