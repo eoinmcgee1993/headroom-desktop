@@ -1388,12 +1388,10 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             disable_codex_gui()?;
         }
         "claude_code" => {
-            let shell_targets = resolve_client_shell_targets_for_cleanup(&state, client_id)?;
-            remove_shell_block(&shell_targets, "claude_code")?;
-            // Also drop the managed_rtk PATH block so `rtk` isn't exported from
-            // shell profiles after quit — otherwise the user's next shell still
-            // has Headroom binaries shadowing whatever's on PATH.
-            remove_shell_block(&shell_targets, "managed_rtk")?;
+            // Routing first, shell profiles best-effort (as codex and grok_build
+            // do): the block routes nothing, and a shell cleanup failure that
+            // returned early left settings.json pointing Claude Code at the
+            // stopped proxy after quit.
             // Restore any pre-Headroom gateway/proxy URL instead of deleting
             // the key — deleting it pointed gateway users at api.anthropic.com
             // where their credentials may not even work.
@@ -1425,6 +1423,13 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             let _ = remove_claude_guard_hook();
             let _ = remove_claude_remote_control_command();
             let _ = remove_claude_statusline();
+            if let Ok(shell_targets) = resolve_client_shell_targets_for_cleanup(&state, client_id) {
+                let _ = remove_shell_block(&shell_targets, "claude_code");
+                // Also drop the managed_rtk PATH block so `rtk` isn't exported
+                // from shell profiles after quit; otherwise the user's next
+                // shell still has Headroom binaries shadowing whatever's on PATH.
+                let _ = remove_shell_block(&shell_targets, "managed_rtk");
+            }
         }
         "vscode" => {
             let preserved = state
@@ -7684,14 +7689,16 @@ fn upsert_managed_block(
     let start = format!("# >>> headroom:{block_id} >>>");
     let end = format!("# <<< headroom:{block_id} <<<");
     let block = format!("{start}\n{block_body}\n{end}\n");
-    let updated = match (existing.find(&start), existing.find(&end)) {
-        // Only rewrite in place when the markers are well-ordered. A stray or
-        // reordered end-before-start (leftover from an interrupted write, or a
-        // hand-pasted/duplicated half-block) makes `end_with_marker < start_idx`,
-        // so `existing[..start_idx]` re-emits the region the suffix also carries
-        // and the old opening marker gets duplicated. Mirror strip_marker_block:
-        // treat a malformed block as absent and append a fresh one instead.
-        (Some(start_idx), Some(end_idx)) if end_idx >= start_idx => {
+    // The end marker is searched AFTER the start, as marker_block_contains does.
+    // Searched from the top, a stray end marker ahead of the block (a
+    // hand-deleted opener, an interrupted write) read as "end before start",
+    // so every launch appended another copy of the block. A start with no end
+    // after it is treated as absent and a fresh block is appended.
+    let updated = match existing
+        .find(&start)
+        .and_then(|s| existing[s..].find(&end).map(|rel| (s, s + rel)))
+    {
+        Some((start_idx, end_idx)) => {
             let end_with_marker = end_idx + end.len();
             let mut rebuilt = String::with_capacity(existing.len() + block.len());
             rebuilt.push_str(&existing[..start_idx]);
@@ -7816,21 +7823,14 @@ fn remove_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
         );
         return Ok(false);
     };
-    let start = format!("# >>> headroom:{block_id} >>>");
-    let end = format!("# <<< headroom:{block_id} <<<");
-
-    let (Some(start_idx), Some(end_idx)) = (existing.find(&start), existing.find(&end)) else {
+    // strip_marker_block pairs each start with the end AFTER it; the two
+    // independent finds here duplicated the file instead of removing the block
+    // when a stray end marker came first. It also removes every copy an older
+    // upsert appended behind such a marker, and the stray marker itself.
+    let mut rebuilt = strip_marker_block(&existing, block_id);
+    if rebuilt == existing {
         return Ok(false);
-    };
-
-    let end_with_marker = end_idx + end.len();
-    let tail = existing[end_with_marker..].trim_start_matches('\n');
-    let mut rebuilt = String::with_capacity(existing.len());
-    rebuilt.push_str(existing[..start_idx].trim_end());
-    if !rebuilt.is_empty() && !tail.is_empty() {
-        rebuilt.push('\n');
     }
-    rebuilt.push_str(tail);
     if !rebuilt.is_empty() && !rebuilt.ends_with('\n') {
         rebuilt.push('\n');
     }
@@ -7896,24 +7896,11 @@ fn shell_block_contains_in_files(
     var_name: &str,
     expected_value: &str,
 ) -> Result<bool> {
-    for file in shell_targets {
-        if !file.exists() {
-            continue;
-        }
-        let content = read_to_string_lossy(file)?;
-        let start = format!("# >>> headroom:{block_id} >>>");
-        let end = format!("# <<< headroom:{block_id} <<<");
-
-        if let (Some(start_idx), Some(end_idx)) = (content.find(&start), content.find(&end)) {
-            let block = &content[start_idx..end_idx];
-            let expected_line = format!("export {var_name}={expected_value}");
-            if block.contains(&expected_line) {
-                return Ok(true);
-            }
-        }
-    }
-
-    Ok(false)
+    shell_block_contains_text_in_files(
+        shell_targets,
+        block_id,
+        &format!("export {var_name}={expected_value}"),
+    )
 }
 
 fn shell_block_contains_text_in_files(
@@ -7925,15 +7912,11 @@ fn shell_block_contains_text_in_files(
         if !file.exists() {
             continue;
         }
-
-        let content = read_to_string_lossy(file)?;
-        let start = format!("# >>> headroom:{block_id} >>>");
-        let end = format!("# <<< headroom:{block_id} <<<");
-
-        if let (Some(start_idx), Some(end_idx)) = (content.find(&start), content.find(&end)) {
-            if content[start_idx..end_idx].contains(expected_text) {
-                return Ok(true);
-            }
+        // marker_block_contains searches the end marker after the start. Two
+        // independent finds sliced `content[start..end]` and panicked when a
+        // stray end marker came first, killing the watchdog and tray threads.
+        if marker_block_contains(&read_to_string_lossy(file)?, block_id, expected_text) {
+            return Ok(true);
         }
     }
 
@@ -8511,12 +8494,40 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 /// Dedupe a shell-target list and drop anything that already exists as a
 /// directory. Such a path is neither readable nor rewritable: `read_to_string`
 /// fails with `EISDIR` ("Is a directory", os error 21), which aborted the whole
-/// client setup for a user whose `~/.profile` is a directory (RUST-5X/5Y/5Z —
-/// it broke claude_code, codex and grok_build alike). Paths that do not exist
-/// yet stay eligible; we create those.
+/// client setup for a user whose `~/.profile` is a directory (RUST-5X/5Y/5Z:
+/// it broke claude_code, codex and grok_build alike). A file we may not open
+/// (chmod 000, a root-owned copy, a dotfiles symlink macOS privacy protection
+/// denies) failed the same way, and at quit stopped disable before it removed
+/// Claude Code's routing, so it is dropped too. Paths that do not exist yet
+/// stay eligible; we create those.
 fn dedupe_shell_targets(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    dedupe_paths(paths.into_iter().filter(|path| !path.is_dir()).collect())
+    dedupe_paths(
+        paths
+            .into_iter()
+            .filter(|path| {
+                if path.is_dir() {
+                    return false;
+                }
+                match std::fs::File::open(path) {
+                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                        // Once per path: the status poll resolves targets every tick.
+                        let mut logged = UNREADABLE_SHELL_TARGETS_LOGGED
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if logged.insert(path.clone()) {
+                            log::warn!("skipping shell profile {}: {err}", path.display());
+                        }
+                        false
+                    }
+                    _ => true,
+                }
+            })
+            .collect(),
+    )
 }
+
+static UNREADABLE_SHELL_TARGETS_LOGGED: std::sync::Mutex<BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(BTreeSet::new());
 
 fn dedupe_strings(values: &mut Vec<String>) {
     let mut seen = BTreeSet::new();
@@ -8555,7 +8566,7 @@ fn shell_path(name: &str) -> PathBuf {
 /// Directory zsh reads its rc/profile files from. zsh honors `$ZDOTDIR`
 /// (falling back to `$HOME`); a Finder-launched app rarely inherits `$ZDOTDIR`
 /// from the login shell, so when it's absent from our own env we recover it
-/// from `~/.zshenv` — the file zsh always sources from `$HOME` and the
+/// from `~/.zshenv`, the file zsh always sources from `$HOME` and the
 /// conventional place users set ZDOTDIR.
 fn zsh_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("ZDOTDIR").filter(|v| !v.is_empty()) {
@@ -8566,7 +8577,44 @@ fn zsh_dir() -> PathBuf {
             return dir;
         }
     }
-    zdotdir_from_zshenv(&home_dir()).unwrap_or_else(home_dir)
+    // Asked once per home: every status poll resolves shell targets, and the
+    // home only changes under TestHome.
+    static ASKED: std::sync::Mutex<Option<(PathBuf, Option<PathBuf>)>> =
+        std::sync::Mutex::new(None);
+    let home = home_dir();
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    if asked
+        .as_ref()
+        .is_none_or(|(asked_home, _)| *asked_home != home)
+    {
+        *asked = Some((home.clone(), zdotdir_from_zsh(&home)));
+    }
+    let from_zsh = asked.as_ref().and_then(|(_, dir)| dir.clone());
+    drop(asked);
+    from_zsh
+        .or_else(|| zdotdir_from_zshenv(&home))
+        .unwrap_or(home)
+}
+
+/// Ask zsh itself. A non-interactive `zsh -c` sources only the zshenv files,
+/// so every way of setting ZDOTDIR there resolves as the user's shells see it
+/// (`"$HOME"/.config/zsh`, `${XDG_CONFIG_HOME:-$HOME/.config}/zsh`, a value
+/// built on an earlier line), which the line parser below gets wrong. Only an
+/// absolute, existing directory is trusted; no zsh, a slow zshenv or odd
+/// output falls back to the parser.
+fn zdotdir_from_zsh(home: &Path) -> Option<PathBuf> {
+    let mut command = crate::proc::command("zsh");
+    command
+        .args(["-c", "print -rn -- \"${ZDOTDIR:-$HOME}\""])
+        .env("HOME", home)
+        .env_remove("ZDOTDIR");
+    let output = crate::proc::output_with_timeout(command, Duration::from_secs(3)).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Last line: a zshenv that prints a banner puts it ahead of the answer.
+    let dir = PathBuf::from(String::from_utf8(output.stdout).ok()?.lines().last()?);
+    (dir.is_absolute() && dir.is_dir()).then_some(dir)
 }
 
 /// Expand `$VAR` / `${VAR}` from the process env. Unset vars are left as the
@@ -10845,6 +10893,33 @@ print(settings(data) is None, settings(data, windows=True) is None)
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A hand-deleted opener leaves a stray end marker ahead of the block. The
+    /// verify helpers sliced `content[start..end]` from two independent finds
+    /// and panicked on it, killing the proxy watchdog and tray threads through
+    /// rtk_integration_status. Upsert appended a fresh copy on every launch and
+    /// remove duplicated the file instead of removing the block.
+    #[test]
+    fn shell_block_ops_tolerate_a_stray_end_marker_before_the_block() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".zshrc");
+        let content = "# <<< headroom:managed_rtk <<<\n# >>> headroom:managed_rtk >>>\nexport PATH=/x:$PATH\n# <<< headroom:managed_rtk <<<\n";
+        fs::write(&path, content).unwrap();
+        let targets = std::slice::from_ref(&path);
+
+        assert!(
+            shell_block_contains_text_in_files(targets, "managed_rtk", "export PATH=").unwrap()
+        );
+        assert!(shell_block_contains_in_files(targets, "managed_rtk", "PATH", "/x:$PATH").unwrap());
+
+        let (changed, _) =
+            upsert_managed_block(&path, "managed_rtk", "export PATH=/x:$PATH").unwrap();
+        assert!(!changed, "an intact block behind a stray end is current");
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+
+        assert!(remove_managed_block(&path, "managed_rtk").unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    }
+
     #[test]
     fn write_file_if_changed_skips_backups_when_content_is_unchanged() {
         let root = unique_temp_dir("headroom-write-file");
@@ -11040,6 +11115,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         )
         .unwrap();
         assert_eq!(super::zdotdir_from_zshenv(&home), None);
+    }
+
+    /// `ZDOTDIR="$HOME"/.config/zsh` (quote then bare tail) resolved to $HOME
+    /// through the line parser, so the managed blocks went into a ~/.zshrc zsh
+    /// never reads. zsh itself answers every form correctly.
+    #[test]
+    #[serial_test::serial]
+    fn zsh_dir_asks_zsh_for_a_zdotdir_the_parser_cannot_read() {
+        if super::find_on_path(&["zsh"]).is_none() {
+            eprintln!("skipping: no zsh on PATH");
+            return;
+        }
+        let home = TestHome::new();
+        let zdotdir = home.path().join(".config").join("zsh");
+        fs::create_dir_all(&zdotdir).unwrap();
+        fs::write(
+            home.path().join(".zshenv"),
+            "export ZDOTDIR=\"$HOME\"/.config/zsh\n",
+        )
+        .unwrap();
+
+        assert_eq!(super::zsh_dir(), zdotdir);
+        assert_eq!(super::shell_path(".zshrc"), zdotdir.join(".zshrc"));
     }
 
     #[test]
@@ -12142,6 +12240,52 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         // Verification reads the same profiles and must not blow up either.
         super::verify_client_setup("claude_code").expect("verification tolerates bad profile");
+    }
+
+    /// A shell rc Headroom may not read (chmod 000, a root-owned copy, a
+    /// dotfiles symlink macOS privacy protection denies) failed shell-target
+    /// discovery, so every client setup aborted before settings.json was
+    /// written, and a quit-time disable returned before it stripped
+    /// ANTHROPIC_BASE_URL, leaving Claude Code on the stopped proxy.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_shell_rc_blocks_neither_setup_nor_quit_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        let zshrc = home.path().join(".zshrc");
+        fs::write(&zshrc, "# user zshrc\n").unwrap();
+        fs::set_permissions(&zshrc, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&zshrc).is_ok() {
+            eprintln!("skipping: running as root, permissions are not enforced");
+            return;
+        }
+        let settings = home.path().join(".claude").join("settings.json");
+        let base_url = |settings: &Path| {
+            read_settings_json(settings)["env"]["ANTHROPIC_BASE_URL"]
+                .as_str()
+                .map(str::to_owned)
+        };
+
+        super::apply_client_setup("claude_code").expect("setup succeeds despite unreadable rc");
+        assert_eq!(
+            base_url(&settings).as_deref(),
+            Some("http://127.0.0.1:6767")
+        );
+        super::clear_client_setups().expect("clear");
+        assert_eq!(base_url(&settings), None);
+
+        // A readable profile holds our block, but the shell cleanup still
+        // fails (no backup can be written next to it). Routing is removed first.
+        super::apply_client_setup("claude_code").expect("re-apply");
+        assert!(fs::read_to_string(home.path().join(".zprofile"))
+            .unwrap()
+            .contains("# >>> headroom:claude_code >>>"));
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let disabled = super::disable_client_setup("claude_code");
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        disabled.expect("disable tolerates a shell cleanup failure");
+        assert_eq!(base_url(&settings), None);
     }
 
     /// A shell export of ANTHROPIC_BASE_URL outlives quit: shells, tmux and VS
