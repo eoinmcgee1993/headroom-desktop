@@ -586,7 +586,9 @@ pub struct AppState {
     cumulative_report_throttle: Mutex<Option<(u64, Instant)>>,
     activity_facts: Mutex<ActivityFacts>,
     cached_clients: Mutex<Option<(Vec<ClientStatus>, Instant)>>,
-    cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant)>>,
+    /// `(stats, fetched_at, hold)`: `hold` is how long this poll's outcome
+    /// stands, which depends on how it failed; see `polled_headroom_stats`.
+    cached_headroom_stats: Mutex<Option<(Option<HeadroomDashboardStats>, Instant, Duration)>>,
     /// Last `/stats` payload that actually arrived, with the time it did.
     /// Kept apart from `cached_headroom_stats` so the miss backoff and the
     /// retention window measure different things: that cache stamps the last
@@ -595,10 +597,13 @@ pub struct AppState {
     last_good_headroom_stats: Mutex<Option<(HeadroomDashboardStats, Instant)>>,
     /// Set while a `/stats` fetch is in flight; see `polled_headroom_stats`.
     headroom_stats_fetch_in_flight: AtomicBool,
-    /// `(history, fetched_at, fresh)` — `fresh` is false when `history` is a
-    /// retained last-good value served because the latest fetch failed (proxy
-    /// paused/unreachable), so it re-probes on the short miss TTL.
-    cached_headroom_history: Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant, bool)>>,
+    /// `(history, fetched_at, hold)`. After a failed fetch `history` is the
+    /// retained last-good value and `hold` says when to re-probe; see
+    /// `cached_headroom_history`.
+    cached_headroom_history:
+        Mutex<Option<(Option<HeadroomSavingsHistoryResponse>, Instant, Duration)>>,
+    /// Set while a `/stats-history` fetch is in flight; see `cached_headroom_history`.
+    headroom_history_fetch_in_flight: AtomicBool,
     cached_rtk_gain_summary: Mutex<Option<(Option<RtkGainSummary>, Instant)>>,
     cached_rtk_today_stats: Mutex<Option<(Option<crate::models::RtkTodayStats>, Instant)>>,
     cached_claude_profile: Mutex<Option<(Option<String>, ClaudeAccountProfile, Instant)>>,
@@ -763,6 +768,7 @@ impl AppState {
             last_good_headroom_stats: Mutex::new(None),
             headroom_stats_fetch_in_flight: AtomicBool::new(false),
             cached_headroom_history: Mutex::new(None),
+            headroom_history_fetch_in_flight: AtomicBool::new(false),
             cached_rtk_gain_summary: Mutex::new(None),
             cached_rtk_today_stats: Mutex::new(None),
             cached_claude_profile: Mutex::new(None),
@@ -2314,21 +2320,24 @@ impl AppState {
         // re-fetch from the proxy. 12s gives at least one cache hit between
         // dashboard refreshes while keeping session savings visibly fresh.
         const TTL: Duration = Duration::from_secs(12);
-        // A failure is held far longer than a success, which is the opposite of
-        // `cached_headroom_history` and deliberate: the dominant failure here
-        // is a `/stats` rebuild that outruns its 15s timeout on a backend busy
-        // serving a session. Re-probing that every 12s keeps a 15s blocking
-        // request in flight essentially all the time, so the poll itself
-        // becomes part of the starvation it is reporting -- RUST-86 shipped
-        // 1601 events that way. At 60s the probe still recovers within a few
-        // seconds of the backend freeing up, at a fifth of the load, and the
-        // retained payload above covers the gap.
+        // A failed request is held far longer than a success, deliberately: the
+        // dominant failure here is a `/stats` rebuild that outruns its 15s
+        // timeout on a backend busy serving a session. Re-probing that every
+        // 12s keeps a 15s blocking request in flight essentially all the
+        // time, so the poll itself becomes part of the starvation it is
+        // reporting -- RUST-86 shipped 1601 events that way. At 60s the probe
+        // still recovers within a few seconds of the backend freeing up, at a
+        // fifth of the load, and the retained payload above covers the gap.
         const MISS_TTL: Duration = Duration::from_secs(60);
+        // But only a request that was SENT: a proxy that is not up yet (cold
+        // start, restart) was never asked for a rebuild, so there is nothing
+        // to back off from, and holding that miss 60s left the `/stats`-only
+        // fields blank for up to a minute after the backend began serving.
+        const UNREACHABLE_TTL: Duration = Duration::from_secs(3);
         {
             let cache = self.cached_headroom_stats.lock();
-            if let Some((stats, at)) = cache.as_ref() {
-                let ttl = if stats.is_some() { TTL } else { MISS_TTL };
-                if at.elapsed() < ttl {
+            if let Some((stats, at, hold)) = cache.as_ref() {
+                if at.elapsed() < *hold {
                     return stats.clone();
                 }
             }
@@ -2350,17 +2359,15 @@ impl AppState {
         {
             return None;
         }
-        // Cleared on every exit, panics included: a stuck flag would stop
-        // `/stats` fetching for the process lifetime.
-        struct InFlight<'a>(&'a AtomicBool);
-        impl Drop for InFlight<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::Release);
-            }
-        }
         let _in_flight = InFlight(&self.headroom_stats_fetch_in_flight);
-        let stats = fetch_headroom_dashboard_stats();
-        *self.cached_headroom_stats.lock() = Some((stats.clone(), Instant::now()));
+        let (stats, hold) = if is_headroom_proxy_reachable() {
+            let stats = fetch_headroom_dashboard_stats();
+            let hold = if stats.is_some() { TTL } else { MISS_TTL };
+            (stats, hold)
+        } else {
+            (None, UNREACHABLE_TTL)
+        };
+        *self.cached_headroom_stats.lock() = Some((stats.clone(), Instant::now(), hold));
         stats
     }
 
@@ -2369,39 +2376,48 @@ impl AppState {
         // the Home charts only change a handful of times per minute under
         // active traffic. A 30s TTL absorbs most dashboard polls while still
         // updating the chart's most-recent bucket within one full refresh.
+        // A request that was sent and failed is held as long: the build it
+        // asked for already ran on the backend's event loop, and re-asking
+        // every poll turned that 30s cadence into ~20% of the loop.
         const TTL: Duration = Duration::from_secs(30);
-        // A miss (backend not yet reachable on cold start, or a retained
-        // last-good value while the proxy is paused) is cached briefly so the
-        // chart resolves/recovers within a few seconds, instead of holding the
-        // startup loading state or stale data for a full 30s.
-        const MISS_TTL: Duration = Duration::from_secs(3);
+        // A proxy that is not up yet (cold start, or paused) is re-probed
+        // briefly so the chart resolves/recovers within a few seconds, instead
+        // of holding the startup loading state or stale data for a full 30s.
+        const UNREACHABLE_TTL: Duration = Duration::from_secs(3);
         {
             let cache = self.cached_headroom_history.lock();
-            if let Some((history, at, fresh)) = cache.as_ref() {
-                let ttl = if *fresh { TTL } else { MISS_TTL };
-                if at.elapsed() < ttl {
+            if let Some((history, at, hold)) = cache.as_ref() {
+                if at.elapsed() < *hold {
                     return history.clone();
                 }
             }
         }
-        // Guard dropped across the fetch — see cached_headroom_stats.
-        match fetch_headroom_savings_history() {
-            Some(history) => {
-                *self.cached_headroom_history.lock() =
-                    Some((Some(history.clone()), Instant::now(), true));
-                Some(history)
-            }
-            None => {
-                // Retain the last good history so a transient proxy pause
-                // doesn't revert the Home chart to the sparse tracker-only
-                // layer. Mark it stale so we re-probe on the short miss TTL and
-                // recover quickly once the proxy returns.
-                let mut cache = self.cached_headroom_history.lock();
-                let retained = cache.as_ref().and_then(|(h, _, _)| h.clone());
-                *cache = Some((retained.clone(), Instant::now(), false));
-                retained
-            }
+        // One fetch at a time, guard dropped across it, as for `/stats`: with
+        // a 15s timeout the 5s dashboard poll and the tray updater would
+        // otherwise stack fetches on one slow build. A caller arriving
+        // mid-fetch gets the retained value.
+        if self
+            .headroom_history_fetch_in_flight
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return self
+                .cached_headroom_history
+                .lock()
+                .as_ref()
+                .and_then(|(history, _, _)| history.clone());
         }
+        let _in_flight = InFlight(&self.headroom_history_fetch_in_flight);
+        let (fetched, hold) = if is_headroom_proxy_reachable() {
+            (fetch_headroom_savings_history(), TTL)
+        } else {
+            (None, UNREACHABLE_TTL)
+        };
+        // A miss retains the last good history so a transient proxy pause
+        // doesn't revert the Home chart to the sparse tracker-only layer.
+        let mut cache = self.cached_headroom_history.lock();
+        let history = fetched.or_else(|| cache.as_ref().and_then(|(h, _, _)| h.clone()));
+        *cache = Some((history.clone(), Instant::now(), hold));
+        history
     }
 
     fn cached_rtk_gain_summary(&self) -> Option<RtkGainSummary> {
@@ -2562,8 +2578,15 @@ impl AppState {
         };
         let mut pending_milestones = PendingMilestones::default();
 
-        let stats = self.cached_headroom_stats();
-        let history = self.cached_headroom_history();
+        // 6767 not ours (another OS user's Headroom holds it, or a relaunch
+        // overlap) means `/stats` and `/stats-history` describe THAT
+        // instance's traffic: ingesting them would persist it here and report
+        // it as this account's savings. The tracker's own record stands in.
+        let spectator = self.intercept_bind_failed();
+        let stats = (!spectator).then(|| self.cached_headroom_stats()).flatten();
+        let history = (!spectator)
+            .then(|| self.cached_headroom_history())
+            .flatten();
         if history.is_some() {
             self.savings_history_loaded
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -7024,7 +7047,8 @@ const STATS_FETCH_WARN_MAX_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// enough that a busy-proxy flap cannot span it, short enough that a genuine
 /// fix is loud again within one sitting.
 const STATS_FETCH_RECOVERY_WINDOW: Duration = Duration::from_secs(300);
-/// Per-request `/stats` timeout; see `fetch_headroom_dashboard_stats` for why 15s.
+/// Per-request `/stats` and `/stats-history` timeout; see
+/// `fetch_headroom_dashboard_stats` for why 15s.
 const STATS_FETCH_TIMEOUT_SECS: u64 = 15;
 static STATS_FETCH_WARNED_AT: Mutex<Option<(Instant, u32)>> = Mutex::new(None);
 /// When the current unbroken run of successful fetches began; `None` when the
@@ -7333,11 +7357,18 @@ fn report_cache_integrity(body: &str) {
     );
 }
 
-fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
-    if !is_headroom_proxy_reachable() {
-        return None;
-    }
+/// Clears a fetch's in-flight flag on every exit, panics included: a stuck
+/// flag would stop that fetch for the process lifetime.
+struct InFlight<'a>(&'a AtomicBool);
 
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Callers probe `/readyz` first (see `polled_headroom_stats`).
+fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     // 500ms was silently fatal: `/stats` rebuilds its whole payload per call
     // and crossed half a second as history grew, so every fetch timed out and
     // the dashboard lost the layers only this endpoint reports (output
@@ -7357,7 +7388,7 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     let mut last_failure: Option<String> = None;
 
     for host in hosts {
-        let url = format!("http://{host}:6767/stats?cached=1");
+        let url = format!("http://{host}:{}/stats?cached=1", local_proxy_port());
         let response = match client.get(&url).send() {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
@@ -7454,23 +7485,26 @@ fn scrape_compression_quarantine() {
     }
 }
 
+/// Callers probe `/readyz` first (see `cached_headroom_history`).
 fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
-    if !is_headroom_proxy_reachable() {
-        return None;
-    }
-
+    // Same budget as `/stats`: the backend builds this on its event loop in
+    // 0.5-1.9s under ordinary traffic, so the 500ms this used to allow failed
+    // most fetches and re-ran the build on every retry.
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_millis(500))
+        .timeout(Duration::from_secs(STATS_FETCH_TIMEOUT_SECS))
         .build()
         .ok()?;
 
     let hosts = ["127.0.0.1", "localhost"];
 
     for host in hosts {
-        let url = format!("http://{host}:6767/stats-history");
+        let url = format!("http://{host}:{}/stats-history", local_proxy_port());
         let response = match client.get(&url).send() {
             Ok(response) if response.status().is_success() => response,
+            // Both host names reach the same listener, so retrying a stalled
+            // build on the other alias only runs it twice.
+            Err(err) if err.is_timeout() => return None,
             _ => continue,
         };
 
@@ -9044,6 +9078,22 @@ fn is_headroom_proxy_reachable() -> bool {
     probe_proxy_readyz(Duration::from_millis(1500))
 }
 
+/// The intercept port the local `/readyz`, `/stats` and `/stats-history` polls
+/// target. A test points its own thread at a throwaway listener instead, since
+/// a dev machine has the real Headroom answering on 6767.
+fn local_proxy_port() -> u16 {
+    #[cfg(test)]
+    if let Some(port) = TEST_PROXY_PORT.with(std::cell::Cell::get) {
+        return port;
+    }
+    crate::proxy_intercept::INTERCEPT_PORT
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PROXY_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether the runtime is already serving, so `ensure_headroom_running` can
 /// return without spawning. Split out from the probes so the decision itself is
 /// testable: the probes hit the network and shell out, this does not.
@@ -9100,7 +9150,10 @@ fn probe_proxy_readyz(timeout: Duration) -> bool {
     };
 
     for host in ["127.0.0.1", "localhost"] {
-        match client.get(format!("http://{host}:6767/readyz")).send() {
+        match client
+            .get(format!("http://{host}:{}/readyz", local_proxy_port()))
+            .send()
+        {
             Ok(response) => return proxy_readyz_response_is_reachable(response),
             // Accepted but slow: the same server sits behind both names, so a
             // second leg only doubles the wait. Only a connect failure earns
@@ -10515,7 +10568,7 @@ mod tests {
         SavingsObservation, SavingsRecord, SavingsTracker, OUTPUT_SAMPLE_SERIES_VERSION,
         STATS_FETCH_LAST_FAILED_AT, STATS_FETCH_LAST_OK, STATS_FETCH_RECOVERED_AT,
         STATS_FETCH_RECOVERY_WINDOW, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
-        STATS_FETCH_WARN_MAX_INTERVAL,
+        STATS_FETCH_WARN_MAX_INTERVAL, TEST_PROXY_PORT,
     };
 
     #[test]
@@ -12990,8 +13043,9 @@ mod tests {
         // Prime both poll caches with a fresh miss: on a dev machine the real
         // proxy answers on 6767, and its live stats would replace the seeded
         // buckets above.
-        *state.cached_headroom_stats.lock() = Some((None, Instant::now()));
-        *state.cached_headroom_history.lock() = Some((None, Instant::now(), true));
+        *state.cached_headroom_stats.lock() = Some((None, Instant::now(), Duration::from_secs(60)));
+        *state.cached_headroom_history.lock() =
+            Some((None, Instant::now(), Duration::from_secs(30)));
 
         // The output layer prices off ~/.headroom/output_savings.json; on a
         // developer machine that real ledger adds hundreds of dollars to the
@@ -13724,10 +13778,15 @@ mod tests {
                 history_point_at(2026, 3, 20, 12, 1_500_000),
             ],
         };
-        *state.cached_headroom_stats.lock() = Some((Some(stats), std::time::Instant::now()));
+        *state.cached_headroom_stats.lock() = Some((
+            Some(stats),
+            std::time::Instant::now(),
+            Duration::from_secs(12),
+        ));
         // Pin the history cache to a fresh miss so build_dashboard doesn't try
         // to fetch native rollups over the network during the test.
-        *state.cached_headroom_history.lock() = Some((None, std::time::Instant::now(), true));
+        *state.cached_headroom_history.lock() =
+            Some((None, std::time::Instant::now(), Duration::from_secs(30)));
 
         // Read-only path observes (building buckets) but must not surface or
         // consume milestones.
@@ -14667,7 +14726,7 @@ mod tests {
         };
         *state.last_good_headroom_stats.lock() = Some((good.clone(), Instant::now()));
         // A failed poll, cached as a miss.
-        *state.cached_headroom_stats.lock() = Some((None, Instant::now()));
+        *state.cached_headroom_stats.lock() = Some((None, Instant::now(), Duration::from_secs(60)));
 
         let served = state
             .cached_headroom_stats()
@@ -14676,7 +14735,7 @@ mod tests {
 
         // The miss is still cached: no fetch was attempted, so the 15s probe
         // is not re-armed on the next dashboard poll.
-        let (cached, _) = (*state.cached_headroom_stats.lock())
+        let (cached, _, _) = (*state.cached_headroom_stats.lock())
             .clone()
             .expect("miss stays cached");
         assert!(
@@ -14696,6 +14755,102 @@ mod tests {
                 "a retained payload must expire"
             );
         }
+    }
+
+    /// A local port with nothing listening, so every probe is refused at once.
+    fn dead_local_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("bind ephemeral")
+            .port()
+    }
+
+    #[test]
+    fn a_stats_miss_before_the_proxy_is_up_is_retried_on_the_next_poll() {
+        // Cold start: the first dashboard build lands before /readyz answers.
+        // That miss was held the 60s meant for a /stats request that was sent
+        // and timed out, so the /stats-only fields stayed blank for up to a
+        // minute after the backend was serving.
+        TEST_PROXY_PORT.with(|port| port.set(Some(dead_local_port())));
+        let state = AppState::new().expect("state");
+        assert!(state.polled_headroom_stats().is_none());
+        {
+            let mut cache = state.cached_headroom_stats.lock();
+            let entry = cache.as_mut().expect("the unreachable miss is cached");
+            // One dashboard poll interval later.
+            entry.1 = Instant::now()
+                .checked_sub(Duration::from_secs(5))
+                .expect("uptime");
+        }
+        assert!(state.polled_headroom_stats().is_none());
+        let age = state
+            .cached_headroom_stats
+            .lock()
+            .as_ref()
+            .expect("cached")
+            .1
+            .elapsed();
+        assert!(
+            age < Duration::from_secs(5),
+            "a proxy-not-up miss must re-probe on the next poll, not wait out 60s"
+        );
+    }
+
+    #[test]
+    fn savings_history_waits_out_a_slow_backend_build() {
+        // /stats-history builds on the backend's event loop and takes 0.5-1.9s
+        // under ordinary traffic. A 500ms client timeout failed every such
+        // fetch, so the chart never hydrated and each retry re-ran the build.
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let port = listener.local_addr().expect("addr").port();
+        // The readyz probe, then the history fetch.
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if String::from_utf8_lossy(&buf[..n]).starts_with("GET /stats-history") {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                let body = r#"{"lifetime":{"compression_savings_usd":1.5}}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        TEST_PROXY_PORT.with(|cell| cell.set(Some(port)));
+        let state = AppState::new().expect("state");
+        assert!(
+            state.cached_headroom_history().is_some(),
+            "a 1s /stats-history build must land, not time out"
+        );
+        server.join().expect("mock server");
+    }
+
+    #[test]
+    fn a_spectator_instance_does_not_poll_the_other_instances_stats() {
+        // 6767 held by another Headroom (another OS user's app, or a relaunch
+        // overlap): its /stats and /stats-history carry THAT instance's
+        // traffic, which this one would persist and report as its own savings.
+        TEST_PROXY_PORT.with(|port| port.set(Some(dead_local_port())));
+        let state = AppState::new().expect("state");
+        *state.intercept_bind_error.lock() =
+            Some("port 6767 is served by another Headroom instance".to_string());
+        let _ = state.dashboard();
+        assert!(
+            state.cached_headroom_stats.lock().is_none(),
+            "a spectator must not poll /stats"
+        );
+        assert!(
+            state.cached_headroom_history.lock().is_none(),
+            "a spectator must not poll /stats-history"
+        );
     }
 
     #[test]
