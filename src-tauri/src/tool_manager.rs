@@ -1667,7 +1667,7 @@ if _hd_lrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
-# --- Learn: a git worktree is its repo, not a project (vendor, upstream owed) --
+# --- Learn: a git worktree is its repo, not a project (vendor, upstream #3854) -
 # Claude Code files each working directory's sessions under its own
 # ~/.claude/projects folder, so every linked worktree (a Conductor workspace,
 # .claude/worktrees/*) became its own learn project: a few sessions each, too
@@ -1706,6 +1706,10 @@ if _hd_lwm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                     # submodule's does not). A bare repo has no checkout.
                     try:
                         path = _hd_lwm_Path(path)
+                        # A relative path (a Windows path decoded on POSIX)
+                        # would walk up into the process's working directory.
+                        if not path.is_absolute():
+                            return None
                         for d in (path, *path.parents):
                             if (d / ".git").exists():
                                 break
