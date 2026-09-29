@@ -161,7 +161,7 @@ fn rtk_codex_agents_path() -> PathBuf {
 /// Codex nudge: Codex has no command-rewrite hook, so it routes shell commands
 /// through the managed `rtk` binary by being told to prefix them with it.
 fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
-    let bin = managed_rtk_path.display();
+    let bin = shell_word(managed_rtk_path);
     format!(
         "## Token-saving shell commands (Headroom RTK)\n\
          Run shell commands through RTK to get compact, token-optimized output:\n\
@@ -1847,6 +1847,17 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
     if let Err(err) = remove_managed_block(&rtk_codex_agents_path(), "rtk") {
         log::warn!("cleanup: removing rtk AGENTS.md block failed: {err}");
     }
+    // MarkItDown's nudges, Bash rule and conversion cache: uninstall_and_quit
+    // removes them through the ToolManager, which `--uninstall` does not have.
+    // The unix shim path (ToolManager::markitdown_shim_path); Windows has no
+    // Bash rule to match, and the rest does not depend on the path.
+    let markitdown_shim = home_dir()
+        .join(".headroom")
+        .join("bin")
+        .join("headroom-markitdown");
+    if let Err(err) = disable_markitdown_integration(&markitdown_shim) {
+        log::warn!("cleanup: removing the MarkItDown integration failed: {err}");
+    }
 
     // MCP server registrations live in the agents' own configs, outside
     // Headroom's footprint. uninstall_and_quit unregisters via the Python
@@ -2346,8 +2357,9 @@ fn strip_headroom_hook_from_settings(settings_path: &Path) -> Result<bool> {
     )
 }
 
-/// Removes every PreToolUse hook entry whose command contains one of `markers`,
-/// pruning empty `PreToolUse`/`hooks` containers. Returns whether the file changed.
+/// Removes every PreToolUse hook whose command contains one of `markers` (a
+/// user hook in the same matcher group stays), pruning empty `PreToolUse`/`hooks`
+/// containers. Returns whether the file changed.
 fn remove_pre_tool_use_markers(settings_path: &Path, markers: &[&str]) -> Result<bool> {
     if !settings_path.exists() {
         return Ok(false);
@@ -2373,15 +2385,7 @@ fn remove_pre_tool_use_markers(settings_path: &Path, markers: &[&str]) -> Result
         .get_mut("PreToolUse")
         .and_then(|value| value.as_array_mut())
     {
-        let before = pre_tool_use.len();
-        pre_tool_use.retain(|entry| {
-            !markers
-                .iter()
-                .any(|marker| entry_contains_hook(entry, marker))
-        });
-        if pre_tool_use.len() != before {
-            changed = true;
-        }
+        changed = strip_hook_from_groups(pre_tool_use, markers);
         if pre_tool_use.is_empty() {
             hooks_obj.remove("PreToolUse");
         }
@@ -2762,6 +2766,12 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         return atomic_write_at(path, contents);
     }
     atomic_write_at(&resolved, contents).or_else(|err| {
+        // A dangling link into a tree we cannot create (a dotfiles volume not
+        // mounted yet): the caller built `contents` from an empty file, so
+        // replacing the link would leave a copy holding only our part.
+        if std::fs::symlink_metadata(&resolved).is_err() {
+            return Err(err);
+        }
         // A link into a tree we cannot write (Nix home-manager points
         // ~/.claude/settings.json into the read-only /nix/store) can't be
         // written through. Replacing the link is what every write did before,
@@ -3175,10 +3185,10 @@ fn markitdown_codex_agents_path() -> PathBuf {
     codex_home().join("AGENTS.md")
 }
 
-/// The shim as a shell word: quoted only when a path with whitespace (a home
-/// dir with a space) would otherwise split. Such a path gets no Bash rule.
-fn markitdown_shim_word(shim_path: &Path) -> String {
-    let bin = shim_path.display().to_string();
+/// A path as a shell word: quoted only when a path with whitespace (a home
+/// dir with a space, macOS "Application Support") would otherwise split.
+fn shell_word(path: &Path) -> String {
+    let bin = path.display().to_string();
     if bin.contains(char::is_whitespace) {
         format!("'{bin}'")
     } else {
@@ -3207,7 +3217,7 @@ fn markitdown_rule_allowed(shim_path: &Path) -> bool {
 /// Office-only nudge for Claude Code, where PDFs are already handled by the
 /// PreToolUse(Read) hook.
 fn build_markitdown_office_nudge(shim_path: &Path) -> String {
-    let bin = markitdown_shim_word(shim_path);
+    let bin = shell_word(shim_path);
     format!(
         "## Reading Office documents (Headroom MarkItDown)\n\
          The Read tool cannot open .docx, .doc, .pptx, .ppt, .xlsx, or .xls files.\n\
@@ -3219,7 +3229,7 @@ fn build_markitdown_office_nudge(shim_path: &Path) -> String {
 /// Codex nudge: Codex has no PreToolUse-style hook, so it covers PDF *and*
 /// Office formats through the `markitdown` CLI.
 fn build_markitdown_codex_nudge(shim_path: &Path) -> String {
-    let bin = markitdown_shim_word(shim_path);
+    let bin = shell_word(shim_path);
     format!(
         "## Reading documents (Headroom MarkItDown)\n\
          To read a .pdf, .docx, .doc, .pptx, .ppt, .xlsx, or .xls file, run\n\
@@ -3301,18 +3311,23 @@ pub fn enable_markitdown_integration(
 /// client that was later disconnected is still scrubbed.
 pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
     let _setup = setup_write_lock();
-    let mut changed =
-        remove_pre_tool_use_markers(&claude_settings_path(), &["headroom-markitdown-read.sh"])?;
     let hook_path = headroom_markitdown_hook_path();
     if hook_path.exists() {
         let _ = std::fs::remove_file(&hook_path);
     }
-    changed |= remove_managed_block(&markitdown_claude_md_path(), "markitdown_office")?;
-    changed |= set_markitdown_bash_permission(markitdown_shim, &[], |_| Some(false))?;
-    changed |= remove_managed_block(&markitdown_codex_agents_path(), "markitdown")?;
+    // Every step runs before the first error is returned: an unparseable
+    // settings.json used to leave both nudges and the cache behind.
+    let steps = [
+        remove_pre_tool_use_markers(&claude_settings_path(), &["headroom-markitdown-read.sh"]),
+        remove_managed_block(&markitdown_claude_md_path(), "markitdown_office"),
+        set_markitdown_bash_permission(markitdown_shim, &[], |_| Some(false)),
+        remove_managed_block(&markitdown_codex_agents_path(), "markitdown"),
+    ];
     // Converted document text must not outlive the integration.
     let _ = std::fs::remove_dir_all(markitdown_cache_dir());
-    Ok(changed)
+    steps
+        .into_iter()
+        .try_fold(false, |changed, step| Ok(changed | step?))
 }
 
 /// The Read hook's conversion cache; mirrors the path the hook computes.
@@ -3714,7 +3729,7 @@ fn ensure_claude_settings_hook(
         return Err(anyhow!("unable to write Claude PreToolUse hooks"));
     };
 
-    pre_tool_use.retain(|entry| !entry_contains_hook(entry, marker));
+    strip_hook_from_groups(pre_tool_use, &[marker]);
     pre_tool_use.push(serde_json::json!({
         "matcher": matcher,
         "hooks": [{
@@ -4143,6 +4158,32 @@ fn claude_hook_present_in_value(content: &Value, hook_path: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// Removes the handlers whose `command` contains one of `fragments` from each
+/// matcher group, and drops a group only when that empties it. Claude Code's
+/// hook editor appends a user's hook to the first group with the same matcher,
+/// which can be ours, so dropping the whole group deleted the user's hook too.
+/// Returns whether anything was removed.
+fn strip_hook_from_groups(entries: &mut Vec<Value>, fragments: &[&str]) -> bool {
+    let mut changed = false;
+    entries.retain_mut(|entry| {
+        let Some(hooks) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let before = hooks.len();
+        hooks.retain(|hook| {
+            !hook
+                .get("command")
+                .is_some_and(|c| fragments.iter().any(|f| command_contains(c, f)))
+        });
+        if hooks.len() == before {
+            return true;
+        }
+        changed = true;
+        !hooks.is_empty()
+    });
+    changed
 }
 
 fn entry_contains_hook(entry: &Value, hook_fragment: &str) -> bool {
@@ -6290,11 +6331,7 @@ fn remove_guard_hook_entries(
                 }
             }
             if let Some(entries) = hooks_obj.get_mut(&event).and_then(Value::as_array_mut) {
-                let before = entries.len();
-                entries.retain(|entry| !entry_contains_hook(entry, command));
-                if entries.len() != before {
-                    changed = true;
-                }
+                changed |= strip_hook_from_groups(entries, &[command]);
             }
         }
         hooks_obj.retain(|_, value| !value.as_array().map(|arr| arr.is_empty()).unwrap_or(false));
@@ -7341,6 +7378,15 @@ fn ensure_claude_remote_control_command() -> Result<(Vec<String>, Vec<String>)> 
             true,
         ),
     ] {
+        // Our commands carry the marker; a same-name file without it is the
+        // user's own and stays, as remove_claude_remote_control_command leaves it.
+        if content.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER)
+            && std::fs::read_to_string(&path)
+                .is_ok_and(|existing| !existing.contains(CLAUDE_REMOTE_CONTROL_COMMAND_MARKER))
+        {
+            log::info!("keeping the user's own {}", path.display());
+            continue;
+        }
         let (did_change, backup) = write_file_if_changed(&path, &content, executable)?;
         if did_change {
             changed.push(path.display().to_string());
@@ -7892,6 +7938,12 @@ pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
 
     let stamp = Utc::now().format("%Y%m%d%H%M%S");
     let backup_path = PathBuf::from(format!("{}.headroom-backup-{}", path.display(), stamp));
+    // One apply rewrites a file several times within a second. The first
+    // backup of the second holds the user's original; a later copy would
+    // replace it with our own intermediate rewrite.
+    if backup_path.exists() {
+        return Ok(Some(backup_path));
+    }
     retry_transient_denied(|| std::fs::copy(path, &backup_path))
         .with_context(|| format!("creating backup {}", backup_path.display()))?;
 
@@ -7914,7 +7966,15 @@ pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
                         .unwrap_or(false)
                 })
                 .collect();
-            backups.sort();
+            // nommer backups predate every headroom one (the app's old name);
+            // sorted by path they came last and got each new backup pruned.
+            backups.sort_by_key(|p| {
+                let ours = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&headroom_prefix));
+                (ours, p.clone())
+            });
             if backups.len() > 3 {
                 for old in &backups[..backups.len() - 3] {
                     let _ = std::fs::remove_file(old);
@@ -10579,6 +10639,19 @@ print(settings(data) is None, settings(data, windows=True) is None)
             super::set_markitdown_bash_permission(old, &[], |_| Some(true)).unwrap();
         }
         let pre_migration = fs::read_to_string(&settings_path).unwrap();
+        // The writes above share the stamp second, whose first backup is kept.
+        for entry in fs::read_dir(settings_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+        {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("settings.json.headroom-backup-")
+            {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
 
         super::refresh_markitdown_integration(md, &shim, &legacy, py).expect("refresh");
         // One write, so its backup is the settings from before the move (two
@@ -10647,6 +10720,21 @@ print(settings(data) is None, settings(data, windows=True) is None)
         assert!(!settings.contains("markitdown"), "{settings}");
         assert!(build_markitdown_office_nudge(shim)
             .contains("`'/Users/Jane Doe/.headroom/bin/headroom-markitdown' <path>`"));
+    }
+
+    #[test]
+    fn rtk_codex_nudge_quotes_a_path_with_a_space() {
+        // macOS keeps rtk under "Application Support"; unquoted, the shell
+        // split the example at the space and the command exited 127.
+        let nudge = super::build_rtk_codex_nudge(Path::new(
+            "/Users/u/Library/Application Support/Headroom/headroom/bin/rtk",
+        ));
+        assert!(
+            nudge.contains(
+                "`'/Users/u/Library/Application Support/Headroom/headroom/bin/rtk' git status`"
+            ),
+            "{nudge}"
+        );
     }
 
     #[test]
@@ -11252,6 +11340,77 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hook_removal_keeps_a_user_hook_sharing_our_matcher_group() {
+        // Claude Code's hook editor appends a new Bash hook to the first group
+        // with that matcher, which can be ours. Strip, reinstall and guard
+        // removal must take only our handler out of the group.
+        let _home = TestHome::new();
+        let settings = super::claude_settings_path();
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let user = json!({ "type": "command", "command": "/u/block-rm-rf.sh" });
+        let seed = |ours: &str| {
+            let content = json!({ "hooks": { "PreToolUse": [{ "matcher": "Bash", "hooks": [
+                { "type": "command", "command": ours }, user.clone()
+            ]}]}});
+            fs::write(&settings, serde_json::to_string_pretty(&content).unwrap()).unwrap();
+        };
+        let commands = || -> Vec<String> {
+            read_settings_json(&settings)["hooks"]["PreToolUse"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|group| group["hooks"].as_array().cloned().unwrap_or_default())
+                .map(|hook| hook["command"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+
+        seed("/h/.claude/hooks/headroom-rtk-rewrite.sh");
+        assert!(strip_headroom_hook_from_settings(&settings).unwrap());
+        assert_eq!(commands(), ["/u/block-rm-rf.sh"]);
+
+        seed("/old/headroom-rtk-rewrite.sh");
+        super::ensure_claude_settings_hook(
+            Path::new("/new/headroom-rtk-rewrite.sh"),
+            "Bash",
+            "headroom-rtk-rewrite.sh",
+        )
+        .unwrap();
+        let after = commands();
+        assert!(after.iter().any(|c| c == "/u/block-rm-rf.sh"), "{after:?}");
+        assert!(after.iter().all(|c| !c.contains("/old/")), "{after:?}");
+
+        seed("/h/.claude/hooks/headroom-guard.py");
+        super::remove_guard_hook_entries(&settings, "headroom-guard.py", false, None).unwrap();
+        assert_eq!(commands(), ["/u/block-rm-rf.sh"]);
+    }
+
+    #[test]
+    fn backup_keeps_the_pre_burst_copy_and_outlives_nommer_backups() {
+        // One apply writes settings.json several times within a second; the
+        // backup must hold the user's original, not the next-to-last rewrite.
+        // Backups from the app's old name sort after ours by path, and used to
+        // get each new backup pruned the moment it was made.
+        let dir = tempfile::tempdir().unwrap();
+        for stamp in ["20250101000000", "20250102000000", "20250103000000"] {
+            let old = dir
+                .path()
+                .join(format!("settings.json.nommer-backup-{stamp}"));
+            fs::write(old, "{}").unwrap();
+        }
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, "{ // mine\n}").unwrap();
+        // Both calls must land in one stamp second.
+        while chrono::Utc::now().timestamp_subsec_millis() > 500 {
+            std::thread::yield_now();
+        }
+        let first = super::backup_if_exists(&settings).unwrap().unwrap();
+        fs::write(&settings, "{}").unwrap();
+        let second = super::backup_if_exists(&settings).unwrap().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(fs::read_to_string(&first).unwrap(), "{ // mine\n}");
     }
 
     #[test]
@@ -12769,6 +12928,38 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !dot_headroom.exists(),
             "full cleanup should remove ~/.headroom"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn revert_external_mutations_strips_markitdown_nudges_and_cache() {
+        // `--uninstall` (NSIS, the Homebrew cask) has no ToolManager, so the
+        // disable uninstall_and_quit runs never happens there. A settings.json
+        // no parser accepts must not keep the nudges or the cache either.
+        let home = TestHome::new();
+        let claude_md = home.path().join(".claude").join("CLAUDE.md");
+        let agents = home.path().join(".codex").join("AGENTS.md");
+        fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        fs::create_dir_all(agents.parent().unwrap()).unwrap();
+        fs::write(home.path().join(".claude").join("settings.json"), "{ nope").unwrap();
+        fs::write(&claude_md, "# mine\n").unwrap();
+        upsert_managed_block(&claude_md, "markitdown_office", "run the shim").unwrap();
+        upsert_managed_block(&agents, "markitdown", "run the shim").unwrap();
+        let cache = home.path().join(".cache").join("headroom-markitdown");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("0123.md"), "contract text").unwrap();
+
+        super::revert_external_mutations();
+
+        let md = fs::read_to_string(&claude_md).unwrap();
+        assert!(
+            md.contains("# mine") && !md.contains("headroom:markitdown"),
+            "{md}"
+        );
+        assert!(!fs::read_to_string(&agents)
+            .unwrap()
+            .contains("headroom:markitdown"));
+        assert!(!cache.exists());
     }
 
     #[test]
@@ -15999,8 +16190,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "my own command\n"
         );
 
+        // ...and install, which used to replace it with ours.
         ensure_claude_remote_control_command().expect("install again");
         remove_claude_remote_control_command().expect("remove again");
+        assert_eq!(
+            std::fs::read_to_string(claude_remote_control_command_path()).unwrap(),
+            "my own command\n"
+        );
+        std::fs::remove_file(claude_remote_control_command_path()).unwrap();
 
         // A wrapper the user configured themselves is neither replaced nor removed.
         if cfg!(target_os = "macos") {
@@ -16905,6 +17102,29 @@ sys.exit(3)
             .is_symlink());
         assert_eq!(std::fs::read(&link).unwrap(), b"new");
         assert_eq!(std::fs::read(&target).unwrap(), b"{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_a_dangling_link_into_a_tree_it_cannot_create() {
+        // ~/.zshrc -> /Volumes/Data/dotfiles/zshrc before the volume mounts:
+        // the caller built the contents from an empty file, so replacing the
+        // link would leave a regular file holding only Headroom's block.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = dir.path().join("Volumes");
+        std::fs::create_dir_all(&volumes).unwrap();
+        std::fs::set_permissions(&volumes, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let link = dir.path().join(".zshrc");
+        std::os::unix::fs::symlink(volumes.join("Data").join("zshrc"), &link).unwrap();
+
+        let result = super::atomic_write(&link, b"# headroom block\n");
+        std::fs::set_permissions(&volumes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
