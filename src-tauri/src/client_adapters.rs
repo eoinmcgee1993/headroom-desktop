@@ -1116,6 +1116,122 @@ pub fn client_local_activity_at(client_id: &str) -> Option<SystemTime> {
     }
 }
 
+/// Newest `*.jsonl` under `root` by mtime, visiting at most `cap` entries.
+/// A resumed thread appends to its original day's rollout, so the date-named
+/// directories cannot be trusted to hold the newest one.
+fn newest_jsonl_under(root: &Path, cap: usize) -> Option<PathBuf> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > cap {
+                return newest.map(|(_, path)| path);
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let path = entry.path();
+            if meta.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                if let Ok(modified) = meta.modified() {
+                    if newest.as_ref().is_none_or(|(at, _)| modified > *at) {
+                        newest = Some((modified, path));
+                    }
+                }
+            }
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// What a Codex rollout's first line (`session_meta`) says about the session.
+#[derive(Debug, Default, PartialEq)]
+struct CodexSessionMeta {
+    /// Which Codex wrote it: codex_cli_rs, codex_vscode, codex_exec, the app...
+    originator: Option<String>,
+    cli_version: Option<String>,
+    /// The provider the thread was CREATED with.
+    model_provider: Option<String>,
+    started_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn parse_codex_session_meta(first_line: &str) -> Option<CodexSessionMeta> {
+    let line: Value = serde_json::from_str(first_line.trim()).ok()?;
+    if line.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = line.get("payload")?;
+    let text = |key: &str| payload.get(key).and_then(Value::as_str).map(str::to_string);
+    Some(CodexSessionMeta {
+        originator: text("originator"),
+        cli_version: text("cli_version"),
+        model_provider: text("model_provider"),
+        started_at: text("timestamp")
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(|at| at.with_timezone(&Utc)),
+    })
+}
+
+/// Sentry tags for "Codex ran, nothing reached the proxy". Without them every
+/// report said only that it happened (RUST-DW), which cannot tell the two
+/// fixes apart: a session CREATED with `model_provider = "headroom"` read our
+/// config and its traffic still never arrived, while one created with
+/// "openai" after Headroom started never read the config at all. `resumed`
+/// marks a thread older than `app_started_at`, whose provider predates us.
+pub(crate) fn codex_unrouted_diagnostics(
+    app_started_at: SystemTime,
+) -> Vec<(&'static str, String)> {
+    use std::io::{BufRead, Read};
+    let meta = newest_jsonl_under(&codex_home().join("sessions"), LOCAL_ACTIVITY_WALK_CAP)
+        .and_then(|path| {
+            let file = std::fs::File::open(path).ok()?;
+            let mut line = String::new();
+            // session_meta carries the base instructions (tens of KB); the cap
+            // only stops a pathological first line.
+            std::io::BufReader::new(file.take(1 << 20))
+                .read_line(&mut line)
+                .ok()?;
+            parse_codex_session_meta(&line)
+        })
+        .unwrap_or_default();
+    let provider = match meta.model_provider.as_deref() {
+        Some("headroom") => "headroom",
+        Some("openai") => "openai",
+        Some(_) => "other",
+        None => "unknown",
+    };
+    let resumed = match meta.started_at {
+        Some(at) => (SystemTime::from(at) < app_started_at).to_string(),
+        None => "unknown".into(),
+    };
+    let unknown = || "unknown".to_string();
+    vec![
+        ("codex_surface", meta.originator.unwrap_or_else(unknown)),
+        (
+            "codex_cli_version",
+            meta.cli_version.unwrap_or_else(unknown),
+        ),
+        ("codex_session_provider", provider.into()),
+        ("codex_session_resumed", resumed),
+        (
+            "codex_config_routed",
+            codex_provider_block_matches().map_or_else(|_| "error".into(), |ok| ok.to_string()),
+        ),
+        (
+            "codex_home_env",
+            std::env::var_os("CODEX_HOME")
+                .is_some_and(|v| !v.is_empty())
+                .to_string(),
+        ),
+    ]
+}
+
 /// Pure decision: the agent ran on this machine while Headroom, up the whole
 /// time, saw nothing from it. `requests_recent` is the agent's proxied request
 /// count over today and yesterday (usage_counters::requests_since_yesterday).
@@ -13806,6 +13922,45 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(super::newest_mtime_under(&root.join("missing"), 1_000).is_none());
         // Cap of 1 visits only the first entry (the year dir) and stops.
         assert!(super::newest_mtime_under(&root, 1).is_some());
+    }
+
+    #[test]
+    fn codex_session_meta_reads_the_newest_rollouts_first_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        fs::create_dir_all(root.join("2026/09/01")).unwrap();
+        fs::create_dir_all(root.join("2026/09/29")).unwrap();
+        // The older day's rollout is written LAST: a resumed thread.
+        fs::write(root.join("2026/09/29/rollout-a.jsonl"), b"{}").unwrap();
+        fs::write(root.join("2026/09/29/notes.txt"), b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(root.join("2026/09/01/rollout-b.jsonl"), b"{}").unwrap();
+        assert_eq!(
+            super::newest_jsonl_under(&root, 1_000),
+            Some(root.join("2026/09/01/rollout-b.jsonl"))
+        );
+        assert_eq!(
+            super::newest_jsonl_under(&root.join("missing"), 1_000),
+            None
+        );
+
+        let meta = super::parse_codex_session_meta(
+            r#"{"timestamp":"x","type":"session_meta","payload":{"id":"1","timestamp":"2026-09-29T07:01:02.123Z","originator":"codex_vscode","cli_version":"0.156.1","model_provider":"openai","instructions":"long"}}"#,
+        )
+        .expect("session_meta parses");
+        assert_eq!(meta.originator.as_deref(), Some("codex_vscode"));
+        assert_eq!(meta.cli_version.as_deref(), Some("0.156.1"));
+        assert_eq!(meta.model_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            meta.started_at.map(|at| at.to_rfc3339()),
+            Some("2026-09-29T07:01:02.123+00:00".into())
+        );
+        // Any other first line is not a session header.
+        assert_eq!(
+            super::parse_codex_session_meta(r#"{"type":"response_item","payload":{}}"#),
+            None
+        );
+        assert_eq!(super::parse_codex_session_meta("not json"), None);
     }
 
     #[test]

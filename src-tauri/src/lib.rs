@@ -589,6 +589,7 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     }
     if codex && !CODEX_BEACON_SENT.swap(true, Ordering::AcqRel) {
         pricing::report_funnel_step(state, "unrouted_codex_usage_detected");
+        report_first_run_unrouted_codex(state, since);
     }
     if !state.try_mark_unrouted_usage_notified() {
         return;
@@ -599,6 +600,36 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         app,
         "unrouted_usage_nudge_shown",
         Some(json!({ "claude": claude, "codex": codex })),
+    );
+}
+
+/// First-run twin of the hourly `unrouted_client` report, with the same Codex
+/// diagnostics. That one needs two hours of uptime, and the new user who gives
+/// up inside the first hour never reaches it; that user is the Windows+Codex
+/// funnel leak (61% of Codex-only Windows installs save, 76% on macOS).
+fn report_first_run_unrouted_codex(state: &AppState, since: chrono::DateTime<Utc>) {
+    // Paused or bypassed, going direct is the intended state, not a leak.
+    if state.runtime_is_paused() || state.proxy_bypass.load(Ordering::Acquire) {
+        return;
+    }
+    let tags = client_adapters::codex_unrouted_diagnostics(since.into());
+    let enabled = client_adapters::is_codex_enabled();
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("flow", "unrouted_client_first_run");
+            scope.set_tag("client", "codex");
+            scope.set_tag("enabled", enabled);
+            for (key, value) in tags {
+                scope.set_tag(key, value);
+            }
+            scope.set_fingerprint(Some(&["unrouted_client_first_run", "codex"]));
+        },
+        || {
+            sentry::capture_message(
+                "unrouted client codex on first run: sessions growing, nothing proxied",
+                sentry::Level::Warning,
+            );
+        },
     );
 }
 
@@ -5509,6 +5540,11 @@ async fn detect_unrouted_clients(
             log::info!(
                 "unrouted client {client_id}: active locally at {active_at}, no proxied request since yesterday; enabled={enabled} reapplied={reapplied}"
             );
+            let codex_diagnostics = if client_id == "codex" {
+                client_adapters::codex_unrouted_diagnostics(app_started_at)
+            } else {
+                Vec::new()
+            };
             // The only fleet-wide trace of an agent silently running outside
             // Headroom. Captured explicitly under a fixed fingerprint: as a
             // warn through the log bridge it grouped on the caller stack,
@@ -5520,6 +5556,9 @@ async fn detect_unrouted_clients(
                     scope.set_tag("client", client_id);
                     scope.set_tag("enabled", enabled);
                     scope.set_tag("reapplied", reapplied);
+                    for (key, value) in codex_diagnostics {
+                        scope.set_tag(key, value);
+                    }
                     scope.set_extra("active_at", active_at.to_rfc3339().into());
                     // Turns a blind fleet signal into a diagnosed one: without
                     // this every event says only "ran unrouted", which is the
