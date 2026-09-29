@@ -19897,7 +19897,7 @@ Always run the linter first.
             "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
         )
         .expect("write pem");
-        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        let out = crate::proc::command(std::env::current_exe().expect("test binary"))
             .args([
                 "tool_manager::tests::downloads_consult_the_os_trust_store_and_loopback_probes_do_not",
                 "--exact",

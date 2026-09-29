@@ -12851,7 +12851,7 @@ mod tests {
     fn pid_exits_within(pid: u32, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
-            let alive = std::process::Command::new("/bin/kill")
+            let alive = crate::proc::command("/bin/kill")
                 .args(["-0", &pid.to_string()])
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -12874,7 +12874,7 @@ mod tests {
         let (python, pid_file) = fake_venv_python(venv.path());
         // `sh` stands in for the subreaper: alive, not us, not Headroom. The
         // script path goes in as $0 so the sh's own argv never matches.
-        let mut parent = std::process::Command::new("/bin/sh")
+        let mut parent = crate::proc::command("/bin/sh")
             .args(["-c", "\"$0\" -m headroom.proxy.server; true"])
             .arg(&python)
             .spawn()
@@ -12905,7 +12905,7 @@ mod tests {
         let venv = tempfile::tempdir().expect("tempdir");
         let (python, pid_file) = fake_venv_python(venv.path());
         // Background it and exit: the fake pip's parent is gone.
-        let status = std::process::Command::new("/bin/sh")
+        let status = crate::proc::command("/bin/sh")
             .args(["-c", "\"$0\" -m pip install x >/dev/null 2>&1 &"])
             .arg(&python)
             .status()

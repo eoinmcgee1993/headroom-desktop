@@ -5354,7 +5354,7 @@ mod tests {
             let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
             let _ = std::io::Write::write_all(&mut stream, b"HTTP/1.1 403 Forbidden\r\n\r\n");
         });
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        let mut child = crate::proc::command(std::env::current_exe().expect("test binary"));
         child.args([
             "proxy_intercept::tests::direct_forwarder_goes_through_the_configured_proxy",
             "--exact",
@@ -5423,7 +5423,7 @@ mod tests {
             assert_eq!(status.ok(), Some(reqwest::StatusCode::OK));
             return;
         }
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        let mut child = crate::proc::command(std::env::current_exe().expect("test binary"));
         child.args([
             "proxy_intercept::tests::loopback_upstream_skips_the_configured_proxy",
             "--exact",
