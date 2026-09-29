@@ -12548,7 +12548,12 @@ fn pip_retry_backoff(failed_attempt: u32, failure_text: &str) -> Option<Duration
 /// The bracket after 32 keeps 320-329 out.
 fn pip_failure_is_sharing_violation(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("winerror 32]") || lower.contains("os error 32)")
+    lower.contains("winerror 32]")
+        || lower.contains("os error 32)")
+        // pip stashing a package dir it could not rename (a live holder)
+        // falls back to copytree, which trips on the stash dir: RUST-6S's
+        // `[WinError 183] ... site-packages\~~adroom`.
+        || (lower.contains("winerror 183]") && lower.contains("\\~"))
 }
 
 /// Widen `limit` for the rest of the run once `line` marks the start of pip's
@@ -19998,6 +20003,14 @@ exit 0
             "[WinError 320] whatever"
         ));
         assert_eq!(backoff(0, locked), None, "attempt numbering starts at 1");
+        // RUST-6S: the stash-rename fallback under a live holder.
+        assert!(super::pip_failure_is_sharing_violation(
+            "OSError: [WinError 183] Eine Datei kann nicht erstellt werden, wenn sie bereits \
+             vorhanden ist: 'C:\\\\x\\\\venv\\\\Lib\\\\site-packages\\\\~~adroom'"
+        ));
+        assert!(!super::pip_failure_is_sharing_violation(
+            "[WinError 183] exists: 'C:\\\\x\\\\file.txt'"
+        ));
     }
 
     #[test]

@@ -8924,13 +8924,28 @@ fn windows_process_sweep_script(
     } else {
         format!("-and $_.CommandLine -like '*{args_escaped}*' ")
     };
+    // Broken WMI (RUST-JW/JX) leaves the venv-lock sweep blind, and pip then
+    // dies stashing site-packages\headroom under a live holder (RUST-6S,
+    // WinError 183 on `~~adroom`). A sweep that needs neither the parent nor
+    // the command line can fall back to Get-Process's image path, which
+    // catches the launcher (headroom.exe, venv python.exe); the launcher's job
+    // object takes its base-python child down with it.
+    let fallback = if matches!(parents, SweepParents::Any) && args_pattern.is_empty() {
+        format!(
+            "try {{ Get-Process -ErrorAction Stop \
+             | Where-Object {{ $_.Id -ne $PID -and $_.Id -ne $me -and $_.Path -like '*{exe_pattern}*' }} \
+             | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; exit 0 }} "
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "try {{ $me = {self_pid}; Get-CimInstance Win32_Process -ErrorAction Stop \
+        "$me = {self_pid}; try {{ Get-CimInstance Win32_Process -ErrorAction Stop \
          | Where-Object {{ $_.ProcessId -ne $PID -and $_.ProcessId -ne $me \
          -and ($_.CommandLine -like '*{exe_pattern}*' -or $_.ExecutablePath -like '*{exe_pattern}*') \
          {args_rule}-and {parent_rule} }} \
          | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} }} \
-         catch {{ exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
+         catch {{ {fallback}exit {PS_SWEEP_ENUMERATION_FAILED} }}; exit 0"
     )
 }
 
@@ -13341,7 +13356,7 @@ mod tests {
             4242,
             super::SweepParents::Orphans { own_children: true },
         );
-        assert!(held.contains("$me = 4242;"), "{held}");
+        assert!(held.starts_with("$me = 4242; try {"), "{held}");
         assert!(held.contains("$_.ProcessId -ne $me"), "{held}");
         assert!(
             held.contains("($_.ParentProcessId -eq $me -and $true)"),
@@ -13377,6 +13392,21 @@ mod tests {
             "{any}"
         );
         assert!(!any.contains("-like '**'"), "{any}");
+        // RUST-6S: broken WMI must not blind the venv-lock sweep; it falls
+        // back to Get-Process by image path, and only fails if that fails too.
+        assert!(
+            any.contains(&format!(
+                "catch {{ try {{ Get-Process -ErrorAction Stop | Where-Object {{ $_.Id -ne $PID \
+                 -and $_.Id -ne $me -and $_.Path -like '*C:\\Users\\a\\venv\\Scripts\\headroom.exe*' }} \
+                 | ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}; \
+                 exit 0 }} exit {} }}; exit 0",
+                super::PS_SWEEP_ENUMERATION_FAILED
+            )),
+            "{any}"
+        );
+        assert_eq!(any.matches('{').count(), any.matches('}').count(), "{any}");
+        // Parent-checked sweeps keep refusing: Get-Process has no parent pid.
+        assert!(!held.contains("Get-Process -ErrorAction Stop"), "{held}");
         assert!(
             held.contains("-and $_.CommandLine -like '*proxy --port*' -and ("),
             "{held}"
