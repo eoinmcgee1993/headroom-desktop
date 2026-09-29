@@ -4087,13 +4087,19 @@ fn get_running_agent_process_counts() -> std::collections::HashMap<String, usize
 /// can offer one click instead of a copy-paste terminal round-trip. Exactly
 /// the script the panel shows for manual use; nothing is decided here, the
 /// panel re-probes connectors afterwards and the installer's own output comes
-/// back on failure. Blocking for its ~30-60s is fine only off the UI thread:
-/// Tauri 2 runs a plain sync command ON the main thread, so it takes
-/// `command(async)` to keep the window responsive while the button holds a
-/// busy state. No timeout - a hung download leaves the button busy, which the
-/// user can abandon for the manual command sitting right under it.
-#[tauri::command(async)]
-fn install_claude_code_cli() -> Result<(), String> {
+/// back on failure. Its ~30-60s runs on the blocking pool: a sync command runs
+/// on the main thread (Tauri 2), and `command(async)` on a sync fn runs it
+/// inline on an async worker, starving other async IPC. No timeout - a hung
+/// download leaves the button busy and holds one blocking-pool thread, which
+/// the user can abandon for the manual command sitting right under it.
+#[tauri::command]
+async fn install_claude_code_cli() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(install_claude_code_cli_blocking)
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn install_claude_code_cli_blocking() -> Result<(), String> {
     #[cfg(windows)]
     let output = crate::proc::command("powershell")
         .args([
@@ -5247,10 +5253,15 @@ async fn start_headroom_learn(
     if matches!(agent, LearnAgent::Claude) && project_path.is_none() {
         return Err("A project path is required for Claude Headroom Learn.".into());
     }
+    // Uncached: smoke-tests both CLIs and may `$SHELL -ilc` probe for each
+    // missing one, seconds that belong on the blocking pool.
+    let prereq = tauri::async_runtime::spawn_blocking(detect_headroom_learn_prereq_status)
+        .await
+        .map_err(|err| err.to_string())?;
     check_headroom_learn_prereqs(
         agent,
         crate::state::headroom_learn_platform_message().as_deref(),
-        &detect_headroom_learn_prereq_status(),
+        &prereq,
     )?;
 
     // Codex isn't project-organized, so its run-status is keyed on a stable id.
@@ -13318,6 +13329,31 @@ Some unrelated content.
         assert!(
             body.contains("spawn_blocking("),
             "the snapshot must not block an async worker: {body}"
+        );
+    }
+
+    /// Every Learn click re-probes both CLIs uncached, with a `$SHELL -ilc`
+    /// fallback per missing one (2-4s without codex, even for a Claude run).
+    #[test]
+    fn learn_start_probes_prereqs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (_, body) = tauri_command_source(&source, "start_headroom_learn");
+        assert!(
+            body.contains("spawn_blocking(detect_headroom_learn_prereq_status)")
+                && !body.contains("detect_headroom_learn_prereq_status()"),
+            "the prereq probe must not block an async worker: {body}"
+        );
+    }
+
+    /// curl|bash (or irm|iex) runs 30-60s with no timeout; a sync body under
+    /// `command(async)` pinned an async worker for all of it.
+    #[test]
+    fn claude_code_cli_install_runs_on_the_blocking_pool() {
+        let source = include_str!("lib.rs").replace('\r', "");
+        let (attr, body) = tauri_command_source(&source, "install_claude_code_cli");
+        assert!(
+            attr.trim_end().ends_with("async") && body.contains("spawn_blocking("),
+            "the installer must run on the blocking pool: {attr}{body}"
         );
     }
 
