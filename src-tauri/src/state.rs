@@ -576,7 +576,7 @@ pub struct AppState {
     weekly_limit_reached_reported: Arc<AtomicBool>,
     weekly_limit_approaching_reported: Arc<AtomicBool>,
     launch_profile: Mutex<LaunchProfile>,
-    launch_profile_path: std::path::PathBuf,
+    launch_profile_path: Option<std::path::PathBuf>,
     last_known_good_plan: Mutex<Option<LastKnownGoodPlan>>,
     last_known_good_plan_path: std::path::PathBuf,
     savings_tracker: Mutex<SavingsTracker>,
@@ -1615,7 +1615,7 @@ impl AppState {
             if let Some(failure) = profile.last_runtime_upgrade_failure.as_mut() {
                 failure.attempts = 0;
             }
-            persist_launch_profile(&self.launch_profile_path, &profile);
+            persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         }
         self.run_upgrade_with_ui(app, force_rebuild);
     }
@@ -1884,7 +1884,7 @@ impl AppState {
     fn stamp_app_version(&self, version: &str) {
         let mut profile = self.launch_profile.lock();
         profile.last_launched_app_version = Some(version.to_string());
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     /// True when the launch-profile stamp can be safely advanced to
@@ -1911,7 +1911,7 @@ impl AppState {
     fn clear_upgrade_failure(&self) {
         let mut profile = self.launch_profile.lock();
         profile.last_runtime_upgrade_failure = None;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     pub fn dismiss_upgrade_failure(&self) {
@@ -1934,7 +1934,7 @@ impl AppState {
             }
         }
         profile.last_runtime_upgrade_failure = Some(failure);
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     fn upgrade_failure_attempts(&self, app_version: &str) -> u32 {
@@ -1977,7 +1977,7 @@ impl AppState {
             return;
         }
         profile.setup_wizard_complete = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     /// One-shot gate for the "setup finished but no traffic ever" recovery
@@ -1989,7 +1989,7 @@ impl AppState {
             return false;
         }
         profile.onboarding_recovery_notified = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         true
     }
 
@@ -2009,7 +2009,7 @@ impl AppState {
         }
         profile.unrouted_usage_notified = true;
         profile.onboarding_recovery_notified = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         true
     }
 
@@ -2021,7 +2021,7 @@ impl AppState {
             return false;
         }
         profile.first_savings_notified = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         true
     }
 
@@ -2035,7 +2035,7 @@ impl AppState {
             return;
         }
         profile.accepted_terms_version = version;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
     }
 
     pub fn upstream_override(&self) -> UpstreamOverride {
@@ -2051,7 +2051,7 @@ impl AppState {
                 return;
             }
             profile.upstream_override = next.clone();
-            persist_launch_profile(&self.launch_profile_path, &profile);
+            persist_launch_profile(self.launch_profile_path.as_deref(), &profile);
         }
         crate::upstream_override::publish(next);
     }
@@ -4759,10 +4759,30 @@ fn parse_launch_profile_salvaging(bytes: &[u8]) -> Result<(LaunchProfile, Vec<St
     Ok((profile, dropped))
 }
 
-fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
+/// `None` when the profile on disk could not be read this launch: the session
+/// then runs on defaults and must never write them over the real file.
+fn persist_launch_profile(path: Option<&std::path::Path>, profile: &LaunchProfile) {
+    let Some(path) = path else {
+        return;
+    };
     if let Ok(bytes) = serde_json::to_vec_pretty(profile) {
         let _ = crate::client_adapters::atomic_write(path, &bytes);
     }
+}
+
+/// Read one of Headroom's own state files, retrying once after a short
+/// backoff. A read error on an EXISTING file (ENFILE, EIO) says nothing about
+/// its bytes, so a caller may reset or move aside only a file it actually
+/// parsed: conflating the two lost real state in RUST-5T (see
+/// `load_setup_state`). NotFound is returned at once, unretried.
+pub(crate) fn read_state_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path).or_else(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Err(err);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        std::fs::read(path)
+    })
 }
 
 impl Default for LaunchProfile {
@@ -4790,8 +4810,11 @@ impl LaunchProfile {
         }
     }
 
-    fn load_or_create(base_dir: &std::path::Path) -> Result<(Self, std::path::PathBuf)> {
+    /// The path is `None` when an existing profile could not be read: see
+    /// `persist_launch_profile`.
+    fn load_or_create(base_dir: &std::path::Path) -> Result<(Self, Option<std::path::PathBuf>)> {
         let path = config_file(base_dir, "launch-profile.json");
+        let mut persist_path = Some(path.clone());
 
         // A corrupt or truncated profile (0-byte file from a crash mid-write,
         // RUST-1P) must not crash startup — that's an unrecoverable launch
@@ -4799,10 +4822,8 @@ impl LaunchProfile {
         // profile; the warn still reaches Sentry for visibility. A profile
         // that is valid JSON with one unreadable field keeps every other
         // field (RUST-D7).
-        let previous = if path.exists() {
-            std::fs::read(&path)
-                .map_err(anyhow::Error::from)
-                .and_then(|bytes| parse_launch_profile_salvaging(&bytes))
+        let previous = match read_state_file(&path) {
+            Ok(bytes) => parse_launch_profile_salvaging(&bytes)
                 .map(|(profile, dropped)| {
                     if !dropped.is_empty() {
                         log::warn!(
@@ -4821,9 +4842,20 @@ impl LaunchProfile {
                     );
                     let _ = crate::client_adapters::move_aside(&path, &path.with_extension("json.corrupt"));
                     Self::fresh()
-                })
-        } else {
-            Self::fresh()
+                }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::fresh(),
+            // Unread is not corrupt: moving the file aside or persisting the
+            // defaults over it would lose onboarding, accepted terms and the
+            // upstream override for good. This session runs on defaults and
+            // the next launch reads the file intact.
+            Err(err) => {
+                log::warn!(
+                    "launch profile at {} could not be read ({err}); running this session on defaults and leaving the file untouched",
+                    path.display()
+                );
+                persist_path = None;
+                Self::fresh()
+            }
         };
 
         let mut current = previous;
@@ -4848,13 +4880,13 @@ impl LaunchProfile {
         // Best-effort persist: a failed write here (e.g. EPERM from locked-down
         // Application Support perms, RUST-1P) must not crash startup. The profile
         // is telemetry; degrade to the in-memory copy and continue.
-        if let Ok(bytes) = serde_json::to_vec_pretty(&current) {
-            if let Err(e) = crate::client_adapters::atomic_write(&path, &bytes) {
+        if let (Some(path), Ok(bytes)) = (&persist_path, serde_json::to_vec_pretty(&current)) {
+            if let Err(e) = crate::client_adapters::atomic_write(path, &bytes) {
                 log::warn!("could not persist {}: {e:#}", path.display());
             }
         }
 
-        Ok((current, path))
+        Ok((current, persist_path))
     }
 }
 
@@ -5134,7 +5166,9 @@ struct PersistedSavingsState {
 
 struct SavingsTracker {
     records_path: std::path::PathBuf,
-    state_path: std::path::PathBuf,
+    /// `None` when savings-state.json exists but could not be read this
+    /// launch: the session is kept in memory only (see `load_or_create`).
+    state_path: Option<std::path::PathBuf>,
     session_requests: usize,
     session_estimated_savings_usd: f64,
     session_estimated_tokens_saved: u64,
@@ -5203,26 +5237,31 @@ impl SavingsTracker {
             }
         }
 
-        // A corrupt file must not brick launch, but it must also not be
-        // silently replaced: back it up for recovery and say so in the log.
-        let persisted_state = match load_persisted_savings_state(&state_path) {
-            Ok(state) => state,
+        // An unusable file is backed up and its history salvaged inside
+        // `load_persisted_savings_state`. An Err here means the file exists
+        // but could not be READ, which says nothing about its bytes (ENFILE,
+        // the RUST-5T shape): leave it alone, run this session in memory,
+        // and never persist over it, so the next launch reads it intact.
+        let (persisted_state, readable) = match load_persisted_savings_state(&state_path) {
+            Ok(state) => (state, true),
             Err(err) => {
-                log::warn!("savings-state.json unreadable ({err}); backing up");
-                let _ = crate::client_adapters::move_aside(&state_path, &state_path.with_extension("json.corrupt"));
-                None
+                log::warn!(
+                    "savings-state.json unreadable ({err:#}); leaving it untouched and not persisting this session"
+                );
+                (None, false)
             }
-        }
-        // Missing/corrupt/schema-mismatched state used to mean starting the
-        // user's savings history from zero even though savings-records.jsonl
-        // holds every observation delta — rebuild the buckets from it instead.
-        // Approximate is fine: the backend's settled-day rollups overwrite
-        // these keys on the next stats poll anyway.
-        .or_else(|| {
-            let rebuilt = rebuild_persisted_savings_from_records(&records_path);
+        };
+        // Last resort when nothing was salvaged (or the file is missing):
+        // savings-records.jsonl. It holds little more than each backend
+        // session's first-poll backfill, so this restores only a fraction of
+        // the history; the backend's rollups refill the days its ring covers.
+        let persisted_state = persisted_state.or_else(|| {
+            let rebuilt = readable
+                .then(|| rebuild_persisted_savings_from_records(&records_path))
+                .flatten();
             if rebuilt.is_some() {
                 log::warn!(
-                    "savings-state.json missing or unusable; rebuilt history from savings-records.jsonl"
+                    "savings-state.json missing or unsalvageable; rebuilt history from savings-records.jsonl"
                 );
             }
             rebuilt
@@ -5230,10 +5269,13 @@ impl SavingsTracker {
 
         // Seed the milestone high-water from the persisted value, or (on first
         // load after upgrade) from the current bucket sum so already-earned
-        // savings don't re-fire every milestone at once.
+        // savings don't re-fire every milestone at once. A session that could
+        // not read the history fires none: its total is only what the backend
+        // rollups refill, and every milestone under it was already earned.
         let lifetime_token_milestone_high_water = persisted_state
             .as_ref()
             .and_then(|state| state.lifetime_token_milestone_high_water)
+            .or((!readable).then_some(u64::MAX))
             .unwrap_or_else(|| {
                 persisted_state.as_ref().map_or(0, |state| {
                     state
@@ -5271,7 +5313,7 @@ impl SavingsTracker {
 
         let mut tracker = Self {
             records_path,
-            state_path,
+            state_path: readable.then_some(state_path),
             session_requests: 0,
             session_estimated_savings_usd: 0.0,
             session_estimated_tokens_saved: 0,
@@ -6329,14 +6371,17 @@ impl SavingsTracker {
 
     fn persist_state(&mut self) -> Result<()> {
         self.prune_hourly_savings();
+        let Some(state_path) = &self.state_path else {
+            return Ok(());
+        };
         // Compact (not pretty) JSON: this is a machine-read file rewritten on
         // every observe tick; pretty-printing roughly doubled the write.
         let serialized =
             serde_json::to_vec(&self.persisted_state()).context("serializing savings state")?;
         // Temp+rename: a crash/power loss mid-write used to leave truncated
         // JSON that the next launch silently replaced with a fresh tracker.
-        crate::client_adapters::atomic_write(&self.state_path, &serialized)
-            .with_context(|| format!("writing {}", self.state_path.display()))?;
+        crate::client_adapters::atomic_write(state_path, &serialized)
+            .with_context(|| format!("writing {}", state_path.display()))?;
         Ok(())
     }
 }
@@ -6396,11 +6441,11 @@ fn lifetime_token_milestones_crossed(previous_total: u64, current_total: u64) ->
 
 /// Rebuild a best-effort `PersistedSavingsState` from the append-only
 /// savings-records.jsonl (current + one rotated generation) by summing each
-/// record's observation deltas into day/hour buckets. Used when
-/// savings-state.json is missing, corrupt, or schema-mismatched. Session
-/// state is not recoverable (and doesn't matter across a restart); the
-/// milestone high-water is seeded from the rebuilt total so already-earned
-/// milestones don't re-fire.
+/// record's observation deltas into day/hour buckets. Used only when
+/// savings-state.json is missing or nothing could be salvaged from it: the
+/// records hold little more than each backend session's first-poll backfill.
+/// Session state is not recoverable (and doesn't matter across a restart);
+/// the milestone high-water is seeded from the rebuilt total.
 fn rebuild_persisted_savings_from_records(records_path: &Path) -> Option<PersistedSavingsState> {
     let mut daily: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
     let mut hourly: BTreeMap<String, DailySavingsBucket> = BTreeMap::new();
@@ -6462,29 +6507,78 @@ fn rebuild_persisted_savings_from_records(records_path: &Path) -> Option<Persist
     })
 }
 
+/// `Err` only when the file exists but could not be read (twice): the caller
+/// must then leave it alone. Unparsable or schema-mismatched bytes are backed
+/// up for recovery and their format-agnostic fields salvaged.
 fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsState>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let persisted = serde_json::from_slice::<PersistedSavingsState>(&bytes)
-        .with_context(|| format!("parsing {}", path.display()))?;
-    if persisted.schema_version == 3 {
-        Ok(Some(persisted))
-    } else {
+    let bytes = match read_state_file(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    let backup = match serde_json::from_slice::<PersistedSavingsState>(&bytes) {
+        Ok(persisted) if persisted.schema_version == 3 => return Ok(Some(persisted)),
         // Unknown schema (e.g. downgrade after a bad update): preserve the
         // file — the fresh tracker's first persist would otherwise overwrite
         // the user's entire savings history with zeros.
-        log::warn!(
-            "{} has schema {} (expected 3); backing up and starting fresh",
-            path.display(),
-            persisted.schema_version
-        );
-        let _ =
-            crate::client_adapters::move_aside(path, &path.with_extension("json.schema-mismatch"));
-        Ok(None)
+        Ok(persisted) => {
+            log::warn!(
+                "{} has schema {} (expected 3); backing up and salvaging its history",
+                path.display(),
+                persisted.schema_version
+            );
+            "json.schema-mismatch"
+        }
+        // A corrupt file must not brick launch, but it must also not be
+        // silently replaced.
+        Err(err) => {
+            log::warn!(
+                "{} unparsable ({err}); backing up and salvaging its history",
+                path.display()
+            );
+            "json.corrupt"
+        }
+    };
+    let _ = crate::client_adapters::move_aside(path, &path.with_extension(backup));
+    Ok(salvage_persisted_savings_state(&bytes))
+}
+
+/// The format-agnostic part of a savings-state.json that cannot be used
+/// whole: day/hour history, lifetime counters and the milestone high-water.
+/// Each bucket is taken on its own, so one unreadable bucket costs only
+/// itself. Session state and the version-sensitive output samples are
+/// dropped. None for a pre-v3 file (older semantics) or when nothing is left.
+fn salvage_persisted_savings_state(bytes: &[u8]) -> Option<PersistedSavingsState> {
+    fn entries<T: serde::de::DeserializeOwned>(
+        map: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> BTreeMap<String, T> {
+        map.get(key)
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| Some((k.clone(), serde_json::from_value(v.clone()).ok()?)))
+            .collect()
     }
+    let serde_json::Value::Object(map) = serde_json::from_slice(bytes).ok()? else {
+        return None;
+    };
+    let number = |key: &str| map.get(key).and_then(serde_json::Value::as_u64);
+    if number("schemaVersion").unwrap_or(0) < 3 {
+        return None;
+    }
+    let salvaged = PersistedSavingsState {
+        schema_version: 3,
+        lifetime_requests: number("lifetimeRequests").unwrap_or(0) as usize,
+        lifetime_token_milestone_high_water: number("lifetimeTokenMilestoneHighWater"),
+        lifetime_tool_schema_tokens_saved: number("lifetimeToolSchemaTokensSaved").unwrap_or(0),
+        daily_savings: entries(&map, "dailySavings"),
+        hourly_savings: entries(&map, "hourlySavings"),
+        tool_schema_daily_samples: entries(&map, "toolSchemaDailySamples"),
+        tool_schema_hourly_samples: entries(&map, "toolSchemaHourlySamples"),
+        ..Default::default()
+    };
+    (!salvaged.daily_savings.is_empty() || salvaged.lifetime_requests > 0).then_some(salvaged)
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -11377,7 +11471,7 @@ mod tests {
             first_savings_notified: true,
             unrouted_usage_notified: true,
         };
-        super::persist_launch_profile(&path, &profile);
+        super::persist_launch_profile(Some(&path), &profile);
 
         let bytes = std::fs::read(&path).expect("persisted");
         let round_tripped: super::LaunchProfile =
@@ -11781,7 +11875,7 @@ mod tests {
         let state_path = std::env::temp_dir().join(format!("headroom-savings-state-{}.json", id));
         SavingsTracker {
             records_path,
-            state_path,
+            state_path: Some(state_path),
             session_requests: 0,
             session_estimated_savings_usd: 0.0,
             session_estimated_tokens_saved: 0,
@@ -15365,6 +15459,130 @@ mod tests {
         assert_eq!(tracker.lifetime_requests, 0);
 
         let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    /// #46: an unusable savings-state.json is still the only full copy of the
+    /// user's history. savings-records.jsonl holds little more than each
+    /// backend session's first-poll backfill, so rebuilding from it restored
+    /// under 1% and re-fired earned milestones. Recovery salvages the
+    /// format-agnostic fields from the unusable bytes instead, for an
+    /// unparsable bucket and for a newer schema alike, and keeps the backup.
+    #[test]
+    fn savings_state_recovery_salvages_history_from_the_unusable_file() {
+        for (schema_version, garbled_bucket, backup) in [
+            (3, true, "json.corrupt"),
+            (4, false, "json.schema-mismatch"),
+        ] {
+            let base_dir = temp_test_dir("headroom-savings-salvage");
+            ensure_data_dirs(&base_dir).expect("create temp dirs");
+            let tiny_backfill = SavingsRecord {
+                schema_version: 7,
+                day_key: "2026-09-01".into(),
+                hour_key: "2026-09-01T09:00".into(),
+                delta_requests: 3,
+                delta_estimated_tokens_saved: 1_000,
+                ..Default::default()
+            };
+            std::fs::write(
+                telemetry_file(&base_dir, "savings-records.jsonl"),
+                serde_json::to_string(&tiny_backfill).unwrap(),
+            )
+            .unwrap();
+            let mut daily = serde_json::json!({
+                "2026-08-31": {"estimated_tokens_saved": 700_000_000u64, "estimated_savings_usd": 900.0},
+                "2026-09-01": {"estimated_tokens_saved": 690_000_000u64},
+            });
+            if garbled_bucket {
+                // One bucket of the wrong type fails the whole typed parse.
+                daily["2026-09-02"] = serde_json::json!({"estimated_tokens_saved": "garbled"});
+            }
+            let state_path = config_file(&base_dir, "savings-state.json");
+            std::fs::write(
+                &state_path,
+                serde_json::json!({
+                    "schemaVersion": schema_version,
+                    "lifetimeRequests": 177_000,
+                    "lifetimeTokenMilestoneHighWater": 1_390_000_000u64,
+                    "dailySavings": daily,
+                    "hourlySavings": {"2026-09-01T09:00": {"estimated_tokens_saved": 690_000_000u64}},
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let tracker = SavingsTracker::load_or_create(&base_dir).expect("load tracker");
+            assert_eq!(
+                tracker.lifetime_requests, 177_000,
+                "schema {schema_version}"
+            );
+            assert_eq!(tracker.lifetime_token_milestone_high_water, 1_390_000_000);
+            assert_eq!(tracker.daily_savings.len(), 2, "schema {schema_version}");
+            assert_eq!(
+                tracker.daily_savings["2026-09-01"].estimated_tokens_saved,
+                690_000_000
+            );
+            assert_eq!(
+                tracker.hourly_savings["2026-09-01T09:00"].estimated_tokens_saved,
+                690_000_000
+            );
+            assert!(state_path.with_extension(backup).exists(), "{backup} kept");
+            let _ = std::fs::remove_dir_all(&base_dir);
+        }
+    }
+
+    /// #141: a read that fails twice on an existing launch-profile.json or
+    /// savings-state.json (ENFILE, EIO: the RUST-5T shape) says nothing about
+    /// the bytes. The session runs on defaults, and neither file is moved
+    /// aside or written over, not at load and not by a later persist, so the
+    /// next launch reads them intact.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_launch_profile_and_savings_state_are_left_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let base_dir = temp_test_dir("headroom-unreadable-state");
+        ensure_data_dirs(&base_dir).expect("create temp dirs");
+        let profile_path = config_file(&base_dir, "launch-profile.json");
+        let state_path = config_file(&base_dir, "savings-state.json");
+        let files: [(&PathBuf, &[u8]); 2] = [
+            (
+                &profile_path,
+                br#"{"launch_count": 40, "setup_wizard_complete": true, "accepted_terms_version": 2}"#,
+            ),
+            (&state_path, br#"{"schemaVersion": 3, "lifetimeRequests": 177000}"#),
+        ];
+        for (path, bytes) in files {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        assert!(
+            std::fs::read(&profile_path).is_err(),
+            "file must really be unreadable, or this test proves nothing"
+        );
+
+        let state = AppState::new_in(base_dir.clone()).expect("degrades, never fails");
+        assert_eq!(
+            state.accepted_terms_version(),
+            0,
+            "session runs on defaults"
+        );
+        state.mark_terms_accepted(3);
+        let _ = state.savings_tracker.lock().persist_state();
+
+        for (path, bytes) in files {
+            assert!(
+                !path.with_extension("json.corrupt").exists(),
+                "{} moved aside",
+                path.display()
+            );
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                bytes,
+                "{} written over",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     fn daily(date: &str, tokens: u64, usd: f64) -> DailySavingsPoint {

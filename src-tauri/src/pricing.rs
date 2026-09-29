@@ -3588,8 +3588,8 @@ pub fn refresh_paywall_first_flag() {
 
 fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
     let path = local_state_path();
-    if let Ok(bytes) = std::fs::read(&path) {
-        match serde_json::from_slice::<LocalPricingState>(&bytes) {
+    match crate::state::read_state_file(&path) {
+        Ok(bytes) => match serde_json::from_slice::<LocalPricingState>(&bytes) {
             Ok(state) => return Ok(state),
             // Only reachable now for a truncated/non-JSON file: every field
             // defaults, so a schema change alone parses. write_local_state
@@ -3598,6 +3598,15 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
                 &path,
                 &format!("pricing state: {err}"),
             ),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // Unread is not corrupt: initializing here would overwrite the trial
+        // and grace clocks with fresh ones, and nothing backs them up.
+        Err(err) => {
+            return Err(format!(
+                "Failed to read pricing state {}: {err}",
+                path.display()
+            ))
         }
     }
 
@@ -6439,6 +6448,33 @@ mod tests {
                 None => std::env::remove_var("HEADROOM_DATA_DIR"),
             }
         }
+    }
+
+    /// #141: a read error other than NotFound (ENFILE, EIO) says nothing about
+    /// the bytes on disk. Initializing over it restarted the trial and grace
+    /// clocks from now, with no backup; the load must fail and leave the
+    /// file alone instead.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_pricing_state_is_not_reinitialized_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = AuthedTestEnv::new("session-xyz");
+        let path = super::local_state_path();
+        let bytes: &[u8] =
+            br#"{"first_seen_at": "2026-01-01T00:00:00Z", "mismatch_since": "2026-09-01T00:00:00Z"}"#;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::read(&path).is_err(),
+            "file must really be unreadable, or this test proves nothing"
+        );
+
+        assert!(super::load_or_initialize_local_state().is_err());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     fn sample_account_envelope_body() -> serde_json::Value {
