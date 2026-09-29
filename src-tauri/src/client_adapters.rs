@@ -396,8 +396,7 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             // Critical, app-owned writes first: the ~/.claude/settings.json env is
             // what actually routes Claude Code through Headroom. Do it before the
             // shell profile so a locked ~/.zshrc can't block core setup.
-            let (changed, backups, replaced) =
-                configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+            let (changed, backups, replaced) = configure_claude_base_url()?;
             let mut updates = (changed, backups);
             if let Some(original) = replaced {
                 // A custom gateway/proxy URL was routing Claude before us:
@@ -1416,31 +1415,23 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             disable_codex_gui()?;
         }
         "claude_code" => {
-            let shell_targets = resolve_client_shell_targets_for_cleanup(&state, client_id)?;
-            remove_shell_block(&shell_targets, "claude_code")?;
-            // Also drop the managed_rtk PATH block so `rtk` isn't exported from
-            // shell profiles after quit — otherwise the user's next shell still
-            // has Headroom binaries shadowing whatever's on PATH.
-            remove_shell_block(&shell_targets, "managed_rtk")?;
+            // settings.json first, as in apply: it is what routes Claude Code,
+            // and quit/pause run this after the proxy is gone, so a failing
+            // shell profile below must not leave Claude on the dead port.
             // Restore any pre-Headroom gateway/proxy URL instead of deleting
             // the key — deleting it pointed gateway users at api.anthropic.com
             // where their credentials may not even work.
-            let preserved = state
-                .preserved_base_urls
-                .get(normalized_setup_id(client_id))
-                .cloned();
-            remove_claude_settings_env(
+            let restored = remove_claude_settings_env(
                 "ANTHROPIC_BASE_URL",
                 HEADROOM_ANTHROPIC_BASE_URL,
-                preserved.as_deref(),
-            )?;
+                claude_restore_base_url(&state).as_deref(),
+            );
             // Drop the ENABLE_TOOL_SEARCH we planted (no-op unless still ours).
             let _ = remove_claude_settings_env(
                 HEADROOM_ENABLE_TOOL_SEARCH_KEY,
                 HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
                 None,
             );
-            let _ = remove_legacy_vscode_base_url_keys()?;
             // Strip the PreToolUse hook entry and delete the hook script so CC
             // behaves exactly as it did before Headroom was launched.
             for settings_path in claude_settings_candidates() {
@@ -1453,13 +1444,17 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             let _ = remove_claude_guard_hook();
             let _ = remove_claude_remote_control_command();
             let _ = remove_claude_statusline();
+            let shell_targets = resolve_client_shell_targets_for_cleanup(&state, client_id)?;
+            remove_shell_block(&shell_targets, "claude_code")?;
+            // Also drop the managed_rtk PATH block so `rtk` isn't exported from
+            // shell profiles after quit -- otherwise the user's next shell still
+            // has Headroom binaries shadowing whatever's on PATH.
+            remove_shell_block(&shell_targets, "managed_rtk")?;
+            let _ = remove_legacy_vscode_base_url_keys()?;
+            restored?;
         }
         "vscode" => {
-            let preserved = state
-                .preserved_base_urls
-                .get(normalized_setup_id(client_id))
-                .cloned();
-            remove_vscode_connector_keys(preserved.as_deref())?;
+            remove_vscode_connector_keys(claude_restore_base_url(&state).as_deref())?;
             let _ = remove_vscode_process_wrapper();
         }
         "grok_build" => disable_grok_build()?,
@@ -1780,20 +1775,15 @@ fn revert_external_mutations_with_status() -> (Vec<String>, bool) {
 
     // Independently strip the ANTHROPIC_BASE_URL routing env and the Claude
     // guard hook. clear_client_setups() above also removes these via
-    // disable_client_setup, but only after remove_shell_block succeeds (it runs
-    // under `?` before them): a shell-rc failure there silently leaves both in
-    // place, and each bricks Claude once the proxy is gone (stale base URL ->
-    // dead 127.0.0.1:6767; guard hook errors on every prompt). Do them
+    // disable_client_setup, but any failure there leaves both in place, and
+    // each bricks Claude once the proxy is gone (stale base URL -> dead
+    // 127.0.0.1:6767; guard hook errors on every prompt). Do them
     // unconditionally here. Idempotent: each only acts on Headroom's own value,
-    // restoring any preserved pre-Headroom gateway URL.
-    let preserved = load_setup_state()
-        .preserved_base_urls
-        .get(normalized_setup_id("claude_code"))
-        .cloned();
+    // restoring the cc-switch capture or any preserved pre-Headroom gateway URL.
     if let Err(err) = remove_claude_settings_env(
         "ANTHROPIC_BASE_URL",
         HEADROOM_ANTHROPIC_BASE_URL,
-        preserved.as_deref(),
+        claude_restore_base_url(&load_setup_state()).as_deref(),
     ) {
         log::warn!("cleanup: removing ANTHROPIC_BASE_URL from Claude settings failed: {err}");
     }
@@ -3443,8 +3433,7 @@ fn clear_legacy_codex_gui_launch_env() -> Result<()> {
 }
 
 fn configure_vscode_settings() -> Result<(Vec<String>, Vec<String>, Option<String>)> {
-    let (mut changed_files, mut backup_files, replaced) =
-        configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+    let (mut changed_files, mut backup_files, replaced) = configure_claude_base_url()?;
     let (ts_changed, ts_backups, _) = configure_claude_settings_env_if_absent(
         HEADROOM_ENABLE_TOOL_SEARCH_KEY,
         HEADROOM_ENABLE_TOOL_SEARCH_VALUE,
@@ -3496,6 +3485,39 @@ fn remove_json_key_if_matches(
         Some(Value::String(value)) if value == expected_value => obj.remove(key).is_some(),
         _ => false,
     }
+}
+
+/// Point settings.json's ANTHROPIC_BASE_URL at Headroom. The cc-switch capture
+/// (`tool_manager::cc_switch_capture_path`) outlives a quit so the next backend
+/// can reseed from it, which is only right while this write replaces that same
+/// URL (the one the quit restored) or our own. Anything else means the user
+/// moved off it, e.g. to Claude Official, so drop it before the write: the
+/// reconciler reseeds as soon as it sees our URL, and Anthropic OAuth traffic
+/// would follow the stale provider.
+fn configure_claude_base_url() -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+    if let Some(captured) = crate::tool_manager::cc_switch_captured_upstream() {
+        let current = read_claude_settings_env("ANTHROPIC_BASE_URL")
+            .ok()
+            .flatten();
+        if !matches!(current.as_deref(), Some(url) if url == captured || url == HEADROOM_ANTHROPIC_BASE_URL)
+        {
+            crate::tool_manager::clear_cc_switch_capture();
+        }
+    }
+    configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)
+}
+
+/// The URL a Claude Code or VS Code disable puts back in place of Headroom's:
+/// the provider the cc-switch reconciler last replaced (newer than anything
+/// apply saw, and gone with the backend otherwise), else the pre-Headroom URL
+/// apply preserved.
+fn claude_restore_base_url(state: &ClientSetupState) -> Option<String> {
+    crate::tool_manager::cc_switch_captured_upstream().or_else(|| {
+        state
+            .preserved_base_urls
+            .get(normalized_setup_id("claude_code"))
+            .cloned()
+    })
 }
 
 /// Point `env.<env_key>` at Headroom. The third return element is a
@@ -12466,6 +12488,134 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .preserved_base_urls
                 .contains_key("claude_code"),
             "preserved entry consumed after restore"
+        );
+    }
+
+    fn write_cc_switch_capture(url: &str) {
+        let capture = crate::tool_manager::cc_switch_capture_path();
+        fs::create_dir_all(capture.parent().unwrap()).unwrap();
+        fs::write(&capture, format!(r#"{{"url":"{url}"}}"#)).unwrap();
+    }
+
+    /// The cc-switch reconciler points settings.json back at the intercept and
+    /// records the provider URL it replaced. Quit and pause restore settings.json
+    /// after the backend is gone, so that record is the only place the URL
+    /// survives: it has to win over an older preserved gateway (deleting the key
+    /// sent the provider's key to api.anthropic.com), and it has to outlive the
+    /// relaunch that routes the restored URL through Headroom again, or the next
+    /// backend has nothing to forward to.
+    #[test]
+    #[serial_test::serial]
+    fn quit_restores_the_cc_switch_capture_and_relaunch_keeps_it() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings_path = home.path().join(".claude").join("settings.json");
+        fs::write(
+            &settings_path,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.corp.example/anthropic"}}"#,
+        )
+        .unwrap();
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+
+        // Mid-session the user picks a relay in cc-switch; the reconciler puts
+        // the intercept back and records the relay.
+        let relay = "https://api.relay.example/anthropic";
+        write_cc_switch_capture(relay);
+        fs::write(
+            &settings_path,
+            format!(
+                r#"{{"env":{{"ANTHROPIC_BASE_URL":"{}","ANTHROPIC_AUTH_TOKEN":"sk-relay"}}}}"#,
+                super::HEADROOM_ANTHROPIC_BASE_URL
+            ),
+        )
+        .unwrap();
+
+        super::clear_client_setups().expect("quit");
+        let after_quit = read_settings_json(&settings_path);
+        assert_eq!(
+            after_quit["env"]["ANTHROPIC_BASE_URL"], relay,
+            "quit dropped the cc-switch provider, got:\n{after_quit:#}"
+        );
+
+        super::apply_client_setup("claude_code").expect("relaunch");
+        assert_eq!(
+            read_settings_json(&settings_path)["env"]["ANTHROPIC_BASE_URL"],
+            super::HEADROOM_ANTHROPIC_BASE_URL
+        );
+        assert_eq!(
+            crate::tool_manager::cc_switch_captured_upstream().as_deref(),
+            Some(relay),
+            "relaunch dropped the capture the quit restored"
+        );
+    }
+
+    /// A kept capture is only valid while settings.json still names that
+    /// provider. Switching cc-switch to Claude Official while Headroom is closed
+    /// leaves no base URL; routing Claude through Headroom again has to drop the
+    /// capture before it writes the intercept URL, or the next backend reseeds
+    /// the relay and Anthropic OAuth traffic follows it there.
+    #[test]
+    #[serial_test::serial]
+    fn routing_claude_drops_a_cc_switch_capture_the_user_moved_off() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings_path = home.path().join(".claude").join("settings.json");
+        fs::write(&settings_path, r#"{"env":{}}"#).unwrap();
+        write_cc_switch_capture("https://api.relay.example/anthropic");
+        seed_installed_rtk();
+
+        super::apply_client_setup("claude_code").expect("apply");
+        assert!(
+            crate::tool_manager::cc_switch_captured_upstream().is_none(),
+            "stale capture survived a re-route over Claude Official"
+        );
+        super::disable_client_setup("claude_code").expect("disable");
+        assert!(read_settings_json(&settings_path)["env"]["ANTHROPIC_BASE_URL"].is_null());
+    }
+
+    /// Quit and pause go through disable_client_setup, whose shell-profile step
+    /// ran first under `?`: a locked or immutable rc file returned before
+    /// settings.json was restored, so Claude Code stayed on the dead port after
+    /// Headroom exited. The error still reaches the caller; the routing restore
+    /// no longer waits on it.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn disable_restores_claude_settings_even_when_the_shell_step_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings_path = home.path().join(".claude").join("settings.json");
+        fs::write(&settings_path, r#"{"hooks": {}}"#).unwrap();
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+
+        // An rc file Headroom cannot read makes the shell step fail (a
+        // directory no longer does: shell targets skip directories).
+        let zshrc = home.path().join(".zshrc");
+        fs::set_permissions(&zshrc, fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(
+            super::disable_client_setup("claude_code").is_err(),
+            "the shell failure must still be reported"
+        );
+        let after = read_settings_json(&settings_path);
+        assert!(
+            after["env"]["ANTHROPIC_BASE_URL"].is_null(),
+            "base url left on the dead port, got:\n{after:#}"
+        );
+        assert!(
+            !serde_json::to_string(&after["hooks"])
+                .unwrap()
+                .contains("headroom-claude-guard.py"),
+            "guard hook left behind, got:\n{after:#}"
         );
     }
 

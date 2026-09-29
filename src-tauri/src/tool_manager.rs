@@ -364,7 +364,13 @@ between the desktop intercept and this process -- so every provider
 switch rewrote the client onto that port and out of the intercept, where
 the activity feed, request counts and savings accounting live. The
 desktop passes the intercept URL in HEADROOM_CC_SWITCH_PROXY_URL and the
-guard writes it onto every reconciler instance.
+guard writes it onto every reconciler instance. Because that replaces the
+string upstream's loop guard matches, the guard also refuses this proxy's
+own address (localhost, the internal port) as an upstream. And it records
+each capture in HEADROOM_CC_SWITCH_CAPTURE_PATH: the desktop restores
+settings.json on quit and pause after this process is gone, so an
+in-memory capture was lost and the provider's key went to
+api.anthropic.com; the next instance reseeds from the same file.
 
 Also stops the traffic learner writing "Learned: error recovery" into the
 user's Claude Code MEMORY.md. It pairs any failed tool call with the next
@@ -1243,12 +1249,83 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     "pinned upstream missing or malformed: %r" % (_hd_ccs_pinned,)
                 )
 
+        # Where a capture is recorded for the desktop, as {"url": ...}: the base
+        # URL this reconciler replaced in settings.json. The capture otherwise
+        # lives only in this process, and the desktop restores settings.json on
+        # quit and pause after this process is gone, so the provider URL was
+        # deleted and its token sent to api.anthropic.com. Required like the
+        # URL above; the next instance reseeds from it (see the tick).
+        _hd_ccs_capture = _hd_os.environ.get("HEADROOM_CC_SWITCH_CAPTURE_PATH", "").strip()
+        if not _hd_os.path.isabs(_hd_ccs_capture):
+            raise RuntimeError(
+                "HEADROOM_CC_SWITCH_CAPTURE_PATH missing or relative: %r" % (_hd_ccs_capture,)
+            )
+
+        def _hd_ccs_save_capture(url):
+            tmp = "%s.%d.tmp" % (_hd_ccs_capture, _hd_os.getpid())
+            with open(tmp, "w", encoding="utf-8") as fh:
+                _hd_ccs_json.dump({"url": url}, fh)
+            _hd_os.replace(tmp, _hd_ccs_capture)
+
+        def _hd_ccs_load_capture():
+            try:
+                with open(_hd_ccs_capture, encoding="utf-8") as fh:
+                    url = _hd_ccs_json.load(fh).get("url")
+            except (OSError, ValueError, AttributeError):
+                return ""
+            ok = isinstance(url, str) and url.startswith(("http://", "https://"))
+            return url if ok else ""
+
+        def _hd_ccs_drop_capture():
+            try:
+                _hd_os.remove(_hd_ccs_capture)
+            except FileNotFoundError:
+                pass
+
+        from urllib.parse import urlsplit as _hd_ccs_urlsplit
+
+        def _hd_ccs_port(url):
+            try:
+                return _hd_ccs_urlsplit(url or "").port
+            except ValueError:
+                return None
+
+        def _hd_ccs_is_self(reconciler, url):
+            # This proxy under any loopback spelling (localhost, the internal
+            # port). Upstream's loop guard matches only the exact proxy_url,
+            # which _hd_ccs_init replaces, so these were captured as the
+            # upstream and every Anthropic request looped back into us.
+            try:
+                host = _hd_ccs_urlsplit(url or "").hostname
+            except ValueError:
+                return False
+            own = getattr(reconciler, "_hd_ccs_own_ports", ())
+            loopback = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+            return host in loopback and _hd_ccs_port(url) in own
+
+        def _hd_ccs_points_here(reconciler):
+            data = _hd_ccs_json.loads(reconciler.path.read_text(encoding="utf-8"))
+            env = data.get("env") if isinstance(data, dict) else None
+            url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+            return isinstance(url, str) and url.rstrip("/") == _hd_ccs_url
+
         _hd_ccs_orig_init = _hd_ccs_mod.CCSwitchReconciler.__init__
 
         def _hd_ccs_init(self, *args, **kwargs):
             _hd_ccs_orig_init(self, *args, **kwargs)
+            ports = {_hd_ccs_port(self.proxy_url), _hd_ccs_port(_hd_ccs_url)}
+            self._hd_ccs_own_ports = ports - {None}
             # Already rstripped, which is what the loop guard compares against.
             self.proxy_url = _hd_ccs_url
+            _hd_ccs_set = self._set_upstream
+
+            def _hd_ccs_guarded_set(url):
+                if _hd_ccs_is_self(self, url):
+                    _hd_ccs_log.info("event=cc_switch_self_upstream_ignored url=%s", url)
+                    return
+                _hd_ccs_set(url)
+
+            self._set_upstream = _hd_ccs_guarded_set
 
         _hd_ccs_mod.CCSwitchReconciler.__init__ = _hd_ccs_init
 
@@ -1266,7 +1343,22 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
 
         def _hd_ccs_tick(self):
             global _hd_ccs_warned
+            prev = self.current_upstream
+            seen = getattr(self, "_last_mtime_ns", None)
             rewrote = _hd_ccs_orig_tick(self)
+            if rewrote:
+                # Only a rewrite captures, so this stays off the 0.3s hot path.
+                try:
+                    if _hd_ccs_is_self(self, self.current_upstream):
+                        # settings.json already named us, just spelled another
+                        # way; the guarded setter refused it as the upstream.
+                        self.current_upstream = prev
+                    elif self.current_upstream not in (None, self.default_upstream):
+                        # Before the pin below: the file is what settings.json
+                        # said, which is what quit restores either way.
+                        _hd_ccs_save_capture(self.current_upstream)
+                except Exception as exc:  # noqa: BLE001 - the watcher must not die
+                    _hd_ccs_log.warning("event=cc_switch_capture_persist_failed err=%s", exc)
             try:
                 # With an override configured, the user's endpoint IS the
                 # default this reconciler returns to -- both when cc-switch
@@ -1280,6 +1372,24 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                             "event=cc_switch_upstream_pinned upstream=%s", target
                         )
                     return rewrote
+                # A new instance (relaunch, resume) meeting settings.json that
+                # already names us: the desktop, racing this process at launch,
+                # routed the provider URL the quit restored before we could
+                # capture it. Only on a settings.json change, and only when it
+                # points here -- anything else (Claude Official) would send
+                # Anthropic OAuth traffic to the recorded provider.
+                if (
+                    self.current_upstream is None
+                    and not rewrote
+                    and getattr(self, "_last_mtime_ns", None) != seen
+                ):
+                    captured = _hd_ccs_load_capture()
+                    if captured and not _hd_ccs_is_self(self, captured) and _hd_ccs_points_here(self):
+                        self.current_upstream = captured
+                        self._set_upstream(captured)
+                        _hd_ccs_log.info(
+                            "event=cc_switch_capture_restored upstream=%s", captured
+                        )
                 # Only a captured third-party upstream can go stale, and only a
                 # changed settings.json can end it. Both checks keep this off
                 # the hot path of a 0.3s poll -- an Anthropic-only user never
@@ -1301,6 +1411,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         "event=cc_switch_official_upstream_reset upstream=%s",
                         target,
                     )
+                    _hd_ccs_drop_capture()
             except Exception as exc:  # noqa: BLE001 - the watcher must not die
                 # Logged once: the reconciler is running and the reset that
                 # makes it safe just did not happen, so a captured third-party
@@ -3607,6 +3718,9 @@ impl ToolManager {
                     // written out, because a port mismatch here is exactly the
                     // bug being fixed.
                     .env("HEADROOM_CC_SWITCH_PROXY_URL", cc_switch_proxy_url())
+                    // Where the guard records a capture so quit/pause can
+                    // restore it; see cc_switch_capture_path.
+                    .env("HEADROOM_CC_SWITCH_CAPTURE_PATH", cc_switch_capture_path())
                     // User-configured upstream (GLM, Kimi, DeepSeek). Empty
                     // for everyone who has not set one, and an empty env is
                     // the same as unset to the runtime's _get_env_str, so this
@@ -10030,6 +10144,35 @@ fn cc_switch_proxy_url() -> String {
         "http://127.0.0.1:{}",
         crate::proxy_intercept::INTERCEPT_PORT
     )
+}
+
+/// Where the cc-switch guard in `SITECUSTOMIZE_PY` records, as `{"url": ...}`,
+/// the base URL the reconciler replaced in the client's settings.json. The
+/// backend writes it (tmp + os.replace) on every capture and removes it when
+/// settings.json goes back to Claude Official; its next instance reseeds from
+/// it. The desktop restores it on disable, since quit and pause restore
+/// settings.json after the backend (and its in-memory capture) is gone, and
+/// drops it once settings.json has moved off that URL (client_adapters).
+pub(crate) fn cc_switch_capture_path() -> PathBuf {
+    crate::storage::config_file(&crate::storage::app_data_dir(), "cc-switch-upstream.json")
+}
+
+/// The URL in [`cc_switch_capture_path`], when it holds a usable one.
+pub(crate) fn cc_switch_captured_upstream() -> Option<String> {
+    let raw = std::fs::read_to_string(cc_switch_capture_path()).ok()?;
+    let url = serde_json::from_str::<Value>(&raw).ok()?["url"]
+        .as_str()?
+        .to_string();
+    (url.starts_with("http://") || url.starts_with("https://")).then_some(url)
+}
+
+pub(crate) fn clear_cc_switch_capture() {
+    let path = cc_switch_capture_path();
+    if let Err(err) = std::fs::remove_file(&path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            log::warn!("removing {} failed: {err}", path.display());
+        }
+    }
 }
 
 fn cc_switch_reconcile_for_spawn(sitecustomize_injected: bool) -> &'static str {
@@ -17202,6 +17345,110 @@ time.sleep(30)
         // Missing or malformed falls into the same fail-closed except as the
         // reset guard: no reconciler rather than one writing a bad base_url.
         assert!(py.contains("HEADROOM_CC_SWITCH_PROXY_URL missing or malformed"));
+    }
+
+    /// Runs `script` against the installed wheel's real CCSwitchReconciler with
+    /// the shipped sitecustomize on PYTHONPATH, the env the backend spawn sets,
+    /// and a scratch dir (argv[1]) holding settings.json and the capture file.
+    /// The internal port is 6768 and the intercept 6767. Skips without a
+    /// managed runtime to run it on.
+    fn run_cc_switch_probe(name: &str, script: &str) {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-ccs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp probe dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let prelude = "import json, os, sys\n\
+            from pathlib import Path\n\
+            assert os.environ['HEADROOM_CC_SWITCH_RECONCILE'] == '1', 'cc-switch guard did not bind'\n\
+            import headroom.proxy.cc_switch_reconciler as m\n\
+            d = Path(sys.argv[1]); settings = d / 'settings.json'; capture = d / 'capture.json'\n\
+            ANTHROPIC = 'https://api.anthropic.com'; RELAY = 'https://api.relay.example/anthropic'\n\
+            n = [0]\n\
+            def write(env):\n    \
+                settings.write_text(json.dumps({'env': env}))\n    \
+                n[0] += 1; t = 1_700_000_000_000_000_000 + n[0] * 1_000_000_000\n    \
+                os.utime(settings, ns=(t, t))\n\
+            def recon(sink):\n    \
+                return m.CCSwitchReconciler(proxy_url='http://127.0.0.1:6768', default_upstream=ANTHROPIC, set_upstream=sink.append, path=settings)\n\
+            def base_url():\n    \
+                return json.loads(settings.read_text()).get('env', {}).get('ANTHROPIC_BASE_URL')\n";
+        std::fs::write(
+            dir.join("probe.py"),
+            format!("{prelude}{script}\nprint('PROBE OK')\n"),
+        )
+        .expect("write probe");
+        let out = crate::proc::command(&python)
+            .arg(dir.join("probe.py"))
+            .arg(&dir)
+            .env("PYTHONPATH", &dir)
+            .env("HEADROOM_SDK", "headroom-desktop-proxy")
+            .env("HEADROOM_CC_SWITCH_RECONCILE", "1")
+            .env("HEADROOM_CC_SWITCH_PROXY_URL", cc_switch_proxy_url())
+            .env("HEADROOM_CC_SWITCH_CAPTURE_PATH", dir.join("capture.json"))
+            .env("HEADROOM_CC_SWITCH_PIN_UPSTREAM", "0")
+            .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+            .output()
+            .expect("run cc-switch probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            out.status.success() && stdout.contains("PROBE OK"),
+            "cc-switch probe {name} failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The reconciler's capture lived only in the backend's memory, and the
+    /// desktop restores settings.json on quit/pause after the backend is gone,
+    /// so the provider URL was deleted and Claude Code sent the provider's key
+    /// to api.anthropic.com. The capture has to reach a file the desktop reads,
+    /// come back on the next backend's first look at a settings.json already on
+    /// the intercept, never come back onto one that is not (Claude Official:
+    /// Anthropic OAuth must not follow it), and end on a switch to Official.
+    #[test]
+    fn cc_switch_capture_outlives_the_backend_against_the_installed_wheel() {
+        run_cc_switch_probe(
+            "capture",
+            "seen = []; r = recon(seen)\n\
+             write({'ANTHROPIC_BASE_URL': RELAY, 'ANTHROPIC_AUTH_TOKEN': 'sk-relay'}); r.tick()\n\
+             assert base_url() == 'http://127.0.0.1:6767', base_url()\n\
+             assert capture.exists() and json.loads(capture.read_text()) == {'url': RELAY}, 'capture not persisted'\n\
+             again = []; r2 = recon(again); r2.tick()\n\
+             assert r2.current_upstream == RELAY and again == [RELAY], ('restart lost the capture', again)\n\
+             write({}); r2.tick()\n\
+             assert again[-1] == ANTHROPIC and not capture.exists(), ('official kept the capture', again)\n\
+             capture.write_text(json.dumps({'url': RELAY}))\n\
+             write({}); stale = []; r3 = recon(stale); r3.tick()\n\
+             assert stale == [] and r3.current_upstream is None, ('reseeded onto official', stale)",
+        );
+    }
+
+    /// Upstream's loop guard only matched the exact proxy_url string, which the
+    /// guard replaces with the intercept URL, so settings.json naming this proxy
+    /// any other way (localhost, the internal port the 0.9.3-rc.1 residue
+    /// restores) became the upstream and every request looped back into us.
+    #[test]
+    fn cc_switch_never_captures_its_own_address_against_the_installed_wheel() {
+        run_cc_switch_probe(
+            "self",
+            "seen = []; r = recon(seen)\n\
+             for url in ('http://localhost:6767', 'http://127.0.0.1:6768/', 'http://[::1]:6767'):\n    \
+                 write({'ANTHROPIC_BASE_URL': url}); r.tick()\n    \
+                 assert seen == [] and r.current_upstream is None, (url, seen)\n    \
+                 assert base_url() == 'http://127.0.0.1:6767' and not capture.exists(), url\n\
+             write({'ANTHROPIC_BASE_URL': RELAY}); r.tick()\n\
+             assert seen == [RELAY], seen\n\
+             write({'ANTHROPIC_BASE_URL': 'http://localhost:6768'}); r.tick()\n\
+             assert seen == [RELAY] and r.current_upstream == RELAY, (seen, r.current_upstream)\n\
+             assert json.loads(capture.read_text()) == {'url': RELAY}",
+        );
     }
 
     /// Regression: `start_headroom_background` previously built `startup_variants`
