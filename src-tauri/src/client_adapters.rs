@@ -7277,7 +7277,7 @@ fn remove_claude_remote_control_command() -> Result<()> {
 /// recognised in settings.json.
 const CLAUDE_STATUSLINE_SCRIPT: &str = "headroom-statusline.sh";
 
-fn claude_statusline_script_path() -> PathBuf {
+pub(crate) fn claude_statusline_script_path() -> PathBuf {
     home_dir()
         .join(".claude")
         .join("hooks")

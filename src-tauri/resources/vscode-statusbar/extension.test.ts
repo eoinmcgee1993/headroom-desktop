@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 // `activate` (which needs the vscode API) is exercised in a real editor.
 import ext from "./extension.cjs";
 
-const { fmt, pickSession, projectDirs, projectSlug, view } = ext;
+const { fmt, pickSession, projectDirs, projectSlug, routed, view } = ext;
 
 describe("vscode status bar extension", () => {
   it("rounds like the terminal statusline", () => {
@@ -63,5 +63,13 @@ describe("vscode status bar extension", () => {
     });
     expect(view(session(0, now - 60_000, 0), now)).toBeNull();
     expect(view(null, now)).toBeNull();
+  });
+
+  it("hides once Headroom removed its statusline script (pause, quit, disconnect)", () => {
+    const script = "/Users/x/.claude/hooks/headroom-statusline.sh";
+    expect(routed(script, (p: string) => p === script)).toBe(true);
+    expect(routed(script, () => false)).toBe(false);
+    // A headroom.json written before scriptPath existed keeps showing.
+    expect(routed(undefined, () => false)).toBe(true);
   });
 });
