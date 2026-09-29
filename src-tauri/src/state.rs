@@ -2172,6 +2172,13 @@ impl AppState {
         profile
     }
 
+    /// Test hook: serve `profile` from the Claude profile cache without a fetch.
+    #[cfg(test)]
+    pub(crate) fn seed_claude_profile_for_test(&self, profile: ClaudeAccountProfile) {
+        *self.cached_claude_profile.lock() =
+            Some((self.current_bearer_token(), profile, Instant::now()));
+    }
+
     /// True iff a `desktop/grace/start` post with this exact set of Claude
     /// fields has already been recorded as successful in this session.
     /// Identity-pusher worker uses this to skip repeat posts when the bearer

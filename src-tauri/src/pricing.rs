@@ -54,6 +54,11 @@ struct LocalPricingState {
     /// server flip can't strand a user halfway through the gated flow.
     #[serde(default)]
     paywall_first: Option<bool>,
+    /// The launch-flags call already waited on one config fetch that failed.
+    /// Later launches then serve cached-or-false at once and leave retries to
+    /// the background warmer, instead of waiting on the network every launch.
+    #[serde(default)]
+    paywall_first_fetch_failed: bool,
     /// Last time any extraheadroom.com call succeeded (grace/start or account
     /// sync). Baseline for the server-silent Sentry alarm.
     #[serde(default)]
@@ -462,15 +467,29 @@ pub fn push_terms_acceptance(state: &AppState, version: u32) {
 /// Piggybacks the existing `desktop/grace/start` POST (device identity already
 /// travels with it) via the `X-Headroom-Funnel-Step` header. Fire-and-forget on
 /// a detached thread so it never blocks the UI or gates the wizard; the server
-/// is first-write-wins, so repeats are harmless.
-pub fn report_funnel_step(state: &AppState, step: &str) {
-    spawn_funnel_step(IdentityPayload::for_state(state), step);
+/// is first-write-wins, so repeats are harmless. Takes the handle, not the
+/// state, because the identity build can fetch from Anthropic and has to run
+/// on that thread too: callers include sync commands on the main thread.
+pub fn report_funnel_step(app: &tauri::AppHandle, step: &str) {
+    use tauri::Manager;
+    let app = app.clone();
+    spawn_funnel_step(
+        move || IdentityPayload::for_state(&app.state::<AppState>()),
+        step,
+        api_base_url(),
+        FUNNEL_STEP_RETRY_BACKOFFS,
+    );
 }
 
 /// `report_funnel_step` for contexts without an `AppState` (e.g. the proxy
 /// intercept thread). Device identity alone keys the server's `TrialIdentity`.
 pub fn report_funnel_step_device_only(step: &str) {
-    spawn_funnel_step(IdentityPayload::device_only(), step);
+    spawn_funnel_step(
+        IdentityPayload::device_only,
+        step,
+        api_base_url(),
+        FUNNEL_STEP_RETRY_BACKOFFS,
+    );
 }
 
 /// Retry backoffs for the funnel beacon. A relaunch that races network
@@ -487,21 +506,22 @@ const FUNNEL_STEP_RETRY_BACKOFFS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(300),
 ];
 
-fn spawn_funnel_step(identity: IdentityPayload, step: &str) {
+fn spawn_funnel_step(
+    identity: impl FnOnce() -> IdentityPayload + Send + 'static,
+    step: &str,
+    base_url: String,
+    backoffs: &'static [std::time::Duration],
+) -> std::thread::JoinHandle<()> {
     let step = step.to_string();
     std::thread::spawn(move || {
-        if let Err(err) = post_funnel_step_with_retries(
-            &identity,
-            &step,
-            &api_base_url(),
-            FUNNEL_STEP_RETRY_BACKOFFS,
-        ) {
+        let identity = identity();
+        if let Err(err) = post_funnel_step_with_retries(&identity, &step, &base_url, backoffs) {
             // info, not warn: the log->Sentry bridge captures warns, and a
             // device offline for the whole session would emit one event per
             // funnel step for a condition that is not our bug.
             log::info!("funnel step {step} not delivered after retries: {err}");
         }
-    });
+    })
 }
 
 fn post_funnel_step_with_retries(
@@ -629,6 +649,10 @@ pub fn is_identity_complete(profile: &ClaudeAccountProfile) -> bool {
 /// push in this session, this is a no-op. On HTTP failure the fingerprint
 /// is not recorded, so the next bearer change retries.
 pub fn warm_and_push_identity(state: &AppState) {
+    warm_and_push_identity_to(state, &api_base_url());
+}
+
+fn warm_and_push_identity_to(state: &AppState, base_url: &str) {
     const COMPLETE_FETCH_THROTTLE: std::time::Duration =
         std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -660,7 +684,16 @@ pub fn warm_and_push_identity(state: &AppState) {
     // new identity fields. Push them now even though the worker would
     // otherwise have skipped the OAuth fetch — this is the account-switch
     // path.
-    match fetch_grace_start(&identity) {
+    //
+    // Within reconcile's shared spacing, though: two Claude accounts taking
+    // turns on the bearer slot signal here on every switch, and each POST
+    // spent the server's 10/device/hour grace/start budget until reconcile's
+    // heartbeat got 429s. Nothing is recorded, so the next signal past the
+    // window retries, and reconcile's own POST carries the identity meanwhile.
+    if !grace_start_attempt_due() {
+        return;
+    }
+    match fetch_grace_start_with_base_url(&identity, base_url) {
         Ok(_) => state.record_pushed_identity_fingerprint(fp),
         Err(_) => {
             // Silent — matches `reconcile_local_state_with_server`'s
@@ -3623,28 +3656,49 @@ pub fn paywall_first_flag() -> bool {
 
 /// Same cached flag, but on the first ever read waits for one bounded config
 /// fetch. Keeps cold launches from missing their server bucket just because the
-/// background warmer has not finished yet.
+/// background warmer has not finished yet. Waits once per install: a failed
+/// fetch is recorded, so a network that drops extraheadroom.com does not stall
+/// every later launch too.
 pub fn paywall_first_flag_or_refresh() -> bool {
+    paywall_first_flag_or_refresh_with(|| fetch_public_config().map(|c| c.paywall_first))
+}
+
+fn paywall_first_flag_or_refresh_with(fetch: impl FnOnce() -> Option<bool>) -> bool {
     let Ok(local) = load_or_initialize_local_state() else {
         return false;
     };
     if let Some(flag) = local.paywall_first {
         return flag;
     }
-    refresh_paywall_first_flag();
-    paywall_first_flag()
+    if local.paywall_first_fetch_failed {
+        return false;
+    }
+    let Some(flag) = fetch() else {
+        // Reloaded: the fetch can take seconds, and a stale copy would clobber
+        // whatever the warmer or reconcile wrote meanwhile.
+        if let Ok(mut local) = load_or_initialize_local_state() {
+            local.paywall_first_fetch_failed = true;
+            let _ = write_local_state(&local);
+        }
+        return paywall_first_flag();
+    };
+    store_paywall_first_flag(flag);
+    flag
 }
 
 /// Refresh the paywall-first flag from the unauthenticated config endpoint.
-/// Called once from `setup()` on a background thread, and synchronously only
-/// when the frontend asks for launch flags before any cache exists.
+/// Called once from `setup()` on a background thread; the launch-flags call
+/// does its own fetch when it finds no cache.
 pub fn refresh_paywall_first_flag() {
-    let Some(config) = fetch_public_config() else {
-        return;
-    };
+    if let Some(config) = fetch_public_config() {
+        store_paywall_first_flag(config.paywall_first);
+    }
+}
+
+fn store_paywall_first_flag(flag: bool) {
     if let Ok(mut local) = load_or_initialize_local_state() {
-        if local.paywall_first != Some(config.paywall_first) {
-            local.paywall_first = Some(config.paywall_first);
+        if local.paywall_first != Some(flag) {
+            local.paywall_first = Some(flag);
             let _ = write_local_state(&local);
         }
     }
@@ -3680,6 +3734,7 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
         mismatch_since: None,
         mismatch_clamped_at: None,
         paywall_first: None,
+        paywall_first_fetch_failed: false,
         last_server_contact_at: None,
         last_account_sync_ok_at: None,
     };
@@ -4112,6 +4167,7 @@ mod tests {
             mismatch_since: None,
             mismatch_clamped_at: None,
             paywall_first: None,
+            paywall_first_fetch_failed: false,
             last_server_contact_at: stale,
             last_account_sync_ok_at: stale,
         };
@@ -6413,6 +6469,90 @@ mod tests {
         )
         .expect("second attempt lands after one failure");
         server.join().unwrap();
+    }
+
+    /// #105/#123: building the identity can fetch the Claude profile and usage
+    /// from Anthropic (two 8s-timeout calls). It ran on the caller's thread,
+    /// which for the sync `report_funnel_step` command and `start_bootstrap`
+    /// is the Tauri main thread, so the window froze on the onboarding
+    /// success screen and on the Upgrade click.
+    #[test]
+    fn funnel_step_builds_its_identity_on_the_beacon_thread() {
+        let caller = std::thread::current().id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base_url = format!("http://127.0.0.1:{}", closed.local_addr().unwrap().port());
+        drop(closed);
+        super::spawn_funnel_step(
+            move || {
+                tx.send(std::thread::current().id()).unwrap();
+                IdentityPayload::default()
+            },
+            "test_step",
+            base_url,
+            &[],
+        )
+        .join()
+        .unwrap();
+        assert_ne!(rx.recv().unwrap(), caller);
+    }
+
+    /// #124: two Claude accounts alternating on the bearer slot signal the
+    /// identity pusher on every switch, and each push POSTed grace/start
+    /// outside the shared ten-minute spacing. That burned the server's
+    /// 10/device/hour budget, after which reconcile's heartbeat got 429s too.
+    #[test]
+    #[serial_test::serial]
+    fn identity_push_respects_the_grace_start_spacing() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (state, dir) = temp_app_state();
+        let mut profile = empty_claude_profile(ClaudePlanTier::Pro);
+        profile.account_uuid = Some("acct-b".into());
+        profile.email = Some("b@example.com".into());
+        state.seed_claude_profile_for_test(profile);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let last = || {
+            super::LAST_GRACE_START_ATTEMPT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        };
+        // Reconcile's heartbeat (or the previous switch) just POSTed.
+        let prev = last().replace(std::time::Instant::now());
+
+        super::warm_and_push_identity_to(&state, &base_url);
+
+        *last() = prev;
+        assert!(
+            listener.accept().is_err(),
+            "grace/start went out inside the spacing window"
+        );
+        drop_state(dir);
+    }
+
+    /// #27/#129: a failed cold fetch recorded nothing, so every launch on a
+    /// network that drops extraheadroom.com waited out the fetch timeout on
+    /// the launch-flags call again.
+    #[test]
+    #[serial_test::serial]
+    fn paywall_flag_waits_on_the_network_once_per_install() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let fetches = std::cell::Cell::new(0);
+        let unreachable = || {
+            fetches.set(fetches.get() + 1);
+            None
+        };
+        assert!(!super::paywall_first_flag_or_refresh_with(unreachable));
+        assert!(!super::paywall_first_flag_or_refresh_with(unreachable));
+        assert_eq!(
+            fetches.get(),
+            1,
+            "a later launch waited on the network again"
+        );
+        // The background warmer still lands the flag later, and it wins.
+        super::store_paywall_first_flag(true);
+        assert!(super::paywall_first_flag_or_refresh_with(|| unreachable!()));
     }
 
     #[test]

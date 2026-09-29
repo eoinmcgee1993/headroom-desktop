@@ -579,7 +579,7 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
         if Utc::now() - since >= chrono::Duration::minutes(45)
             && !ABSENT_BEACON_SENT.swap(true, Ordering::AcqRel)
         {
-            pricing::report_funnel_step(state, "agent_activity_absent");
+            pricing::report_funnel_step(app, "agent_activity_absent");
         }
         return;
     }
@@ -608,11 +608,11 @@ fn maybe_fire_unrouted_usage_nudge(app: &AppHandle, state: &AppState, dashboard:
     static CLAUDE_BEACON_SENT: AtomicBool = AtomicBool::new(false);
     static CODEX_BEACON_SENT: AtomicBool = AtomicBool::new(false);
     if claude && !CLAUDE_BEACON_SENT.swap(true, Ordering::AcqRel) {
-        pricing::report_funnel_step(state, "unrouted_usage_detected");
+        pricing::report_funnel_step(app, "unrouted_usage_detected");
     }
     if let Some(routed_since) = codex_routed_since {
         if !CODEX_BEACON_SENT.swap(true, Ordering::AcqRel) {
-            pricing::report_funnel_step(state, "unrouted_codex_usage_detected");
+            pricing::report_funnel_step(app, "unrouted_codex_usage_detected");
             report_first_run_unrouted_codex(state, routed_since);
         }
     }
@@ -934,7 +934,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         if dashboard.lifetime_estimated_tokens_saved > 0
             && !FIRST_SAVINGS_FUNNEL_REPORTED.swap(true, Ordering::AcqRel)
         {
-            pricing::report_funnel_step(&state, "first_savings_recorded");
+            pricing::report_funnel_step(&app, "first_savings_recorded");
         }
 
         maybe_inject_fake_daily_savings(&mut dashboard);
@@ -1850,7 +1850,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         );
     } else {
         analytics::track_event(&app, "bootstrap_started", None);
-        pricing::report_funnel_step(&app.state::<AppState>(), "bootstrap_started");
+        pricing::report_funnel_step(&app, "bootstrap_started");
     }
 
     let app_handle = app.clone();
@@ -1906,7 +1906,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
                     "bootstrap_failed",
                     Some(json!({ "phase": "install_runtime", "kind": kind.as_str() })),
                 );
-                pricing::report_funnel_step(&state, "bootstrap_failed");
+                pricing::report_funnel_step(&app_handle, "bootstrap_failed");
                 return;
             }
 
@@ -1978,7 +1978,7 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         state.mark_bootstrap_complete();
         emit_bootstrap_progress(&app_handle, &state);
         analytics::track_event(&app_handle, "bootstrap_completed", None);
-        pricing::report_funnel_step(&state, "bootstrap_completed");
+        pricing::report_funnel_step(&app_handle, "bootstrap_completed");
     });
 
     Ok(())
@@ -4127,8 +4127,10 @@ pub struct DebugOverrides {
 }
 
 /// Cached launch flags. On a cold cache, performs one bounded config fetch so
-/// a fresh first launch does not miss its server bucket.
-#[tauri::command]
+/// a fresh first launch does not miss its server bucket. `async` so that fetch
+/// never runs on the main thread: both windows call this at startup, and on a
+/// network that drops extraheadroom.com each call froze the UI for 8s.
+#[tauri::command(async)]
 fn get_launch_flags() -> LaunchFlags {
     LaunchFlags {
         paywall_first: pricing::paywall_first_flag_or_refresh(),
@@ -4198,8 +4200,8 @@ async fn get_headroom_pricing_status(
 /// immediately; `pricing::report_funnel_step` does the POST on a detached
 /// thread so a slow/offline network never blocks the wizard.
 #[tauri::command]
-fn report_funnel_step(state: State<'_, AppState>, step: String) {
-    pricing::report_funnel_step(&state, &step);
+fn report_funnel_step(app: AppHandle, step: String) {
+    pricing::report_funnel_step(&app, &step);
 }
 
 /// Credentials handed over by a `headroom://auth` magic link, waiting for the
@@ -5382,7 +5384,7 @@ async fn apply_client_setup(
             // path counts: launcher auto-configure, the manual client-setup
             // screen, and the dashboard connector toggle. First-write-wins
             // server-side, so post-onboarding re-applies are no-ops.
-            pricing::report_funnel_step(&state, "client_setup_applied");
+            pricing::report_funnel_step(&app, "client_setup_applied");
             analytics::track_event(
                 &app,
                 "client_setup_applied",
@@ -5457,7 +5459,7 @@ async fn apply_client_setup(
             // exclusions: permission-denied and disk-full are environmental,
             // but the per-OS funnel still needs them counted as "setup was
             // attempted and did not stick" (invisible on Windows otherwise).
-            pricing::report_funnel_step(&state, "client_setup_failed");
+            pricing::report_funnel_step(&app, "client_setup_failed");
             Err(msg)
         }
     }
@@ -6604,7 +6606,9 @@ pub fn run() {
     // the error branch ever ran. Production funnel data (2026-08-26) shows
     // these silent deaths outnumber classified failures ~4:1; this is the only
     // signal they leave.
-    if let Some(abandoned) = state.tool_manager.take_abandoned_bootstrap() {
+    let abandoned_bootstrap = state.tool_manager.take_abandoned_bootstrap();
+    let report_bootstrap_abandoned = abandoned_bootstrap.is_some();
+    if let Some(abandoned) = abandoned_bootstrap {
         // The tail of the previous run's app log usually holds the last thing
         // the install did before dying. Same 12KB cap as
         // capture_upgrade_failure: Sentry drops extras past ~16KB. Connection-
@@ -6640,10 +6644,6 @@ pub fn run() {
                 );
             },
         );
-        // Funnel mirror so the server-side stall query can tell "died
-        // mid-install but came back" from "gone for good". Unknown step names
-        // are ignored by servers that predate this one.
-        pricing::report_funnel_step(&state, "bootstrap_abandoned");
     }
 
     let mut builder =
@@ -6687,7 +6687,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init());
 
     let app = builder
-        .setup(|app| {
+        .setup(move |app| {
             // First thing in setup, before anything that can pump the Windows
             // message loop (set_size/center below re-enter the webview and can
             // dispatch a frontend command): every analytics accessor resolves
@@ -6696,6 +6696,14 @@ pub fn run() {
             app.manage(analytics::AnalyticsClient::new(
                 app.package_info().version.to_string(),
             ));
+            // Funnel mirror of the bootstrap_abandoned capture, so the server-
+            // side stall query can tell "died mid-install but came back" from
+            // "gone for good". Sent from here because the beacon builds its
+            // identity from the managed state. Unknown step names are ignored
+            // by servers that predate this one.
+            if report_bootstrap_abandoned {
+                pricing::report_funnel_step(app.handle(), "bootstrap_abandoned");
+            }
             // A WebView2 runtime that is registered but broken passes Tauri's
             // "installed" check, then fails to create the config windows, and
             // Tauri only logs that: the app ran with a tray icon and no window
@@ -6866,7 +6874,8 @@ pub fn run() {
             // channel forever). On panic we log + report and resume the
             // recv loop on the next signal.
             // Warm the paywall-first flag cache once per launch. Fire-and-forget:
-            // get_launch_flags serves cached-or-false immediately either way.
+            // get_launch_flags waits on its own fetch only until one has failed
+            // on this install, then serves cached-or-false.
             std::thread::Builder::new()
                 .name("paywall-flag-fetch".into())
                 .spawn(pricing::refresh_paywall_first_flag)

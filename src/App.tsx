@@ -2225,7 +2225,8 @@ export default function App() {
       const [runtimeResult, pricingResult, launchFlagsResult] = await Promise.all([
         invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
         invoke<HeadroomPricingStatus>("get_headroom_pricing_status").catch(() => null),
-        // Local cached read, never blocks on the network. Fetched before
+        // Cached read; waits on one config fetch per install only while no
+        // flag is cached and no fetch has failed yet. Fetched before
         // startupReady so TermsGate sees the paywall-first flag on its very
         // first render (a late fetch would flicker the auth section in).
         invoke<LaunchFlags>("get_launch_flags").catch(() => null),
