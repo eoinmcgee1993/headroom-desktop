@@ -1361,6 +1361,10 @@ async fn handle(
     // port (and may switch to a fallback) when the proxy spawn runs, which
     // happens after this thread is already accepting; reading per-connection
     // means existing clients pick up the chosen port without restarting.
+    // Unselected means tool_manager has not vetted the port yet, and whatever
+    // listens on 6768 (Orca, a dev server) is not known to be our backend:
+    // treat it as down. Loaded before the port, see `backend_port::selected`.
+    let backend_selected = backend_port::selected();
     let backend_addr: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
     // Read only through the end of the HTTP headers. We only need headers to
     // capture the bearer token, and forwarding early avoids deadlocks with
@@ -1648,7 +1652,12 @@ async fn handle(
     };
 
     // Forward to the headroom backend.
-    let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
+    let backend = if backend_selected {
+        TcpStream::connect(backend_addr).await.ok()
+    } else {
+        None
+    };
+    let Some(mut backend) = backend else {
         // Backend down or mid-restart (crash, gate transition, post-update
         // cold boot — which deliberately holds the bypass flags off for up to
         // 10 minutes): fall back per-request to the native provider. That now
@@ -1732,7 +1741,10 @@ async fn handle(
     // response path that sees those headers. Every other client (Claude) keeps
     // the untouched zero-copy splice.
     if is_codex && !is_opencode && !is_grok {
-        let req_path = parse_request_head(&buf).map(|p| p.path).unwrap_or_default();
+        let req_path = parsed_head
+            .as_ref()
+            .map(|p| p.path.clone())
+            .unwrap_or_default();
         let prompt = parsed_head.as_ref().is_some_and(is_prompt_request_head);
         splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt).await;
     } else {
@@ -2009,8 +2021,13 @@ fn report_codex_stream_without_terminal(req_path: &str, streamed_bytes: u64) {
 /// Parse the status code from an HTTP response head's status line
 /// (`HTTP/1.1 400 Bad Request` -> `400`).
 fn parse_response_status(head: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(head).ok()?;
-    let first = text.split("\r\n").next()?;
+    // Status line only: `head` may carry over-read body bytes (or, in the
+    // sniffer, a partial header) ending mid-character.
+    let end = head
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(head.len());
+    let first = std::str::from_utf8(&head[..end]).ok()?;
     first.split_whitespace().nth(1)?.parse().ok()
 }
 
@@ -2395,7 +2412,9 @@ fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
 /// `headroom/subscription/codex_rate_limits.py`. Returns `None` when there is no
 /// usable signal (no windows and no credits balance).
 fn parse_codex_rate_limit_headers(head: &[u8]) -> Option<CodexRateLimitSnapshot> {
-    let text = std::str::from_utf8(head).ok()?;
+    // Head only: `read_http_headers` over-reads into the SSE body.
+    let end = find_header_end(head).unwrap_or(head.len());
+    let text = std::str::from_utf8(&head[..end]).ok()?;
 
     let mut headers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for line in text.split("\r\n").skip(1) {
@@ -3126,7 +3145,10 @@ struct ParsedRequestHead {
 }
 
 fn parse_request_head(buf: &[u8]) -> Option<ParsedRequestHead> {
-    let text = std::str::from_utf8(buf).ok()?;
+    // Head only, same guard as `extract_header_value`: `buf` may carry
+    // over-read body bytes ending mid-character.
+    let end = find_header_end(buf).unwrap_or(buf.len());
+    let text = std::str::from_utf8(&buf[..end]).ok()?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
@@ -3605,7 +3627,10 @@ fn is_claude_session_id(id: &str) -> bool {
 /// and no browser Origin header is present. Protects against DNS-rebinding
 /// attacks that aim the user's browser at 127.0.0.1 via an attacker domain.
 fn request_is_loopback_safe(buf: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(buf) else {
+    // Head only: `read_http_headers` over-reads into the body, and a
+    // multi-byte character cut at the read boundary must not fail the check.
+    let end = find_header_end(buf).unwrap_or(buf.len());
+    let Ok(text) = std::str::from_utf8(&buf[..end]) else {
         return false;
     };
     let mut host: Option<&str> = None;
@@ -4036,6 +4061,45 @@ mod tests {
     fn missing_host_header_is_rejected() {
         let req = b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         assert!(!request_is_loopback_safe(req));
+    }
+
+    /// What one 4096-byte `read_http_headers` chunk holds when non-ASCII body
+    /// text straddles the read boundary: `head`, then body bytes ending on the
+    /// lead byte of a two-byte character.
+    fn over_read_with_split_char(head: &[u8]) -> Vec<u8> {
+        let mut buf = head.to_vec();
+        buf.resize(4095, b'x');
+        buf.push(0xC3); // lead byte of U+00E9
+        buf
+    }
+
+    #[test]
+    fn loopback_check_ignores_a_character_split_at_the_read_boundary() {
+        let req = over_read_with_split_char(
+            b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nContent-Length: 9000\r\n\r\n{",
+        );
+        assert!(request_is_loopback_safe(&req));
+        let req = over_read_with_split_char(
+            b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nOrigin: https://evil.example.com\r\n\r\n{",
+        );
+        assert!(!request_is_loopback_safe(&req));
+    }
+
+    #[test]
+    fn head_parsers_ignore_a_character_split_at_the_read_boundary() {
+        let req = over_read_with_split_char(
+            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 9000\r\n\r\n{",
+        );
+        let parsed = parse_request_head(&req).expect("request head parses");
+        assert_eq!(parsed.path, "/v1/responses");
+        assert_eq!(parsed.content_length, Some(9000));
+
+        let resp = over_read_with_split_char(
+            b"HTTP/1.1 429 Too Many Requests\r\nx-codex-primary-used-percent: 99\r\n\r\ndata: ",
+        );
+        assert_eq!(parse_response_status(&resp), Some(429));
+        let snapshot = parse_codex_rate_limit_headers(&resp).expect("rate-limit snapshot");
+        assert_eq!(snapshot.primary.expect("primary").used_percent, 99.0);
     }
 
     #[tokio::test]
@@ -4522,6 +4586,93 @@ mod tests {
 
         run_task.abort();
         backend_port::reset_for_tests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn intercept_goes_direct_until_the_backend_port_is_selected() {
+        // Something already listens where the backend port points (Orca's
+        // mobile server, a dev server on 6768) before tool_manager has probed
+        // and selected the port. It is not our backend: the request must go
+        // direct and never reach it.
+        // Records what reaches it; other tests' health probes may land here
+        // too (the port is global), so only the client request counts.
+        let (foreign_listener, foreign_addr) = bind_ephemeral().await;
+        let foreign_got_request = Arc::new(AtomicBool::new(false));
+        let got_request = foreign_got_request.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = foreign_listener.accept().await {
+                let got_request = got_request.clone();
+                tokio::spawn(async move {
+                    let head = read_until_header_end(&mut sock).await;
+                    if head.starts_with(b"POST /v1/messages") {
+                        got_request.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        backend_port::point_unselected_for_tests(foreign_addr.port());
+
+        let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = read_until_header_end(&mut sock).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let (intercept_listener, intercept_addr) = bind_ephemeral().await;
+        let mut client = TcpStream::connect(intercept_addr)
+            .await
+            .expect("client connect");
+        let (accepted, _) = intercept_listener.accept().await.expect("accept");
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        tokio::spawn(super::handle(
+            accepted,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            fresh_bearer_tx,
+            Arc::new(format!("http://127.0.0.1:{}", upstream_addr.port())),
+        ));
+        client
+            .write_all(
+                b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 256];
+        let _ = timeout(Duration::from_secs(5), async {
+            while response.len() < 16 {
+                let n = client.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                response.extend_from_slice(&tmp[..n]);
+            }
+        })
+        .await;
+        backend_port::reset_for_tests();
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "expected the direct 200, got: {response:?}"
+        );
+        assert!(
+            !foreign_got_request.load(std::sync::atomic::Ordering::SeqCst),
+            "the request reached a listener on the unselected backend port"
+        );
     }
 
     #[test]

@@ -3443,6 +3443,10 @@ impl AppState {
                     "ensure_headroom_running: adopting healthy backend on port {} behind an unreachable intercept; not spawning",
                     crate::backend_port::get()
                 );
+                // Vetted (/readyz plus this build's argv), so select it: the
+                // intercept treats an unselected port as down, and nothing
+                // else selects a backend this process did not spawn.
+                crate::backend_port::set(crate::backend_port::get());
             }
             *self.last_startup_error.lock() = None;
             return Ok(());
