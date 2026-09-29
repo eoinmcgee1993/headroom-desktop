@@ -333,9 +333,9 @@ const addonCopy: Record<string, AddonCopy> = {
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
-    "Sets ANTHROPIC_BASE_URL in your shell profile and ~/.claude/settings.json. Claude Code turns off Remote Control behind a proxy, so Headroom adds a /remote-control command (/remote-control-headroom in VS Code) that restarts the session without Headroom.",
+    "Sets ANTHROPIC_BASE_URL in ~/.claude/settings.json. Claude Code turns off Remote Control behind a proxy, so Headroom adds a /remote-control command (/remote-control-headroom in VS Code) that restarts the session without Headroom.",
   codex:
-    "Adds a Headroom provider to ~/.codex/config.toml, which the ChatGPT app, the IDE extension and the CLI share, plus an OPENAI_BASE_URL shell export and a guard that warns if routing breaks. In the Codex CLI, run /hooks once to trust the guard.",
+    "Adds a Headroom provider to ~/.codex/config.toml, which the ChatGPT app, the IDE extension and the CLI share, plus a guard that warns if routing breaks. In the Codex CLI, run /hooks once to trust the guard.",
   grok_build:
     "Adds a proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profile.",
   opencode:

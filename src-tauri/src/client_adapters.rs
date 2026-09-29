@@ -463,8 +463,8 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                 }
             }
 
-            // Shell profile (RTK PATH + env export) is convenience; tolerate an
-            // unwritable profile rather than failing the whole setup.
+            // Shell profile (RTK PATH + `claude` function) is convenience;
+            // tolerate an unwritable profile rather than failing the whole setup.
             let env_block = claude_code_shell_block();
             let shell_step = ensure_rtk_integrations_for_targets(
                 &default_headroom_rtk_path(),
@@ -503,7 +503,6 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             }
         }
         "codex" | "codex_cli" => {
-            let shell_targets = resolve_client_shell_targets(&state, client_id)?;
             // Critical, app-owned write first: the ~/.codex/config.toml provider
             // block is what routes Codex through Headroom.
             let (changed, backups, preserved_provider) = configure_codex_provider_block()?;
@@ -523,23 +522,13 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
             updates.0.append(&mut guard.0);
             updates.1.append(&mut guard.1);
 
-            let env_block = format!("export OPENAI_BASE_URL={}", HEADROOM_OPENAI_BASE_URL);
-            match shell_step_best_effort(configure_shell_block(
-                &shell_targets,
-                "codex_cli",
-                &env_block,
-            ))? {
-                Some(mut shell) => {
-                    updates.0.append(&mut shell.0);
-                    updates.1.append(&mut shell.1);
-                }
-                None => shell_unwritable = true,
-            }
+            // No OPENAI_BASE_URL shell export: config.toml routes Codex, and an
+            // export appended to the rc overrode the user's own (Ollama,
+            // OpenRouter) for every other OpenAI client, then outlived quit.
+            // Drop the block older builds wrote.
+            let _ = remove_shell_block(&all_shell_paths(), "codex_cli");
             changed_files.extend(updates.0);
             backup_files.extend(updates.1);
-            state
-                .managed_shell_files
-                .insert(state_id.clone(), serialize_paths(&shell_targets));
             // Pull existing native threads into the headroom-provider menu so the
             // Codex history list stays whole once it routes through Headroom.
             retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
@@ -651,12 +640,6 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
         "claude_code" => {
             let state = load_setup_state();
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
-            let shell_ok = shell_block_contains_in_files(
-                &shell_targets,
-                "claude_code",
-                "ANTHROPIC_BASE_URL",
-                HEADROOM_ANTHROPIC_BASE_URL,
-            )?;
             let rtk_path_ok =
                 shell_block_contains_text_in_files(&shell_targets, "managed_rtk", "export PATH=")?;
             let claude_settings_ok =
@@ -664,11 +647,6 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             let rtk_hook_ok = claude_settings_hook_matches("headroom-rtk-rewrite.sh")?
                 && headroom_rtk_hook_path().exists();
 
-            if shell_ok {
-                checks.push(
-                    "Found Claude Code ANTHROPIC_BASE_URL export in managed shell block.".into(),
-                );
-            }
             if rtk_path_ok {
                 checks.push("Found Headroom-managed RTK PATH export in shell profiles.".into());
             }
@@ -683,9 +661,9 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                     "Found Headroom-managed RTK Claude hook in ~/.claude/settings.json.".into(),
                 );
             }
-            if !shell_ok && !claude_settings_ok {
+            if !claude_settings_ok {
                 failures.push(
-                    "Claude Code ANTHROPIC_BASE_URL was not found in shell blocks or ~/.claude/settings.json."
+                    "Claude Code ANTHROPIC_BASE_URL was not found in ~/.claude/settings.json."
                         .into(),
                 );
             }
@@ -695,12 +673,9 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             // `ensure_rtk_integrations_for_targets`), so its absence must not
             // fail Claude Code verification when RTK isn't installed or the user
             // disabled it — routing is what "connected" means here.
+            // The PATH export is shell convenience apply skips on an unwritable
+            // profile; the hook is the RTK wiring, so only it can fail setup.
             let rtk_required = !state.rtk_disabled && default_headroom_rtk_path().exists();
-            if rtk_required && !rtk_path_ok {
-                failures.push(
-                    "Headroom-managed RTK PATH export was not found in shell profiles.".into(),
-                );
-            }
             if rtk_required && !rtk_hook_ok {
                 failures.push(
                     "Headroom-managed RTK Claude hook was not found in ~/.claude/settings.json."
@@ -724,21 +699,8 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             return Ok(delegated);
         }
         "codex" | "codex_cli" => {
-            let state = load_setup_state();
-            let shell_targets = resolve_client_shell_targets(&state, client_id)?;
-            let shell_ok = shell_block_contains_in_files(
-                &shell_targets,
-                "codex_cli",
-                "OPENAI_BASE_URL",
-                HEADROOM_OPENAI_BASE_URL,
-            )?;
             let toml_ok = codex_provider_block_matches()?;
 
-            if shell_ok {
-                checks.push(
-                    "Found ChatGPT Codex OPENAI_BASE_URL export in managed shell block.".into(),
-                );
-            }
             if toml_ok {
                 checks
                     .push("Found Headroom-managed provider block in ~/.codex/config.toml.".into());
@@ -748,11 +710,6 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                     "Headroom-managed provider block in ~/.codex/config.toml is missing or stale (e.g. Codex login state changed since it was written).".into(),
                 );
             }
-            // Shell export is convenience, not routing: config.toml is what routes
-            // Codex (apply tolerates an unwritable shell profile). A missing export
-            // must not fail verification -- mirrors Claude, which only fails when
-            // *no* routing source is present.
-
             if codex_guard_hook_path().exists() && codex_guard_registered()? {
                 checks
                     .push("Found Headroom routing guard registered in ~/.codex/hooks.json.".into());
@@ -6492,9 +6449,11 @@ fn claude_remote_control_command_path() -> PathBuf {
         .join("remote-control.md")
 }
 
-/// The managed `claude_code` shell block: the routing export plus a `claude`
-/// function that (a) adds the api.anthropic.com settings layer whenever the
-/// user passes `--remote-control`, (b) tags the session with
+/// The managed `claude_code` shell block. No ANTHROPIC_BASE_URL export: the
+/// settings.json env routes Claude Code, and an export outlives quit in every
+/// shell, tmux server and VS Code opened meanwhile, pointing them at the dead
+/// port. Just a `claude` function that (a) adds the api.anthropic.com settings
+/// layer whenever the user passes `--remote-control`, (b) tags the session with
 /// `HEADROOM_RC_RELAUNCHER=tty` so the script only ends sessions this function
 /// will bring back (an alias, `command claude` or a shell opened before setup
 /// skips it), and (c) after the wrapped session exits,
@@ -6547,8 +6506,7 @@ fn claude_code_shell_block() -> String {
     )
     .replace("__OVERRIDE__", CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE);
     format!(
-        "export ANTHROPIC_BASE_URL={HEADROOM_ANTHROPIC_BASE_URL}\n\
-         # /remote-control needs api.anthropic.com; this relaunches the same session without Headroom.\n\
+        "# /remote-control needs api.anthropic.com; this relaunches the same session without Headroom.\n\
          if ! alias claude >/dev/null 2>&1; then eval '{}'; fi",
         function.replace('\'', r"'\''")
     )
@@ -11946,6 +11904,78 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         super::verify_client_setup("claude_code").expect("verification tolerates bad profile");
     }
 
+    /// A shell export of ANTHROPIC_BASE_URL outlives quit: shells, tmux and VS
+    /// Code opened while Headroom ran keep it, and once quit strips the
+    /// settings.json env Claude Code falls back to it and hits the dead
+    /// 127.0.0.1:6767. settings.json alone routes Claude Code, so the managed
+    /// block must not export it, and a re-apply must drop an older block's
+    /// export.
+    #[test]
+    #[serial_test::serial]
+    fn apply_claude_code_drops_the_routing_export_from_the_shell_block() {
+        let home = TestHome::new();
+        let zshrc = home.path().join(".zshrc");
+        fs::write(
+            &zshrc,
+            "# user zshrc\n# >>> headroom:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6767\n# <<< headroom:claude_code <<<\n",
+        )
+        .unwrap();
+
+        let result = super::apply_client_setup("claude_code").expect("apply");
+        assert!(
+            result.verification.verified,
+            "{:?}",
+            result.verification.failures
+        );
+
+        let combined = format!(
+            "{}\n{}",
+            fs::read_to_string(&zshrc).unwrap(),
+            fs::read_to_string(home.path().join(".zprofile")).unwrap_or_default()
+        );
+        assert!(
+            combined.contains("# >>> headroom:claude_code >>>"),
+            "the claude function block is still written, got:\n{combined}"
+        );
+        assert!(
+            !combined.contains("export ANTHROPIC_BASE_URL"),
+            "no routing export in shell profiles, got:\n{combined}"
+        );
+        let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"].as_str(),
+            Some("http://127.0.0.1:6767")
+        );
+    }
+
+    /// The RTK PATH export is shell convenience that apply skips when the first
+    /// profile is unwritable or not UTF-8; verification must not then fail
+    /// Claude Code forever ("Setup incomplete", a useless re-apply every
+    /// repair pass) while settings.json and the RTK hook route it fine.
+    #[test]
+    #[serial_test::serial]
+    fn claude_code_verifies_when_the_rtk_path_export_cannot_be_written() {
+        let home = TestHome::new();
+        let zprofile = home.path().join(".zprofile");
+        fs::write(&zprofile, b"# caf\xe9\n\xff\n").unwrap();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        seed_installed_rtk();
+
+        let result = super::apply_client_setup("claude_code").expect("apply");
+        assert!(result.shell_profile_unwritable, "shell step was skipped");
+        assert!(
+            !fs::read_to_string(home.path().join(".zshrc"))
+                .unwrap()
+                .contains("headroom:managed_rtk"),
+            "precondition: no RTK PATH export anywhere"
+        );
+        assert!(
+            result.verification.verified,
+            "{:?}",
+            result.verification.failures
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn apply_then_verify_claude_code_writes_expected_files() {
@@ -11996,14 +12026,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "PreToolUse hook entry exists, got: {settings}"
         );
 
-        // Shell block in zshenv (or whichever profile the writer chose) should
-        // export ANTHROPIC_BASE_URL pointing at the loopback proxy.
+        // The managed shell block carries the `claude` function, never a
+        // routing export (settings.json routes Claude Code).
         let zshrc = fs::read_to_string(home.path().join(".zshrc")).unwrap();
-        let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
-        let combined = format!("{zshrc}\n{zshenv}");
         assert!(
-            combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6767"),
-            "ANTHROPIC_BASE_URL exported from a managed shell block, got:\n{combined}"
+            zshrc.contains("# >>> headroom:claude_code >>>")
+                && !zshrc.contains("export ANTHROPIC_BASE_URL"),
+            "claude_code block without a routing export, got:\n{zshrc}"
         );
 
         // verify_client_setup should report all the configured checks.
@@ -12782,8 +12811,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
         let combined = format!("{zshrc}\n{zshenv}");
         assert!(
-            !combined.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:6767"),
-            "ANTHROPIC_BASE_URL export removed, got:\n{combined}"
+            !combined.contains("headroom:claude_code"),
+            "claude_code shell block removed, got:\n{combined}"
         );
 
         // settings.json no longer points env at the proxy and no longer carries
@@ -12961,14 +12990,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "requires_openai_auth must NOT be written without ChatGPT auth, got:\n{toml}"
         );
 
-        // OPENAI_BASE_URL exported from a managed shell block.
+        // No OPENAI_BASE_URL shell export: config.toml alone routes Codex.
         let zshrc = fs::read_to_string(home.path().join(".zshrc")).unwrap();
-        let zshenv = fs::read_to_string(home.path().join(".zshenv")).unwrap();
-        let combined = format!("{zshrc}\n{zshenv}");
-        assert!(
-            combined.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
-            "OPENAI_BASE_URL exported from a managed shell block, got:\n{combined}"
-        );
+        assert_eq!(zshrc, "# user zshrc\n");
 
         // verify_client_setup reports the configured checks and passes.
         let verification =
@@ -12988,7 +13012,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             verification.checks
         );
 
-        // Disable strips both the toml block and the shell export.
+        // Disable strips the toml block and any shell export an older build left.
         super::disable_client_setup("codex").expect("disable_client_setup succeeds");
         let toml_after = fs::read_to_string(&config_toml).unwrap_or_default();
         assert!(
@@ -13004,6 +13028,36 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             !combined_after.contains("OPENAI_BASE_URL=http://127.0.0.1:6767/v1"),
             "shell export removed on disable, got:\n{combined_after}"
         );
+    }
+
+    /// A Headroom OPENAI_BASE_URL export appended to ~/.zshrc overrode the
+    /// user's own earlier value (Ollama, OpenRouter), sending their prompts
+    /// and third-party key to api.openai.com. config.toml alone routes Codex:
+    /// apply writes no shell block, and drops one an older build left.
+    #[test]
+    #[serial_test::serial]
+    fn apply_codex_removes_its_shell_export_and_keeps_the_users_base_url() {
+        let home = TestHome::new();
+        let user_line = "export OPENAI_BASE_URL=http://localhost:11434/v1\n";
+        let zshrc = home.path().join(".zshrc");
+        fs::write(
+            &zshrc,
+            format!("{user_line}# >>> headroom:codex_cli >>>\nexport OPENAI_BASE_URL=http://127.0.0.1:6767/v1\n# <<< headroom:codex_cli <<<\n"),
+        )
+        .unwrap();
+
+        let result = super::apply_client_setup("codex").expect("apply");
+        assert!(
+            result.verification.verified,
+            "{:?}",
+            result.verification.failures
+        );
+
+        assert_eq!(fs::read_to_string(&zshrc).unwrap(), user_line);
+        assert!(!home.path().join(".zprofile").exists());
+        assert!(!super::load_setup_state()
+            .managed_shell_files
+            .contains_key("codex_cli"));
     }
 
     #[test]
