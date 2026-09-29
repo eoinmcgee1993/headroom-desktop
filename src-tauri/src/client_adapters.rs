@@ -8515,8 +8515,7 @@ pub(crate) const MARKITDOWN_MAIN_NO_AUDIO: &str = r#"import sys; import os; _cwd
 /// the managed `markitdown` and redirect the read at the converted file through
 /// `updatedInput.file_path`. Fails open at every step so a missing binary,
 /// oversized file, or conversion error falls through to a native Read, and so
-/// does any read a Read rule could cover (see HOOK_RULES_PY). On Windows that is
-/// every read, since its registry policies cannot be checked from here.
+/// does any read a Read rule could cover (see HOOK_RULES_PY), Windows included.
 ///
 /// Scoped to PDF deliberately: Claude Code's Read tool rejects unsupported
 /// binary types (docx/pptx/xlsx) at input validation *before* PreToolUse hooks
@@ -8569,7 +8568,7 @@ if not any(full == r or full.startswith(r.rstrip(os.sep) + os.sep) for r in root
 # Rules match the redirected cache path, never the PDF, so the allow below would
 # dodge every Read rule, and a block on reads outside the project (the cache is
 # outside it). Leave the read to Claude Code wherever one could apply.
-rules = settings(data)
+rules = settings(data, windows=True)
 if rules is None or rules[2] or any(not isinstance(r, str) or r.partition("(")[0].strip() == "Read" for r in rules[0] + rules[1]):
     sys.exit(0)
 try:
@@ -8683,18 +8682,37 @@ def cli_rules():
     return True
 
 
-def settings(data):
+def policy_keys():
+    # The Windows policy tier Claude Code reads (a "Settings" value under either key).
+    import winreg
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            winreg.CloseKey(winreg.OpenKey(hive, "SOFTWARE\\Policies\\ClaudeCode"))
+            return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+    return False
+
+
+def settings(data, windows=False):
     # (ask rules, deny rules, reads outside blocked) across what Claude Code loads,
     # or None when a source cannot be read here: registry and MDM policies,
     # managed files (a policyHelper hides their rules), the server-managed cache.
-    if sys.platform == "win32":
+    # Windows only when the caller opts in (the rtk verdict never has).
+    win = sys.platform == "win32"
+    if win and not windows:
         return None
     conf = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-    opaque = [os.path.join(d, n) for d in ("/Library/Application Support/ClaudeCode", "/etc/claude-code") for n in ("managed-settings.json", "managed-settings.d")]
+    managed = [os.path.join(os.environ.get("ProgramFiles") or "C:\\Program Files", "ClaudeCode")] if win else ["/Library/Application Support/ClaudeCode", "/etc/claude-code"]
+    opaque = [os.path.join(d, n) for d in managed for n in ("managed-settings.json", "managed-settings.d")]
     opaque.append(os.path.join(conf, "remote-settings.json"))
     if os.environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH") or os.environ.get("CLAUDE_CODE_REMOTE_SETTINGS_PATH"):
         return None
-    if any(os.path.exists(p) for p in opaque) or glob.glob("/Library/Managed Preferences/**/com.anthropic.claudecode.plist", recursive=True):
+    if any(os.path.exists(p) for p in opaque):
+        return None
+    if policy_keys() if win else glob.glob("/Library/Managed Preferences/**/com.anthropic.claudecode.plist", recursive=True):
         return None
     files = [os.path.join(conf, "settings.json"), os.path.join(conf, "settings.local.json")]
     bases = [os.environ.get("CLAUDE_PROJECT_DIR"), data.get("cwd")]
@@ -8725,7 +8743,10 @@ def settings(data):
             return None
         ask, deny = ask + more_ask, deny + more_deny
         blocks = blocks or bool(perms.get("blockReadsOutsideWorkingDirectories"))
-    return None if cli_rules() else (ask, deny, blocks)
+    # ponytail: Windows has no ps, so an ancestor --settings or
+    # --disallowedTools goes unseen there; read the parent chain through
+    # CreateToolhelp32Snapshot (ctypes) if that ever matters.
+    return None if not win and cli_rules() else (ask, deny, blocks)
 "##;
 
 /// The rtk hook's last step, after HOOK_RULES_PY: prints allow-with-the-rewrite,
@@ -9976,6 +9997,58 @@ mod tests {
         assert!(hook.contains("HEADROOM_PYTHON=\"/tmp/head room/runtime/\\$python\""));
         assert!(hook.contains("Headroom RTK auto-rewrite"));
         assert!(hook.contains("\"updatedInput\": updated"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_rules_read_windows_sources_only_when_asked() {
+        // The rules reader under a stand-in win32 (hook tests only run on unix
+        // CI): the rtk verdict still gets None there, the MarkItDown hook reads
+        // the files, and either policy key or Program Files managed settings
+        // makes it None again (the sources Claude Code 2.1.284 reads).
+        let root = unique_temp_dir("headroom-hook-rules-win");
+        let (conf, project, pf) = (root.join("conf"), root.join("project"), root.join("pf"));
+        for dir in [&conf, &project, &pf] {
+            fs::create_dir_all(dir).expect("dirs");
+        }
+        let check = r#"
+import sys, types
+keys = set(sys.argv[1].split(",")) - {""}
+winreg = types.ModuleType("winreg")
+winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER = "HKLM", "HKCU"
+def open_key(hive, path):
+    if hive in keys and path == "SOFTWARE\\Policies\\ClaudeCode":
+        return hive
+    raise FileNotFoundError(path)
+winreg.OpenKey, winreg.CloseKey = open_key, lambda key: None
+sys.modules["winreg"] = winreg
+sys.platform = "win32"
+data = {"cwd": sys.argv[2]}
+print(settings(data) is None, settings(data, windows=True) is None)
+"#;
+        let run = |keys: &str| {
+            let output = crate::proc::command("/usr/bin/python3")
+                .arg("-c")
+                .arg(format!("{}\n{check}", super::HOOK_RULES_PY))
+                .arg(keys)
+                .arg(&project)
+                .env("CLAUDE_CONFIG_DIR", &conf)
+                .env("ProgramFiles", &pf)
+                .env_remove("CLAUDE_PROJECT_DIR")
+                .env_remove("CLAUDE_CODE_MANAGED_SETTINGS_PATH")
+                .env_remove("CLAUDE_CODE_REMOTE_SETTINGS_PATH")
+                .output()
+                .expect("python");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+                + &String::from_utf8_lossy(&output.stderr)
+        };
+        assert_eq!(run(""), "True False");
+        assert_eq!(run("HKLM"), "True True");
+        assert_eq!(run("HKCU"), "True True");
+        fs::create_dir_all(pf.join("ClaudeCode")).expect("managed dir");
+        fs::write(pf.join("ClaudeCode").join("managed-settings.json"), "{}").expect("managed");
+        assert_eq!(run(""), "True True");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
