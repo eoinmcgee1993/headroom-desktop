@@ -120,3 +120,17 @@ export function whenWindowVisible(poll: () => void | Promise<void>): () => Promi
     await poll();
   };
 }
+
+/// Home dashboard poll gate, or null when it should not run. The tray hides on
+/// blur, so focus stands in for visibility there. The launcher stays visible
+/// while a first-run user is off in their terminal sending the test prompt,
+/// and its post_install screen waits on this poll for their first savings, so
+/// it gates on visibility instead: shown keeps polling, hidden skips.
+export function homeDashboardPoll(
+  windowLabel: string | null,
+  focused: boolean,
+  poll: () => void | Promise<void>
+): (() => Promise<void>) | null {
+  if (windowLabel === "launcher") return whenWindowVisible(poll);
+  return focused ? async () => poll() : null;
+}

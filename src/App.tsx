@@ -192,6 +192,7 @@ import {
 } from "./lib/pricing";
 import {
   activityFeedSignature,
+  homeDashboardPoll,
   notificationActionView,
   runtimeStatusPollMs,
   serializeState,
@@ -3088,29 +3089,26 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (activeView !== "home" || !trayWindowFocused) {
+    if (activeView !== "home") {
       return;
     }
 
     let active = true;
-    const refreshDashboard = () => {
-      void loadDashboard()
-        .then((next) => {
-          if (!active) return;
-          applyDashboardIfChanged(next);
-        })
-        .catch(() => {
-          // keep last known state
-        });
-    };
+    const refreshDashboard = homeDashboardPoll(windowLabel, trayWindowFocused, async () => {
+      const next = await loadDashboard().catch(() => null); // keep last known state
+      if (active && next) applyDashboardIfChanged(next);
+    });
+    if (!refreshDashboard) {
+      return;
+    }
 
-    refreshDashboard();
-    const interval = window.setInterval(refreshDashboard, 5000);
+    void refreshDashboard();
+    const interval = window.setInterval(() => void refreshDashboard(), 5000);
     return () => {
       active = false;
       window.clearInterval(interval);
     };
-  }, [activeView, trayWindowFocused]);
+  }, [activeView, trayWindowFocused, windowLabel]);
 
   // Track whether the user has ever visited a heavy-data tab this session.
   // Once true, stays true until app restart — the pre-warm below is gated
@@ -6092,9 +6090,10 @@ export default function App() {
           ))}
         </div>
       ) : null;
-    // The tray's 5s dashboard poll keeps running under the launcher window,
-    // so a first-run user who sends a prompt sees this screen flip from
-    // "waiting" to their first real savings without any interaction — the
+    // The 5s home dashboard poll keeps running while the launcher is visible,
+    // focused or not (homeDashboardPoll), so a first-run user who sends a
+    // prompt from their terminal sees this screen flip from "waiting" to
+    // their first real savings without any interaction. The
     // payoff moment stays inside onboarding instead of being deferred to a
     // later session that a third of signups never have. While waiting,
     // blur-autohide is disarmed (see awaitingFirstPrompt above).

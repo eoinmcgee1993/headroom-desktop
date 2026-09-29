@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   activityFeedSignature,
+  homeDashboardPoll,
   notificationActionView,
   runtimeStatusPollMs,
   useWindowFocused,
@@ -211,5 +212,36 @@ describe("whenWindowVisible", () => {
     isVisibleMock.mockResolvedValue(true);
     await gated();
     expect(poll).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("homeDashboardPoll", () => {
+  beforeEach(() => {
+    isVisibleMock.mockReset();
+  });
+
+  it("keeps the launcher's first-run savings poll running while it is visible but unfocused", async () => {
+    // The user is in their terminal sending the test prompt: the launcher
+    // lost focus but still shows post_install, waiting on this poll.
+    const poll = vi.fn();
+    const gated = homeDashboardPoll("launcher", false, poll);
+    expect(gated).not.toBeNull();
+
+    isVisibleMock.mockResolvedValue(true);
+    await gated?.();
+    expect(poll).toHaveBeenCalledTimes(1);
+
+    isVisibleMock.mockResolvedValue(false);
+    await gated?.();
+    expect(poll).toHaveBeenCalledTimes(1);
+  });
+
+  it("gates the tray on focus, since it hides on blur", async () => {
+    const poll = vi.fn();
+    expect(homeDashboardPoll("main", false, poll)).toBeNull();
+    expect(homeDashboardPoll(null, false, poll)).toBeNull();
+    await homeDashboardPoll("main", true, poll)?.();
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(isVisibleMock).not.toHaveBeenCalled();
   });
 });
