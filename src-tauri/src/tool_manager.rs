@@ -7196,7 +7196,7 @@ impl ToolManager {
                  f=$(realpath \"$1\" 2>/dev/null && echo .) || refuse \"no such file: $1\"\n\
                  d=${{d%?.}} f=${{f%?.}}\n\
                  case \"$d$f\" in *'\n'*) refuse 'paths with newlines are not supported';; esac\n\
-                 case \"$f\" in \"$d\"/*) ;; *) refuse \"$1 is outside this project (for files outside it, run '{real}' <path>)\";; esac\n\
+                 case \"$f\" in \"$d\"/*) ;; *) refuse \"$1 is outside this project (for files outside it, run '{python}' -c '{main_q}' <path>)\";; esac\n\
                  '{python}' -c '{main}' \"$f\" || exit\n\
                  C='{counter}'\n\
                  n=$(cat \"$C\" 2>/dev/null)\n\
@@ -7205,8 +7205,9 @@ impl ToolManager {
                  exit 0\n",
                 counter = self.markitdown_conversion_counter_path().display(),
                 python = self.runtime.managed_python().display(),
-                real = self.markitdown_entrypoint().display(),
                 main = crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO,
+                // The bare entrypoint transcribes audio; the hint keeps the guard.
+                main_q = crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO.replace('"', "\\\""),
             );
             crate::client_adapters::atomic_write(&shim, script.as_bytes())
                 .with_context(|| format!("writing markitdown shim {}", shim.display()))?;
@@ -18150,7 +18151,7 @@ after
         }
 
         // Nor anything outside the project, which the Read tool would prompt
-        // for: those name the real CLI, which prompts too.
+        // for: those name a command that prompts too, still without audio.
         let secret = home.join("secret.docx").display().to_string();
         let outside_abs = outside.display().to_string();
         for arg in [
@@ -18166,7 +18167,11 @@ after
             assert!(out.stdout.is_empty(), "real binary ran for {arg}");
             assert!(
                 stderr.contains("outside this project")
-                    && stderr.contains(&manager.markitdown_entrypoint().display().to_string()),
+                    && stderr.contains(&format!(
+                        "run '{}' -c '{}' <path>",
+                        manager.runtime.managed_python().display(),
+                        crate::client_adapters::MARKITDOWN_MAIN_NO_AUDIO
+                    )),
                 "{arg}: {stderr}"
             );
         }

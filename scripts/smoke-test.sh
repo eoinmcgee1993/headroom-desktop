@@ -181,6 +181,9 @@ if [ -n "$rec" ]; then
     row FAIL "8 markitdown shim" "migration left: $(echo $stale)"
   elif [ ! -x "$shim" ]; then
     row FAIL "8 markitdown shim" "$shim missing or not executable"
+  # The Bash rule is a Claude Code setting; a Codex-only machine never gets one.
+  elif [ "$(jq -r '.configuredClients.claude_code // empty' "$CFG/client-setup.json" 2>/dev/null)" = "" ]; then
+    row PASS "8 markitdown shim" "$shim (Claude Code not configured, no rule expected)"
   elif [ "$(jq -r '.enabled' "$HR/tools/markitdown.json" 2>/dev/null)" = "false" ]; then
     if [ "${rules:-0}" -eq 0 ]; then
       row PASS "8 markitdown shim" "$shim (addon disabled, no rule)"

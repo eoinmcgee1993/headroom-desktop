@@ -258,8 +258,9 @@ pub fn set_rtk_enabled(
     } else {
         let shell_targets = resolve_client_shell_targets_for_cleanup(&state, "claude_code")?;
         remove_shell_block(&shell_targets, "managed_rtk")?;
+        // Only RTK's entry: the MarkItDown Read hook is its own add-on.
         for settings_path in claude_settings_candidates() {
-            let _ = strip_headroom_hook_from_settings(&settings_path);
+            let _ = remove_pre_tool_use_markers(&settings_path, &["headroom-rtk-rewrite.sh"]);
         }
         let hook_path = headroom_rtk_hook_path();
         if hook_path.exists() {
@@ -442,6 +443,24 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
                     updates.1.append(&mut line.1);
                 }
                 Err(err) => log::warn!("installing Claude statusline failed: {err}"),
+            }
+            // `disable_client_setup` (every pause and quit) strips the MarkItDown
+            // Read hook with RTK's but keeps its script, which only turning the
+            // add-on off deletes; so the script says to re-register it. Without
+            // this the PDF hook was gone after the first quit.
+            let markitdown_hook = headroom_markitdown_hook_path();
+            if markitdown_hook.exists() {
+                match ensure_claude_settings_hook(
+                    &markitdown_hook,
+                    "Read",
+                    "headroom-markitdown-read.sh",
+                ) {
+                    Ok(mut hook) => {
+                        updates.0.append(&mut hook.0);
+                        updates.1.append(&mut hook.1);
+                    }
+                    Err(err) => log::warn!("re-registering the MarkItDown Read hook failed: {err}"),
+                }
             }
 
             // Shell profile (RTK PATH + env export) is convenience; tolerate an
@@ -8495,7 +8514,9 @@ pub(crate) const MARKITDOWN_MAIN_NO_AUDIO: &str = r#"import sys; import os; _cwd
 /// PreToolUse(Read) hook: when Claude reads a PDF, convert it to Markdown via
 /// the managed `markitdown` and redirect the read at the converted file through
 /// `updatedInput.file_path`. Fails open at every step so a missing binary,
-/// oversized file, or conversion error falls through to a native Read.
+/// oversized file, or conversion error falls through to a native Read, and so
+/// does any read a Read rule could cover (see HOOK_RULES_PY). On Windows that is
+/// every read, since its registry policies cannot be checked from here.
 ///
 /// Scoped to PDF deliberately: Claude Code's Read tool rejects unsupported
 /// binary types (docx/pptx/xlsx) at input validation *before* PreToolUse hooks
@@ -8505,6 +8526,7 @@ fn build_headroom_markitdown_hook(markitdown_path: &Path, python_path: &Path) ->
     let markitdown = shell_double_quote(&markitdown_path.to_string_lossy());
     let python = shell_double_quote(&python_path.to_string_lossy());
     let no_audio = MARKITDOWN_MAIN_NO_AUDIO;
+    let rules = HOOK_RULES_PY;
 
     format!(
         r#"#!/usr/bin/env bash
@@ -8523,8 +8545,7 @@ if [ -z "$INPUT" ]; then
 fi
 
 # -X utf8: the hook JSON on stdin/stdout is UTF-8, not the Windows locale codepage.
-"$HEADROOM_PYTHON" -X utf8 -c 'import sys; import os; _cwd = os.path.realpath(os.getcwd()); sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _cwd] # cwd off sys.path: a project json.py must not run
-import json, os, subprocess, hashlib, stat, tempfile, time
+"$HEADROOM_PYTHON" -X utf8 -c '{rules}import json, os, subprocess, hashlib, stat, tempfile, time
 ALLOWED = {{".pdf"}}
 MAX_BYTES = 25 * 1024 * 1024
 try:
@@ -8544,6 +8565,12 @@ if os.path.splitext(fp)[1].lower() not in ALLOWED:
 roots = [os.path.realpath(d) for d in (data.get("cwd"), os.environ.get("CLAUDE_PROJECT_DIR")) if isinstance(d, str) and d]
 full = os.path.realpath(os.path.join(roots[0], fp) if roots else fp)
 if not any(full == r or full.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+    sys.exit(0)
+# Rules match the redirected cache path, never the PDF, so the allow below would
+# dodge every Read rule, and a block on reads outside the project (the cache is
+# outside it). Leave the read to Claude Code wherever one could apply.
+rules = settings(data)
+if rules is None or rules[2] or any(not isinstance(r, str) or r.partition("(")[0].strip() == "Read" for r in rules[0] + rules[1]):
     sys.exit(0)
 try:
     st = os.stat(fp)
@@ -8622,11 +8649,88 @@ fn msys_path(value: &str) -> String {
     }
 }
 
-/// The rtk hook's last step: prints allow-with-the-rewrite, or nothing. It runs
-/// as `python -c '...'`, so it must never contain a single quote. First line:
-/// see MARKITDOWN_MAIN_NO_AUDIO.
-const RTK_HOOK_VERDICT_PY: &str = r##"import sys; import os; _cwd = os.path.realpath(os.getcwd()); sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _cwd]
-import glob, json, os, re, shlex, subprocess
+/// Opens the `python -c` of every hook that answers "allow" with a rewritten
+/// input: Claude Code matches its rules against that rewrite, never the
+/// original, so the hook must first see which rules could apply. Never contains
+/// a single quote, like the scripts it opens. First line: see
+/// MARKITDOWN_MAIN_NO_AUDIO.
+const HOOK_RULES_PY: &str = r##"import sys; import os; _cwd = os.path.realpath(os.getcwd()); sys.path[:] = [p for p in sys.path if p and os.path.realpath(p) != _cwd]
+import glob, json, re, subprocess
+
+
+def cli_rules():
+    # Rules on an ancestor command line: --settings, --disallowedTools.
+    try:
+        rows = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="], capture_output=True, text=True, timeout=5).stdout.splitlines()
+    except Exception:
+        return True
+    procs = {}
+    for row in rows:
+        parts = row.split(None, 2)
+        if len(parts) > 1 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    pid = os.getppid()
+    for _ in range(64):
+        if pid == 0:
+            return False
+        if pid not in procs:
+            return True
+        pid, command = procs[pid]
+        # The Headroom remote-control relaunch (CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE) sets env only.
+        command = command.replace("--settings {\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.anthropic.com\"}}", "")
+        if re.search(r"--(managed-)?settings|--disallowed", command):
+            return True
+    return True
+
+
+def settings(data):
+    # (ask rules, deny rules, reads outside blocked) across what Claude Code loads,
+    # or None when a source cannot be read here: registry and MDM policies,
+    # managed files (a policyHelper hides their rules), the server-managed cache.
+    if sys.platform == "win32":
+        return None
+    conf = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    opaque = [os.path.join(d, n) for d in ("/Library/Application Support/ClaudeCode", "/etc/claude-code") for n in ("managed-settings.json", "managed-settings.d")]
+    opaque.append(os.path.join(conf, "remote-settings.json"))
+    if os.environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH") or os.environ.get("CLAUDE_CODE_REMOTE_SETTINGS_PATH"):
+        return None
+    if any(os.path.exists(p) for p in opaque) or glob.glob("/Library/Managed Preferences/**/com.anthropic.claudecode.plist", recursive=True):
+        return None
+    files = [os.path.join(conf, "settings.json"), os.path.join(conf, "settings.local.json")]
+    bases = [os.environ.get("CLAUDE_PROJECT_DIR"), data.get("cwd")]
+    for base in bases[:2]:
+        if isinstance(base, str) and base:
+            try:
+                common = subprocess.run(["git", "-C", base, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=5).stdout.strip()
+            except Exception:
+                return None
+            if common:
+                bases.append(os.path.dirname(common))
+    for base in bases:
+        d = os.path.abspath(base) if isinstance(base, str) and base else ""
+        while d:
+            files += [os.path.join(d, ".claude", n) for n in ("settings.json", "settings.local.json")]
+            d = "" if os.path.dirname(d) == d else os.path.dirname(d)
+    ask, deny, blocks = [], [], False
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as f:
+                perms = json.load(f).get("permissions") or {}
+            more_ask, more_deny = perms.get("ask") or [], perms.get("deny") or []
+            if not isinstance(more_ask, list) or not isinstance(more_deny, list):
+                return None
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except Exception:
+            return None
+        ask, deny = ask + more_ask, deny + more_deny
+        blocks = blocks or bool(perms.get("blockReadsOutsideWorkingDirectories"))
+    return None if cli_rules() else (ask, deny, blocks)
+"##;
+
+/// The rtk hook's last step, after HOOK_RULES_PY: prints allow-with-the-rewrite,
+/// or nothing.
+const RTK_HOOK_VERDICT_PY: &str = r##"import json, os, re, shlex
 
 data = json.load(sys.stdin)
 tool_input = data.get("tool_input")
@@ -8720,76 +8824,6 @@ def read_only(cmd, out):
     return True
 
 
-def cli_rules():
-    # Rules on an ancestor command line: --settings, --disallowedTools.
-    try:
-        rows = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="], capture_output=True, text=True, timeout=5).stdout.splitlines()
-    except Exception:
-        return True
-    procs = {}
-    for row in rows:
-        parts = row.split(None, 2)
-        if len(parts) > 1 and parts[0].isdigit() and parts[1].isdigit():
-            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
-    pid = os.getppid()
-    for _ in range(64):
-        if pid == 0:
-            return False
-        if pid not in procs:
-            return True
-        pid, command = procs[pid]
-        # The Headroom remote-control relaunch (CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE) sets env only.
-        command = command.replace("--settings {\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.anthropic.com\"}}", "")
-        if re.search(r"--(managed-)?settings|--disallowed", command):
-            return True
-    return True
-
-
-def settings():
-    # (ask rules, deny rules, reads outside blocked) across what Claude Code loads,
-    # or None when a source cannot be read here: registry and MDM policies,
-    # managed files (a policyHelper hides their rules), the server-managed cache.
-    if sys.platform == "win32":
-        return None
-    conf = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
-    opaque = [os.path.join(d, n) for d in ("/Library/Application Support/ClaudeCode", "/etc/claude-code") for n in ("managed-settings.json", "managed-settings.d")]
-    opaque.append(os.path.join(conf, "remote-settings.json"))
-    if os.environ.get("CLAUDE_CODE_MANAGED_SETTINGS_PATH") or os.environ.get("CLAUDE_CODE_REMOTE_SETTINGS_PATH"):
-        return None
-    if any(os.path.exists(p) for p in opaque) or glob.glob("/Library/Managed Preferences/**/com.anthropic.claudecode.plist", recursive=True):
-        return None
-    files = [os.path.join(conf, "settings.json"), os.path.join(conf, "settings.local.json")]
-    bases = [os.environ.get("CLAUDE_PROJECT_DIR"), data.get("cwd")]
-    for base in bases[:2]:
-        if isinstance(base, str) and base:
-            try:
-                common = subprocess.run(["git", "-C", base, "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=5).stdout.strip()
-            except Exception:
-                return None
-            if common:
-                bases.append(os.path.dirname(common))
-    for base in bases:
-        d = os.path.abspath(base) if isinstance(base, str) and base else ""
-        while d:
-            files += [os.path.join(d, ".claude", n) for n in ("settings.json", "settings.local.json")]
-            d = "" if os.path.dirname(d) == d else os.path.dirname(d)
-    ask, deny, blocks = [], [], False
-    for path in files:
-        try:
-            with open(path, encoding="utf-8") as f:
-                perms = json.load(f).get("permissions") or {}
-            more_ask, more_deny = perms.get("ask") or [], perms.get("deny") or []
-            if not isinstance(more_ask, list) or not isinstance(more_deny, list):
-                return None
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        except Exception:
-            return None
-        ask, deny = ask + more_ask, deny + more_deny
-        blocks = blocks or bool(perms.get("blockReadsOutsideWorkingDirectories"))
-    return None if cli_rules() else (ask, deny, blocks)
-
-
 def hides(rule, name, asking):
     # Could the rewrite hide `name ...` from this rule? Read rules reach cat, head
     # and tail, and an ask rule naming the command stops matching `rtk ...`. rtk
@@ -8806,9 +8840,17 @@ def hides(rule, name, asking):
 
 
 mode, cmd = data.get("permission_mode"), tool_input.get("command")
-if os.environ.get("HEADROOM_RTK_RC") != "0":
-    ro = mode in QUIET_MODES and isinstance(cmd, str) and read_only(cmd, os.environ.get("HEADROOM_RTK_OUT", ""))
-    rules = settings() if ro or mode == "bypassPermissions" else None
+if os.environ.get("HEADROOM_RTK_RC") == "0":
+    # rtk judged only the rules it can read. A managed, MDM or command-line
+    # deny it never saw would be dodged by this allow, so stay silent there.
+    # ponytail: Windows keeps the unconditional allow, since settings() cannot
+    # read registry policies and gating would turn RTK off there outright;
+    # close it by reading HKLM\SOFTWARE\Policies\ClaudeCode via winreg.
+    if sys.platform != "win32" and settings(data) is None:
+        sys.exit(0)
+else:
+    ro =mode in QUIET_MODES and isinstance(cmd, str) and read_only(cmd, os.environ.get("HEADROOM_RTK_OUT", ""))
+    rules = settings(data) if ro or mode == "bypassPermissions" else None
     if rules is None:
         sys.exit(0)
     ask, deny, blocks = rules
@@ -8934,8 +8976,9 @@ fi
 REWRITTEN="export PATH=$HEADROOM_RTK_DIR_Q:\"\$PATH\"; $REWRITTEN"
 
 HEADROOM_RTK_RC="$RTK_RC" HEADROOM_RTK_OUT="$RTK_OUT" HEADROOM_RTK_REWRITTEN="$REWRITTEN" \
-  "$HEADROOM_PYTHON" -X utf8 -c '{verdict}' <<<"$INPUT" 2>/dev/null || exit 0
+  "$HEADROOM_PYTHON" -X utf8 -c '{rules}{verdict}' <<<"$INPUT" 2>/dev/null || exit 0
 "#,
+        rules = HOOK_RULES_PY,
         verdict = RTK_HOOK_VERDICT_PY
     )
 }
@@ -9985,6 +10028,7 @@ mod tests {
                 .env("PYTHONPATH", &pythonpath)
                 .env_remove("XDG_CACHE_HOME")
                 .env_remove("CLAUDE_PROJECT_DIR")
+                .env_remove("CLAUDE_CONFIG_DIR")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .spawn()
@@ -10050,6 +10094,28 @@ mod tests {
         assert_eq!(fs::read_to_string(&victim).unwrap(), "ssh-ed25519 original");
         assert!(!fs::symlink_metadata(&out).unwrap().file_type().is_symlink());
         assert_eq!(fs::read_to_string(&out).unwrap(), "converted");
+
+        // Rules match the redirected cache path, so a Read rule anywhere
+        // Claude Code loads it (or a source this hook cannot read) keeps the
+        // read native. Other rules do not.
+        let user_settings = home.join(".claude").join("settings.json");
+        let project_settings = root.join(".claude").join("settings.local.json");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        for (path, body) in [
+            (
+                &user_settings,
+                r#"{"permissions":{"deny":["Read(./secret/**)"]}}"#,
+            ),
+            (&project_settings, r#"{"permissions":{"ask":["Read"]}}"#),
+            (&project_settings, "{not json"),
+        ] {
+            fs::write(path, body).unwrap();
+            assert_eq!(run(), None, "{body} in {}", path.display());
+            fs::remove_file(path).unwrap();
+        }
+        fs::write(&user_settings, r#"{"permissions":{"deny":["Bash(rm:*)"]}}"#).unwrap();
+        assert_eq!(run().as_deref(), Some(out.as_path()));
 
         // A cache dir that is itself a symlink is refused outright.
         fs::remove_dir_all(&cache).unwrap();
@@ -11370,7 +11436,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     fn rtk_hook_ignores_only_headrooms_own_remote_control_settings() {
         // The relaunch's env-only --settings must not read as user rules (it
         // turned RTK off for every remote-control session); any other does.
-        assert!(super::RTK_HOOK_VERDICT_PY.contains(&format!(
+        assert!(super::HOOK_RULES_PY.contains(&format!(
             "--settings {}",
             super::CLAUDE_REMOTE_CONTROL_SETTINGS_OVERRIDE.replace('"', "\\\"")
         )));
@@ -11560,6 +11626,9 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             fs::write(&local, body).expect("write project settings");
             assert_eq!(run(3, &project, "git status", "default"), None, "{body}");
         }
+        // rtk's exit 0 covers only the rules rtk read, so a source this hook
+        // cannot read (managed settings, or this one) keeps it silent too.
+        assert_eq!(run(0, &project, "cargo test", "default"), None);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -12313,6 +12382,48 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 .contains_key("claude_code"),
             "preserved entry consumed after restore"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn markitdown_read_hook_survives_pause_resume_and_rtk_toggle() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+        super::apply_client_setup("claude_code").expect("apply");
+        let md = home.path().join("md");
+        super::enable_markitdown_integration(&md, &md, &md).expect("enable markitdown");
+        let settings_path = home.path().join(".claude").join("settings.json");
+        let registered = || {
+            read_settings_json(&settings_path)["hooks"]["PreToolUse"]
+                .as_array()
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|e| e.to_string().contains("headroom-markitdown-read.sh"))
+                })
+        };
+        assert!(registered());
+
+        // Pause (and every quit) strips it; resume must put it back.
+        super::disable_client_setup("claude_code").expect("disable");
+        assert!(!registered());
+        super::apply_client_setup("claude_code").expect("re-apply");
+        assert!(registered(), "resume lost the MarkItDown Read hook");
+
+        // Turning RTK off is not turning MarkItDown off.
+        let (rtk, python) = (super::default_headroom_rtk_path(), home.path().join("py"));
+        super::set_rtk_enabled(false, &rtk, &python).expect("rtk off");
+        assert!(
+            registered(),
+            "RTK off took the MarkItDown Read hook with it"
+        );
+
+        // Turning MarkItDown off removes the script, so apply leaves it off.
+        super::disable_markitdown_integration(&md).expect("disable markitdown");
+        super::apply_client_setup("claude_code").expect("apply after md off");
+        assert!(!registered());
     }
 
     #[test]

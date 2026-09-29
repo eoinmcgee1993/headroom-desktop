@@ -2315,8 +2315,14 @@ impl AppState {
         // (readyz probe + stats request, several seconds when the proxy is
         // down) serialized every concurrent dashboard builder behind one
         // stalled fetch. A rare duplicate fetch is cheaper than that.
+        let started = Instant::now();
         let stats = fetch_headroom_dashboard_stats();
-        *self.cached_headroom_stats.lock() = Some((stats.clone(), Instant::now()));
+        let mut cache = self.cached_headroom_stats.lock();
+        // A timeout that outlived a concurrent success must not replace it:
+        // that held a miss for MISS_TTL over a fresh answer.
+        if stats.is_some() || !matches!(cache.as_ref(), Some((Some(_), at)) if *at > started) {
+            *cache = Some((stats.clone(), Instant::now()));
+        }
         stats
     }
 

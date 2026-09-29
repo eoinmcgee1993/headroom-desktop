@@ -32,8 +32,15 @@ V=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" /Applications
 chk "rtk hook runs python -X utf8"          "$(grep -c -- '-X utf8' "$RH_REAL")" 2
 chk "rtk hook strips cwd from sys.path"     "$(grep -c 'sys.path\[:\] = \[p for p' "$RH_REAL" | awk '{print ($1>=2)}')" 1
 chk "rtk hook: glob refused for all cmds"   "$(grep -c 'symlink out of the project' "$RH_REAL")" 1
+chk "rtk hook: attached short-flag paths"   "$(grep -c 'A short flag takes its value' "$RH_REAL")" 1
+chk "shim: realpath cwd (case-safe)"        "$(grep -c 'realpath . && echo' "$SHIM")" 1
 chk "rtk hook: RC relaunch settings ignored" "$(grep -c 'remote-control relaunch' "$RH_REAL")" 1
 [ -x "$SHIM" ] && ok "shim at ~/.headroom/bin" || bad "shim at ~/.headroom/bin" missing
+# Every quit/pause strips the Read hook's settings entry; launch must re-add it.
+if [ -f "$MH_REAL" ]; then
+  grep -q 'headroom-markitdown-read.sh' ~/.claude/settings.json \
+    && ok "markitdown Read hook registered" || bad "markitdown Read hook registered" "script present, no settings entry"
+fi
 for old in "$AS/headroom/tools/markitdown" "$AS/headroom/bin/markitdown"; do
   [ -e "$old" ] && bad "legacy shim removed" "$old" || ok "legacy shim removed: ${old##*/headroom/}"
 done
@@ -66,7 +73,8 @@ else
            'find . -name *.txt' 'rg --pre sh x' 'FOO=1 ls' 'git branch newbranch' 'git branch -D main' \
            'tree -o out' 'git diff --check' 'echo hi' \
            'cat /etc/hosts' 'cat ../x' 'ls ..' 'cat ~/.zshrc' 'cat z.txt' 'cat z*' 'head z?txt' 'ls *.txt' \
-           "$(printf 'git diff --out\001put=/tmp/x')" $'git status\nrm -rf ~/x'; do
+           "$(printf 'git diff --out\001put=/tmp/x')" $'git status\nrm -rf ~/x' \
+           'grep -f/etc/hosts x' 'grep -rfz.txt x' $'cat \\\' z* \\\'' 'cat a\.txt'; do
     chk "silent: $(printf %q "$c")" "$(t "$c")" SILENT
   done
   chk "mode auto: silent"         "$(t 'git status' auto)" SILENT
@@ -111,6 +119,10 @@ else
   chk "cache dir mode" "$(stat -f '%Lp' "$TH/.cache/headroom-markitdown")" 700
   rm -f "$out"; echo victim > "$W/victim"; ln -s "$W/victim" "$out"; rj "$P/doc.pdf" >/dev/null
   chk "planted symlink replaced, not followed" "$(cat "$W/victim"; [ -L "$out" ] && echo L)" victim
+  # Rules match the redirected cache path, so a Read rule must keep the read native.
+  mkdir -p "$P/.claude"; echo '{"permissions":{"deny":["Read(./doc.pdf)"]}}' > "$P/.claude/settings.local.json"
+  chk "Read deny rule -> left to Claude Code" "$(rj "$P/doc.pdf")" SILENT
+  rm -f "$P/.claude/settings.local.json"
 fi
 
 echo "== D. MarkItDown shim"
@@ -124,8 +136,14 @@ if [ ! -x "$SHIM" ]; then skip "shim" "not installed"; else
   mkdir -p "$P/markitdown" && echo 'print("PWNED")' > "$P/markitdown/__main__.py" && : > "$P/markitdown/__init__.py" \
     && echo 'raise SystemExit("PWNED")' > "$P/json.py"
   chk "shim never imports project code" "$(cd "$P" && "$SHIM" a.docx 2>&1 | grep -c PWNED)" 0
+  # An empty PYTHONPATH entry ($PYTHONPATH:/x with it unset) adds the cwd as an absolute path.
+  chk "shim never imports project code (PYTHONPATH=:)" "$(cd "$P" && PYTHONPATH=: "$SHIM" a.docx 2>&1 | grep -c PWNED)" 0
   [ -f "$RH_REAL" ] && chk "rtk hook never imports project code" "$(t 'git status')" allow
+  [ -f "$RH_REAL" ] && chk "rtk hook never imports project code (PYTHONPATH=:)" "$(PYTHONPATH=: t 'git status')" allow
   rm -rf "$P/markitdown" "$P/json.py"
+  # bash 3.2's `pwd -P` keeps an inherited $PWD's case; the file's realpath does not.
+  mkdir -p "$W/CaseProj" && cp "$P/a.docx" "$W/CaseProj/"
+  chk "shim from a case-mismatched cwd" "$(cd "$W/caseproj" && "$SHIM" a.docx 2>/dev/null | grep -c hi)" 1
 fi
 
 echo "== E. guards survive non-UTF-8 config (the CP950 report, macOS stand-in)"

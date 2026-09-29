@@ -7730,9 +7730,23 @@ fn learn_failure_is_agent_unparseable_output(text: &str) -> bool {
 /// ``error: unknown option '--include-partial-messages'`` from a stale
 /// `/usr/local/bin/claude`). Same class as RUST-DE's too-old-for-the-model
 /// line: the user's install, fixed by updating it, not by a release of ours.
+///
+/// Only a flag current CLIs accept counts. Any other unknown flag is upstream
+/// passing something no CLI has, which is ours to fix and must reach Sentry.
+/// A wheel bump that makes `learn/analyzer.py` pass a new flag adds it here.
 fn learn_failure_is_agent_cli_outdated(text: &str) -> bool {
+    const CURRENT_FLAGS: &[&str] = &[
+        "--include-partial-messages",
+        "--output-format",
+        "--verbose",
+        "--skip-git-repo-check",
+        "--json",
+    ];
     // Commander (Claude Code) and clap (Codex) wording, respectively.
-    text.contains("error: unknown option '--") || text.contains("error: unexpected argument '--")
+    CURRENT_FLAGS.iter().any(|flag| {
+        text.contains(&format!("error: unknown option '{flag}'"))
+            || text.contains(&format!("error: unexpected argument '{flag}'"))
+    })
 }
 
 /// The user-facing remedy for [`learn_failure_is_agent_cli_outdated`].
@@ -13141,6 +13155,9 @@ Some unrelated content.
         ));
         for stderr in [
             "Error: No such option: --foo",
+            // A flag no CLI has is an upstream break, not a stale install.
+            "error: unknown option '--include-partial-mesages'",
+            "error: unexpected argument '--made-up' found",
             "API Error: 400 status code (no body)",
             "",
         ] {
