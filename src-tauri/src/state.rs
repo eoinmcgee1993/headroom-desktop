@@ -607,12 +607,13 @@ pub struct AppState {
     /// `~/.codex/auth.json` + the live `codex_plan_tier` slot; no network fetch,
     /// so the cache is a plain value + timestamp.
     cached_codex_profile: Mutex<Option<(Option<CodexAccountProfile>, Instant)>>,
-    /// When the current run of transient profile-fetch failures began. Set the
+    /// The current run of transient profile-fetch failures, as (start, last
+    /// failure) on the wall clock (`pricing::extend_failure_run`). Set the
     /// first time we suppress a transient error (and serve the last good
     /// profile), cleared on the next successful fetch. Once the run exceeds
     /// `STALE_PROFILE_ESCALATE_AFTER` we stop suppressing and surface the
     /// banner — the token-rotation gap has lasted long enough to be real.
-    stale_profile_since: Mutex<Option<Instant>>,
+    stale_profile_since: Mutex<Option<(DateTime<Utc>, DateTime<Utc>)>>,
     /// Last `IdentityFingerprint` we successfully posted to
     /// `desktop/grace/start`. Used by the bearer-triggered identity-pusher
     /// worker to skip redundant posts when the same Claude account/plan is
@@ -2140,11 +2141,9 @@ impl AppState {
         // no longer a momentary rotation blip, so we stop suppressing and let
         // the real error (and its banner) through.
         if detection.error_is_transient && !pricing::is_identity_complete(&profile) {
-            let escalate = {
-                let mut since = self.stale_profile_since.lock();
-                let started = since.get_or_insert_with(Instant::now);
-                started.elapsed() >= STALE_PROFILE_ESCALATE_AFTER
-            };
+            let escalate =
+                pricing::extend_failure_run(&mut self.stale_profile_since.lock(), Utc::now())
+                    >= STALE_PROFILE_ESCALATE_AFTER;
             if !escalate {
                 let mut cache = self.cached_claude_profile.lock();
                 if let Some((_, prev, _)) = cache.as_ref() {
@@ -4028,8 +4027,22 @@ impl AppState {
     /// bypass flag alone is enough to make the Rust intercept pass traffic
     /// straight through to api.anthropic.com while Python is down.
     fn enforce_pricing_gate(&self) {
+        self.enforce_pricing_status(pricing::get_pricing_status(self));
+    }
+
+    fn enforce_pricing_status(
+        &self,
+        status: std::result::Result<crate::models::HeadroomPricingStatus, String>,
+    ) {
         use std::sync::atomic::Ordering::Release;
-        match pricing::get_pricing_status(self) {
+        match status {
+            // Same guard as apply_pricing_gates: a failed account sync
+            // evaluates as allowed but is no verdict.
+            Ok(status) if Self::is_error_reading(&status) => {
+                log::info!(
+                    "enforce_pricing_gate: account sync failed; leaving gate flags untouched"
+                );
+            }
             Ok(status) if !status.optimization_allowed => {
                 // Gated. When Codex is still enabled, use the Claude-only
                 // bypass (Python stays up for Codex) instead of the full
@@ -12888,6 +12901,32 @@ mod tests {
         assert!(!state
             .proxy_bypass
             .load(std::sync::atomic::Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    /// #140: enforce_pricing_gate (launch, tray, watchdog, provider save) is
+    /// a second gate writer. On a failed account sync it took the ungated arm
+    /// and cleared the bypass, reopening the leak apply_pricing_gates guards.
+    #[test]
+    fn enforce_pricing_gate_leaves_flags_untouched_on_an_error_reading() {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let base_dir = temp_test_dir("headroom-enforce-error-reading");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        // Claude-only gate engaged (Codex keeps Python up).
+        state.claude_only_bypass.store(true, Release);
+
+        let mut blip = pricing_status_with_optimization(true);
+        blip.account = None;
+        blip.account_sync_error = Some("send: timed out".into());
+        state.enforce_pricing_status(Ok(blip));
+        assert!(
+            state.claude_only_bypass.load(Acquire),
+            "a failed account sync must not lift the gate"
+        );
+
+        // A real ungated verdict still lifts it.
+        state.enforce_pricing_status(Ok(pricing_status_with_optimization(true)));
+        assert!(!state.claude_only_bypass.load(Acquire));
         let _ = std::fs::remove_dir_all(base_dir);
     }
 

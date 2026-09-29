@@ -979,6 +979,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     let tier_mismatch = resolve_tier_mismatch(
         account.as_ref(),
         &claude,
+        last_known_good_plan_tier.as_ref(),
         codex_plan,
         &state.active_day_keys(),
     );
@@ -1514,6 +1515,7 @@ pub(crate) fn verify_auth_code_with_base_url(
     let tier_mismatch = resolve_tier_mismatch(
         Some(&account),
         &claude,
+        last_known_good_plan_tier.as_ref(),
         codex_plan,
         &state.active_day_keys(),
     );
@@ -1698,6 +1700,7 @@ pub(crate) fn activate_account_with_retry_backoff(
     let tier_mismatch = resolve_tier_mismatch(
         Some(&account),
         &claude,
+        last_known_good_plan_tier.as_ref(),
         codex_plan,
         &state.active_day_keys(),
     );
@@ -2388,6 +2391,7 @@ fn detect_tier_mismatch(
 fn resolve_tier_mismatch(
     account: Option<&HeadroomAccountProfile>,
     claude: &ClaudeAccountProfile,
+    last_known_good_claude_plan: Option<&ClaudePlanTier>,
     codex_plan: Option<CodexPlanTier>,
     active_day_keys: &[String],
 ) -> Option<TierMismatch> {
@@ -2400,7 +2404,21 @@ fn resolve_tier_mismatch(
                 // here, and clearing on those used to restart the 14-day clamp
                 // window on every transient blip — one flaky poll per two
                 // weeks meant under-subscribed users were never clamped.
-                if account.is_some() {
+                // An Unknown Claude plan is no verdict either (no bearer after
+                // a relaunch or an idle hour, a failed profile fetch), so judge
+                // it by the last known-good plan; a machine that never
+                // classified one has only Codex to go on.
+                let affirmative = account.is_some_and(|a| {
+                    claude.plan_tier != ClaudePlanTier::Unknown
+                        || last_known_good_claude_plan.is_none_or(|plan| {
+                            let known = ClaudeAccountProfile {
+                                plan_tier: plan.clone(),
+                                ..claude.clone()
+                            };
+                            detect_tier_mismatch(a, &known, codex_plan).is_none()
+                        })
+                });
+                if affirmative {
                     if let Ok(mut local) = load_or_initialize_local_state() {
                         if local.mismatch_since.is_some() || local.mismatch_clamped_at.is_some() {
                             local.mismatch_since = None;
@@ -2969,12 +2987,51 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
 
 /// Failure from the OAuth profile fetch. `transient` marks the conditions
 /// that resolve on their own once a fresh bearer flows through the proxy
-/// (network blip, 5xx, or a 401/403 from a stale captured token during the
+/// (network blip, 5xx, 429/408, or a 401/403 from a stale captured token during the
 /// token-rotation gap). Callers suppress the banner for transient errors and
 /// keep serving the last known-good profile instead.
 struct ProfileFetchError {
     message: String,
     transient: bool,
+}
+
+/// Classifies a non-success status from the OAuth profile endpoint.
+fn profile_http_error(status: u16) -> ProfileFetchError {
+    let (message, transient) = if status >= 500 {
+        (
+            format!(
+                "Anthropic is having trouble serving your Claude plan right now (HTTP \
+                 {status}). We'll keep trying."
+            ),
+            true,
+        )
+    } else if status == 401 || status == 403 {
+        (
+            "Anthropic rejected our request for your Claude plan. Try signing out of Claude \
+             Code and back in."
+                .to_string(),
+            true,
+        )
+    } else if status == 429 || status == 408 {
+        // Throttled or timed out: says nothing about the account, so keep
+        // serving the last known-good profile like the other transient cases.
+        (
+            format!(
+                "Anthropic is busy and couldn't look up your Claude plan (HTTP {status}). We'll \
+                 try again shortly."
+            ),
+            true,
+        )
+    } else {
+        (
+            format!(
+                "Anthropic returned an unexpected response for your Claude plan (HTTP \
+                 {status}). We'll try again shortly."
+            ),
+            false,
+        )
+    };
+    ProfileFetchError { message, transient }
 }
 
 fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, ProfileFetchError> {
@@ -2996,32 +3053,7 @@ fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, ProfileFetchEr
         })?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let (message, transient) = if status >= 500 {
-            (
-                format!(
-                    "Anthropic is having trouble serving your Claude plan right now (HTTP \
-                     {status}). We'll keep trying."
-                ),
-                true,
-            )
-        } else if status == 401 || status == 403 {
-            (
-                "Anthropic rejected our request for your Claude plan. Try signing out of Claude \
-                 Code and back in."
-                    .to_string(),
-                true,
-            )
-        } else {
-            (
-                format!(
-                    "Anthropic returned an unexpected response for your Claude plan (HTTP \
-                     {status}). We'll try again shortly."
-                ),
-                false,
-            )
-        };
-        return Err(ProfileFetchError { message, transient });
+        return Err(profile_http_error(response.status().as_u16()));
     }
 
     // Same split as the activation path above (RUST-58): `.json()` collapses a
@@ -3403,8 +3435,33 @@ static SERVER_SILENT_REPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static AUTH_SILENT_REPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static GRACE_FAILING_SINCE: std::sync::Mutex<Option<std::time::Instant>> =
+/// The current grace/start failure run, as (start, last failure).
+static GRACE_FAILING_SINCE: std::sync::Mutex<Option<(DateTime<Utc>, DateTime<Utc>)>> =
     std::sync::Mutex::new(None);
+
+/// Longest gap between two failures that still counts as one run. Awake, the
+/// pricing loop retries at most ~30 min apart (a 10-min loop that skips when
+/// something else fetched within the interval), so a longer gap means the
+/// machine slept.
+const FAILURE_RUN_MAX_GAP_MINS: i64 = 60;
+
+/// Extends the failure run in `run` (start, last failure) to `now` and returns
+/// how long it has lasted. On the wall clock, not `Instant`: Windows' monotonic
+/// clock counts sleep and macOS' does not, and neither may carry a run that
+/// began before a weekend sleep into the first refresh after wake. A gap past
+/// FAILURE_RUN_MAX_GAP_MINS, or a clock stepped backwards, starts a new run.
+pub(crate) fn extend_failure_run(
+    run: &mut Option<(DateTime<Utc>, DateTime<Utc>)>,
+    now: DateTime<Utc>,
+) -> std::time::Duration {
+    let (start, last) = run.get_or_insert((now, now));
+    let gap = now - *last;
+    if gap < Duration::zero() || gap > Duration::minutes(FAILURE_RUN_MAX_GAP_MINS) {
+        *start = now;
+    }
+    *last = now;
+    (now - *start).to_std().unwrap_or_default()
+}
 
 /// Hours the backend has been unreachable, if past the alarm window. Falls
 /// back to first_seen_at so a machine that never reached us still alarms
@@ -3432,11 +3489,10 @@ fn auth_silent_hours(local: &LocalPricingState, now: DateTime<Utc>) -> Option<i6
 
 fn maybe_report_server_silent(local: &LocalPricingState, identity: &IdentityPayload, err: &str) {
     let failing_long_enough = {
-        let mut since = GRACE_FAILING_SINCE
+        let mut run = GRACE_FAILING_SINCE
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let start = since.get_or_insert_with(std::time::Instant::now);
-        start.elapsed().as_secs() >= SERVER_SILENT_MIN_FAILING_SECS
+        extend_failure_run(&mut run, Utc::now()).as_secs() >= SERVER_SILENT_MIN_FAILING_SECS
     };
     if !failing_long_enough {
         return;
@@ -4003,11 +4059,11 @@ mod tests {
         detect_tier_mismatch, evaluate_pricing_status_with_mismatch, is_identity_complete,
         latch_clamp_start, merge_background_account_sync, parse_oauth_profile_value,
         plan_tier_header_value, remote_account_to_profile, resolve_account_api_base_url,
-        tier_mismatch_grace_ends_at, ClaudeOauthProfile, ClaudeOauthProfileAccount,
-        ClaudeOauthProfileOrganization, HeadroomSubscriptionTier, IdentityFingerprint,
-        IdentityPayload, LocalPricingState, PricingPromo, RemoteAccountResponse,
-        RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
-        MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
+        resolve_tier_mismatch, tier_mismatch_grace_ends_at, ClaudeOauthProfile,
+        ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
+        IdentityFingerprint, IdentityPayload, LocalPricingState, PricingPromo,
+        RemoteAccountResponse, RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS,
+        DEFAULT_ACCOUNT_API_BASE_URL, MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, CodexPlanTier,
@@ -4083,6 +4139,50 @@ mod tests {
         local.first_seen_at = now - Duration::days(3);
         assert_eq!(server_silent_hours(&local, now), Some(72));
         assert_eq!(auth_silent_hours(&local, now), None);
+    }
+
+    /// #128: the server-silent alarm's failure run is on the wall clock and
+    /// restarts after a gap no awake retry cadence produces, so a run that
+    /// began before a weekend sleep can't alarm on the first refresh after
+    /// wake (Windows' monotonic clock counts the sleep; macOS' does not).
+    #[test]
+    fn failure_run_restarts_after_a_sleep_gap() {
+        use super::extend_failure_run;
+        use chrono::Duration;
+        let min_failing = std::time::Duration::from_secs(super::SERVER_SILENT_MIN_FAILING_SECS);
+        let t0 = Utc::now();
+        let mut run = None;
+        assert_eq!(extend_failure_run(&mut run, t0), std::time::Duration::ZERO);
+        // Awake retries 10 and 30 min apart keep one run going.
+        extend_failure_run(&mut run, t0 + Duration::minutes(10));
+        assert!(extend_failure_run(&mut run, t0 + Duration::minutes(40)) >= min_failing);
+
+        // Two days asleep, then the first refresh fails before Wi-Fi is back.
+        let wake = t0 + Duration::days(2);
+        assert!(extend_failure_run(&mut run, wake) < min_failing);
+        assert!(extend_failure_run(&mut run, wake + Duration::minutes(10)) < min_failing);
+
+        // A wall clock stepped backwards starts over too.
+        let stepped = wake - Duration::hours(3);
+        assert_eq!(
+            extend_failure_run(&mut run, stepped),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// #127: a 429 (or 408) from the OAuth profile endpoint is Anthropic
+    /// throttling, not a broken account. As non-transient it skipped the
+    /// last-known-good profile and showed an error banner with plan Unknown.
+    #[test]
+    fn profile_fetch_rate_limit_is_transient() {
+        for status in [408, 429] {
+            let err = super::profile_http_error(status);
+            assert!(err.transient, "HTTP {status} must be transient");
+            assert!(err.message.contains(&status.to_string()));
+        }
+        assert!(super::profile_http_error(503).transient);
+        assert!(super::profile_http_error(401).transient);
+        assert!(!super::profile_http_error(404).transient);
     }
 
     #[test]
@@ -7258,6 +7358,59 @@ mod tests {
         account.subscription_active = false;
         let claude = empty_claude_profile(ClaudePlanTier::Max20x);
         assert!(detect_tier_mismatch(&account, &claude, None).is_none());
+    }
+
+    /// #36: an Unknown Claude plan (no bearer after a relaunch or an idle
+    /// hour, or a failed profile fetch) is not evidence the mismatch is gone.
+    /// It used to wipe the grace clock and the latched clamp, so the next
+    /// request restarted a fresh 14-day grace and nobody was ever clamped.
+    #[test]
+    #[serial_test::serial]
+    fn tier_mismatch_clock_survives_an_unknown_claude_plan() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let since = Utc::now() - Duration::days(20);
+        let clamped_at = since + Duration::days(TIER_MISMATCH_GRACE_DAYS);
+        let mut local = super::load_or_initialize_local_state().unwrap();
+        local.mismatch_since = Some(since);
+        local.mismatch_clamped_at = Some(clamped_at);
+        super::write_local_state(&local).unwrap();
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        let persisted = || {
+            let local = super::load_or_initialize_local_state().unwrap();
+            (local.mismatch_since, local.mismatch_clamped_at)
+        };
+
+        let unknown = empty_claude_profile(ClaudePlanTier::Unknown);
+        assert!(resolve_tier_mismatch(
+            Some(&account),
+            &unknown,
+            Some(&ClaudePlanTier::Max20x),
+            None,
+            &[]
+        )
+        .is_none());
+        assert_eq!(persisted(), (Some(since), Some(clamped_at)));
+
+        // The next classified request resumes the same clock, still clamped.
+        let max = empty_claude_profile(ClaudePlanTier::Max20x);
+        let resumed = resolve_tier_mismatch(
+            Some(&account),
+            &max,
+            Some(&ClaudePlanTier::Max20x),
+            None,
+            &[],
+        )
+        .expect("mismatch");
+        assert!(resumed.clamped);
+        assert_eq!(persisted(), (Some(since), Some(clamped_at)));
+
+        // A classified plan the paid tier covers clears it for real.
+        let pro = empty_claude_profile(ClaudePlanTier::Pro);
+        assert!(
+            resolve_tier_mismatch(Some(&account), &pro, Some(&ClaudePlanTier::Pro), None, &[])
+                .is_none()
+        );
+        assert_eq!(persisted(), (None, None));
     }
 
     #[test]
