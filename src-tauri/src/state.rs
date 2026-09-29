@@ -4255,7 +4255,7 @@ impl AppState {
     }
 
     /// TTL-cached Codex identity profile, the Codex analog of
-    /// `cached_claude_profile`. Reads `~/.codex/auth.json` at most once per TTL.
+    /// `cached_claude_profile`. Reads `$CODEX_HOME/auth.json` at most once per TTL.
     /// `None` when nothing is known yet (no auth.json and no live capture).
     pub fn cached_codex_profile(&self) -> Option<CodexAccountProfile> {
         const TTL: Duration = Duration::from_secs(300);
@@ -4279,12 +4279,12 @@ impl AppState {
     /// so a Codex overage can't pause Claude optimization for a mixed user.
     pub fn apply_codex_pricing_gate_status(&self, codex: Option<&crate::models::CodexUsage>) {
         let was_bypassed = self.codex_bypass.load(std::sync::atomic::Ordering::Acquire);
-        // No Codex usage signal yet → leave the current state untouched rather
-        // than clearing a gate that a transient empty poll didn't disprove.
-        let Some(codex) = codex else {
-            return;
-        };
-        let should_bypass = !codex.optimization_allowed;
+        // `None` is no gate verdict, which allows: Codex disabled, or Ungated/
+        // Metered with no snapshot yet (a hard block always carries a reading,
+        // and error polls never get here, see `is_error_reading`). Keeping the
+        // flag left a user who paid after a trial-ended block on API-key Codex,
+        // which never yields a snapshot, bypassed until relaunch.
+        let should_bypass = codex.is_some_and(|codex| !codex.optimization_allowed);
 
         if should_bypass {
             if was_bypassed {
@@ -4295,7 +4295,7 @@ impl AppState {
             }
             log::info!(
                 "codex_gate: entering bypass (gate_reason={:?})",
-                codex.gate_reason
+                codex.and_then(|codex| codex.gate_reason.as_ref())
             );
             self.codex_bypass
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -13041,19 +13041,22 @@ mod tests {
     }
 
     #[test]
-    fn apply_codex_gate_ignores_absent_usage() {
+    fn apply_codex_gate_lifts_when_the_block_clears_without_usage() {
         let base_dir = temp_test_dir("headroom-codex-bypass-none");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
-        // Flip it on first.
+        // Trial-ended hard block engages on the default (empty) snapshot, as it
+        // does for API-key Codex, whose traffic never yields rate-limit headers.
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
         state.age_gate_debounce();
         state.apply_codex_pricing_gate_status(Some(&codex_usage_with_optimization(false)));
         assert!(state
             .codex_bypass
             .load(std::sync::atomic::Ordering::Acquire));
-        // A poll with no Codex signal must leave the gate as-is, not clear it.
+        // The user subscribes: activation is Ungated and there is still no
+        // snapshot, so `fetch_codex_usage` reports None. That is no gate
+        // verdict, i.e. allowed, and must lift the bypass.
         state.apply_codex_pricing_gate_status(None);
-        assert!(state
+        assert!(!state
             .codex_bypass
             .load(std::sync::atomic::Ordering::Acquire));
         fs::remove_dir_all(base_dir).ok();

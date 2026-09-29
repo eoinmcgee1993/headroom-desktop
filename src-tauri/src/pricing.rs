@@ -1837,8 +1837,8 @@ pub struct WeeklyLimitNudge {
 /// Maps a freshly evaluated pricing status to the weekly-limit nudge the
 /// desktop should report, or `None`. `"reached"` when the weekly cap has paused
 /// optimization (Claude or Codex); `"approaching"` when nudging near it but not
-/// yet paused. The cap reflects whichever provider tripped — Claude's tier-aware
-/// threshold, or the fixed Codex cap. Subscriber filtering and per-window
+/// yet paused. The cap reflects whichever provider tripped: each gate's own
+/// tier-aware, invite-bonus-inclusive pause threshold. Subscriber filtering and per-window
 /// de-duplication are the server's job (headroom-web
 /// `POST /api/v1/desktop/weekly_limit`), so this stays a pure mapping.
 pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<WeeklyLimitNudge> {
@@ -1851,7 +1851,10 @@ pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<WeeklyLimit
     }
 
     let claude_cap = status.effective_disable_threshold_percent;
-    let codex_cap = Some(CODEX_WEEKLY_DISABLE_THRESHOLD_PCT);
+    let codex_cap = status
+        .codex
+        .as_ref()
+        .map(|codex| codex.effective_disable_threshold_percent);
 
     let claude_reached = !status.optimization_allowed
         && matches!(
@@ -2740,15 +2743,18 @@ fn sanitize_plan_claim(raw: &str) -> Option<String> {
     (!clean.is_empty()).then_some(clean)
 }
 
-/// Build a [`CodexAccountProfile`] from `~/.codex/auth.json`. `plan_tier` and
+/// Build a [`CodexAccountProfile`] from `$CODEX_HOME/auth.json` (default
+/// `~/.codex`, the same resolution the Codex CLI uses). `plan_tier` and
 /// `account_uuid` are also available from live traffic (`state.codex_plan_tier`
 /// and the access-token bearer), so this prefers a live, classified plan tier
 /// over the on-disk id_token when present. `email` and `organization_type` only
 /// exist in the id_token, so they require the file. Returns `None` only when
-/// nothing at all is known (no file and no live capture).
+/// nothing at all is known (no file and no live capture). `plan_tier` is
+/// `None` when neither source carries a plan claim (API-key auth): that is no
+/// plan evidence, not an unclassifiable plan, so it must not recommend Max 20x.
 pub fn detect_codex_profile(state: &AppState) -> Option<CodexAccountProfile> {
     let live_tier = state.codex_plan_tier();
-    let path = dirs::home_dir()?.join(".codex").join("auth.json");
+    let path = crate::client_adapters::codex_home().join("auth.json");
     let on_disk = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
@@ -2803,26 +2809,28 @@ pub fn detect_codex_profile(state: &AppState) -> Option<CodexAccountProfile> {
         .and_then(|a| a.get("chatgpt_plan_type"))
         .and_then(|v| v.as_str());
     let (plan_tier, source) = if !matches!(live_tier, CodexPlanTier::Unknown) {
-        (live_tier, "access_token")
+        (Some(live_tier), "access_token")
     } else {
         match raw_claim.map(CodexPlanTier::from_claim) {
-            Some(tier) => (tier, "id_token"),
-            None => (CodexPlanTier::Unknown, "none"),
+            Some(tier) => (Some(tier), "id_token"),
+            None => (None, "none"),
         }
     };
     // Keep the raw claim only when it exists but decodes to Unknown: that is
     // a plan value OpenAI ships and we don't know yet (Business Premium seats
     // are the expected next one). Known tiers carry nothing extra.
-    let plan_raw = matches!(plan_tier, CodexPlanTier::Unknown)
+    let plan_raw = matches!(plan_tier, Some(CodexPlanTier::Unknown))
         .then(|| raw_claim.and_then(sanitize_plan_claim))
         .flatten();
 
-    let billing_type = codex_billing_type(&plan_tier, organization_type.is_some());
+    let billing_type = plan_tier
+        .as_ref()
+        .and_then(|tier| codex_billing_type(tier, organization_type.is_some()));
 
     Some(CodexAccountProfile {
         email,
         account_uuid,
-        plan_tier: Some(plan_tier),
+        plan_tier,
         plan_raw,
         organization_type,
         rate_limit_tier: None,
@@ -4463,6 +4471,77 @@ mod tests {
         assert_eq!(auth["organizations"][0]["role"], "owner");
     }
 
+    /// Runs `detect_codex_profile` against a scratch HOME holding `auth_json`
+    /// in `<HOME>/<codex_dir>/auth.json`, with `CODEX_HOME` pointed there when
+    /// `codex_dir` is not `.codex`. Restores both env vars afterwards.
+    fn detect_codex_profile_with_auth(
+        codex_dir: &str,
+        auth_json: &str,
+    ) -> Option<crate::models::CodexAccountProfile> {
+        let _home_lock = crate::test_env_lock::lock_home();
+        let prev_home = std::env::var_os("HOME");
+        let prev_codex = std::env::var_os("CODEX_HOME");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        std::env::set_var("HOME", scratch.path());
+        let dir = scratch.path().join(codex_dir);
+        if codex_dir == ".codex" {
+            std::env::remove_var("CODEX_HOME");
+        } else {
+            std::env::set_var("CODEX_HOME", &dir);
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), auth_json).unwrap();
+
+        let (state, state_dir) = temp_app_state();
+        let profile = super::detect_codex_profile(&state);
+        drop_state(state_dir);
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_codex {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        profile
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn api_key_codex_auth_reports_no_plan_and_no_tier_mismatch() {
+        // `codex login --with-api-key`: a key, no ChatGPT tokens, no plan claim.
+        let profile = detect_codex_profile_with_auth(
+            ".codex",
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-test","tokens":null}"#,
+        );
+        let codex_plan = profile.and_then(|p| p.plan_tier);
+        assert_eq!(codex_plan, None, "no plan claim is no plan evidence");
+
+        assert!(
+            detect_tier_mismatch(
+                &active_subscriber(HeadroomSubscriptionTier::Pro),
+                &empty_claude_profile(ClaudePlanTier::Pro),
+                codex_plan,
+            )
+            .is_none(),
+            "an API-key Codex login must not recommend Max 20x"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_profile_reads_auth_json_from_codex_home() {
+        use base64::Engine;
+        let payload = r#"{"email":"dev@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acct_9","chatgpt_plan_type":"plus"}}"#;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let auth = serde_json::json!({ "tokens": { "id_token": format!("h.{b64}.s") } });
+
+        let profile = detect_codex_profile_with_auth("custom-codex", &auth.to_string())
+            .expect("auth.json under $CODEX_HOME is read");
+        assert_eq!(profile.email.as_deref(), Some("dev@example.com"));
+        assert_eq!(profile.plan_tier, Some(CodexPlanTier::Plus));
+    }
+
     fn complete_profile() -> ClaudeAccountProfile {
         ClaudeAccountProfile {
             auth_method: ClaudeAuthMethod::ClaudeAiOauth,
@@ -5091,6 +5170,42 @@ mod tests {
         let approaching = super::weekly_limit_signal(&nudging).expect("nudging free tier reports");
         assert_eq!(approaching.status, "approaching");
         assert_eq!(approaching.cap_percent, Some(50.0));
+    }
+
+    #[test]
+    fn codex_weekly_limit_report_carries_the_codex_gates_own_cap() {
+        let (start, end) = grace();
+        // Claude side quiet, so only the Codex gate can trip the report.
+        let mut status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(grandfathered_account()),
+            pro_profile_with_weekly(0.0),
+            false,
+            None,
+        );
+        let cap_for = |status: &mut HeadroomPricingStatus, plan, used, bonus| {
+            status.codex = Some(super::codex_usage_from_snapshot(
+                codex_snapshot_with_weekly(used),
+                plan,
+                super::CodexActivation::Metered,
+                bonus,
+            ));
+            super::weekly_limit_signal(status).expect("codex nudge reports")
+        };
+
+        // ChatGPT Pro meters on the Max ladder: pauses at 25%, not 50%.
+        let pro = cap_for(&mut status, CodexPlanTier::Pro, 12.0, 0.0);
+        assert_eq!(pro.status, "approaching");
+        assert_eq!(pro.cap_percent, Some(25.0));
+
+        // An invite bonus raises the pause point; the report must follow it.
+        let plus = cap_for(&mut status, CodexPlanTier::Plus, 40.0, 10.0);
+        assert_eq!(plus.status, "approaching");
+        assert_eq!(plus.cap_percent, Some(60.0));
     }
 
     #[test]
