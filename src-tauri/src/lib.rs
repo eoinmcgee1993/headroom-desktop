@@ -9691,6 +9691,19 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             // answers, the process is alive and merely busy, not down.
             let tolerant_outcome =
                 probe_backend_readyz_outcome_with_timeout(std::time::Duration::from_secs(5));
+            // A backend answers on 6768 but this process never selected a
+            // port (it started as a spectator, then took 6767 over from a
+            // window that died without stopping its backend). The intercept
+            // forwards nothing to an unselected port and no strike is ever
+            // counted, so adopt it here; ensure_headroom_running vets argv
+            // before selecting.
+            if !crate::backend_port::selected()
+                && (tolerant_outcome == "ok" || readyz_failure_is_upstream_only(&tolerant_outcome))
+            {
+                if let Err(err) = state.ensure_headroom_running() {
+                    log::info!("watchdog: adopting unselected backend failed: {err:#}");
+                }
+            }
             if tolerant_outcome == "ok" {
                 log::info!(
                     "watchdog: backend /readyz answered on tolerant 5s re-probe; not counting failure"

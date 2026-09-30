@@ -968,6 +968,18 @@ describe("calloutBannerFor", () => {
     ).toEqual({ tone: "disabled", title: "Your Headroom trial ended." });
   });
 
+  it("names a failed 6767 bind while the 6768 backend is healthy", () => {
+    // `running` tracks the backend only, so the bind hint never reaches
+    // runtimeIssues here; the banner must still name the port holder.
+    const status = runtime({ running: true, startupErrorHint: bindHint, interceptBindFailed: true });
+    for (const pricingStatus of [null, pricing({ shouldNudge: true, gateMessage: "You've used 80% of this week." })]) {
+      expect(calloutBannerFor({ ...healthy, runtimeStatus: status, pricingStatus })).toEqual({
+        tone: "disconnected",
+        title: "Headroom is not hooked up right now: Port 6767 is in use by python3.12 (PID 4242)."
+      });
+    }
+  });
+
   it("keeps the rest of the precedence order", () => {
     const codexGated = pricing({
       codex: { optimizationAllowed: false, shouldNudge: false, gateMessage: "Codex limit reached." }

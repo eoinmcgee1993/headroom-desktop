@@ -595,6 +595,9 @@ pub struct AppState {
     /// FETCH (and must expire fast on success, slowly on failure), this one
     /// stamps the last real ANSWER.
     last_good_headroom_stats: Mutex<Option<(HeadroomDashboardStats, Instant)>>,
+    /// Fetch time of the newest `/stats` payload the savings tracker has
+    /// observed; see `record_savings_snapshot`.
+    last_recorded_stats_at: Mutex<Option<Instant>>,
     /// Set while a `/stats` fetch is in flight; see `polled_headroom_stats`.
     headroom_stats_fetch_in_flight: AtomicBool,
     /// `(history, fetched_at, hold)`. After a failed fetch `history` is the
@@ -770,6 +773,7 @@ impl AppState {
             cached_clients: Mutex::new(None),
             cached_headroom_stats: Mutex::new(None),
             last_good_headroom_stats: Mutex::new(None),
+            last_recorded_stats_at: Mutex::new(None),
             headroom_stats_fetch_in_flight: AtomicBool::new(false),
             cached_headroom_history: Mutex::new(None),
             headroom_history_fetch_in_flight: AtomicBool::new(false),
@@ -2309,11 +2313,12 @@ impl AppState {
     /// live.
     const HEADROOM_STATS_RETAIN_LAST_GOOD: Duration = Duration::from_secs(10 * 60);
 
-    fn cached_headroom_stats(&self) -> Option<HeadroomDashboardStats> {
+    /// The payload and when it was fetched.
+    fn cached_headroom_stats(&self) -> Option<(HeadroomDashboardStats, Instant)> {
         match self.polled_headroom_stats() {
-            Some(stats) => {
-                *self.last_good_headroom_stats.lock() = Some((stats.clone(), Instant::now()));
-                Some(stats)
+            Some((stats, fetched_at)) => {
+                *self.last_good_headroom_stats.lock() = Some((stats.clone(), fetched_at));
+                Some((stats, fetched_at))
             }
             // Retain the previous good payload rather than blanking the
             // dashboard on one timeout. The stamp is the age of the DATA, not
@@ -2324,14 +2329,14 @@ impl AppState {
                 .lock()
                 .as_ref()
                 .filter(|(_, at)| at.elapsed() < Self::HEADROOM_STATS_RETAIN_LAST_GOOD)
-                .map(|(stats, _)| stats.clone()),
+                .cloned(),
         }
     }
 
     /// The raw poll behind [`Self::cached_headroom_stats`]: cache lookup, then
     /// a live fetch on miss. Returns `None` for "this poll had no answer",
     /// which the caller may still cover with a retained payload.
-    fn polled_headroom_stats(&self) -> Option<HeadroomDashboardStats> {
+    fn polled_headroom_stats(&self) -> Option<(HeadroomDashboardStats, Instant)> {
         // Dashboard polls at 5s; a 4s TTL caused every poll to miss and
         // re-fetch from the proxy. 12s gives at least one cache hit between
         // dashboard refreshes while keeping session savings visibly fresh.
@@ -2354,7 +2359,7 @@ impl AppState {
             let cache = self.cached_headroom_stats.lock();
             if let Some((stats, at, hold)) = cache.as_ref() {
                 if at.elapsed() < *hold {
-                    return stats.clone();
+                    return stats.clone().map(|stats| (stats, *at));
                 }
             }
         }
@@ -2383,8 +2388,9 @@ impl AppState {
         } else {
             (None, UNREACHABLE_TTL)
         };
-        *self.cached_headroom_stats.lock() = Some((stats.clone(), Instant::now(), hold));
-        stats
+        let fetched_at = Instant::now();
+        *self.cached_headroom_stats.lock() = Some((stats.clone(), fetched_at, hold));
+        stats.map(|stats| (stats, fetched_at))
     }
 
     fn cached_headroom_history(&self) -> Option<HeadroomSavingsHistoryResponse> {
@@ -2599,7 +2605,11 @@ impl AppState {
         // instance's traffic: ingesting them would persist it here and report
         // it as this account's savings. The tracker's own record stands in.
         let spectator = self.intercept_bind_failed();
-        let stats = (!spectator).then(|| self.cached_headroom_stats()).flatten();
+        let polled = (!spectator).then(|| self.cached_headroom_stats()).flatten();
+        let (stats, stats_fetched_at) = match polled {
+            Some((stats, at)) => (Some(stats), Some(at)),
+            None => (None, None),
+        };
         let history = (!spectator)
             .then(|| self.cached_headroom_history())
             .flatten();
@@ -2608,9 +2618,9 @@ impl AppState {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
-        if let Some(stats) = stats.as_ref() {
+        if let (Some(stats), Some(fetched_at)) = (stats.as_ref(), stats_fetched_at) {
             if let Some((updated, updated_daily, updated_hourly)) =
-                self.record_savings_snapshot(stats)
+                self.record_savings_snapshot(stats, fetched_at)
             {
                 snapshot = updated;
                 daily_savings = updated_daily;
@@ -3294,12 +3304,26 @@ impl AppState {
     fn record_savings_snapshot(
         &self,
         stats: &HeadroomDashboardStats,
+        fetched_at: Instant,
     ) -> Option<(
         SavingsTotalsSnapshot,
         Vec<DailySavingsPoint>,
         Vec<HourlySavingsPoint>,
     )> {
         let mut tracker = self.savings_tracker.lock();
+        // Concurrent builders (tray updater, dashboard poll) can finish out of
+        // order: one holding a retained or cached payload records after
+        // another recorded a newer fetch. `observe` reads the older session
+        // totals as a backend restart and re-banks the whole session, so a
+        // payload older than the last one observed is skipped. Checked under
+        // the tracker lock so the check and the observe are one step.
+        {
+            let mut last = self.last_recorded_stats_at.lock();
+            if last.is_some_and(|last| fetched_at < last) {
+                return None;
+            }
+            *last = Some(fetched_at);
+        }
         let snapshot = tracker.observe(stats)?;
         let daily_savings = tracker.daily_savings();
         let hourly_savings = tracker.hourly_savings();
@@ -3458,7 +3482,10 @@ impl AppState {
 
         // Re-read: a caller that passed the check above can wait here on the
         // upgrade's own stop_headroom, then must not spawn into its install.
-        if self.upgrade_install_blocks_spawn() {
+        // Likewise a quit that stopped the backend while we waited.
+        if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire)
+            || self.upgrade_install_blocks_spawn()
+        {
             return Ok(());
         }
         // Another caller may have brought the runtime up while we waited.
@@ -3583,13 +3610,22 @@ impl AppState {
                 // A full-bypass gate flip that raced this spawn timed out on
                 // the lifecycle lock we hold and, lock-less, reaped only
                 // orphans, so the child just recorded would otherwise run for
-                // the whole gated period. Its teardown is owed here.
-                if self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
-                    && !*self.runtime_upgrade_in_progress.lock()
+                // the whole gated period. Its teardown is owed here. Same for
+                // a quit that began mid-spawn: exit stops the backend once,
+                // before this child existed, so it would outlive the app.
+                let shutting_down = crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire);
+                if shutting_down
+                    || (self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire)
+                        && !*self.runtime_upgrade_in_progress.lock())
                 {
                     drop(_lifecycle_guard);
                     log::info!(
-                        "ensure_headroom_running: proxy_bypass set during spawn; stopping the new backend"
+                        "ensure_headroom_running: {} set during spawn; stopping the new backend",
+                        if shutting_down {
+                            "shutdown"
+                        } else {
+                            "proxy_bypass"
+                        }
                     );
                     self.stop_headroom();
                 }
@@ -5906,10 +5942,18 @@ impl SavingsTracker {
         // Local keys on both maps, same as the tracker's own input deltas.
         let hour_key = local_hour_key(Local::now());
         let day_key = day_key_from_hour_key(&hour_key);
-        for (map, key) in [
-            (&mut self.hourly_savings, hour_key),
-            (&mut self.daily_savings, day_key),
-        ] {
+        // Not into an archived UTC rollup that shares this local date: west of
+        // UTC in the evening the output belongs to the NEXT UTC day, whose
+        // rollup already carries it, so adding it here counted it twice.
+        let day_is_utc_rollup = self
+            .daily_savings
+            .get(&day_key)
+            .is_some_and(|bucket| bucket.utc_keyed);
+        let mut targets = vec![(&mut self.hourly_savings, hour_key)];
+        if !day_is_utc_rollup {
+            targets.push((&mut self.daily_savings, day_key));
+        }
+        for (map, key) in targets {
             let entry = map.entry(key).or_default();
             entry.output_tokens_saved = entry.output_tokens_saved.saturating_add(delta_tokens);
             entry.output_savings_usd += delta_usd;
@@ -10841,6 +10885,30 @@ mod tests {
         assert!(tracker.hourly_savings.contains_key(&hour));
     }
 
+    /// West of UTC in the evening the local date is an archived UTC rollup
+    /// whose day has ended; the output belongs to the next UTC day's rollup.
+    #[test]
+    fn backend_output_skips_a_utc_rollup_sharing_the_local_date() {
+        let mut tracker = make_tracker();
+        let day = super::day_key_from_hour_key(&super::local_hour_key(Local::now()));
+        let rollup = DailySavingsBucket {
+            output_tokens_saved: 500,
+            output_savings_usd: 5.0,
+            utc_keyed: true,
+            ..DailySavingsBucket::default()
+        };
+        tracker.daily_savings.insert(day.clone(), rollup);
+        assert!(!tracker.sample_backend_output((1_000, 10.0)));
+        assert!(tracker.sample_backend_output((1_050, 10.5)));
+        assert_eq!(tracker.daily_savings[&day], rollup);
+        let hourly: u64 = tracker
+            .hourly_savings
+            .values()
+            .map(|b| b.output_tokens_saved)
+            .sum();
+        assert_eq!(hourly, 50, "the local hour still gets its output");
+    }
+
     #[test]
     fn tool_schema_tokens_accumulate_across_backend_restarts() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -14718,6 +14786,39 @@ mod tests {
     }
 
     #[test]
+    fn an_older_stats_payload_recorded_late_is_not_read_as_a_restart() {
+        // The dashboard poll got the retained payload while the tray updater
+        // fetched a newer one, and recorded after it: observe read the drop
+        // as a backend restart and banked the whole session a second time.
+        let base_dir = temp_test_dir("headroom-stats-out-of-order");
+        let state = AppState::new_in(base_dir.clone()).expect("app state");
+        let payload = |requests: usize, saved: u64| HeadroomDashboardStats {
+            session_requests: Some(requests),
+            session_estimated_savings_usd: Some(saved as f64 / 1_000.0),
+            session_estimated_tokens_saved: Some(saved),
+            session_total_tokens_sent: Some(saved * 4),
+            ..HeadroomDashboardStats::default()
+        };
+        let older = Instant::now();
+        let newer = older + Duration::from_secs(5);
+        state.record_savings_snapshot(&payload(5, 500), older);
+        let after_newer = state
+            .record_savings_snapshot(&payload(10, 1_000), newer)
+            .expect("newer payload observed")
+            .0;
+        assert!(
+            state
+                .record_savings_snapshot(&payload(5, 500), older)
+                .is_none(),
+            "a payload older than the last observed one is skipped"
+        );
+        let now = state.savings_tracker.lock().snapshot();
+        assert_eq!(now.lifetime_requests, after_newer.lifetime_requests);
+        assert_eq!(now.session_estimated_tokens_saved, 1_000);
+        fs::remove_dir_all(base_dir).expect("remove temp dir");
+    }
+
+    #[test]
     fn a_stats_poll_during_an_in_flight_fetch_does_not_start_another() {
         // RUST-86 on 0.9.26: the tray updater and the dashboard each started
         // a fetch during one slow rebuild, both timed out, and the second
@@ -14778,7 +14879,7 @@ mod tests {
         // A failed poll, cached as a miss.
         *state.cached_headroom_stats.lock() = Some((None, Instant::now(), Duration::from_secs(60)));
 
-        let served = state
+        let (served, _) = state
             .cached_headroom_stats()
             .expect("the retained payload covers a transient failure");
         assert_eq!(served.tool_schema_tokens_saved, Some(4_242));

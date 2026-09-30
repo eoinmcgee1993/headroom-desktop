@@ -1077,10 +1077,15 @@ export function calloutBannerFor({
   // nothing reaches Headroom and the bypass cannot pass traffic through either.
   // A pricing banner here would claim traffic still flows unoptimized and hide
   // the one remedy that works (freeing the port).
-  if (runtimeStatus.interceptBindFailed && primaryIssue) {
+  // Keyed on the hint itself, not runtimeIssues: `running` only reflects the
+  // backend on 6768, so a healthy backend behind a foreign-held 6767 never
+  // puts the hint in runtimeIssues.
+  if (runtimeStatus.interceptBindFailed && runtimeStatus.startupErrorHint) {
     return {
       tone: "disconnected",
-      title: endSentence(`Headroom is not hooked up right now: ${primaryIssue.lead}`)
+      title: endSentence(
+        `Headroom is not hooked up right now: ${splitIssue(runtimeStatus.startupErrorHint).lead}`
+      )
     };
   }
 

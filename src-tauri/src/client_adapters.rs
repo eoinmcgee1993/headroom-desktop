@@ -254,6 +254,9 @@ pub fn set_statusline_enabled(enabled: bool) -> Result<()> {
     // Headroom's uninstall: remove_claude_statusline also runs on every quit.
     // Not an error to the toggle: the flag and the statusline are already off,
     // and failing here left the UI showing "on" over a disabled state.
+    // Released first: the uninstall runs editor CLIs (60s timeout each), and
+    // a quit or pause meanwhile blocks on this lock on the UI thread.
+    drop(_setup);
     if !enabled {
         if let Err(err) = crate::vscode_statusbar::uninstall() {
             log::warn!("statusline disabled, but the editor status bar extension stayed: {err:#}");
@@ -418,6 +421,12 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
 
 fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
     let _setup = setup_write_lock();
+    // Again under the lock: an apply that passed the check above and then
+    // waited here while `unwire_clients_for_port_holder` ran would wire the
+    // client straight back to the holder, and that unwire runs only once.
+    if clients_unwired_for_port_holder() {
+        return Err(anyhow!(PORT_HOLDER_REFUSAL));
+    }
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
     let mut state = load_setup_state();
@@ -4908,6 +4917,7 @@ fn rescue_foreign_toml(
             return;
         }
         if let Some(at) = at {
+            let at = before_adjacent_headroom_blocks(out, at);
             while rescued.last().is_some_and(|l| l.trim().is_empty()) {
                 rescued.pop();
             }
@@ -6033,6 +6043,47 @@ fn mcp_span_marker(line: &str) -> Option<(bool, &str)> {
     Some((is_end, name))
 }
 
+/// Where a table can go above the Headroom block whose start marker is
+/// `lines[at]`: moved back past every Headroom MCP span or managed block
+/// directly above it, so the comments toml_edit keeps as the table's prefix
+/// never hold one of our markers (the wheel appends each span at EOF, and the
+/// Codex provider block can sit right above them). Stops at a block that
+/// does not open with a table: a table placed above root keys takes them.
+fn before_adjacent_headroom_blocks(lines: &[&str], mut at: usize) -> usize {
+    loop {
+        let mut k = at;
+        while k > 0 && lines[k - 1].trim().is_empty() {
+            k -= 1;
+        }
+        let Some(above) = k.checked_sub(1).map(|i| lines[i].trim()) else {
+            return at;
+        };
+        let start = match mcp_span_marker(above) {
+            Some((true, "headroom")) => "# --- Headroom MCP server ---".to_string(),
+            Some((true, name)) => format!("# --- Headroom MCP server: {name} ---"),
+            _ => match above
+                .strip_prefix("# <<< headroom:")
+                .and_then(|rest| rest.strip_suffix(" <<<"))
+            {
+                Some(id) => format!("# >>> headroom:{id} >>>"),
+                None => return at,
+            },
+        };
+        let Some(s) = lines[..k - 1].iter().rposition(|l| l.trim() == start) else {
+            return at;
+        };
+        let opens_with_table = lines[s + 1..k - 1]
+            .iter()
+            .map(|l| l.split('#').next().unwrap_or("").trim())
+            .find(|code| !code.is_empty())
+            .is_some_and(|code| code.starts_with('['));
+        if !opens_with_table {
+            return at;
+        }
+        at = s;
+    }
+}
+
 /// Move every table a Headroom MCP span does not own (anything but
 /// `[mcp_servers.<span name>(.*)]`) to just before the span's start marker,
 /// byte-preserved and in order. The wheel's Codex/Grok registrar deletes
@@ -6144,21 +6195,18 @@ fn mcp_span_foreign_groups(content: &str) -> Vec<(Vec<String>, bool, String)> {
 }
 
 /// Byte offset of the first Headroom MCP span start marker that directly
-/// precedes a table header, where a table can go without taking over any key.
+/// precedes a table header, where a table can go without taking over any key,
+/// moved back past adjacent Headroom blocks (`before_adjacent_headroom_blocks`).
 fn mcp_span_start_offset(text: &str) -> Option<usize> {
-    let mut offset = 0;
-    let mut lines = text.split_inclusive('\n').peekable();
-    while let Some(line) = lines.next() {
-        if matches!(mcp_span_marker(line.trim()), Some((false, _)))
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let at = (0..lines.len()).find(|&i| {
+        matches!(mcp_span_marker(lines[i].trim()), Some((false, _)))
             && lines
-                .peek()
+                .get(i + 1)
                 .is_some_and(|next| next.trim_start().starts_with('['))
-        {
-            return Some(offset);
-        }
-        offset += line.len();
-    }
-    None
+    })?;
+    let at = before_adjacent_headroom_blocks(&lines, at);
+    Some(lines[..at].iter().map(|l| l.len()).sum())
 }
 
 /// Heal configs an earlier build already damaged: re-add (before the span)
@@ -6275,8 +6323,11 @@ pub fn protect_foreign_mcp_tables() {
 /// then predates this build's own writes (the evacuation backs up the file
 /// with the tables still inside the span), and a server the user removes or
 /// renames afterwards stays gone.
-// ponytail: a server removed between the rc11 damage and this build's first
-// run comes back that one time.
+// ponytail: a server the user removed while any retained backup (the newest
+// three, possibly weeks old) still held it inside our span comes back that one
+// time; it cannot be told apart from one the wheel's force re-register
+// deleted (0.9.26 and rc11 both ran `mcp install --force`). Date-gate the
+// backups if that ever shows up in a report.
 fn claim_mcp_span_heal() -> bool {
     let marker = config_file(&app_data_dir(), "mcp-span-heal-done");
     if marker.exists() {
@@ -19410,6 +19461,61 @@ sys.exit(3)
             .collect();
         out.push("");
         out.join("\n")
+    }
+
+    /// The wheel appends each span at EOF and the Codex provider block can sit
+    /// right above them, so the spot before our span's start marker can be
+    /// directly under another Headroom end marker. Evacuating there made that
+    /// marker node_repl's prefix, and the app dropping node_repl took it.
+    #[test]
+    fn an_evacuated_table_never_sits_under_another_headroom_marker() {
+        let cbm_span = "# --- Headroom MCP server: codebase-memory ---\n\
+             [mcp_servers.codebase-memory]\n\
+             command = \"cbm\"\n\
+             # --- end Headroom MCP server: codebase-memory ---";
+        let provider = "# >>> headroom:codex_cli_provider >>>\n\
+             [model_providers.headroom]\n\
+             name = \"Headroom\"\n\
+             # <<< headroom:codex_cli_provider <<<";
+        let trapped = codex_config_with_trapped_node_repl("headroom");
+        let (head, span) = trapped.split_at(trapped.find("# --- Headroom MCP server ---").unwrap());
+        for above in [cbm_span.to_string(), format!("{provider}\n\n{cbm_span}")] {
+            let config = format!("{head}{above}\n\n{span}");
+            let evacuated = super::rescue_foreign_toml_from_mcp_spans(&config);
+            let before_config: toml::Value = toml::from_str(&config).unwrap();
+            assert_eq!(
+                toml::from_str::<toml::Value>(&evacuated).unwrap(),
+                before_config
+            );
+            let dropped = toml_edit_remove_server(&evacuated, "node_repl");
+            for marker in [
+                "# --- Headroom MCP server: codebase-memory ---",
+                "# --- end Headroom MCP server: codebase-memory ---",
+                "# --- Headroom MCP server ---",
+                "# --- end Headroom MCP server ---",
+            ] {
+                assert!(dropped.contains(marker), "{marker} lost:\n{dropped}");
+            }
+            if above.contains("codex_cli_provider") {
+                assert!(
+                    dropped.contains("# <<< headroom:codex_cli_provider <<<"),
+                    "{dropped}"
+                );
+            }
+        }
+        // A block of root keys is never jumped: a table above it takes them.
+        let root = "# >>> headroom:codex_cli >>>\nopenai_base_url = \"http://127.0.0.1:6767/v1\"\n# <<< headroom:codex_cli <<<";
+        let config = format!(
+            "{root}\n\n{}",
+            &trapped[trapped.find("# --- Headroom").unwrap()..]
+        );
+        let evacuated = super::rescue_foreign_toml_from_mcp_spans(&config);
+        let parsed: toml::Value = toml::from_str(&evacuated).unwrap();
+        assert_eq!(
+            parsed["openai_base_url"].as_str(),
+            Some("http://127.0.0.1:6767/v1")
+        );
+        assert!(evacuated.starts_with(root), "{evacuated}");
     }
 
     /// rc12 gate: the evacuation put node_repl right after our end marker,
