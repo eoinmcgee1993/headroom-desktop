@@ -7732,7 +7732,7 @@ impl ToolManager {
              if \"%~1\"==\"\" exit /b 0\r\n\
              if \"%~1\"==\"--help\" exit /b 0\r\n\
              set \"C={counter}\"\r\n\
-             set /p n=<\"%C%\" 2>nul\r\n\
+             if exist \"%C%\" set /p n=<\"%C%\"\r\n\
              if not defined n set n=0\r\n\
              set /a n+=1 >nul 2>nul\r\n\
              >\"%C%.tmp\" echo %n%\r\n\
@@ -21890,6 +21890,14 @@ exec(os.environ["HELPER"])
         assert!(script.is_ascii(), "{script}");
         assert!(script.contains("\"%~dp0..\\runtime"), "{script}");
         assert!(script.contains("set \"C=%~dp0..\\tools"), "{script}");
+        // cmd opens a `<` redirect before `2>nul` applies, so reading the
+        // counter bare printed "The system cannot find the file specified."
+        // on the first conversion (rc9 win-test VM). No counter yet reads as 0.
+        assert!(
+            script
+                .contains("\r\nif exist \"%C%\" set /p n=<\"%C%\"\r\nif not defined n set n=0\r\n"),
+            "{script}"
+        );
     }
 
     /// markitdown[all] lives in the runtime venv, so a full rebuild dropped it
