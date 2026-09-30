@@ -15615,7 +15615,7 @@ assert g.done"#,
                 continue;
             }
             std::fs::write(&path, config).unwrap();
-            crate::client_adapters::protect_foreign_mcp_tables_in(&path).unwrap();
+            crate::client_adapters::protect_foreign_mcp_tables_in(&path, false).unwrap();
             register();
             assert_eq!(
                 node_repl_env(&path).as_deref(),
