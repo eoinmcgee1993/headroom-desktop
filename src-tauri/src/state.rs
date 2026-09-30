@@ -2639,22 +2639,18 @@ impl AppState {
         // `/stats`, which credits strata the baseline never observed against a
         // global mean and flips to the A/B number on a single sample per arm.
         // See `output_savings`. The backend's figure is a fallback ONLY when
-        // the ledger carries no evidence at all (missing, or no shaped
-        // traffic yet); a torn mid-write read stands for this launch's last
-        // evidenced read (see `ledger_read_or_last`), so it neither blanks
-        // the tile nor flips it to the credited figure. A readable ledger that scores nothing shows nothing: falling back
+        // the ledger carries no evidence at all (missing, mid-write, or no
+        // shaped traffic yet), so a torn read never blanks the tile. A
+        // readable ledger that scores nothing shows nothing: falling back
         // there put the credited number on exactly the machines the recompute
         // refuses to score (all-codex traffic vs a claude-seeded baseline
         // read as "Output -100%" on Windows, 0.9.7-rc.7).
-        let ledger_read = self
-            .savings_tracker
-            .lock()
-            .ledger_read_or_last(crate::output_savings::estimate());
+        let ledger_read = crate::output_savings::estimate();
         let backend_output_fallback_allowed = matches!(
             ledger_read,
             crate::output_savings::LedgerEstimate::NoEvidence
         );
-        let ledger_estimate = ledger_read.clone().scored();
+        let ledger_estimate = ledger_read.scored();
         let output_reduction = ledger_estimate
             .as_ref()
             .map(|e| crate::models::OutputReduction {
@@ -2748,9 +2744,10 @@ impl AppState {
         // Neither merge source carries it: backend rollups have no baseline
         // dimension and tracker buckets predate the sampler. Daily joins on
         // UTC date keys, hourly on local hour keys — matching each list.
-        // Output dollars are then repriced from those samples, so the chart,
-        // the tray and the per-day report stop carrying the backend's credit
-        // (see `ledger_priced_output`).
+        // Output dollars stay the backend's per-bucket figures, as in rc7:
+        // repricing them from the samples (audit finding #50, see
+        // /Users/garmlucassen/Code/headroom-audit-2026-09-29/findings.json)
+        // is held back as a product decision, not a stability fix.
         //
         // Cache fields overlay from the archive too, and the archive wins:
         // the history points carry a fresh derivation from the backend's
@@ -2760,8 +2757,6 @@ impl AppState {
         // and the live UTC day's archive equals this poll's derivation;
         // live local-day hours are never ingested, keep None here, and so
         // fall through to the fresh derivation.
-        let ledger_unscored =
-            matches!(ledger_read, crate::output_savings::LedgerEstimate::Unscored);
         {
             let tracker = self.savings_tracker.lock();
             for point in daily_savings.iter_mut() {
@@ -2769,12 +2764,6 @@ impl AppState {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
-                (point.output_savings_usd, point.output_tokens_saved) = ledger_priced_output(
-                    point.output_savings_usd,
-                    point.output_tokens_saved,
-                    point.output_sampled_tokens_saved,
-                    ledger_unscored,
-                );
                 if let Some(bucket) = tracker.daily_savings.get(&point.date) {
                     (
                         point.cache_read_tokens,
@@ -2808,12 +2797,6 @@ impl AppState {
                     point.output_sampled_tokens_saved = Some(sample.saved_tokens);
                     point.output_baseline_tokens = Some(sample.baseline_tokens);
                 }
-                (point.output_savings_usd, point.output_tokens_saved) = ledger_priced_output(
-                    point.output_savings_usd,
-                    point.output_tokens_saved,
-                    point.output_sampled_tokens_saved,
-                    ledger_unscored,
-                );
                 if let Some(bucket) = tracker.hourly_savings.get(&point.hour) {
                     (
                         point.cache_read_tokens,
@@ -2867,19 +2850,36 @@ impl AppState {
                 tracker.last_output_estimator_tokens_saved,
             )
         };
+        // Until the backend is reachable (cold start), price the output layer
+        // off the last persisted estimator reading instead of the bucket sum,
+        // so the headline doesn't dip by hundreds of dollars for the first
+        // minutes and then jump back up.
         // Same ledger recomputation as the tile above: the dollar row and the
         // percentage have to describe one estimate, or the drill-down stops
-        // explaining the headline. With no ledger evidence this launch, the
-        // last persisted ledger reading prices it; the backend's token total
-        // (global-mean credit) only on a machine that never had one.
+        // explaining the headline.
+        // Kept as in rc7 on purpose: audit finding #50 (price the ledger
+        // total, $0 when it scores nothing, never floored by the credited
+        // buckets) visibly drops the lifetime headline on update, so it is
+        // held back for a product decision. See
+        // /Users/garmlucassen/Code/headroom-audit-2026-09-29/findings.json.
         let lifetime_output_savings_usd = lifetime_output_savings_usd(
             &daily_savings,
-            &ledger_read,
-            cached_output_estimator_tokens,
-            stats
+            ledger_estimate
                 .as_ref()
-                .and_then(|s| s.output_reduction.as_ref())
-                .map(|r| r.tokens_saved),
+                .map(|e| e.tokens_saved)
+                .or_else(|| {
+                    // Same gate as the tile above: the backend's token total
+                    // carries the global-mean credit, so it may only stand in
+                    // when the ledger itself has nothing to say.
+                    if !backend_output_fallback_allowed {
+                        return None;
+                    }
+                    stats
+                        .as_ref()
+                        .and_then(|s| s.output_reduction.as_ref())
+                        .map(|r| r.tokens_saved)
+                })
+                .or(cached_output_estimator_tokens),
         );
         let lifetime_tool_schema_savings_usd =
             tool_schema_savings_usd(&daily_savings, lifetime_tool_schema_tokens_saved);
@@ -5371,9 +5371,6 @@ struct SavingsTracker {
     last_output_estimator_tokens_saved: Option<u64>,
     /// See `PersistedSavingsState::last_output_estimator_baseline_tokens`.
     last_output_estimator_baseline_tokens: Option<u64>,
-    /// See `ledger_read_or_last`. Not persisted: across launches the cached
-    /// `last_output_estimator_tokens_saved` stands in instead.
-    last_evidenced_ledger: Option<crate::output_savings::LedgerEstimate>,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
     /// Bytes of the last successful savings-state write. Every dashboard poll
@@ -5549,7 +5546,6 @@ impl SavingsTracker {
                 .as_ref()
                 .filter(|_| output_series_current)
                 .and_then(|state| state.last_output_estimator_baseline_tokens),
-            last_evidenced_ledger: None,
             last_written_at: None,
             last_persisted: Vec::new(),
         };
@@ -6504,23 +6500,6 @@ impl SavingsTracker {
     /// were seeded from the same credited cumulative, and a mark parked at
     /// that larger figure would silence the sampler long after the control
     /// arm makes this machine scoreable. Runs every poll; a no-op once clean.
-    /// Upstream rewrites the ledger in place (a plain `write_text` every 25
-    /// requests), so a read can land mid-write, parse as `NoEvidence`, and
-    /// flip every output figure to the backend's credit for one poll: the
-    /// headline, the chart points, and $0 to credited dollars on an unscored
-    /// machine. Once this launch has read evidence, a later `NoEvidence`
-    /// stands for that last read instead.
-    fn ledger_read_or_last(
-        &mut self,
-        read: crate::output_savings::LedgerEstimate,
-    ) -> crate::output_savings::LedgerEstimate {
-        if read == crate::output_savings::LedgerEstimate::NoEvidence {
-            return self.last_evidenced_ledger.clone().unwrap_or(read);
-        }
-        self.last_evidenced_ledger = Some(read.clone());
-        read
-    }
-
     fn drop_unscoreable_output_samples(&mut self) {
         if self.output_daily_samples.is_empty()
             && self.output_hourly_samples.is_empty()
@@ -10176,78 +10155,43 @@ fn tool_schema_savings_usd(daily_savings: &[DailySavingsPoint], tokens_saved: u6
 
 /// Lifetime dollars saved by output shaping.
 ///
-/// Priced from the shaper's own ledger, the same recomputation the output tile
-/// shows. The daily buckets are the backend's rollups, which credit strata the
-/// baseline never observed at a global mean: on 2026-09-29 one machine's
-/// buckets held 47.75M output tokens against 2.73M in its ledger. The buckets
-/// only lend their blended $/token, so a user on cheaper models is priced at
-/// their own models' rates.
+/// The daily buckets only carry this layer from the day the backend's rollups
+/// started reporting it, which is far later than the shaper itself started
+/// working: on 2026-08-06 the buckets held 2.66M output tokens across 4 days
+/// while the shaper's own durable estimator held 17.38M across 48,638 requests.
+/// Summing the buckets therefore understates the layer roughly six-fold.
 ///
-/// - Scored: the ledger total, floored by the sampled series (it survives a
-///   re-seeded ledger), never by the credited bucket sum. The ledger has no
-///   timestamps, so its total can only be a lifetime figure, and it reaches
-///   back before the rollups carried this layer at all.
-/// - Unscored: nothing. The buckets hold only the credit the tile refuses.
-/// - NoEvidence (no ledger this launch, or a torn first read):
-///   `cached_ledger_tokens`, the tracker's last ledger reading, priced exactly
-///   as Scored. Only a machine that never had one falls back to
-///   `backend_tokens_saved` (the `/stats` credited total) when it exceeds the
-///   buckets, else the bucket sum. The credited total always exceeds the
-///   repriced buckets, so preferring it on a torn read flipped the headline
-///   to it for one poll (and posted it, if a savings report went out then).
+/// The estimator has no timestamps -- it is a set of stratified running sums --
+/// so its total can only be a lifetime figure, and it is priced with the
+/// blended $/token the tracked buckets already imply rather than a hardcoded
+/// rate, so a user on cheaper models is priced at their own models' rates.
 ///
-/// Falls back to the bucket sum whenever the buckets carry no rate to price
-/// with. The sources measure the same layer, so this replaces the bucket sum,
-/// never adds to it.
+/// Falls back to the bucket sum whenever the estimator is absent, is smaller
+/// (a re-seeded baseline), or the buckets carry no rate to price with. The two
+/// sources measure the same layer, so this replaces the bucket sum, never adds
+/// to it. `estimator_tokens_saved` is the live `/stats` reading when the
+/// backend is up, or the tracker's persisted last reading during cold start.
+///
+/// Audit finding #50 (price the ledger total instead, $0 when the ledger
+/// scores nothing, never floored by the credited buckets) is held back as a
+/// product decision: it visibly drops the lifetime headline on update. See
+/// /Users/garmlucassen/Code/headroom-audit-2026-09-29/findings.json.
 fn lifetime_output_savings_usd(
     daily_savings: &[DailySavingsPoint],
-    ledger: &crate::output_savings::LedgerEstimate,
-    cached_ledger_tokens: Option<u64>,
-    backend_tokens_saved: Option<u64>,
+    estimator_tokens_saved: Option<u64>,
 ) -> f64 {
-    use crate::output_savings::LedgerEstimate;
     let bucket_usd: f64 = daily_savings.iter().map(|p| p.output_savings_usd).sum();
     let bucket_tokens: u64 = daily_savings.iter().map(|p| p.output_tokens_saved).sum();
-    let sampled_tokens: u64 = daily_savings
-        .iter()
-        .filter_map(|p| p.output_sampled_tokens_saved)
-        .sum();
-    let tokens_saved = match (ledger, cached_ledger_tokens) {
-        (LedgerEstimate::Unscored, _) => return 0.0,
-        (LedgerEstimate::Scored(e), _) => e.tokens_saved.max(sampled_tokens),
-        (LedgerEstimate::NoEvidence, Some(cached)) => cached.max(sampled_tokens),
-        (LedgerEstimate::NoEvidence, None) => match backend_tokens_saved {
-            Some(tokens) if tokens > bucket_tokens => tokens,
-            _ => return bucket_usd,
-        },
+
+    let Some(tokens_saved) = estimator_tokens_saved else {
+        return bucket_usd;
     };
-    if bucket_tokens == 0 || bucket_usd <= 0.0 {
+    if bucket_tokens == 0 || bucket_usd <= 0.0 || tokens_saved <= bucket_tokens {
         return bucket_usd;
     }
 
     let usd_per_token = bucket_usd / bucket_tokens as f64;
     usd_per_token * tokens_saved as f64
-}
-
-/// A bucket's output figures, repriced from the ledger-backed sampled series
-/// for the chart, the tray and the per-day report. The rollup's own figure
-/// carries the backend's credit (see `lifetime_output_savings_usd`), but its
-/// $/token still prices the bucket's models. An unsampled bucket keeps the
-/// rollup figure, having nothing better; a ledger that scores nothing zeroes
-/// it, as the tile shows nothing.
-fn ledger_priced_output(
-    usd: f64,
-    tokens: u64,
-    sampled_tokens: Option<u64>,
-    ledger_unscored: bool,
-) -> (f64, u64) {
-    if ledger_unscored {
-        return (0.0, 0);
-    }
-    match sampled_tokens {
-        Some(sampled) if tokens > 0 => (usd / tokens as f64 * sampled as f64, sampled),
-        _ => (usd, tokens),
-    }
 }
 
 /// For days before `cutoff_date` (exclusive), the tracker is preferred.
@@ -10628,7 +10572,7 @@ mod tests {
         aggregate_weekly_totals, apply_bootstrap_step, begin_bootstrap_transition,
         boot_validation_stalled, boot_validation_timed_out, bootstrap_complete_state,
         bootstrap_failed_state, classify_startup_error, cpu_time_advanced, drop_rollup_backfill,
-        hf_cache_grew, intercept_bind_hint, ledger_priced_output, lifetime_output_savings_usd,
+        hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
         lifetime_token_milestones_crossed, log_mtime_advanced, lone_stats_stall,
         merge_daily_savings, merge_hourly_savings, most_recent_monday, note_stats_fetch_success,
         parse_headroom_stats_from_json, parse_headroom_stats_history_from_json, parse_ps_cpu_time,
@@ -10822,7 +10766,6 @@ mod tests {
 
     #[test]
     fn lifetime_output_savings_prices_the_estimators_full_history() {
-        // No ledger evidence (missing or torn): the fallback estimator.
         // Buckets: 2 days, 100k tokens for $2.50 -> $25/M blended.
         let mut buckets = vec![daily("2026-08-04", 0, 0.0), daily("2026-08-05", 0, 0.0)];
         buckets[0].output_tokens_saved = 40_000;
@@ -10832,111 +10775,20 @@ mod tests {
 
         // The estimator covers history the rollups never carried: price all of
         // it at the buckets' own rate.
-        let none = crate::output_savings::LedgerEstimate::NoEvidence;
-        let usd = lifetime_output_savings_usd(&buckets, &none, None, Some(1_000_000));
+        let usd = lifetime_output_savings_usd(&buckets, Some(1_000_000));
         assert!((usd - 25.0).abs() < 1e-9, "{usd}");
 
         // Re-seeded / lagging estimator: never go below what we can see.
-        let usd = lifetime_output_savings_usd(&buckets, &none, None, Some(10_000));
+        let usd = lifetime_output_savings_usd(&buckets, Some(10_000));
         assert!((usd - 2.5).abs() < 1e-9, "{usd}");
 
         // No estimate at all (old backend, unseeded baseline).
-        let usd = lifetime_output_savings_usd(&buckets, &none, None, None);
+        let usd = lifetime_output_savings_usd(&buckets, None);
         assert!((usd - 2.5).abs() < 1e-9, "{usd}");
 
         // No priced buckets yet: nothing to extrapolate a rate from.
         let empty = vec![daily("2026-08-04", 0, 0.0)];
-        assert_eq!(
-            lifetime_output_savings_usd(&empty, &none, None, Some(1_000_000)),
-            0.0
-        );
-    }
-
-    #[test]
-    fn lifetime_output_savings_follow_the_ledger_not_the_credited_buckets() {
-        use crate::output_savings::{LedgerEstimate, OutputEstimate};
-        let scored = |tokens_saved| {
-            LedgerEstimate::Scored(OutputEstimate {
-                method: "estimated",
-                reduction_percent: 10.0,
-                ci_low_percent: 5.0,
-                ci_high_percent: 15.0,
-                requests: 100,
-                coverage_percent: 90.0,
-                tokens_saved,
-                baseline_tokens: tokens_saved * 10,
-            })
-        };
-        // The rollups carry the backend's credited figure: 100k tokens, $2.50.
-        let mut buckets = vec![daily("2026-09-04", 0, 0.0), daily("2026-09-05", 0, 0.0)];
-        buckets[0].output_tokens_saved = 40_000;
-        buckets[0].output_savings_usd = 1.0;
-        buckets[1].output_tokens_saved = 60_000;
-        buckets[1].output_savings_usd = 1.5;
-
-        // The recompute scores 20k: price that at the buckets' rate ($25/M),
-        // never floor it at the credited bucket sum.
-        let usd = lifetime_output_savings_usd(&buckets, &scored(20_000), None, None);
-        assert!((usd - 0.5).abs() < 1e-9, "{usd}");
-        // A re-seeded ledger: the sampled series survives it and floors it.
-        buckets[1].output_sampled_tokens_saved = Some(40_000);
-        let usd = lifetime_output_savings_usd(&buckets, &scored(20_000), None, None);
-        assert!((usd - 1.0).abs() < 1e-9, "{usd}");
-        // A readable ledger that scores nothing: the buckets are all credit.
-        let usd =
-            lifetime_output_savings_usd(&buckets, &LedgerEstimate::Unscored, None, Some(500_000));
-        assert_eq!(usd, 0.0);
-        // No readable ledger (a torn read of the in-place rewrite) with a
-        // cached ledger reading: priced exactly as that reading would be,
-        // never as the backend's larger credited total, and never floored by
-        // the bucket sum, which an unsampled bucket keeps at rollup credit.
-        let none = LedgerEstimate::NoEvidence;
-        let usd = lifetime_output_savings_usd(&buckets, &none, Some(20_000), Some(500_000));
-        assert!((usd - 1.0).abs() < 1e-9, "{usd}");
-        let usd = lifetime_output_savings_usd(&buckets, &none, Some(60_000), Some(500_000));
-        assert!((usd - 1.5).abs() < 1e-9, "{usd}");
-
-        // Chart, tray and per-day report: a sampled bucket is repriced from
-        // its sample at the bucket's own rate; an unsampled one is left alone.
-        let (usd, tokens) = ledger_priced_output(1.5, 60_000, Some(6_000), false);
-        assert!((usd - 0.15).abs() < 1e-9, "{usd}");
-        assert_eq!(tokens, 6_000);
-        assert_eq!(
-            ledger_priced_output(1.5, 60_000, None, false),
-            (1.5, 60_000)
-        );
-        assert_eq!(ledger_priced_output(1.5, 60_000, None, true), (0.0, 0));
-    }
-
-    #[test]
-    fn torn_ledger_read_recalls_the_launchs_last_evidenced_read() {
-        use crate::output_savings::{LedgerEstimate, OutputEstimate};
-        let mut tracker = make_tracker();
-        let none = LedgerEstimate::NoEvidence;
-        // Nothing read yet this launch: no evidence stays no evidence.
-        assert_eq!(tracker.ledger_read_or_last(none.clone()), none);
-        // An unscored machine's torn read stays unscored ($0 output), not the
-        // backend's credited fallback.
-        assert_eq!(
-            tracker.ledger_read_or_last(LedgerEstimate::Unscored),
-            LedgerEstimate::Unscored
-        );
-        assert_eq!(
-            tracker.ledger_read_or_last(none.clone()),
-            LedgerEstimate::Unscored
-        );
-        let scored = LedgerEstimate::Scored(OutputEstimate {
-            method: "estimated",
-            reduction_percent: 10.0,
-            ci_low_percent: 5.0,
-            ci_high_percent: 15.0,
-            requests: 100,
-            coverage_percent: 90.0,
-            tokens_saved: 2_000,
-            baseline_tokens: 20_000,
-        });
-        assert_eq!(tracker.ledger_read_or_last(scored.clone()), scored);
-        assert_eq!(tracker.ledger_read_or_last(none), scored);
+        assert_eq!(lifetime_output_savings_usd(&empty, Some(1_000_000)), 0.0);
     }
 
     #[test]
@@ -12515,7 +12367,6 @@ mod tests {
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: None,
             last_output_estimator_baseline_tokens: None,
-            last_evidenced_ledger: None,
             last_written_at: None,
             last_persisted: Vec::new(),
         }
