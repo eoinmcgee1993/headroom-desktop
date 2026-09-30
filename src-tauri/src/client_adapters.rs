@@ -11470,10 +11470,14 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 continue;
             }
             for (start, expected) in &cases {
-                let out = std::process::Command::new(shell)
+                let out = crate::proc::command(shell)
                     .args(["-c", ". \"$1\"; . \"$1\"; printf %s \"$PATH\"", "sh"])
                     .arg(&rc)
                     .env("PATH", start)
+                    // zsh -c still reads $ZDOTDIR/.zshenv, and a developer's
+                    // one prepends its own PATH entries.
+                    .env("ZDOTDIR", tmp.path())
+                    .env_remove("BASH_ENV")
                     .output()
                     .unwrap();
                 let path = String::from_utf8_lossy(&out.stdout).into_owned();
