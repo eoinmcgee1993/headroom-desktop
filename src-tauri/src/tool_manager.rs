@@ -1813,6 +1813,56 @@ if _hd_os.environ.get(
         # Fail-open to the wheel's fallback (the pre-vendor behaviour).
         pass
 
+# --- Token mode: keep the recent-read window under the coding persona (vendor)
+# The desktop runs HEADROOM_MODE=token with the coding persona. Token mode
+# protects excluded-tool output (Read, Skill, Grep, Glob, Edit, Write) in the
+# last max(4, 30%) messages and lets older output compress
+# (protect_recent_reads_fraction=0.3). proxy_pipeline_kwargs() also passes the
+# persona's protect_recent as read_protection_window, and coding sets that to 0
+# for CACHE mode's positional guard, so ContentRouter.apply narrows the window
+# to 0 and no Read is protected at any position: a newest-message Read of
+# learn/analyzer.py went out as one flattened line of Kompress output (9,448 ->
+# 5,694 tokens), while the persona says file reads stay byte-exact and a Skill
+# body loses its negations. Drop a zero window so the router uses token mode's
+# own; protect_recent, the positional guard for all other tool output, is
+# untouched. A compression change (lowers savings on recent excluded-tool
+# output): soak + savings:did. Exact-pin gated to wheel 0.39.0; self-neutralizes
+# when the router stops letting a zero window narrow protection. Kill switch:
+# HEADROOM_TOKEN_READ_WINDOW=0.
+_hd_trw_flag = _hd_os.environ.get("HEADROOM_TOKEN_READ_WINDOW", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_trw_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_trw_meta
+
+        if _hd_trw_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_trw_inspect
+
+            from headroom.transforms import content_router as _hd_trw_cr
+
+            _hd_trw_orig = _hd_trw_cr.ContentRouter.apply
+
+            def _hd_trw_apply(self, messages, tokenizer, **kwargs):
+                if kwargs.get("read_protection_window") == 0:
+                    del kwargs["read_protection_window"]
+                return _hd_trw_orig(self, messages, tokenizer, **kwargs)
+
+            if "read_protection_window = max(0, int(runtime_read_protection_window))" in (
+                _hd_trw_inspect.getsource(_hd_trw_orig)
+            ):
+                _hd_trw_cr.ContentRouter.apply = _hd_trw_apply
+                _hd_bound.add("token_read_window")
+    except Exception:
+        # Fail-open to the wheel's zero window (the pre-vendor behaviour).
+        pass
+
 # --- Read protection: judge a Codex exec envelope by its output (vendor) ------
 # Codex code mode runs `exec` as JavaScript. When the script prints the whole
 # exec_command result, text(r) rather than text(r.output), the tool output is
@@ -2161,6 +2211,7 @@ _HD_VENDORS = (
     "quarantine_spare_capacity",
     "ccr_repair_order",
     "kompress_waste",
+    "token_read_window",
     "codex_whole_read",
     "proxied_guarded_upstreams",
     "learn_rule_coerce",
@@ -4110,9 +4161,10 @@ impl ToolManager {
                     // `proxy` entrypoint reads HEADROOM_SAVINGS_PROFILE into
                     // config.savings_profile, and proxy_pipeline_kwargs() applies
                     // the persona's compression knobs per request across all
-                    // handlers. The "coding" persona holds the active code working
-                    // set verbatim (protect_recent=2, protect_analysis_context,
-                    // smart_crusher_with_compaction) with a low min_tokens so
+                    // handlers. The "coding" persona (protect_recent=0 since 0.39.0,
+                    // so recent Reads rely on the token_read_window vendor;
+                    // protect_analysis_context,
+                    // smart_crusher_with_compaction) runs with a low min_tokens so
                     // compression stays visible, and target_ratio unset so savings
                     // emerge from lossless + relevance rather than a forced keep.
                     // The persona set compress_user_messages=False through
@@ -15629,6 +15681,79 @@ assert g.done"#,
             String::from_utf8_lossy(&off.stdout).contains("REFUSED"),
             "with the flag off the wheel should refuse\n{}",
             String::from_utf8_lossy(&off.stderr)
+        );
+    }
+
+    #[test]
+    fn sitecustomize_vendors_token_read_window() {
+        // Behaviour is proven by token_read_window_behaves_against_the_installed_wheel;
+        // this pins the gate, the kill switch, the self-neutralization probe and
+        // that only a ZERO window is dropped (protect_recent stays the persona's).
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(
+            py.contains("HEADROOM_TOKEN_READ_WINDOW"),
+            "kill switch missing"
+        );
+        assert!(py.contains(r#"_hd_trw_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains(
+            r#""read_protection_window = max(0, int(runtime_read_protection_window))" in ("#
+        ));
+        assert!(py.contains(r#"if kwargs.get("read_protection_window") == 0:"#));
+        assert!(py.contains("_hd_trw_cr.ContentRouter.apply = _hd_trw_apply"));
+    }
+
+    #[test]
+    fn token_read_window_behaves_against_the_installed_wheel() {
+        // Runs the shipped sitecustomize against the installed wheel's real
+        // token-mode coding pipeline (scripts/verify-token-read-window.py): the
+        // newest Read stays byte-exact, an aged one still compresses. Self-skips
+        // when the vendor does not bind, so green is NOT evidence after a bump.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-token-read-window.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-trw-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .arg(&probe)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_TOKEN_READ_WINDOW", flag)
+                .output()
+                .expect("run token read-window probe")
+        };
+
+        let out = run("1");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        if stdout.contains("FAIL trw bound") {
+            eprintln!("skipping: token read-window vendor did not bind (wheel bumped?)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "token read-window probe failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // With the switch off the wheel's zero window leaves the newest Read
+        // unprotected, which is also what proves the probe can tell the two apart.
+        let off = run("0");
+        let off_stdout = String::from_utf8_lossy(&off.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            off_stdout.contains("FAIL trw bound")
+                && off_stdout.contains("FAIL newest Read excluded and byte-exact"),
+            "HEADROOM_TOKEN_READ_WINDOW=0 did not unbind the vendor\nstdout:\n{off_stdout}"
         );
     }
 
