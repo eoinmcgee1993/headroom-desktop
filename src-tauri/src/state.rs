@@ -9541,6 +9541,7 @@ fn sweep_should_kill(
 /// Headroom desktop, given `own`, what it reports for this process. An empty
 /// `comm` is a parent that has exited; an unknown `own` matches anything, so
 /// the sweep falls back to sparing every live parent.
+#[cfg(unix)]
 fn comm_is_headroom_desktop(comm: &str, own: &str) -> bool {
     let comm = comm.trim();
     !comm.is_empty() && comm.contains(own)
@@ -12706,7 +12707,11 @@ mod tests {
         // Claude Code / Codex spawned. Sparing them left pip facing a locked
         // Scripts\headroom.exe, so that sweep ignores the parent.
         assert!(sweep_should_kill(777, me, false, SweepParents::Any));
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn comm_is_headroom_desktop_spares_only_live_headroom_parents() {
         use super::comm_is_headroom_desktop as is_headroom;
         assert!(!is_headroom("systemd\n", "headroom"));
         assert!(is_headroom("headroom\n", "headroom"));
