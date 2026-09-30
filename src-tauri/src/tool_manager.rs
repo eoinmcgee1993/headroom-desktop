@@ -1990,6 +1990,130 @@ if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
         # Fail-closed: on any binding failure the wheel keeps refusing.
         pass
 
+# --- Output holdout: key a conversation on its whole opener (vendor, #3209) ----
+# The holdout picks a conversation's arm by hashing the model plus the first 512
+# chars of the FIRST text block of its first user message. Claude Code opens
+# every conversation with a system-reminder carrying the global CLAUDE.md, the
+# same bytes in every session, so a whole client hashed to one key and sat in
+# one arm forever: on 2026-09-30 one machine's 24.7k opus continuations came
+# from 3 "conversations" with 0 control requests, and the measured A/B covered
+# 296 ping requests. The Responses path (Codex over WebSocket) has the same cut.
+# Seed on every text block of the opener, in full, hashed field by field. A
+# single short block hashes exactly as before, so those arms do not move. The
+# opener is part of the cached prefix, so it is byte-stable for the life of a
+# conversation and the arm (and the shaper's system tail) never flips mid-way.
+# Callers import both functions from headroom.proxy.output_savings at call
+# time, so rebinding that module (and the policy module) reaches them all.
+# Exact-pin gated to wheel 0.39.0; self-neutralizes when the wheel already
+# separates conversations behind a long shared prologue. Kill switch:
+# HEADROOM_HOLDOUT_KEY=0.
+_hd_hk_flag = _hd_os.environ.get("HEADROOM_HOLDOUT_KEY", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_hk_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_hk_meta
+
+        if _hd_hk_meta.version("headroom-ai") == "0.39.0":
+            import hashlib as _hd_hk_hashlib
+
+            from headroom.proxy import output_savings as _hd_hk_os
+            from headroom.proxy import output_savings_policy as _hd_hk_pol
+
+            def _hd_hk_absorb(digest, text):
+                digest.update(b"\x00")
+                digest.update(text.encode("utf-8", "ignore"))
+
+            def _hd_hk_absorb_blocks(digest, blocks):
+                absorbed = False
+                for text in blocks:
+                    _hd_hk_absorb(digest, text)
+                    absorbed = True
+                if not absorbed:
+                    digest.update(b"\x00")
+
+            def _hd_hk_key(body):
+                body = _hd_hk_pol._unwrap_response_create_body(body)
+                digest = _hd_hk_hashlib.sha256()
+                digest.update(str(body.get("model", "")).encode("utf-8", "ignore"))
+                for msg in body.get("messages", []):
+                    if isinstance(msg, dict) and msg.get("role") == "user":
+                        content = msg.get("content")
+                        if isinstance(content, str):
+                            _hd_hk_absorb(digest, content)
+                        elif isinstance(content, list):
+                            _hd_hk_absorb_blocks(
+                                digest,
+                                (
+                                    str(b.get("text", ""))
+                                    for b in content
+                                    if isinstance(b, dict) and b.get("type") == "text"
+                                ),
+                            )
+                        break
+                if "input" in body:
+                    stable = _hd_hk_pol._stable_response_identifier(body)
+                    if stable:
+                        _hd_hk_absorb(digest, stable)
+                    elif not body.get("messages"):
+                        _hd_hk_absorb(digest, "responses")
+                return digest.hexdigest()
+
+            def _hd_hk_responses_key(body):
+                body = _hd_hk_pol._unwrap_response_create_body(body)
+                digest = _hd_hk_hashlib.sha256()
+                digest.update(str(body.get("model", "")).encode("utf-8", "ignore"))
+                input_data = body.get("input")
+                if isinstance(input_data, str):
+                    _hd_hk_absorb(digest, input_data)
+                elif isinstance(input_data, list):
+                    for item in input_data:
+                        if not isinstance(item, dict) or item.get("role") != "user":
+                            continue
+                        content = item.get("content")
+                        if isinstance(content, str):
+                            _hd_hk_absorb(digest, content)
+                        elif isinstance(content, list):
+                            _hd_hk_absorb_blocks(
+                                digest,
+                                (
+                                    p["text"]
+                                    for p in content
+                                    if isinstance(p, dict) and isinstance(p.get("text"), str)
+                                ),
+                            )
+                        break
+                return digest.hexdigest()
+
+            def _hd_hk_probe(question):
+                return {
+                    "model": "m",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "x" * 600},
+                                {"type": "text", "text": question},
+                            ],
+                        }
+                    ],
+                }
+
+            _hd_hk_orig = _hd_hk_pol.conversation_key_from_body
+            if _hd_hk_orig(_hd_hk_probe("a")) == _hd_hk_orig(_hd_hk_probe("b")):
+                for _hd_hk_mod in (_hd_hk_pol, _hd_hk_os):
+                    _hd_hk_mod.conversation_key_from_body = _hd_hk_key
+                    _hd_hk_mod.conversation_key_from_responses_body = _hd_hk_responses_key
+                _hd_bound.add("holdout_key")
+    except Exception:
+        pass
+
 # --- Learn: non-string rule fields from the model (vendor, upstream PR #2471) --
 # The learn prompt asks for each rule's content as "1-3 bullet points", and a
 # model that returns them as a JSON array killed the whole analysis: 0.39.0's
@@ -2214,6 +2338,7 @@ _HD_VENDORS = (
     "token_read_window",
     "codex_whole_read",
     "proxied_guarded_upstreams",
+    "holdout_key",
     "learn_rule_coerce",
     "learn_worktree_merge",
     "learn_drop_error_recovery",
@@ -3866,6 +3991,10 @@ impl ToolManager {
                 // here on the control arm is live data and clearing it every
                 // spawn would empty it as fast as it fills.
                 purge_legacy_output_savings_control_arm_once();
+                // Restart the A/B's conversation-qualified counters once, as
+                // the `holdout_key` vendor starts assigning arms per
+                // conversation (see `requalify_output_savings_arms_once`).
+                requalify_output_savings_arms_once();
 
                 // Cross-turn dedup + cold-prefix recompaction (headroom-ai
                 // 0.33.0; older fallback runtimes ignore unknown envs).
@@ -4143,20 +4272,21 @@ impl ToolManager {
                     // never gets there; 3% reaches the same precision in ~30 days
                     // and still costs only 3% of conversations.
                     //
-                    // The fraction is boosted to 10% until this machine's ledger
-                    // can promote the measured estimator, then drops back to 3%
-                    // (`output_holdout_for`). Per-conversation hashing hides
-                    // whole model classes at 3%: one real ledger had 51% of its
-                    // shaped traffic (every fable and sonnet stratum) with zero
-                    // control observations after weeks, which no amount of
-                    // waiting fixes for a machine with ~20 sessions in a class.
+                    // A 10% boost until the measured estimator promoted was tried
+                    // (2026-09-07 to 2026-09-30). It was compensating for the
+                    // holdout key, not for the fraction: the wheel keyed every
+                    // Claude Code and Codex conversation on its shared
+                    // CLAUDE.md/AGENTS.md prologue, so whole clients sat in one
+                    // arm. With the `holdout_key` vendor each conversation draws
+                    // on its own, and 3% of ~345 sessions a week is ~10 control
+                    // conversations, enough for #3460's gate in about a week.
                     //
                     // Invisible to the compression figures: the arm gates the
                     // `shape_request` call alone, so control conversations are
                     // compressed, memory-augmented and cache-aligned exactly like
                     // any other, and the input-savings rate is priced off
                     // `cost.total_input_cost_usd`, which no output token enters.
-                    .env("HEADROOM_OUTPUT_HOLDOUT", output_holdout_fraction())
+                    .env("HEADROOM_OUTPUT_HOLDOUT", OUTPUT_HOLDOUT)
                     // Agent savings persona (new in headroom-ai 0.30.0). The
                     // `proxy` entrypoint reads HEADROOM_SAVINGS_PROFILE into
                     // config.savings_profile, and proxy_pipeline_kwargs() applies
@@ -12556,36 +12686,11 @@ fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&ledger).ok()
 }
 
-/// Holdout once this machine's measured estimate is promotable.
-const OUTPUT_HOLDOUT_STEADY: &str = "0.03";
-/// Holdout until then. `assign_arm` is one nested threshold on one hash
-/// (`frac < holdout`), so the 3% set is a subset of the 10% set and dropping
-/// back never flips a conversation that was already in control. At ~140
-/// sessions a week (this machine), 3% lands ~4 in control and 10% ~14, so a
-/// stratum clears #3460's 5-conversation gate in a fortnight instead of two
-/// months; the price is the shaper's own effect (measured +3 to +12% on the
-/// continuations it targets) on 7pp more conversations, well under 1% of
-/// output tokens.
-const OUTPUT_HOLDOUT_BOOSTED: &str = "0.10";
-
-/// Evidence-driven, not time-driven: boosted until `output_savings` promotes
-/// the measured estimator over the synthetic control, steady from then on.
-/// Coverage is cumulative, so it stays steady unless a new model class shows
-/// up with no control data, which re-boosts -- exactly the correction wanted.
-fn output_holdout_for(estimate: &crate::output_savings::LedgerEstimate) -> &'static str {
-    match estimate {
-        crate::output_savings::LedgerEstimate::Scored(e) if e.method == "measured" => {
-            OUTPUT_HOLDOUT_STEADY
-        }
-        _ => OUTPUT_HOLDOUT_BOOSTED,
-    }
-}
-
-fn output_holdout_fraction() -> &'static str {
-    let holdout = output_holdout_for(&crate::output_savings::estimate());
-    log::info!("[tool_manager] output-shaper holdout {holdout}");
-    holdout
-}
+/// Share of conversations the output shaper leaves unshaped, so its effect can
+/// be measured. `assign_arm` is one threshold on one hash (`frac < holdout`),
+/// so the 3% set is a subset of the 10% set the boost used: dropping back
+/// moved no conversation out of treatment.
+const OUTPUT_HOLDOUT: &str = "0.03";
 
 /// Drop the output-shaper A/B control arm left over from the abandoned 1%
 /// holdout, exactly once.
@@ -12600,36 +12705,83 @@ fn output_holdout_fraction() -> &'static str {
 /// `~/.headroom` takes the control samples with it, so the stamp going too is
 /// correct: there is nothing left to purge either way.
 ///
-/// Best-effort throughout: a missing ledger holds nothing legacy and is only
-/// stamped, an unparseable one is never touched, and the ledger is only
-/// rewritten when there is control data to drop. Uses `atomic_write` so a
-/// crash mid-write cannot truncate the ledger.
+/// Best-effort throughout: see [`rewrite_output_savings_ledger_once`].
 fn purge_legacy_output_savings_control_arm_once() {
+    rewrite_output_savings_ledger_once(".legacy-control-arm-purged", ledger_bytes_without_control);
+}
+
+/// Restart the measured A/B once, for the `holdout_key` vendor.
+///
+/// Until that vendor, the wheel keyed a conversation's arm on its shared
+/// CLAUDE.md/AGENTS.md prologue, so the conversation-qualified counters the
+/// A/B reads (`qn`/`qsum`/`qsumsq`/`clusters`) hold whole clients frozen in
+/// one arm: 24.7k opus continuations from 3 "conversations" on one machine.
+/// Left in, they would sit beside a control arm that only starts filling now,
+/// comparing two periods instead of two arms. Dropping just those four fields
+/// returns the rows to "no conversation provenance", which the wheel and
+/// `output_savings` already keep out of the measured estimate, while `n`,
+/// `sum` and `sumsq` stay, so the estimated figure and its history are
+/// untouched.
+fn requalify_output_savings_arms_once() {
+    rewrite_output_savings_ledger_once(".holdout-key-requalified", ledger_bytes_unqualified);
+}
+
+/// Core of [`requalify_output_savings_arms_once`]: the ledger without any
+/// conversation-qualified field in either arm, or `None` when it holds none
+/// (or does not parse).
+fn ledger_bytes_unqualified(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut ledger = serde_json::from_slice::<Value>(bytes).ok()?;
+    let mut changed = false;
+    for arm in ["treatment", "control"] {
+        let Some(strata) = ledger.get_mut(arm).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for acc in strata.values_mut().filter_map(Value::as_object_mut) {
+            for field in ["qn", "qsum", "qsumsq", "clusters"] {
+                changed |= acc.remove(field).is_some();
+            }
+        }
+    }
+    changed.then(|| serde_json::to_vec(&ledger).ok()).flatten()
+}
+
+/// Apply `rewrite` to the output-savings ledger once per machine, before the
+/// proxy loads it (the proxy holds it in memory and rewrites it every 25
+/// records, so it cannot be edited live).
+///
+/// The stamp sits beside the ledger on purpose: a reset that removes
+/// `~/.headroom` takes the data with it, so the stamp going too is correct.
+/// A missing ledger holds nothing to rewrite and is only stamped (whatever
+/// the proxy writes from here on is live data), an unparseable one is never
+/// touched, and the original is kept as `<stamp>.bak` beside it. Uses
+/// `atomic_write` so a crash mid-write cannot truncate the ledger.
+fn rewrite_output_savings_ledger_once(stamp: &str, rewrite: fn(&[u8]) -> Option<Vec<u8>>) {
     let Some(path) = output_savings_ledger_path() else {
         return;
     };
-    let stamp = path.with_file_name(".legacy-control-arm-purged");
+    let stamp = path.with_file_name(stamp);
     if stamp.exists() {
         return;
     }
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        // No ledger, nothing legacy: whatever the proxy writes from here on
-        // is the live arm, so stamp now or the next spawn would clear it.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(_) => return,
     };
-    if let Some(out) = ledger_bytes_without_control(&bytes) {
-        if let Err(err) = crate::client_adapters::atomic_write(&path, &out) {
-            log::warn!("[tool_manager] purging output_savings control arm failed: {err}");
+    if let Some(out) = rewrite(&bytes) {
+        let backup = stamp.with_extension("bak");
+        let written = crate::client_adapters::atomic_write(&backup, &bytes)
+            .and_then(|()| crate::client_adapters::atomic_write(&path, &out));
+        if let Err(err) = written {
+            log::warn!("[tool_manager] output_savings rewrite {stamp:?} failed: {err}");
             // Leave the stamp unwritten so the next spawn retries; a failed
-            // purge must not be recorded as a done one.
+            // rewrite must not be recorded as a done one.
             return;
         }
-        log::info!("[tool_manager] cleared legacy output-shaper control arm");
+        log::info!("[tool_manager] output_savings rewrite {stamp:?} applied");
     }
     if let Err(err) = crate::client_adapters::atomic_write(&stamp, b"") {
-        log::warn!("[tool_manager] stamping legacy control-arm purge failed: {err}");
+        log::warn!("[tool_manager] stamping output_savings rewrite {stamp:?} failed: {err}");
     }
 }
 
@@ -14915,27 +15067,42 @@ mod tests {
     }
 
     #[test]
-    fn output_holdout_boosts_until_the_measured_estimate_is_promotable() {
-        use crate::output_savings::{LedgerEstimate, OutputEstimate};
-        let scored = |method: &'static str| {
-            LedgerEstimate::Scored(OutputEstimate {
-                method,
-                reduction_percent: 3.0,
-                ci_low_percent: 0.0,
-                ci_high_percent: 6.0,
-                requests: 100,
-                coverage_percent: 60.0,
-                tokens_saved: 10,
-                baseline_tokens: 300,
-            })
-        };
+    fn requalify_restarts_the_measured_ab_once_and_keeps_the_totals() {
+        let root = std::env::temp_dir().join(format!("headroom-requalify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _guard = HomeGuard::new(&root);
+        let dir = root.join(".headroom");
+        let ledger = dir.join("output_savings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let collapsed = br#"{"shaped_only":true,"baseline":{"strata":{"k":{"n":20,"sum":2000.0,"sumsq":1.0}},"glob":{"n":20}},"treatment":{"k":{"n":9,"sum":90.0,"sumsq":900.0,"clusters":["a"],"qn":9,"qsum":90.0,"qsumsq":900.0}},"control":{"k":{"n":2,"sum":8.0,"sumsq":32.0,"clusters":["b"],"qn":2,"qsum":8.0,"qsumsq":32.0}}}"#;
+
+        // The collapsed-key era's qualified rows go; totals and everything
+        // else stay, and the original is kept beside the ledger.
+        std::fs::write(&ledger, collapsed).unwrap();
+        super::requalify_output_savings_arms_once();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        for arm in ["treatment", "control"] {
+            let acc = v[arm]["k"].as_object().unwrap();
+            assert!(["qn", "qsum", "qsumsq", "clusters"]
+                .iter()
+                .all(|f| !acc.contains_key(*f)));
+        }
+        assert_eq!(v["treatment"]["k"]["n"], 9);
+        assert_eq!(v["control"]["k"]["sum"], 8.0);
+        assert_eq!(v["baseline"]["strata"]["k"]["n"], 20);
+        assert_eq!(v["shaped_only"], true);
         assert_eq!(
-            super::output_holdout_for(&LedgerEstimate::NoEvidence),
-            "0.10"
+            std::fs::read(dir.join(".holdout-key-requalified.bak")).unwrap(),
+            collapsed
         );
-        assert_eq!(super::output_holdout_for(&LedgerEstimate::Unscored), "0.10");
-        assert_eq!(super::output_holdout_for(&scored("estimated")), "0.10");
-        assert_eq!(super::output_holdout_for(&scored("measured")), "0.03");
+
+        // Rows qualified after that are the new A/B: the stamp must hold.
+        std::fs::write(&ledger, collapsed).unwrap();
+        super::requalify_output_savings_arms_once();
+        assert_eq!(std::fs::read(&ledger).unwrap(), collapsed);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -15234,6 +15401,26 @@ mod tests {
         // Production runs lossless_then_lossy; gating on it made the vendor inert.
         assert!(py.contains("and pending[1] < _hd_kw_cr._estimate_tokens(content)"));
         assert!(!py.contains("and not self._lossless_then_lossy"));
+    }
+
+    #[test]
+    fn sitecustomize_vendors_holdout_key() {
+        // Upstream #3209: the output holdout keyed Claude Code and Codex
+        // conversations on a shared CLAUDE.md/AGENTS.md prologue, so a whole
+        // client sat in one arm. Behaviour is proven by
+        // holdout_key_behaves_against_the_installed_wheel; this pins the
+        // backend gate, the exact pin, the kill switch, the self-neutralization
+        // probe and both rebinds.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_HOLDOUT_KEY"));
+        assert!(py.contains(r#"_hd_hk_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(
+            py.contains(r#"if _hd_hk_orig(_hd_hk_probe("a")) == _hd_hk_orig(_hd_hk_probe("b")):"#)
+        );
+        assert!(py.contains("for _hd_hk_mod in (_hd_hk_pol, _hd_hk_os):"));
+        assert!(
+            py.contains("_hd_hk_mod.conversation_key_from_responses_body = _hd_hk_responses_key")
+        );
     }
 
     #[test]
@@ -16221,6 +16408,72 @@ assert g.done"#,
         }
         assert_eq!(off, "False False False True", "kill switch arm:\n{off_err}");
         assert_eq!(on, "True True False True", "stderr:\n{on_err}");
+    }
+
+    #[test]
+    fn holdout_key_behaves_against_the_installed_wheel() {
+        // 400 conversations behind one long shared prologue (Claude Code's
+        // CLAUDE.md system-reminder, Codex's AGENTS.md) must get 400 keys, on
+        // both the Messages and the Responses path, so a 10% holdout puts some
+        // but not all of them in control. The wheel gives them one key, one arm.
+        // A conversation keeps its key, a short single-block opener keeps the
+        // wheel's key (its arm does not move), and both modules the handlers
+        // import from carry the same function. The kill switch restores the
+        // wheel's collapse.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-holdout-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe = "import hashlib\n\
+                     from headroom.proxy import output_savings_policy as pol\n\
+                     from headroom.proxy.output_savings import assign_arm\n\
+                     from headroom.proxy.output_savings import conversation_key_from_body as k\n\
+                     from headroom.proxy.output_savings import conversation_key_from_responses_body as rk\n\
+                     pro = '<system-reminder>' + 'global CLAUDE.md. ' * 200 + '</system-reminder>'\n\
+                     def body(q):\n    \
+                         return {'model': 'claude-opus-5-5', 'messages': [{'role': 'user', 'content': [\n        \
+                         {'type': 'text', 'text': pro}, {'type': 'text', 'text': q}]}]}\n\
+                     def rbody(q):\n    \
+                         return {'model': 'gpt-5', 'input': [{'role': 'user', 'content': [\n        \
+                         {'type': 'input_text', 'text': pro}, {'type': 'input_text', 'text': q}]}]}\n\
+                     qs = ['task %d' % i for i in range(400)]\n\
+                     control = sum(assign_arm(k(body(q)), 0.1) == 'control' for q in qs)\n\
+                     short = {'model': 'm', 'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'hi'}]}]}\n\
+                     print(len({k(body(q)) for q in qs}), len({rk(rbody(q)) for q in qs}),\n      \
+                     0 < control < 400, k(body('a')) == k(body('a')),\n      \
+                     k(short) == hashlib.sha256(b'm\\x00hi').hexdigest(),\n      \
+                     pol.conversation_key_from_body is k and pol.conversation_key_from_responses_body is rk)";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_HOLDOUT_KEY", kill)
+                .output()
+                .expect("run holdout key probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if off.starts_with("400 ") {
+            eprintln!("skipping: the wheel already keys past a shared prologue; drop the vendor");
+            return;
+        }
+        assert_eq!(
+            off, "1 1 False True True True",
+            "kill switch arm:\n{off_err}"
+        );
+        assert_eq!(on, "400 400 True True True True", "stderr:\n{on_err}");
     }
 
     #[test]

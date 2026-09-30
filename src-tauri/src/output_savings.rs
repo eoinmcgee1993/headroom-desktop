@@ -391,7 +391,7 @@ fn measured_if_ready(
     // Never trade a usable estimate for a measurement of less traffic. Both
     // sides on the qn basis: `measured.requests` counts only conversation-
     // qualified rows, so comparing it to the estimate's `n` let one legacy
-    // row block promotion (and hold the 10% holdout boost) for good.
+    // row block promotion for good.
     let estimated_qn: u64 = ledger
         .treatment
         .iter()
@@ -568,8 +568,7 @@ mod tests {
         // A ledger upgraded from before wheel 0.38.0 keeps 10 treatment rows
         // with no conversation: they count in n, never in qn. The measured
         // side is on the qn basis, so the "never trade for less traffic"
-        // check has to be too, or it refuses promotion (and the 10% holdout
-        // boost) for good.
+        // check has to be too, or it refuses promotion for good.
         let e = estimate(&HOLDOUT.replace(
             r#"{"n": 1000, "sum": 800000, "sumsq": 649990000,"#,
             r#"{"n": 1010, "sum": 808000, "sumsq": 656390000,"#,
