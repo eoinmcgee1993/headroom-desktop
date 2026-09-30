@@ -7136,6 +7136,9 @@ impl ToolManager {
         // previous Headroom version (e.g. venv python3 path → headroom CLI)
         // are overwritten without a separate retry. --force is a no-op when
         // the config is already correct or absent. Desktop owns this config.
+        // But not the other apps' tables its marker span may hold: the wheel's
+        // force re-register deletes the whole span, so move them out first.
+        crate::client_adapters::protect_foreign_mcp_tables();
         let (output, args) = run_install(true)?;
 
         if !output.status.success() {
@@ -7218,6 +7221,7 @@ impl ToolManager {
         // failure here must not break the Claude integration below.
         let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
         let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
+        crate::client_adapters::protect_foreign_mcp_tables();
 
         // Ground truth: did Claude Code actually see the server? The Python
         // CLI's fallback branch writes ~/.claude/mcp.json (legacy, ignored by
@@ -8221,14 +8225,19 @@ impl ToolManager {
     }
 
     fn run_mcp_helper(&self, args: &[&str]) -> Result<()> {
+        // The Codex/Grok registrars delete their whole marker span on
+        // unregister, other apps' tables inside it included.
+        crate::client_adapters::protect_foreign_mcp_tables();
         // ClaudeRegistrar may shell out to the `claude` CLI, which can take a
         // few seconds per agent; 60s covers both registrars comfortably.
-        run_command_with_timeout(
+        let result = run_command_with_timeout(
             &self.managed_python(),
             args,
             &self.runtime.root_dir,
             Duration::from_secs(60),
-        )
+        );
+        crate::client_adapters::protect_foreign_mcp_tables();
+        result
     }
 
     /// Remove the managed rtk binary and its receipt. Shell PATH and Claude Code
@@ -15356,6 +15365,88 @@ assert g.done"#,
             off_err.contains("has no attribute 'strip'"),
             "kill switch did not unbind:\n{off_err}"
         );
+    }
+
+    #[test]
+    fn foreign_mcp_tables_survive_the_installed_wheels_registrars() {
+        // rc11 data loss, against the real registrars: `mcp install --force`
+        // with a Rust-pinned command makes the wheel's Codex/Grok registrar
+        // delete everything inside its marker span, the ChatGPT app's
+        // node_repl included. A temp home only; never the real ~/.codex.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let script = "import sys\n\
+             from pathlib import Path\n\
+             from headroom.mcp_registry.base import ServerSpec\n\
+             from headroom.mcp_registry.codex import CodexRegistrar\n\
+             from headroom.mcp_registry.grok import GrokRegistrar\n\
+             cls = {'codex': CodexRegistrar, 'grok': GrokRegistrar}[sys.argv[2]]\n\
+             spec = ServerSpec(name='headroom', command='headroom', args=('mcp', 'serve'),\n\
+                 env={'HEADROOM_PROXY_URL': 'http://127.0.0.1:6767'})\n\
+             print(cls(home_dir=Path(sys.argv[1])).register_server(spec, force=True).status)";
+        let config = "model = \"gpt-5\"\n\
+             # --- Headroom MCP server ---\n\
+             [mcp_servers.headroom]\n\
+             command = \"/Apps/Headroom/venv/bin/headroom\"\n\
+             args = [\"mcp\", \"serve\"]\n\
+             \n\
+             [mcp_servers.node_repl]\n\
+             command = \"/Applications/ChatGPT.app/node_repl\"\n\
+             \n\
+             [mcp_servers.node_repl.env]\n\
+             BROWSER_USE_AVAILABLE_BACKENDS = \"chrome,iab\"\n\
+             # --- end Headroom MCP server ---\n";
+        let node_repl_env = |path: &std::path::Path| {
+            let text = std::fs::read_to_string(path).unwrap();
+            let parsed: toml::Value = toml::from_str(&text).expect("config parses");
+            parsed
+                .get("mcp_servers")
+                .and_then(|s| s.get("node_repl"))
+                .and_then(|n| n.get("env"))
+                .and_then(|e| e.get("BROWSER_USE_AVAILABLE_BACKENDS"))
+                .and_then(|v| v.as_str().map(str::to_owned))
+        };
+        for (registrar, dir) in [("codex", ".codex"), ("grok", ".grok")] {
+            let home = tempfile::tempdir().expect("tempdir");
+            let path = home.path().join(dir).join("config.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let register = || {
+                let out = crate::proc::command(&python)
+                    .args(["-c", script])
+                    .arg(home.path())
+                    .arg(registrar)
+                    .env("HOME", home.path())
+                    .env_remove("CODEX_HOME")
+                    .env_remove("GROK_HOME")
+                    .output()
+                    .expect("run registrar");
+                assert!(
+                    out.status.success(),
+                    "{registrar} registrar failed:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            // Control: unprotected, the wheel deletes the trapped tables.
+            std::fs::write(&path, config).unwrap();
+            register();
+            if node_repl_env(&path).is_some() {
+                eprintln!("skipping {registrar}: the wheel no longer deletes foreign span tables");
+                continue;
+            }
+            std::fs::write(&path, config).unwrap();
+            crate::client_adapters::protect_foreign_mcp_tables_in(&path).unwrap();
+            register();
+            assert_eq!(
+                node_repl_env(&path).as_deref(),
+                Some("chrome,iab"),
+                "{registrar}: node_repl lost:\n{}",
+                std::fs::read_to_string(&path).unwrap()
+            );
+        }
     }
 
     #[test]
