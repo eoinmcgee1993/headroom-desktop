@@ -321,6 +321,9 @@ export interface RuntimeStatus {
   headroomLearnDisabledReason?: string | null;
   startupError?: string | null;
   startupErrorHint?: string | null;
+  /** True while the intercept cannot bind port 6767 and no other Headroom
+   *  instance holds it, so no client can reach Headroom at all. */
+  interceptBindFailed?: boolean;
   /** Prose hint while the backend is failing certificate verification against
    *  the provider (TLS-inspecting network); cleared once the failures age out. */
   upstreamTlsInterceptionHint?: string | null;

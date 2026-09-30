@@ -54,6 +54,11 @@ struct LocalPricingState {
     /// server flip can't strand a user halfway through the gated flow.
     #[serde(default)]
     paywall_first: Option<bool>,
+    /// The launch-flags call already waited on one config fetch that failed.
+    /// Later launches then serve cached-or-false at once and leave retries to
+    /// the background warmer, instead of waiting on the network every launch.
+    #[serde(default)]
+    paywall_first_fetch_failed: bool,
     /// Last time any extraheadroom.com call succeeded (grace/start or account
     /// sync). Baseline for the server-silent Sentry alarm.
     #[serde(default)]
@@ -166,6 +171,11 @@ fn is_transient_transport_error(err: &reqwest::Error) -> bool {
 /// than interpolating the cause - the user gets something to act on, and
 /// Sentry gets a message that groups instead of splintering on `os error 61`.
 fn transport_failure(action: &str, err: &reqwest::Error) -> String {
+    if is_local_filter_drop(err) {
+        return format!(
+            "Could not {action}: {FILTER_DROP_HINT} Allow Headroom in it and try again."
+        );
+    }
     let kind = if err.is_timeout() {
         "the request timed out"
     } else if err.is_connect() {
@@ -174,6 +184,32 @@ fn transport_failure(action: &str, err: &reqwest::Error) -> String {
         "the request failed"
     };
     format!("Could not {action}: {kind}. Check your connection and try again in a moment.")
+}
+
+const FILTER_DROP_HINT: &str =
+    "a firewall or network filter on this Mac is blocking Headroom from reaching extraheadroom.com.";
+
+/// RUST-78: a macOS content filter that drops a flow defuncts the socket, and
+/// XNU's `sodefunct` sets `so_error = EBADF`, so the connect fails with "Bad
+/// file descriptor (os error 9)". Nothing in this process produces that, and
+/// the rule is per app: curl from Terminal still reaches us, which is why the
+/// generic "check your connection" sent the user in circles for six weeks.
+fn is_local_filter_drop(err: &reqwest::Error) -> bool {
+    err.is_connect() && chain_has_ebadf(err)
+}
+
+fn chain_has_ebadf(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(cause) = source {
+        let errno = cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|e| e.raw_os_error());
+        if cfg!(target_os = "macos") && errno == Some(libc::EBADF) {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// Report transport failures, but rank them. Before issue #58 the auth path
@@ -462,15 +498,29 @@ pub fn push_terms_acceptance(state: &AppState, version: u32) {
 /// Piggybacks the existing `desktop/grace/start` POST (device identity already
 /// travels with it) via the `X-Headroom-Funnel-Step` header. Fire-and-forget on
 /// a detached thread so it never blocks the UI or gates the wizard; the server
-/// is first-write-wins, so repeats are harmless.
-pub fn report_funnel_step(state: &AppState, step: &str) {
-    spawn_funnel_step(IdentityPayload::for_state(state), step);
+/// is first-write-wins, so repeats are harmless. Takes the handle, not the
+/// state, because the identity build can fetch from Anthropic and has to run
+/// on that thread too: callers include sync commands on the main thread.
+pub fn report_funnel_step(app: &tauri::AppHandle, step: &str) {
+    use tauri::Manager;
+    let app = app.clone();
+    spawn_funnel_step(
+        move || IdentityPayload::for_state(&app.state::<AppState>()),
+        step,
+        api_base_url(),
+        FUNNEL_STEP_RETRY_BACKOFFS,
+    );
 }
 
 /// `report_funnel_step` for contexts without an `AppState` (e.g. the proxy
 /// intercept thread). Device identity alone keys the server's `TrialIdentity`.
 pub fn report_funnel_step_device_only(step: &str) {
-    spawn_funnel_step(IdentityPayload::device_only(), step);
+    spawn_funnel_step(
+        IdentityPayload::device_only,
+        step,
+        api_base_url(),
+        FUNNEL_STEP_RETRY_BACKOFFS,
+    );
 }
 
 /// Retry backoffs for the funnel beacon. A relaunch that races network
@@ -487,21 +537,22 @@ const FUNNEL_STEP_RETRY_BACKOFFS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(300),
 ];
 
-fn spawn_funnel_step(identity: IdentityPayload, step: &str) {
+fn spawn_funnel_step(
+    identity: impl FnOnce() -> IdentityPayload + Send + 'static,
+    step: &str,
+    base_url: String,
+    backoffs: &'static [std::time::Duration],
+) -> std::thread::JoinHandle<()> {
     let step = step.to_string();
     std::thread::spawn(move || {
-        if let Err(err) = post_funnel_step_with_retries(
-            &identity,
-            &step,
-            &api_base_url(),
-            FUNNEL_STEP_RETRY_BACKOFFS,
-        ) {
+        let identity = identity();
+        if let Err(err) = post_funnel_step_with_retries(&identity, &step, &base_url, backoffs) {
             // info, not warn: the log->Sentry bridge captures warns, and a
             // device offline for the whole session would emit one event per
             // funnel step for a condition that is not our bug.
             log::info!("funnel step {step} not delivered after retries: {err}");
         }
-    });
+    })
 }
 
 fn post_funnel_step_with_retries(
@@ -629,6 +680,10 @@ pub fn is_identity_complete(profile: &ClaudeAccountProfile) -> bool {
 /// push in this session, this is a no-op. On HTTP failure the fingerprint
 /// is not recorded, so the next bearer change retries.
 pub fn warm_and_push_identity(state: &AppState) {
+    warm_and_push_identity_to(state, &api_base_url());
+}
+
+fn warm_and_push_identity_to(state: &AppState, base_url: &str) {
     const COMPLETE_FETCH_THROTTLE: std::time::Duration =
         std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -660,7 +715,16 @@ pub fn warm_and_push_identity(state: &AppState) {
     // new identity fields. Push them now even though the worker would
     // otherwise have skipped the OAuth fetch — this is the account-switch
     // path.
-    match fetch_grace_start(&identity) {
+    //
+    // Within reconcile's shared spacing, though: two Claude accounts taking
+    // turns on the bearer slot signal here on every switch, and each POST
+    // spent the server's 10/device/hour grace/start budget until reconcile's
+    // heartbeat got 429s. Nothing is recorded, so the next signal past the
+    // window retries, and reconcile's own POST carries the identity meanwhile.
+    if !grace_start_attempt_due() {
+        return;
+    }
+    match fetch_grace_start_with_base_url(&identity, base_url) {
         Ok(_) => state.record_pushed_identity_fingerprint(fp),
         Err(_) => {
             // Silent — matches `reconcile_local_state_with_server`'s
@@ -899,6 +963,8 @@ enum RemoteAccountSyncError {
     /// is read only via the derived Debug in the sync-failure log, which
     /// dead-code analysis deliberately ignores.
     Other(#[allow(dead_code)] String),
+    /// A local content filter dropped the connection (`is_local_filter_drop`).
+    FilterBlocked(#[allow(dead_code)] String),
 }
 
 /// When any caller last ran `get_pricing_status`; the background pricing
@@ -979,6 +1045,7 @@ pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, Str
     let tier_mismatch = resolve_tier_mismatch(
         account.as_ref(),
         &claude,
+        last_known_good_plan_tier.as_ref(),
         codex_plan,
         &state.active_day_keys(),
     );
@@ -1514,6 +1581,7 @@ pub(crate) fn verify_auth_code_with_base_url(
     let tier_mismatch = resolve_tier_mismatch(
         Some(&account),
         &claude,
+        last_known_good_plan_tier.as_ref(),
         codex_plan,
         &state.active_day_keys(),
     );
@@ -1698,6 +1766,7 @@ pub(crate) fn activate_account_with_retry_backoff(
     let tier_mismatch = resolve_tier_mismatch(
         Some(&account),
         &claude,
+        last_known_good_plan_tier.as_ref(),
         codex_plan,
         &state.active_day_keys(),
     );
@@ -1791,7 +1860,7 @@ pub struct SavingsDay {
     /// the day exactly as the app does without pricing reads. None on days the
     /// session sampler did not cover (backend rollups, pre-coverage buckets).
     pub new_input_tokens: Option<u64>,
-    pub output_sampled_tokens_saved: Option<u64>,
+    pub output_sampled_tokens_saved: Option<i64>,
     pub output_baseline_tokens: Option<u64>,
     /// Aggregate per-client counters from the intercept proxy (local day
     /// keys; see usage_counters.rs for the join caveat). None on days
@@ -1837,8 +1906,8 @@ pub struct WeeklyLimitNudge {
 /// Maps a freshly evaluated pricing status to the weekly-limit nudge the
 /// desktop should report, or `None`. `"reached"` when the weekly cap has paused
 /// optimization (Claude or Codex); `"approaching"` when nudging near it but not
-/// yet paused. The cap reflects whichever provider tripped — Claude's tier-aware
-/// threshold, or the fixed Codex cap. Subscriber filtering and per-window
+/// yet paused. The cap reflects whichever provider tripped: each gate's own
+/// tier-aware, invite-bonus-inclusive pause threshold. Subscriber filtering and per-window
 /// de-duplication are the server's job (headroom-web
 /// `POST /api/v1/desktop/weekly_limit`), so this stays a pure mapping.
 pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<WeeklyLimitNudge> {
@@ -1851,7 +1920,10 @@ pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<WeeklyLimit
     }
 
     let claude_cap = status.effective_disable_threshold_percent;
-    let codex_cap = Some(CODEX_WEEKLY_DISABLE_THRESHOLD_PCT);
+    let codex_cap = status
+        .codex
+        .as_ref()
+        .map(|codex| codex.effective_disable_threshold_percent);
 
     let claude_reached = !status.optimization_allowed
         && matches!(
@@ -2385,6 +2457,7 @@ fn detect_tier_mismatch(
 fn resolve_tier_mismatch(
     account: Option<&HeadroomAccountProfile>,
     claude: &ClaudeAccountProfile,
+    last_known_good_claude_plan: Option<&ClaudePlanTier>,
     codex_plan: Option<CodexPlanTier>,
     active_day_keys: &[String],
 ) -> Option<TierMismatch> {
@@ -2397,7 +2470,21 @@ fn resolve_tier_mismatch(
                 // here, and clearing on those used to restart the 14-day clamp
                 // window on every transient blip — one flaky poll per two
                 // weeks meant under-subscribed users were never clamped.
-                if account.is_some() {
+                // An Unknown Claude plan is no verdict either (no bearer after
+                // a relaunch or an idle hour, a failed profile fetch), so judge
+                // it by the last known-good plan; a machine that never
+                // classified one has only Codex to go on.
+                let affirmative = account.is_some_and(|a| {
+                    claude.plan_tier != ClaudePlanTier::Unknown
+                        || last_known_good_claude_plan.is_none_or(|plan| {
+                            let known = ClaudeAccountProfile {
+                                plan_tier: plan.clone(),
+                                ..claude.clone()
+                            };
+                            detect_tier_mismatch(a, &known, codex_plan).is_none()
+                        })
+                });
+                if affirmative {
                     if let Ok(mut local) = load_or_initialize_local_state() {
                         if local.mismatch_since.is_some() || local.mismatch_clamped_at.is_some() {
                             local.mismatch_since = None;
@@ -2740,15 +2827,18 @@ fn sanitize_plan_claim(raw: &str) -> Option<String> {
     (!clean.is_empty()).then_some(clean)
 }
 
-/// Build a [`CodexAccountProfile`] from `~/.codex/auth.json`. `plan_tier` and
+/// Build a [`CodexAccountProfile`] from `$CODEX_HOME/auth.json` (default
+/// `~/.codex`, the same resolution the Codex CLI uses). `plan_tier` and
 /// `account_uuid` are also available from live traffic (`state.codex_plan_tier`
 /// and the access-token bearer), so this prefers a live, classified plan tier
 /// over the on-disk id_token when present. `email` and `organization_type` only
 /// exist in the id_token, so they require the file. Returns `None` only when
-/// nothing at all is known (no file and no live capture).
+/// nothing at all is known (no file and no live capture). `plan_tier` is
+/// `None` when neither source carries a plan claim (API-key auth): that is no
+/// plan evidence, not an unclassifiable plan, so it must not recommend Max 20x.
 pub fn detect_codex_profile(state: &AppState) -> Option<CodexAccountProfile> {
     let live_tier = state.codex_plan_tier();
-    let path = dirs::home_dir()?.join(".codex").join("auth.json");
+    let path = crate::client_adapters::codex_home().join("auth.json");
     let on_disk = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
@@ -2803,26 +2893,28 @@ pub fn detect_codex_profile(state: &AppState) -> Option<CodexAccountProfile> {
         .and_then(|a| a.get("chatgpt_plan_type"))
         .and_then(|v| v.as_str());
     let (plan_tier, source) = if !matches!(live_tier, CodexPlanTier::Unknown) {
-        (live_tier, "access_token")
+        (Some(live_tier), "access_token")
     } else {
         match raw_claim.map(CodexPlanTier::from_claim) {
-            Some(tier) => (tier, "id_token"),
-            None => (CodexPlanTier::Unknown, "none"),
+            Some(tier) => (Some(tier), "id_token"),
+            None => (None, "none"),
         }
     };
     // Keep the raw claim only when it exists but decodes to Unknown: that is
     // a plan value OpenAI ships and we don't know yet (Business Premium seats
     // are the expected next one). Known tiers carry nothing extra.
-    let plan_raw = matches!(plan_tier, CodexPlanTier::Unknown)
+    let plan_raw = matches!(plan_tier, Some(CodexPlanTier::Unknown))
         .then(|| raw_claim.and_then(sanitize_plan_claim))
         .flatten();
 
-    let billing_type = codex_billing_type(&plan_tier, organization_type.is_some());
+    let billing_type = plan_tier
+        .as_ref()
+        .and_then(|tier| codex_billing_type(tier, organization_type.is_some()));
 
     Some(CodexAccountProfile {
         email,
         account_uuid,
-        plan_tier: Some(plan_tier),
+        plan_tier,
         plan_raw,
         organization_type,
         rate_limit_tier: None,
@@ -2961,12 +3053,51 @@ pub fn detect_claude_profile_uncached(state: &AppState) -> ProfileDetection {
 
 /// Failure from the OAuth profile fetch. `transient` marks the conditions
 /// that resolve on their own once a fresh bearer flows through the proxy
-/// (network blip, 5xx, or a 401/403 from a stale captured token during the
+/// (network blip, 5xx, 429/408, or a 401/403 from a stale captured token during the
 /// token-rotation gap). Callers suppress the banner for transient errors and
 /// keep serving the last known-good profile instead.
 struct ProfileFetchError {
     message: String,
     transient: bool,
+}
+
+/// Classifies a non-success status from the OAuth profile endpoint.
+fn profile_http_error(status: u16) -> ProfileFetchError {
+    let (message, transient) = if status >= 500 {
+        (
+            format!(
+                "Anthropic is having trouble serving your Claude plan right now (HTTP \
+                 {status}). We'll keep trying."
+            ),
+            true,
+        )
+    } else if status == 401 || status == 403 {
+        (
+            "Anthropic rejected our request for your Claude plan. Try signing out of Claude \
+             Code and back in."
+                .to_string(),
+            true,
+        )
+    } else if status == 429 || status == 408 {
+        // Throttled or timed out: says nothing about the account, so keep
+        // serving the last known-good profile like the other transient cases.
+        (
+            format!(
+                "Anthropic is busy and couldn't look up your Claude plan (HTTP {status}). We'll \
+                 try again shortly."
+            ),
+            true,
+        )
+    } else {
+        (
+            format!(
+                "Anthropic returned an unexpected response for your Claude plan (HTTP \
+                 {status}). We'll try again shortly."
+            ),
+            false,
+        )
+    };
+    ProfileFetchError { message, transient }
 }
 
 fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, ProfileFetchError> {
@@ -2988,32 +3119,7 @@ fn fetch_oauth_profile(token: &str) -> Result<ClaudeOauthProfile, ProfileFetchEr
         })?;
 
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let (message, transient) = if status >= 500 {
-            (
-                format!(
-                    "Anthropic is having trouble serving your Claude plan right now (HTTP \
-                     {status}). We'll keep trying."
-                ),
-                true,
-            )
-        } else if status == 401 || status == 403 {
-            (
-                "Anthropic rejected our request for your Claude plan. Try signing out of Claude \
-                 Code and back in."
-                    .to_string(),
-                true,
-            )
-        } else {
-            (
-                format!(
-                    "Anthropic returned an unexpected response for your Claude plan (HTTP \
-                     {status}). We'll try again shortly."
-                ),
-                false,
-            )
-        };
-        return Err(ProfileFetchError { message, transient });
+        return Err(profile_http_error(response.status().as_u16()));
     }
 
     // Same split as the activation path above (RUST-58): `.json()` collapses a
@@ -3395,8 +3501,33 @@ static SERVER_SILENT_REPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static AUTH_SILENT_REPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static GRACE_FAILING_SINCE: std::sync::Mutex<Option<std::time::Instant>> =
+/// The current grace/start failure run, as (start, last failure).
+static GRACE_FAILING_SINCE: std::sync::Mutex<Option<(DateTime<Utc>, DateTime<Utc>)>> =
     std::sync::Mutex::new(None);
+
+/// Longest gap between two failures that still counts as one run. Awake, the
+/// pricing loop retries at most ~30 min apart (a 10-min loop that skips when
+/// something else fetched within the interval), so a longer gap means the
+/// machine slept.
+const FAILURE_RUN_MAX_GAP_MINS: i64 = 60;
+
+/// Extends the failure run in `run` (start, last failure) to `now` and returns
+/// how long it has lasted. On the wall clock, not `Instant`: Windows' monotonic
+/// clock counts sleep and macOS' does not, and neither may carry a run that
+/// began before a weekend sleep into the first refresh after wake. A gap past
+/// FAILURE_RUN_MAX_GAP_MINS, or a clock stepped backwards, starts a new run.
+pub(crate) fn extend_failure_run(
+    run: &mut Option<(DateTime<Utc>, DateTime<Utc>)>,
+    now: DateTime<Utc>,
+) -> std::time::Duration {
+    let (start, last) = run.get_or_insert((now, now));
+    let gap = now - *last;
+    if gap < Duration::zero() || gap > Duration::minutes(FAILURE_RUN_MAX_GAP_MINS) {
+        *start = now;
+    }
+    *last = now;
+    (now - *start).to_std().unwrap_or_default()
+}
 
 /// Hours the backend has been unreachable, if past the alarm window. Falls
 /// back to first_seen_at so a machine that never reached us still alarms
@@ -3424,11 +3555,10 @@ fn auth_silent_hours(local: &LocalPricingState, now: DateTime<Utc>) -> Option<i6
 
 fn maybe_report_server_silent(local: &LocalPricingState, identity: &IdentityPayload, err: &str) {
     let failing_long_enough = {
-        let mut since = GRACE_FAILING_SINCE
+        let mut run = GRACE_FAILING_SINCE
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let start = since.get_or_insert_with(std::time::Instant::now);
-        start.elapsed().as_secs() >= SERVER_SILENT_MIN_FAILING_SECS
+        extend_failure_run(&mut run, Utc::now()).as_secs() >= SERVER_SILENT_MIN_FAILING_SECS
     };
     if !failing_long_enough {
         return;
@@ -3545,6 +3675,13 @@ fn merge_background_account_sync(
                     .into(),
             ),
         ),
+        Err(RemoteAccountSyncError::FilterBlocked(_)) => (
+            true,
+            None,
+            Some(format!(
+                "Headroom account connected, but {FILTER_DROP_HINT}"
+            )),
+        ),
     }
 }
 
@@ -3559,28 +3696,49 @@ pub fn paywall_first_flag() -> bool {
 
 /// Same cached flag, but on the first ever read waits for one bounded config
 /// fetch. Keeps cold launches from missing their server bucket just because the
-/// background warmer has not finished yet.
+/// background warmer has not finished yet. Waits once per install: a failed
+/// fetch is recorded, so a network that drops extraheadroom.com does not stall
+/// every later launch too.
 pub fn paywall_first_flag_or_refresh() -> bool {
+    paywall_first_flag_or_refresh_with(|| fetch_public_config().map(|c| c.paywall_first))
+}
+
+fn paywall_first_flag_or_refresh_with(fetch: impl FnOnce() -> Option<bool>) -> bool {
     let Ok(local) = load_or_initialize_local_state() else {
         return false;
     };
     if let Some(flag) = local.paywall_first {
         return flag;
     }
-    refresh_paywall_first_flag();
-    paywall_first_flag()
+    if local.paywall_first_fetch_failed {
+        return false;
+    }
+    let Some(flag) = fetch() else {
+        // Reloaded: the fetch can take seconds, and a stale copy would clobber
+        // whatever the warmer or reconcile wrote meanwhile.
+        if let Ok(mut local) = load_or_initialize_local_state() {
+            local.paywall_first_fetch_failed = true;
+            let _ = write_local_state(&local);
+        }
+        return paywall_first_flag();
+    };
+    store_paywall_first_flag(flag);
+    flag
 }
 
 /// Refresh the paywall-first flag from the unauthenticated config endpoint.
-/// Called once from `setup()` on a background thread, and synchronously only
-/// when the frontend asks for launch flags before any cache exists.
+/// Called once from `setup()` on a background thread; the launch-flags call
+/// does its own fetch when it finds no cache.
 pub fn refresh_paywall_first_flag() {
-    let Some(config) = fetch_public_config() else {
-        return;
-    };
+    if let Some(config) = fetch_public_config() {
+        store_paywall_first_flag(config.paywall_first);
+    }
+}
+
+fn store_paywall_first_flag(flag: bool) {
     if let Ok(mut local) = load_or_initialize_local_state() {
-        if local.paywall_first != Some(config.paywall_first) {
-            local.paywall_first = Some(config.paywall_first);
+        if local.paywall_first != Some(flag) {
+            local.paywall_first = Some(flag);
             let _ = write_local_state(&local);
         }
     }
@@ -3588,8 +3746,8 @@ pub fn refresh_paywall_first_flag() {
 
 fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
     let path = local_state_path();
-    if let Ok(bytes) = std::fs::read(&path) {
-        match serde_json::from_slice::<LocalPricingState>(&bytes) {
+    match crate::state::read_state_file(&path) {
+        Ok(bytes) => match serde_json::from_slice::<LocalPricingState>(&bytes) {
             Ok(state) => return Ok(state),
             // Only reachable now for a truncated/non-JSON file: every field
             // defaults, so a schema change alone parses. write_local_state
@@ -3598,6 +3756,15 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
                 &path,
                 &format!("pricing state: {err}"),
             ),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // Unread is not corrupt: initializing here would overwrite the trial
+        // and grace clocks with fresh ones, and nothing backs them up.
+        Err(err) => {
+            return Err(format!(
+                "Failed to read pricing state {}: {err}",
+                path.display()
+            ))
         }
     }
 
@@ -3607,6 +3774,7 @@ fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
         mismatch_since: None,
         mismatch_clamped_at: None,
         paywall_first: None,
+        paywall_first_fetch_failed: false,
         last_server_contact_at: None,
         last_account_sync_ok_at: None,
     };
@@ -3845,7 +4013,12 @@ fn fetch_remote_account_with_base_url(
     // Chain for the auth-silent alarm's `error` extra, same reason as
     // fetch_grace_start; the user sees merge_background_account_sync's text.
     let response = identity.apply_headers(builder).send().map_err(|err| {
-        RemoteAccountSyncError::Other(format!("send: {}", transport_cause_chain(&err)))
+        let text = format!("send: {}", transport_cause_chain(&err));
+        if is_local_filter_drop(&err) {
+            RemoteAccountSyncError::FilterBlocked(text)
+        } else {
+            RemoteAccountSyncError::Other(text)
+        }
     })?;
 
     if response.status().as_u16() == 401 {
@@ -3986,11 +4159,11 @@ mod tests {
         detect_tier_mismatch, evaluate_pricing_status_with_mismatch, is_identity_complete,
         latch_clamp_start, merge_background_account_sync, parse_oauth_profile_value,
         plan_tier_header_value, remote_account_to_profile, resolve_account_api_base_url,
-        tier_mismatch_grace_ends_at, ClaudeOauthProfile, ClaudeOauthProfileAccount,
-        ClaudeOauthProfileOrganization, HeadroomSubscriptionTier, IdentityFingerprint,
-        IdentityPayload, LocalPricingState, PricingPromo, RemoteAccountResponse,
-        RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
-        MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
+        resolve_tier_mismatch, tier_mismatch_grace_ends_at, ClaudeOauthProfile,
+        ClaudeOauthProfileAccount, ClaudeOauthProfileOrganization, HeadroomSubscriptionTier,
+        IdentityFingerprint, IdentityPayload, LocalPricingState, PricingPromo,
+        RemoteAccountResponse, RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS,
+        DEFAULT_ACCOUNT_API_BASE_URL, MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS, TIER_MISMATCH_GRACE_DAYS,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, CodexPlanTier,
@@ -4039,6 +4212,7 @@ mod tests {
             mismatch_since: None,
             mismatch_clamped_at: None,
             paywall_first: None,
+            paywall_first_fetch_failed: false,
             last_server_contact_at: stale,
             last_account_sync_ok_at: stale,
         };
@@ -4066,6 +4240,50 @@ mod tests {
         local.first_seen_at = now - Duration::days(3);
         assert_eq!(server_silent_hours(&local, now), Some(72));
         assert_eq!(auth_silent_hours(&local, now), None);
+    }
+
+    /// #128: the server-silent alarm's failure run is on the wall clock and
+    /// restarts after a gap no awake retry cadence produces, so a run that
+    /// began before a weekend sleep can't alarm on the first refresh after
+    /// wake (Windows' monotonic clock counts the sleep; macOS' does not).
+    #[test]
+    fn failure_run_restarts_after_a_sleep_gap() {
+        use super::extend_failure_run;
+        use chrono::Duration;
+        let min_failing = std::time::Duration::from_secs(super::SERVER_SILENT_MIN_FAILING_SECS);
+        let t0 = Utc::now();
+        let mut run = None;
+        assert_eq!(extend_failure_run(&mut run, t0), std::time::Duration::ZERO);
+        // Awake retries 10 and 30 min apart keep one run going.
+        extend_failure_run(&mut run, t0 + Duration::minutes(10));
+        assert!(extend_failure_run(&mut run, t0 + Duration::minutes(40)) >= min_failing);
+
+        // Two days asleep, then the first refresh fails before Wi-Fi is back.
+        let wake = t0 + Duration::days(2);
+        assert!(extend_failure_run(&mut run, wake) < min_failing);
+        assert!(extend_failure_run(&mut run, wake + Duration::minutes(10)) < min_failing);
+
+        // A wall clock stepped backwards starts over too.
+        let stepped = wake - Duration::hours(3);
+        assert_eq!(
+            extend_failure_run(&mut run, stepped),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// #127: a 429 (or 408) from the OAuth profile endpoint is Anthropic
+    /// throttling, not a broken account. As non-transient it skipped the
+    /// last-known-good profile and showed an error banner with plan Unknown.
+    #[test]
+    fn profile_fetch_rate_limit_is_transient() {
+        for status in [408, 429] {
+            let err = super::profile_http_error(status);
+            assert!(err.transient, "HTTP {status} must be transient");
+            assert!(err.message.contains(&status.to_string()));
+        }
+        assert!(super::profile_http_error(503).transient);
+        assert!(super::profile_http_error(401).transient);
+        assert!(!super::profile_http_error(404).transient);
     }
 
     #[test]
@@ -4452,6 +4670,77 @@ mod tests {
             CodexPlanTier::Business
         );
         assert_eq!(auth["organizations"][0]["role"], "owner");
+    }
+
+    /// Runs `detect_codex_profile` against a scratch HOME holding `auth_json`
+    /// in `<HOME>/<codex_dir>/auth.json`, with `CODEX_HOME` pointed there when
+    /// `codex_dir` is not `.codex`. Restores both env vars afterwards.
+    fn detect_codex_profile_with_auth(
+        codex_dir: &str,
+        auth_json: &str,
+    ) -> Option<crate::models::CodexAccountProfile> {
+        let _home_lock = crate::test_env_lock::lock_home();
+        let prev_home = std::env::var_os("HOME");
+        let prev_codex = std::env::var_os("CODEX_HOME");
+        let scratch = tempfile::tempdir().expect("scratch tempdir");
+        std::env::set_var("HOME", scratch.path());
+        let dir = scratch.path().join(codex_dir);
+        if codex_dir == ".codex" {
+            std::env::remove_var("CODEX_HOME");
+        } else {
+            std::env::set_var("CODEX_HOME", &dir);
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), auth_json).unwrap();
+
+        let (state, state_dir) = temp_app_state();
+        let profile = super::detect_codex_profile(&state);
+        drop_state(state_dir);
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_codex {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        profile
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn api_key_codex_auth_reports_no_plan_and_no_tier_mismatch() {
+        // `codex login --with-api-key`: a key, no ChatGPT tokens, no plan claim.
+        let profile = detect_codex_profile_with_auth(
+            ".codex",
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-test","tokens":null}"#,
+        );
+        let codex_plan = profile.and_then(|p| p.plan_tier);
+        assert_eq!(codex_plan, None, "no plan claim is no plan evidence");
+
+        assert!(
+            detect_tier_mismatch(
+                &active_subscriber(HeadroomSubscriptionTier::Pro),
+                &empty_claude_profile(ClaudePlanTier::Pro),
+                codex_plan,
+            )
+            .is_none(),
+            "an API-key Codex login must not recommend Max 20x"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_profile_reads_auth_json_from_codex_home() {
+        use base64::Engine;
+        let payload = r#"{"email":"dev@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acct_9","chatgpt_plan_type":"plus"}}"#;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let auth = serde_json::json!({ "tokens": { "id_token": format!("h.{b64}.s") } });
+
+        let profile = detect_codex_profile_with_auth("custom-codex", &auth.to_string())
+            .expect("auth.json under $CODEX_HOME is read");
+        assert_eq!(profile.email.as_deref(), Some("dev@example.com"));
+        assert_eq!(profile.plan_tier, Some(CodexPlanTier::Plus));
     }
 
     fn complete_profile() -> ClaudeAccountProfile {
@@ -5082,6 +5371,42 @@ mod tests {
         let approaching = super::weekly_limit_signal(&nudging).expect("nudging free tier reports");
         assert_eq!(approaching.status, "approaching");
         assert_eq!(approaching.cap_percent, Some(50.0));
+    }
+
+    #[test]
+    fn codex_weekly_limit_report_carries_the_codex_gates_own_cap() {
+        let (start, end) = grace();
+        // Claude side quiet, so only the Codex gate can trip the report.
+        let mut status = evaluate_pricing_status(
+            true,
+            start,
+            end,
+            false,
+            None,
+            Some(grandfathered_account()),
+            pro_profile_with_weekly(0.0),
+            false,
+            None,
+        );
+        let cap_for = |status: &mut HeadroomPricingStatus, plan, used, bonus| {
+            status.codex = Some(super::codex_usage_from_snapshot(
+                codex_snapshot_with_weekly(used),
+                plan,
+                super::CodexActivation::Metered,
+                bonus,
+            ));
+            super::weekly_limit_signal(status).expect("codex nudge reports")
+        };
+
+        // ChatGPT Pro meters on the Max ladder: pauses at 25%, not 50%.
+        let pro = cap_for(&mut status, CodexPlanTier::Pro, 12.0, 0.0);
+        assert_eq!(pro.status, "approaching");
+        assert_eq!(pro.cap_percent, Some(25.0));
+
+        // An invite bonus raises the pause point; the report must follow it.
+        let plus = cap_for(&mut status, CodexPlanTier::Plus, 40.0, 10.0);
+        assert_eq!(plus.status, "approaching");
+        assert_eq!(plus.cap_percent, Some(60.0));
     }
 
     #[test]
@@ -6191,6 +6516,90 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// #105/#123: building the identity can fetch the Claude profile and usage
+    /// from Anthropic (two 8s-timeout calls). It ran on the caller's thread,
+    /// which for the sync `report_funnel_step` command and `start_bootstrap`
+    /// is the Tauri main thread, so the window froze on the onboarding
+    /// success screen and on the Upgrade click.
+    #[test]
+    fn funnel_step_builds_its_identity_on_the_beacon_thread() {
+        let caller = std::thread::current().id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base_url = format!("http://127.0.0.1:{}", closed.local_addr().unwrap().port());
+        drop(closed);
+        super::spawn_funnel_step(
+            move || {
+                tx.send(std::thread::current().id()).unwrap();
+                IdentityPayload::default()
+            },
+            "test_step",
+            base_url,
+            &[],
+        )
+        .join()
+        .unwrap();
+        assert_ne!(rx.recv().unwrap(), caller);
+    }
+
+    /// #124: two Claude accounts alternating on the bearer slot signal the
+    /// identity pusher on every switch, and each push POSTed grace/start
+    /// outside the shared ten-minute spacing. That burned the server's
+    /// 10/device/hour budget, after which reconcile's heartbeat got 429s too.
+    #[test]
+    #[serial_test::serial]
+    fn identity_push_respects_the_grace_start_spacing() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let (state, dir) = temp_app_state();
+        let mut profile = empty_claude_profile(ClaudePlanTier::Pro);
+        profile.account_uuid = Some("acct-b".into());
+        profile.email = Some("b@example.com".into());
+        state.seed_claude_profile_for_test(profile);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let last = || {
+            super::LAST_GRACE_START_ATTEMPT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        };
+        // Reconcile's heartbeat (or the previous switch) just POSTed.
+        let prev = last().replace(std::time::Instant::now());
+
+        super::warm_and_push_identity_to(&state, &base_url);
+
+        *last() = prev;
+        assert!(
+            listener.accept().is_err(),
+            "grace/start went out inside the spacing window"
+        );
+        drop_state(dir);
+    }
+
+    /// #27/#129: a failed cold fetch recorded nothing, so every launch on a
+    /// network that drops extraheadroom.com waited out the fetch timeout on
+    /// the launch-flags call again.
+    #[test]
+    #[serial_test::serial]
+    fn paywall_flag_waits_on_the_network_once_per_install() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let fetches = std::cell::Cell::new(0);
+        let unreachable = || {
+            fetches.set(fetches.get() + 1);
+            None
+        };
+        assert!(!super::paywall_first_flag_or_refresh_with(unreachable));
+        assert!(!super::paywall_first_flag_or_refresh_with(unreachable));
+        assert_eq!(
+            fetches.get(),
+            1,
+            "a later launch waited on the network again"
+        );
+        // The background warmer still lands the flag later, and it wins.
+        super::store_paywall_first_flag(true);
+        assert!(super::paywall_first_flag_or_refresh_with(|| unreachable!()));
+    }
+
     #[test]
     fn request_auth_code_retries_once_past_a_gateway_error() {
         // RUST-J4: a 502 during a headroom-web deploy switchover must not
@@ -6441,6 +6850,33 @@ mod tests {
         }
     }
 
+    /// #141: a read error other than NotFound (ENFILE, EIO) says nothing about
+    /// the bytes on disk. Initializing over it restarted the trial and grace
+    /// clocks from now, with no backup; the load must fail and leave the
+    /// file alone instead.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn unreadable_pricing_state_is_not_reinitialized_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = AuthedTestEnv::new("session-xyz");
+        let path = super::local_state_path();
+        let bytes: &[u8] =
+            br#"{"first_seen_at": "2026-01-01T00:00:00Z", "mismatch_since": "2026-09-01T00:00:00Z"}"#;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::read(&path).is_err(),
+            "file must really be unreadable, or this test proves nothing"
+        );
+
+        assert!(super::load_or_initialize_local_state().is_err());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
     fn sample_account_envelope_body() -> serde_json::Value {
         serde_json::json!({
             "account": {
@@ -6630,6 +7066,16 @@ mod tests {
             chain.chars().count() <= 400,
             "chain must stay bounded: {chain}"
         );
+    }
+
+    /// RUST-78 (0.9.26 event): "tcp connect error <- Bad file descriptor (os
+    /// error 9)" is a macOS content filter's drop, and only that errno is.
+    #[test]
+    fn filter_drop_is_recognized_by_errno() {
+        let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(super::chain_has_ebadf(&ebadf), cfg!(target_os = "macos"));
+        let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        assert!(!super::chain_has_ebadf(&refused));
     }
 
     /// RUST-78: the server-silent alarm's `error` extra is fetch_grace_start's
@@ -7107,6 +7553,59 @@ mod tests {
         account.subscription_active = false;
         let claude = empty_claude_profile(ClaudePlanTier::Max20x);
         assert!(detect_tier_mismatch(&account, &claude, None).is_none());
+    }
+
+    /// #36: an Unknown Claude plan (no bearer after a relaunch or an idle
+    /// hour, or a failed profile fetch) is not evidence the mismatch is gone.
+    /// It used to wipe the grace clock and the latched clamp, so the next
+    /// request restarted a fresh 14-day grace and nobody was ever clamped.
+    #[test]
+    #[serial_test::serial]
+    fn tier_mismatch_clock_survives_an_unknown_claude_plan() {
+        let _env = AuthedTestEnv::new("session-xyz");
+        let since = Utc::now() - Duration::days(20);
+        let clamped_at = since + Duration::days(TIER_MISMATCH_GRACE_DAYS);
+        let mut local = super::load_or_initialize_local_state().unwrap();
+        local.mismatch_since = Some(since);
+        local.mismatch_clamped_at = Some(clamped_at);
+        super::write_local_state(&local).unwrap();
+        let account = active_subscriber(HeadroomSubscriptionTier::Pro);
+        let persisted = || {
+            let local = super::load_or_initialize_local_state().unwrap();
+            (local.mismatch_since, local.mismatch_clamped_at)
+        };
+
+        let unknown = empty_claude_profile(ClaudePlanTier::Unknown);
+        assert!(resolve_tier_mismatch(
+            Some(&account),
+            &unknown,
+            Some(&ClaudePlanTier::Max20x),
+            None,
+            &[]
+        )
+        .is_none());
+        assert_eq!(persisted(), (Some(since), Some(clamped_at)));
+
+        // The next classified request resumes the same clock, still clamped.
+        let max = empty_claude_profile(ClaudePlanTier::Max20x);
+        let resumed = resolve_tier_mismatch(
+            Some(&account),
+            &max,
+            Some(&ClaudePlanTier::Max20x),
+            None,
+            &[],
+        )
+        .expect("mismatch");
+        assert!(resumed.clamped);
+        assert_eq!(persisted(), (Some(since), Some(clamped_at)));
+
+        // A classified plan the paid tier covers clears it for real.
+        let pro = empty_claude_profile(ClaudePlanTier::Pro);
+        assert!(
+            resolve_tier_mismatch(Some(&account), &pro, Some(&ClaudePlanTier::Pro), None, &[])
+                .is_none()
+        );
+        assert_eq!(persisted(), (None, None));
     }
 
     #[test]

@@ -9,6 +9,7 @@ import {
   setupStallBannerLine,
   setupStallNoTrafficMinutes,
   shouldShowStallBannerLine,
+  unroutedAfterReconnect,
   unroutedBody,
   SETUP_STALL_NO_SAVINGS_AFTER_MS,
   SETUP_STALL_NO_SAVINGS_MIN_REQUESTS,
@@ -611,5 +612,32 @@ describe("unroutedBody", () => {
     expect(unroutedBody({ ...base, enabled: false, reapplied: false })).toContain(
       "Reconnect it"
     );
+  });
+});
+
+describe("unroutedAfterReconnect", () => {
+  const client = (clientId: string, enabled: boolean) => ({
+    clientId,
+    name: clientId,
+    activeAt: "2026-09-21T13:07:33Z",
+    enabled,
+    reapplied: enabled,
+  });
+
+  // The alert is once per day, so closing the modal on the first click left
+  // every other switched-off agent unrouted until tomorrow.
+  it("keeps the other switched-off agents listed after one is reconnected", () => {
+    const rest = unroutedAfterReconnect(
+      [client("claude_code", false), client("codex", false)],
+      "claude_code"
+    );
+    expect(rest?.map((entry) => entry.clientId)).toEqual(["codex"]);
+  });
+
+  it("closes once no switched-off agent is left to reconnect", () => {
+    expect(
+      unroutedAfterReconnect([client("claude_code", false), client("codex", true)], "claude_code")
+    ).toBeNull();
+    expect(unroutedAfterReconnect([client("codex", false)], "codex")).toBeNull();
   });
 });

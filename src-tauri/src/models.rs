@@ -259,9 +259,14 @@ pub struct DailySavingsPoint {
     /// build, or while the app wasn't running. Window reduction = saved /
     /// baseline over the covered buckets.
     #[serde(default)]
-    pub output_sampled_tokens_saved: Option<u64>,
+    pub output_sampled_tokens_saved: Option<i64>,
     #[serde(default)]
     pub output_baseline_tokens: Option<u64>,
+    /// `date` is a UTC day: the bucket is a backend rollup (fresh, or archived
+    /// at ingest). False for buckets the local tracker keyed by LOCAL day.
+    /// Decides whether the reported day ends at UTC or local midnight.
+    #[serde(default)]
+    pub utc_keyed: bool,
 }
 
 /// Per-provider (anthropic / openai / unknown) attribution for a single hourly
@@ -316,7 +321,7 @@ pub struct HourlySavingsPoint {
     pub cache_read_cost_usd: Option<f64>,
     /// See `DailySavingsPoint::output_sampled_tokens_saved`.
     #[serde(default)]
-    pub output_sampled_tokens_saved: Option<u64>,
+    pub output_sampled_tokens_saved: Option<i64>,
     #[serde(default)]
     pub output_baseline_tokens: Option<u64>,
     #[serde(default)]
@@ -497,6 +502,10 @@ pub struct RuntimeStatus {
     pub headroom_learn_disabled_reason: Option<String>,
     pub startup_error: Option<String>,
     pub startup_error_hint: Option<String>,
+    /// True while the intercept cannot bind 6767 and no other Headroom instance
+    /// serves it, so no client reaches Headroom. Outranks the pricing banners.
+    #[serde(default)]
+    pub intercept_bind_failed: bool,
     /// Prose hint while the backend is failing certificate verification against
     /// the provider (TLS-inspecting network); `None` once the failures age out.
     #[serde(default)]
@@ -699,6 +708,7 @@ pub struct AppliedPatterns {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RtkTodayStats {
+    /// UTC date: rtk's own day bucket, which cannot be re-cut to local days.
     pub date: String,
     pub saved_tokens: u64,
     pub commands: u64,

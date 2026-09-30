@@ -17,6 +17,10 @@ use crate::state::UpstreamOverride;
 
 const UPSTREAM_KEYCHAIN_SERVICE: &str = "com.extraheadroom.headroom.upstream";
 const UPSTREAM_TOKEN_ACCOUNT: &str = "auth-token";
+/// The user's own `ANTHROPIC_AUTH_TOKEN` (cc-switch, a gateway) that saving a
+/// provider overwrote, put back when the provider is turned off. It is a
+/// credential, so it waits here rather than in launch-profile.json.
+const REPLACED_TOKEN_ACCOUNT: &str = "replaced-auth-token";
 
 static CURRENT: Mutex<Option<UpstreamOverride>> = Mutex::new(None);
 
@@ -33,7 +37,15 @@ pub fn get() -> UpstreamOverride {
 }
 
 pub fn read_token() -> Option<String> {
-    match crate::keychain::read_secret(UPSTREAM_KEYCHAIN_SERVICE, UPSTREAM_TOKEN_ACCOUNT) {
+    read_account(UPSTREAM_TOKEN_ACCOUNT)
+}
+
+pub fn read_replaced_token() -> Option<String> {
+    read_account(REPLACED_TOKEN_ACCOUNT)
+}
+
+fn read_account(account: &str) -> Option<String> {
+    match crate::keychain::read_secret(UPSTREAM_KEYCHAIN_SERVICE, account) {
         Ok(token) => token.filter(|t| !t.is_empty()),
         Err(err) => {
             // Never fatal: a locked or unavailable keychain means the token
@@ -51,6 +63,14 @@ pub fn write_token(token: &str) -> Result<(), String> {
 
 pub fn delete_token() -> Result<(), String> {
     crate::keychain::delete_secret(UPSTREAM_KEYCHAIN_SERVICE, UPSTREAM_TOKEN_ACCOUNT)
+}
+
+pub fn write_replaced_token(token: &str) -> Result<(), String> {
+    crate::keychain::write_secret(UPSTREAM_KEYCHAIN_SERVICE, REPLACED_TOKEN_ACCOUNT, token)
+}
+
+pub fn delete_replaced_token() -> Result<(), String> {
+    crate::keychain::delete_secret(UPSTREAM_KEYCHAIN_SERVICE, REPLACED_TOKEN_ACCOUNT)
 }
 
 #[cfg(test)]

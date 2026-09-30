@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildInitialProxyVerificationRows,
   markIdleProxyVerificationRows,
+  proxyVerificationComplete,
   proxyVerificationRowMessage,
   PROXY_VERIFY_IDLE_AFTER_SECONDS,
   getClaudeConnector,
@@ -356,6 +357,17 @@ describe("idle marking and row order", () => {
     const rows = markIdleProxyVerificationRows([row("codex", "verified")], {});
 
     expect(rows[0].state).toBe("verified");
+  });
+
+  // A dormant second agent must not hold back the proxy_verified beacon and
+  // the persisted marker, or the tray re-asks a healthy install to verify.
+  it("counts verification complete once every row the user uses is verified", () => {
+    expect(proxyVerificationComplete([row("claude_code", "verified"), row("codex", "idle")])).toBe(
+      true
+    );
+    expect(proxyVerificationComplete([row("claude_code", "verified"), row("codex")])).toBe(false);
+    expect(proxyVerificationComplete([row("codex", "idle")])).toBe(false);
+    expect(proxyVerificationComplete([])).toBe(false);
   });
 });
 

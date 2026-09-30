@@ -1,16 +1,20 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { HeadroomPricingStatus, RuntimeStatus } from "./types";
 import {
   __resetRuntimeNotificationState,
   fireUpsellNudge,
+  localDayKey,
   maybeFireUrgentPricingNotifications,
   maybeFireUrgentRuntimeNotification,
 } from "./urgentNotifications";
 
-const { invokeMock, isVisibleMock } = vi.hoisted(() => ({
+const { invokeMock, isVisibleMock, windows } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
   isVisibleMock: vi.fn(),
+  // The calling webview's label, and whether the OTHER Headroom window is on
+  // screen. isVisibleMock is the calling (main) window.
+  windows: { label: "main", otherVisible: false },
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -18,7 +22,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({ isVisible: isVisibleMock }),
+  getCurrentWindow: () => ({ label: windows.label, isVisible: isVisibleMock }),
+  getAllWindows: async () => [
+    { isVisible: isVisibleMock },
+    { isVisible: async () => windows.otherVisible },
+  ],
 }));
 
 function installStorage(initial: Record<string, string> = {}) {
@@ -30,10 +38,18 @@ function installStorage(initial: Record<string, string> = {}) {
       setItem: vi.fn((key: string, value: string) => {
         values.set(key, value);
       }),
+      removeItem: vi.fn((key: string) => {
+        values.delete(key);
+      }),
     },
   });
   return values;
 }
+
+afterEach(() => {
+  windows.label = "main";
+  windows.otherVisible = false;
+});
 
 function makePricing(
   overrides: Partial<HeadroomPricingStatus> = {}
@@ -148,6 +164,54 @@ describe("maybeFireUrgentPricingNotifications", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
+  it("fires only from the main webview, and not while any Headroom window is on screen", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+    const status = makePricing({ needsAuthentication: true });
+
+    // The launcher webview polls pricing too; it must never notify.
+    windows.label = "launcher";
+    await maybeFireUrgentPricingNotifications(status);
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    // Main is hidden but the launcher is on screen (onboarding): stay quiet.
+    windows.label = "main";
+    windows.otherVisible = true;
+    await maybeFireUrgentPricingNotifications(status);
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    windows.otherVisible = false;
+    await maybeFireUrgentPricingNotifications(status);
+    expect(invokeMock).toHaveBeenCalledOnce();
+  });
+
+  it("fires once when two overlapping ticks race for the same day slot", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    invokeMock.mockResolvedValue(undefined);
+    installStorage();
+    const status = makePricing({ needsAuthentication: true });
+
+    await Promise.all([
+      maybeFireUrgentPricingNotifications(status),
+      maybeFireUrgentPricingNotifications(status),
+    ]);
+
+    expect(invokeMock).toHaveBeenCalledOnce();
+  });
+
+  it("hands the day slot back when the notification fails", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    invokeMock.mockRejectedValueOnce(new Error("notifications disabled"));
+    const store = installStorage();
+    const status = makePricing({ needsAuthentication: true });
+
+    await maybeFireUrgentPricingNotifications(status);
+    expect(store.has("headroom_urgent_needs_auth_date")).toBe(false);
+
+    await maybeFireUrgentPricingNotifications(status);
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+
   it("fires the needs-auth notification with the signin action", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
@@ -216,7 +280,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
 
   it("does not repeat a notification already fired today", async () => {
     isVisibleMock.mockResolvedValue(false);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayKey(new Date());
     installStorage({ headroom_urgent_needs_auth_date: today });
 
     await maybeFireUrgentPricingNotifications(
@@ -229,7 +293,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
   it("records today's date after sending", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayKey(new Date());
 
     await maybeFireUrgentPricingNotifications(
       makePricing({ needsAuthentication: true })
@@ -368,7 +432,7 @@ describe("maybeFireUrgentPricingNotifications", () => {
   it("fires the generic reminder at most once per day", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage({
-      headroom_urgent_nudge_date: new Date().toISOString().slice(0, 10),
+      headroom_urgent_nudge_date: localDayKey(new Date()),
     });
 
     await maybeFireUrgentPricingNotifications(
@@ -560,21 +624,42 @@ describe("maybeFireUrgentPricingNotifications", () => {
 });
 
 describe("maybeFireUrgentRuntimeNotification", () => {
+  let nowSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    nowSpy = vi.spyOn(Date, "now").mockReturnValue(0);
+  });
   afterEach(() => {
+    nowSpy.mockRestore();
     invokeMock.mockReset();
     isVisibleMock.mockReset();
     __resetRuntimeNotificationState();
   });
 
-  it("fires when the runtime drops after having been reachable", async () => {
+  // One status reading taken at `at` ms.
+  async function readAt(at: number, runtime: RuntimeStatus): Promise<void> {
+    nowSpy.mockReturnValue(at);
+    await maybeFireUrgentRuntimeNotification(runtime);
+  }
+
+  // Two readings spanning the 45s confirm window: enough to fire when the
+  // reading itself warrants it, so the quiet cases below are quiet for their
+  // own reason, not for want of a second reading.
+  async function readSustained(runtime: RuntimeStatus): Promise<void> {
+    await readAt(0, runtime);
+    await readAt(45_000, runtime);
+  }
+
+  it("fires when the runtime stays down after having been reachable", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
     // A healthy boot first, so this isn't the first-boot cold-start window.
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: true }));
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false })
-    );
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(0, makeRuntime({ running: false }));
+    expect(invokeMock).not.toHaveBeenCalled();
+    await readAt(30_000, makeRuntime({ running: false }));
+    expect(invokeMock).not.toHaveBeenCalled();
+    await readAt(45_000, makeRuntime({ running: false }));
 
     expect(invokeMock).toHaveBeenCalledWith("show_notification", {
       title: "Headroom stopped running",
@@ -583,12 +668,80 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     });
   });
 
+  it("does not fire on a single down reading", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(30_000, makeRuntime({ running: false }));
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("does not fire on a down gap shorter than 45s", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(10_000, makeRuntime({ running: false }));
+    await readAt(54_999, makeRuntime({ running: false }));
+    // Self-healed (a watchdog respawn, a post-wake /readyz lag).
+    await readAt(60_000, makeRuntime({ running: true }));
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("recovery resets the down streak", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(10_000, makeRuntime({ running: false }));
+    await readAt(40_000, makeRuntime({ running: true }));
+    // 50s after the first down reading, but only 30s into this streak.
+    await readAt(60_000, makeRuntime({ running: false }));
+    await readAt(90_000, makeRuntime({ running: false }));
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    await readAt(105_000, makeRuntime({ running: false }));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "show_notification",
+      expect.objectContaining({ action: "runtime" })
+    );
+  });
+
+  it("a watchdog restart in progress ends the down streak", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(10_000, makeRuntime({ running: false }));
+    await readAt(40_000, makeRuntime({ running: false, starting: true }));
+    await readAt(70_000, makeRuntime({ running: false }));
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("a reading gap across sleep starts a new streak", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(10_000, makeRuntime({ running: false }));
+    // Asleep for ten minutes: the first reading after wake is a new streak.
+    await readAt(610_000, makeRuntime({ running: false }));
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    await readAt(655_000, makeRuntime({ running: false }));
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
   it("stays quiet during the first-boot cold-start window", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
     // Never reachable yet, no hard error: the /readyz warmup window.
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: false }));
+    await readSustained(makeRuntime({ running: false }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -596,27 +749,23 @@ describe("maybeFireUrgentRuntimeNotification", () => {
   it("fires on first boot once the grace window elapses", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
-    const nowSpy = vi.spyOn(Date, "now");
 
-    nowSpy.mockReturnValue(0);
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: false }));
+    await readAt(0, makeRuntime({ running: false }));
+    await readAt(150_000, makeRuntime({ running: false }));
     expect(invokeMock).not.toHaveBeenCalled();
 
-    nowSpy.mockReturnValue(5 * 60 * 1000 + 1);
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: false }));
+    await readAt(5 * 60 * 1000 + 1, makeRuntime({ running: false }));
     expect(invokeMock).toHaveBeenCalledWith(
       "show_notification",
       expect.objectContaining({ action: "runtime" })
     );
-
-    nowSpy.mockRestore();
   });
 
   it("surfaces the startup error when one is present", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
+    await readSustained(
       makeRuntime({ running: false, startupError: "port 6767 busy" })
     );
 
@@ -631,7 +780,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
+    await readSustained(
       makeRuntime({
         running: false,
         startupError: "never opened port 6768 within 60000ms",
@@ -651,8 +800,8 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     installStorage();
 
     // Reachable once, so the cold-start grace is not what is suppressing it.
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: true }));
-    await maybeFireUrgentRuntimeNotification(
+    await readAt(0, makeRuntime({ running: true }));
+    await readSustained(
       makeRuntime({
         running: false,
         startupError: "os error 10048",
@@ -669,9 +818,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false, starting: true })
-    );
+    await readSustained(makeRuntime({ running: false, starting: true }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -680,9 +827,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false, paused: true })
-    );
+    await readSustained(makeRuntime({ running: false, paused: true }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -691,8 +836,20 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ installed: false, running: false })
+    await readSustained(makeRuntime({ installed: false, running: false }));
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("does not fire while the pricing gate has bypassed the runtime", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    // Reachable first, so neither the first-boot grace nor a hard error is
+    // what keeps it quiet: a gated account stops the backend on purpose.
+    await readAt(0, makeRuntime({ running: true }));
+    await readSustained(
+      makeRuntime({ running: false, proxyReachable: false, bypassed: true })
     );
 
     expect(invokeMock).not.toHaveBeenCalled();
@@ -702,21 +859,19 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(true);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false })
-    );
+    await readAt(0, makeRuntime({ running: true }));
+    await readSustained(makeRuntime({ running: false }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("does not repeat within the same day", async () => {
     isVisibleMock.mockResolvedValue(false);
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayKey(new Date());
     installStorage({ headroom_urgent_runtime_down_date: today });
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false })
-    );
+    await readAt(0, makeRuntime({ running: true }));
+    await readSustained(makeRuntime({ running: false }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -775,6 +930,40 @@ describe("fireUpsellNudge", () => {
     vi.setSystemTime(new Date(2026, 0, 15, 12, 0, 0)); // +3h < 6h gap
     expect(await fireUpsellNudge("t", "b")).toBe(false);
     expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fires once when two effect runs overlap", async () => {
+    const store = installStorage();
+    invokeMock.mockResolvedValue(undefined);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    const results = await Promise.all([
+      fireUpsellNudge("t", "b"),
+      fireUpsellNudge("t", "b"),
+    ]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(invokeMock).toHaveBeenCalledOnce();
+    expect(store.get(KEY)).toMatch(/^2026-01-15\|1\|/);
+  });
+
+  it("restores the previous state when the notification fails", async () => {
+    const previous = `2026-01-14|2|${new Date(2026, 0, 14, 20, 0, 0).getTime()}`;
+    const store = installStorage({ [KEY]: previous });
+    invokeMock.mockRejectedValueOnce(new Error("notifications disabled"));
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    expect(await fireUpsellNudge("t", "b")).toBe(false);
+    expect(store.get(KEY)).toBe(previous);
+  });
+
+  it("never fires from the launcher webview", async () => {
+    installStorage();
+    invokeMock.mockResolvedValue(undefined);
+    windows.label = "launcher";
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0));
+    expect(await fireUpsellNudge("t", "b")).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("resets the next local day", async () => {

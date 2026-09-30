@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getAllWindows, getCurrentWindow } from "@tauri-apps/api/window";
 
 import type { HeadroomPricingStatus, RuntimeStatus } from "./types";
 
@@ -46,7 +46,7 @@ export async function maybeFireUrgentPricingNotifications(
   // appended to the blocked notice so the wall is felt, not just announced.
   unsavedLabel: string | null = null
 ): Promise<void> {
-  if (await isWindowVisible()) return;
+  if (!(await shouldNotifyInBackground())) return;
 
   if (status.needsAuthentication) {
     await fireOncePerDay(
@@ -166,10 +166,26 @@ const RUNTIME_DOWN_GRACE_MS = 5 * 60 * 1000;
 let everReachable = false;
 let firstDownSeenAt: number | null = null;
 
-// Test-only: reset the cross-call first-boot state.
+// A down reading is not yet an outage: the watchdog respawns a dead backend
+// within ~15s, and sleep/wake leaves a gap before /readyz answers again. The
+// hidden window polls every 30s, so firing on one reading raised "stopped
+// running" over gaps that heal on their own. Fire only once consecutive down
+// readings span RUNTIME_DOWN_CONFIRM_MS. Any not-down reading (running, a
+// restart in progress via `starting`, paused, bypassed, port handover) ends
+// the streak, and so does a reading gap longer than
+// RUNTIME_DOWN_MAX_READING_GAP_MS: a down reading from before a sleep says
+// nothing about the one after it.
+const RUNTIME_DOWN_CONFIRM_MS = 45 * 1000;
+const RUNTIME_DOWN_MAX_READING_GAP_MS = 3 * 60 * 1000;
+let downStreakSince: number | null = null;
+let lastDownSeenAt: number | null = null;
+
+// Test-only: reset the cross-call first-boot and down-streak state.
 export function __resetRuntimeNotificationState(): void {
   everReachable = false;
   firstDownSeenAt = null;
+  downStreakSince = null;
+  lastDownSeenAt = null;
 }
 
 export async function maybeFireUrgentRuntimeNotification(
@@ -180,26 +196,51 @@ export async function maybeFireUrgentRuntimeNotification(
     firstDownSeenAt = null;
   }
 
-  if (await isWindowVisible()) return;
-
+  // `bypassed` is a deliberate stop (see RuntimeStatus.bypassed): the pricing
+  // gate tore the backend down and its own "optimization is off" notice
+  // already tells the user, so "stopped running" here would be a false alarm.
+  // `starting` covers a watchdog respawn in progress.
   const runtimeDown =
-    runtime.installed && !runtime.running && !runtime.starting && !runtime.paused;
-  if (!runtimeDown) return;
+    runtime.installed &&
+    !runtime.running &&
+    !runtime.starting &&
+    !runtime.paused &&
+    !runtime.bypassed &&
+    // A restart handing the port over to itself is not a crash. The
+    // intercept publishes this hint within 15s of an update relaunch and
+    // clears it as soon as the old instance's sockets drain, so notifying
+    // over it fires "Headroom stopped running" whose own body says there is
+    // nothing to do -- which is how the channel gets muted (0.9.10 -> 0.9.14
+    // Windows update). The in-app banner still shows it.
+    !runtime.startupErrorHint?.includes("still being released");
 
-  // A restart handing the port over to itself is not a crash. The intercept
-  // publishes this hint within 15s of an update relaunch and clears it as soon
-  // as the old instance's sockets drain, so notifying over it fires "Headroom
-  // stopped running" whose own body says there is nothing to do -- which is
-  // how the channel gets muted (0.9.10 -> 0.9.14 Windows update). The in-app
-  // banner still shows it.
-  if (runtime.startupErrorHint?.includes("still being released")) return;
+  // Tracked before the visibility check so readings taken while a window is
+  // showing still count toward (or end) the streak.
+  const now = Date.now();
+  if (!runtimeDown) {
+    downStreakSince = null;
+    lastDownSeenAt = null;
+    return;
+  }
+  if (
+    downStreakSince === null ||
+    lastDownSeenAt === null ||
+    now - lastDownSeenAt > RUNTIME_DOWN_MAX_READING_GAP_MS
+  ) {
+    downStreakSince = now;
+  }
+  lastDownSeenAt = now;
+  const streakStart = downStreakSince;
+
+  if (!(await shouldNotifyInBackground())) return;
 
   const hasHardError = !!(runtime.startupError || runtime.startupErrorHint);
   if (!everReachable && !hasHardError) {
-    const now = Date.now();
     if (firstDownSeenAt === null) firstDownSeenAt = now;
     if (now - firstDownSeenAt < RUNTIME_DOWN_GRACE_MS) return;
   }
+
+  if (now - streakStart < RUNTIME_DOWN_CONFIRM_MS) return;
 
   const body = runtime.startupErrorHint
     ? `Headroom isn't running. ${runtime.startupErrorHint}`
@@ -218,7 +259,7 @@ export async function maybeFireUrgentRuntimeNotification(
 // Local day, not UTC: a UTC key flips the throttle window mid-afternoon for US
 // users, letting two nudges land in one local day (and training people to
 // disable notifications on the channel urgent alerts share).
-function localDayKey(now: Date): string {
+export function localDayKey(now: Date): string {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
     now.getDate()
   ).padStart(2, "0")}`;
@@ -243,6 +284,7 @@ export async function fireUpsellNudge(
   title: string,
   body: string
 ): Promise<boolean> {
+  if (!isNotifyingWebview()) return false;
   const now = new Date();
   const hour = now.getHours();
   if (hour >= QUIET_START_HOUR || hour < QUIET_END_HOUR) return false;
@@ -262,12 +304,13 @@ export async function fireUpsellNudge(
   if (count >= UPSELL_MAX_PER_DAY) return false;
   if (lastMs && nowMs - lastMs < UPSELL_MIN_GAP_MS) return false;
 
+  localStorage.setItem(UPSELL_NUDGE_KEY, `${today}|${count + 1}|${nowMs}`);
   try {
     await invoke("show_notification", { title, body, action: "billing" });
-    localStorage.setItem(UPSELL_NUDGE_KEY, `${today}|${count + 1}|${nowMs}`);
     return true;
   } catch {
     // best-effort
+    releaseSlot(UPSELL_NUDGE_KEY, raw);
     return false;
   }
 }
@@ -280,19 +323,48 @@ async function fireOncePerDay(
   action: string
 ): Promise<boolean> {
   const today = localDayKey(new Date());
-  if (localStorage.getItem(storageKey) === today) return false;
+  const previous = localStorage.getItem(storageKey);
+  if (previous === today) return false;
+  // Claim the slot before awaiting (as fireUpsellNudge does): two overlapping
+  // ticks, a poll and a pricing-refreshed event, both read the old value
+  // across the await and both fired.
+  localStorage.setItem(storageKey, today);
   try {
     await invoke("show_notification", { title, body, action });
-    localStorage.setItem(storageKey, today);
     return true;
   } catch {
     // best-effort
+    releaseSlot(storageKey, previous);
     return false;
   }
 }
 
-async function isWindowVisible(): Promise<boolean> {
-  return getCurrentWindow()
-    .isVisible()
-    .catch(() => true);
+// A failed show hands the slot back so the next tick can retry.
+function releaseSlot(storageKey: string, previous: string | null): void {
+  if (previous === null) localStorage.removeItem(storageKey);
+  else localStorage.setItem(storageKey, previous);
+}
+
+// Both webviews poll pricing (and the launcher polls runtime status during
+// install), so only main notifies. Two webviews racing one localStorage day
+// slot could both pass it. Read synchronously: the label never changes.
+function isNotifyingWebview(): boolean {
+  return getCurrentWindow().label === "main";
+}
+
+// Background notices are redundant while the user can see Headroom, and that
+// means ANY Headroom window: checking only the calling one let the hidden main
+// webview notify over the onboarding launcher. A failed probe counts as
+// visible so a broken bridge can't spam.
+export async function shouldNotifyInBackground(): Promise<boolean> {
+  if (!isNotifyingWebview()) return false;
+  try {
+    const windows = await getAllWindows();
+    const visible = await Promise.all(
+      windows.map((w) => w.isVisible().catch(() => true))
+    );
+    return !visible.some(Boolean);
+  } catch {
+    return false;
+  }
 }

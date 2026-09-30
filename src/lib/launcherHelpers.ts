@@ -281,6 +281,15 @@ export function markIdleProxyVerificationRows(
   return marked.sort((a, b) => Number(a.state === "idle") - Number(b.state === "idle"));
 }
 
+/// Whether every client the user actually uses has been verified. Idle rows
+/// are out of the test (see ProxyVerificationRowState): a dormant agent can
+/// never turn green, so counting it withheld proxy_verified from every
+/// multi-agent machine. All-idle is not complete: nothing was verified.
+export function proxyVerificationComplete(rows: ProxyVerificationRowState[]): boolean {
+  const tested = rows.filter((row) => row.state !== "idle");
+  return tested.length > 0 && tested.every((row) => row.state === "verified");
+}
+
 /// What the row says while it waits. It has to distinguish "your tool is
 /// still holding the old settings" from "you have not opened it" -- a support
 /// case (2026-09-08) sat 2h42m on a copy that could not. It does NOT count

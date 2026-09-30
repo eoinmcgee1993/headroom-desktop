@@ -33,6 +33,24 @@ describe("estimateCostSavingsUsd", () => {
     expect(estimateCostSavingsUsd("gpt-4o-mini", 1_000_000)).toBeCloseTo(0.15);
     expect(estimateCostSavingsUsd("gpt-4o", 1_000_000)).toBeCloseTo(2.5);
     expect(estimateCostSavingsUsd("gemini-2.5-pro", 1_000_000)).toBeCloseTo(1.25);
+  });
+
+  it("prices Opus 4.5, dotted ids and GPT-5 variants at their own input rates", () => {
+    // Opus 4.5 was the first $5/M Opus; dotted (OpenRouter style) ids too.
+    expect(estimateCostSavingsUsd("claude-opus-4-5-20251101", 1_000_000)).toBeCloseTo(5);
+    expect(estimateCostSavingsUsd("anthropic/claude-opus-4.6", 1_000_000)).toBeCloseTo(5);
+    expect(estimateCostSavingsUsd("anthropic/claude-opus-4.1", 1_000_000)).toBeCloseTo(15);
+    // GPT-5 rates as in litellm's price table.
+    expect(estimateCostSavingsUsd("gpt-5", 1_000_000)).toBeCloseTo(1.25);
+    expect(estimateCostSavingsUsd("gpt-5-codex", 1_000_000)).toBeCloseTo(1.25);
+    expect(estimateCostSavingsUsd("gpt-5-mini", 1_000_000)).toBeCloseTo(0.25);
+    expect(estimateCostSavingsUsd("gpt-5.1-codex-mini", 1_000_000)).toBeCloseTo(0.25);
+    expect(estimateCostSavingsUsd("gpt-5-nano", 1_000_000)).toBeCloseTo(0.05);
+    expect(estimateCostSavingsUsd("gpt-5.2-codex", 1_000_000)).toBeCloseTo(1.75);
+    expect(estimateCostSavingsUsd("openai/gpt-5.4", 1_000_000)).toBeCloseTo(2.5);
+    expect(estimateCostSavingsUsd("gpt-5.4-mini", 1_000_000)).toBeCloseTo(0.75);
+    expect(estimateCostSavingsUsd("gpt-5.4-nano", 1_000_000)).toBeCloseTo(0.2);
+    expect(estimateCostSavingsUsd("gpt-5.5", 1_000_000)).toBeCloseTo(5);
     expect(estimateCostSavingsUsd("gemini-2.0-flash", 1_000_000)).toBeCloseTo(0.1);
   });
 });

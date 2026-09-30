@@ -56,6 +56,11 @@ impl FileLogger {
         let Ok(mut guard) = self.file.lock() else {
             return;
         };
+        // Re-check under the lock: a rotator that passed the check above while
+        // another rotated would otherwise delete the log that one just rotated.
+        if fs::metadata(&self.path).map_or(true, |m| m.len() < MAX_LOG_BYTES) {
+            return;
+        }
         // Drop the current handle before renaming so Windows can't hold it open;
         // also necessary on macOS for log inspection while the app runs.
         *guard = None;
@@ -574,17 +579,48 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
 /// Replace the user's home directory with `~` wherever it appears.
 pub(crate) fn scrub_home(msg: &str) -> String {
     match dirs::home_dir() {
-        Some(home) => {
-            let home = home.to_string_lossy();
-            let home = home.trim_end_matches('/');
-            if home.is_empty() {
-                msg.to_string()
-            } else {
-                msg.replace(home, "~")
-            }
-        }
+        Some(home) => scrub_home_path(msg, &home.to_string_lossy()),
         None => msg.to_string(),
     }
+}
+
+fn scrub_home_path(msg: &str, home: &str) -> String {
+    let home = home.trim_end_matches(['/', '\\']);
+    if home.is_empty() {
+        return msg.to_string();
+    }
+    if !home.contains('\\') {
+        return msg.replace(home, "~");
+    }
+    // Windows: a Python repr or a `{:?}` doubles every backslash, some tools
+    // write forward slashes, and pip's normcase lowercases the whole path. The
+    // native spelling alone missed all three and sent the username (Sentry
+    // 140801318, 141261580).
+    [
+        home.replace('\\', r"\\"),
+        home.to_string(),
+        home.replace('\\', "/"),
+    ]
+    .iter()
+    .fold(msg.to_string(), |out, form| {
+        replace_ascii_ci(&out, form, "~")
+    })
+}
+
+/// `str::replace`, ignoring ASCII case. ASCII lowercasing keeps every byte
+/// offset, so a match in the lowered text splices the original at the same spot.
+fn replace_ascii_ci(haystack: &str, needle: &str, with: &str) -> String {
+    let lower = haystack.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut last = 0;
+    for (at, _) in lower.match_indices(&needle) {
+        out.push_str(&haystack[last..at]);
+        out.push_str(with);
+        last = at + needle.len();
+    }
+    out.push_str(&haystack[last..]);
+    out
 }
 
 /// Last gate before an event leaves the process: drop what is environmental,
@@ -786,7 +822,15 @@ fn os_failure_fingerprint(msg: &str) -> Option<[String; 2]> {
     }
     let before = msg[..at].trim_end();
     let head = before.rfind(": ").map_or(before, |cut| &before[..cut]);
-    Some([head.trim().to_string(), format!("os error {code}")])
+    // Digits out, as `warning_repeat` does for unfingerprinted text: the head
+    // often names an atomic_write temp file (`.tmp.<pid>.<n>`), which made
+    // every retry of one stuck write a new issue past the daily throttle.
+    let head: String = head
+        .trim()
+        .chars()
+        .filter(|c| !c.is_ascii_digit())
+        .collect();
+    Some([head, format!("os error {code}")])
 }
 
 impl Log for FileLogger {
@@ -910,6 +954,63 @@ mod tests {
             "pre-update snapshot: cannot create ~/config/pre-update"
         );
         assert_eq!(ja[1], "os error 161");
+
+        // atomic_write's temp name carries the pid and a counter, so without
+        // the digit strip every retry of one stuck write was a new issue and
+        // slipped the once-per-day warning throttle.
+        let first = f("failed to persist usage-counters.json: writing ~/config/usage-counters.json.tmp.47276.4810: Permission denied (os error 13)").unwrap();
+        let retry = f("failed to persist usage-counters.json: writing ~/config/usage-counters.json.tmp.47276.4811: Permission denied (os error 13)").unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(first[1], "os error 13");
+    }
+
+    #[test]
+    fn scrub_home_catches_escaped_slashed_and_lowercased_windows_home() {
+        let home = r"C:\Users\alice";
+        let scrub = |msg: &str| super::scrub_home_path(msg, home);
+        // pip's OSError repr doubles every backslash (Sentry 140801318).
+        assert_eq!(
+            scrub(r"ERROR: [WinError 32] 'C:\\Users\\alice\\AppData\\x.whl'"),
+            r"ERROR: [WinError 32] '~\\AppData\\x.whl'"
+        );
+        assert_eq!(scrub(r"c:\users\alice\x"), r"~\x");
+        assert_eq!(scrub("C:/Users/alice/x"), "~/x");
+        assert_eq!(scrub(r"C:\Users\alice\x"), r"~\x");
+        assert_eq!(scrub(r"C:\Users\bob\x"), r"C:\Users\bob\x");
+    }
+
+    #[test]
+    fn concurrent_rotation_keeps_the_just_rotated_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("headroom-desktop.log");
+        let backup = path.with_extension("log.old");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(super::MAX_LOG_BYTES)
+            .unwrap();
+        let logger = std::sync::Arc::new(super::FileLogger {
+            file: std::sync::Mutex::new(None),
+            path: path.clone(),
+            records_since_rotate_check: std::sync::atomic::AtomicU64::new(0),
+        });
+        // Hold the lock so the second rotator passes the unlocked size check
+        // and then waits, as it does behind a rotation already in progress.
+        let guard = logger.file.lock().unwrap();
+        let second = {
+            let logger = logger.clone();
+            std::thread::spawn(move || logger.rotate_if_needed())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // The first rotation lands while the second waits.
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::write(&path, b"fresh\n").unwrap();
+        drop(guard);
+        second.join().unwrap();
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().len(),
+            super::MAX_LOG_BYTES,
+            "the second rotation replaced the rotated log"
+        );
     }
 
     use super::skip_sentry;

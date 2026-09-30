@@ -3,6 +3,7 @@ import {
   authMethodLabel,
   cachePricingStatus,
   claudePlanLabel,
+  createPricingStatusOrder,
   formatPercentValue,
   formatRemainingDays,
   PRICING_CACHE_KEY,
@@ -208,5 +209,74 @@ describe("pricing cache localStorage round-trip", () => {
     expect(readCachedPricing()).toEqual({});
 
     getItemSpy.mockRestore();
+  });
+});
+
+describe("createPricingStatusOrder", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("drops a poll issued before a sign-in that landed while it was in flight", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-29T12:00:00Z"));
+    const order = createPricingStatusOrder();
+    const poll = deferred<HeadroomPricingStatus>();
+    const pending = order.fetch(() => poll.promise);
+
+    vi.setSystemTime(new Date("2026-09-29T12:00:01Z"));
+    order.wrote();
+    poll.resolve(makePricingStatus({ authenticated: false }));
+
+    expect(await pending).toBeNull();
+  });
+
+  it("still lands polls after the clock steps back past the last write", async () => {
+    vi.useFakeTimers();
+    // Signed in while the clock ran an hour fast, then NTP stepped it back.
+    vi.setSystemTime(new Date("2026-09-29T13:00:00Z"));
+    const order = createPricingStatusOrder();
+    order.wrote();
+    vi.setSystemTime(new Date("2026-09-29T12:00:00Z"));
+
+    const upgraded = makePricingStatus({ authenticated: true });
+    expect(await order.fetch(async () => upgraded)).toBe(upgraded);
+  });
+
+  it("lands the refresh after a plan change over an older in-flight poll", async () => {
+    const order = createPricingStatusOrder();
+    const poll = deferred<HeadroomPricingStatus>();
+    const olderPoll = order.fetch(() => poll.promise);
+
+    const newPlan = makePricingStatus({ authenticated: true });
+    const refresh = order.fetch(async () => newPlan, true);
+    expect(refresh).not.toBeNull();
+    expect(await refresh).toBe(newPlan);
+
+    // The poll read the account before the change committed.
+    poll.resolve(makePricingStatus({ authenticated: false }));
+    expect(await olderPoll).toBeNull();
+
+    // Its slot is free again for the next scheduled poll.
+    const next = makePricingStatus({ authenticated: true });
+    expect(await order.fetch(async () => next)).toBe(next);
+  });
+
+  it("skips a poll while another is in flight", async () => {
+    const order = createPricingStatusOrder();
+    const poll = deferred<HeadroomPricingStatus>();
+    const first = order.fetch(() => poll.promise);
+
+    expect(order.fetch(async () => makePricingStatus())).toBeNull();
+    poll.resolve(makePricingStatus());
+    expect(await first).not.toBeNull();
   });
 });

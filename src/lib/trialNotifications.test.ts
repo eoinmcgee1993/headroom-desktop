@@ -2,10 +2,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { HeadroomAccountProfile, HeadroomPricingStatus } from "./types";
 import { maybeFireTrialNotifications } from "./trialNotifications";
+import { localDayKey } from "./urgentNotifications";
 
-const { invokeMock, isVisibleMock } = vi.hoisted(() => ({
+const { invokeMock, isVisibleMock, windows } = vi.hoisted(() => ({
   invokeMock: vi.fn(),
   isVisibleMock: vi.fn(),
+  // The calling webview's label, and whether the OTHER Headroom window is on
+  // screen. isVisibleMock is the calling (main) window.
+  windows: { label: "main", otherVisible: false },
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -13,7 +17,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 vi.mock("@tauri-apps/api/window", () => ({
-  getCurrentWindow: () => ({ isVisible: isVisibleMock }),
+  getCurrentWindow: () => ({ label: windows.label, isVisible: isVisibleMock }),
+  getAllWindows: async () => [
+    { isVisible: isVisibleMock },
+    { isVisible: async () => windows.otherVisible },
+  ],
 }));
 
 function installStorage(initial: Record<string, string> = {}) {
@@ -25,10 +33,20 @@ function installStorage(initial: Record<string, string> = {}) {
       setItem: vi.fn((key: string, value: string) => {
         values.set(key, value);
       }),
+      removeItem: vi.fn((key: string) => {
+        values.delete(key);
+      }),
     },
   });
   return values;
 }
+
+afterEach(() => {
+  windows.label = "main";
+  windows.otherVisible = false;
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+});
 
 function hoursAgo(n: number): string {
   return new Date(Date.now() - n * 60 * 60 * 1000).toISOString();
@@ -115,6 +133,51 @@ describe("maybeFireTrialNotifications", () => {
       await maybeFireTrialNotifications(status);
 
       expect(invokeMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("single notifying webview", () => {
+    it("fires only from the main webview, and not while any Headroom window is on screen", async () => {
+      isVisibleMock.mockResolvedValue(false);
+      installStorage();
+      const status = makeStatus({ localGraceEndsAt: hoursFromNow(15.5) });
+
+      windows.label = "launcher";
+      await maybeFireTrialNotifications(status);
+      expect(invokeMock).not.toHaveBeenCalled();
+
+      windows.label = "main";
+      windows.otherVisible = true;
+      await maybeFireTrialNotifications(status);
+      expect(invokeMock).not.toHaveBeenCalled();
+
+      windows.otherVisible = false;
+      await maybeFireTrialNotifications(status);
+      expect(invokeMock).toHaveBeenCalledOnce();
+    });
+
+    it("fires once when two overlapping ticks race for the same slot", async () => {
+      isVisibleMock.mockResolvedValue(false);
+      invokeMock.mockResolvedValue(undefined);
+      installStorage();
+      const grace = makeStatus({ localGraceEndsAt: hoursFromNow(15.5) });
+      const trial = makeStatus({
+        localGraceActive: false,
+        authenticated: true,
+        account: makeTrialAccount(daysFromNow(2)),
+      });
+
+      await Promise.all([
+        maybeFireTrialNotifications(grace),
+        maybeFireTrialNotifications(grace),
+      ]);
+      expect(invokeMock).toHaveBeenCalledOnce();
+
+      await Promise.all([
+        maybeFireTrialNotifications(trial),
+        maybeFireTrialNotifications(trial),
+      ]);
+      expect(invokeMock).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -319,6 +382,65 @@ describe("maybeFireTrialNotifications", () => {
       });
     });
 
+    it("says the trial ends today when it ends later the same local day", async () => {
+      isVisibleMock.mockResolvedValue(false);
+      installStorage();
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 0, 15, 9, 0, 0)); // 9 AM local
+      const status = makeStatus({
+        localGraceActive: false,
+        authenticated: true,
+        account: makeTrialAccount(new Date(2026, 0, 15, 15, 0, 0).toISOString()),
+      });
+
+      await maybeFireTrialNotifications(status);
+
+      expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+        title: "Headroom Trial Ending Soon",
+        body: "Your Headroom trial ends today. Upgrade now to keep optimization enabled.",
+        action: "billing",
+      });
+    });
+
+    it("says tomorrow for a trial ending tomorrow afternoon", async () => {
+      isVisibleMock.mockResolvedValue(false);
+      installStorage();
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 0, 15, 9, 0, 0)); // 30 hours before the end
+      const status = makeStatus({
+        localGraceActive: false,
+        authenticated: true,
+        account: makeTrialAccount(new Date(2026, 0, 16, 15, 0, 0).toISOString()),
+      });
+
+      await maybeFireTrialNotifications(status);
+
+      expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+        title: "Headroom Trial Ending Soon",
+        body: "Your Headroom trial ends tomorrow. Upgrade today to keep optimization enabled.",
+        action: "billing",
+      });
+    });
+
+    it("throttles by local calendar day, not UTC day", async () => {
+      vi.stubEnv("TZ", "America/Los_Angeles");
+      isVisibleMock.mockResolvedValue(false);
+      vi.useFakeTimers();
+      // The morning notice already fired on Jan 15. 6 PM Pacific is 02:00 UTC
+      // on Jan 16, but it is still Jan 15 for the user.
+      vi.setSystemTime(new Date(2026, 0, 15, 18, 0, 0));
+      installStorage({ headroom_trial_expiry_notif_date: "2026-01-15" });
+      const status = makeStatus({
+        localGraceActive: false,
+        authenticated: true,
+        account: makeTrialAccount(new Date(2026, 0, 17, 12, 0, 0).toISOString()),
+      });
+
+      await maybeFireTrialNotifications(status);
+
+      expect(invokeMock).not.toHaveBeenCalled();
+    });
+
     it("does not fire when more than 3 days remain", async () => {
       isVisibleMock.mockResolvedValue(false);
       installStorage();
@@ -349,7 +471,7 @@ describe("maybeFireTrialNotifications", () => {
 
     it("does not fire a second time on the same calendar day", async () => {
       isVisibleMock.mockResolvedValue(false);
-      const today = new Date().toISOString().slice(0, 10);
+      const today = localDayKey(new Date());
       installStorage({ headroom_trial_expiry_notif_date: today });
       const status = makeStatus({
         localGraceActive: false,
@@ -365,7 +487,7 @@ describe("maybeFireTrialNotifications", () => {
     it("records today's date in localStorage after sending", async () => {
       isVisibleMock.mockResolvedValue(false);
       installStorage();
-      const today = new Date().toISOString().slice(0, 10);
+      const today = localDayKey(new Date());
       const status = makeStatus({
         localGraceActive: false,
         authenticated: true,

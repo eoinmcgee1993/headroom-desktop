@@ -71,7 +71,7 @@ const STALL_TITLE = "Headroom hasn't saved anything yet";
 
 /// The drift branch fires on installs that HAVE saved before, so the shared
 /// "yet" title would be factually wrong there.
-function stallTitle(kind: SetupStallKind): string {
+export function stallTitle(kind: SetupStallKind): string {
   return kind === "drift" ? "Headroom has stopped saving" : STALL_TITLE;
 }
 
@@ -406,6 +406,17 @@ export function unroutedBody(client: UnroutedClient): string {
   return client.enabled
     ? `Headroom has reconnected ${client.name}. Quit and reopen it to pick that up.`
     : `${client.name}'s connector is off, so nothing was optimized. Reconnect it to resume saving.`;
+}
+
+/// What the reconnect modal still shows after one agent is reconnected, or
+/// null to close it. The alert fires once per day, so closing on the first
+/// click left every other switched-off agent unrouted until tomorrow.
+export function unroutedAfterReconnect(
+  clients: UnroutedClient[],
+  reconnectedClientId: string
+): UnroutedClient[] | null {
+  const rest = clients.filter((client) => client.clientId !== reconnectedClientId);
+  return rest.some((client) => !client.enabled) ? rest : null;
 }
 
 /// Once per local day, on its own slot so this and the stall alert cannot

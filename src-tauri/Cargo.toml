@@ -1,6 +1,6 @@
 [package]
 name = "headroom-desktop"
-version = "0.9.26"
+version = "0.9.27"
 description = "Headroom v1 local-first LLM optimization tray app"
 authors = ["Codex"]
 license = "MIT"
@@ -26,7 +26,12 @@ log = { version = "0.4", features = ["std"] }
 os_info = "3.10"
 parking_lot = "0.12"
 rand = "0.9"
-reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# rustls-tls-native-roots: trust the OS store (and SSL_CERT_FILE) on top of the
+# bundled webpki roots, so a TLS-inspecting network's corporate root works.
+# Loading it costs ~130ms per build on macOS, so loopback clients opt out with
+# .tls_built_in_root_certs(false) (every_reqwest_client_decides_about_the_system_proxy).
+# system-proxy is macOS-only, in the target table below.
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 serde = { version = "=1.0.228", features = ["derive"] }
@@ -55,10 +60,17 @@ serial_test = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6"
+# system-proxy: honor the System Settings proxy, not only *_PROXY env; via the
+# shared hyper-util feature it also reaches the updater's reqwest 0.13. Not on
+# Windows: hyper-util parses HKCU ProxyServer raw, and the values real machines
+# carry there (v2rayN `socks=127.0.0.1:10808`, `socks4://...`, see
+# registry_proxy_env_overrides) become an unusable proxy for every client,
+# where going direct worked. Linux has no system reader to enable.
+reqwest = { version = "=0.12.28", default-features = false, features = ["system-proxy"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
-windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_DataExchange"] }
 # Windows-only: std/tokio set SO_REUSEADDR on Unix but not here, so rebinding
 # the intercept port over a previous instance's draining TIME_WAIT sockets
 # needs the option set by hand before bind. See `reuse_bound_std_listener`.
@@ -72,3 +84,7 @@ socket2 = "0.6"
 # build needs no openssl headers. Declared per-target rather than once with
 # every feature, so Windows and macOS builds do not drag in dbus/zbus.
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+# Already in every Linux build through gtk/tao; named here for
+# `glib::unix_signal_add`, which turns SIGTERM/SIGHUP/SIGINT into a normal quit
+# (see `route_signals_to_exit`).
+glib = "0.18"

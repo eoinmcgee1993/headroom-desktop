@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import type { HeadroomPricingStatus } from "./types";
+import { localDayKey, shouldNotifyInBackground } from "./urgentNotifications";
 
 // Remaining-time thresholds at which to fire grace period notifications.
 const GRACE_HOURS_LEFT_THRESHOLDS = [
@@ -16,10 +16,7 @@ const TRIAL_EXPIRY_DATE_KEY = "headroom_trial_expiry_notif_date";
 export async function maybeFireTrialNotifications(
   status: HeadroomPricingStatus
 ): Promise<void> {
-  const windowVisible = await getCurrentWindow()
-    .isVisible()
-    .catch(() => true);
-  if (windowVisible) return;
+  if (!(await shouldNotifyInBackground())) return;
 
   if (status.localGraceActive && !status.authenticated) {
     await maybeFireGraceNotification(status);
@@ -57,35 +54,53 @@ async function maybeFireGraceNotification(
       ? `Less than ${hoursLeft + 1} hour(s) left. Create a Headroom account to start your 7-day trial.`
       : `${hoursLeft} hours left in your 72-hour access window. Create an account to unlock a 7-day trial.`;
 
-  await sendNotification("Start Your Headroom Trial", body, "signup");
+  // Claim the threshold before awaiting so an overlapping tick can't send it
+  // twice. sendNotification never throws, so the claim always stood anyway.
   localStorage.setItem(GRACE_THRESHOLD_KEY, String(nextIndex));
+  await sendNotification("Start Your Headroom Trial", body, "signup");
 }
 
 async function maybeFireTrialExpiryNotification(
   trialEndsAt: string | null,
   usageDaysLeft: number | null
 ): Promise<void> {
-  // Usage-day trial: the server counts saving days, not the calendar.
-  const daysLeft =
-    usageDaysLeft ??
-    (trialEndsAt
-      ? Math.ceil((new Date(trialEndsAt).getTime() - Date.now()) / (24 * 60 * 60 * 1000))
-      : null);
-  if (daysLeft == null) return;
-  if (daysLeft > (usageDaysLeft != null ? 2 : 3) || daysLeft <= 0) return;
+  const now = new Date();
+  let daysLeft: number;
+  if (usageDaysLeft != null) {
+    // Usage-day trial: the server counts saving days, not the calendar.
+    daysLeft = usageDaysLeft;
+    if (daysLeft <= 0 || daysLeft > 2) return;
+  } else {
+    const endsAt = trialEndsAt ? new Date(trialEndsAt) : null;
+    // Missing, unparseable or already over.
+    if (!endsAt || !(endsAt.getTime() > now.getTime())) return;
+    // Local calendar days, not ceil(hours left / 24), which called a trial
+    // ending at 3 PM today "tomorrow". Math.round absorbs a DST hour.
+    daysLeft = Math.round((startOfLocalDay(endsAt) - startOfLocalDay(now)) / DAY_MS);
+    if (daysLeft > 3) return;
+  }
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDayKey(now);
   if (localStorage.getItem(TRIAL_EXPIRY_DATE_KEY) === today) return;
 
   const body =
     usageDaysLeft != null
       ? `Your Headroom trial ends after ${daysLeft} more day${daysLeft === 1 ? "" : "s"} of use. Upgrade to keep optimization enabled.`
-      : daysLeft === 1
-        ? "Your Headroom trial ends tomorrow. Upgrade today to keep optimization enabled."
-        : `Your Headroom trial ends in ${daysLeft} days. Upgrade to keep optimization enabled.`;
+      : daysLeft === 0
+        ? "Your Headroom trial ends today. Upgrade now to keep optimization enabled."
+        : daysLeft === 1
+          ? "Your Headroom trial ends tomorrow. Upgrade today to keep optimization enabled."
+          : `Your Headroom trial ends in ${daysLeft} days. Upgrade to keep optimization enabled.`;
 
-  await sendNotification("Headroom Trial Ending Soon", body, "billing");
+  // Claimed before awaiting, as in the grace path above.
   localStorage.setItem(TRIAL_EXPIRY_DATE_KEY, today);
+  await sendNotification("Headroom Trial Ending Soon", body, "billing");
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function startOfLocalDay(d: Date): number {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
 }
 
 async function sendNotification(

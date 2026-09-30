@@ -118,8 +118,8 @@ pub fn gated_bypass_bytes() -> u64 {
 
 /// Account-level gate (trial ended / sign-in required), set by
 /// `AppState::apply_pricing_gate_status`. Unlike the Claude flags it is
-/// honored by EVERY client: OpenCode and Grok keep Python alive (their
-/// third-party upstreams cannot be forwarded direct) and used to sail
+/// honored by EVERY client: OpenCode and Grok keep Python alive (it owns
+/// their third-party upstream routing) and used to sail
 /// through it fully optimized after the wall. Plan-usage metering stays
 /// per product; only the account wall is shared.
 static ACCOUNT_GATE: AtomicBool = AtomicBool::new(false);
@@ -163,6 +163,12 @@ static BACKEND_DOWN_SINCE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 static CODEX_INFLIGHT_503_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 static CODEX_STREAM_NO_TERMINAL_LAST_REPORTED: AtomicU64 = AtomicU64::new(0);
 const CODEX_RECONNECT_REPORT_MIN_INTERVAL_SECS: u64 = 60;
+/// Consecutive failed Codex prompts; any success resets it. See
+/// `note_codex_prompt_outcome`.
+static CODEX_PROMPT_FAILURE_STREAK: AtomicU64 = AtomicU64::new(0);
+/// Codex retries a 5xx or dropped stream about five times before it gives up on
+/// a turn, so ten in a row is at least one turn the user saw fail.
+const CODEX_FAILURE_STREAK_REPORT_AT: u64 = 10;
 /// Last-reported epoch-seconds per (client, status) for `report_upstream_error`:
 /// one Sentry event per error class per interval. A client looping on a 4xx
 /// (RUST-BT: one host, 472 events of the same 400 in 19h, 4/min in bursts)
@@ -175,8 +181,9 @@ static UPSTREAM_ERROR_LAST_REPORTED: Mutex<Vec<((&'static str, u16), u64)>> =
 const UPSTREAM_ERROR_REPORT_MIN_INTERVAL_SECS: u64 = 300;
 /// Epoch-second of the last backend 502 whose body said the provider's TLS
 /// certificate could not be verified (a corporate proxy / antivirus re-signing
-/// HTTPS). Read by `runtime_status` to show the user what to do: the failure
-/// is otherwise invisible to them (Claude Code shows a generic 502) and to us
+/// HTTPS), or of a bypass forward that failed its own handshake that way.
+/// Read by `runtime_status` to show the user what to do: the failure is
+/// otherwise invisible to them (Claude Code shows a generic 502) and to us
 /// (5xx is not captured). 0 = never seen.
 static UPSTREAM_TLS_INTERCEPTION_LAST_SEEN: AtomicU64 = AtomicU64::new(0);
 const UPSTREAM_TLS_INTERCEPTION_HINT_TTL_SECS: u64 = 15 * 60;
@@ -194,6 +201,17 @@ fn is_tls_interception_error(body: &[u8]) -> bool {
     contains(body, b"CERTIFICATE_VERIFY_FAILED")
         || contains(body, b"self-signed certificate in certificate chain")
         || contains(body, b"self signed certificate in certificate chain")
+}
+
+/// The same diagnosis for the bypass forwarder's own reqwest send: rustls
+/// found no trusted root for the provider's chain, which with the OS store
+/// loaded means an inspection root the machine does not trust either. The
+/// rustls error sits a few sources down (reqwest > hyper > io::Error).
+fn is_untrusted_certificate_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(err), |e| e.source()).any(|e| {
+        e.to_string()
+            .contains("invalid peer certificate: UnknownIssuer")
+    })
 }
 
 /// User-facing hint while certificate-verification failures are recent (within
@@ -520,6 +538,7 @@ struct CodexTerminalReader<R> {
     inner: R,
     tail: Vec<u8>,
     saw_terminal: bool,
+    failed: bool,
 }
 
 impl<R> CodexTerminalReader<R> {
@@ -528,6 +547,7 @@ impl<R> CodexTerminalReader<R> {
             inner,
             tail: Vec::new(),
             saw_terminal: false,
+            failed: false,
         }
     }
 
@@ -549,14 +569,22 @@ impl<R> CodexTerminalReader<R> {
         ];
         const TAIL_BYTES: usize = 32;
 
+        // The subset of terminals that end the turn in an error Codex shows
+        // the user (a bare "System error" in the ChatGPT app).
+        const FAILURE_EVENTS: &[&[u8]] = &[b"response.failed", b"event: error"];
+
         let mut combined = Vec::with_capacity(self.tail.len() + bytes.len());
         combined.extend_from_slice(&self.tail);
         combined.extend_from_slice(bytes);
-        self.saw_terminal = TERMINAL_EVENTS.iter().any(|needle| {
-            combined
-                .windows(needle.len())
-                .any(|window| window == *needle)
-        });
+        let hit = |needles: &[&[u8]]| {
+            needles.iter().any(|needle| {
+                combined
+                    .windows(needle.len())
+                    .any(|window| window == *needle)
+            })
+        };
+        self.saw_terminal = hit(TERMINAL_EVENTS);
+        self.failed = self.saw_terminal && hit(FAILURE_EVENTS);
         let keep_from = combined.len().saturating_sub(TAIL_BYTES);
         self.tail.clear();
         self.tail.extend_from_slice(&combined[keep_from..]);
@@ -564,6 +592,10 @@ impl<R> CodexTerminalReader<R> {
 
     fn saw_terminal(&self) -> bool {
         self.saw_terminal
+    }
+
+    fn failed(&self) -> bool {
+        self.failed
     }
 }
 
@@ -670,6 +702,49 @@ pub(crate) enum HeldPortVerdict {
     /// A live foreign listener. Does not clear on its own, and we can name it,
     /// so this is the one the user can actually act on.
     Foreign { name: String, pid: u32 },
+    /// A live listener we could not name: the probe's connect was accepted,
+    /// but `listener_process` found nobody. Another user's socket does this
+    /// (lsof and ss only see the caller's own processes), and so does a
+    /// Windows host whose policy blocks netstat. Never `Draining`: that would
+    /// turn on `SO_REUSEADDR`, which on Windows binds beside a live listener.
+    Unidentified,
+}
+
+/// What answered a connect to 127.0.0.1 on the probed port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PortProbe {
+    /// Nothing accepted the connect within the timeout.
+    Refused,
+    /// A listener answered `GET /health` with HTTP. Says nothing about WHO:
+    /// see `held_by_our_other_window`.
+    Http,
+    /// A listener accepted the connect but did not answer with HTTP.
+    NonHttp,
+}
+
+/// The `bind_error` holder for `HeldPortVerdict::Unidentified`, worded for the
+/// ` is held by ` arm of `state::intercept_bind_hint`.
+const UNIDENTIFIED_HOLDER: &str =
+    "a program Headroom cannot identify, such as another signed-in user's Headroom";
+
+/// The `bind_error` holder for a `HeldPortVerdict::Foreign` that is another
+/// copy of Headroom this same user runs (see
+/// `tool_manager::pid_is_same_user_headroom_desktop`), the one holder the bind
+/// loop leaves the clients wired to. `state::intercept_bind_hint` keys on it.
+pub(crate) const OTHER_HEADROOM_COPY: &str = "another copy of Headroom";
+
+/// Whether the port's holder is another window of this same Headroom, run by
+/// this same user: the one holder a second window may stand beside as a
+/// spectator, because clients reaching it are still optimized for this user.
+///
+/// An HTTP answer alone proves only that something speaks HTTP. Bazarr's
+/// default port is 6767, and another signed-in user's Headroom answers exactly
+/// like ours; calling either a spectator told this user their traffic was
+/// being optimized while it went to that process, credentials included, and
+/// skipped the diagnosis that names the holder. `is_twin` shells out, so it
+/// only runs once the probe has answered.
+fn held_by_our_other_window(probe: PortProbe, is_twin: impl FnOnce() -> bool) -> bool {
+    probe == PortProbe::Http && is_twin()
 }
 
 /// Whether a verdict makes a `SO_REUSEADDR` rebind safe.
@@ -685,13 +760,48 @@ pub(crate) fn verdict_permits_reuse(verdict: &HeldPortVerdict) -> bool {
     matches!(verdict, HeldPortVerdict::Draining)
 }
 
+/// Whether a verdict unwires every client until the port is ours again.
+///
+/// Any live holder that is not this user's Headroom does: every wired client's
+/// requests fail there, and its bearer and prompts go to that program. The
+/// exception is another copy of Headroom this same user runs (`is_own_copy`,
+/// which shells out, so it only runs for a named holder): it manages the same
+/// client files, and unwiring them would fight it. `Draining` and `Stuck` have
+/// nothing listening, and a draining update relaunch must never unwire.
+pub(crate) fn verdict_unwires_clients(
+    verdict: &HeldPortVerdict,
+    is_own_copy: impl FnOnce(u32) -> bool,
+) -> bool {
+    match verdict {
+        HeldPortVerdict::Unidentified => true,
+        HeldPortVerdict::Foreign { pid, .. } => !is_own_copy(*pid),
+        HeldPortVerdict::Draining | HeldPortVerdict::Stuck => false,
+    }
+}
+
+/// Counts the bind loop's consecutive stranger verdicts
+/// (`verdict_unwires_clients`) in `streak` and says whether to act on this
+/// one. A single diagnosis is not enough: one failed `ps` or netstat makes
+/// this user's second copy look like a stranger, and a holder the reclaim just
+/// killed can still be listed, so only a second verdict in a row unwires.
+fn stranger_confirmed(streak: &mut u32, stranger: bool) -> bool {
+    *streak = if stranger {
+        streak.saturating_add(1)
+    } else {
+        0
+    };
+    *streak >= 2
+}
+
 pub(crate) fn classify_held_port(
     occupant: Option<(String, u32)>,
+    probe: PortProbe,
     elapsed: std::time::Duration,
     drain_grace: std::time::Duration,
 ) -> HeldPortVerdict {
     match occupant {
         Some((name, pid)) => HeldPortVerdict::Foreign { name, pid },
+        None if probe != PortProbe::Refused => HeldPortVerdict::Unidentified,
         None if elapsed < drain_grace => HeldPortVerdict::Draining,
         None => HeldPortVerdict::Stuck,
     }
@@ -752,6 +862,8 @@ pub fn spawn(
                 // Headroom desktop instance (updater relaunch), which nothing
                 // else ever clears -- see reclaim_stranded_intercept_holder.
                 let mut reclaim_attempted = false;
+                // Consecutive stranger verdicts; see `stranger_confirmed`.
+                let mut stranger_streak = 0u32;
                 let mut orphans_reaped = false;
                 // A restart -- the updater relaunch, or the "Restart now"
                 // button -- starts the new process while the old one still
@@ -811,13 +923,16 @@ pub fn spawn(
                         Ok(()) => return,
                         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                             consecutive_failures += 1;
-                            // If /health responds over HTTP, an existing
-                            // Headroom proxy owns the port (single-instance
-                            // plugin should normally prevent this, but a
-                            // crashed or still-exiting prior process can leave
-                            // it held) — benign, just wait for it to go away.
-                            // Otherwise the port is foreign; escalate once.
-                            if probe_existing_intercept().await {
+                            // If our other window serves the port (the
+                            // single-instance plugin should normally prevent
+                            // this, but a crashed or still-exiting prior
+                            // process can leave it held) it is benign, just
+                            // wait for it to go away. Anything else, HTTP or
+                            // not, goes through the diagnosis below.
+                            let probe = probe_port(INTERCEPT_PORT).await;
+                            if held_by_our_other_window(probe, || {
+                                crate::tool_manager::port_held_by_desktop_twin(INTERCEPT_PORT)
+                            }) {
                                 // Name the real cause. `bind_error` is only
                                 // ever cleared by a successful bind and this
                                 // arm never binds, so whatever an earlier
@@ -836,6 +951,7 @@ pub fn spawn(
                                 *bind_error.lock() = Some(format!(
                                     "port {INTERCEPT_PORT} is served by another Headroom instance"
                                 ));
+                                stranger_streak = 0;
                                 // Clients still reach A Headroom, so this is
                                 // benign for traffic -- but nothing in this
                                 // loop ever clears it, and a second instance
@@ -961,14 +1077,17 @@ pub fn spawn(
                                         log::info!(
                                             "[proxy_intercept] reclaimed stranded instance on port {INTERCEPT_PORT}; retrying bind"
                                         );
-                                        continue;
-                                    }
-                                    if !orphans_reaped {
+                                    } else if !orphans_reaped {
                                         orphans_reaped = true;
-                                        if reap_orphans_holding_intercept() {
-                                            continue;
-                                        }
+                                        reap_orphans_holding_intercept();
                                     }
+                                    // Diagnose on the next pass, never on
+                                    // `probe`: it predates the reclaim, which
+                                    // can kill our stranded instance without
+                                    // the port coming free inside its 3s
+                                    // (Windows TIME_WAIT, RUST-7M), and that
+                                    // stale probe read as a live stranger.
+                                    continue;
                                 }
                                 // Who actually holds it decides whether this
                                 // is worth a report. `listener_process` only
@@ -991,6 +1110,7 @@ pub fn spawn(
                                 let key = os_error_key(&e);
                                 let verdict = classify_held_port(
                                     occupant,
+                                    probe,
                                     launched_at.elapsed(),
                                     DRAIN_GRACE,
                                 );
@@ -1001,7 +1121,31 @@ pub fn spawn(
                                 if verdict_permits_reuse(&verdict) {
                                     reuse_addr = true;
                                 }
+                                let stranger = verdict_unwires_clients(
+                                    &verdict,
+                                    crate::tool_manager::pid_is_same_user_headroom_desktop,
+                                );
+                                let confirmed = stranger_confirmed(&mut stranger_streak, stranger);
+                                // Every wired client still sends this user's
+                                // bearer and prompts to that listener. Unwire
+                                // them; `run` wires them back once the port
+                                // is ours.
+                                if confirmed
+                                    && crate::client_adapters::unwire_clients_for_port_holder()
+                                {
+                                    log::warn!(
+                                        "[proxy_intercept] unwired clients from the holder of port {INTERCEPT_PORT}"
+                                    );
+                                }
                                 match verdict {
+                                    // Unconfirmed, so the banner keeps saying
+                                    // we are identifying the holder rather
+                                    // than that the tools connect directly.
+                                    _ if stranger && !confirmed => {
+                                        log::info!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} looks held by a stranger ({verdict:?}); confirming on the next retry ({e})"
+                                        );
+                                    }
                                     HeldPortVerdict::Draining => {
                                         // Still a real outage from the user's
                                         // side, so the banner stays -- but it
@@ -1076,12 +1220,20 @@ pub fn spawn(
                                     HeldPortVerdict::Foreign { name, pid } => {
                                         // Actionable: the user can quit this.
                                         // Reclaim already declined it, so it
-                                        // is not one of ours.
+                                        // is not this install. Not unwiring
+                                        // means it is another copy of this
+                                        // user's Headroom, and the hint must
+                                        // not say the tools connect directly.
                                         log::warn!(
                                             "[proxy_intercept] port {INTERCEPT_PORT} is held by {name} (pid {pid}); retrying in 15s ({e})"
                                         );
+                                        let holder = if stranger {
+                                            name.as_str()
+                                        } else {
+                                            OTHER_HEADROOM_COPY
+                                        };
                                         *bind_error.lock() = Some(format!(
-                                            "port {INTERCEPT_PORT} is held by {name} (pid {pid})"
+                                            "port {INTERCEPT_PORT} is held by {holder} (pid {pid})"
                                         ));
                                         if reported_errors.insert(format!("foreign:{key}:{name}")) {
                                             sentry::with_scope(
@@ -1111,6 +1263,37 @@ pub fn spawn(
                                                     sentry::capture_message(
                                                         &format!(
                                                             "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} held by {name}; retrying)"
+                                                        ),
+                                                        sentry::Level::Error,
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    }
+                                    HeldPortVerdict::Unidentified => {
+                                        log::warn!(
+                                            "[proxy_intercept] port {INTERCEPT_PORT} has a live listener that could not be identified; retrying in 15s ({e})"
+                                        );
+                                        *bind_error.lock() = Some(format!(
+                                            "port {INTERCEPT_PORT} is held by {UNIDENTIFIED_HOLDER}"
+                                        ));
+                                        if reported_errors.insert(format!("unidentified:{key}")) {
+                                            sentry::with_scope(
+                                                |scope| {
+                                                    scope.set_extra(
+                                                        "os_error", e.to_string().into());
+                                                    scope.set_extra(
+                                                        "probe", format!("{probe:?}").into());
+                                                    scope.set_fingerprint(Some(&[
+                                                        "proxy_intercept_bind_failed",
+                                                        "unidentified",
+                                                        key.as_str(),
+                                                    ]));
+                                                },
+                                                || {
+                                                    sentry::capture_message(
+                                                        &format!(
+                                                            "proxy_intercept bind failed: {key} (port {INTERCEPT_PORT} held by a listener that could not be identified; retrying)"
                                                         ),
                                                         sentry::Level::Error,
                                                     );
@@ -1215,10 +1398,11 @@ fn reap_orphans_holding_intercept() -> bool {
 /// `SO_REUSEADDR` on Windows also lets a bind succeed over a socket that is
 /// actively LISTENING, so using it unconditionally would let a second Headroom
 /// bind 6767 alongside the first and split traffic between two proxies -- the
-/// `probe_existing_intercept` branch relies on that bind failing. `Draining`
-/// is only reached when `listener_process` found nothing in LISTENING state,
-/// which rules out both another Headroom and a foreign holder, leaving the
-/// kernel's TIME_WAIT reservation as the only thing this can bind over.
+/// spectator branch relies on that bind failing. `Draining` is only reached
+/// when `listener_process` found nothing in LISTENING state AND the probe's
+/// connect was refused, which rules out both another Headroom and a foreign
+/// holder, leaving the kernel's TIME_WAIT reservation as the only thing this
+/// can bind over.
 #[cfg(windows)]
 fn reuse_bound_std_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -1267,6 +1451,12 @@ async fn run(
     // Serving again: clear whatever the previous attempt recorded so a
     // recovered port stops showing a stale cause in the UI.
     *bind_error.lock() = None;
+    // And wire back any clients the bind loop unwired from another holder of
+    // this port. Off this single-threaded runtime, which must accept; tests
+    // bind other ports and never reach it.
+    if bind_addr.port() == INTERCEPT_PORT {
+        std::thread::spawn(crate::client_adapters::rewire_clients_after_port_reclaimed);
+    }
 
     loop {
         match listener.accept().await {
@@ -1329,6 +1519,10 @@ async fn handle(
     // port (and may switch to a fallback) when the proxy spawn runs, which
     // happens after this thread is already accepting; reading per-connection
     // means existing clients pick up the chosen port without restarting.
+    // Unselected means tool_manager has not vetted the port yet, and whatever
+    // listens on 6768 (Orca, a dev server) is not known to be our backend:
+    // treat it as down. Loaded before the port, see `backend_port::selected`.
+    let backend_selected = backend_port::selected();
     let backend_addr: SocketAddr = ([127, 0, 0, 1], backend_port::get()).into();
     // Read only through the end of the HTTP headers. We only need headers to
     // capture the bearer token, and forwarding early avoids deadlocks with
@@ -1432,8 +1626,7 @@ async fn handle(
     // backend's OpenAI handler honours `x-headroom-base-url`, so grok traffic
     // gets the full compression pipeline and the correct upstream from the
     // shared backend instance. Stamped BEFORE the bypass branches below so the
-    // no-direct-upstream 503 guard covers grok too - the direct forwarder
-    // only knows the Anthropic/OpenAI bases, and forwarding an xAI key to
+    // direct forwarder sends grok there too: forwarding an xAI key to
     // api.openai.com is the exact misroute this connector was blocked on.
     if is_grok {
         let upstream = grok_upstream_header(extract_bearer(&buf).as_deref());
@@ -1507,6 +1700,27 @@ async fn handle(
         // in the backend's `handle_openai_responses_ws` (covers OSS-direct users
         // too). Remove this line once the bundled package includes that fix.
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
+        // A thread created on Codex's built-in `openai` provider (before setup,
+        // or resumed from before it) reaches us through the root
+        // `openai_base_url`, and that provider speaks WebSocket: the transport
+        // our own `headroom` provider turns off (`supports_websockets = false`).
+        // Its failures were invisible: the 101 is no error, and a socket closed
+        // mid-turn left Codex retrying into a bare "System error" (user 3277,
+        // 2026-09-29). 426 is Codex's own signal to move the session to HTTPS
+        // at once, without retrying, so every Codex turn takes the transport
+        // `splice_with_codex_capture` watches.
+        if request_has_header(&buf, "upgrade")
+            && parsed_head
+                .as_ref()
+                .is_some_and(|head| head.path.starts_with("/v1/responses"))
+        {
+            let _ = client
+                .write_all(
+                    b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return;
+        }
     }
 
     // When the pricing gate has bypassed Headroom, the Python proxy on
@@ -1515,26 +1729,14 @@ async fn handle(
     // forwarder picks the upstream from the credential: Claude Code to its
     // configured upstream (Anthropic by default), API-key Codex to
     // api.openai.com, ChatGPT-subscription Codex to chatgpt.com's Codex
-    // backend (the only place its OAuth token is valid).
-    // OpenCode's transport plugin routes third-party providers (Google, custom
-    // gateways) here with the real upstream in `x-headroom-base-url`. The
-    // direct forwarder only knows the Anthropic/OpenAI bases, so forwarding
-    // such a request would send it (and its credential) to the wrong vendor -
-    // the exact grok-class misroute. 503-retry instead; these windows are
-    // short because the backend is kept alive whenever OpenCode is enabled.
-    let is_plugin_routed = request_has_header(&buf, "x-headroom-base-url");
-
+    // backend (the only place its OAuth token is valid). OpenCode's transport
+    // plugin routes third-party providers (Google, custom gateways) here with
+    // the real upstream in `x-headroom-base-url`, and the forwarder sends them
+    // there, like Grok. They used to get 503-retry, which a watchdog give-up
+    // (bypass for as long as the backend stays down) turned into an outage.
     if bypass.load(Ordering::Acquire) {
-        // ChatGPT-authenticated Codex goes through the direct forwarder too
-        // now: it knows chatgpt.com's Codex backend, so the OAuth token lands
-        // where it is valid instead of being answered 503. Only plugin-routed
-        // third-party providers still have no correct direct upstream.
-        if is_plugin_routed {
-            write_retryable_service_unavailable(&mut client).await;
-        } else {
-            record_gated_bypass(&buf);
-            forward_direct_to_anthropic(client, buf, &upstream_base).await;
-        }
+        record_gated_bypass(&buf);
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     }
 
@@ -1608,7 +1810,12 @@ async fn handle(
     };
 
     // Forward to the headroom backend.
-    let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
+    let backend = if backend_selected {
+        TcpStream::connect(backend_addr).await.ok()
+    } else {
+        None
+    };
+    let Some(mut backend) = backend else {
         // Backend down or mid-restart (crash, gate transition, post-update
         // cold boot — which deliberately holds the bypass flags off for up to
         // 10 minutes): fall back per-request to the native provider. That now
@@ -1622,13 +1829,7 @@ async fn handle(
         // info, not warn: warn would ship to Sentry per request; the watchdog's
         // capture_watchdog_give_up already reports genuine down episodes.
         note_backend_reachability(false, backend_addr);
-        if is_plugin_routed {
-            // See the bypass branch above: no correct direct upstream exists
-            // for plugin-routed third-party providers.
-            write_retryable_service_unavailable(&mut client).await;
-        } else {
-            forward_direct_to_anthropic(client, buf, &upstream_base).await;
-        }
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     };
     note_backend_reachability(true, backend_addr);
@@ -1694,8 +1895,12 @@ async fn handle(
     if is_models_fetch {
         splice_with_models_lite_rewrite(client, backend).await;
     } else if is_codex && !is_opencode && !is_grok {
-        let req_path = parse_request_head(&buf).map(|p| p.path).unwrap_or_default();
-        splice_with_codex_capture(client, backend, &codex_slot, &req_path).await;
+        let req_path = parsed_head
+            .as_ref()
+            .map(|p| p.path.clone())
+            .unwrap_or_default();
+        let prompt = parsed_head.as_ref().is_some_and(is_prompt_request_head);
+        splice_with_codex_capture(client, backend, &codex_slot, &req_path, prompt).await;
     } else {
         // Same shape as copy_bidirectional, split so the backend->client half
         // can stamp traffic liveness for the watchdog.
@@ -1971,6 +2176,7 @@ async fn splice_with_codex_capture(
     mut backend: TcpStream,
     codex_slot: &CodexRateLimitSlot,
     req_path: &str,
+    prompt: bool,
 ) {
     let (mut client_rd, mut client_wr) = client.split();
     let (mut backend_rd, mut backend_wr) = backend.split();
@@ -2018,11 +2224,13 @@ async fn splice_with_codex_capture(
         if client_wr.write_all(&head).await.is_err() {
             return;
         }
+        let status = parse_response_status(&head);
+        let mut error_body = Vec::new();
         // On an upstream error status, peek one bounded chunk of the error
         // body for a Sentry report and forward it immediately. Codex error
         // responses are small JSON (not the SSE stream), so the streaming
         // happy path never takes this branch.
-        if let Some(status) = parse_response_status(&head).filter(is_reportable_upstream_error) {
+        if let Some(status) = status.filter(is_reportable_upstream_error) {
             let mut chunk = vec![0u8; MAX_ERROR_BODY];
             let n = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, backend_rd.read(&mut chunk))
                 .await
@@ -2035,6 +2243,10 @@ async fn splice_with_codex_capture(
                 return;
             }
             report_upstream_error("codex", status, req_path, &head, &chunk);
+            if let Some(end) = find_header_end(&head) {
+                error_body.extend_from_slice(&head[(end + 4).min(head.len())..]);
+            }
+            error_body.extend_from_slice(&chunk);
         }
         let monitor_terminal = is_codex_sse_response(&head, req_path);
         let mut streamed = CodexTerminalReader::new(backend_rd);
@@ -2061,10 +2273,94 @@ async fn splice_with_codex_capture(
         {
             report_codex_stream_without_terminal(req_path, copy_result.unwrap_or(0));
         }
+        if prompt {
+            note_codex_prompt_outcome(
+                status,
+                streamed.failed(),
+                client_gone.load(Ordering::Relaxed),
+                req_path,
+                &error_body,
+            );
+        }
         let _ = client_wr.shutdown().await;
     };
 
     tokio::join!(upstream, downstream);
+}
+
+/// Whether a Codex prompt failed in a way the user saw: `Some(true)` failed,
+/// `Some(false)` succeeded, `None` says nothing either way. 402/429 are the
+/// user's plan, which Codex names itself; a response that never started
+/// because the client left first is a cancel.
+fn codex_prompt_failed(
+    status: Option<u16>,
+    stream_failed: bool,
+    client_gone: bool,
+) -> Option<bool> {
+    match status {
+        Some(200..=299) => Some(stream_failed),
+        Some(402 | 429) => None,
+        Some(_) => Some(true),
+        None if client_gone => None,
+        None => Some(true),
+    }
+}
+
+/// Report a Codex user who cannot get any prompt through. Codex retries a 5xx
+/// or a dropped stream on its own and, once that budget is spent, shows a bare
+/// "System error" in the ChatGPT app. Each of those classes stays out of Sentry
+/// per request on purpose (5xx is provider noise, see `report_upstream_error`;
+/// an in-band `response.failed` rides a 200), which left a user whose every
+/// prompt failed with no trace at all (user 3277, 2026-09-29: one RUST-KC,
+/// then nothing). An unbroken run is the signal: report once when the run
+/// reaches the threshold, and the next success re-arms it.
+fn note_codex_prompt_outcome(
+    status: Option<u16>,
+    stream_failed: bool,
+    client_gone: bool,
+    req_path: &str,
+    error_body: &[u8],
+) {
+    match codex_prompt_failed(status, stream_failed, client_gone) {
+        None => return,
+        Some(false) => {
+            CODEX_PROMPT_FAILURE_STREAK.store(0, Ordering::Relaxed);
+            return;
+        }
+        Some(true) => {}
+    }
+    if CODEX_PROMPT_FAILURE_STREAK.fetch_add(1, Ordering::AcqRel) + 1
+        != CODEX_FAILURE_STREAK_REPORT_AT
+    {
+        return;
+    }
+    let kind = match status {
+        None => "no_response",
+        Some(200..=299) => "stream_error",
+        Some(_) => "status",
+    };
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("codex_failure_kind", kind);
+            if let Some(status) = status {
+                scope.set_tag("upstream_status", status);
+            }
+            scope.set_tag("upstream_request_path", req_path);
+            if !error_body.is_empty() {
+                scope.set_tag("upstream_error_shape", codex_error_shape_tag(error_body));
+                scope.set_extra("error_body", codex_error_summary(error_body).into());
+            }
+            scope.set_fingerprint(Some(&["codex-prompts-failing", kind]));
+        },
+        || {
+            sentry::capture_message(
+                &format!(
+                    "Codex prompts failing: {CODEX_FAILURE_STREAK_REPORT_AT} in a row ({kind})"
+                ),
+                sentry::Level::Warning,
+            );
+        },
+    );
 }
 
 /// Bound on the error-body slice we peek for a Sentry report (and forward).
@@ -2103,8 +2399,13 @@ fn report_codex_stream_without_terminal(req_path: &str, streamed_bytes: u64) {
 /// Parse the status code from an HTTP response head's status line
 /// (`HTTP/1.1 400 Bad Request` -> `400`).
 fn parse_response_status(head: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(head).ok()?;
-    let first = text.split("\r\n").next()?;
+    // Status line only: `head` may carry over-read body bytes (or, in the
+    // sniffer, a partial header) ending mid-character.
+    let end = head
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(head.len());
+    let first = std::str::from_utf8(&head[..end]).ok()?;
     first.split_whitespace().nth(1)?.parse().ok()
 }
 
@@ -2467,7 +2768,7 @@ fn codex_error_shape_tag(body: &[u8]) -> String {
 }
 
 /// Classify an Anthropic invalid_request 400 by signature, so the tool-search
-/// history 400s stop hiding inside the generic RUST-BT bucket. Substring match
+/// and tool_use/tool_result adjacency 400s stop hiding inside the generic RUST-BT bucket. Substring match
 /// on the raw bytes because these stream as SSE (JSON parse fails). Returns a
 /// fixed, content-free classification (never the offending tool name), or None
 /// when the body is not one of these shapes (fall back to the codex classifier).
@@ -2479,6 +2780,11 @@ fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
         Some("tool_reference_not_found")
     } else if contains(body, b"All tools cannot be deferred") {
         Some("all_tools_deferred")
+    } else if contains(body, b"ids were found without `tool_result` blocks") {
+        // A tool_use turn whose tool_results do not lead the next message
+        // (Claude Code: "400 due to tool use concurrency issues"); the wheel's
+        // CCR history repair produced it (HEADROOM_CCR_REPAIR_ORDER).
+        Some("tool_use_without_result")
     } else {
         None
     }
@@ -2489,7 +2795,9 @@ fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
 /// `headroom/subscription/codex_rate_limits.py`. Returns `None` when there is no
 /// usable signal (no windows and no credits balance).
 fn parse_codex_rate_limit_headers(head: &[u8]) -> Option<CodexRateLimitSnapshot> {
-    let text = std::str::from_utf8(head).ok()?;
+    // Head only: `read_http_headers` over-reads into the SSE body.
+    let end = find_header_end(head).unwrap_or(head.len());
+    let text = std::str::from_utf8(&head[..end]).ok()?;
 
     let mut headers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for line in text.split("\r\n").skip(1) {
@@ -2795,22 +3103,69 @@ fn codex_window_label(window_minutes: i64) -> String {
 }
 
 static UPSTREAM_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+static LOOPBACK_UPSTREAM_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
-fn upstream_client() -> &'static reqwest::Client {
+// Connect timeout only: no overall timeout, since bypassed SSE streams
+// legitimately run for minutes. Without it, a SYN-blackholed network hangs
+// every bypass request until the client's own deadline.
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The shared client for a bypass forward to `url`. Provider traffic takes
+/// the same env/system proxy and OS trust store the backend's httpx does:
+/// going around the proxy turned every gated request on a proxy-only network
+/// into a 502. A loopback upstream override (a local LiteLLM or
+/// claude-code-router) goes direct: hyper-util exempts no loopback address,
+/// and a corporate proxy cannot reach the user's 127.0.0.1.
+fn upstream_client(url: &str) -> &'static reqwest::Client {
+    if url_is_loopback(url) {
+        return LOOPBACK_UPSTREAM_CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+                .no_proxy()
+                // roots-ok: built once, and a local gateway may serve https
+                .build()
+                .expect("reqwest client for loopback bypass forwarder")
+        });
+    }
     UPSTREAM_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            // Connect timeout only — no overall timeout, since bypassed SSE
-            // streams legitimately run for minutes. Without it, a
-            // SYN-blackholed network hangs every bypass request until the
-            // client's own deadline.
-            .connect_timeout(std::time::Duration::from_secs(10))
-            // reqwest honors HTTP(S)_PROXY env vars by default, which would
-            // silently route "direct to provider" traffic through a corporate
-            // proxy the intercept path never uses.
-            .no_proxy()
+        // proxy-ok: direct-to-provider forwarder, not loopback
+        let builder = reqwest::Client::builder().connect_timeout(UPSTREAM_CONNECT_TIMEOUT);
+        // reqwest is built without its `socks` feature, so a socks env proxy
+        // fails every send ("unsupported scheme"); go direct, as rc7 did.
+        // ponytail: drop this once reqwest gets the `socks` feature.
+        let builder = if env_proxy_for_is_socks(url) {
+            builder.no_proxy() // roots-ok: provider https needs the OS trust store
+        } else {
+            builder
+        };
+        builder
             .build()
             .expect("reqwest client for bypass forwarder")
     })
+}
+
+/// True when the env proxy reqwest would pick for `url` is a socks proxy.
+/// hyper-util's order: the first set of HTTPS_PROXY/https_proxy
+/// (HTTP_PROXY/http_proxy for an http:// url), else ALL_PROXY/all_proxy.
+/// ponytail: ignores the macOS System Settings HTTPS proxy hyper-util prefers
+/// over ALL_PROXY; with a socks ALL_PROXY that pair goes direct, as rc7 did.
+fn env_proxy_for_is_socks(url: &str) -> bool {
+    let first = |names: [&str; 2]| names.iter().find_map(|name| std::env::var(name).ok());
+    let is_http = url
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("http://"));
+    let scheme_proxy = if is_http {
+        first(["HTTP_PROXY", "http_proxy"])
+    } else {
+        first(["HTTPS_PROXY", "https_proxy"])
+    }
+    .unwrap_or_default();
+    let picked = if scheme_proxy.trim().is_empty() {
+        first(["ALL_PROXY", "all_proxy"]).unwrap_or_default()
+    } else {
+        scheme_proxy
+    };
+    crate::tool_manager::is_socks_proxy_value(&picked)
 }
 
 /// Where direct-forwarded Claude traffic goes: the user's configured upstream
@@ -2819,10 +3174,11 @@ fn upstream_client() -> &'static reqwest::Client {
 /// the same URL (ANTHROPIC_TARGET_API_URL) and trims a trailing `/v1` off it
 /// (`_normalize_api_url`) before appending the request path, so this does too.
 ///
-/// None when, with no override, the request carries a key Anthropic never
-/// issued: the backend's cc-switch reconciler captured some relay this
-/// process cannot see, and forwarding would hand that relay's key and the
-/// prompt to api.anthropic.com. Such a key would only earn a 401 there anyway.
+/// With no override, a key Anthropic never issued is a cc-switch relay's: the
+/// backend's reconciler records the relay it captured
+/// (`tool_manager::cc_switch_capture_path`), and the key goes there. None when
+/// nothing is recorded, since forwarding would hand that relay's key and the
+/// prompt to api.anthropic.com, where it would only earn a 401 anyway.
 ///
 /// The reverse holds too: with a provider token stored, a request keyed only
 /// with Anthropic credentials is not the override's traffic (OpenCode's native
@@ -2836,14 +3192,74 @@ fn claude_direct_base(default: &str, header_buf: &[u8]) -> Option<String> {
     let foreign_key = keys
         .iter()
         .any(|key| !key.starts_with(ANTHROPIC_CREDENTIAL_PREFIX));
+    let trim = |url: &str| {
+        let url = url.trim_end_matches('/');
+        url.strip_suffix("/v1").unwrap_or(url).to_string()
+    };
     let upstream = crate::upstream_override::get();
     if let Some(url) = upstream.configured_upstream() {
         if foreign_key || keys.is_empty() || !upstream.has_token {
-            let url = url.trim_end_matches('/');
-            return Some(url.strip_suffix("/v1").unwrap_or(url).to_string());
+            return Some(trim(url));
         }
     }
-    (!foreign_key).then(|| default.to_string())
+    if foreign_key {
+        return crate::tool_manager::cc_switch_captured_upstream().map(|url| trim(&url));
+    }
+    Some(default.to_string())
+}
+
+/// A plugin-routed request's upstream: the origin OpenCode's transport plugin
+/// put in `x-headroom-base-url` (the intercept stamps Grok's the same way), and
+/// the provider's own path in `x-headroom-original-path` when the plugin
+/// normalized it to /v1/chat/completions or /v1/responses. Takes both headers,
+/// and our X-Client stamp, out of `buf`: they are for the backend, and the
+/// provider gets what the client would have sent it without Headroom.
+fn take_plugin_route(buf: &mut Vec<u8>) -> Option<(String, Option<String>)> {
+    let origin = extract_header_value(buf, "x-headroom-base-url")?;
+    let original_path = extract_header_value(buf, "x-headroom-original-path");
+    for name in [
+        "x-headroom-base-url",
+        "x-headroom-original-path",
+        "x-client",
+    ] {
+        strip_request_header(buf, name);
+    }
+    Some((origin, original_path))
+}
+
+/// The URL the client would have called without Headroom: the plugin's
+/// origin, then the original path (an absolute one only, as the backend
+/// accepts) with this request's query, else this request's path. https, or
+/// plain http (a LAN Ollama or LiteLLM) to another host only, as the plugin
+/// routes: http to a loopback or unspecified host could name this intercept
+/// and loop.
+fn plugin_direct_url(origin: &str, original_path: Option<&str>, path: &str) -> Option<String> {
+    let origin = reqwest::Url::parse(origin.trim()).ok().filter(|url| {
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        match url.scheme() {
+            "https" => true,
+            "http" => {
+                !url_is_loopback(url.as_str())
+                    && !host
+                        .trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.to_canonical().is_unspecified())
+            }
+            _ => false,
+        }
+    })?;
+    let path = match original_path {
+        Some(original) if original.starts_with('/') && !original.starts_with("//") => {
+            match path.split_once('?') {
+                Some((_, query)) => format!("{original}?{query}"),
+                None => original.to_string(),
+            }
+        }
+        _ => path.to_string(),
+    };
+    Some(format!("{}{path}", origin.origin().ascii_serialization()))
 }
 
 async fn write_retryable_service_unavailable(client: &mut TcpStream) {
@@ -2855,8 +3271,8 @@ async fn write_retryable_service_unavailable(client: &mut TcpStream) {
 }
 
 /// Forward the request that produced `header_buf` directly to the provider:
-/// the Claude upstream from `claude_direct_base`, or OpenAI/chatgpt.com for
-/// Codex.
+/// the Claude upstream from `claude_direct_base`, OpenAI/chatgpt.com for
+/// Codex, or a plugin-routed request's own upstream (`plugin_direct_url`).
 ///
 /// Used when the pricing gate has stopped the local Python proxy. The CC
 /// session keeps speaking HTTP/1.1 to 127.0.0.1:6767; we re-issue the same
@@ -2864,9 +3280,10 @@ async fn write_retryable_service_unavailable(client: &mut TcpStream) {
 /// the response back as HTTP/1.1 chunked transfer.
 async fn forward_direct_to_anthropic(
     mut client: TcpStream,
-    header_buf: Vec<u8>,
+    mut header_buf: Vec<u8>,
     upstream_base: &str,
 ) {
+    let plugin_route = take_plugin_route(&mut header_buf);
     let header_end = match find_header_end(&header_buf) {
         Some(pos) => pos + 4,
         None => {
@@ -2906,21 +3323,27 @@ async fn forward_direct_to_anthropic(
     // Three upstreams, keyed on what the request carries: a ChatGPT OAuth
     // token is only valid at chatgpt.com's Codex backend, an API key at
     // api.openai.com, anything else is Claude Code on `upstream_base`.
-    let chatgpt_codex = is_codex_request_head(&parsed) && request_uses_chatgpt_auth(&header_buf);
-    let effective_base: String = if chatgpt_codex {
-        chatgpt_codex_direct_base()
+    // A plugin-routed request (Grok, OpenCode's third-party providers) names
+    // its own upstream, and goes there first: by path it looks like Codex.
+    let chatgpt_codex = plugin_route.is_none()
+        && is_codex_request_head(&parsed)
+        && request_uses_chatgpt_auth(&header_buf);
+    let url = if let Some((origin, original_path)) = &plugin_route {
+        plugin_direct_url(origin, original_path.as_deref(), &parsed.path)
+    } else if chatgpt_codex {
+        Some(format!(
+            "{}{}",
+            chatgpt_codex_direct_base(),
+            chatgpt_codex_direct_path(&parsed.path)
+        ))
     } else if is_codex_request_head(&parsed) {
-        OPENAI_DIRECT_BASE.to_string()
-    } else if let Some(base) = claude_direct_base(upstream_base, &header_buf) {
-        base
+        Some(format!("{OPENAI_DIRECT_BASE}{}", parsed.path))
     } else {
+        claude_direct_base(upstream_base, &header_buf).map(|base| format!("{base}{}", parsed.path))
+    };
+    let Some(url) = url else {
         write_retryable_service_unavailable(&mut client).await;
         return;
-    };
-    let effective_path: &str = if chatgpt_codex {
-        chatgpt_codex_direct_path(&parsed.path)
-    } else {
-        &parsed.path
     };
 
     let header_value = |name: &str| {
@@ -2937,7 +3360,6 @@ async fn forward_direct_to_anthropic(
     // bypass modes meant to keep it alive. Tunnel the upgrade via hyper's
     // connection takeover instead.
     if header_value("upgrade").is_some() {
-        let url = format!("{}{}", effective_base, effective_path);
         tunnel_upgrade_direct(client, &parsed, leftover_body, &url).await;
         return;
     }
@@ -3011,7 +3433,6 @@ async fn forward_direct_to_anthropic(
         sanitize_stale_tool_references(body, &parsed.path)
     };
 
-    let url = format!("{}{}", effective_base, effective_path);
     let method = match reqwest::Method::from_bytes(parsed.method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -3022,7 +3443,7 @@ async fn forward_direct_to_anthropic(
         }
     };
 
-    let mut req = upstream_client().request(method, &url);
+    let mut req = upstream_client(&url).request(method, &url);
     // Same fallback the backend's `resolve_codex_routing` applies: a Codex
     // build that omits the account header on some request still carries the
     // account id in its JWT, and chatgpt.com wants it as a header.
@@ -3046,6 +3467,9 @@ async fn forward_direct_to_anthropic(
     let mut resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
+            if is_untrusted_certificate_error(&e) {
+                UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(now_epoch_secs(), Ordering::Relaxed);
+            }
             log::warn!("proxy_intercept bypass forward failed: {e}");
             let _ = client
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -3053,7 +3477,8 @@ async fn forward_direct_to_anthropic(
             return;
         }
     };
-    if resp.status().as_u16() == 429 {
+    // Plugin-routed 429s are OpenCode's or Grok's, not Codex's or Claude's.
+    if resp.status().as_u16() == 429 && plugin_route.is_none() {
         crate::usage_counters::record_429(if is_codex_request_head(&parsed) {
             "codex"
         } else {
@@ -3124,7 +3549,7 @@ async fn tunnel_upgrade_direct(
         }
     };
 
-    let mut req = upstream_client().request(method, url);
+    let mut req = upstream_client(url).request(method, url);
     for (name, value) in &parsed.headers {
         // Unlike the plain forward, Connection/Upgrade/Sec-WebSocket-* must
         // survive: hyper needs the upgrade intent to keep the connection for
@@ -3138,6 +3563,9 @@ async fn tunnel_upgrade_direct(
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
+            if is_untrusted_certificate_error(&e) {
+                UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(now_epoch_secs(), Ordering::Relaxed);
+            }
             log::warn!("proxy_intercept bypass upgrade forward failed: {e}");
             let _ = client
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
@@ -3199,7 +3627,10 @@ struct ParsedRequestHead {
 }
 
 fn parse_request_head(buf: &[u8]) -> Option<ParsedRequestHead> {
-    let text = std::str::from_utf8(buf).ok()?;
+    // Head only, same guard as `extract_header_value`: `buf` may carry
+    // over-read body bytes ending mid-character.
+    let end = find_header_end(buf).unwrap_or(buf.len());
+    let text = std::str::from_utf8(&buf[..end]).ok()?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
@@ -3339,24 +3770,27 @@ fn is_hop_by_hop_response_header(name: &str) -> bool {
     )
 }
 
-/// Return true if something at 127.0.0.1:INTERCEPT_PORT answers /health with a
-/// response that begins with `HTTP/` — that matches both our intercept (which
-/// forwards to the python backend and may return 200 or 502) and no realistic
-/// foreign process we expect to encounter on this port.
-async fn probe_existing_intercept() -> bool {
-    let connect = TcpStream::connect(("127.0.0.1", INTERCEPT_PORT));
+/// Connect to 127.0.0.1:`port` and ask `/health`. Only a completed connect
+/// proves a live listener; an answer beginning `HTTP/` proves it speaks HTTP,
+/// which our intercept does (200 or 502) and so does any other web server.
+async fn probe_port(port: u16) -> PortProbe {
+    let connect = TcpStream::connect(("127.0.0.1", port));
     let Ok(Ok(mut stream)) = tokio::time::timeout(PROBE_TIMEOUT, connect).await else {
-        return false;
+        return PortProbe::Refused;
     };
     let req = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
     if stream.write_all(req).await.is_err() {
-        return false;
+        return PortProbe::NonHttp;
     }
     let mut buf = [0u8; 16];
     let Ok(Ok(n)) = tokio::time::timeout(PROBE_TIMEOUT, stream.read(&mut buf)).await else {
-        return false;
+        return PortProbe::NonHttp;
     };
-    buf.get(..n).is_some_and(|b| b.starts_with(b"HTTP/"))
+    if buf.get(..n).is_some_and(|b| b.starts_with(b"HTTP/")) {
+        PortProbe::Http
+    } else {
+        PortProbe::NonHttp
+    }
 }
 
 /// Read through the end of the HTTP headers from `stream` into `buf`.
@@ -3678,7 +4112,10 @@ fn is_claude_session_id(id: &str) -> bool {
 /// and no browser Origin header is present. Protects against DNS-rebinding
 /// attacks that aim the user's browser at 127.0.0.1 via an attacker domain.
 fn request_is_loopback_safe(buf: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(buf) else {
+    // Head only: `read_http_headers` over-reads into the body, and a
+    // multi-byte character cut at the read boundary must not fail the check.
+    let end = find_header_end(buf).unwrap_or(buf.len());
+    let Ok(text) = std::str::from_utf8(&buf[..end]) else {
         return false;
     };
     let mut host: Option<&str> = None;
@@ -3698,6 +4135,21 @@ fn request_is_loopback_safe(buf: &[u8]) -> bool {
         Some(value) => host_is_loopback(value),
         None => false,
     }
+}
+
+/// Whether `url` names this machine: localhost, 127.0.0.0/8 or ::1, also
+/// written IPv4-mapped (::ffff:127.0.0.1).
+fn url_is_loopback(url: &str) -> bool {
+    let Some(host) = reqwest::Url::parse(url).ok().and_then(|url| {
+        url.host_str()
+            .map(|h| h.trim_matches(['[', ']']).to_string())
+    }) else {
+        return false;
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 fn host_is_loopback(host: &str) -> bool {
@@ -3736,21 +4188,23 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 mod tests {
     use super::{
         bearer_value_changed, bind_intercept, classify_held_port, codex_error_shape_tag,
-        codex_error_summary, codex_snapshot_from_usage_payload, codex_window_label,
-        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
-        grok_upstream_header, intercept_request_counts, is_claude_session_id, is_client_probe_path,
-        is_codex_request_head, is_codex_sse_response, is_compression_refused_error,
-        is_geo_blocked_codex_error, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
-        is_local_proxy_path, is_missing_auth_error, is_openai_path, is_prompt_request_head,
-        is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
+        codex_error_summary, codex_prompt_failed, codex_snapshot_from_usage_payload,
+        codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
+        find_header_end, grok_upstream_header, held_by_our_other_window, intercept_request_counts,
+        is_claude_session_id, is_client_probe_path, is_codex_request_head, is_codex_sse_response,
+        is_compression_refused_error, is_geo_blocked_codex_error, is_hop_by_hop_request_header,
+        is_hop_by_hop_response_header, is_local_proxy_path, is_missing_auth_error, is_openai_path,
+        is_prompt_request_head, is_reportable_upstream_error, is_vscode_claude_ua, os_error_key,
         parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
-        read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
-        response_content_type, rewrite_use_responses_lite, run, sanitize_stale_tool_references,
+        plugin_direct_url, probe_port, read_http_headers, request_has_header,
+        request_is_loopback_safe, request_uses_chatgpt_auth, response_content_type,
+        rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, should_report_upstream_error,
         stamp_client_header, stamp_codex_client_header, stamp_headroom_bypass_header,
-        stamp_request_header, strip_request_header, verdict_permits_reuse, BypassFlag,
-        CodexTerminalReader, HeldPortVerdict, ModelsRewrite, ParsedRequestHead, ResponseSniffer,
-        SharedToken, FIRST_OPTIMIZED_REQUEST_REPORTED,
+        stamp_request_header, strip_request_header, take_plugin_route, verdict_permits_reuse,
+        verdict_unwires_clients, BypassFlag, CodexTerminalReader, HeldPortVerdict, ModelsRewrite,
+        ParsedRequestHead, PortProbe, ResponseSniffer, SharedToken,
+        FIRST_OPTIMIZED_REQUEST_REPORTED,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -3795,7 +4249,12 @@ mod tests {
     #[test]
     fn a_listener_less_port_inside_the_grace_is_draining_not_an_error() {
         assert_eq!(
-            classify_held_port(None, std::time::Duration::from_secs(120), HELD_GRACE),
+            classify_held_port(
+                None,
+                PortProbe::Refused,
+                std::time::Duration::from_secs(120),
+                HELD_GRACE
+            ),
             HeldPortVerdict::Draining
         );
     }
@@ -3806,7 +4265,12 @@ mod tests {
     #[test]
     fn the_relaunch_grace_alone_does_not_cover_the_windows_drain() {
         assert_eq!(
-            classify_held_port(None, std::time::Duration::from_secs(91), HELD_GRACE),
+            classify_held_port(
+                None,
+                PortProbe::Refused,
+                std::time::Duration::from_secs(91),
+                HELD_GRACE
+            ),
             HeldPortVerdict::Draining
         );
     }
@@ -3824,6 +4288,43 @@ mod tests {
             name: "Affinity".into(),
             pid: 54915
         }));
+    }
+
+    /// A foreign 6767 holder gets every wired client's bearer and prompts, so
+    /// it unwires them the way an unidentified one does; another copy of this
+    /// user's Headroom manages the same client files, so it is spared, and a
+    /// port with nothing listening (a draining relaunch) never unwires.
+    #[test]
+    fn a_foreign_holder_unwires_the_clients_unless_it_is_this_users_headroom() {
+        let squatter = HeldPortVerdict::Foreign {
+            name: "Affinity".into(),
+            pid: 54915,
+        };
+        let stranger = |_: u32| false;
+        assert!(verdict_unwires_clients(&squatter, stranger));
+        assert!(!verdict_unwires_clients(&squatter, |pid| pid == 54915));
+        assert!(verdict_unwires_clients(
+            &HeldPortVerdict::Unidentified,
+            stranger
+        ));
+        assert!(!verdict_unwires_clients(
+            &HeldPortVerdict::Draining,
+            stranger
+        ));
+        assert!(!verdict_unwires_clients(&HeldPortVerdict::Stuck, stranger));
+    }
+
+    /// One diagnosis never unwires: a failed `ps` makes this user's second
+    /// copy look like a stranger, and a holder the reclaim just killed can
+    /// still be listed. Only a second stranger verdict in a row acts.
+    #[test]
+    fn a_stranger_verdict_unwires_only_when_the_next_diagnosis_agrees() {
+        let mut streak = 0;
+        assert!(!super::stranger_confirmed(&mut streak, true));
+        assert!(!super::stranger_confirmed(&mut streak, false));
+        assert!(!super::stranger_confirmed(&mut streak, true));
+        assert!(super::stranger_confirmed(&mut streak, true));
+        assert!(super::stranger_confirmed(&mut streak, true));
     }
 
     /// Off Windows the flag is inert (Unix already sets SO_REUSEADDR), so both
@@ -3845,7 +4346,12 @@ mod tests {
     #[test]
     fn a_listener_less_port_past_the_grace_is_stuck() {
         assert_eq!(
-            classify_held_port(None, std::time::Duration::from_secs(301), HELD_GRACE),
+            classify_held_port(
+                None,
+                PortProbe::Refused,
+                std::time::Duration::from_secs(301),
+                HELD_GRACE
+            ),
             HeldPortVerdict::Stuck
         );
     }
@@ -3857,6 +4363,7 @@ mod tests {
         assert_eq!(
             classify_held_port(
                 Some(("Affinity".into(), 54915)),
+                PortProbe::Http,
                 std::time::Duration::from_secs(1),
                 HELD_GRACE
             ),
@@ -3872,6 +4379,7 @@ mod tests {
         assert_eq!(
             classify_held_port(
                 Some(("node".into(), 99)),
+                PortProbe::NonHttp,
                 std::time::Duration::from_secs(9_999),
                 HELD_GRACE
             ),
@@ -3880,6 +4388,43 @@ mod tests {
                 pid: 99
             }
         );
+    }
+
+    /// Finding 41: Bazarr's default port is 6767, and another signed-in
+    /// user's Headroom answers HTTP exactly like ours. Only our own twin makes
+    /// this window a spectator; any other HTTP holder goes to the diagnosis
+    /// that names it.
+    #[test]
+    fn an_http_answer_alone_does_not_make_this_window_a_spectator() {
+        assert!(!held_by_our_other_window(PortProbe::Http, || false));
+        assert!(held_by_our_other_window(PortProbe::Http, || true));
+        assert!(!held_by_our_other_window(PortProbe::NonHttp, || true));
+        assert!(!held_by_our_other_window(PortProbe::Refused, || true));
+    }
+
+    /// Finding 131: a listener that accepted the probe but that netstat (or
+    /// lsof, for another user's socket) could not name is still live, so it
+    /// must never read as a draining port and turn on SO_REUSEADDR beside it.
+    #[tokio::test]
+    async fn an_unnamed_listener_that_accepted_the_probe_is_never_draining() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let _ = sock.write_all(b"SSH-2.0-OpenSSH\r\n").await;
+        });
+        let probe = probe_port(port).await;
+        server.await.expect("server");
+        assert_eq!(probe, PortProbe::NonHttp);
+        let verdict =
+            classify_held_port(None, probe, std::time::Duration::from_secs(1), HELD_GRACE);
+        assert_eq!(verdict, HeldPortVerdict::Unidentified);
+        assert!(!verdict_permits_reuse(&verdict));
+        // Unchanged: a refused connect with nobody named is still draining.
+        let closed = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let closed_port = closed.local_addr().expect("local_addr").port();
+        drop(closed);
+        assert_eq!(probe_port(closed_port).await, PortProbe::Refused);
     }
     use tokio::time::{timeout, Duration};
 
@@ -4096,6 +4641,45 @@ mod tests {
     fn missing_host_header_is_rejected() {
         let req = b"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
         assert!(!request_is_loopback_safe(req));
+    }
+
+    /// What one 4096-byte `read_http_headers` chunk holds when non-ASCII body
+    /// text straddles the read boundary: `head`, then body bytes ending on the
+    /// lead byte of a two-byte character.
+    fn over_read_with_split_char(head: &[u8]) -> Vec<u8> {
+        let mut buf = head.to_vec();
+        buf.resize(4095, b'x');
+        buf.push(0xC3); // lead byte of U+00E9
+        buf
+    }
+
+    #[test]
+    fn loopback_check_ignores_a_character_split_at_the_read_boundary() {
+        let req = over_read_with_split_char(
+            b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nContent-Length: 9000\r\n\r\n{",
+        );
+        assert!(request_is_loopback_safe(&req));
+        let req = over_read_with_split_char(
+            b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nOrigin: https://evil.example.com\r\n\r\n{",
+        );
+        assert!(!request_is_loopback_safe(&req));
+    }
+
+    #[test]
+    fn head_parsers_ignore_a_character_split_at_the_read_boundary() {
+        let req = over_read_with_split_char(
+            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 9000\r\n\r\n{",
+        );
+        let parsed = parse_request_head(&req).expect("request head parses");
+        assert_eq!(parsed.path, "/v1/responses");
+        assert_eq!(parsed.content_length, Some(9000));
+
+        let resp = over_read_with_split_char(
+            b"HTTP/1.1 429 Too Many Requests\r\nx-codex-primary-used-percent: 99\r\n\r\ndata: ",
+        );
+        assert_eq!(parse_response_status(&resp), Some(429));
+        let snapshot = parse_codex_rate_limit_headers(&resp).expect("rate-limit snapshot");
+        assert_eq!(snapshot.primary.expect("primary").used_percent, 99.0);
     }
 
     #[tokio::test]
@@ -4343,6 +4927,72 @@ mod tests {
         backend_port::reset_for_tests();
     }
 
+    /// A Codex WebSocket handshake gets 426, Codex's cue to use HTTPS for the
+    /// session, and never reaches the backend.
+    #[tokio::test]
+    #[serial]
+    async fn codex_websocket_handshake_gets_426() {
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        backend_port::set(backend_addr.port());
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                false,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                Arc::new("http://127.0.0.1:1".to_string()),
+                Arc::new(Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(stream) = TcpStream::connect(intercept_addr).await {
+                client = Some(stream);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("connect to intercept");
+        client
+            .write_all(
+                b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            )
+            .await
+            .expect("write handshake");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .expect("intercept answers and closes")
+            .expect("read response");
+        assert!(
+            response.starts_with(b"HTTP/1.1 426 "),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), backend_listener.accept())
+                .await
+                .is_err(),
+            "the handshake must not be forwarded to the backend"
+        );
+
+        run_task.abort();
+        backend_port::reset_for_tests();
+    }
+
     #[tokio::test]
     #[serial]
     async fn intercept_falls_back_direct_when_backend_is_unreachable() {
@@ -4516,6 +5166,93 @@ mod tests {
 
         run_task.abort();
         backend_port::reset_for_tests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn intercept_goes_direct_until_the_backend_port_is_selected() {
+        // Something already listens where the backend port points (Orca's
+        // mobile server, a dev server on 6768) before tool_manager has probed
+        // and selected the port. It is not our backend: the request must go
+        // direct and never reach it.
+        // Records what reaches it; other tests' health probes may land here
+        // too (the port is global), so only the client request counts.
+        let (foreign_listener, foreign_addr) = bind_ephemeral().await;
+        let foreign_got_request = Arc::new(AtomicBool::new(false));
+        let got_request = foreign_got_request.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = foreign_listener.accept().await {
+                let got_request = got_request.clone();
+                tokio::spawn(async move {
+                    let head = read_until_header_end(&mut sock).await;
+                    if head.starts_with(b"POST /v1/messages") {
+                        got_request.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        backend_port::point_unselected_for_tests(foreign_addr.port());
+
+        let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = read_until_header_end(&mut sock).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let (intercept_listener, intercept_addr) = bind_ephemeral().await;
+        let mut client = TcpStream::connect(intercept_addr)
+            .await
+            .expect("client connect");
+        let (accepted, _) = intercept_listener.accept().await.expect("accept");
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        tokio::spawn(super::handle(
+            accepted,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            fresh_bearer_tx,
+            Arc::new(format!("http://127.0.0.1:{}", upstream_addr.port())),
+        ));
+        client
+            .write_all(
+                b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 256];
+        let _ = timeout(Duration::from_secs(5), async {
+            while response.len() < 16 {
+                let n = client.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                response.extend_from_slice(&tmp[..n]);
+            }
+        })
+        .await;
+        backend_port::reset_for_tests();
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "expected the direct 200, got: {response:?}"
+        );
+        assert!(
+            !foreign_got_request.load(std::sync::atomic::Ordering::SeqCst),
+            "the request reached a listener on the unselected backend port"
+        );
     }
 
     #[test]
@@ -4755,6 +5492,21 @@ mod tests {
         assert!(!errored.saw_terminal());
         errored.observe(b"event: error\ndata: {\"type\":\"error\"}\n\n");
         assert!(errored.saw_terminal());
+        assert!(errored.failed());
+        assert!(!reader.failed(), "response.completed is not a failure");
+    }
+
+    #[test]
+    fn codex_prompt_outcome_counts_only_what_the_user_saw_fail() {
+        // The classes the per-request capture drops are exactly the ones counted.
+        assert_eq!(codex_prompt_failed(Some(502), false, false), Some(true));
+        assert_eq!(codex_prompt_failed(Some(200), true, false), Some(true));
+        assert_eq!(codex_prompt_failed(None, false, false), Some(true));
+        // Success re-arms; plan limits and cancels say nothing.
+        assert_eq!(codex_prompt_failed(Some(200), false, false), Some(false));
+        assert_eq!(codex_prompt_failed(Some(429), false, false), None);
+        assert_eq!(codex_prompt_failed(Some(402), false, false), None);
+        assert_eq!(codex_prompt_failed(None, false, true), None);
     }
 
     #[test]
@@ -4925,6 +5677,263 @@ mod tests {
             "hint must expire"
         );
         super::UPSTREAM_TLS_INTERCEPTION_LAST_SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The bypass forwarder's own handshake failure is the same diagnosis as
+    /// the backend's CERTIFICATE_VERIFY_FAILED body, and used to leave the
+    /// user with a bare 502. rustls says it through an io::Error inside the
+    /// reqwest error, so the check walks the source chain.
+    #[test]
+    fn bypass_certificate_rejection_is_recognised_through_the_error_chain() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request for url (https://api.anthropic.com/v1/messages)")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let rejected = Outer(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert!(super::is_untrusted_certificate_error(&rejected));
+        let refused = Outer(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(!super::is_untrusted_certificate_error(&refused));
+    }
+
+    /// Gated and backend-down traffic goes direct through `upstream_client`.
+    /// It ignored every proxy, so on a network whose only way out is the proxy
+    /// each Claude Code and Codex request got a 502 for as long as the gate
+    /// held, while the backend's httpx used that proxy fine. Child process:
+    /// HTTPS_PROXY would reroute every other test's internet clients.
+    #[test]
+    fn direct_forwarder_goes_through_the_configured_proxy() {
+        if std::env::var_os("HEADROOM_TEST_PROXY_CHILD").is_some() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            // The fake proxy refuses the tunnel, so this errors either way;
+            // the parent checks where the connection went.
+            let url = "https://upstream.invalid/v1/messages";
+            let _ = rt.block_on(super::upstream_client(url).get(url).send());
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let _ = std::io::Write::write_all(&mut stream, b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        });
+        let mut child = crate::proc::command(std::env::current_exe().expect("test binary"));
+        child.args([
+            "proxy_intercept::tests::direct_forwarder_goes_through_the_configured_proxy",
+            "--exact",
+            "--test-threads=1",
+        ]);
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            child.env_remove(name);
+        }
+        let out = child
+            .env("HEADROOM_TEST_PROXY_CHILD", "1")
+            .env("HTTPS_PROXY", format!("http://127.0.0.1:{port}"))
+            .output()
+            .expect("run child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let seen = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_default();
+        assert!(
+            seen.starts_with("CONNECT upstream.invalid:443"),
+            "direct forward bypassed the proxy; proxy saw {seen:?}"
+        );
+    }
+
+    /// reqwest is built without its `socks` feature, so a socks env proxy
+    /// made every direct forward fail on "unsupported scheme socks5" (a 502)
+    /// before connecting anywhere, where rc7, which ignored proxies here, went
+    /// direct. A direct send fails on resolving upstream.invalid ("dns
+    /// error"). Only the proxy reqwest would pick counts: a socks ALL_PROXY
+    /// behind an HTTP HTTPS_PROXY, or a socks HTTP_PROXY for an https
+    /// upstream, is never used, and the HTTP proxy must still be (a refused
+    /// connect to 127.0.0.1:1, "tcp connect error"). Child process, as above.
+    #[test]
+    fn direct_forwarder_skips_only_a_socks_proxy_it_would_pick() {
+        if let Some(expect) = std::env::var_os("HEADROOM_TEST_SOCKS_CHILD") {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let url = std::env::var("HEADROOM_TEST_SOCKS_URL").expect("url");
+            let err = rt
+                .block_on(super::upstream_client(&url).get(&url).send())
+                .expect_err("upstream.invalid does not resolve");
+            let mut chain = err.to_string();
+            let mut source = std::error::Error::source(&err);
+            while let Some(inner) = source {
+                chain.push_str(&format!(": {inner}"));
+                source = inner.source();
+            }
+            let expect = expect.to_string_lossy();
+            assert!(chain.contains(&*expect), "expected {expect}: {chain}");
+            return;
+        }
+        let https = "https://upstream.invalid/v1/messages";
+        let socks = "socks5://127.0.0.1:1";
+        let http = "http://127.0.0.1:1";
+        for (url, envs, expect) in [
+            (https, vec![("ALL_PROXY", socks)], "dns error"),
+            (
+                https,
+                vec![("HTTPS_PROXY", http), ("ALL_PROXY", socks)],
+                "tcp connect error",
+            ),
+            (
+                https,
+                vec![("HTTP_PROXY", socks), ("ALL_PROXY", http)],
+                "tcp connect error",
+            ),
+            (
+                "http://upstream.invalid/v1/messages",
+                vec![("HTTP_PROXY", socks)],
+                "dns error",
+            ),
+        ] {
+            let mut child = crate::proc::command(std::env::current_exe().expect("test binary"));
+            child.args([
+                "proxy_intercept::tests::direct_forwarder_skips_only_a_socks_proxy_it_would_pick",
+                "--exact",
+                "--test-threads=1",
+            ]);
+            for name in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ] {
+                child.env_remove(name);
+            }
+            let out = child
+                .envs(envs.iter().copied())
+                .env("HEADROOM_TEST_SOCKS_CHILD", expect)
+                .env("HEADROOM_TEST_SOCKS_URL", url)
+                .output()
+                .expect("run child test");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{url} {envs:?}: child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The upstream override can be a gateway on this machine (a local
+    /// LiteLLM or claude-code-router at http://127.0.0.1:3456). hyper-util
+    /// exempts no loopback address from an env or system proxy, and a
+    /// corporate proxy cannot reach the user's 127.0.0.1, so each gated or
+    /// backend-down request to it got a 502. The proxy here is a closed port:
+    /// only a direct send reaches the fake gateway. Child process, as above.
+    #[test]
+    fn loopback_upstream_skips_the_configured_proxy() {
+        if std::env::var_os("HEADROOM_TEST_LOOPBACK_CHILD").is_some() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    let mut buf = [0u8; 1024];
+                    let _ = std::io::Read::read(&mut stream, &mut buf);
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    );
+                }
+            });
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let url = format!("http://127.0.0.1:{port}/v1/messages");
+            let status = rt
+                .block_on(super::upstream_client(&url).get(&url).send())
+                .map(|resp| resp.status());
+            assert_eq!(status.ok(), Some(reqwest::StatusCode::OK));
+            return;
+        }
+        let mut child = crate::proc::command(std::env::current_exe().expect("test binary"));
+        child.args([
+            "proxy_intercept::tests::loopback_upstream_skips_the_configured_proxy",
+            "--exact",
+            "--test-threads=1",
+        ]);
+        for name in ["NO_PROXY", "no_proxy"] {
+            child.env_remove(name);
+        }
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            child.env(name, "http://127.0.0.1:1");
+        }
+        let out = child
+            .env("HEADROOM_TEST_LOOPBACK_CHILD", "1")
+            .output()
+            .expect("run child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "loopback upstream went through the proxy:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for url in [
+            "http://127.0.0.1:3456",
+            "http://127.0.0.2:3456/v1",
+            "http://LOCALHOST:4000",
+            "https://[::1]:8443/v1",
+            "http://[::ffff:127.0.0.1]:3456",
+        ] {
+            assert!(super::url_is_loopback(url), "{url}");
+        }
+        for url in [
+            "https://api.anthropic.com",
+            "http://localhost.example.com",
+            "https://10.0.0.5:4000",
+            "not a url",
+        ] {
+            assert!(!super::url_is_loopback(url), "{url}");
+        }
     }
 
     #[test]
@@ -5399,6 +6408,7 @@ mod tests {
     #[serial]
     fn claude_direct_base_follows_the_configured_upstream() {
         use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+        let _data = TempDataDir::new();
         let glm = b"POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer glm.key\r\n\r\n";
         let kimi = b"POST /v1/messages HTTP/1.1\r\nx-api-key: sk-kimi\r\n\r\n";
         let oauth = b"POST /v1/messages HTTP/1.1\r\nAuthorization: Bearer sk-ant-oat01-x\r\n\r\n";
@@ -5406,9 +6416,23 @@ mod tests {
 
         crate::upstream_override::publish(UpstreamOverride::default());
         assert_eq!(base(oauth).as_deref(), Some("https://api.anthropic.com"));
-        // A relay only the backend knows (cc-switch capture): no direct target.
+        // A relay nothing recorded (no cc-switch capture): no direct target.
         assert_eq!(base(glm), None);
         assert_eq!(base(kimi), None);
+        // The relay the reconciler recorded; Anthropic keys never go there.
+        let capture = crate::tool_manager::cc_switch_capture_path();
+        std::fs::create_dir_all(capture.parent().expect("config dir")).expect("mkdir");
+        std::fs::write(
+            &capture,
+            r#"{"url":"https://open.bigmodel.cn/api/anthropic/"}"#,
+        )
+        .expect("write capture");
+        assert_eq!(
+            base(kimi).as_deref(),
+            Some("https://open.bigmodel.cn/api/anthropic")
+        );
+        assert_eq!(base(oauth).as_deref(), Some("https://api.anthropic.com"));
+        crate::tool_manager::clear_cc_switch_capture();
 
         // The backend's `_normalize_api_url` drops a trailing `/v1`.
         crate::upstream_override::publish(UpstreamOverride {
@@ -5442,6 +6466,8 @@ mod tests {
     #[serial]
     async fn direct_forward_never_sends_a_third_party_key_to_anthropic() {
         use crate::state::{UpstreamOverride, UpstreamOverrideMode};
+        // No cc-switch capture recorded, whatever the real profile holds.
+        let _data = TempDataDir::new();
         // Dead backend: the third branch falls back direct because of it.
         backend_port::set(1);
         for (branch, bypass, claude_only) in [
@@ -5520,6 +6546,218 @@ mod tests {
                 token_slot.lock().is_none(),
                 "{branch}: a provider key landed in the Claude bearer slot"
             );
+            run_task.abort();
+        }
+        backend_port::reset_for_tests();
+    }
+
+    /// Points HEADROOM_DATA_DIR at a fresh temp dir while alive, so the
+    /// cc-switch capture `claude_direct_base` reads is never the real profile's.
+    struct TempDataDir {
+        _dir: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl TempDataDir {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("temp data dir");
+            let prev = std::env::var_os("HEADROOM_DATA_DIR");
+            std::env::set_var("HEADROOM_DATA_DIR", dir.path());
+            Self { _dir: dir, prev }
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("HEADROOM_DATA_DIR", v),
+                None => std::env::remove_var("HEADROOM_DATA_DIR"),
+            }
+        }
+    }
+
+    /// An intercept on an ephemeral port with the given bypass flags, whose
+    /// default Claude upstream refuses instantly.
+    async fn spawn_direct_intercept(
+        bypass: bool,
+        claude_only: bool,
+    ) -> (SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let (probe, intercept_addr) = bind_ephemeral().await;
+        drop(probe);
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(run(
+            intercept_addr,
+            false,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(bypass)),
+            Arc::new(AtomicBool::new(claude_only)),
+            Arc::new(AtomicBool::new(false)),
+            fresh_bearer_tx,
+            Arc::new("http://127.0.0.1:1".to_string()),
+            Arc::new(Mutex::new(None)),
+        ));
+        (intercept_addr, run_task)
+    }
+
+    async fn send_to_intercept(addr: SocketAddr, request: &[u8]) -> Vec<u8> {
+        for _ in 0..50 {
+            if let Ok(mut c) = TcpStream::connect(addr).await {
+                c.write_all(request).await.expect("write request");
+                return read_until_header_end(&mut c).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("intercept unreachable");
+    }
+
+    /// A cc-switch relay key got 503-retry on every direct path (full bypass,
+    /// claude-only bypass, backend down), because only the stopped backend
+    /// knew the relay: a lapsed trial left Claude Code failing, not merely
+    /// unoptimized. The backend records its capture for the desktop, so the
+    /// forwarder sends the key there, trimming `/v1` like the override.
+    #[tokio::test]
+    #[serial]
+    async fn direct_forward_sends_a_cc_switch_relay_key_to_the_captured_relay() {
+        let _data = TempDataDir::new();
+        crate::upstream_override::publish(crate::state::UpstreamOverride::default());
+        backend_port::set(1);
+        for (branch, bypass, claude_only) in [
+            ("bypass", true, false),
+            ("claude-only bypass", false, true),
+            ("backend unreachable", false, false),
+        ] {
+            let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+            let upstream_task = tokio::spawn(async move {
+                let (mut sock, _) = upstream_listener.accept().await.expect("upstream accept");
+                let received = read_until_header_end(&mut sock).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                received
+            });
+            let capture = crate::tool_manager::cc_switch_capture_path();
+            std::fs::create_dir_all(capture.parent().expect("config dir")).expect("mkdir");
+            std::fs::write(
+                &capture,
+                format!(
+                    r#"{{"url":"http://127.0.0.1:{}/api/anthropic/v1/"}}"#,
+                    upstream_addr.port()
+                ),
+            )
+            .expect("write capture");
+            let (intercept_addr, run_task) = spawn_direct_intercept(bypass, claude_only).await;
+
+            let response = send_to_intercept(
+                intercept_addr,
+                b"POST /v1/messages?beta=true HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer glm.key\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 200"),
+                "{branch}: {:?}",
+                String::from_utf8_lossy(&response)
+            );
+            let received = timeout(Duration::from_secs(5), upstream_task)
+                .await
+                .expect("relay got the request in time")
+                .expect("relay task ok");
+            let received = String::from_utf8_lossy(&received);
+            assert!(
+                received.starts_with("POST /api/anthropic/v1/messages?beta=true HTTP/1.1"),
+                "{branch}: {received:?}"
+            );
+            run_task.abort();
+        }
+        backend_port::reset_for_tests();
+    }
+
+    /// Plugin-routed requests (OpenCode's third-party providers, and Grok, whose
+    /// upstream the intercept stamps) got 503-retry for the whole of a bypass
+    /// or backend outage, so a watchdog give-up left them failing until the
+    /// backend came back. They go direct to the origin the plugin named.
+    #[tokio::test]
+    #[serial]
+    async fn plugin_routed_requests_go_direct_to_their_own_upstream() {
+        // The provider's own URL, without Headroom's headers.
+        let mut buf = b"POST /v1/chat/completions?alt=sse HTTP/1.1\r\nHost: 127.0.0.1\r\nx-headroom-base-url: https://generativelanguage.googleapis.com\r\nx-headroom-original-path: /v1beta/openai/chat/completions\r\nX-Client: grok_build\r\nContent-Length: 2\r\n\r\n{}".to_vec();
+        let (origin, original) = take_plugin_route(&mut buf).expect("plugin-routed");
+        assert_eq!(
+            plugin_direct_url(&origin, original.as_deref(), "/v1/chat/completions?alt=sse")
+                .as_deref(),
+            Some(
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions?alt=sse"
+            )
+        );
+        for name in [
+            "x-headroom-base-url",
+            "x-headroom-original-path",
+            "x-client",
+        ] {
+            assert!(
+                !request_has_header(&buf, name),
+                "{name} reached the provider"
+            );
+        }
+        assert!(buf.ends_with(b"Content-Length: 2\r\n\r\n{}"));
+        let mut claude = b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_vec();
+        assert!(take_plugin_route(&mut claude).is_none());
+        // Grok: the origin the intercept stamped, on the client's own path.
+        assert_eq!(
+            plugin_direct_url("https://api.x.ai", None, "/v1/chat/completions").as_deref(),
+            Some("https://api.x.ai/v1/chat/completions")
+        );
+        // Plain http to a LAN gateway (Ollama, LiteLLM) goes direct too, but
+        // never to this machine, which could name this intercept and loop;
+        // and a relative original path is ignored like the backend ignores it.
+        assert_eq!(
+            plugin_direct_url("http://192.168.1.20:11434", None, "/v1/chat/completions").as_deref(),
+            Some("http://192.168.1.20:11434/v1/chat/completions")
+        );
+        for origin in [
+            "http://127.0.0.1:6767",
+            "http://0.0.0.0:6767",
+            "http://[::]:6767",
+            "http://[::ffff:127.0.0.1]:6767",
+            "http://localhost:6767",
+            "ftp://h.example",
+        ] {
+            assert_eq!(plugin_direct_url(origin, None, "/v1/x"), None, "{origin}");
+        }
+        assert_eq!(plugin_direct_url("not a url", None, "/v1/x"), None);
+        assert_eq!(
+            plugin_direct_url("https://h.example", Some("evil.example/x"), "/v1/responses")
+                .as_deref(),
+            Some("https://h.example/v1/responses")
+        );
+
+        backend_port::set(1);
+        for (branch, bypass) in [("bypass", true), ("backend unreachable", false)] {
+            // Plain TCP: a TLS ClientHello reaching it proves the forwarder
+            // dialed the plugin's origin; the handshake then fails (502).
+            let (tls_listener, tls_addr) = bind_ephemeral().await;
+            let dialed = tokio::spawn(async move {
+                let (mut sock, _) = tls_listener.accept().await.expect("origin accept");
+                let mut first = [0u8; 1];
+                sock.read_exact(&mut first).await.ok().map(|_| first[0])
+            });
+            let (intercept_addr, run_task) = spawn_direct_intercept(bypass, false).await;
+            let request = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: opencode/1.18.5\r\nx-headroom-base-url: https://127.0.0.1:{}\r\nx-headroom-original-path: /v1beta/openai/chat/completions\r\nContent-Length: 0\r\n\r\n",
+                tls_addr.port()
+            );
+            let response = send_to_intercept(intercept_addr, request.as_bytes()).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 502"),
+                "{branch}: {:?}",
+                String::from_utf8_lossy(&response)
+            );
+            let first = timeout(Duration::from_secs(5), dialed)
+                .await
+                .expect("the plugin's origin was dialed in time")
+                .expect("origin task ok");
+            assert_eq!(first, Some(0x16), "{branch}: no TLS handshake reached it");
             run_task.abort();
         }
         backend_port::reset_for_tests();
@@ -6234,6 +7472,13 @@ mod tests {
             super::anthropic_error_shape(deferred),
             Some("all_tools_deferred")
         );
+
+        // The CCR-repair adjacency 400 ("API Error: 400 due to tool use
+        // concurrency issues"), counted by release without its ids or index.
+        let adjacency = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.255: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_012Zqt7AE3Xy4ctFGWSjAPw7. Each `tool_use` block must have a corresponding `tool_result` block in the next message.\"}}\n\n";
+        let tag = super::anthropic_error_shape(adjacency);
+        assert_eq!(tag, Some("tool_use_without_result"));
+        assert!(!tag.unwrap().contains("toolu_") && !tag.unwrap().contains("255"));
 
         // Unrelated bodies fall through to the codex classifier.
         assert_eq!(

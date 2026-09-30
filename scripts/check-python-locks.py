@@ -69,8 +69,9 @@ def required_names(version: str, sys_platform: str) -> set[str]:
 
 def pinned_names(lock: Path) -> set[str]:
     names = set()
-    for line in lock.read_text().splitlines():
-        line = line.split("#", 1)[0].strip()
+    # Join each hashed entry's backslash-continued --hash lines onto its pin.
+    for line in lock.read_text().replace("\\\n", " ").splitlines():
+        line = line.split("#", 1)[0].split("--hash", 1)[0].strip()
         if line:
             names.add(canonicalize_name(Requirement(line).name))
     return names

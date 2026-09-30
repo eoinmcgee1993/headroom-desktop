@@ -57,7 +57,7 @@ const EMPTY_TILE_COPY: Record<
   rtkToday: {
     badgeClass: "activity-feed__badge--rtk",
     badgeLabel: "RTK",
-    copy: "No RTK commands observed yet today.",
+    copy: "No RTK commands observed yet today (UTC).",
     itemModifier: "activity-feed__item--rtk"
   },
   serenaToday: {
@@ -237,6 +237,12 @@ function ExpandableRow({
   const toggle = () => {
     if (canExpand) setExpanded((prev) => !prev);
   };
+  // A click that ends a text selection (say, of the Request ID) is not a
+  // toggle, or the row collapses and takes the selection with it.
+  const onClick = () => {
+    if (window.getSelection()?.toString()) return;
+    toggle();
+  };
   const onKeyDown = (e: ReactKeyboardEvent<HTMLLIElement>) => {
     if (!canExpand) return;
     if (e.key === "Enter" || e.key === " ") {
@@ -255,12 +261,14 @@ function ExpandableRow({
       role={canExpand ? "button" : undefined}
       tabIndex={canExpand ? 0 : undefined}
       aria-expanded={canExpand ? expanded : undefined}
-      onClick={toggle}
+      onClick={onClick}
       onKeyDown={onKeyDown}
     >
       {children}
       {expanded && detail ? (
-        <div className="activity-feed__detail">{detail}</div>
+        <div className="activity-feed__detail" onClick={(e) => e.stopPropagation()}>
+          {detail}
+        </div>
       ) : null}
     </li>
   );
@@ -610,7 +618,7 @@ function RtkTodayRow({ event }: { event: RtkTodayStats }) {
       </div>
       <div className="activity-feed__row activity-feed__row--savings">
         <strong className="activity-feed__savings">
-          {event.savedTokens.toLocaleString()} tokens saved today
+          {event.savedTokens.toLocaleString()} tokens saved today (UTC)
         </strong>
         <span className="activity-feed__delta">
           {event.commands.toLocaleString()} command{event.commands === 1 ? "" : "s"}

@@ -116,3 +116,45 @@ export function writeCachedPricing(pricing: CachedPricing) {
     localStorage.setItem(PRICING_CACHE_KEY, JSON.stringify(pricing));
   } catch {}
 }
+
+/// Orders one window's pricing-status writes so a slow fetch cannot overwrite
+/// a newer status. Every write (sign-in, sign-out, plan change, reactivation,
+/// a status pushed with `pricing-refreshed`) bumps a counter, and a fetch lands
+/// only if the counter has not moved since it was issued. A counter, not a
+/// Date.now() stamp: after a backward clock step the stamp made every poll look
+/// older than the last write, and dropped them all until the clock caught up.
+export function createPricingStatusOrder() {
+  let writes = 0;
+  let pollInFlight = false;
+  return {
+    /// Records a status applied from outside fetch().
+    wrote() {
+      writes += 1;
+    },
+    /// Resolves to the status to apply, or null when a newer write landed while
+    /// it was in flight. Returns null at once, fetching nothing, for a poll
+    /// while another poll is in flight. An authoritative fetch, made right after
+    /// a mutation, runs anyway (the poll in flight read the account before the
+    /// change) and counts as a write, so that older poll is dropped.
+    fetch(
+      load: () => Promise<HeadroomPricingStatus>,
+      authoritative = false
+    ): Promise<HeadroomPricingStatus | null> | null {
+      const issued = writes;
+      if (authoritative) {
+        return load().then((status) => {
+          if (writes !== issued) return null;
+          writes += 1;
+          return status;
+        });
+      }
+      if (pollInFlight) return null;
+      pollInFlight = true;
+      return load()
+        .then((status) => (writes === issued ? status : null))
+        .finally(() => {
+          pollInFlight = false;
+        });
+    },
+  };
+}

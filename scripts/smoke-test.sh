@@ -56,7 +56,16 @@ backend_port() {
 
 # Resolve the pid exactly as the doc insists: a bare `lsof -ti :PORT` also
 # matches the desktop's client connection and head -1 then returns the desktop.
-backend_pid() { lsof -ti "TCP:${1}" -sTCP:LISTEN 2>/dev/null | head -1; }
+# Then require the proxy's argv, as pid_is_headroom_backend does: PORT falls
+# back to 6768 when no backend is up, and check 12 sends this pid SIGUSR1, whose
+# default action terminates whatever unrelated process holds that port.
+backend_pid() {
+  local pid
+  pid=$(lsof -ti "TCP:${1}" -sTCP:LISTEN 2>/dev/null | head -1)
+  [ -n "$pid" ] || return 0
+  ps -o command= -p "$pid" 2>/dev/null | grep -i headroom | grep -qi proxy && echo "$pid"
+  return 0
+}
 
 livez() { curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:6767/livez" 2>/dev/null; }
 
@@ -406,7 +415,7 @@ fi
 # --- 12. the running proxy has the configured flags and patches -------------
 pid=$(backend_pid "$PORT")
 if [ -z "$pid" ]; then
-  row FAIL "12 backend pid" "nothing listening on $PORT"
+  row FAIL "12 backend pid" "no headroom proxy listening on $PORT"
 else
   noccr=$(ps -o args= -p "$pid" | tr ' ' '\n' | grep -c -- '--no-ccr')
   inj=$(ps eww -o command= -p "$pid" | grep -c 'pyinject')

@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long a captured bearer token is considered usable before it must be
 /// re-captured from a fresh request. Claude Code's OAuth access tokens rotate
@@ -15,6 +15,10 @@ pub const BEARER_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 pub struct BearerToken {
     value: String,
     captured_at: Instant,
+    // Instant stops while the machine sleeps on macOS/Linux, so a token
+    // captured before an overnight sleep would still look minutes old. The
+    // wall clock keeps counting through sleep; age is the larger of the two.
+    captured_wall: SystemTime,
 }
 
 impl BearerToken {
@@ -22,11 +26,12 @@ impl BearerToken {
         Self {
             value,
             captured_at: Instant::now(),
+            captured_wall: SystemTime::now(),
         }
     }
 
     pub fn value_if_fresh(&self, ttl: Duration) -> Option<&str> {
-        if self.captured_at.elapsed() < ttl {
+        if self.age() < ttl {
             Some(&self.value)
         } else {
             None
@@ -34,7 +39,9 @@ impl BearerToken {
     }
 
     pub fn age(&self) -> Duration {
-        self.captured_at.elapsed()
+        // A wall clock set backwards reads as zero, leaving the monotonic age.
+        let wall = self.captured_wall.elapsed().unwrap_or_default();
+        self.captured_at.elapsed().max(wall)
     }
 }
 
@@ -62,8 +69,22 @@ mod tests {
         let t = BearerToken {
             value: "secret-abc".into(),
             captured_at: Instant::now() - Duration::from_secs(120),
+            captured_wall: SystemTime::now(),
         };
         assert!(t.value_if_fresh(Duration::from_secs(60)).is_none());
+    }
+
+    #[test]
+    fn token_that_expired_during_sleep_is_not_fresh() {
+        // Monotonic clock barely moved (it pauses in sleep) while two hours of
+        // wall time passed: the OAuth token behind it has rotated.
+        let t = BearerToken {
+            value: "secret-abc".into(),
+            captured_at: Instant::now(),
+            captured_wall: SystemTime::now() - Duration::from_secs(2 * 60 * 60),
+        };
+        assert!(t.value_if_fresh(BEARER_TOKEN_TTL).is_none());
+        assert!(t.age() >= Duration::from_secs(2 * 60 * 60));
     }
 
     #[test]
