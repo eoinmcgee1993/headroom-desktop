@@ -2083,8 +2083,13 @@ if _hd_lwm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                             memory_file=memory if memory.exists() else None,
                         )
                         merged._hd_lwm_data_paths = [p.data_path for p, _ in members]
+                        # The main checkout too when its path is not the
+                        # resolved key (a symlink, /tmp on macOS): patterns
+                        # match roots by string prefix, so its own were lost.
                         merged._hd_lwm_aliases = [
-                            p.project_path for p, root in members if root is not None
+                            p.project_path
+                            for p, root in members
+                            if root is not None or p.project_path != key
                         ]
                         out.append(merged)
                     return out
@@ -16113,11 +16118,11 @@ assert g.done"#,
         let (off, off_err) = run("0");
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
-            on, "only=repo both=repo scanned=2 hit=repo",
+            on, "only=repo both=repo scanned=2 hit=repo link=repo",
             "stderr:\n{on_err}"
         );
         assert_eq!(
-            off, "only=wt both=repo,wt scanned=1 hit=wt",
+            off, "only=wt both=repo,wt scanned=1 hit=wt link=link",
             "stderr:\n{off_err}"
         );
     }

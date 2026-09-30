@@ -10,8 +10,9 @@ Run with the desktop's sitecustomize on PYTHONPATH:
 
     PYTHONPATH=<pyinject> <managed python> scripts/verify-learn-worktree-merge.py
 
-Prints one line: `only=<paths> both=<paths> scanned=<n> hit=<path>`, each path
-as `repo`/`wt`, e.g. `only=repo both=repo scanned=2 hit=repo` when merged.
+Prints one line: `only=<paths> both=<paths> scanned=<n> hit=<path> link=<path>`,
+each path as `repo`/`wt`/`link`, e.g.
+`only=repo both=repo scanned=2 hit=repo link=repo` when merged.
 """
 
 from __future__ import annotations
@@ -65,9 +66,24 @@ try:
         category=PatternCategory.PREFERENCE, content=f"edit {wt}/src/x.py", importance=0.5
     )
     hit = _project_for_pattern(pattern, projects)
+    # The main checkout reached through a symlinked parent: the merged project
+    # is keyed by the resolved root, so its own patterns need an alias too.
+    link = base / "link"
+    link.symlink_to(base, target_is_directory=True)
+    label[str(link / "repo")] = "link"
+    session(link / "repo", "c")
+    linked = _project_for_pattern(
+        ExtractedPattern(
+            category=PatternCategory.PREFERENCE,
+            content=f"edit {link / 'repo'}/src/y.py",
+            importance=0.5,
+        ),
+        plugin.discover_projects(),
+    )
     print(
         f"only={only} both={names(projects)} scanned={scanned} "
-        f"hit={label.get(str(hit.project_path), '?') if hit else None}"
+        f"hit={label.get(str(hit.project_path), '?') if hit else None} "
+        f"link={label.get(str(linked.project_path), '?') if linked else None}"
     )
 finally:
     shutil.rmtree(base, ignore_errors=True)
