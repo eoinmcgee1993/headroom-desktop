@@ -13198,6 +13198,15 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         "no-pip"
     } else if pip_itself_broken(&evidence_lower) {
         "pip-broken"
+    } else if lower.contains("do not match the hashes")
+        || lower.contains("--require-hashes mode")
+        || lower.contains("can't verify hashes")
+    {
+        // pip's hash-checking mode (every lock entry is hashed, #125) refused
+        // a download: a swapped or corrupted wheel (a caching proxy, or
+        // tampering), or a lock pin without its hash. Its own bucket, and a
+        // content-free fingerprint: the tail names packages and hashes.
+        "hash-mismatch"
     } else if (lower.contains("no matching distribution found")
         || lower.contains("could not find a version that satisfies"))
         && !pip_index_fetch_failed(&lower)
@@ -22916,6 +22925,28 @@ exit 0
                 "network",
             ),
             ("exit=1; stderr tail: something new", "other"),
+            // Hash-checking mode (#125's hashed locks), pip's verbatim heads:
+            // a swapped or corrupted wheel, a pin added without its hash, an
+            // unpinned requirement. Never the "other" grab-bag.
+            (
+                "exit=1; stderr tail: ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE \
+                 REQUIREMENTS FILE. If you have updated the package versions, please update \
+                 the hashes. Otherwise, examine the package contents carefully; someone may \
+                 have tampered with them.\n    pydantic-core==2.46.4 from https://x/a.whl:\n\
+                 Expected sha256 aa\n             Got        bb",
+                "hash-mismatch",
+            ),
+            (
+                "exit=1; stderr tail: ERROR: Hashes are required in --require-hashes mode, but \
+                 they are missing from some requirements. Here is a list of those requirements \
+                 along with the hashes their downloaded archives actually had.",
+                "hash-mismatch",
+            ),
+            (
+                "exit=1; stderr tail: ERROR: In --require-hashes mode, all requirements must \
+                 have their versions pinned with ==. These do not:\n    anyio>=4",
+                "hash-mismatch",
+            ),
             // RUST-6S third shape: venv damaged in place, launcher stub can't
             // resolve the interpreter, pip never runs.
             ("exit=106; stderr tail: No pyvenv.cfg file", "venv-broken"),
