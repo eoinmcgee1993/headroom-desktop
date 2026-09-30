@@ -10210,12 +10210,17 @@ mod tests {
         // reads it again to match, while sibling tests flip HOME to a tempdir.
         let _env_lock = crate::test_env_lock::lock_home();
         let app_dir = crate::storage::app_data_dir().display().to_string();
+        // Real config.toml files hold these paths as TOML basic strings, so a
+        // Windows path's backslashes arrive escaped; the fixture must match.
+        let headroom_cmd =
+            super::toml_basic_string(&format!("{app_dir}/runtime/venv/bin/headroom"));
+        let serena_cmd = super::toml_basic_string(&format!("{app_dir}/serena-venv/bin/serena"));
         let content = format!(
             "model = \"gpt-5\"\n\
              \n\
              # --- Headroom MCP server ---\n\
              [mcp_servers.headroom]\n\
-             command = \"{app_dir}/runtime/venv/bin/headroom\"\n\
+             command = {headroom_cmd}\n\
              args = [\"mcp\", \"serve\"]\n\
              \n\
              [mcp_servers.headroom.env]\n\
@@ -10223,7 +10228,7 @@ mod tests {
              # --- end Headroom MCP server ---\n\
              # --- Headroom MCP server: serena ---\n\
              [mcp_servers.serena]\n\
-             command = \"{app_dir}/serena-venv/bin/serena\"\n\
+             command = {serena_cmd}\n\
              \n\
              [mcp_servers.context7]\n\
              command = \"npx\"\n\
