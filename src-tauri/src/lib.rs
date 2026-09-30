@@ -9423,6 +9423,24 @@ fn spawn_tray_runtime_icon_updater(app: AppHandle) {
     });
 }
 
+/// Busy, not wedged: response bytes through the intercept within the last 10s
+/// prove the backend's event loop was alive a moment ago, so a starving
+/// /readyz is not a reason to kill it. A backend that just died leaves that
+/// same fresh stamp behind, though, so the stamp alone reset the strikes once
+/// and delayed every crash respawn by a poll (~9s, Windows rc9 pass). A dead
+/// backend refuses connections on its port; a busy one still accepts them.
+fn backend_busy_not_wedged() -> bool {
+    busy_not_wedged_verdict(
+        proxy_intercept::backend_traffic_within(std::time::Duration::from_secs(10)),
+        state::proxy_port_accepts_connection,
+    )
+}
+
+/// The port probe costs up to 1s, so it only runs when there was traffic.
+fn busy_not_wedged_verdict(recent_traffic: bool, port_accepts: impl FnOnce() -> bool) -> bool {
+    recent_traffic && port_accepts()
+}
+
 /// Should the watchdog expect the Python proxy to be reachable right now?
 ///
 /// All five inputs are required to be in their "ready" state for the proxy
@@ -9707,7 +9725,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 // in-flight SSE stream ("Connection closed mid-response"), so
                 // hold off as long as bytes keep moving. A truly wedged or
                 // dead backend delivers nothing and ages past the window.
-                if proxy_intercept::backend_traffic_within(std::time::Duration::from_secs(10)) {
+                if backend_busy_not_wedged() {
                     log::info!(
                         "watchdog: probes failing but backend streamed bytes within 10s; busy not wedged, resetting counter"
                     );
@@ -9934,7 +9952,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 // strike 1 and every in-flight stream cut. Skip the respawn as
                 // well: its pre-flight reclaims an orphan that misses /readyz.
                 // A dead backend delivers nothing and ages past the window.
-                if proxy_intercept::backend_traffic_within(std::time::Duration::from_secs(10)) {
+                if backend_busy_not_wedged() {
                     log::info!(
                         "watchdog: untracked backend streamed bytes within 10s; busy not wedged, resetting counter"
                     );
@@ -13254,6 +13272,20 @@ Some unrelated content.
     /// teardown read it as dead on strike 1 and killed it mid-stream before the
     /// busy-not-wedged guard at give-up ever ran. The guard must also skip the
     /// respawn: the spawn pre-flight reclaims an orphan that misses /readyz.
+    /// A backend killed mid-stream leaves a fresh traffic stamp; with its port
+    /// closed it must count as dead, not busy (Windows rc9 pass: +9s respawn).
+    #[test]
+    fn recent_traffic_from_a_dead_backend_is_not_busy() {
+        assert!(!super::busy_not_wedged_verdict(true, || false));
+        assert!(super::busy_not_wedged_verdict(true, || true));
+        let mut probed = false;
+        assert!(!super::busy_not_wedged_verdict(false, || {
+            probed = true;
+            true
+        }));
+        assert!(!probed, "no traffic must not pay for the port probe");
+    }
+
     #[test]
     fn watchdog_does_not_tear_down_a_busy_untracked_backend() {
         let source = include_str!("lib.rs").replace('\r', "");
@@ -13267,8 +13299,7 @@ Some unrelated content.
             .find("state.stop_headroom();")
             .expect("teardown stops the backend")];
         assert!(
-            before_stop.contains("proxy_intercept::backend_traffic_within(")
-                && before_stop.contains("continue;"),
+            before_stop.contains("backend_busy_not_wedged()") && before_stop.contains("continue;"),
             "busy guard must precede the untracked teardown: {before_stop}"
         );
     }
