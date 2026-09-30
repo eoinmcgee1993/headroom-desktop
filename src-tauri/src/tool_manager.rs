@@ -1808,6 +1808,7 @@ if _hd_os.environ.get(
             ):
                 _hd_kw_R._registry_compress = _hd_kw_reg
                 _hd_kw_R._try_ml_compressor = _hd_kw_ml
+                _hd_bound.add("kompress_waste")
     except Exception:
         # Fail-open to the wheel's fallback (the pre-vendor behaviour).
         pass
@@ -1894,6 +1895,7 @@ if _hd_os.environ.get(
             )
             if not _hd_cxr_orig(_hd_cxr_probe) and _hd_cxr_gate(_hd_cxr_probe):
                 _hd_cxr_mod._read_output_should_be_protected = _hd_cxr_gate
+                _hd_bound.add("codex_whole_read")
     except Exception:
         # Fail-open to the wheel's verdict: nothing is rebound.
         pass
@@ -2153,6 +2155,8 @@ _HD_VENDORS = (
     "tool_ref_hint",
     "quarantine_spare_capacity",
     "ccr_repair_order",
+    "kompress_waste",
+    "codex_whole_read",
     "proxied_guarded_upstreams",
     "learn_rule_coerce",
     "learn_worktree_merge",
