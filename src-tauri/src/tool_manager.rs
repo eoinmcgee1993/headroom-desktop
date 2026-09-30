@@ -20904,6 +20904,38 @@ Always run the linter first.
     }
 
     #[test]
+    fn prepare_in_place_accepts_a_receipt_sha_written_before_hashed_locks() {
+        // Receipts from rc9 and earlier carry the pre-hash rule's sha of an
+        // unhashed lock, and the on-disk-lock guard above compares against it.
+        // If lock_requirements ever normalises an unhashed line differently,
+        // every upgrade silently takes the full ~2 GB rebuild. The literal is
+        // the old rule's digest (trim, skip blank/#, hash each line + "\n").
+        let rc9_lock =
+            "# rc9 lock\nabsl-py==2.4.0\n  torch==2.12.1  \ncryptography==50.0.0; sys_platform != \"darwin\"\n";
+        let rc9_sha = "855658165570aebeb58a3898a7260a169708a4e9e322e8999bcd58252ab6ee14";
+        assert_eq!(requirements_lock_sha(rc9_lock), rc9_sha);
+
+        let (root, runtime, manager) = seed_test_runtime("in-place-rc9-receipt");
+        fs::write(
+            runtime.tools_dir.join("headroom.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "0.20.0",
+                "artifact": { "requirementsLockSha256": rc9_sha },
+            }))
+            .unwrap(),
+        )
+        .expect("receipt");
+        fs::write(manager.active_lock_path(), rc9_lock).expect("seed active lock");
+
+        let ctx = manager
+            .prepare_in_place_upgrade()
+            .expect("an rc9 receipt still upgrades in place");
+        let backup = ctx.previous_lock_backup.expect("pins differ => snapshot");
+        assert_eq!(fs::read_to_string(backup).unwrap(), rc9_lock);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn prepare_in_place_falls_back_to_atomic_when_lock_missing() {
         // Lock pins differ AND the active lock is missing on disk => caller
         // should fall through to the full atomic rebuild so rollback stays
