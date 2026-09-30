@@ -7358,10 +7358,14 @@ impl ToolManager {
         let lock = bootstrap_requirements_lock();
         let mut pins = String::new();
         for name in names {
-            let entry = lock_entry(lock, name)
-                .ok_or_else(|| anyhow!("the requirements lock does not pin {name}"))?;
-            pins.push_str(&entry);
-            pins.push('\n');
+            let entries = lock_entries_named(lock, name);
+            if entries.is_empty() {
+                bail!("the requirements lock does not pin {name}");
+            }
+            for entry in entries {
+                pins.push_str(&entry);
+                pins.push('\n');
+            }
         }
         let pins_path = self.runtime.downloads_dir.join(file_name);
         crate::client_adapters::atomic_write(&pins_path, pins.as_bytes())
@@ -8325,6 +8329,7 @@ impl ToolManager {
     }
 
     pub fn install_markitdown(&self) -> Result<()> {
+        let before = venv_dist_infos(&self.runtime.managed_python());
         run_pip_install_with_retries_streaming(
             &self.runtime.managed_python(),
             &[
@@ -8340,13 +8345,25 @@ impl ToolManager {
             &self.runtime.root_dir,
             |line| log_pip_line("markitdown pip", line),
         )?;
-        // markitdown 0.1.7 requires magika~=0.6.1, so pip downgrades the
-        // lock's magika (the content router's detector) below its hashed pin.
-        // Put the lock's pin back: same API and labels, and markitdown runs on
-        // it. Warn-only: 0.6.3 behaves the same, and failing here would take
-        // the addon down over a pin.
-        if let Err(err) = self.reinstall_lock_pins(&["magika"], "markitdown-magika.lock") {
-            log::warn!("restoring the lock's magika after markitdown failed: {err:#}");
+        // markitdown's own pins move lock packages below their hashed pins:
+        // magika~=0.6.1 everywhere, and on Windows its onnxruntime too
+        // (1.27.0 -> 1.20.1, which Kompress runs on; Windows rc16 pass). Put
+        // back every lock package the install changed, found by diffing the
+        // venv's dist-info dirs, so a future pin moving another one is caught
+        // too. magika 1.0.3 and onnxruntime 1.27.0 both run markitdown 0.1.7.
+        // Warn-only: failing here would take the addon down over a pin.
+        let lock = bootstrap_requirements_lock();
+        let moved: Vec<String> = moved_lock_packages(
+            &before,
+            &venv_dist_infos(&self.runtime.managed_python()),
+            lock,
+        );
+        if !moved.is_empty() {
+            let names: Vec<&str> = moved.iter().map(String::as_str).collect();
+            log::info!("markitdown moved lock pins {names:?}; restoring them");
+            if let Err(err) = self.reinstall_lock_pins(&names, "markitdown-restore.lock") {
+                log::warn!("restoring the lock's pins after markitdown failed: {err:#}");
+            }
         }
         if !self.markitdown_entrypoint().exists() {
             bail!(
@@ -12684,15 +12701,21 @@ fn lock_requirements(lock: &str) -> Vec<String> {
 
 /// The hashed entry pinning `name` (PEP 503 normalized), as one requirements
 /// line: for a targeted reinstall that must stay in hash-checking mode.
-fn lock_entry(lock: &str, name: &str) -> Option<String> {
+/// Every lock entry for `name`: a package pinned per platform (onnxruntime on
+/// macOS: one arm64, one Intel, split by markers) has several, and pip keeps
+/// only the one whose marker applies.
+fn lock_entries_named(lock: &str, name: &str) -> Vec<String> {
     let normalize = |s: &str| s.trim().to_ascii_lowercase().replace(['_', '.'], "-");
-    let entry = lock_entries(lock).into_iter().find(|entry| {
-        entry
-            .split("==")
-            .next()
-            .is_some_and(|pin| normalize(pin) == normalize(name))
-    })?;
-    Some(entry.split_whitespace().collect::<Vec<_>>().join(" "))
+    lock_entries(lock)
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .split("==")
+                .next()
+                .is_some_and(|pin| normalize(pin) == normalize(name))
+        })
+        .map(|entry| entry.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
 }
 
 /// Each lock entry joined onto one line, `--hash` options included.
@@ -13855,6 +13878,66 @@ fn pip_itself_broken(evidence: &str) -> bool {
     lower.contains("no module named pip")
         || lower.contains("no module named 'pip.")
         || lower.contains("from 'pip.")
+}
+
+/// Normalized `name-version` of every `*.dist-info` dir in the venv
+/// `python` belongs to; empty when it cannot be read.
+fn venv_dist_infos(python: &Path) -> std::collections::BTreeSet<String> {
+    let Some(lib) = python
+        .parent()
+        .and_then(Path::parent)
+        .map(|v| v.join("lib"))
+    else {
+        return std::collections::BTreeSet::new();
+    };
+    let site_dirs = std::iter::once(lib.clone())
+        .chain(
+            std::fs::read_dir(&lib)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path()),
+        )
+        .map(|dir| dir.join("site-packages"));
+    let mut found = std::collections::BTreeSet::new();
+    for site in site_dirs {
+        for entry in std::fs::read_dir(&site).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".dist-info") {
+                found.insert(stem.to_ascii_lowercase().replace(['_', '.'], "-"));
+            }
+        }
+    }
+    found
+}
+
+/// Lock packages whose installed dist-info changed between `before` and
+/// `after` (a downgrade or upgrade replaces `name-X` with `name-Y`), as the
+/// lock spells them. Packages the lock does not pin (the addon's own) are
+/// ignored.
+fn moved_lock_packages(
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+    lock: &str,
+) -> Vec<String> {
+    let norm = |s: &str| s.trim().to_ascii_lowercase().replace(['_', '.'], "-");
+    let changed: std::collections::BTreeSet<&String> = after.difference(before).collect();
+    lock_entries(lock)
+        .iter()
+        .filter_map(|entry| {
+            let spec = entry.split_whitespace().next()?;
+            let (name, version) = spec.split_once("==")?;
+            let version = version.split(';').next()?.trim();
+            let key = norm(name);
+            let pinned = format!("{key}-{}", norm(version));
+            let moved = changed
+                .iter()
+                .any(|d| d.starts_with(&format!("{key}-")) && **d != pinned);
+            moved.then(|| name.trim().to_string())
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Puts a fresh pip into the venv `python` belongs to. ensurepip alone leaves
@@ -20701,7 +20784,10 @@ Always run the linter first.
         let calls = fs::read_to_string(&log).expect("argv log");
         let lock = super::bootstrap_requirements_lock();
         for name in ["pydantic", "pydantic-core"] {
-            let entry = super::lock_entry(lock, name).expect("lock pins it");
+            let entry = super::lock_entries_named(lock, name)
+                .into_iter()
+                .next()
+                .expect("lock pins it");
             assert!(entry.contains("--hash=sha256:"), "{entry}");
             assert!(
                 calls.contains(&entry),
@@ -20720,6 +20806,33 @@ Always run the linter first.
         }
     }
 
+    /// markitdown 0.1.7 on Windows downgraded the lock's onnxruntime as well
+    /// as magika (rc16 pass); both must be found, the addon's own packages
+    /// and untouched pins must not.
+    #[test]
+    fn markitdown_install_restores_every_lock_pin_it_moved() {
+        let lock = "magika==1.0.3 \\\n    --hash=sha256:aa\n\
+                    onnxruntime==1.27.0 \\\n    --hash=sha256:bb\n\
+                    numpy==2.4.1 \\\n    --hash=sha256:cc\n";
+        let set = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = set(&["magika-1-0-3", "onnxruntime-1-27-0", "numpy-2-4-1"]);
+        let after = set(&[
+            "magika-0-6-3",
+            "onnxruntime-1-20-1",
+            "numpy-2-4-1",
+            "markitdown-0-1-7",
+        ]);
+        assert_eq!(
+            super::moved_lock_packages(&before, &after, lock),
+            vec!["magika".to_string(), "onnxruntime".to_string()]
+        );
+        assert!(super::moved_lock_packages(&before, &before, lock).is_empty());
+    }
+
     #[test]
     fn lock_entry_matches_the_exact_package_with_its_hashes() {
         let lock = "# header\n\
@@ -20727,15 +20840,19 @@ Always run the linter first.
                     pydantic-core==2.46.4 \\\n    --hash=sha256:bb \\\n    --hash=sha256:cc\n\
                     Pydantic_Settings==2.14.2 \\\n    --hash=sha256:dd\n";
         assert_eq!(
-            super::lock_entry(lock, "pydantic").as_deref(),
+            super::lock_entries_named(lock, "pydantic")
+                .first()
+                .map(String::as_str),
             Some("pydantic==2.13.4 --hash=sha256:aa")
         );
         assert_eq!(
-            super::lock_entry(lock, "pydantic-core").as_deref(),
+            super::lock_entries_named(lock, "pydantic-core")
+                .first()
+                .map(String::as_str),
             Some("pydantic-core==2.46.4 --hash=sha256:bb --hash=sha256:cc")
         );
-        assert!(super::lock_entry(lock, "pydantic-settings").is_some());
-        assert!(super::lock_entry(lock, "pydantic-extra").is_none());
+        assert!(!super::lock_entries_named(lock, "pydantic-settings").is_empty());
+        assert!(super::lock_entries_named(lock, "pydantic-extra").is_empty());
     }
 
     #[test]
@@ -23266,20 +23383,32 @@ exec(os.environ["HELPER"])
     /// lock's magika; the lock's hashed pin goes back on right after.
     #[test]
     #[cfg(unix)] // fake shell-script python
-    fn install_markitdown_puts_the_locks_magika_back() {
+    fn install_markitdown_puts_back_every_lock_pin_it_moved() {
         let (root, runtime, manager) = seed_test_runtime("markitdown-magika");
         let home = root.join("home");
         fs::create_dir_all(&home).expect("home");
         let _home = HomeGuard::new(&home);
         let log = root.join("argv.log");
         let entrypoint = manager.markitdown_entrypoint();
+        // The addon's install moves magika (and on Windows onnxruntime) below
+        // the lock: simulated by swapping their dist-info dirs.
+        let site = runtime
+            .venv_dir
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(site.join("magika-1.0.3.dist-info")).expect("magika");
+        fs::create_dir_all(site.join("onnxruntime-1.27.0.dist-info")).expect("onnxruntime");
         write_executable(
             &runtime.managed_python(),
             &format!(
                 "#!/bin/sh\necho \"ARGV $*\" >> {log}\nprev=\n\
                  for a in \"$@\"; do [ \"$prev\" = --requirement ] && cat \"$a\" >> {log}; prev=$a; done\n\
+                 case \"$*\" in *markitdown*) mv '{site}/magika-1.0.3.dist-info' '{site}/magika-0.6.3.dist-info'; \
+                 mv '{site}/onnxruntime-1.27.0.dist-info' '{site}/onnxruntime-1.20.1.dist-info';; esac\n\
                  mkdir -p '{dir}'\nprintf '#!/bin/sh\\nexit 0\\n' > '{e}'\nchmod +x '{e}'\n",
                 log = log.display(),
+                site = site.display(),
                 dir = entrypoint.parent().expect("bin").display(),
                 e = entrypoint.display()
             ),
@@ -23297,10 +23426,14 @@ exec(os.environ["HELPER"])
             .expect("magika re-pinned");
         assert!(repin > markitdown, "{calls}");
         assert!(argvs[repin].contains("--no-deps"), "{calls}");
-        let entry = super::lock_entry(super::bootstrap_requirements_lock(), "magika")
-            .expect("lock pins magika");
-        assert!(entry.contains("--hash=sha256:"), "{entry}");
-        assert!(calls.contains(&entry), "{calls}");
+        for name in ["magika", "onnxruntime"] {
+            let entries = super::lock_entries_named(super::bootstrap_requirements_lock(), name);
+            assert!(!entries.is_empty(), "lock pins {name}");
+            for entry in entries {
+                assert!(entry.contains("--hash=sha256:"), "{entry}");
+                assert!(calls.contains(&entry), "{name}: {calls}");
+            }
+        }
         let _ = fs::remove_dir_all(root);
     }
 
