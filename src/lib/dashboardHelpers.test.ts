@@ -854,6 +854,19 @@ describe("outputReductionForWindow", () => {
     expect(pct!.pct).toBeCloseTo(20);
   });
 
+  it("nets a negative bucket against the window and floors only the total", () => {
+    const window = outputReductionForWindow([
+      { outputSampledTokensSaved: -100, outputBaselineTokens: 1000 },
+      { outputSampledTokensSaved: 300, outputBaselineTokens: 1000 }
+    ]);
+    expect(window!.pct).toBeCloseTo(10);
+    const negative = outputReductionForWindow([
+      { outputSampledTokensSaved: -100, outputBaselineTokens: 1000 }
+    ]);
+    expect(negative!.pct).toBe(0);
+    expect(negative!.savedTokens).toBe(0);
+  });
+
   it("returns null without coverage or baseline", () => {
     expect(outputReductionForWindow([{}])).toBeNull();
     expect(

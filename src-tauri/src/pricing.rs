@@ -1827,7 +1827,7 @@ pub struct SavingsDay {
     /// the day exactly as the app does without pricing reads. None on days the
     /// session sampler did not cover (backend rollups, pre-coverage buckets).
     pub new_input_tokens: Option<u64>,
-    pub output_sampled_tokens_saved: Option<u64>,
+    pub output_sampled_tokens_saved: Option<i64>,
     pub output_baseline_tokens: Option<u64>,
     /// Aggregate per-client counters from the intercept proxy (local day
     /// keys; see usage_counters.rs for the join caveat). None on days

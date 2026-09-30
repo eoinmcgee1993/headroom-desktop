@@ -259,7 +259,7 @@ pub struct DailySavingsPoint {
     /// build, or while the app wasn't running. Window reduction = saved /
     /// baseline over the covered buckets.
     #[serde(default)]
-    pub output_sampled_tokens_saved: Option<u64>,
+    pub output_sampled_tokens_saved: Option<i64>,
     #[serde(default)]
     pub output_baseline_tokens: Option<u64>,
     /// `date` is a UTC day: the bucket is a backend rollup (fresh, or archived
@@ -321,7 +321,7 @@ pub struct HourlySavingsPoint {
     pub cache_read_cost_usd: Option<f64>,
     /// See `DailySavingsPoint::output_sampled_tokens_saved`.
     #[serde(default)]
-    pub output_sampled_tokens_saved: Option<u64>,
+    pub output_sampled_tokens_saved: Option<i64>,
     #[serde(default)]
     pub output_baseline_tokens: Option<u64>,
     #[serde(default)]

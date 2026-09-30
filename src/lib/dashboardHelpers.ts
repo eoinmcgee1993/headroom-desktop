@@ -295,7 +295,9 @@ export function newInputSavingsRate(
 
 /** Output-shaper reduction over a window of buckets, from the locally-sampled
  * saved/baseline deltas. Only buckets with samples count; null when the window
- * has no coverage or the sampled baseline is zero. */
+ * has no coverage or the sampled baseline is zero. A bucket's saved delta is
+ * signed (a stretch of replies longer than baseline), so it nets against the
+ * rest of the window and only the window total is floored at zero. */
 export function outputReductionForWindow(
   points: Array<{
     outputSampledTokensSaved?: number | null;
@@ -306,10 +308,11 @@ export function outputReductionForWindow(
   let baseline = 0;
   for (const point of points) {
     if (point.outputSampledTokensSaved == null || point.outputBaselineTokens == null) continue;
-    saved += Math.max(0, point.outputSampledTokensSaved);
+    saved += point.outputSampledTokensSaved;
     baseline += Math.max(0, point.outputBaselineTokens);
   }
   if (baseline <= 0) return null;
+  saved = Math.max(0, saved);
   return { pct: Math.min(100, (saved / baseline) * 100), savedTokens: saved, baselineTokens: baseline };
 }
 

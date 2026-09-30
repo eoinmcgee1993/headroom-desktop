@@ -5238,7 +5238,10 @@ fn pick_cache_fields(fresh: CacheFields, archived: CacheFields, fresh_first: boo
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 struct OutputSampleBucket {
-    saved_tokens: u64,
+    /// Signed: a bucket whose shaped replies ran longer than their baseline
+    /// is a net-negative stretch, and flooring it would inflate every window
+    /// that contains it. Readers clamp the window total, not the bucket.
+    saved_tokens: i64,
     baseline_tokens: u64,
 }
 
@@ -6412,7 +6415,9 @@ impl SavingsTracker {
     /// moment (same tradeoff as `session_new_input_history`).
     ///
     /// The invariant is that a counter that goes backwards may cost us a
-    /// sample but must never manufacture one. Two ways it goes backwards:
+    /// sample but must never manufacture one. The baseline counter is the
+    /// judge: it only grows with scored requests, so it going backwards means
+    /// the ledger itself regressed. Two ways that happens:
     ///
     /// - The backend restarted onto a lagging durable checkpoint, so it
     ///   re-earns ground already banked. Holding the mark makes the catch-up
@@ -6420,6 +6425,14 @@ impl SavingsTracker {
     /// - The estimator was genuinely wiped and restarts near zero. Its climb
     ///   is real new work, so the mark has to rebase or the sampler goes
     ///   silent forever.
+    ///
+    /// `tokens_saved` falling while the baseline grows is neither: those
+    /// requests produced more output than their baseline, and the negative
+    /// delta is booked as-is. Holding the mark there went silent for the
+    /// whole stretch, then billed all of its baseline to whichever hour saved
+    /// climbed back past the mark (2026-09-30: 3.69M baseline tokens of an
+    /// evening's traffic landed in one 02:00 bucket and read "Output -2%" for
+    /// a day that scored 16%).
     ///
     /// Seeding matters as much as the dip. A fresh launch seeds from the
     /// higher of the live reading and the last persisted one: seeding on a
@@ -6452,11 +6465,11 @@ impl SavingsTracker {
             return;
         };
 
-        if current.0 < prev_saved || current.1 < prev_baseline {
+        if current.1 < prev_baseline {
             // ponytail: "wiped" = fell below half the mark. A lagging
             // checkpoint dips by a poll's worth of work; a wipe drops to ~0.
             // Tighten if a real reset ever lands shallower than that.
-            let wiped = current.0 < prev_saved / 2;
+            let wiped = current.1 < prev_baseline / 2;
             self.output_sample_watermark = Some(if wiped {
                 current
             } else {
@@ -6466,7 +6479,7 @@ impl SavingsTracker {
         }
 
         self.output_sample_watermark = Some(current);
-        let delta_saved = current.0 - prev_saved;
+        let delta_saved = current.0 as i64 - prev_saved as i64;
         let delta_baseline = current.1 - prev_baseline;
         if delta_saved == 0 && delta_baseline == 0 {
             return;
@@ -12120,12 +12133,39 @@ mod tests {
             .expect("day bucket");
         assert_eq!(day.saved_tokens, 450);
         assert_eq!(day.baseline_tokens, 1_100);
-        let hourly_total: u64 = tracker
+        let hourly_total: i64 = tracker
             .output_hourly_samples
             .values()
             .map(|bucket| bucket.saved_tokens)
             .sum();
         assert_eq!(hourly_total, 450);
+    }
+
+    #[test]
+    fn net_negative_stretch_is_booked_as_it_happens_not_dumped_on_recovery() {
+        // 2026-09-30: an evening of replies longer than their baseline pulled
+        // tokens_saved down while baseline grew. Holding the mark on that dip
+        // silenced the sampler for five hours, then billed all of the
+        // stretch's baseline to the hour saved climbed back past the mark.
+        let mut tracker = make_tracker();
+        let day_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let day = |t: &SavingsTracker| t.output_daily_samples[&day_key];
+
+        tracker.sample_output_reduction(Some((1_000, 10_000)));
+        // Net-negative work: saved falls, baseline grows.
+        tracker.sample_output_reduction(Some((700, 13_000)));
+        assert_eq!(day(&tracker).saved_tokens, -300);
+        assert_eq!(day(&tracker).baseline_tokens, 3_000);
+
+        // Recovery is credited from where the counter actually was, so the
+        // stretch nets out instead of vanishing.
+        tracker.sample_output_reduction(Some((1_100, 14_000)));
+        assert_eq!(day(&tracker).saved_tokens, 100);
+        assert_eq!(day(&tracker).baseline_tokens, 4_000);
+        assert_eq!(
+            tracker.persisted_state().output_daily_samples[&day_key],
+            day(&tracker)
+        );
     }
 
     #[test]
