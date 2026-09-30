@@ -1525,13 +1525,13 @@ fn schedule_app_bundle_trash() -> Option<std::path::PathBuf> {
     // install stays put, so skip it. Probed rather than matched on
     // `/AppTranslocation/`, which misses the mounted-volume half.
     if bundle.parent().is_some_and(dir_is_read_only) {
-        // No path in the warn: it is per-user random, so each host made its
-        // own Sentry issue (RUST-44, RUST-GD).
-        log::warn!(
-            "uninstall: skipping app-bundle removal; running from a translocated path \
+        // Info, not warn: running off the DMG is the user's setup, not a
+        // defect, and the bridge kept filing it (RUST-44, RUST-GD). Same call
+        // as the update path's read-only refusal (RUST-9J, RUST-JM).
+        log::info!(
+            "uninstall: skipping app-bundle removal; read-only bundle path {bundle:?} \
              (launched from the DMG without being moved to /Applications)"
         );
-        log::info!("uninstall: translocated bundle path {bundle:?}");
         return None;
     }
 
@@ -8096,9 +8096,16 @@ fn learn_agent_limit_hint(agent: LearnAgent, limit_line: &str) -> String {
 /// for the Claude agent -- `ANTHROPIC_MODEL` is explicitly removed before the
 /// spawn -- the remedy is in the CLI's own line, and the version pair in it
 /// would split the fingerprint per machine.
+///
+/// A model the backend does not know is the same class again (RUST-KE:
+/// "There's an issue with the selected model (zen/claude-opus-5-5). It may not
+/// exist or you may not have access to it. Run /model to pick a different
+/// model."), with the model name in the line.
 fn learn_failure_is_agent_model_rejected(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
-    lowered.contains("unrecognized_model") || lowered.contains("does not support this model")
+    lowered.contains("unrecognized_model")
+        || lowered.contains("does not support this model")
+        || lowered.contains("issue with the selected model")
 }
 
 /// True when a `headroom learn` failure was the agent CLI exhausting its own
@@ -14203,6 +14210,10 @@ Some unrelated content.
         // RUST-DE verbatim: the user's CLI is older than the model needs.
         assert!(learn_failure_is_agent_model_rejected(
             "LLM analysis failed: `claude -p --output-format stream-json --verbose` failed (exit 1):\nAPI Error: 400 Claude Code 2.1.228 does not support this model; version 2.1.251 or newer is required. Run 'claude update', or update the Claude desktop app, then try again."
+        ));
+        // RUST-KE verbatim: a model name the backend does not know.
+        assert!(learn_failure_is_agent_model_rejected(
+            "LLM analysis failed: `claude -p --output-format stream-json --verbose --include-partial-messages` failed (exit 1):\nThere's an issue with the selected model (zen/claude-opus-5-5). It may not exist or you may not have access to it. Run /model to pick a different model."
         ));
         // These must keep reporting: they are ours to fix (or transient).
         for stderr in [
