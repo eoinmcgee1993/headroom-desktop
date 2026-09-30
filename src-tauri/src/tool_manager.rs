@@ -12552,7 +12552,7 @@ fn registry_proxy_env_overrides(proxy_server: &str) -> Option<Vec<(String, Strin
 /// True when a proxy env value names a socks-scheme proxy (any variant -
 /// socks4/socks4a/socks5/socks5h), which pip's vendored requests cannot use
 /// without the optional pysocks package.
-fn is_socks_proxy_value(value: &str) -> bool {
+pub(crate) fn is_socks_proxy_value(value: &str) -> bool {
     value.trim().to_ascii_lowercase().starts_with("socks")
 }
 

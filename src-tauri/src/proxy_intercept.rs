@@ -2885,10 +2885,29 @@ fn upstream_client(url: &str) -> &'static reqwest::Client {
     }
     UPSTREAM_CLIENT.get_or_init(|| {
         // proxy-ok: direct-to-provider forwarder, not loopback
-        reqwest::Client::builder()
-            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        let builder = reqwest::Client::builder().connect_timeout(UPSTREAM_CONNECT_TIMEOUT);
+        // reqwest is built without its `socks` feature, so a socks env proxy
+        // fails every send ("unsupported scheme"); go direct, as rc7 did.
+        // ponytail: drop this once reqwest gets the `socks` feature.
+        let builder = if env_names_a_socks_proxy() {
+            builder.no_proxy() // roots-ok: provider https needs the OS trust store
+        } else {
+            builder
+        };
+        builder
             .build()
             .expect("reqwest client for bypass forwarder")
+    })
+}
+
+/// True when any proxy env var reqwest reads names a socks-scheme proxy.
+fn env_names_a_socks_proxy() -> bool {
+    std::env::vars_os().any(|(name, value)| {
+        name.to_str().is_some_and(|name| {
+            ["http_proxy", "https_proxy", "all_proxy"]
+                .iter()
+                .any(|p| name.eq_ignore_ascii_case(p))
+        }) && crate::tool_manager::is_socks_proxy_value(&value.to_string_lossy())
     })
 }
 
@@ -5493,6 +5512,61 @@ mod tests {
         assert!(
             seen.starts_with("CONNECT upstream.invalid:443"),
             "direct forward bypassed the proxy; proxy saw {seen:?}"
+        );
+    }
+
+    /// reqwest is built without its `socks` feature, so a socks env proxy
+    /// made every direct forward fail on "unsupported scheme socks5" (a 502)
+    /// before connecting anywhere, where rc7, which ignored proxies here, went
+    /// direct. A direct send fails on resolving upstream.invalid instead.
+    /// Child process, as above.
+    #[test]
+    fn direct_forwarder_goes_direct_past_a_socks_proxy() {
+        if std::env::var_os("HEADROOM_TEST_SOCKS_CHILD").is_some() {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let url = "https://upstream.invalid/v1/messages";
+            let err = rt
+                .block_on(super::upstream_client(url).get(url).send())
+                .expect_err("upstream.invalid does not resolve");
+            let mut chain = err.to_string();
+            let mut source = std::error::Error::source(&err);
+            while let Some(inner) = source {
+                chain.push_str(&format!(": {inner}"));
+                source = inner.source();
+            }
+            assert!(chain.contains("dns error"), "not sent direct: {chain}");
+            return;
+        }
+        let mut child = crate::proc::command(std::env::current_exe().expect("test binary"));
+        child.args([
+            "proxy_intercept::tests::direct_forwarder_goes_direct_past_a_socks_proxy",
+            "--exact",
+            "--test-threads=1",
+        ]);
+        for name in [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            child.env_remove(name);
+        }
+        let out = child
+            .env("HEADROOM_TEST_SOCKS_CHILD", "1")
+            .env("ALL_PROXY", "socks5://127.0.0.1:1")
+            .output()
+            .expect("run child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
