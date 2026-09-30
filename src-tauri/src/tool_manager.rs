@@ -1672,23 +1672,24 @@ if _hd_os.environ.get(
         pass
 
 # --- Kompress: skip a fallback the router is bound to discard (vendor) --------
-# A Read or cat of source code routes to code_aware, which hands line-numbered
-# text back unchanged (it never parses) yet reports compressed=True, so the
-# router records a WORD count as its token count (content_router.py:3707). The
-# no-savings fallback then runs Kompress on the whole block (:3968) and keeps it
-# only if its cl100k payload, CCR marker included, is under that word count
-# (:3974). Code runs 2.1-2.4 tokens per word, so Kompress never wins: rc8 spent
-# 19.8s of ONNX inference on a 1821-line Read for 0 tokens saved
-# (hr_1790743422_000578, logged as lossy_unrecoverable_skipped), holding the
-# Kompress slot other requests queue on. Skip that one call when Kompress cannot
-# clear the bar and return what a Kompress passthrough returns there, (content,
-# W), so the compare, the ratio, the guards and the forwarded bytes stay the
-# wheel's. "Cannot" means the must-keep words Kompress always keeps already cost
-# W tokens, or would with a keep-floor share of the other tokens. Latency only:
-# fixing the unit mismatch would start compressing code Reads, a compression
-# change for the soak and savings:did gate. Exact-pin gated to wheel 0.39.0;
-# self-neutralizes once either half of the mismatch changes. Kill switch:
-# HEADROOM_KOMPRESS_WASTE=0.
+# A Claude Code Read of source code routes to code_aware (Bash cat/nl and Codex
+# reads are read_protected under the coding profile's HEADROOM_PROTECT_READS),
+# which hands line-numbered text back unchanged (it never parses) yet reports
+# compressed=True, so the router records a WORD count as its token count
+# (content_router.py:3707). The no-savings fallback then runs Kompress on the
+# whole block (:3968) and keeps it only if its cl100k payload, CCR marker
+# included, is under that word count (:3974). Code runs 2.1-2.4 tokens per word,
+# so Kompress never wins: rc8 spent 19.8s of ONNX inference on a 1821-line Read
+# for 0 tokens saved (hr_1790743422_000578, logged as
+# lossy_unrecoverable_skipped), holding the Kompress slot other requests queue
+# on. Skip that one call when Kompress cannot clear the bar and return what a
+# Kompress passthrough returns there, (content, W), so the compare, the ratio,
+# the guards and the forwarded bytes stay the wheel's. "Cannot" means the
+# must-keep words Kompress always keeps already cost W tokens, or would with a
+# keep-floor share of the other tokens. Latency only: fixing the unit mismatch
+# would start compressing code Reads, a compression change for the soak and
+# savings:did gate. Exact-pin gated to wheel 0.39.0; self-neutralizes once
+# either half of the mismatch changes. Kill switch: HEADROOM_KOMPRESS_WASTE=0.
 _hd_kw_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_WASTE", "1")
 if _hd_os.environ.get(
     "HEADROOM_SDK"
@@ -1757,7 +1758,10 @@ if _hd_os.environ.get(
                         and pending[0] is content
                         and target_ratio is None
                         and getattr(self, "_runtime_target_ratio", None) is None
-                        and not self._lossless_then_lossy
+                        # Only the :3968 fallback, never the lossless-then-lossy
+                        # call (:3719), which fires when W >= the block's token
+                        # estimate and keeps Kompress against tokens, not words.
+                        and pending[1] < _hd_kw_cr._estimate_tokens(content)
                         and self.config.enable_kompress
                         and not getattr(self, "_runtime_skip_kompress", False)
                         and not (
@@ -14852,6 +14856,9 @@ mod tests {
         assert!(py.contains(r#""if fallback_tokens < compressed_tokens:" in _hd_kw_src"#));
         assert!(py.contains("_hd_kw_R._registry_compress = _hd_kw_reg"));
         assert!(py.contains("_hd_kw_R._try_ml_compressor = _hd_kw_ml"));
+        // Production runs lossless_then_lossy; gating on it made the vendor inert.
+        assert!(py.contains("and pending[1] < _hd_kw_cr._estimate_tokens(content)"));
+        assert!(!py.contains("and not self._lossless_then_lossy"));
     }
 
     #[test]
@@ -15533,7 +15540,10 @@ assert g.done"#,
         // With the vendor the router forwards the same bytes and the same token
         // counts without calling Kompress at all; the kill switch restores the
         // call. Kompress is stubbed (ready, passthrough) so the probe needs no
-        // ONNX model and measures only the router's own decision.
+        // ONNX model and measures only the router's own decision. The probe
+        // seeds the coding-profile env the way `run_server` does, so the router
+        // runs with lossless_then_lossy on as it does for every user: a bare
+        // router let a vendor that was inert in production pass here.
         let python =
             ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
         if !python.exists() || !installed_wheel_is_pinned(&python) {
@@ -15550,6 +15560,8 @@ assert g.done"#,
         // which is what makes the call pure waste. Output unchanged plus a
         // code_aware,kompress chain pins the repro path.
         let probe = "import hashlib, sys\n\
+                     from headroom.agent_savings import seed_proxy_env_defaults\n\
+                     seed_proxy_env_defaults()\n\
                      from headroom.transforms import content_router as cr\n\
                      from headroom.transforms import kompress_compressor as kc\n\
                      calls = []\n\
@@ -15562,6 +15574,7 @@ assert g.done"#,
                      src = open(sys.argv[1]).read().split('\\n')\n\
                      text = '\\n'.join(f'{i}\\t{l}' for i, l in enumerate(src, 1))\n\
                      router = cr.ContentRouter(cr.ContentRouterConfig(enable_code_aware=True))\n\
+                     assert router._lossless_then_lossy, 'not the production posture'\n\
                      out = router.compress(text, context='Summarise this.')\n\
                      print(len(calls), out.compressed == text, ','.join(out.strategy_chain),\n\
                      out.total_original_tokens, out.total_compressed_tokens,\n\
