@@ -4881,6 +4881,7 @@ fn rescue_foreign_toml_from_block(
         &format!("# <<< headroom:{block_id} <<<"),
         |header| owned_table == Some(header),
         owned_table.is_none(),
+        false,
     )
 }
 
@@ -4888,32 +4889,52 @@ fn rescue_foreign_toml_from_block(
 /// [`rescue_foreign_toml_from_mcp_spans`]: between the `start`/`end` marker
 /// lines, a table is kept when `owns` accepts its header; `root_keys_only`
 /// also moves out any root key that is not one of [`CODEX_ROOT_KEYS`].
+/// Moved lines land after the block's end marker, or with `before_start` just
+/// before its start marker.
 fn rescue_foreign_toml(
     content: &str,
     start: &str,
     end: &str,
     owns: impl Fn(&str) -> bool,
     root_keys_only: bool,
+    before_start: bool,
 ) -> String {
+    fn place<'a>(out: &mut Vec<&'a str>, rescued: &mut Vec<&'a str>, at: Option<usize>) {
+        if rescued.is_empty() {
+            return;
+        }
+        if let Some(at) = at {
+            while rescued.last().is_some_and(|l| l.trim().is_empty()) {
+                rescued.pop();
+            }
+            rescued.push("");
+            if at > 0 && !out[at - 1].trim().is_empty() {
+                rescued.insert(0, "");
+            }
+            out.splice(at..at, rescued.drain(..));
+        } else {
+            out.push("");
+            out.append(rescued);
+        }
+    }
     let mut out: Vec<&str> = Vec::new();
     let mut rescued: Vec<&str> = Vec::new();
     let mut in_block = false;
     let mut in_foreign_table = false;
+    let mut start_at = 0;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed == start {
             in_block = true;
             in_foreign_table = false;
+            start_at = out.len();
             out.push(line);
             continue;
         }
         if trimmed == end {
             in_block = false;
             out.push(line);
-            if !rescued.is_empty() {
-                out.push("");
-                out.append(&mut rescued);
-            }
+            place(&mut out, &mut rescued, before_start.then_some(start_at));
             continue;
         }
         if in_block {
@@ -4934,10 +4955,7 @@ fn rescue_foreign_toml(
         out.push(line);
     }
     // Unterminated block (missing end marker): don't lose what we set aside.
-    if !rescued.is_empty() {
-        out.push("");
-        out.append(&mut rescued);
-    }
+    place(&mut out, &mut rescued, before_start.then_some(start_at));
     out.join("\n")
 }
 
@@ -6012,12 +6030,20 @@ fn mcp_span_marker(line: &str) -> Option<(bool, &str)> {
 }
 
 /// Move every table a Headroom MCP span does not own (anything but
-/// `[mcp_servers.<span name>(.*)]`) to just after the span's end marker,
+/// `[mcp_servers.<span name>(.*)]`) to just before the span's start marker,
 /// byte-preserved and in order. The wheel's Codex/Grok registrar deletes
 /// everything between its markers on a force re-register, and Codex/ChatGPT's
 /// TOML writer appends new tables before the document's trailing comment -- so
 /// with our span last, their MCP servers land inside it (rc11 lost the ChatGPT
 /// app's browser-use/computer-use `node_repl` this way).
+///
+/// Not after the end marker: toml_edit (Codex's writer) keeps the comments
+/// above a header as that table's prefix, so the end marker would belong to
+/// the app's table and go when the app drops it. The wheel then finds a start
+/// with no end, cannot unregister, and appends a second
+/// `[mcp_servers.headroom]`: the whole config stops parsing. Before the start
+/// marker, the start stays the prefix of our own header and the end stays the
+/// document trailer.
 fn rescue_foreign_toml_from_mcp_spans(content: &str) -> String {
     // Only spans that hold their own table. The wheel finds that table by its
     // parsed key wherever it is, deletes the span and appends a fresh one, so
@@ -6053,6 +6079,7 @@ fn rescue_foreign_toml_from_mcp_spans(content: &str) -> String {
             &end,
             |header| mcp_table_name(header).as_deref() == Some(name),
             false,
+            true,
         );
     }
     if content.ends_with('\n') && !out.ends_with('\n') {
@@ -6112,7 +6139,25 @@ fn mcp_span_foreign_groups(content: &str) -> Vec<(Vec<String>, bool, String)> {
         .collect()
 }
 
-/// Heal configs an earlier build already damaged: re-append (outside any span)
+/// Byte offset of the first Headroom MCP span start marker that directly
+/// precedes a table header, where a table can go without taking over any key.
+fn mcp_span_start_offset(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut lines = text.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        if matches!(mcp_span_marker(line.trim()), Some((false, _)))
+            && lines
+                .peek()
+                .is_some_and(|next| next.trim_start().starts_with('['))
+        {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Heal configs an earlier build already damaged: re-add (before the span)
 /// each foreign table family a `<file>.headroom-backup-*` held inside a
 /// Headroom MCP span, newest backup first, when adding it to `live` still
 /// parses -- TOML refuses a table defined twice, so a table the live file has
@@ -6152,7 +6197,16 @@ fn restore_lost_mcp_span_tables(path: &Path, live: &str) -> String {
             if !has_root && !root_is_live() {
                 continue;
             }
-            let candidate = format!("{}\n\n{group}\n", healed.trim_end());
+            // Before our span, not at EOF: the span is last, so EOF is its end
+            // marker (see `rescue_foreign_toml_from_mcp_spans`).
+            let candidate = match mcp_span_start_offset(&healed) {
+                Some(at) => {
+                    let head = healed[..at].trim_end();
+                    let sep = if head.is_empty() { "" } else { "\n\n" };
+                    format!("{head}{sep}{group}\n\n{}", &healed[at..])
+                }
+                None => format!("{}\n\n{group}\n", healed.trim_end()),
+            };
             if candidate.parse::<toml::Value>().is_ok() {
                 log::info!(
                     "restored [{}] to {} from {} (lost from inside the Headroom MCP span)",
@@ -7227,10 +7281,13 @@ fn claude_remote_control_command_path() -> PathBuf {
 /// took about 2 s: every new terminal after a crash or a failed quit
 /// cleanup, and every `claude`/`codex` call in a terminal opened while
 /// Headroom ran. There the connect runs in a child bash under coreutils
-/// `timeout 0.5` (shipped with Git for Windows): 0.5 s closed, 0.15 s open
-/// on the rc9 win-test VM. BASH_ENV is cleared so that child never sources
-/// an rc carrying this block and probes again. Without `timeout` it falls
-/// back to the plain connect.
+/// `/usr/bin/timeout 1` (shipped with Git for Windows, MSYS2 and Cygwin):
+/// 1 s closed; open took 0.15 s on the rc9 win-test VM, and 1 s leaves room
+/// for a loaded or AV-scanned box to start that child. The path is explicit
+/// because a PATH with System32 first finds Windows' timeout.exe, which
+/// rejects the arguments and would report a live intercept as down. BASH_ENV
+/// is cleared so that child never sources an rc carrying this block and
+/// probes again. Without it the probe falls back to the plain connect.
 ///
 /// Known residuals:
 /// * Outside Windows it has no timeout. While the intercept is wedged with a
@@ -7248,8 +7305,8 @@ fn intercept_probe_function(port: u16) -> String {
     format!(
         r#"__headroom_up() {{
   case ${{OSTYPE-}} in
-    msys*|cygwin*) if command -v timeout >/dev/null 2>&1; then
-      BASH_ENV= timeout 0.5 "${{BASH:-bash}}" -c ': </dev/tcp/127.0.0.1/{port}' 2>/dev/null; return
+    msys*|cygwin*) if [ -x /usr/bin/timeout ]; then
+      BASH_ENV= /usr/bin/timeout 1 "${{BASH:-bash}}" -c ': </dev/tcp/127.0.0.1/{port}' 2>/dev/null; return
     fi ;;
   esac
   if [ -n "${{ZSH_VERSION-}}" ]; then
@@ -17949,28 +18006,40 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     /// probe of a closed 6767 took about 2 s (rc9 win-test VM, 6/6 runs), on
     /// every new terminal and `claude`/`codex` call once the blocks outlive
     /// the app. There (`$OSTYPE` msys or cygwin) the probe runs under
-    /// coreutils `timeout 0.5`, with BASH_ENV cleared so the child bash never
-    /// sources an rc that probes again; elsewhere it stays the builtin
+    /// coreutils `/usr/bin/timeout 1`, with BASH_ENV cleared so the child bash
+    /// never sources an rc that probes again; elsewhere it stays the builtin
     /// connect, no extra process. Simulated with OSTYPE set in the script and
-    /// a fake `timeout` that logs and runs its command.
+    /// a fake coreutils `timeout` that logs and runs its command, substituted
+    /// for /usr/bin/timeout in the block.
+    ///
+    /// rc12 gate: the probe ran whichever `timeout` PATH found first. With
+    /// System32 ahead of /usr/bin that is Windows' timeout.exe, which rejects
+    /// the arguments and exits 1, so a live intercept read as down and the
+    /// block dropped the URL. The PATH `timeout` here is that impostor.
     #[cfg(unix)]
     #[test]
     fn windows_git_bash_bounds_the_intercept_probe() {
         use std::os::unix::fs::PermissionsExt;
         let home = TestHome::new();
         let bin = home.path().join("bin");
+        let usr_bin = home.path().join("usr").join("bin");
         std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&usr_bin).unwrap();
         let log = home.path().join("timeout.log");
-        std::fs::write(
-            bin.join("timeout"),
-            format!(
-                "#!/bin/sh\necho \"$1 env=${{BASH_ENV-}}\" >> '{}'\nshift\nexec \"$@\"\n",
-                log.display()
+        let coreutils = usr_bin.join("timeout");
+        for (path, script) in [
+            (
+                coreutils.clone(),
+                format!(
+                    "#!/bin/sh\necho \"$1 env=${{BASH_ENV-}}\" >> '{}'\nshift\nexec \"$@\"\n",
+                    log.display()
+                ),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(bin.join("timeout"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+            (bin.join("timeout"), "#!/bin/sh\nexit 1\n".to_string()),
+        ] {
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let (open, closed) = (
             listener.local_addr().unwrap().port(),
@@ -17988,7 +18057,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         for shell in shells {
             let run = |port: u16, ostype: &str| {
                 let block = home.path().join(format!("block-{port}.sh"));
-                std::fs::write(&block, claude_code_shell_block(port)).unwrap();
+                std::fs::write(
+                    &block,
+                    claude_code_shell_block(port)
+                        .replace("/usr/bin/timeout", &coreutils.to_string_lossy()),
+                )
+                .unwrap();
                 let _ = std::fs::remove_file(&log);
                 let out = crate::proc::command(shell)
                     .arg("-c")
@@ -18018,13 +18092,13 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                     run(open, ostype),
                     (
                         format!("{HEADROOM_ANTHROPIC_BASE_URL}\n"),
-                        "0.5 env=\n".to_string()
+                        "1 env=\n".to_string()
                     ),
                     "{shell} {ostype}: bounded probe, intercept up"
                 );
                 assert_eq!(
                     run(closed, ostype),
-                    ("unset\n".to_string(), "0.5 env=\n".to_string()),
+                    ("unset\n".to_string(), "1 env=\n".to_string()),
                     "{shell} {ostype}: bounded probe, intercept down"
                 );
             }
@@ -19124,11 +19198,103 @@ sys.exit(3)
             parsed["mcp_servers"]["node_repl"]["env"]["BROWSER_USE_AVAILABLE_BACKENDS"].as_str(),
             Some("chrome,iab")
         );
-        let end = after.find("# --- end Headroom MCP server ---").unwrap();
+        // Outside the span and not after it: the end marker stays the
+        // document trailer rather than the prefix of the app's table.
+        let start = after.find("# --- Headroom MCP server ---").unwrap();
         assert!(
-            after.find("[mcp_servers.node_repl]").unwrap() > end,
-            "node_repl still inside the Headroom span:\n{after}"
+            after.find("[mcp_servers.node_repl]").unwrap() < start,
+            "node_repl not moved before the Headroom span:\n{after}"
         );
+        assert_eq!(
+            after.trim_end().lines().last(),
+            Some("# --- end Headroom MCP server ---"),
+            "end marker is no longer the trailer:\n{after}"
+        );
+    }
+
+    /// What Codex's toml_edit writer does when the ChatGPT app drops a
+    /// server: the table goes with its prefix decor, i.e. every blank and
+    /// comment line between the previous key and its header (checked against
+    /// toml_edit 0.22). Comments before EOF are the document trailer and stay.
+    fn toml_edit_remove_server(content: &str, name: &str) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let header = |l: &str| l.trim_start().starts_with('[');
+        let decor = |l: &str| l.trim().is_empty() || l.trim_start().starts_with('#');
+        let mut keep = vec![true; lines.len()];
+        for i in 0..lines.len() {
+            if super::mcp_table_name(lines[i]).as_deref() != Some(name) {
+                continue;
+            }
+            let mut from = i;
+            while from > 0 && decor(lines[from - 1]) {
+                from -= 1;
+            }
+            let mut to = i + 1;
+            while to < lines.len() && !header(lines[to]) {
+                to += 1;
+            }
+            while to > i + 1 && decor(lines[to - 1]) {
+                to -= 1;
+            }
+            keep[from..to].iter_mut().for_each(|k| *k = false);
+        }
+        let mut out: Vec<&str> = lines
+            .iter()
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .map(|(l, _)| *l)
+            .collect();
+        out.push("");
+        out.join("\n")
+    }
+
+    /// rc12 gate: the evacuation put node_repl right after our end marker,
+    /// which toml_edit then owns as node_repl's prefix. The app dropping
+    /// node_repl (browser-use turned off) took the end marker with it; the
+    /// wheel's force re-register could then not unregister and appended a
+    /// second `[mcp_servers.headroom]`, so Codex refused the whole config.
+    #[test]
+    fn the_app_dropping_an_evacuated_table_keeps_both_span_markers() {
+        let pinned = "/Apps/Headroom/venv/bin/headroom";
+        let evacuated =
+            super::rescue_foreign_toml_from_mcp_spans(&codex_config_with_trapped_node_repl(pinned));
+        assert_node_repl_intact(&evacuated);
+        let dropped = toml_edit_remove_server(&evacuated, "node_repl");
+        assert!(!dropped.contains("node_repl"), "{dropped}");
+        assert!(dropped.contains("# --- Headroom MCP server ---\n[mcp_servers.headroom]"));
+        assert!(
+            dropped.contains("# --- end Headroom MCP server ---"),
+            "{dropped}"
+        );
+        let reinstalled = wheel_force_register(&dropped, WHEEL_BLOCK);
+        let parsed: toml::Value = toml::from_str(&reinstalled)
+            .unwrap_or_else(|err| panic!("reinstall broke the config: {err}\n{reinstalled}"));
+        assert_eq!(
+            parsed["mcp_servers"]["headroom"]["command"].as_str(),
+            Some("headroom")
+        );
+
+        // The heal's re-added tables sit before the span the same way.
+        let _home = TestHome::new();
+        let config = super::codex_config_toml_path();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            config.with_file_name("config.toml.headroom-backup-20260930060313"),
+            codex_config_with_trapped_node_repl(pinned),
+        )
+        .unwrap();
+        std::fs::write(
+            &config,
+            wheel_force_register("model = \"gpt-5\"\n", WHEEL_BLOCK),
+        )
+        .unwrap();
+        let healed = super::restore_lost_mcp_span_tables(
+            &config,
+            &std::fs::read_to_string(&config).unwrap(),
+        );
+        assert_node_repl_intact(&healed);
+        assert!(toml_edit_remove_server(&healed, "node_repl")
+            .contains("# --- end Headroom MCP server ---"));
     }
 
     /// rc11 data loss: runtime maintenance ran `headroom mcp install --force`,
@@ -19224,9 +19390,10 @@ sys.exit(3)
             parsed["mcp_servers"]["chrome"]["command"].as_str(),
             Some("new-chrome")
         );
-        assert!(
-            after.starts_with(live.trim_end()),
-            "live content moved:\n{after}"
+        assert_eq!(
+            after.replace(&format!("{}\n\n", NODE_REPL_TABLES.trim_end()), ""),
+            live,
+            "live content moved"
         );
 
         // Review: the heal ran on every call while a backup held the table,
