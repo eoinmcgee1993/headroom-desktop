@@ -403,6 +403,10 @@ try:
 except Exception:
     pass
 
+# Names of the patches below that bound in this process; summarized once at
+# the end (see _HD_VENDORS).
+_hd_bound = set()
+
 # Protect user-turn text (CLAUDE.md system-reminders) from lossy Kompress:
 # flip the coding persona back to compress_user_messages=False. Guarded so
 # fallback runtimes without the persona (< 0.30.0) and half-installed venvs
@@ -417,6 +421,7 @@ try:
         _hd_savings._PROFILES["coding"] = _hd_replace(
             _hd_coding, compress_user_messages=False
         )
+        _hd_bound.add("user_turn_verbatim")
 except Exception:
     pass
 
@@ -443,6 +448,7 @@ if _hd_sys.platform in ("win32", "darwin") and _hd_ost_flag.strip().lower() not 
         import truststore as _hd_ost_truststore
 
         _hd_ost_truststore.inject_into_ssl()
+        _hd_bound.add("os_truststore")
     except Exception:
         pass
 
@@ -732,6 +738,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 return resp
 
             _hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response
+            _hd_bound.add("context_guard")
     except Exception:
         pass
 
@@ -785,6 +792,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 )
 
             _hd_sc.SemanticCache.set = _hd_sc_set
+            _hd_bound.add("response_cache_guard")
     except Exception:
         pass
 
@@ -820,6 +828,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     return _hd_sf_orig_record(self, **kwargs)
 
                 _hd_sf_st.SavingsTracker.record_request = _hd_sf_record
+                _hd_bound.add("savings_fold_guard")
     except Exception:
         pass
 
@@ -874,6 +883,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 )
 
             _hd_rc_cr._is_read_command = _hd_rc_is_read
+            _hd_bound.add("read_chain_guard")
     except Exception:
         pass
 
@@ -923,6 +933,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                             family[key] = previous
                 return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
             _hd_ts_pt.SessionTrackerStore.resolve_tracker = _hd_ts_resolve_tracker
+            _hd_bound.add("transient_system_lineage")
     except Exception:
         pass
 
@@ -1037,6 +1048,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             _hd_ci_pt.SessionTrackerStore.resolve_tracker = _hd_ci_resolve_tracker
             _hd_ci_pt.PrefixCacheTracker.update_from_response = _hd_ci_update_tracker
             _hd_ci_cost.build_prefix_cache_stats = _hd_ci_prefix_stats
+            _hd_bound.add("cache_integrity")
             # Usually server imports cost after sitecustomize; cover an already
             # loaded server too without importing it just for instrumentation.
             _hd_ci_server = _hd_ci_sys.modules.get("headroom.proxy.server")
@@ -1144,6 +1156,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             _hd_cb_router.ContentRouter.compress = _hd_cb_router_compress
             _hd_cb_kc.KompressCompressor.compress = _hd_cb_kompress_wrapper(_hd_cb_kc.KompressCompressor.compress)
             _hd_cb_kc.KompressCompressor.compress_batch = _hd_cb_kompress_wrapper(_hd_cb_kc.KompressCompressor.compress_batch, batch=True)
+            _hd_bound.add("responses_shared_budget")
     except Exception:
         pass
 
@@ -1196,6 +1209,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         _hd_pr_pt._compact_json_bytes = _hd_pr_saved
 
                 _hd_pr_pt.overlay_cached_prefix = _hd_pr_overlay
+                _hd_bound.add("prefix_replay_guard")
     except Exception:
         pass
 
@@ -1466,6 +1480,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             return rewrote
 
         _hd_ccs_mod.CCSwitchReconciler.tick = _hd_ccs_tick
+        _hd_bound.add("cc_switch_reset")
     except Exception:
         # Fail closed: without the reset, a switch back to Claude Official
         # leaves the captured third-party endpoint live process-wide and
@@ -1534,6 +1549,7 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                     return result
 
             _hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped
+            _hd_bound.add("tool_ref_hint")
     except Exception:
         # Response-shaping only: on any binding failure the client sees the
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
@@ -1574,6 +1590,7 @@ if _hd_cq_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 return await _hd_cq_orig(self, fn, timeout=timeout)
 
             _hd_cq_server.HeadroomProxy._run_compression_in_executor = _hd_cq_run
+            _hd_bound.add("quarantine_spare_capacity")
     except Exception:
         pass
 
@@ -1667,6 +1684,7 @@ if _hd_os.environ.get(
 
             if _hd_cro_needed():
                 _hd_cro_mod.strip_unsupported_ccr_retrieve_blocks = _hd_cro_strip
+                _hd_bound.add("ccr_repair_order")
     except Exception:
         # Fail-open to the wheel's repair (the pre-vendor behaviour).
         pass
@@ -1915,6 +1933,7 @@ if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
                     return await _hd_pgu_orig(self, request)
 
                 _hd_pgu_cls.handle_async_request = _hd_pgu_handle
+                _hd_bound.add("proxied_guarded_upstreams")
     except Exception:
         # Fail-closed: on any binding failure the wheel keeps refusing.
         pass
@@ -1967,6 +1986,7 @@ if _hd_lrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                     return _hd_lrc_orig(raw)
 
                 _hd_lrc_mod._parse_llm_response = _hd_lrc_parse
+                _hd_bound.add("learn_rule_coerce")
     except Exception:
         pass
 
@@ -2092,6 +2112,7 @@ if _hd_lwm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 _hd_lwm_cls.discover_projects = _hd_lwm_discover_projects
                 _hd_lwm_cls.scan_project = _hd_lwm_scan_project
                 _hd_lwm_tl._project_for_pattern = _hd_lwm_project_for_pattern
+                _hd_bound.add("learn_worktree_merge")
     except Exception:
         pass
 
@@ -2106,6 +2127,47 @@ if _hd_ler_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         from headroom.memory import traffic_learner as _hd_ler_mod
 
         _hd_ler_mod._CATEGORY_TO_TARGET.pop(_hd_ler_mod.PatternCategory.ERROR_RECOVERY, None)
+        _hd_bound.add("learn_drop_error_recovery")
+    except Exception:
+        pass
+
+# --- One INFO line: which vendors bound (observability) -----------------------
+# Without it nobody can tell on a user machine whether a vendor (say
+# HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
+# stderr (the proxy log) because logging is not configured yet at import
+# time. Proxy process only: the learn subprocess and other venv Pythons do not
+# set HEADROOM_SDK, and the proxy's own multiprocessing spawn children
+# (image isolation) inherit it but start with `-c`.
+_HD_VENDORS = (
+    "user_turn_verbatim",
+    "os_truststore",
+    "context_guard",
+    "response_cache_guard",
+    "savings_fold_guard",
+    "read_chain_guard",
+    "transient_system_lineage",
+    "cache_integrity",
+    "responses_shared_budget",
+    "prefix_replay_guard",
+    "cc_switch_reset",
+    "tool_ref_hint",
+    "quarantine_spare_capacity",
+    "ccr_repair_order",
+    "proxied_guarded_upstreams",
+    "learn_rule_coerce",
+    "learn_worktree_merge",
+    "learn_drop_error_recovery",
+)
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
+    try:
+        _hd_sys.stderr.write(
+            "INFO:headroom.desktop:sitecustomize vendors bound=%s skipped=%s\n"
+            % (
+                ",".join(n for n in _HD_VENDORS if n in _hd_bound) or "-",
+                ",".join(n for n in _HD_VENDORS if n not in _hd_bound) or "-",
+            )
+        )
+        _hd_sys.stderr.flush()
     except Exception:
         pass
 
@@ -4256,10 +4318,10 @@ impl ToolManager {
                     .find_map(|f| extract_required_pydantic_core_version(&f.log_tail))
                 {
                     log::warn!(
-                        "headroom proxy failed with pydantic-core/pydantic skew; \
-                     reinstalling pydantic-core=={target} and retrying"
+                        "headroom proxy failed with pydantic-core/pydantic skew \
+                     (requires pydantic-core {target}); reinstalling the lock's pins and retrying"
                     );
-                    match self.repair_pydantic_core(&target) {
+                    match self.repair_pydantic_core() {
                         Ok(()) => {
                             log::warn!("pydantic-core repair succeeded; retrying headroom startup");
                             allow_repair = false;
@@ -5922,10 +5984,10 @@ impl ToolManager {
                     return Err(err);
                 };
                 log::warn!(
-                    "smoke test failed with pydantic-core/pydantic skew; \
-                     reinstalling pydantic-core=={target} and retrying"
+                    "smoke test failed with pydantic-core/pydantic skew \
+                     (requires pydantic-core {target}); reinstalling the lock's pins and retrying"
                 );
-                if let Err(repair_err) = self.repair_pydantic_core(&target) {
+                if let Err(repair_err) = self.repair_pydantic_core() {
                     log::error!("pydantic-core repair failed: {repair_err:#}");
                     return Err(err);
                 }
@@ -6968,18 +7030,29 @@ impl ToolManager {
         .with_context(|| format!("reinstalling Headroom version {version}"))
     }
 
-    /// Recover from a pydantic / pydantic-core version skew by reinstalling
-    /// pydantic-core at the version pydantic wants. Triggered when the proxy
-    /// log shows the SystemError pydantic raises during import. `--no-deps`
-    /// keeps the rest of the venv untouched.
-    fn repair_pydantic_core(&self, target_version: &str) -> Result<()> {
-        // Reinstall pydantic itself first (no version pin) to rewrite its
-        // dist-info. A failed prior upgrade can leave two `pydantic-X.Y.dist-info`
-        // dirs in site-packages; `importlib.metadata.metadata('pydantic')` then
-        // returns either one non-deterministically, producing flip-flopping
-        // "requires N.N.N" errors across attempts. Force-reinstalling pydantic
-        // collapses the duplicates so the next pin we apply actually matches
-        // what pydantic asks for.
+    /// Recover from a pydantic / pydantic-core version skew (the SystemError
+    /// pydantic raises during import, in the proxy log or smoke test):
+    /// force-reinstall the platform lock's pydantic and pydantic-core, hash
+    /// pinned, without deps. A failed prior upgrade can leave two
+    /// `pydantic-X.Y.dist-info` dirs in site-packages;
+    /// `importlib.metadata.metadata('pydantic')` then returns either one
+    /// non-deterministically, producing flip-flopping "requires N.N.N" errors
+    /// across attempts. Reinstalling pydantic collapses the duplicates, and the
+    /// lock's pydantic-core is by construction the one its pydantic requires.
+    /// Hash-checking mode like every other install from the lock (#125): a bare
+    /// `pydantic` here took whatever PyPI served.
+    fn repair_pydantic_core(&self) -> Result<()> {
+        let lock = bootstrap_requirements_lock();
+        let mut pins = String::new();
+        for name in ["pydantic", "pydantic-core"] {
+            let entry = lock_entry(lock, name)
+                .ok_or_else(|| anyhow!("the requirements lock does not pin {name}"))?;
+            pins.push_str(&entry);
+            pins.push('\n');
+        }
+        let pins_path = self.runtime.downloads_dir.join("pydantic-repair.lock");
+        crate::client_adapters::atomic_write(&pins_path, pins.as_bytes())
+            .with_context(|| format!("writing {}", pins_path.display()))?;
         run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
@@ -6995,37 +7068,15 @@ impl ToolManager {
                 "https://pypi.org/simple",
                 "--no-deps",
                 "--force-reinstall",
-                "pydantic",
+                "--require-hashes",
+                "--requirement",
+                pins_path.to_string_lossy().as_ref(),
             ],
             &self.runtime.root_dir,
             &self.runtime.venv_dir,
             |_| {},
         )
-        .with_context(|| "reinstalling pydantic to clear duplicate dist-info")?;
-
-        let spec = format!("pydantic-core=={target_version}");
-        run_pip_install_with_retries_clearing_locks(
-            &self.runtime.managed_python(),
-            &[
-                "-m",
-                "pip",
-                "install",
-                "--timeout",
-                "180",
-                "--retries",
-                "10",
-                PIP_ONLY_BINARY,
-                "--extra-index-url",
-                "https://pypi.org/simple",
-                "--no-deps",
-                "--force-reinstall",
-                &spec,
-            ],
-            &self.runtime.root_dir,
-            &self.runtime.venv_dir,
-            |_| {},
-        )
-        .with_context(|| format!("reinstalling pydantic-core=={target_version}"))
+        .context("reinstalling the lock's pydantic and pydantic-core")
     }
 
     /// Restore deps from `previous_lock_backup` via
@@ -7345,6 +7396,9 @@ impl ToolManager {
         // previous Headroom version (e.g. venv python3 path → headroom CLI)
         // are overwritten without a separate retry. --force is a no-op when
         // the config is already correct or absent. Desktop owns this config.
+        // But not the other apps' tables its marker span may hold: the wheel's
+        // force re-register deletes the whole span, so move them out first.
+        crate::client_adapters::protect_foreign_mcp_tables();
         let (output, args) = run_install(true)?;
 
         if !output.status.success() {
@@ -7427,6 +7481,7 @@ impl ToolManager {
         // failure here must not break the Claude integration below.
         let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
         let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
+        crate::client_adapters::protect_foreign_mcp_tables();
 
         // Ground truth: did Claude Code actually see the server? The Python
         // CLI's fallback branch writes ~/.claude/mcp.json (legacy, ignored by
@@ -8430,14 +8485,19 @@ impl ToolManager {
     }
 
     fn run_mcp_helper(&self, args: &[&str]) -> Result<()> {
+        // The Codex/Grok registrars delete their whole marker span on
+        // unregister, other apps' tables inside it included.
+        crate::client_adapters::protect_foreign_mcp_tables();
         // ClaudeRegistrar may shell out to the `claude` CLI, which can take a
         // few seconds per agent; 60s covers both registrars comfortably.
-        run_command_with_timeout(
+        let result = run_command_with_timeout(
             &self.managed_python(),
             args,
             &self.runtime.root_dir,
             Duration::from_secs(60),
-        )
+        );
+        crate::client_adapters::protect_foreign_mcp_tables();
+        result
     }
 
     /// Remove the managed rtk binary and its receipt. Shell PATH and Claude Code
@@ -12294,12 +12354,35 @@ fn collect_native_extensions(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 /// sha of an unchanged pin set identical to its pre-hash value: otherwise
 /// every install would read its receipt as stale and re-sync for nothing.
 fn lock_requirements(lock: &str) -> Vec<String> {
+    lock_entries(lock)
+        .iter()
+        .map(|entry| entry.split("--hash").next().unwrap_or_default().trim())
+        .filter(|requirement| !requirement.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The hashed entry pinning `name` (PEP 503 normalized), as one requirements
+/// line: for a targeted reinstall that must stay in hash-checking mode.
+fn lock_entry(lock: &str, name: &str) -> Option<String> {
+    let normalize = |s: &str| s.trim().to_ascii_lowercase().replace(['_', '.'], "-");
+    let entry = lock_entries(lock).into_iter().find(|entry| {
+        entry
+            .split("==")
+            .next()
+            .is_some_and(|pin| normalize(pin) == normalize(name))
+    })?;
+    Some(entry.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Each lock entry joined onto one line, `--hash` options included.
+fn lock_entries(lock: &str) -> Vec<String> {
     let mut entries = Vec::new();
     let mut pending = String::new();
     let mut finish = |pending: &mut String| {
-        let requirement = pending.split("--hash").next().unwrap_or_default().trim();
-        if !requirement.is_empty() {
-            entries.push(requirement.to_string());
+        let entry = pending.trim();
+        if !entry.is_empty() {
+            entries.push(entry.to_string());
         }
         pending.clear();
     };
@@ -13324,6 +13407,15 @@ pub(crate) fn pip_failure_category_with_evidence(compact: &str, evidence: &str) 
         "no-pip"
     } else if pip_itself_broken(&evidence_lower) {
         "pip-broken"
+    } else if lower.contains("do not match the hashes")
+        || lower.contains("--require-hashes mode")
+        || lower.contains("can't verify hashes")
+    {
+        // pip's hash-checking mode (every lock entry is hashed, #125) refused
+        // a download: a swapped or corrupted wheel (a caching proxy, or
+        // tampering), or a lock pin without its hash. Its own bucket, and a
+        // content-free fingerprint: the tail names packages and hashes.
+        "hash-mismatch"
     } else if (lower.contains("no matching distribution found")
         || lower.contains("could not find a version that satisfies"))
         && !pip_index_fetch_failed(&lower)
@@ -14955,6 +15047,100 @@ mod tests {
         assert!(py.contains("_hd_cro_mod.strip_unsupported_ccr_retrieve_blocks = _hd_cro_strip"));
     }
 
+    /// Vendor names the summary line reports: every `_hd_bound.add("x")` and
+    /// the `_HD_VENDORS` tuple must name the same set, or a vendor drops out
+    /// of the line.
+    fn sitecustomize_vendor_names(py: &str) -> (Vec<String>, Vec<String>) {
+        let added = py
+            .split("_hd_bound.add(\"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap().to_string())
+            .collect();
+        let tuple = py
+            .split("_HD_VENDORS = (")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("_HD_VENDORS tuple");
+        let listed = tuple
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        (added, listed)
+    }
+
+    #[test]
+    fn sitecustomize_logs_which_vendors_bound() {
+        // Nobody could tell on a user machine whether a vendor (say
+        // HEADROOM_CCR_REPAIR_ORDER) was active. One line per proxy process,
+        // names only; the -c gate keeps the proxy's multiprocessing spawn
+        // children (image isolation) and ad-hoc probes quiet.
+        let py = super::SITECUSTOMIZE_PY;
+        let (mut added, mut listed) = sitecustomize_vendor_names(py);
+        assert!(added.len() >= 15, "bind markers missing: {added:?}");
+        added.sort();
+        added.dedup();
+        listed.sort();
+        assert_eq!(added, listed, "_hd_bound.add names != _HD_VENDORS");
+        let tail = &py[py.find("_HD_VENDORS = (").unwrap()..];
+        assert!(tail.contains(r#"_hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
+        assert!(tail.contains(r#"_hd_sys.argv[:1] != ["-c"]"#));
+        assert!(tail.contains("INFO:headroom.desktop:sitecustomize vendors bound="));
+    }
+
+    #[test]
+    fn sitecustomize_vendor_summary_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = dir.path().join("probe.py");
+        std::fs::write(&probe, "pass\n").unwrap();
+        let run = |args: &[&std::ffi::OsStr], sdk: &str, ccr: &str| {
+            let out = crate::proc::command(&python)
+                .args(args)
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_SDK", sdk)
+                .env("HEADROOM_CCR_REPAIR_ORDER", ccr)
+                .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+                .output()
+                .expect("run probe");
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .filter(|l| l.starts_with("INFO:headroom.desktop:sitecustomize vendors"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let proxy = run(&[probe.as_os_str()], "headroom-desktop-proxy", "1");
+        assert_eq!(proxy.len(), 1, "{proxy:?}");
+        let (bound, skipped) = proxy[0].split_once(" skipped=").unwrap();
+        assert!(bound.contains("ccr_repair_order"), "{}", proxy[0]);
+        assert!(!skipped.contains("ccr_repair_order"), "{}", proxy[0]);
+        let off = run(&[probe.as_os_str()], "headroom-desktop-proxy", "0");
+        assert!(
+            off.len() == 1
+                && off[0]
+                    .split_once(" skipped=")
+                    .unwrap()
+                    .1
+                    .contains("ccr_repair_order"),
+            "{off:?}"
+        );
+        // Not the learn subprocess or any other venv Python, not `-c` children.
+        assert!(run(&[probe.as_os_str()], "", "1").is_empty());
+        assert!(run(
+            &["-c".as_ref(), "pass".as_ref()],
+            "headroom-desktop-proxy",
+            "1"
+        )
+        .is_empty());
+    }
+
     #[test]
     fn sitecustomize_vendors_kompress_waste() {
         // code_aware no-ops on a code Read, and the router then runs Kompress
@@ -15600,6 +15786,88 @@ assert g.done"#,
             off_err.contains("has no attribute 'strip'"),
             "kill switch did not unbind:\n{off_err}"
         );
+    }
+
+    #[test]
+    fn foreign_mcp_tables_survive_the_installed_wheels_registrars() {
+        // rc11 data loss, against the real registrars: `mcp install --force`
+        // with a Rust-pinned command makes the wheel's Codex/Grok registrar
+        // delete everything inside its marker span, the ChatGPT app's
+        // node_repl included. A temp home only; never the real ~/.codex.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() {
+            eprintln!("skipping: no managed runtime {}", python.display());
+            return;
+        }
+        let script = "import sys\n\
+             from pathlib import Path\n\
+             from headroom.mcp_registry.base import ServerSpec\n\
+             from headroom.mcp_registry.codex import CodexRegistrar\n\
+             from headroom.mcp_registry.grok import GrokRegistrar\n\
+             cls = {'codex': CodexRegistrar, 'grok': GrokRegistrar}[sys.argv[2]]\n\
+             spec = ServerSpec(name='headroom', command='headroom', args=('mcp', 'serve'),\n\
+                 env={'HEADROOM_PROXY_URL': 'http://127.0.0.1:6767'})\n\
+             print(cls(home_dir=Path(sys.argv[1])).register_server(spec, force=True).status)";
+        let config = "model = \"gpt-5\"\n\
+             # --- Headroom MCP server ---\n\
+             [mcp_servers.headroom]\n\
+             command = \"/Apps/Headroom/venv/bin/headroom\"\n\
+             args = [\"mcp\", \"serve\"]\n\
+             \n\
+             [mcp_servers.node_repl]\n\
+             command = \"/Applications/ChatGPT.app/node_repl\"\n\
+             \n\
+             [mcp_servers.node_repl.env]\n\
+             BROWSER_USE_AVAILABLE_BACKENDS = \"chrome,iab\"\n\
+             # --- end Headroom MCP server ---\n";
+        let node_repl_env = |path: &std::path::Path| {
+            let text = std::fs::read_to_string(path).unwrap();
+            let parsed: toml::Value = toml::from_str(&text).expect("config parses");
+            parsed
+                .get("mcp_servers")
+                .and_then(|s| s.get("node_repl"))
+                .and_then(|n| n.get("env"))
+                .and_then(|e| e.get("BROWSER_USE_AVAILABLE_BACKENDS"))
+                .and_then(|v| v.as_str().map(str::to_owned))
+        };
+        for (registrar, dir) in [("codex", ".codex"), ("grok", ".grok")] {
+            let home = tempfile::tempdir().expect("tempdir");
+            let path = home.path().join(dir).join("config.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let register = || {
+                let out = crate::proc::command(&python)
+                    .args(["-c", script])
+                    .arg(home.path())
+                    .arg(registrar)
+                    .env("HOME", home.path())
+                    .env_remove("CODEX_HOME")
+                    .env_remove("GROK_HOME")
+                    .output()
+                    .expect("run registrar");
+                assert!(
+                    out.status.success(),
+                    "{registrar} registrar failed:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            // Control: unprotected, the wheel deletes the trapped tables.
+            std::fs::write(&path, config).unwrap();
+            register();
+            if node_repl_env(&path).is_some() {
+                eprintln!("skipping {registrar}: the wheel no longer deletes foreign span tables");
+                continue;
+            }
+            std::fs::write(&path, config).unwrap();
+            crate::client_adapters::protect_foreign_mcp_tables_in(&path, false).unwrap();
+            register();
+            assert_eq!(
+                node_repl_env(&path).as_deref(),
+                Some("chrome,iab"),
+                "{registrar}: node_repl lost:\n{}",
+                std::fs::read_to_string(&path).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -19812,6 +20080,68 @@ Always run the linter first.
     /// discarded. Creating the venv without pip and running ensurepip ourselves
     /// is what venv does internally, but keeps ensurepip's stderr. If anyone
     /// folds these back into one step, that blind spot returns.
+    ///
+    /// Supply chain: the pydantic/pydantic-core skew repair force-reinstalled a
+    /// bare `pydantic` (whatever PyPI served) and an unhashed pydantic-core,
+    /// bypassing the hash-pinned locks. Both must come from the platform lock,
+    /// hashes included, in hash-checking mode.
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn repair_pydantic_core_installs_the_locks_hashed_pins() {
+        let (root, runtime, manager) = seed_test_runtime("pydantic-repair-hashes");
+        let log = root.join("argv.log");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\nprev=\n\
+                 for a in \"$@\"; do [ \"$prev\" = --requirement ] && cat \"$a\" >> {log}; prev=$a; done\n\
+                 exit 0\n",
+                log = log.display()
+            ),
+        );
+
+        manager.repair_pydantic_core().expect("fake pip succeeds");
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let lock = super::bootstrap_requirements_lock();
+        for name in ["pydantic", "pydantic-core"] {
+            let entry = super::lock_entry(lock, name).expect("lock pins it");
+            assert!(entry.contains("--hash=sha256:"), "{entry}");
+            assert!(
+                calls.contains(&entry),
+                "{name} not installed from its hashed lock entry:\n{calls}"
+            );
+        }
+        for argv in calls.lines().filter(|l| l.starts_with("ARGV ")) {
+            assert!(
+                argv.contains("--require-hashes"),
+                "unhashed install: {argv}"
+            );
+            assert!(
+                !argv.split(' ').any(|a| a.starts_with("pydantic")),
+                "bare requirement on the command line: {argv}"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_entry_matches_the_exact_package_with_its_hashes() {
+        let lock = "# header\n\
+                    pydantic==2.13.4 \\\n    --hash=sha256:aa\n\
+                    pydantic-core==2.46.4 \\\n    --hash=sha256:bb \\\n    --hash=sha256:cc\n\
+                    Pydantic_Settings==2.14.2 \\\n    --hash=sha256:dd\n";
+        assert_eq!(
+            super::lock_entry(lock, "pydantic").as_deref(),
+            Some("pydantic==2.13.4 --hash=sha256:aa")
+        );
+        assert_eq!(
+            super::lock_entry(lock, "pydantic-core").as_deref(),
+            Some("pydantic-core==2.46.4 --hash=sha256:bb --hash=sha256:cc")
+        );
+        assert!(super::lock_entry(lock, "pydantic-settings").is_some());
+        assert!(super::lock_entry(lock, "pydantic-extra").is_none());
+    }
+
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn create_managed_venv_runs_ensurepip_as_its_own_step() {
@@ -22437,22 +22767,21 @@ exit 0
             .expect("repair should let smoke retry succeed");
 
         let pip_args = fs::read_to_string(&pip_log).expect("pip log written");
-        assert!(
-            pip_args.contains("pydantic-core==2.46.3"),
-            "expected repair to install pydantic-core==2.46.3, got: {pip_args}"
-        );
-        // pydantic itself must also be force-reinstalled to collapse any
-        // duplicate dist-info dirs that cause the flip-flop skew.
-        let pydantic_invocations = pip_args
+        // One hash-checked force-reinstall of the lock's pydantic and
+        // pydantic-core (repair_pydantic_core_installs_the_locks_hashed_pins
+        // checks the pins): pydantic itself too, to collapse any duplicate
+        // dist-info dirs that cause the flip-flop skew.
+        let repairs = pip_args
             .lines()
             .filter(|line| {
                 line.contains("--force-reinstall")
-                    && line.split_whitespace().any(|tok| tok == "pydantic")
+                    && line.contains("--require-hashes")
+                    && line.contains("pydantic-repair.lock")
             })
             .count();
         assert_eq!(
-            pydantic_invocations, 1,
-            "expected exactly one force-reinstall of pydantic, got: {pip_args}"
+            repairs, 1,
+            "expected exactly one hashed pydantic repair, got: {pip_args}"
         );
 
         let _ = fs::remove_dir_all(root);
@@ -22984,6 +23313,28 @@ exit 0
                 "network",
             ),
             ("exit=1; stderr tail: something new", "other"),
+            // Hash-checking mode (#125's hashed locks), pip's verbatim heads:
+            // a swapped or corrupted wheel, a pin added without its hash, an
+            // unpinned requirement. Never the "other" grab-bag.
+            (
+                "exit=1; stderr tail: ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE \
+                 REQUIREMENTS FILE. If you have updated the package versions, please update \
+                 the hashes. Otherwise, examine the package contents carefully; someone may \
+                 have tampered with them.\n    pydantic-core==2.46.4 from https://x/a.whl:\n\
+                 Expected sha256 aa\n             Got        bb",
+                "hash-mismatch",
+            ),
+            (
+                "exit=1; stderr tail: ERROR: Hashes are required in --require-hashes mode, but \
+                 they are missing from some requirements. Here is a list of those requirements \
+                 along with the hashes their downloaded archives actually had.",
+                "hash-mismatch",
+            ),
+            (
+                "exit=1; stderr tail: ERROR: In --require-hashes mode, all requirements must \
+                 have their versions pinned with ==. These do not:\n    anyio>=4",
+                "hash-mismatch",
+            ),
             // RUST-6S third shape: venv damaged in place, launcher stub can't
             // resolve the interpreter, pip never runs.
             ("exit=106; stderr tail: No pyvenv.cfg file", "venv-broken"),

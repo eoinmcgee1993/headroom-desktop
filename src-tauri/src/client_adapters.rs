@@ -541,6 +541,9 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
         }
         "codex" | "codex_cli" => {
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
+            // Heal (and pre-empt) the wheel's MCP registrar deleting other
+            // apps' tables from inside our marker span. Best-effort.
+            protect_foreign_mcp_tables_unlocked();
             // Critical, app-owned write first: the ~/.codex/config.toml provider
             // block is what routes Codex through Headroom.
             let (changed, backups, preserved) = configure_codex_provider_block()?;
@@ -596,6 +599,7 @@ fn apply_client_setup_once(client_id: &str) -> Result<ClientSetupResult> {
         }
         "grok_build" => {
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
+            protect_foreign_mcp_tables_unlocked();
             let mut updates = configure_grok_proxy_block()?;
             let env_block = format!(
                 "export GROK_CLI_CHAT_PROXY_BASE_URL={}",
@@ -2333,6 +2337,33 @@ fn strip_headroom_mcp_from_opencode() -> Option<String> {
     }
 }
 
+/// The key path of a `[a.b]` table header line as TOML reads it, so
+/// `[ a . "b" ]` is `[a.b]` too; `None` for any other line, `[[array]]`
+/// headers included.
+fn toml_table_header_path(line: &str) -> Option<Vec<String>> {
+    let line = line.trim();
+    if !line.starts_with('[') {
+        return None;
+    }
+    let mut table = line.parse::<toml::Table>().ok()?;
+    let mut path = Vec::new();
+    while let Some((key, value)) = table.into_iter().next() {
+        path.push(key);
+        let toml::Value::Table(inner) = value else {
+            return None;
+        };
+        table = inner;
+    }
+    (!path.is_empty()).then_some(path)
+}
+
+/// The server name of a `[mcp_servers.<name>]` / `[mcp_servers.<name>.<sub>]`
+/// header line, however it is spelled.
+fn mcp_table_name(line: &str) -> Option<String> {
+    let mut path = toml_table_header_path(line)?.into_iter();
+    (path.next()? == "mcp_servers").then(|| path.next())?
+}
+
 /// Pure-text removal of Headroom-owned `[mcp_servers.*]` tables (including
 /// subtables) and the Python registrar's
 /// `# --- [end ]Headroom MCP server[: name] ---` marker comments from a
@@ -2340,26 +2371,18 @@ fn strip_headroom_mcp_from_opencode() -> Option<String> {
 /// its `command` launches from Headroom's install footprint; user-managed
 /// servers stay untouched.
 fn strip_headroom_mcp_toml(content: &str) -> String {
-    fn mcp_table_name(line: &str) -> Option<&str> {
-        let inner = line
-            .split('#')
-            .next()?
-            .trim()
-            .strip_prefix("[mcp_servers.")?
-            .strip_suffix(']')?;
-        Some(inner.split('.').next().unwrap_or(inner))
-    }
-
     let lines: Vec<&str> = content.lines().collect();
 
     // Pass 1: which server names are Headroom-owned.
     let mut owned: BTreeSet<String> = BTreeSet::new();
-    let mut current: Option<&str> = None;
+    let mut current: Option<String> = None;
     for line in &lines {
         if line.trim().starts_with('[') {
             current = mcp_table_name(line);
         }
-        let Some(name) = current else { continue };
+        let Some(name) = current.as_deref() else {
+            continue;
+        };
         if name == "headroom"
             || (line
                 .split_once('=')
@@ -2385,7 +2408,7 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
             continue;
         }
         if trimmed.starts_with('[') {
-            dropping = matches!(mcp_table_name(line), Some(name) if owned.contains(name));
+            dropping = mcp_table_name(line).is_some_and(|name| owned.contains(&name));
         }
         if !dropping {
             out.push(line);
@@ -3222,17 +3245,28 @@ fn ensure_managed_rtk_on_path(
     } else {
         bin_dir.into_owned()
     };
-    let path_value = shell_double_quote(&bin_dir);
-    // Written to both the profile and the rc file, so a login shell sources it
-    // twice: skip only when the dir is already FIRST. Anywhere-on-PATH is not
-    // enough: in a nested macOS login shell (tmux, VS Code, `zsh -l`)
+    let d = shell_double_quote(&bin_dir);
+    // Dedupe, then prepend: the dir ends up first and exactly once. Written to
+    // both the profile and the rc file, so a login shell sources it twice, and
+    // an rc that prepends its own dir in between (~/.grok/bin) made a
+    // skip-when-first block add a second copy (rc11). Anywhere-on-PATH is not
+    // enough either: in a nested macOS login shell (tmux, VS Code, `zsh -l`)
     // path_helper moves the inherited dir behind /etc/paths, and a Homebrew or
-    // Rust Type Kit `rtk` would then win.
+    // Rust Type Kit `rtk` would then win. Plain POSIX string surgery on
+    // ":$PATH:", so the one body runs the same in zsh, bash 3.2 and sh (zsh
+    // does not word-split); quoted pattern text is literal in all three.
     configure_shell_block(
         shell_targets,
         "managed_rtk",
         &format!(
-            "case \"$PATH\" in\n  \"{path_value}\"|\"{path_value}\":*) ;;\n  *) export PATH=\"{path_value}:$PATH\" ;;\nesac"
+            "_headroom_path=\":$PATH:\"\n\
+             while case \"$_headroom_path\" in *:\"{d}\":*) true ;; *) false ;; esac; do\n\
+             \x20 _headroom_path=${{_headroom_path%%:\"{d}\":*}}:${{_headroom_path#*:\"{d}\":}}\n\
+             done\n\
+             _headroom_path=${{_headroom_path#:}}\n\
+             _headroom_path=${{_headroom_path%:}}\n\
+             export PATH=\"{d}${{_headroom_path:+:$_headroom_path}}\"\n\
+             unset _headroom_path"
         ),
     )
 }
@@ -4841,8 +4875,26 @@ fn rescue_foreign_toml_from_block(
     block_id: &str,
     owned_table: Option<&str>,
 ) -> String {
-    let start = format!("# >>> headroom:{block_id} >>>");
-    let end = format!("# <<< headroom:{block_id} <<<");
+    rescue_foreign_toml(
+        content,
+        &format!("# >>> headroom:{block_id} >>>"),
+        &format!("# <<< headroom:{block_id} <<<"),
+        |header| owned_table == Some(header),
+        owned_table.is_none(),
+    )
+}
+
+/// The engine behind [`rescue_foreign_toml_from_block`] and
+/// [`rescue_foreign_toml_from_mcp_spans`]: between the `start`/`end` marker
+/// lines, a table is kept when `owns` accepts its header; `root_keys_only`
+/// also moves out any root key that is not one of [`CODEX_ROOT_KEYS`].
+fn rescue_foreign_toml(
+    content: &str,
+    start: &str,
+    end: &str,
+    owns: impl Fn(&str) -> bool,
+    root_keys_only: bool,
+) -> String {
     let mut out: Vec<&str> = Vec::new();
     let mut rescued: Vec<&str> = Vec::new();
     let mut in_block = false;
@@ -4867,13 +4919,13 @@ fn rescue_foreign_toml_from_block(
         if in_block {
             let code = line.split('#').next().unwrap_or("").trim();
             if code.starts_with('[') && code.ends_with(']') {
-                in_foreign_table = owned_table != Some(code);
+                in_foreign_table = !owns(code);
             }
             // Codex's TOML writer appends a new root key (/model's `model`,
             // `model_reasoning_effort`) after the last root key -- our
             // openai_base_url -- so it lands before our end marker too.
             let foreign_root_line =
-                owned_table.is_none() && !code.is_empty() && !is_codex_root_key_line(code);
+                root_keys_only && !code.is_empty() && !is_codex_root_key_line(code);
             if in_foreign_table || foreign_root_line {
                 rescued.push(line);
                 continue;
@@ -5941,6 +5993,261 @@ fn opencode_user_state_exists() -> bool {
 /// runtime relocates.
 pub fn pin_grok_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
     pin_toml_mcp_command(&grok_config_toml_path(), entrypoint)
+}
+
+/// `(is_end, server_name)` for the wheel registrar's
+/// `# --- [end ]Headroom MCP server[: name] ---` marker lines.
+fn mcp_span_marker(line: &str) -> Option<(bool, &str)> {
+    let (is_end, rest) = match line.strip_prefix("# --- end Headroom MCP server") {
+        Some(rest) => (true, rest),
+        None => (false, line.strip_prefix("# --- Headroom MCP server")?),
+    };
+    let rest = rest.strip_suffix(" ---")?;
+    let name = if rest.is_empty() {
+        "headroom"
+    } else {
+        rest.strip_prefix(": ")?
+    };
+    Some((is_end, name))
+}
+
+/// Move every table a Headroom MCP span does not own (anything but
+/// `[mcp_servers.<span name>(.*)]`) to just after the span's end marker,
+/// byte-preserved and in order. The wheel's Codex/Grok registrar deletes
+/// everything between its markers on a force re-register, and Codex/ChatGPT's
+/// TOML writer appends new tables before the document's trailing comment -- so
+/// with our span last, their MCP servers land inside it (rc11 lost the ChatGPT
+/// app's browser-use/computer-use `node_repl` this way).
+fn rescue_foreign_toml_from_mcp_spans(content: &str) -> String {
+    // Only spans that hold their own table. The wheel finds that table by its
+    // parsed key wherever it is, deletes the span and appends a fresh one, so
+    // emptying a span whose table lives elsewhere (an inline table under
+    // `[mcp_servers]`) would leave the file with two definitions.
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    let mut span: Option<&str> = None;
+    for line in content.lines() {
+        if let Some((is_end, name)) = mcp_span_marker(line.trim()) {
+            span = (!is_end).then_some(name);
+        } else if let Some(name) = span {
+            if mcp_table_name(line).as_deref() == Some(name) {
+                names.insert(name);
+            }
+        }
+    }
+    let mut out = content.to_string();
+    for name in names {
+        let (start, end) = if name == "headroom" {
+            (
+                "# --- Headroom MCP server ---".to_string(),
+                "# --- end Headroom MCP server ---".to_string(),
+            )
+        } else {
+            (
+                format!("# --- Headroom MCP server: {name} ---"),
+                format!("# --- end Headroom MCP server: {name} ---"),
+            )
+        };
+        out = rescue_foreign_toml(
+            &out,
+            &start,
+            &end,
+            |header| mcp_table_name(header).as_deref() == Some(name),
+            false,
+        );
+    }
+    if content.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Foreign tables that sat inside a Headroom MCP span of `content`, as
+/// `(key, has_root, text)`: a server's tables are one family keyed
+/// `mcp_servers.<x>`, any other table is keyed by its own path, and `has_root`
+/// says the family's own header is among them. `[[array]]` entries are left
+/// out: TOML takes another entry, so a duplicate would still parse.
+fn mcp_span_foreign_groups(content: &str) -> Vec<(Vec<String>, bool, String)> {
+    let mut groups: Vec<(Vec<String>, bool, Vec<&str>)> = Vec::new();
+    let mut span: Option<&str> = None;
+    let mut current: Option<usize> = None;
+    for line in content.lines() {
+        if let Some((is_end, name)) = mcp_span_marker(line.trim()) {
+            span = (!is_end).then_some(name);
+            current = None;
+            continue;
+        }
+        let Some(name) = span else { continue };
+        let code = line.split('#').next().unwrap_or("").trim();
+        if code.starts_with('[') && code.ends_with(']') {
+            current = None;
+            if mcp_table_name(line).as_deref() == Some(name) {
+                continue;
+            }
+            let Some(path) = toml_table_header_path(line) else {
+                continue;
+            };
+            let family = if path[0] == "mcp_servers" {
+                2
+            } else {
+                path.len()
+            };
+            let key = path[..family.min(path.len())].to_vec();
+            let i = groups
+                .iter()
+                .position(|(k, ..)| *k == key)
+                .unwrap_or_else(|| {
+                    groups.push((key.clone(), false, Vec::new()));
+                    groups.len() - 1
+                });
+            groups[i].1 |= path == key;
+            current = Some(i);
+        }
+        if let Some(i) = current {
+            groups[i].2.push(line);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(key, has_root, lines)| (key, has_root, lines.join("\n").trim_end().to_string()))
+        .collect()
+}
+
+/// Heal configs an earlier build already damaged: re-append (outside any span)
+/// each foreign table family a `<file>.headroom-backup-*` held inside a
+/// Headroom MCP span, newest backup first, when adding it to `live` still
+/// parses -- TOML refuses a table defined twice, so a table the live file has
+/// (the app re-added it, maybe with newer values) is never overwritten. A
+/// family without its root header is restored only under a root `live` has:
+/// a lone `[mcp_servers.x.env]` has no `command`, which Codex rejects.
+fn restore_lost_mcp_span_tables(path: &Path, live: &str) -> String {
+    let mut healed = live.to_string();
+    let (Some(dir), Some(file_name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return healed;
+    };
+    let prefix = format!("{file_name}.headroom-backup-");
+    let mut backups: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect();
+    backups.sort_by(|a, b| b.cmp(a));
+    for backup in backups {
+        let Ok(text) = std::fs::read_to_string(&backup) else {
+            continue;
+        };
+        for (key, has_root, group) in mcp_span_foreign_groups(&text) {
+            let root_is_live = || {
+                healed
+                    .parse::<toml::Value>()
+                    .ok()
+                    .is_some_and(|doc| key.iter().try_fold(&doc, |v, k| v.get(k)).is_some())
+            };
+            if !has_root && !root_is_live() {
+                continue;
+            }
+            let candidate = format!("{}\n\n{group}\n", healed.trim_end());
+            if candidate.parse::<toml::Value>().is_ok() {
+                log::info!(
+                    "restored [{}] to {} from {} (lost from inside the Headroom MCP span)",
+                    key.join("."),
+                    path.display(),
+                    backup.display()
+                );
+                healed = candidate;
+            }
+        }
+    }
+    healed
+}
+
+/// Keep other apps' tables out of the wheel registrar's reach in `path` (a
+/// Codex or Grok `config.toml`): evacuate foreign tables from Headroom MCP
+/// spans and, with `heal`, restore any a backup shows were already lost. Only
+/// writes a change that leaves the parsed config otherwise identical; a file
+/// that does not parse is left alone. Returns whether the file changed.
+pub(crate) fn protect_foreign_mcp_tables_in(path: &Path, heal: bool) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let existing =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let Ok(parsed) = existing.parse::<toml::Value>() else {
+        return Ok(false);
+    };
+    let mut evacuated = rescue_foreign_toml_from_mcp_spans(&existing);
+    if evacuated.parse::<toml::Value>().ok().as_ref() != Some(&parsed) {
+        // Keys after the end marker would change owner (TOML scoping): keep
+        // the file as it is rather than alter the user's config.
+        log::warn!(
+            "{}: moving tables out of the Headroom MCP span would change the config; left in place",
+            path.display()
+        );
+        evacuated = existing.clone();
+    }
+    let updated = if heal {
+        restore_lost_mcp_span_tables(path, &evacuated)
+    } else {
+        evacuated
+    };
+    if updated == existing {
+        return Ok(false);
+    }
+    backup_if_exists(path)?;
+    atomic_write(path, updated.as_bytes())?;
+    Ok(true)
+}
+
+/// [`protect_foreign_mcp_tables_in`] for every config the wheel's marker-span
+/// registrars (Codex, Grok) write. Run it around every `headroom mcp install`
+/// and MCP helper run. Best-effort: logs and carries on.
+pub fn protect_foreign_mcp_tables() {
+    let _setup = setup_write_lock();
+    protect_foreign_mcp_tables_unlocked();
+}
+
+/// Whether this run may heal (see [`restore_lost_mcp_span_tables`]). The heal
+/// runs once per machine and is recorded before it runs: every backup it reads
+/// then predates this build's own writes (the evacuation backs up the file
+/// with the tables still inside the span), and a server the user removes or
+/// renames afterwards stays gone.
+// ponytail: a server removed between the rc11 damage and this build's first
+// run comes back that one time.
+fn claim_mcp_span_heal() -> bool {
+    let marker = config_file(&app_data_dir(), "mcp-span-heal-done");
+    if marker.exists() {
+        return false;
+    }
+    match atomic_write(&marker, Utc::now().to_rfc3339().as_bytes()) {
+        Ok(()) => true,
+        Err(err) => {
+            log::warn!(
+                "not healing lost MCP tables: recording {} failed: {err:#}",
+                marker.display()
+            );
+            false
+        }
+    }
+}
+
+/// [`protect_foreign_mcp_tables`] for callers already holding the setup
+/// write lock.
+fn protect_foreign_mcp_tables_unlocked() {
+    let heal = claim_mcp_span_heal();
+    for path in [codex_config_toml_path(), grok_config_toml_path()] {
+        if let Err(err) = protect_foreign_mcp_tables_in(&path, heal) {
+            log::warn!(
+                "protecting foreign MCP tables in {} failed: {err:#}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn toml_basic_string(value: &str) -> String {
@@ -11460,10 +11767,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let reordered = format!("/usr/bin:/bin:{dir}");
         let cases: [(&str, Vec<&str>); 2] = [
             ("/usr/bin:/bin", vec![dir.as_str(), "/usr/bin", "/bin"]),
-            (
-                reordered.as_str(),
-                vec![dir.as_str(), "/usr/bin", "/bin", dir.as_str()],
-            ),
+            (reordered.as_str(), vec![dir.as_str(), "/usr/bin", "/bin"]),
         ];
         for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
             if !Path::new(shell).exists() {
@@ -11489,6 +11793,58 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                     String::from_utf8_lossy(&out.stderr)
                 );
             }
+        }
+    }
+
+    /// rc11: the block skipped only when the dir was already first, so a
+    /// login zsh whose .zshrc prepends another dir (~/.grok/bin) between the
+    /// .zprofile block and the .zshrc block carried the Headroom dir twice.
+    /// Dedupe-then-prepend: first, exactly once, also in nested login shells.
+    #[cfg(unix)]
+    #[test]
+    fn managed_rtk_dir_is_first_exactly_once_when_rc_prepends_another_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin = tmp.path().join("Head room $x [1]*").join("bin");
+        let dir = bin.to_string_lossy().into_owned();
+        let profile = tmp.path().join(".zprofile");
+        let rc = tmp.path().join(".zshrc");
+        fs::write(&rc, "export PATH=\"/grok bin:$PATH\"\n").unwrap();
+        super::ensure_managed_rtk_on_path(&bin.join("rtk"), &[profile.clone(), rc.clone()])
+            .unwrap();
+        let login = ". \"$1\"; . \"$2\"";
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            // Twice: the second pass is a nested login shell inheriting PATH.
+            let out = crate::proc::command(shell)
+                .args([
+                    "-c",
+                    &format!("{login}; {login}; printf %s \"$PATH\""),
+                    "sh",
+                ])
+                .arg(&profile)
+                .arg(&rc)
+                .env("PATH", format!("/usr/bin:/bin:{dir}:/usr/bin"))
+                .env("ZDOTDIR", tmp.path())
+                .env_remove("BASH_ENV")
+                .output()
+                .unwrap();
+            let path = String::from_utf8_lossy(&out.stdout).into_owned();
+            let entries: Vec<&str> = path.split(':').collect();
+            assert_eq!(
+                entries,
+                [
+                    dir.as_str(),
+                    "/grok bin",
+                    "/grok bin",
+                    "/usr/bin",
+                    "/bin",
+                    "/usr/bin"
+                ],
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
 
@@ -18580,6 +18936,304 @@ sys.exit(3)
             "python -m args must be normalized, got:\n{after}"
         );
         assert!(after.contains("[mcp_servers.headroom.env]"));
+    }
+
+    /// Faithful port of the wheel's `CodexRegistrar.register_server(force=True)`
+    /// for a spec that differs from the file (always, once Rust pinned the
+    /// command): `unregister_server` deletes everything between the markers,
+    /// then `_write_block` appends a fresh span (headroom/mcp_registry/codex.py
+    /// and grok.py, 0.39.0).
+    fn wheel_force_register(content: &str, block: &str) -> String {
+        let (ms, me) = (
+            "# --- Headroom MCP server ---",
+            "# --- end Headroom MCP server ---",
+        );
+        let mut content = content.to_string();
+        if let (Some(start), Some(end)) = (content.find(ms), content.find(me)) {
+            let before = content[..start].trim_end_matches('\n');
+            let after = content[end + me.len()..].trim_start_matches('\n');
+            content = if !before.is_empty() && !after.is_empty() {
+                format!("{before}\n\n{after}")
+            } else {
+                let rest = if before.is_empty() { after } else { before };
+                let rest = rest.trim_end_matches('\n');
+                if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!("{rest}\n")
+                }
+            };
+        }
+        if content.trim().is_empty() {
+            format!("{block}\n")
+        } else {
+            format!("{}\n\n{block}\n", content.trim_end_matches('\n'))
+        }
+    }
+
+    /// The span the wheel's `_write_block` appends for its own spec.
+    const WHEEL_BLOCK: &str = "# --- Headroom MCP server ---\n\
+         [mcp_servers.headroom]\n\
+         command = \"headroom\"\n\
+         args = [\"mcp\", \"serve\"]\n\
+         \n\
+         [mcp_servers.headroom.env]\n\
+         HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n\
+         # --- end Headroom MCP server ---";
+
+    const NODE_REPL_TABLES: &str = "[mcp_servers.node_repl]\n\
+         args = []\n\
+         command = \"/Applications/ChatGPT.app/node_repl\"\n\
+         startup_timeout_sec = 120\n\
+         \n\
+         [mcp_servers.node_repl.env]\n\
+         BROWSER_USE_AVAILABLE_BACKENDS = \"chrome,iab\"\n\
+         NODE_REPL_TRUSTED_SERVICES = '{\"browser\":\"x.mjs\"}'\n";
+
+    /// The ChatGPT app appends its tables before the document's trailing
+    /// comment, so with our span last they land inside it.
+    fn codex_config_with_trapped_node_repl(headroom_command: &str) -> String {
+        format!(
+            "model = \"gpt-5\"\n\
+             \n\
+             [tui]\n\
+             screen_reader_detection_done = true\n\
+             # --- Headroom MCP server ---\n\
+             [mcp_servers.headroom]\n\
+             command = \"{headroom_command}\"\n\
+             args = [\"mcp\", \"serve\"]\n\
+             \n\
+             [mcp_servers.headroom.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n\
+             \n\
+             {NODE_REPL_TABLES}\
+             # --- end Headroom MCP server ---\n"
+        )
+    }
+
+    fn assert_node_repl_intact(after: &str) {
+        assert!(
+            after.contains(NODE_REPL_TABLES.trim_end()),
+            "node_repl tables lost or altered:\n{after}"
+        );
+        let parsed: toml::Value = toml::from_str(after).expect("config parses");
+        assert_eq!(
+            parsed["mcp_servers"]["node_repl"]["env"]["BROWSER_USE_AVAILABLE_BACKENDS"].as_str(),
+            Some("chrome,iab")
+        );
+        let end = after.find("# --- end Headroom MCP server ---").unwrap();
+        assert!(
+            after.find("[mcp_servers.node_repl]").unwrap() > end,
+            "node_repl still inside the Headroom span:\n{after}"
+        );
+    }
+
+    /// rc11 data loss: runtime maintenance ran `headroom mcp install --force`,
+    /// the wheel saw the Rust-pinned command differ from its own spec, and its
+    /// unregister deleted the ChatGPT app's browser-use/computer-use servers
+    /// that sat inside our marker span. The desktop must move them out before
+    /// (and after) every registrar run.
+    #[test]
+    #[serial_test::serial]
+    fn foreign_tables_in_the_mcp_span_survive_the_wheels_force_reinstall() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        let pinned = "/Apps/Headroom/venv/bin/headroom";
+        std::fs::write(&config, codex_config_with_trapped_node_repl(pinned)).unwrap();
+
+        assert!(super::protect_foreign_mcp_tables_in(&config, false).unwrap());
+        let evacuated = std::fs::read_to_string(&config).unwrap();
+        assert_node_repl_intact(&evacuated);
+        // Nothing but the move: the parsed config is unchanged.
+        assert_eq!(
+            toml::from_str::<toml::Value>(&evacuated).unwrap(),
+            toml::from_str::<toml::Value>(&codex_config_with_trapped_node_repl(pinned)).unwrap()
+        );
+
+        std::fs::write(&config, wheel_force_register(&evacuated, WHEEL_BLOCK)).unwrap();
+        pin_codex_mcp_command(Path::new(pinned)).unwrap();
+        super::protect_foreign_mcp_tables_in(&config, false).unwrap();
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            after.contains("[mcp_servers.node_repl]"),
+            "wheel reinstall dropped node_repl:\n{after}"
+        );
+        let parsed: toml::Value = toml::from_str(&after).expect("config parses");
+        assert_eq!(
+            parsed["mcp_servers"]["node_repl"]["command"].as_str(),
+            Some("/Applications/ChatGPT.app/node_repl")
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["headroom"]["command"].as_str(),
+            Some(pinned)
+        );
+        // Idempotent once clean.
+        assert!(!super::protect_foreign_mcp_tables_in(&config, false).unwrap());
+    }
+
+    /// Heal for machines rc11 already damaged: a `.headroom-backup-*` still
+    /// holds the tables the wheel deleted from inside the span. Restore those
+    /// the live file lacks, outside the span; never overwrite a table the live
+    /// file has (the app may have re-added it with newer values).
+    #[test]
+    #[serial_test::serial]
+    fn lost_mcp_span_tables_are_restored_from_a_headroom_backup() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        let pinned = "/Apps/Headroom/venv/bin/headroom";
+        let damaged_backup = codex_config_with_trapped_node_repl(pinned).replace(
+            "# --- end Headroom MCP server ---\n",
+            "[mcp_servers.chrome]\ncommand = \"old-chrome\"\n# --- end Headroom MCP server ---\n",
+        );
+        std::fs::write(
+            codex.join("config.toml.headroom-backup-20260930060313"),
+            &damaged_backup,
+        )
+        .unwrap();
+        // The live file after the wheel's unregister+append: node_repl gone,
+        // chrome re-added by the app with a newer command.
+        let live = format!(
+            "model = \"gpt-5\"\n\
+             \n\
+             [tui]\n\
+             screen_reader_detection_done = true\n\
+             \n\
+             [mcp_servers.chrome]\n\
+             command = \"new-chrome\"\n\
+             \n\
+             # --- Headroom MCP server ---\n\
+             [mcp_servers.headroom]\n\
+             command = \"{pinned}\"\n\
+             args = [\"mcp\", \"serve\"]\n\
+             # --- end Headroom MCP server ---\n"
+        );
+        std::fs::write(&config, &live).unwrap();
+
+        super::protect_foreign_mcp_tables();
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert_node_repl_intact(&after);
+        let parsed: toml::Value = toml::from_str(&after).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["chrome"]["command"].as_str(),
+            Some("new-chrome")
+        );
+        assert!(
+            after.starts_with(live.trim_end()),
+            "live content moved:\n{after}"
+        );
+
+        // Review: the heal ran on every call while a backup held the table,
+        // so a server the user turned off afterwards came back (three times,
+        // until the backups rotated out). It runs once.
+        let removed = after.replace(NODE_REPL_TABLES.trim_end(), "");
+        std::fs::write(&config, &removed).unwrap();
+        super::protect_foreign_mcp_tables();
+        let again = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !again.contains("node_repl"),
+            "removed server restored:\n{again}"
+        );
+    }
+
+    /// Review: the heal read the backup the evacuation itself had just written
+    /// (node_repl still inside the span), so a server the user removed after
+    /// the evacuation came back.
+    #[test]
+    #[serial_test::serial]
+    fn a_server_removed_after_the_evacuation_stays_removed() {
+        let _home = TestHome::new();
+        let config = super::codex_config_toml_path();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            codex_config_with_trapped_node_repl("/Apps/Headroom/venv/bin/headroom"),
+        )
+        .unwrap();
+        super::protect_foreign_mcp_tables();
+        let evacuated = std::fs::read_to_string(&config).unwrap();
+        assert_node_repl_intact(&evacuated);
+
+        // The user turns browser-use off; the ChatGPT app deletes node_repl.
+        std::fs::write(&config, evacuated.replace(NODE_REPL_TABLES.trim_end(), "")).unwrap();
+        super::protect_foreign_mcp_tables();
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !after.contains("node_repl"),
+            "removed server restored:\n{after}"
+        );
+    }
+
+    /// Review: the heal took any header inside a backup's span as restorable.
+    /// A subtable whose server was since deleted came back as an orphan
+    /// `[mcp_servers.gone.env]` (no `command`, which Codex rejects), and an
+    /// `[[array]]` entry the live file still has was appended again (TOML
+    /// allows another entry, so the parse check passed).
+    #[test]
+    #[serial_test::serial]
+    fn the_heal_restores_no_orphan_subtable_or_duplicate_array_entry() {
+        let _home = TestHome::new();
+        let config = super::codex_config_toml_path();
+        let dir = config.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let span = "# --- Headroom MCP server ---\n\
+             [mcp_servers.headroom]\n\
+             command = \"/Apps/Headroom/venv/bin/headroom\"\n";
+        let end = "# --- end Headroom MCP server ---\n";
+        std::fs::write(
+            dir.join("config.toml.headroom-backup-20260930060313"),
+            format!(
+                "[mcp_servers.gone]\ncommand = \"gone\"\n\n{span}\n\
+                 [mcp_servers.gone.env]\nA = \"1\"\n\n[[hooks]]\nname = \"a\"\n{end}"
+            ),
+        )
+        .unwrap();
+        let live = format!("{span}{end}\n[[hooks]]\nname = \"a\"\n");
+        std::fs::write(&config, &live).unwrap();
+
+        super::protect_foreign_mcp_tables();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), live);
+    }
+
+    /// Review: ownership compared header text, so our own table spelled
+    /// `[ mcp_servers."headroom" ]` (the same TOML key) counted as foreign and
+    /// was moved out of the span. The wheel's re-register then appended a
+    /// second `[mcp_servers.headroom]` and Codex refused the config.
+    #[test]
+    #[serial_test::serial]
+    fn a_respelled_headroom_table_stays_in_its_span() {
+        let home = TestHome::new();
+        let config = home.path().join("config.toml");
+        std::fs::write(
+            &config,
+            codex_config_with_trapped_node_repl("/Apps/Headroom/venv/bin/headroom")
+                .replace("[mcp_servers.headroom]\n", "[ mcp_servers.\"headroom\" ]\n"),
+        )
+        .unwrap();
+        super::protect_foreign_mcp_tables_in(&config, false).unwrap();
+        let evacuated = std::fs::read_to_string(&config).unwrap();
+        assert_node_repl_intact(&evacuated);
+
+        let reinstalled = wheel_force_register(&evacuated, WHEEL_BLOCK);
+        let parsed: toml::Value = toml::from_str(&reinstalled)
+            .unwrap_or_else(|err| panic!("reinstall broke the config: {err}\n{reinstalled}"));
+        assert_eq!(
+            parsed["mcp_servers"]["node_repl"]["command"].as_str(),
+            Some("/Applications/ChatGPT.app/node_repl")
+        );
+    }
+
+    /// Review: protect is a read-modify-write of ~/.codex/config.toml run from
+    /// the maintenance and add-on threads, so it must not interleave with an
+    /// apply writing the provider block to the same file.
+    #[test]
+    #[serial_test::serial]
+    fn protecting_mcp_tables_waits_for_an_apply_in_flight() {
+        let _home = TestHome::new();
+        assert_waits_for_setup_writes(super::protect_foreign_mcp_tables);
     }
 
     /// Regression: the Learn backend took the first `codex` that merely
