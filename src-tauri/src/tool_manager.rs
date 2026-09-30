@@ -1794,6 +1794,92 @@ if _hd_os.environ.get(
         # Fail-open to the wheel's fallback (the pre-vendor behaviour).
         pass
 
+# --- Read protection: judge a Codex exec envelope by its output (vendor) ------
+# Codex code mode runs `exec` as JavaScript. When the script prints the whole
+# exec_command result, text(r) rather than text(r.output), the tool output is
+# the JSON envelope {"chunk_id","wall_time_seconds","exit_code",...,"output":
+# "<file>"}. The read command is detected (#3621/#3737), but protection is then
+# finalized by CONTENT on the envelope, and the detector's verdict on one line
+# of JSON-escaped code flips per file: rc8's 400-line `nl -ba models.rs` came
+# back JSON (releasable), was replaced by one CCR marker, and the model re-ran
+# the command twice with line filters. Judge the envelope's `output` string(s)
+# instead, so the verdict is the one text(r.output) gets: a code read is
+# protected, a JSON/log/diff read inside an envelope stays releasable. Only
+# read commands reach this gate. Every caller (Responses handler,
+# ContentRouter.apply) looks the gate up at call time, so rebinding the module
+# attribute reaches them all. Exact-pin gated to wheel 0.39.0; self-neutralizes
+# when the wheel already protects an enveloped code read. Kill switch:
+# HEADROOM_CODEX_WHOLE_READ=0.
+_hd_cxr_flag = _hd_os.environ.get("HEADROOM_CODEX_WHOLE_READ", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_cxr_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_cxr_meta
+
+        if _hd_cxr_meta.version("headroom-ai") == "0.39.0":
+            import json as _hd_cxr_json
+
+            from headroom.transforms import content_router as _hd_cxr_mod
+
+            _hd_cxr_orig = _hd_cxr_mod._read_output_should_be_protected
+
+            def _hd_cxr_outputs(text):
+                # The Responses handler joins the parts, so the envelope may sit
+                # behind Codex's "Script completed / Wall time / Output:" preamble.
+                # ponytail: only a script whose sole output is the envelope(s);
+                # text("x"); text(r) keeps the wheel's verdict.
+                body = text.strip()
+                if not body.startswith(("{", "[")):
+                    cut = text.find("\nOutput:\n")
+                    if cut < 0:
+                        return None
+                    body = text[cut + 9 :].strip()
+                if not body.startswith(("{", "[")):
+                    return None
+                try:
+                    obj = _hd_cxr_json.loads(body)
+                except (ValueError, RecursionError):
+                    return None
+                objs = obj if isinstance(obj, list) else [obj]
+                outs = [
+                    o["output"]
+                    for o in objs
+                    if isinstance(o, dict)
+                    and isinstance(o.get("output"), str)
+                    and "wall_time_seconds" in o
+                ]
+                return outs if outs and len(outs) == len(objs) else None
+
+            def _hd_cxr_gate(text):
+                outs = _hd_cxr_outputs(text) if isinstance(text, str) and text else None
+                if outs is None:
+                    return _hd_cxr_orig(text)
+                return any(_hd_cxr_orig(o) for o in outs)
+
+            _hd_cxr_probe = _hd_cxr_json.dumps(
+                {
+                    "chunk_id": "p",
+                    "wall_time_seconds": 0.0,
+                    "exit_code": 0,
+                    "output": "".join(
+                        f"{i:6d}\tpub fn f{i}(x: Option<Vec<u8>>) -> usize {{ x.map_or(0, |v| v.len()) }}\n"
+                        for i in range(1, 41)
+                    ),
+                }
+            )
+            if not _hd_cxr_orig(_hd_cxr_probe) and _hd_cxr_gate(_hd_cxr_probe):
+                _hd_cxr_mod._read_output_should_be_protected = _hd_cxr_gate
+    except Exception:
+        # Fail-open to the wheel's verdict: nothing is rebound.
+        pass
+
 # Proxied guarded upstreams (upstream PR #3804; self-neutralizes once
 # upstream_pinning grows `proxied_guarded_upstreams_allowed`):
 # 0.39.0 pins caller-supplied upstreams (x-headroom-base-url) to the address the
@@ -14862,6 +14948,21 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_codex_whole_read() {
+        // Codex code-mode `text(r)` wraps a file read in the exec result JSON,
+        // which the wheel's content gate can judge as releasable JSON and
+        // replace with one CCR marker. Behaviour is proven by
+        // codex_whole_read_behaves_against_the_installed_wheel; this pins the
+        // backend gate, the exact pin, the kill switch, the self-neutralization
+        // probe and the rebind.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_CODEX_WHOLE_READ"));
+        assert!(py.contains(r#"_hd_cxr_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains("if not _hd_cxr_orig(_hd_cxr_probe) and _hd_cxr_gate(_hd_cxr_probe):"));
+        assert!(py.contains("_hd_cxr_mod._read_output_should_be_protected = _hd_cxr_gate"));
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -15609,6 +15710,71 @@ assert g.done"#,
         );
         assert_eq!(on_calls, "0", "vendor still ran Kompress:\n{on}\n{on_err}");
         assert_eq!(on_rest, off_rest, "vendor changed the router's output");
+    }
+
+    #[test]
+    fn codex_whole_read_behaves_against_the_installed_wheel() {
+        // The rc8 repro (Codex session 01a0f09a): code mode ran `nl -ba
+        // src-tauri/src/models.rs | sed -n 1,400p` and printed the whole exec
+        // result, text(r). The read command is detected, but the wheel judges
+        // the JSON envelope rather than the file inside it; its detector called
+        // this envelope JSON, so the read was released and replaced by one CCR
+        // marker and the model re-ran the command twice with line filters. The
+        // envelope below is the incident's bytes cut to the first 20 lines,
+        // which the wheel still misjudges. With the vendor the verdict is the
+        // inner text's: the enveloped code read is protected, bare and behind
+        // Codex's "Output:" preamble joined as the Responses handler joins it;
+        // an enveloped JSON read stays releasable; plain code keeps the
+        // wheel's verdict. The kill switch restores the wheel's. The probe
+        // seeds the coding-profile env the way `run_server` does and asserts
+        // read protection is on, so the gate is the one production reaches.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-codex-whole-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let envelope = r##"{"chunk_id":"6c7260","wall_time_seconds":0.000003292,"exit_code":0,"original_token_count":5032,"output":"     1\tuse chrono::{DateTime, Utc};\n     2\tuse serde::{Deserialize, Serialize};\n     3\t\n     4\t#[derive(Debug, Clone, Serialize, Deserialize)]\n     5\t#[serde(rename_all = \"snake_case\")]\n     6\tpub enum ToolStatus {\n     7\t    NotInstalled,\n     8\t    Installing,\n     9\t    Healthy,\n    10\t    Degraded,\n    11\t}\n    12\t\n    13\t#[derive(Debug, Clone, Serialize, Deserialize)]\n    14\t#[serde(rename_all = \"camelCase\")]\n    15\tpub struct ManagedTool {\n    16\t    pub id: String,\n    17\t    pub name: String,\n    18\t    pub description: String,\n    19\t    pub runtime: String,\n    20\t    pub required: bool,\n"}"##;
+        let probe = "import json, sys\n\
+                     from headroom.agent_savings import seed_proxy_env_defaults\n\
+                     seed_proxy_env_defaults()\n\
+                     from headroom.transforms import content_router as cr\n\
+                     from headroom.proxy.handlers.openai import _responses_part_text\n\
+                     assert cr.read_protection_enabled(), 'not the production posture'\n\
+                     env = sys.argv[1]\n\
+                     r = json.loads(env)\n\
+                     pre = 'Script completed\\nWall time 0.1 seconds\\nOutput:\\n'\n\
+                     joined = _responses_part_text([{'text': pre}, {'text': env}])\n\
+                     pkg = json.dumps(dict(r, output=json.dumps(\n\
+                     {'name': 'app', 'private': True, 'scripts': {'build': 'tsc'}}, indent=2)))\n\
+                     g = cr._read_output_should_be_protected\n\
+                     print(g(env), g(joined), g(pkg), g(r['output']))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe, envelope])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_CODEX_WHOLE_READ", kill)
+                .output()
+                .expect("run codex whole-read probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if off.starts_with("True ") {
+            eprintln!("skipping: the wheel already protects this enveloped read; drop the vendor");
+            return;
+        }
+        assert_eq!(off, "False False False True", "kill switch arm:\n{off_err}");
+        assert_eq!(on, "True True False True", "stderr:\n{on_err}");
     }
 
     #[test]
