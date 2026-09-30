@@ -83,8 +83,12 @@ jobs:
         # runner's own platform is both simpler and a truer model of a user's
         # machine. --find-links mirrors VENDOR_WHEELS_INDEX_URL in
         # tool_manager.rs, the way the Windows check does.
+        # No --no-deps either, like the app: the locks carry --hash pins, so pip
+        # runs in hash-checking mode, downloads every wheel and verifies its
+        # sha256, and fails on any dependency the lock does not pin. That proves
+        # the hashes and the lock's closure on each platform we ship.
         run: >
-          python -m pip install --dry-run --no-deps --only-binary=:all:
+          python -m pip install --dry-run --only-binary=:all:
           --find-links https://github.com/gglucass/headroom-desktop/releases/expanded_assets/vendor-wheels-v1
           -r src-tauri/python/headroom-linux-requirements.lock
 
@@ -182,11 +186,12 @@ jobs:
         # A pin without a win_amd64/universal wheel makes bootstrap compile
         # from source, which needs MSVC and bricks every user install without
         # build tools (hnswlib, RUST-65). Fail here instead. --dry-run
-        # resolves the full pin set without installing; the --find-links
-        # mirror matches VENDOR_WHEELS_INDEX_URL in tool_manager.rs.
+        # resolves the full pin set without installing, in hash-checking mode
+        # (see the Linux job); the --find-links mirror matches
+        # VENDOR_WHEELS_INDEX_URL in tool_manager.rs.
         shell: bash
         run: >
-          python -m pip install --dry-run --no-deps --only-binary=:all:
+          python -m pip install --dry-run --only-binary=:all:
           --find-links https://github.com/gglucass/headroom-desktop/releases/expanded_assets/vendor-wheels-v1
           -r src-tauri/python/headroom-windows-requirements.lock
 
@@ -264,8 +269,9 @@ jobs:
         # resolves; macos-intel-lock covers the other. No --platform: pip
         # matches wheel tags exactly rather than accepting older compatible
         # ones, so resolving for the runner's own arch is the truer model.
+        # Hash-checking mode, like the Linux job: every wheel is verified.
         run: >
-          python -m pip install --dry-run --no-deps --only-binary=:all:
+          python -m pip install --dry-run --only-binary=:all:
           --find-links https://github.com/gglucass/headroom-desktop/releases/expanded_assets/vendor-wheels-v1
           -r src-tauri/python/headroom-requirements.lock
 
@@ -347,17 +353,17 @@ jobs:
 
       - name: macOS x86_64 runtime lock resolves to wheels only
         run: >
-          python -m pip install --dry-run --no-deps --only-binary=:all:
+          python -m pip install --dry-run --only-binary=:all:
           --find-links https://github.com/gglucass/headroom-desktop/releases/expanded_assets/vendor-wheels-v1
           -r src-tauri/python/headroom-requirements.lock
 
   advisories:
     # Separate job so a newly-published advisory reds a distinguishable check
-    # rather than looking like a test regression. Both audits read committed
-    # lockfiles, so this needs no build.
+    # rather than looking like a test regression. All three audits (Rust, npm,
+    # the Python runtime) read committed lockfiles, so this needs no build.
     # Known tradeoff: an advisory published upstream can red an unrelated PR.
     # If that gets noisy, ignore the specific ID here rather than dropping the
-    # job -- `cargo audit --ignore RUSTSEC-YYYY-NNNN`.
+    # job -- `cargo audit --ignore RUSTSEC-YYYY-NNNN`, `pip-audit --ignore-vuln`.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -390,3 +396,38 @@ jobs:
         # --omit=dev: a devDependency advisory is not in the shipped bundle and
         # would block releases on something users never run.
         run: npm audit --audit-level=high --omit=dev
+      - name: Set up Python (runtime advisories)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Python runtime advisories
+        # Audits the pins each platform installs, not the lock files as-is:
+        # pip-audit evaluates environment markers against the runner, so a
+        # direct audit silently skips the Intel-Mac-only pins. --export
+        # resolves markers per target first (offline). The ignores:
+        # - PYSEC-2025-194 (torch.jit.script memory corruption): exploiting it
+        #   means running attacker-written TorchScript locally, and nothing in
+        #   headroom calls torch.jit. The fix is torch 2.13, a native bump with
+        #   its own macOS-arch review; drop the ignore with that bump.
+        # - PYSEC-2026-3447 (setuptools MANIFEST.in excludes vs NFD names):
+        #   only reachable when building an sdist, which the runtime never does
+        #   (--only-binary=:all:). Drop when setuptools moves to >=83.
+        # - PYSEC-2026-3552/3553/3554: cryptography 48.0.1 on Intel Macs only,
+        #   GHSA-g6cj-pr64-35w5 / GHSA-jwv3-5hgf-82ww / GHSA-m2h6-j472-rp4c,
+        #   verified unreachable 2026-08-17 (see headroom-requirements.lock).
+        #   Drop with that pin.
+        shell: bash
+        run: |
+          python -m pip install --quiet pip-audit==2.10.1
+          python scripts/hash-python-locks.py --export "$RUNNER_TEMP/python-targets"
+          status=0
+          for target in "$RUNNER_TEMP"/python-targets/*.txt; do
+            echo "== $(basename "$target" .txt)"
+            pip-audit -r "$target" --disable-pip --progress-spinner off \
+              --ignore-vuln PYSEC-2025-194 \
+              --ignore-vuln PYSEC-2026-3447 \
+              --ignore-vuln PYSEC-2026-3552 \
+              --ignore-vuln PYSEC-2026-3553 \
+              --ignore-vuln PYSEC-2026-3554 || status=1
+          done
+          exit "$status"
