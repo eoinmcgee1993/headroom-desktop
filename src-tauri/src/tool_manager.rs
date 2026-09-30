@@ -4109,10 +4109,10 @@ impl ToolManager {
                     .find_map(|f| extract_required_pydantic_core_version(&f.log_tail))
                 {
                     log::warn!(
-                        "headroom proxy failed with pydantic-core/pydantic skew; \
-                     reinstalling pydantic-core=={target} and retrying"
+                        "headroom proxy failed with pydantic-core/pydantic skew \
+                     (requires pydantic-core {target}); reinstalling the lock's pins and retrying"
                     );
-                    match self.repair_pydantic_core(&target) {
+                    match self.repair_pydantic_core() {
                         Ok(()) => {
                             log::warn!("pydantic-core repair succeeded; retrying headroom startup");
                             allow_repair = false;
@@ -5775,10 +5775,10 @@ impl ToolManager {
                     return Err(err);
                 };
                 log::warn!(
-                    "smoke test failed with pydantic-core/pydantic skew; \
-                     reinstalling pydantic-core=={target} and retrying"
+                    "smoke test failed with pydantic-core/pydantic skew \
+                     (requires pydantic-core {target}); reinstalling the lock's pins and retrying"
                 );
-                if let Err(repair_err) = self.repair_pydantic_core(&target) {
+                if let Err(repair_err) = self.repair_pydantic_core() {
                     log::error!("pydantic-core repair failed: {repair_err:#}");
                     return Err(err);
                 }
@@ -6821,18 +6821,29 @@ impl ToolManager {
         .with_context(|| format!("reinstalling Headroom version {version}"))
     }
 
-    /// Recover from a pydantic / pydantic-core version skew by reinstalling
-    /// pydantic-core at the version pydantic wants. Triggered when the proxy
-    /// log shows the SystemError pydantic raises during import. `--no-deps`
-    /// keeps the rest of the venv untouched.
-    fn repair_pydantic_core(&self, target_version: &str) -> Result<()> {
-        // Reinstall pydantic itself first (no version pin) to rewrite its
-        // dist-info. A failed prior upgrade can leave two `pydantic-X.Y.dist-info`
-        // dirs in site-packages; `importlib.metadata.metadata('pydantic')` then
-        // returns either one non-deterministically, producing flip-flopping
-        // "requires N.N.N" errors across attempts. Force-reinstalling pydantic
-        // collapses the duplicates so the next pin we apply actually matches
-        // what pydantic asks for.
+    /// Recover from a pydantic / pydantic-core version skew (the SystemError
+    /// pydantic raises during import, in the proxy log or smoke test):
+    /// force-reinstall the platform lock's pydantic and pydantic-core, hash
+    /// pinned, without deps. A failed prior upgrade can leave two
+    /// `pydantic-X.Y.dist-info` dirs in site-packages;
+    /// `importlib.metadata.metadata('pydantic')` then returns either one
+    /// non-deterministically, producing flip-flopping "requires N.N.N" errors
+    /// across attempts. Reinstalling pydantic collapses the duplicates, and the
+    /// lock's pydantic-core is by construction the one its pydantic requires.
+    /// Hash-checking mode like every other install from the lock (#125): a bare
+    /// `pydantic` here took whatever PyPI served.
+    fn repair_pydantic_core(&self) -> Result<()> {
+        let lock = bootstrap_requirements_lock();
+        let mut pins = String::new();
+        for name in ["pydantic", "pydantic-core"] {
+            let entry = lock_entry(lock, name)
+                .ok_or_else(|| anyhow!("the requirements lock does not pin {name}"))?;
+            pins.push_str(&entry);
+            pins.push('\n');
+        }
+        let pins_path = self.runtime.downloads_dir.join("pydantic-repair.lock");
+        crate::client_adapters::atomic_write(&pins_path, pins.as_bytes())
+            .with_context(|| format!("writing {}", pins_path.display()))?;
         run_pip_install_with_retries_clearing_locks(
             &self.runtime.managed_python(),
             &[
@@ -6848,37 +6859,15 @@ impl ToolManager {
                 "https://pypi.org/simple",
                 "--no-deps",
                 "--force-reinstall",
-                "pydantic",
+                "--require-hashes",
+                "--requirement",
+                pins_path.to_string_lossy().as_ref(),
             ],
             &self.runtime.root_dir,
             &self.runtime.venv_dir,
             |_| {},
         )
-        .with_context(|| "reinstalling pydantic to clear duplicate dist-info")?;
-
-        let spec = format!("pydantic-core=={target_version}");
-        run_pip_install_with_retries_clearing_locks(
-            &self.runtime.managed_python(),
-            &[
-                "-m",
-                "pip",
-                "install",
-                "--timeout",
-                "180",
-                "--retries",
-                "10",
-                PIP_ONLY_BINARY,
-                "--extra-index-url",
-                "https://pypi.org/simple",
-                "--no-deps",
-                "--force-reinstall",
-                &spec,
-            ],
-            &self.runtime.root_dir,
-            &self.runtime.venv_dir,
-            |_| {},
-        )
-        .with_context(|| format!("reinstalling pydantic-core=={target_version}"))
+        .context("reinstalling the lock's pydantic and pydantic-core")
     }
 
     /// Restore deps from `previous_lock_backup` via
@@ -12156,12 +12145,35 @@ fn collect_native_extensions(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 /// sha of an unchanged pin set identical to its pre-hash value: otherwise
 /// every install would read its receipt as stale and re-sync for nothing.
 fn lock_requirements(lock: &str) -> Vec<String> {
+    lock_entries(lock)
+        .iter()
+        .map(|entry| entry.split("--hash").next().unwrap_or_default().trim())
+        .filter(|requirement| !requirement.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The hashed entry pinning `name` (PEP 503 normalized), as one requirements
+/// line: for a targeted reinstall that must stay in hash-checking mode.
+fn lock_entry(lock: &str, name: &str) -> Option<String> {
+    let normalize = |s: &str| s.trim().to_ascii_lowercase().replace(['_', '.'], "-");
+    let entry = lock_entries(lock).into_iter().find(|entry| {
+        entry
+            .split("==")
+            .next()
+            .is_some_and(|pin| normalize(pin) == normalize(name))
+    })?;
+    Some(entry.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Each lock entry joined onto one line, `--hash` options included.
+fn lock_entries(lock: &str) -> Vec<String> {
     let mut entries = Vec::new();
     let mut pending = String::new();
     let mut finish = |pending: &mut String| {
-        let requirement = pending.split("--hash").next().unwrap_or_default().trim();
-        if !requirement.is_empty() {
-            entries.push(requirement.to_string());
+        let entry = pending.trim();
+        if !entry.is_empty() {
+            entries.push(entry.to_string());
         }
         pending.clear();
     };
@@ -19671,6 +19683,68 @@ Always run the linter first.
     /// discarded. Creating the venv without pip and running ensurepip ourselves
     /// is what venv does internally, but keeps ensurepip's stderr. If anyone
     /// folds these back into one step, that blind spot returns.
+    ///
+    /// Supply chain: the pydantic/pydantic-core skew repair force-reinstalled a
+    /// bare `pydantic` (whatever PyPI served) and an unhashed pydantic-core,
+    /// bypassing the hash-pinned locks. Both must come from the platform lock,
+    /// hashes included, in hash-checking mode.
+    #[test]
+    #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
+    fn repair_pydantic_core_installs_the_locks_hashed_pins() {
+        let (root, runtime, manager) = seed_test_runtime("pydantic-repair-hashes");
+        let log = root.join("argv.log");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\nprev=\n\
+                 for a in \"$@\"; do [ \"$prev\" = --requirement ] && cat \"$a\" >> {log}; prev=$a; done\n\
+                 exit 0\n",
+                log = log.display()
+            ),
+        );
+
+        manager.repair_pydantic_core().expect("fake pip succeeds");
+
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let lock = super::bootstrap_requirements_lock();
+        for name in ["pydantic", "pydantic-core"] {
+            let entry = super::lock_entry(lock, name).expect("lock pins it");
+            assert!(entry.contains("--hash=sha256:"), "{entry}");
+            assert!(
+                calls.contains(&entry),
+                "{name} not installed from its hashed lock entry:\n{calls}"
+            );
+        }
+        for argv in calls.lines().filter(|l| l.starts_with("ARGV ")) {
+            assert!(
+                argv.contains("--require-hashes"),
+                "unhashed install: {argv}"
+            );
+            assert!(
+                !argv.split(' ').any(|a| a.starts_with("pydantic")),
+                "bare requirement on the command line: {argv}"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_entry_matches_the_exact_package_with_its_hashes() {
+        let lock = "# header\n\
+                    pydantic==2.13.4 \\\n    --hash=sha256:aa\n\
+                    pydantic-core==2.46.4 \\\n    --hash=sha256:bb \\\n    --hash=sha256:cc\n\
+                    Pydantic_Settings==2.14.2 \\\n    --hash=sha256:dd\n";
+        assert_eq!(
+            super::lock_entry(lock, "pydantic").as_deref(),
+            Some("pydantic==2.13.4 --hash=sha256:aa")
+        );
+        assert_eq!(
+            super::lock_entry(lock, "pydantic-core").as_deref(),
+            Some("pydantic-core==2.46.4 --hash=sha256:bb --hash=sha256:cc")
+        );
+        assert!(super::lock_entry(lock, "pydantic-settings").is_some());
+        assert!(super::lock_entry(lock, "pydantic-extra").is_none());
+    }
+
     #[test]
     #[cfg(unix)] // exercises a fake shell-script binary; Windows cannot exec it
     fn create_managed_venv_runs_ensurepip_as_its_own_step() {
@@ -22296,22 +22370,21 @@ exit 0
             .expect("repair should let smoke retry succeed");
 
         let pip_args = fs::read_to_string(&pip_log).expect("pip log written");
-        assert!(
-            pip_args.contains("pydantic-core==2.46.3"),
-            "expected repair to install pydantic-core==2.46.3, got: {pip_args}"
-        );
-        // pydantic itself must also be force-reinstalled to collapse any
-        // duplicate dist-info dirs that cause the flip-flop skew.
-        let pydantic_invocations = pip_args
+        // One hash-checked force-reinstall of the lock's pydantic and
+        // pydantic-core (repair_pydantic_core_installs_the_locks_hashed_pins
+        // checks the pins): pydantic itself too, to collapse any duplicate
+        // dist-info dirs that cause the flip-flop skew.
+        let repairs = pip_args
             .lines()
             .filter(|line| {
                 line.contains("--force-reinstall")
-                    && line.split_whitespace().any(|tok| tok == "pydantic")
+                    && line.contains("--require-hashes")
+                    && line.contains("pydantic-repair.lock")
             })
             .count();
         assert_eq!(
-            pydantic_invocations, 1,
-            "expected exactly one force-reinstall of pydantic, got: {pip_args}"
+            repairs, 1,
+            "expected exactly one hashed pydantic repair, got: {pip_args}"
         );
 
         let _ = fs::remove_dir_all(root);
