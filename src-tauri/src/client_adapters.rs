@@ -6915,15 +6915,21 @@ fn claude_remote_control_command_path() -> PathBuf {
 /// once per shell (`intercept_export_line`); `claude` and `codex` run it per
 /// call while the shell carries Headroom's URL.
 ///
+/// On Windows (Git Bash reads these blocks too, `$OSTYPE` msys or cygwin)
+/// Winsock retries a refused loopback connect, so a probe of a closed 6767
+/// took about 2 s: every new terminal after a crash or a failed quit
+/// cleanup, and every `claude`/`codex` call in a terminal opened while
+/// Headroom ran. There the connect runs in a child bash under coreutils
+/// `timeout 0.5` (shipped with Git for Windows): 0.5 s closed, 0.15 s open
+/// on the rc9 win-test VM. BASH_ENV is cleared so that child never sources
+/// an rc carrying this block and probes again. Without `timeout` it falls
+/// back to the plain connect.
+///
 /// Known residuals:
-/// * It has no timeout. While the intercept is wedged with a full accept
-///   queue (macOS caps the backlog at kern.ipc.somaxconn, 128 by default)
-///   each probe blocks until the connect times out, measured at about 8 s
-///   on macOS in bash, zsh and sh. On Windows (Git Bash reads these blocks
-///   too) Winsock retries a refused connect, so with 6767 closed each probe
-///   takes about 1-2 s: a new terminal after a crash or a failed quit
-///   cleanup, and each `claude`/`codex` call in a terminal opened while
-///   Headroom ran.
+/// * Outside Windows it has no timeout. While the intercept is wedged with a
+///   full accept queue (macOS caps the backlog at kern.ipc.somaxconn, 128 by
+///   default) each probe blocks until the connect times out, measured at
+///   about 8 s on macOS in bash, zsh and sh.
 /// * A terminal opened while Headroom ran keeps the exported URL after quit,
 ///   and so does every tool started from it: a running process's env cannot
 ///   be changed from outside. `claude` and `codex` below re-probe per call;
@@ -6934,6 +6940,11 @@ fn claude_remote_control_command_path() -> PathBuf {
 fn intercept_probe_function(port: u16) -> String {
     format!(
         r#"__headroom_up() {{
+  case ${{OSTYPE-}} in
+    msys*|cygwin*) if command -v timeout >/dev/null 2>&1; then
+      BASH_ENV= timeout 0.5 "${{BASH:-bash}}" -c ': </dev/tcp/127.0.0.1/{port}' 2>/dev/null; return
+    fi ;;
+  esac
   if [ -n "${{ZSH_VERSION-}}" ]; then
     local REPLY
     zmodload zsh/net/tcp 2>/dev/null && ztcp 127.0.0.1 {port} 2>/dev/null && ztcp -c "$REPLY"
@@ -17576,6 +17587,98 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let probes = std::iter::from_fn(|| listener.accept().ok()).count();
             assert_eq!(probes, 1, "{shell}: connects at shell start");
         }
+    }
+
+    /// Winsock retries a refused loopback connect, so in Windows Git Bash a
+    /// probe of a closed 6767 took about 2 s (rc9 win-test VM, 6/6 runs), on
+    /// every new terminal and `claude`/`codex` call once the blocks outlive
+    /// the app. There (`$OSTYPE` msys or cygwin) the probe runs under
+    /// coreutils `timeout 0.5`, with BASH_ENV cleared so the child bash never
+    /// sources an rc that probes again; elsewhere it stays the builtin
+    /// connect, no extra process. Simulated with OSTYPE set in the script and
+    /// a fake `timeout` that logs and runs its command.
+    #[cfg(unix)]
+    #[test]
+    fn windows_git_bash_bounds_the_intercept_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestHome::new();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = home.path().join("timeout.log");
+        std::fs::write(
+            bin.join("timeout"),
+            format!(
+                "#!/bin/sh\necho \"$1 env=${{BASH_ENV-}}\" >> '{}'\nshift\nexec \"$@\"\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("timeout"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (open, closed) = (
+            listener.local_addr().unwrap().port(),
+            closed_loopback_port(),
+        );
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let shells: Vec<&str> = ["bash", "zsh", "sh"]
+            .into_iter()
+            .filter(|sh| crate::proc::command(sh).arg("-c").arg(":").status().is_ok())
+            .collect();
+        for shell in shells {
+            let run = |port: u16, ostype: &str| {
+                let block = home.path().join(format!("block-{port}.sh"));
+                std::fs::write(&block, claude_code_shell_block(port)).unwrap();
+                let _ = std::fs::remove_file(&log);
+                let out = crate::proc::command(shell)
+                    .arg("-c")
+                    .arg(format!(
+                        "{ostype}set -u; . '{}'; echo \"${{ANTHROPIC_BASE_URL:-unset}}\"",
+                        block.display()
+                    ))
+                    .env("HOME", home.path())
+                    .env("PATH", &path)
+                    .env("BASH_ENV", "/dev/null")
+                    .env_remove("CLAUDE_CONFIG_DIR")
+                    .env_remove("ANTHROPIC_BASE_URL")
+                    .output()
+                    .expect("run shell");
+                assert!(
+                    out.stderr.is_empty(),
+                    "{shell}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                (
+                    String::from_utf8(out.stdout).unwrap(),
+                    std::fs::read_to_string(&log).unwrap_or_default(),
+                )
+            };
+            for ostype in ["OSTYPE=msys; ", "OSTYPE=cygwin; "] {
+                assert_eq!(
+                    run(open, ostype),
+                    (
+                        format!("{HEADROOM_ANTHROPIC_BASE_URL}\n"),
+                        "0.5 env=\n".to_string()
+                    ),
+                    "{shell} {ostype}: bounded probe, intercept up"
+                );
+                assert_eq!(
+                    run(closed, ostype),
+                    ("unset\n".to_string(), "0.5 env=\n".to_string()),
+                    "{shell} {ostype}: bounded probe, intercept down"
+                );
+            }
+            assert_eq!(
+                run(open, "").1,
+                "",
+                "{shell}: macOS/Linux never spawn timeout"
+            );
+        }
+        drop(listener);
     }
 
     /// settings.json is hand-maintained JSONC: the wrapper key goes in and out
