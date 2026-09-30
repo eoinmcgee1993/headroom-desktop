@@ -403,6 +403,10 @@ try:
 except Exception:
     pass
 
+# Names of the patches below that bound in this process; summarized once at
+# the end (see _HD_VENDORS).
+_hd_bound = set()
+
 # Protect user-turn text (CLAUDE.md system-reminders) from lossy Kompress:
 # flip the coding persona back to compress_user_messages=False. Guarded so
 # fallback runtimes without the persona (< 0.30.0) and half-installed venvs
@@ -417,6 +421,7 @@ try:
         _hd_savings._PROFILES["coding"] = _hd_replace(
             _hd_coding, compress_user_messages=False
         )
+        _hd_bound.add("user_turn_verbatim")
 except Exception:
     pass
 
@@ -443,6 +448,7 @@ if _hd_sys.platform in ("win32", "darwin") and _hd_ost_flag.strip().lower() not 
         import truststore as _hd_ost_truststore
 
         _hd_ost_truststore.inject_into_ssl()
+        _hd_bound.add("os_truststore")
     except Exception:
         pass
 
@@ -732,6 +738,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 return resp
 
             _hd_cg_stream.StreamingMixin._stream_response = _hd_cg_stream_response
+            _hd_bound.add("context_guard")
     except Exception:
         pass
 
@@ -785,6 +792,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 )
 
             _hd_sc.SemanticCache.set = _hd_sc_set
+            _hd_bound.add("response_cache_guard")
     except Exception:
         pass
 
@@ -820,6 +828,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                     return _hd_sf_orig_record(self, **kwargs)
 
                 _hd_sf_st.SavingsTracker.record_request = _hd_sf_record
+                _hd_bound.add("savings_fold_guard")
     except Exception:
         pass
 
@@ -874,6 +883,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                 )
 
             _hd_rc_cr._is_read_command = _hd_rc_is_read
+            _hd_bound.add("read_chain_guard")
     except Exception:
         pass
 
@@ -923,6 +933,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                             family[key] = previous
                 return _hd_ts_resolve(self, session_id, provider, messages, cache_affinity)
             _hd_ts_pt.SessionTrackerStore.resolve_tracker = _hd_ts_resolve_tracker
+            _hd_bound.add("transient_system_lineage")
     except Exception:
         pass
 
@@ -1037,6 +1048,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             _hd_ci_pt.SessionTrackerStore.resolve_tracker = _hd_ci_resolve_tracker
             _hd_ci_pt.PrefixCacheTracker.update_from_response = _hd_ci_update_tracker
             _hd_ci_cost.build_prefix_cache_stats = _hd_ci_prefix_stats
+            _hd_bound.add("cache_integrity")
             # Usually server imports cost after sitecustomize; cover an already
             # loaded server too without importing it just for instrumentation.
             _hd_ci_server = _hd_ci_sys.modules.get("headroom.proxy.server")
@@ -1144,6 +1156,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             _hd_cb_router.ContentRouter.compress = _hd_cb_router_compress
             _hd_cb_kc.KompressCompressor.compress = _hd_cb_kompress_wrapper(_hd_cb_kc.KompressCompressor.compress)
             _hd_cb_kc.KompressCompressor.compress_batch = _hd_cb_kompress_wrapper(_hd_cb_kc.KompressCompressor.compress_batch, batch=True)
+            _hd_bound.add("responses_shared_budget")
     except Exception:
         pass
 
@@ -1196,6 +1209,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
                         _hd_pr_pt._compact_json_bytes = _hd_pr_saved
 
                 _hd_pr_pt.overlay_cached_prefix = _hd_pr_overlay
+                _hd_bound.add("prefix_replay_guard")
     except Exception:
         pass
 
@@ -1466,6 +1480,7 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy":
             return rewrote
 
         _hd_ccs_mod.CCSwitchReconciler.tick = _hd_ccs_tick
+        _hd_bound.add("cc_switch_reset")
     except Exception:
         # Fail closed: without the reset, a switch back to Claude Official
         # leaves the captured third-party endpoint live process-wide and
@@ -1534,6 +1549,7 @@ if _hd_hint_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                     return result
 
             _hd_hint_mod.StreamingMixin._stream_response = _hd_hint_wrapped
+            _hd_bound.add("tool_ref_hint")
     except Exception:
         # Response-shaping only: on any binding failure the client sees the
         # upstream error verbatim (the pre-vendor behavior), never a new failure.
@@ -1574,6 +1590,7 @@ if _hd_cq_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 return await _hd_cq_orig(self, fn, timeout=timeout)
 
             _hd_cq_server.HeadroomProxy._run_compression_in_executor = _hd_cq_run
+            _hd_bound.add("quarantine_spare_capacity")
     except Exception:
         pass
 
@@ -1667,6 +1684,7 @@ if _hd_os.environ.get(
 
             if _hd_cro_needed():
                 _hd_cro_mod.strip_unsupported_ccr_retrieve_blocks = _hd_cro_strip
+                _hd_bound.add("ccr_repair_order")
     except Exception:
         # Fail-open to the wheel's repair (the pre-vendor behaviour).
         pass
@@ -1706,6 +1724,7 @@ if _hd_pgu_flag.strip().lower() in ("1", "true", "yes", "on"):
                     return await _hd_pgu_orig(self, request)
 
                 _hd_pgu_cls.handle_async_request = _hd_pgu_handle
+                _hd_bound.add("proxied_guarded_upstreams")
     except Exception:
         # Fail-closed: on any binding failure the wheel keeps refusing.
         pass
@@ -1758,6 +1777,7 @@ if _hd_lrc_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                     return _hd_lrc_orig(raw)
 
                 _hd_lrc_mod._parse_llm_response = _hd_lrc_parse
+                _hd_bound.add("learn_rule_coerce")
     except Exception:
         pass
 
@@ -1883,6 +1903,7 @@ if _hd_lwm_flag.strip().lower() not in ("", "0", "false", "no", "off"):
                 _hd_lwm_cls.discover_projects = _hd_lwm_discover_projects
                 _hd_lwm_cls.scan_project = _hd_lwm_scan_project
                 _hd_lwm_tl._project_for_pattern = _hd_lwm_project_for_pattern
+                _hd_bound.add("learn_worktree_merge")
     except Exception:
         pass
 
@@ -1897,6 +1918,47 @@ if _hd_ler_flag.strip().lower() not in ("", "0", "false", "no", "off"):
         from headroom.memory import traffic_learner as _hd_ler_mod
 
         _hd_ler_mod._CATEGORY_TO_TARGET.pop(_hd_ler_mod.PatternCategory.ERROR_RECOVERY, None)
+        _hd_bound.add("learn_drop_error_recovery")
+    except Exception:
+        pass
+
+# --- One INFO line: which vendors bound (observability) -----------------------
+# Without it nobody can tell on a user machine whether a vendor (say
+# HEADROOM_CCR_REPAIR_ORDER) is active. Names only, no user data. Written to
+# stderr (the proxy log) because logging is not configured yet at import
+# time. Proxy process only: the learn subprocess and other venv Pythons do not
+# set HEADROOM_SDK, and the proxy's own multiprocessing spawn children
+# (image isolation) inherit it but start with `-c`.
+_HD_VENDORS = (
+    "user_turn_verbatim",
+    "os_truststore",
+    "context_guard",
+    "response_cache_guard",
+    "savings_fold_guard",
+    "read_chain_guard",
+    "transient_system_lineage",
+    "cache_integrity",
+    "responses_shared_budget",
+    "prefix_replay_guard",
+    "cc_switch_reset",
+    "tool_ref_hint",
+    "quarantine_spare_capacity",
+    "ccr_repair_order",
+    "proxied_guarded_upstreams",
+    "learn_rule_coerce",
+    "learn_worktree_merge",
+    "learn_drop_error_recovery",
+)
+if _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy" and _hd_sys.argv[:1] != ["-c"]:
+    try:
+        _hd_sys.stderr.write(
+            "INFO:headroom.desktop:sitecustomize vendors bound=%s skipped=%s\n"
+            % (
+                ",".join(n for n in _HD_VENDORS if n in _hd_bound) or "-",
+                ",".join(n for n in _HD_VENDORS if n not in _hd_bound) or "-",
+            )
+        )
+        _hd_sys.stderr.flush()
     except Exception:
         pass
 
@@ -14753,6 +14815,100 @@ mod tests {
         assert!(py.contains(r#"_hd_cro_meta.version("headroom-ai") == "0.39.0""#));
         assert!(py.contains("if _hd_cro_needed():"));
         assert!(py.contains("_hd_cro_mod.strip_unsupported_ccr_retrieve_blocks = _hd_cro_strip"));
+    }
+
+    /// Vendor names the summary line reports: every `_hd_bound.add("x")` and
+    /// the `_HD_VENDORS` tuple must name the same set, or a vendor drops out
+    /// of the line.
+    fn sitecustomize_vendor_names(py: &str) -> (Vec<String>, Vec<String>) {
+        let added = py
+            .split("_hd_bound.add(\"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap().to_string())
+            .collect();
+        let tuple = py
+            .split("_HD_VENDORS = (")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("_HD_VENDORS tuple");
+        let listed = tuple
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        (added, listed)
+    }
+
+    #[test]
+    fn sitecustomize_logs_which_vendors_bound() {
+        // Nobody could tell on a user machine whether a vendor (say
+        // HEADROOM_CCR_REPAIR_ORDER) was active. One line per proxy process,
+        // names only; the -c gate keeps the proxy's multiprocessing spawn
+        // children (image isolation) and ad-hoc probes quiet.
+        let py = super::SITECUSTOMIZE_PY;
+        let (mut added, mut listed) = sitecustomize_vendor_names(py);
+        assert!(added.len() >= 15, "bind markers missing: {added:?}");
+        added.sort();
+        added.dedup();
+        listed.sort();
+        assert_eq!(added, listed, "_hd_bound.add names != _HD_VENDORS");
+        let tail = &py[py.find("_HD_VENDORS = (").unwrap()..];
+        assert!(tail.contains(r#"_hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy""#));
+        assert!(tail.contains(r#"_hd_sys.argv[:1] != ["-c"]"#));
+        assert!(tail.contains("INFO:headroom.desktop:sitecustomize vendors bound="));
+    }
+
+    #[test]
+    fn sitecustomize_vendor_summary_behaves_against_the_installed_wheel() {
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("sitecustomize.py"), super::SITECUSTOMIZE_PY).unwrap();
+        let probe = dir.path().join("probe.py");
+        std::fs::write(&probe, "pass\n").unwrap();
+        let run = |args: &[&std::ffi::OsStr], sdk: &str, ccr: &str| {
+            let out = crate::proc::command(&python)
+                .args(args)
+                .env("PYTHONPATH", dir.path())
+                .env("HEADROOM_SDK", sdk)
+                .env("HEADROOM_CCR_REPAIR_ORDER", ccr)
+                .env("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+                .output()
+                .expect("run probe");
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .filter(|l| l.starts_with("INFO:headroom.desktop:sitecustomize vendors"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let proxy = run(&[probe.as_os_str()], "headroom-desktop-proxy", "1");
+        assert_eq!(proxy.len(), 1, "{proxy:?}");
+        let (bound, skipped) = proxy[0].split_once(" skipped=").unwrap();
+        assert!(bound.contains("ccr_repair_order"), "{}", proxy[0]);
+        assert!(!skipped.contains("ccr_repair_order"), "{}", proxy[0]);
+        let off = run(&[probe.as_os_str()], "headroom-desktop-proxy", "0");
+        assert!(
+            off.len() == 1
+                && off[0]
+                    .split_once(" skipped=")
+                    .unwrap()
+                    .1
+                    .contains("ccr_repair_order"),
+            "{off:?}"
+        );
+        // Not the learn subprocess or any other venv Python, not `-c` children.
+        assert!(run(&[probe.as_os_str()], "", "1").is_empty());
+        assert!(run(
+            &["-c".as_ref(), "pass".as_ref()],
+            "headroom-desktop-proxy",
+            "1"
+        )
+        .is_empty());
     }
 
     #[test]
