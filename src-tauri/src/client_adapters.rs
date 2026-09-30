@@ -3224,12 +3224,15 @@ fn ensure_managed_rtk_on_path(
     };
     let path_value = shell_double_quote(&bin_dir);
     // Written to both the profile and the rc file, so a login shell sources it
-    // twice: prepend only when the dir is not on PATH yet.
+    // twice: skip only when the dir is already FIRST. Anywhere-on-PATH is not
+    // enough: in a nested macOS login shell (tmux, VS Code, `zsh -l`)
+    // path_helper moves the inherited dir behind /etc/paths, and a Homebrew or
+    // Rust Type Kit `rtk` would then win.
     configure_shell_block(
         shell_targets,
         "managed_rtk",
         &format!(
-            "case \":$PATH:\" in\n  *\":{path_value}:\"*) ;;\n  *) export PATH=\"{path_value}:$PATH\" ;;\nesac"
+            "case \"$PATH\" in\n  \"{path_value}\"|\"{path_value}\":*) ;;\n  *) export PATH=\"{path_value}:$PATH\" ;;\nesac"
         ),
     )
 }
@@ -11451,24 +11454,37 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         )
         .unwrap());
 
+        // A nested macOS login shell inherits PATH and path_helper moves the
+        // inherited dir behind /etc/paths, so "on PATH" is not enough: the
+        // block must put it back first.
+        let reordered = format!("/usr/bin:/bin:{dir}");
+        let cases: [(&str, Vec<&str>); 2] = [
+            ("/usr/bin:/bin", vec![dir.as_str(), "/usr/bin", "/bin"]),
+            (
+                reordered.as_str(),
+                vec![dir.as_str(), "/usr/bin", "/bin", dir.as_str()],
+            ),
+        ];
         for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
             if !Path::new(shell).exists() {
                 continue;
             }
-            let out = std::process::Command::new(shell)
-                .args(["-c", ". \"$1\"; . \"$1\"; printf %s \"$PATH\"", "sh"])
-                .arg(&rc)
-                .env("PATH", "/usr/bin:/bin")
-                .output()
-                .unwrap();
-            let path = String::from_utf8_lossy(&out.stdout).into_owned();
-            let entries: Vec<&str> = path.split(':').collect();
-            assert_eq!(
-                entries,
-                [dir.as_str(), "/usr/bin", "/bin"],
-                "{shell}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            for (start, expected) in &cases {
+                let out = std::process::Command::new(shell)
+                    .args(["-c", ". \"$1\"; . \"$1\"; printf %s \"$PATH\"", "sh"])
+                    .arg(&rc)
+                    .env("PATH", start)
+                    .output()
+                    .unwrap();
+                let path = String::from_utf8_lossy(&out.stdout).into_owned();
+                let entries: Vec<&str> = path.split(':').collect();
+                assert_eq!(
+                    &entries,
+                    expected,
+                    "{shell} from {start}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
         }
     }
 
