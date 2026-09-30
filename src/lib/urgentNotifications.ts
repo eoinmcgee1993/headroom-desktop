@@ -166,10 +166,26 @@ const RUNTIME_DOWN_GRACE_MS = 5 * 60 * 1000;
 let everReachable = false;
 let firstDownSeenAt: number | null = null;
 
-// Test-only: reset the cross-call first-boot state.
+// A down reading is not yet an outage: the watchdog respawns a dead backend
+// within ~15s, and sleep/wake leaves a gap before /readyz answers again. The
+// hidden window polls every 30s, so firing on one reading raised "stopped
+// running" over gaps that heal on their own. Fire only once consecutive down
+// readings span RUNTIME_DOWN_CONFIRM_MS. Any not-down reading (running, a
+// restart in progress via `starting`, paused, bypassed, port handover) ends
+// the streak, and so does a reading gap longer than
+// RUNTIME_DOWN_MAX_READING_GAP_MS: a down reading from before a sleep says
+// nothing about the one after it.
+const RUNTIME_DOWN_CONFIRM_MS = 45 * 1000;
+const RUNTIME_DOWN_MAX_READING_GAP_MS = 3 * 60 * 1000;
+let downStreakSince: number | null = null;
+let lastDownSeenAt: number | null = null;
+
+// Test-only: reset the cross-call first-boot and down-streak state.
 export function __resetRuntimeNotificationState(): void {
   everReachable = false;
   firstDownSeenAt = null;
+  downStreakSince = null;
+  lastDownSeenAt = null;
 }
 
 export async function maybeFireUrgentRuntimeNotification(
@@ -180,33 +196,51 @@ export async function maybeFireUrgentRuntimeNotification(
     firstDownSeenAt = null;
   }
 
-  if (!(await shouldNotifyInBackground())) return;
-
   // `bypassed` is a deliberate stop (see RuntimeStatus.bypassed): the pricing
   // gate tore the backend down and its own "optimization is off" notice
   // already tells the user, so "stopped running" here would be a false alarm.
+  // `starting` covers a watchdog respawn in progress.
   const runtimeDown =
     runtime.installed &&
     !runtime.running &&
     !runtime.starting &&
     !runtime.paused &&
-    !runtime.bypassed;
-  if (!runtimeDown) return;
+    !runtime.bypassed &&
+    // A restart handing the port over to itself is not a crash. The
+    // intercept publishes this hint within 15s of an update relaunch and
+    // clears it as soon as the old instance's sockets drain, so notifying
+    // over it fires "Headroom stopped running" whose own body says there is
+    // nothing to do -- which is how the channel gets muted (0.9.10 -> 0.9.14
+    // Windows update). The in-app banner still shows it.
+    !runtime.startupErrorHint?.includes("still being released");
 
-  // A restart handing the port over to itself is not a crash. The intercept
-  // publishes this hint within 15s of an update relaunch and clears it as soon
-  // as the old instance's sockets drain, so notifying over it fires "Headroom
-  // stopped running" whose own body says there is nothing to do -- which is
-  // how the channel gets muted (0.9.10 -> 0.9.14 Windows update). The in-app
-  // banner still shows it.
-  if (runtime.startupErrorHint?.includes("still being released")) return;
+  // Tracked before the visibility check so readings taken while a window is
+  // showing still count toward (or end) the streak.
+  const now = Date.now();
+  if (!runtimeDown) {
+    downStreakSince = null;
+    lastDownSeenAt = null;
+    return;
+  }
+  if (
+    downStreakSince === null ||
+    lastDownSeenAt === null ||
+    now - lastDownSeenAt > RUNTIME_DOWN_MAX_READING_GAP_MS
+  ) {
+    downStreakSince = now;
+  }
+  lastDownSeenAt = now;
+  const streakStart = downStreakSince;
+
+  if (!(await shouldNotifyInBackground())) return;
 
   const hasHardError = !!(runtime.startupError || runtime.startupErrorHint);
   if (!everReachable && !hasHardError) {
-    const now = Date.now();
     if (firstDownSeenAt === null) firstDownSeenAt = now;
     if (now - firstDownSeenAt < RUNTIME_DOWN_GRACE_MS) return;
   }
+
+  if (now - streakStart < RUNTIME_DOWN_CONFIRM_MS) return;
 
   const body = runtime.startupErrorHint
     ? `Headroom isn't running. ${runtime.startupErrorHint}`

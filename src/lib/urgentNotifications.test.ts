@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { HeadroomPricingStatus, RuntimeStatus } from "./types";
 import {
@@ -624,21 +624,42 @@ describe("maybeFireUrgentPricingNotifications", () => {
 });
 
 describe("maybeFireUrgentRuntimeNotification", () => {
+  let nowSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    nowSpy = vi.spyOn(Date, "now").mockReturnValue(0);
+  });
   afterEach(() => {
+    nowSpy.mockRestore();
     invokeMock.mockReset();
     isVisibleMock.mockReset();
     __resetRuntimeNotificationState();
   });
 
-  it("fires when the runtime drops after having been reachable", async () => {
+  // One status reading taken at `at` ms.
+  async function readAt(at: number, runtime: RuntimeStatus): Promise<void> {
+    nowSpy.mockReturnValue(at);
+    await maybeFireUrgentRuntimeNotification(runtime);
+  }
+
+  // Two readings spanning the 45s confirm window: enough to fire when the
+  // reading itself warrants it, so the quiet cases below are quiet for their
+  // own reason, not for want of a second reading.
+  async function readSustained(runtime: RuntimeStatus): Promise<void> {
+    await readAt(0, runtime);
+    await readAt(45_000, runtime);
+  }
+
+  it("fires when the runtime stays down after having been reachable", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
     // A healthy boot first, so this isn't the first-boot cold-start window.
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: true }));
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false })
-    );
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(0, makeRuntime({ running: false }));
+    expect(invokeMock).not.toHaveBeenCalled();
+    await readAt(30_000, makeRuntime({ running: false }));
+    expect(invokeMock).not.toHaveBeenCalled();
+    await readAt(45_000, makeRuntime({ running: false }));
 
     expect(invokeMock).toHaveBeenCalledWith("show_notification", {
       title: "Headroom stopped running",
@@ -647,12 +668,80 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     });
   });
 
+  it("does not fire on a single down reading", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(30_000, makeRuntime({ running: false }));
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("does not fire on a down gap shorter than 45s", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(10_000, makeRuntime({ running: false }));
+    await readAt(54_999, makeRuntime({ running: false }));
+    // Self-healed (a watchdog respawn, a post-wake /readyz lag).
+    await readAt(60_000, makeRuntime({ running: true }));
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("recovery resets the down streak", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(10_000, makeRuntime({ running: false }));
+    await readAt(40_000, makeRuntime({ running: true }));
+    // 50s after the first down reading, but only 30s into this streak.
+    await readAt(60_000, makeRuntime({ running: false }));
+    await readAt(90_000, makeRuntime({ running: false }));
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    await readAt(105_000, makeRuntime({ running: false }));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "show_notification",
+      expect.objectContaining({ action: "runtime" })
+    );
+  });
+
+  it("a watchdog restart in progress ends the down streak", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(10_000, makeRuntime({ running: false }));
+    await readAt(40_000, makeRuntime({ running: false, starting: true }));
+    await readAt(70_000, makeRuntime({ running: false }));
+
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("a reading gap across sleep starts a new streak", async () => {
+    isVisibleMock.mockResolvedValue(false);
+    installStorage();
+
+    await readAt(0, makeRuntime({ running: true }));
+    await readAt(10_000, makeRuntime({ running: false }));
+    // Asleep for ten minutes: the first reading after wake is a new streak.
+    await readAt(610_000, makeRuntime({ running: false }));
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    await readAt(655_000, makeRuntime({ running: false }));
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
   it("stays quiet during the first-boot cold-start window", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
     // Never reachable yet, no hard error: the /readyz warmup window.
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: false }));
+    await readSustained(makeRuntime({ running: false }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -660,27 +749,23 @@ describe("maybeFireUrgentRuntimeNotification", () => {
   it("fires on first boot once the grace window elapses", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
-    const nowSpy = vi.spyOn(Date, "now");
 
-    nowSpy.mockReturnValue(0);
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: false }));
+    await readAt(0, makeRuntime({ running: false }));
+    await readAt(150_000, makeRuntime({ running: false }));
     expect(invokeMock).not.toHaveBeenCalled();
 
-    nowSpy.mockReturnValue(5 * 60 * 1000 + 1);
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: false }));
+    await readAt(5 * 60 * 1000 + 1, makeRuntime({ running: false }));
     expect(invokeMock).toHaveBeenCalledWith(
       "show_notification",
       expect.objectContaining({ action: "runtime" })
     );
-
-    nowSpy.mockRestore();
   });
 
   it("surfaces the startup error when one is present", async () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
+    await readSustained(
       makeRuntime({ running: false, startupError: "port 6767 busy" })
     );
 
@@ -695,7 +780,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
+    await readSustained(
       makeRuntime({
         running: false,
         startupError: "never opened port 6768 within 60000ms",
@@ -715,8 +800,8 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     installStorage();
 
     // Reachable once, so the cold-start grace is not what is suppressing it.
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: true }));
-    await maybeFireUrgentRuntimeNotification(
+    await readAt(0, makeRuntime({ running: true }));
+    await readSustained(
       makeRuntime({
         running: false,
         startupError: "os error 10048",
@@ -733,9 +818,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false, starting: true })
-    );
+    await readSustained(makeRuntime({ running: false, starting: true }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -744,9 +827,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false, paused: true })
-    );
+    await readSustained(makeRuntime({ running: false, paused: true }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -755,9 +836,7 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(false);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ installed: false, running: false })
-    );
+    await readSustained(makeRuntime({ installed: false, running: false }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -768,8 +847,8 @@ describe("maybeFireUrgentRuntimeNotification", () => {
 
     // Reachable first, so neither the first-boot grace nor a hard error is
     // what keeps it quiet: a gated account stops the backend on purpose.
-    await maybeFireUrgentRuntimeNotification(makeRuntime({ running: true }));
-    await maybeFireUrgentRuntimeNotification(
+    await readAt(0, makeRuntime({ running: true }));
+    await readSustained(
       makeRuntime({ running: false, proxyReachable: false, bypassed: true })
     );
 
@@ -780,9 +859,8 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     isVisibleMock.mockResolvedValue(true);
     installStorage();
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false })
-    );
+    await readAt(0, makeRuntime({ running: true }));
+    await readSustained(makeRuntime({ running: false }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
@@ -792,9 +870,8 @@ describe("maybeFireUrgentRuntimeNotification", () => {
     const today = localDayKey(new Date());
     installStorage({ headroom_urgent_runtime_down_date: today });
 
-    await maybeFireUrgentRuntimeNotification(
-      makeRuntime({ running: false })
-    );
+    await readAt(0, makeRuntime({ running: true }));
+    await readSustained(makeRuntime({ running: false }));
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
