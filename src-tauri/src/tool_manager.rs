@@ -1671,6 +1671,215 @@ if _hd_os.environ.get(
         # Fail-open to the wheel's repair (the pre-vendor behaviour).
         pass
 
+# --- Kompress: skip a fallback the router is bound to discard (vendor) --------
+# A Claude Code Read of source code routes to code_aware (Bash cat/nl and Codex
+# reads are read_protected under the coding profile's HEADROOM_PROTECT_READS),
+# which hands line-numbered text back unchanged (it never parses) yet reports
+# compressed=True, so the router records a WORD count as its token count
+# (content_router.py:3707). The no-savings fallback then runs Kompress on the
+# whole block (:3968) and keeps it only if its cl100k payload, CCR marker
+# included, is under that word count (:3974). Code runs 2.1-2.4 tokens per word,
+# so Kompress never wins: rc8 spent 19.8s of ONNX inference on a 1821-line Read
+# for 0 tokens saved (hr_1790743422_000578, logged as
+# lossy_unrecoverable_skipped), holding the Kompress slot other requests queue
+# on. Skip that one call when Kompress cannot clear the bar and return what a
+# Kompress passthrough returns there, (content, W), so the compare, the ratio,
+# the guards and the forwarded bytes stay the wheel's. "Cannot" means the
+# must-keep words Kompress always keeps already cost W tokens, or would with a
+# keep-floor share of the other tokens. Latency only: fixing the unit mismatch
+# would start compressing code Reads, a compression change for the soak and
+# savings:did gate. Exact-pin gated to wheel 0.39.0; self-neutralizes once
+# either half of the mismatch changes. Kill switch: HEADROOM_KOMPRESS_WASTE=0.
+_hd_kw_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_WASTE", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_kw_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_kw_meta
+
+        if _hd_kw_meta.version("headroom-ai") == "0.39.0":
+            import contextvars as _hd_kw_cvars
+            import inspect as _hd_kw_inspect
+
+            from headroom.transforms import content_router as _hd_kw_cr
+            from headroom.transforms import kompress_compressor as _hd_kw_kc
+            from headroom.transforms.tag_protector import protect_tags as _hd_kw_tags
+
+            _hd_kw_R = _hd_kw_cr.ContentRouter
+            _hd_kw_src = _hd_kw_inspect.getsource(_hd_kw_R._apply_strategy_to_content)
+            # ponytail: empirical share of non-must-keep tokens Kompress keeps
+            # (lowest seen 0.43 over 18 code reads, 2026-09-30); re-measure on
+            # a Kompress model bump.
+            _hd_kw_floor = float(
+                _hd_os.environ.get("HEADROOM_KOMPRESS_WASTE_KEEP_FLOOR", "0.30")
+            )
+            _hd_kw_pending = _hd_kw_cvars.ContextVar("hd_kompress_waste", default=None)
+            _hd_kw_orig_reg = _hd_kw_R._registry_compress
+            _hd_kw_orig_ml = _hd_kw_R._try_ml_compressor
+
+            def _hd_kw_cannot_beat(text, words):
+                if _hd_os.environ.get(_hd_kw_kc._KOMPRESS_MUST_KEEP_ENV, "1") == "0":
+                    return False
+                total = _hd_kw_kc.payload_tokens(text)
+                enc = _hd_kw_kc._payload_encoder
+                if not enc:
+                    return False
+                # cl100k never merges across the single spaces Kompress joins
+                # kept words with, so the words' own counts add up; the marker
+                # (30+ tokens) is left out, which keeps this a lower bound.
+                keep = [" " + w for w in text.split() if _hd_kw_kc._KOMPRESS_MUST_KEEP_RE.search(w)]
+                low = sum(len(t) for t in enc.encode_ordinary_batch(keep))
+                return low + _hd_kw_floor * max(0, total - low) >= words
+
+            def _hd_kw_reg(self, name, strategy, content, *args, **kwargs):
+                out = _hd_kw_orig_reg(self, name, strategy, content, *args, **kwargs)
+                noop = (
+                    name == "code_aware"
+                    and out is not None
+                    and out.compressed
+                    and out.content == content
+                )
+                # Same expression as the router's compressed_tokens (:3707).
+                _hd_kw_pending.set((content, len(out.content.split())) if noop else None)
+                return out
+
+            def _hd_kw_ml(self, content, context, question=None, target_ratio=None):
+                pending = _hd_kw_pending.get()
+                _hd_kw_pending.set(None)
+                try:
+                    if (
+                        pending is not None
+                        and pending[0] is content
+                        and target_ratio is None
+                        and getattr(self, "_runtime_target_ratio", None) is None
+                        # Only the :3968 fallback, never the lossless-then-lossy
+                        # call (:3719), which fires when W >= the block's token
+                        # estimate and keeps Kompress against tokens, not words.
+                        and pending[1] < _hd_kw_cr._estimate_tokens(content)
+                        and self.config.enable_kompress
+                        and not getattr(self, "_runtime_skip_kompress", False)
+                        and not (
+                            self._kompress_max_tokens > 0
+                            and _hd_kw_cr._estimate_tokens(content) > self._kompress_max_tokens
+                        )
+                        and not _hd_kw_tags(
+                            content, compress_tagged_content=self.config.compress_tagged_content
+                        )[1]
+                    ):
+                        k = self._get_kompress()
+                        if (
+                            type(k) is _hd_kw_kc.KompressCompressor
+                            and k.config.enable_ccr
+                            and k.is_ready()
+                            and _hd_kw_cannot_beat(content, pending[1])
+                        ):
+                            return content, pending[1]
+                except Exception:
+                    pass
+                return _hd_kw_orig_ml(self, content, context, question, target_ratio)
+
+            if (
+                "compressed_tokens = len(output.content.split())" in _hd_kw_src
+                and "if fallback_tokens < compressed_tokens:" in _hd_kw_src
+            ):
+                _hd_kw_R._registry_compress = _hd_kw_reg
+                _hd_kw_R._try_ml_compressor = _hd_kw_ml
+    except Exception:
+        # Fail-open to the wheel's fallback (the pre-vendor behaviour).
+        pass
+
+# --- Read protection: judge a Codex exec envelope by its output (vendor) ------
+# Codex code mode runs `exec` as JavaScript. When the script prints the whole
+# exec_command result, text(r) rather than text(r.output), the tool output is
+# the JSON envelope {"chunk_id","wall_time_seconds","exit_code",...,"output":
+# "<file>"}. The read command is detected (#3621/#3737), but protection is then
+# finalized by CONTENT on the envelope, and the detector's verdict on one line
+# of JSON-escaped code flips per file: rc8's 400-line `nl -ba models.rs` came
+# back JSON (releasable), was replaced by one CCR marker, and the model re-ran
+# the command twice with line filters. Judge the envelope's `output` string(s)
+# instead, so the verdict is the one text(r.output) gets: a code read is
+# protected, a JSON/log/diff read inside an envelope stays releasable. Only
+# read commands reach this gate. Every caller (Responses handler,
+# ContentRouter.apply) looks the gate up at call time, so rebinding the module
+# attribute reaches them all. Exact-pin gated to wheel 0.39.0; self-neutralizes
+# when the wheel already protects an enveloped code read. Kill switch:
+# HEADROOM_CODEX_WHOLE_READ=0.
+_hd_cxr_flag = _hd_os.environ.get("HEADROOM_CODEX_WHOLE_READ", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_cxr_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_cxr_meta
+
+        if _hd_cxr_meta.version("headroom-ai") == "0.39.0":
+            import json as _hd_cxr_json
+
+            from headroom.transforms import content_router as _hd_cxr_mod
+
+            _hd_cxr_orig = _hd_cxr_mod._read_output_should_be_protected
+
+            def _hd_cxr_outputs(text):
+                # The Responses handler joins the parts, so the envelope may sit
+                # behind Codex's "Script completed / Wall time / Output:" preamble.
+                # ponytail: only a script whose sole output is the envelope(s);
+                # text("x"); text(r) keeps the wheel's verdict.
+                body = text.strip()
+                if not body.startswith(("{", "[")):
+                    cut = text.find("\nOutput:\n")
+                    if cut < 0:
+                        return None
+                    body = text[cut + 9 :].strip()
+                if not body.startswith(("{", "[")):
+                    return None
+                try:
+                    obj = _hd_cxr_json.loads(body)
+                except (ValueError, RecursionError):
+                    return None
+                objs = obj if isinstance(obj, list) else [obj]
+                outs = [
+                    o["output"]
+                    for o in objs
+                    if isinstance(o, dict)
+                    and isinstance(o.get("output"), str)
+                    and "wall_time_seconds" in o
+                ]
+                return outs if outs and len(outs) == len(objs) else None
+
+            def _hd_cxr_gate(text):
+                outs = _hd_cxr_outputs(text) if isinstance(text, str) and text else None
+                if outs is None:
+                    return _hd_cxr_orig(text)
+                return any(_hd_cxr_orig(o) for o in outs)
+
+            _hd_cxr_probe = _hd_cxr_json.dumps(
+                {
+                    "chunk_id": "p",
+                    "wall_time_seconds": 0.0,
+                    "exit_code": 0,
+                    "output": "".join(
+                        f"{i:6d}\tpub fn f{i}(x: Option<Vec<u8>>) -> usize {{ x.map_or(0, |v| v.len()) }}\n"
+                        for i in range(1, 41)
+                    ),
+                }
+            )
+            if not _hd_cxr_orig(_hd_cxr_probe) and _hd_cxr_gate(_hd_cxr_probe):
+                _hd_cxr_mod._read_output_should_be_protected = _hd_cxr_gate
+    except Exception:
+        # Fail-open to the wheel's verdict: nothing is rebound.
+        pass
+
 # Proxied guarded upstreams (upstream PR #3804; self-neutralizes once
 # upstream_pinning grows `proxied_guarded_upstreams_allowed`):
 # 0.39.0 pins caller-supplied upstreams (x-headroom-base-url) to the address the
@@ -14747,6 +14956,41 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_kompress_waste() {
+        // code_aware no-ops on a code Read, and the router then runs Kompress
+        // against a word count it can never beat (rc8: 19.8s of inference, 0
+        // tokens saved). Behaviour is proven by
+        // kompress_waste_behaves_against_the_installed_wheel; this pins the
+        // backend gate, the exact pin, the kill switch, the self-neutralization
+        // probe on both halves of the unit mismatch and the two rebinds.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_KOMPRESS_WASTE"));
+        assert!(py.contains(r#"_hd_kw_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains(r#""compressed_tokens = len(output.content.split())" in _hd_kw_src"#));
+        assert!(py.contains(r#""if fallback_tokens < compressed_tokens:" in _hd_kw_src"#));
+        assert!(py.contains("_hd_kw_R._registry_compress = _hd_kw_reg"));
+        assert!(py.contains("_hd_kw_R._try_ml_compressor = _hd_kw_ml"));
+        // Production runs lossless_then_lossy; gating on it made the vendor inert.
+        assert!(py.contains("and pending[1] < _hd_kw_cr._estimate_tokens(content)"));
+        assert!(!py.contains("and not self._lossless_then_lossy"));
+    }
+
+    #[test]
+    fn sitecustomize_vendors_codex_whole_read() {
+        // Codex code-mode `text(r)` wraps a file read in the exec result JSON,
+        // which the wheel's content gate can judge as releasable JSON and
+        // replace with one CCR marker. Behaviour is proven by
+        // codex_whole_read_behaves_against_the_installed_wheel; this pins the
+        // backend gate, the exact pin, the kill switch, the self-neutralization
+        // probe and the rebind.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_CODEX_WHOLE_READ"));
+        assert!(py.contains(r#"_hd_cxr_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains("if not _hd_cxr_orig(_hd_cxr_probe) and _hd_cxr_gate(_hd_cxr_probe):"));
+        assert!(py.contains("_hd_cxr_mod._read_output_should_be_protected = _hd_cxr_gate"));
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -15417,6 +15661,150 @@ assert g.done"#,
             off, "2 True True 0 ['x', 'b', 'go']",
             "kill switch did not unbind:\n{off_err}"
         );
+    }
+
+    #[test]
+    fn kompress_waste_behaves_against_the_installed_wheel() {
+        // The rc8 repro: a 1821-line Read of logging.rs routes to code_aware,
+        // which hands it back unchanged, and the no-savings fallback runs
+        // Kompress (~20s on a laptop) on a result the router then discards.
+        // With the vendor the router forwards the same bytes and the same token
+        // counts without calling Kompress at all; the kill switch restores the
+        // call. Kompress is stubbed (ready, passthrough) so the probe needs no
+        // ONNX model and measures only the router's own decision. The probe
+        // seeds the coding-profile env the way `run_server` does, so the router
+        // runs with lossless_then_lossy on as it does for every user: a bare
+        // router let a vendor that was inert in production pass here.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-kompress-waste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logging.rs");
+        // The stub hands back a real shrink one token short of the whole block:
+        // the wheel's fallback must discard it (still above the word count),
+        // which is what makes the call pure waste. Output unchanged plus a
+        // code_aware,kompress chain pins the repro path.
+        let probe = "import hashlib, sys\n\
+                     from headroom.agent_savings import seed_proxy_env_defaults\n\
+                     seed_proxy_env_defaults()\n\
+                     from headroom.transforms import content_router as cr\n\
+                     from headroom.transforms import kompress_compressor as kc\n\
+                     calls = []\n\
+                     def fake(self, content, **kw):\n\
+                     \x20   calls.append(1)\n\
+                     \x20   tokens = kc.payload_tokens(content) - 1\n\
+                     \x20   return kc.KompressResult(content[:-1], content, 0, tokens, 1.0)\n\
+                     kc.KompressCompressor.is_ready = lambda self: True\n\
+                     kc.KompressCompressor.compress = fake\n\
+                     src = open(sys.argv[1]).read().split('\\n')\n\
+                     text = '\\n'.join(f'{i}\\t{l}' for i, l in enumerate(src, 1))\n\
+                     router = cr.ContentRouter(cr.ContentRouterConfig(enable_code_aware=True))\n\
+                     assert router._lossless_then_lossy, 'not the production posture'\n\
+                     out = router.compress(text, context='Summarise this.')\n\
+                     print(len(calls), out.compressed == text, ','.join(out.strategy_chain),\n\
+                     out.total_original_tokens, out.total_compressed_tokens,\n\
+                     hashlib.sha256(out.compressed.encode()).hexdigest())";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .arg(&source)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_KOMPRESS_WASTE", kill)
+                .output()
+                .expect("run kompress waste probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (on_calls, on_rest) = on.split_once(' ').unwrap_or((&on, ""));
+        let (off_calls, off_rest) = off.split_once(' ').unwrap_or((&off, ""));
+        if off_calls == "0" && !off_rest.is_empty() {
+            eprintln!("skipping: the wheel no longer runs this Kompress fallback; drop the vendor");
+            return;
+        }
+        assert_eq!(off_calls, "1", "kill switch arm:\n{off}\n{off_err}");
+        assert!(
+            off_rest.starts_with("True code_aware,kompress "),
+            "not the repro path: {off}"
+        );
+        assert_eq!(on_calls, "0", "vendor still ran Kompress:\n{on}\n{on_err}");
+        assert_eq!(on_rest, off_rest, "vendor changed the router's output");
+    }
+
+    #[test]
+    fn codex_whole_read_behaves_against_the_installed_wheel() {
+        // The rc8 repro (Codex session 01a0f09a): code mode ran `nl -ba
+        // src-tauri/src/models.rs | sed -n 1,400p` and printed the whole exec
+        // result, text(r). The read command is detected, but the wheel judges
+        // the JSON envelope rather than the file inside it; its detector called
+        // this envelope JSON, so the read was released and replaced by one CCR
+        // marker and the model re-ran the command twice with line filters. The
+        // envelope below is the incident's bytes cut to the first 20 lines,
+        // which the wheel still misjudges. With the vendor the verdict is the
+        // inner text's: the enveloped code read is protected, bare and behind
+        // Codex's "Output:" preamble joined as the Responses handler joins it;
+        // an enveloped JSON read stays releasable; plain code keeps the
+        // wheel's verdict. The kill switch restores the wheel's. The probe
+        // seeds the coding-profile env the way `run_server` does and asserts
+        // read protection is on, so the gate is the one production reaches.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-codex-whole-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let envelope = r##"{"chunk_id":"6c7260","wall_time_seconds":0.000003292,"exit_code":0,"original_token_count":5032,"output":"     1\tuse chrono::{DateTime, Utc};\n     2\tuse serde::{Deserialize, Serialize};\n     3\t\n     4\t#[derive(Debug, Clone, Serialize, Deserialize)]\n     5\t#[serde(rename_all = \"snake_case\")]\n     6\tpub enum ToolStatus {\n     7\t    NotInstalled,\n     8\t    Installing,\n     9\t    Healthy,\n    10\t    Degraded,\n    11\t}\n    12\t\n    13\t#[derive(Debug, Clone, Serialize, Deserialize)]\n    14\t#[serde(rename_all = \"camelCase\")]\n    15\tpub struct ManagedTool {\n    16\t    pub id: String,\n    17\t    pub name: String,\n    18\t    pub description: String,\n    19\t    pub runtime: String,\n    20\t    pub required: bool,\n"}"##;
+        let probe = "import json, sys\n\
+                     from headroom.agent_savings import seed_proxy_env_defaults\n\
+                     seed_proxy_env_defaults()\n\
+                     from headroom.transforms import content_router as cr\n\
+                     from headroom.proxy.handlers.openai import _responses_part_text\n\
+                     assert cr.read_protection_enabled(), 'not the production posture'\n\
+                     env = sys.argv[1]\n\
+                     r = json.loads(env)\n\
+                     pre = 'Script completed\\nWall time 0.1 seconds\\nOutput:\\n'\n\
+                     joined = _responses_part_text([{'text': pre}, {'text': env}])\n\
+                     pkg = json.dumps(dict(r, output=json.dumps(\n\
+                     {'name': 'app', 'private': True, 'scripts': {'build': 'tsc'}}, indent=2)))\n\
+                     g = cr._read_output_should_be_protected\n\
+                     print(g(env), g(joined), g(pkg), g(r['output']))";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe, envelope])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_CODEX_WHOLE_READ", kill)
+                .output()
+                .expect("run codex whole-read probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if off.starts_with("True ") {
+            eprintln!("skipping: the wheel already protects this enveloped read; drop the vendor");
+            return;
+        }
+        assert_eq!(off, "False False False True", "kill switch arm:\n{off_err}");
+        assert_eq!(on, "True True False True", "stderr:\n{on_err}");
     }
 
     #[test]
