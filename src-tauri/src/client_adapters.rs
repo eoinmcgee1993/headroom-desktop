@@ -3194,7 +3194,11 @@ fn resolve_client_shell_targets(state: &ClientSetupState, client_id: &str) -> Re
         }
     }
 
-    Ok(dedupe_shell_targets(targets))
+    Ok(dedupe_shell_targets(rehome_shell_targets(
+        targets,
+        legacy_shell_home().as_deref(),
+        &shell_home(),
+    )))
 }
 
 fn resolve_client_shell_targets_for_cleanup(
@@ -9097,7 +9101,11 @@ fn resolve_default_shell_targets() -> Vec<PathBuf> {
     if targets.is_empty() {
         targets = default_shell_targets_for_family(detect_shell_family());
     }
-    dedupe_shell_targets(targets)
+    dedupe_shell_targets(rehome_shell_targets(
+        targets,
+        legacy_shell_home().as_deref(),
+        &shell_home(),
+    ))
 }
 
 fn detect_shell_family() -> ShellFamily {
@@ -9166,7 +9174,7 @@ fn preferred_bash_profile_path() -> PathBuf {
 
 fn discover_managed_shell_targets(block_ids: &[&str]) -> Result<Vec<PathBuf>> {
     let mut discovered = Vec::new();
-    for file in all_shell_paths() {
+    for file in current_shell_paths() {
         for block_id in block_ids {
             if file_has_managed_block(&file, block_id)? {
                 discovered.push(file.clone());
@@ -9253,8 +9261,112 @@ fn dedupe_strings(values: &mut Vec<String>) {
     values.retain(|value| seen.insert(value.clone()));
 }
 
+/// Every shell file a managed block may live in, for removal and cleanup:
+/// the current locations plus, on Windows, the Git Bash files under
+/// `%USERPROFILE%` that builds before the `shell_home` fix wrote.
 fn all_shell_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = ALL_SHELL_FILES.into_iter().map(shell_path).collect();
+    if let Some(legacy) = legacy_shell_home() {
+        paths.extend(
+            ALL_SHELL_FILES
+                .into_iter()
+                .filter(|name| !is_zsh_file_name(name))
+                .map(|name| legacy.join(name)),
+        );
+    }
+    dedupe_shell_targets(paths)
+}
+
+/// The shell files the current environment reads. Discovery uses these, not
+/// [`all_shell_paths`], so a stale block at the legacy location is not taken
+/// as the place to keep writing.
+fn current_shell_paths() -> Vec<PathBuf> {
     dedupe_shell_targets(ALL_SHELL_FILES.into_iter().map(shell_path).collect())
+}
+
+fn is_zsh_file_name(name: &str) -> bool {
+    matches!(name, ZSH_PROFILE_FILE | ZSH_RC_FILE)
+}
+
+/// Home directory Git Bash (and any POSIX shell) reads its profile files from.
+/// `home_dir()` deliberately ignores `HOME` on Windows, but Git for Windows
+/// honors a `HOME` the user set (user or system environment variable) and only
+/// falls back to `%USERPROFILE%` without one, so blocks written under
+/// `%USERPROFILE%` never loaded for those users (Windows rc9 pass:
+/// HOME=C:\hrhome-test). Unchanged everywhere else.
+fn shell_home() -> PathBuf {
+    if cfg!(windows) && !cfg!(test) {
+        git_bash_home(std::env::var_os("HOME"), home_dir(), |p| p.is_dir())
+    } else {
+        home_dir()
+    }
+}
+
+/// `%USERPROFILE%` when Git Bash reads a different home: where earlier builds
+/// wrote the blocks, so disable and cleanup still reach them.
+fn legacy_shell_home() -> Option<PathBuf> {
+    let home = home_dir();
+    let shell = shell_home();
+    (shell != home).then_some(home)
+}
+
+/// Resolve Git Bash's home from its `HOME` value: the MSYS form Git Bash
+/// exports (`/c/Users/x`) is mapped to `C:\Users\x`, quotes are dropped, and
+/// anything that is not an existing directory falls back to `profile`.
+fn git_bash_home(
+    home_env: Option<std::ffi::OsString>,
+    profile: PathBuf,
+    is_dir: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let Some(raw) = home_env.and_then(|v| v.into_string().ok()) else {
+        return profile;
+    };
+    let raw = raw.trim().trim_matches('"').trim();
+    if raw.is_empty() {
+        return profile;
+    }
+    let bytes = raw.as_bytes();
+    let native = if bytes.len() >= 2
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && (bytes.len() == 2 || bytes[2] == b'/')
+    {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let rest = raw.get(3..).unwrap_or("").replace('/', "\\");
+        format!("{drive}:\\{rest}")
+    } else {
+        raw.to_string()
+    };
+    let path = PathBuf::from(native);
+    if is_dir(&path) {
+        path
+    } else {
+        profile
+    }
+}
+
+/// Map persisted Git Bash targets under the legacy home onto the current one,
+/// so an existing install moves its blocks rather than keep rewriting the copy
+/// Git Bash never reads. zsh files resolve through `zsh_dir` and stay put.
+fn rehome_shell_targets(
+    paths: Vec<PathBuf>,
+    legacy: Option<&Path>,
+    current: &Path,
+) -> Vec<PathBuf> {
+    let Some(legacy) = legacy else {
+        return paths;
+    };
+    paths
+        .into_iter()
+        .map(
+            |path| match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+                (Some(parent), Some(name)) if parent == legacy && !is_zsh_file_name(name) => {
+                    current.join(name)
+                }
+                _ => path,
+            },
+        )
+        .collect()
 }
 
 fn is_profile_file(path: &Path) -> bool {
@@ -9278,7 +9390,7 @@ fn file_has_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
 fn shell_path(name: &str) -> PathBuf {
     match name {
         ZSH_PROFILE_FILE | ZSH_RC_FILE => zsh_dir().join(name),
-        _ => home_dir().join(name),
+        _ => shell_home().join(name),
     }
 }
 
@@ -18000,6 +18112,58 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             let probes = std::iter::from_fn(|| listener.accept().ok()).count();
             assert_eq!(probes, 1, "{shell}: connects at shell start");
         }
+    }
+
+    /// Git for Windows reads profile files from a `HOME` the user set; the
+    /// blocks must go there, not to `%USERPROFILE%` (Windows rc9 pass).
+    #[test]
+    fn git_bash_home_follows_a_user_set_home() {
+        use std::ffi::OsString;
+        let profile = PathBuf::from("PROFILE");
+        let exists = |p: &Path| p == Path::new("C:\\hrhome-test") || p == Path::new("D:\\home\\x");
+        let home = |v: &str| super::git_bash_home(Some(OsString::from(v)), profile.clone(), exists);
+        assert_eq!(home("C:\\hrhome-test"), PathBuf::from("C:\\hrhome-test"));
+        assert_eq!(
+            home("\"C:\\hrhome-test\""),
+            PathBuf::from("C:\\hrhome-test")
+        );
+        assert_eq!(home("/d/home/x"), PathBuf::from("D:\\home\\x"));
+        // Not an existing directory, empty, or unset: Git Bash's fallback.
+        assert_eq!(home("C:\\gone"), profile);
+        assert_eq!(home("  "), profile);
+        assert_eq!(super::git_bash_home(None, profile.clone(), exists), profile);
+    }
+
+    /// Persisted targets from the old location move to the new home; zsh
+    /// files and targets elsewhere stay put.
+    #[test]
+    fn legacy_git_bash_targets_move_to_the_shell_home() {
+        let legacy = PathBuf::from("/profile");
+        let current = PathBuf::from("/home");
+        let moved = super::rehome_shell_targets(
+            vec![
+                legacy.join(".bashrc"),
+                legacy.join(".bash_profile"),
+                legacy.join(".zshrc"),
+                PathBuf::from("/elsewhere/.bashrc"),
+            ],
+            Some(&legacy),
+            &current,
+        );
+        assert_eq!(
+            moved,
+            vec![
+                current.join(".bashrc"),
+                current.join(".bash_profile"),
+                legacy.join(".zshrc"),
+                PathBuf::from("/elsewhere/.bashrc"),
+            ]
+        );
+        let same = vec![legacy.join(".bashrc")];
+        assert_eq!(
+            super::rehome_shell_targets(same.clone(), None, &current),
+            same
+        );
     }
 
     /// Winsock retries a refused loopback connect, so in Windows Git Bash a
