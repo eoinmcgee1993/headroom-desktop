@@ -7013,7 +7013,7 @@ fn codex_shell_block(port: u16) -> String {
 fn claude_code_shell_block(port: u16) -> String {
     let function = r#"claude() {
   local a; for a in "$@"; do [ "$a" = --remote-control ] && { set -- --settings '__OVERRIDE__' "$@"; break; }; done
-  if [ -n "$CLAUDE_CONFIG_DIR" ] && [ "${CLAUDE_CONFIG_DIR%/}" != "$HOME/.claude" ] && [ -z "$ANTHROPIC_BASE_URL" ] &&
+  if [ -n "${CLAUDE_CONFIG_DIR-}" ] && [ "${CLAUDE_CONFIG_DIR%/}" != "$HOME/.claude" ] && [ -z "${ANTHROPIC_BASE_URL-}" ] &&
     command grep -qs '"ANTHROPIC_BASE_URL"[[:space:]]*:[[:space:]]*"__BASE__"' "$HOME/.claude/settings.json"; then
     ANTHROPIC_BASE_URL=__BASE__ HEADROOM_RC_RELAUNCHER=tty command claude "$@"
   elif [ "${ANTHROPIC_BASE_URL-}" = __BASE__ ] && ! __headroom_up; then
@@ -17243,9 +17243,11 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         for shell in shells {
             let run = |config_dir: Option<&str>, base_url: Option<&str>| {
                 let mut cmd = crate::proc::command(shell);
+                // `set -u`: an rc file with `setopt nounset` / `set -u` above
+                // the block must still be able to start claude.
                 cmd.arg("-c")
                     .arg(format!(
-                        ". '{}'; claude; echo \"after=${{ANTHROPIC_BASE_URL:-unset}}\"",
+                        "set -u; . '{}'; claude; echo \"after=${{ANTHROPIC_BASE_URL:-unset}}\"",
                         block.display()
                     ))
                     .env("HOME", home.path())
