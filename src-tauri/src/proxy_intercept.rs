@@ -2768,7 +2768,7 @@ fn codex_error_shape_tag(body: &[u8]) -> String {
 }
 
 /// Classify an Anthropic invalid_request 400 by signature, so the tool-search
-/// history 400s stop hiding inside the generic RUST-BT bucket. Substring match
+/// and tool_use/tool_result adjacency 400s stop hiding inside the generic RUST-BT bucket. Substring match
 /// on the raw bytes because these stream as SSE (JSON parse fails). Returns a
 /// fixed, content-free classification (never the offending tool name), or None
 /// when the body is not one of these shapes (fall back to the codex classifier).
@@ -2780,6 +2780,11 @@ fn anthropic_error_shape(body: &[u8]) -> Option<&'static str> {
         Some("tool_reference_not_found")
     } else if contains(body, b"All tools cannot be deferred") {
         Some("all_tools_deferred")
+    } else if contains(body, b"ids were found without `tool_result` blocks") {
+        // A tool_use turn whose tool_results do not lead the next message
+        // (Claude Code: "400 due to tool use concurrency issues"); the wheel's
+        // CCR history repair produced it (HEADROOM_CCR_REPAIR_ORDER).
+        Some("tool_use_without_result")
     } else {
         None
     }
@@ -7467,6 +7472,13 @@ mod tests {
             super::anthropic_error_shape(deferred),
             Some("all_tools_deferred")
         );
+
+        // The CCR-repair adjacency 400 ("API Error: 400 due to tool use
+        // concurrency issues"), counted by release without its ids or index.
+        let adjacency = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.255: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_012Zqt7AE3Xy4ctFGWSjAPw7. Each `tool_use` block must have a corresponding `tool_result` block in the next message.\"}}\n\n";
+        let tag = super::anthropic_error_shape(adjacency);
+        assert_eq!(tag, Some("tool_use_without_result"));
+        assert!(!tag.unwrap().contains("toolu_") && !tag.unwrap().contains("255"));
 
         // Unrelated bodies fall through to the codex classifier.
         assert_eq!(
