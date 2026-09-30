@@ -1689,6 +1689,123 @@ if _hd_os.environ.get(
         # Fail-open to the wheel's repair (the pre-vendor behaviour).
         pass
 
+# --- Kompress fallback judged in tokens (vendor, upstream #3881) --------------
+# The code_aware branch of ContentRouter._apply_strategy_to_content records a
+# WORD count as compressed_tokens (content_router.py:3707), and the no-savings
+# Kompress fallback keeps its result only if it beats that count in TOKENS
+# (:3974). Code runs 2.1-2.4 tokens per word, so a code_aware no-op (a large
+# line-numbered code Read, which code_aware cannot parse) looked like a 55%
+# compression: Kompress's result was always discarded after up to ~20s of
+# inference and the block went out verbatim (lossy_unrecoverable_skipped).
+# Applies #3881's three hunks verbatim to the method's source and execs it in
+# content_router's globals: code_aware's result is counted with
+# _estimate_tokens, both Kompress attempts are judged with it, and the inline
+# lossless-then-lossy attempt is recorded in the chain so a losing one is not
+# run again. The inference that already ran now pays for itself. A compression
+# change (raises savings on code no-op blocks): soak + savings:did. It relies
+# on token_read_window keeping recent Reads out of the router, and supersedes
+# kompress_waste, which skips the very calls this keeps, so that vendor stands
+# down when this one binds. Exact-pin gated to wheel 0.39.0; self-neutralizes
+# when any hunk's old text is gone. Kill switch: HEADROOM_KOMPRESS_FALLBACK_UNITS=0.
+_hd_kfu_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_FALLBACK_UNITS", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_kfu_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_kfu_meta
+
+        if _hd_kfu_meta.version("headroom-ai") == "0.39.0":
+            import inspect as _hd_kfu_inspect
+            import re as _hd_kfu_re
+            import textwrap as _hd_kfu_tw
+
+            from headroom.transforms import content_router as _hd_kfu_cr
+
+            # (old, new) at column 0; each is re-indented to where it sits.
+            _hd_kfu_hunks = (
+                (
+                    "compressed_tokens = len(output.content.split())",
+                    "compressed_tokens = _estimate_tokens(output.content)",
+                ),
+                (
+                    """_k, _kt = self._try_ml_compressor(content, context, question)
+if (
+    _k is not None
+    and _kt is not None
+    and _kt < original_tokens
+    and len(_k) < len(content)
+):
+    compressed, compressed_tokens = _k, _kt
+    strategy = CompressionStrategy.KOMPRESS
+    actual_strategy = strategy
+    compressor_name = "KompressCompressor"
+    decision_reason = "code_aware_no_shrink_fallback_kompress"
+    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+""",
+                    """strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+_k, _ = self._try_ml_compressor(content, context, question)
+_kt = _estimate_tokens(_k)
+if _kt < original_tokens and len(_k) < len(content):
+    compressed, compressed_tokens = _k, _kt
+    strategy = CompressionStrategy.KOMPRESS
+    actual_strategy = strategy
+    compressor_name = "KompressCompressor"
+    decision_reason = "code_aware_no_shrink_fallback_kompress"
+""",
+                ),
+                (
+                    """fallback_compressed, fallback_tokens = self._try_ml_compressor(
+    content, context, question
+)
+""",
+                    """fallback_compressed, _ = self._try_ml_compressor(content, context, question)
+fallback_tokens = _estimate_tokens(fallback_compressed)
+""",
+                ),
+            )
+
+            def _hd_kfu_patch(src):
+                for old, new in _hd_kfu_hunks:
+                    at = _hd_kfu_re.findall(
+                        r"(?m)^( *)" + _hd_kfu_re.escape(old.splitlines()[0]), src
+                    )
+                    if len(at) != 1:
+                        return None
+                    o, n = (
+                        "".join(at[0] + ln if ln.strip() else ln for ln in b.splitlines(True))
+                        for b in (old, new)
+                    )
+                    if src.count(o) != 1:
+                        return None
+                    src = src.replace(o, n)
+                return src
+
+            _hd_kfu_src = _hd_kfu_patch(
+                _hd_kfu_tw.dedent(
+                    _hd_kfu_inspect.getsource(_hd_kfu_cr.ContentRouter._apply_strategy_to_content)
+                )
+            )
+            if _hd_kfu_src is not None:
+                _hd_kfu_ns = {}
+                exec(
+                    compile(_hd_kfu_src, "<headroom-desktop #3881 content_router>", "exec"),
+                    _hd_kfu_cr.__dict__,
+                    _hd_kfu_ns,
+                )
+                _hd_kfu_cr.ContentRouter._apply_strategy_to_content = _hd_kfu_ns[
+                    "_apply_strategy_to_content"
+                ]
+                _hd_bound.add("kompress_fallback_units")
+    except Exception:
+        # Fail-open to the wheel's word-count fallback (the pre-vendor behaviour).
+        pass
+
 # --- Kompress: skip a fallback the router is bound to discard (vendor) --------
 # A Claude Code Read of source code routes to code_aware (Bash cat/nl and Codex
 # reads are read_protected under the coding profile's HEADROOM_PROTECT_READS),
@@ -1709,14 +1826,11 @@ if _hd_os.environ.get(
 # savings:did gate. Exact-pin gated to wheel 0.39.0; self-neutralizes once
 # either half of the mismatch changes. Kill switch: HEADROOM_KOMPRESS_WASTE=0.
 _hd_kw_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_WASTE", "1")
-if _hd_os.environ.get(
-    "HEADROOM_SDK"
-) == "headroom-desktop-proxy" and _hd_kw_flag.strip().lower() not in (
-    "",
-    "0",
-    "false",
-    "no",
-    "off",
+if (
+    _hd_os.environ.get("HEADROOM_SDK") == "headroom-desktop-proxy"
+    and _hd_kw_flag.strip().lower() not in ("", "0", "false", "no", "off")
+    # kompress_fallback_units keeps the calls this skips.
+    and "kompress_fallback_units" not in _hd_bound
 ):
     try:
         import importlib.metadata as _hd_kw_meta
@@ -2334,6 +2448,7 @@ _HD_VENDORS = (
     "tool_ref_hint",
     "quarantine_spare_capacity",
     "ccr_repair_order",
+    "kompress_fallback_units",
     "kompress_waste",
     "token_read_window",
     "codex_whole_read",
@@ -15384,6 +15499,83 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_kompress_fallback_units() {
+        // Upstream #3881's three hunks, exec'd over the installed method.
+        // Behaviour is proven by kompress_fallback_units_behaves_against_the_installed_wheel;
+        // this pins the gate, the kill switch, the hunks' old text (the
+        // self-neutralization probe), the rebind, and that kompress_waste,
+        // which skips the calls this keeps, stands down when it binds.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_KOMPRESS_FALLBACK_UNITS"));
+        assert!(py.contains(r#"_hd_kfu_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains(r#""compressed_tokens = len(output.content.split())","#));
+        assert!(py.contains("fallback_tokens = _estimate_tokens(fallback_compressed)"));
+        assert!(py.contains("_hd_kfu_cr.ContentRouter._apply_strategy_to_content = _hd_kfu_ns["));
+        assert!(py.contains(r#"and "kompress_fallback_units" not in _hd_bound"#));
+        assert!(
+            py.find(r#"_hd_bound.add("kompress_fallback_units")"#) < py.find("_hd_kw_flag = "),
+            "must bind before kompress_waste checks for it"
+        );
+    }
+
+    #[test]
+    fn kompress_fallback_units_behaves_against_the_installed_wheel() {
+        // Runs #3881's own three tests against the installed method patched by
+        // the shipped sitecustomize (scripts/verify-kompress-fallback-units.py).
+        // Self-skips when the vendor does not bind, so green is NOT evidence
+        // after a bump.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("verify-kompress-fallback-units.py");
+        if !python.exists() || !probe.exists() {
+            eprintln!("skipping: no managed runtime at {}", python.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-kfu-vendor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let run = |flag: &str| {
+            crate::proc::command(&python)
+                .arg(&probe)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_KOMPRESS_FALLBACK_UNITS", flag)
+                .output()
+                .expect("run kompress fallback-units probe")
+        };
+
+        let out = run("1");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        if stdout.contains("FAIL kfu bound") {
+            eprintln!("skipping: kompress fallback-units vendor did not bind (wheel bumped?)");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "kompress fallback-units probe failed\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // With the switch off the wheel's word count discards the smaller
+        // Kompress result and kompress_waste binds again, which is also what
+        // proves the probe can tell the two apart.
+        let off = run("0");
+        let off_stdout = String::from_utf8_lossy(&off.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            off_stdout.contains("FAIL kfu bound")
+                && off_stdout.contains("FAIL kompress_waste stood down")
+                && off_stdout.contains("FAIL code_aware no-op keeps a smaller Kompress fallback"),
+            "HEADROOM_KOMPRESS_FALLBACK_UNITS=0 did not unbind the vendor\nstdout:\n{off_stdout}"
+        );
+    }
+
+    #[test]
     fn sitecustomize_vendors_kompress_waste() {
         // code_aware no-ops on a code Read, and the router then runs Kompress
         // against a word count it can never beat (rc8: 19.8s of inference, 0
@@ -16319,6 +16511,9 @@ assert g.done"#,
                 .arg(&source)
                 .env("PYTHONPATH", &dir)
                 .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                // kompress_fallback_units supersedes this vendor when it binds;
+                // this proves the fallback its kill switch returns to.
+                .env("HEADROOM_KOMPRESS_FALLBACK_UNITS", "0")
                 .env("HEADROOM_KOMPRESS_WASTE", kill)
                 .output()
                 .expect("run kompress waste probe");
