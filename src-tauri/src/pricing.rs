@@ -171,6 +171,11 @@ fn is_transient_transport_error(err: &reqwest::Error) -> bool {
 /// than interpolating the cause - the user gets something to act on, and
 /// Sentry gets a message that groups instead of splintering on `os error 61`.
 fn transport_failure(action: &str, err: &reqwest::Error) -> String {
+    if is_local_filter_drop(err) {
+        return format!(
+            "Could not {action}: {FILTER_DROP_HINT} Allow Headroom in it and try again."
+        );
+    }
     let kind = if err.is_timeout() {
         "the request timed out"
     } else if err.is_connect() {
@@ -179,6 +184,32 @@ fn transport_failure(action: &str, err: &reqwest::Error) -> String {
         "the request failed"
     };
     format!("Could not {action}: {kind}. Check your connection and try again in a moment.")
+}
+
+const FILTER_DROP_HINT: &str =
+    "a firewall or network filter on this Mac is blocking Headroom from reaching extraheadroom.com.";
+
+/// RUST-78: a macOS content filter that drops a flow defuncts the socket, and
+/// XNU's `sodefunct` sets `so_error = EBADF`, so the connect fails with "Bad
+/// file descriptor (os error 9)". Nothing in this process produces that, and
+/// the rule is per app: curl from Terminal still reaches us, which is why the
+/// generic "check your connection" sent the user in circles for six weeks.
+fn is_local_filter_drop(err: &reqwest::Error) -> bool {
+    err.is_connect() && chain_has_ebadf(err)
+}
+
+fn chain_has_ebadf(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(err);
+    while let Some(cause) = source {
+        let errno = cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(|e| e.raw_os_error());
+        if cfg!(target_os = "macos") && errno == Some(libc::EBADF) {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// Report transport failures, but rank them. Before issue #58 the auth path
@@ -932,6 +963,8 @@ enum RemoteAccountSyncError {
     /// is read only via the derived Debug in the sync-failure log, which
     /// dead-code analysis deliberately ignores.
     Other(#[allow(dead_code)] String),
+    /// A local content filter dropped the connection (`is_local_filter_drop`).
+    FilterBlocked(#[allow(dead_code)] String),
 }
 
 /// When any caller last ran `get_pricing_status`; the background pricing
@@ -3642,6 +3675,13 @@ fn merge_background_account_sync(
                     .into(),
             ),
         ),
+        Err(RemoteAccountSyncError::FilterBlocked(_)) => (
+            true,
+            None,
+            Some(format!(
+                "Headroom account connected, but {FILTER_DROP_HINT}"
+            )),
+        ),
     }
 }
 
@@ -3973,7 +4013,12 @@ fn fetch_remote_account_with_base_url(
     // Chain for the auth-silent alarm's `error` extra, same reason as
     // fetch_grace_start; the user sees merge_background_account_sync's text.
     let response = identity.apply_headers(builder).send().map_err(|err| {
-        RemoteAccountSyncError::Other(format!("send: {}", transport_cause_chain(&err)))
+        let text = format!("send: {}", transport_cause_chain(&err));
+        if is_local_filter_drop(&err) {
+            RemoteAccountSyncError::FilterBlocked(text)
+        } else {
+            RemoteAccountSyncError::Other(text)
+        }
     })?;
 
     if response.status().as_u16() == 401 {
@@ -7021,6 +7066,16 @@ mod tests {
             chain.chars().count() <= 400,
             "chain must stay bounded: {chain}"
         );
+    }
+
+    /// RUST-78 (0.9.26 event): "tcp connect error <- Bad file descriptor (os
+    /// error 9)" is a macOS content filter's drop, and only that errno is.
+    #[test]
+    fn filter_drop_is_recognized_by_errno() {
+        let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(super::chain_has_ebadf(&ebadf), cfg!(target_os = "macos"));
+        let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        assert!(!super::chain_has_ebadf(&refused));
     }
 
     /// RUST-78: the server-silent alarm's `error` extra is fetch_grace_start's
