@@ -3228,17 +3228,28 @@ fn ensure_managed_rtk_on_path(
     } else {
         bin_dir.into_owned()
     };
-    let path_value = shell_double_quote(&bin_dir);
-    // Written to both the profile and the rc file, so a login shell sources it
-    // twice: skip only when the dir is already FIRST. Anywhere-on-PATH is not
-    // enough: in a nested macOS login shell (tmux, VS Code, `zsh -l`)
+    let d = shell_double_quote(&bin_dir);
+    // Dedupe, then prepend: the dir ends up first and exactly once. Written to
+    // both the profile and the rc file, so a login shell sources it twice, and
+    // an rc that prepends its own dir in between (~/.grok/bin) made a
+    // skip-when-first block add a second copy (rc11). Anywhere-on-PATH is not
+    // enough either: in a nested macOS login shell (tmux, VS Code, `zsh -l`)
     // path_helper moves the inherited dir behind /etc/paths, and a Homebrew or
-    // Rust Type Kit `rtk` would then win.
+    // Rust Type Kit `rtk` would then win. Plain POSIX string surgery on
+    // ":$PATH:", so the one body runs the same in zsh, bash 3.2 and sh (zsh
+    // does not word-split); quoted pattern text is literal in all three.
     configure_shell_block(
         shell_targets,
         "managed_rtk",
         &format!(
-            "case \"$PATH\" in\n  \"{path_value}\"|\"{path_value}\":*) ;;\n  *) export PATH=\"{path_value}:$PATH\" ;;\nesac"
+            "_headroom_path=\":$PATH:\"\n\
+             while case \"$_headroom_path\" in *:\"{d}\":*) true ;; *) false ;; esac; do\n\
+             \x20 _headroom_path=${{_headroom_path%%:\"{d}\":*}}:${{_headroom_path#*:\"{d}\":}}\n\
+             done\n\
+             _headroom_path=${{_headroom_path#:}}\n\
+             _headroom_path=${{_headroom_path%:}}\n\
+             export PATH=\"{d}${{_headroom_path:+:$_headroom_path}}\"\n\
+             unset _headroom_path"
         ),
     )
 }
@@ -11671,10 +11682,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let reordered = format!("/usr/bin:/bin:{dir}");
         let cases: [(&str, Vec<&str>); 2] = [
             ("/usr/bin:/bin", vec![dir.as_str(), "/usr/bin", "/bin"]),
-            (
-                reordered.as_str(),
-                vec![dir.as_str(), "/usr/bin", "/bin", dir.as_str()],
-            ),
+            (reordered.as_str(), vec![dir.as_str(), "/usr/bin", "/bin"]),
         ];
         for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
             if !Path::new(shell).exists() {
@@ -11700,6 +11708,58 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                     String::from_utf8_lossy(&out.stderr)
                 );
             }
+        }
+    }
+
+    /// rc11: the block skipped only when the dir was already first, so a
+    /// login zsh whose .zshrc prepends another dir (~/.grok/bin) between the
+    /// .zprofile block and the .zshrc block carried the Headroom dir twice.
+    /// Dedupe-then-prepend: first, exactly once, also in nested login shells.
+    #[cfg(unix)]
+    #[test]
+    fn managed_rtk_dir_is_first_exactly_once_when_rc_prepends_another_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin = tmp.path().join("Head room $x [1]*").join("bin");
+        let dir = bin.to_string_lossy().into_owned();
+        let profile = tmp.path().join(".zprofile");
+        let rc = tmp.path().join(".zshrc");
+        fs::write(&rc, "export PATH=\"/grok bin:$PATH\"\n").unwrap();
+        super::ensure_managed_rtk_on_path(&bin.join("rtk"), &[profile.clone(), rc.clone()])
+            .unwrap();
+        let login = ". \"$1\"; . \"$2\"";
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            // Twice: the second pass is a nested login shell inheriting PATH.
+            let out = crate::proc::command(shell)
+                .args([
+                    "-c",
+                    &format!("{login}; {login}; printf %s \"$PATH\""),
+                    "sh",
+                ])
+                .arg(&profile)
+                .arg(&rc)
+                .env("PATH", format!("/usr/bin:/bin:{dir}:/usr/bin"))
+                .env("ZDOTDIR", tmp.path())
+                .env_remove("BASH_ENV")
+                .output()
+                .unwrap();
+            let path = String::from_utf8_lossy(&out.stdout).into_owned();
+            let entries: Vec<&str> = path.split(':').collect();
+            assert_eq!(
+                entries,
+                [
+                    dir.as_str(),
+                    "/grok bin",
+                    "/grok bin",
+                    "/usr/bin",
+                    "/bin",
+                    "/usr/bin"
+                ],
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
 
