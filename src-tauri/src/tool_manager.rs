@@ -1671,6 +1671,125 @@ if _hd_os.environ.get(
         # Fail-open to the wheel's repair (the pre-vendor behaviour).
         pass
 
+# --- Kompress: skip a fallback the router is bound to discard (vendor) --------
+# A Read or cat of source code routes to code_aware, which hands line-numbered
+# text back unchanged (it never parses) yet reports compressed=True, so the
+# router records a WORD count as its token count (content_router.py:3707). The
+# no-savings fallback then runs Kompress on the whole block (:3968) and keeps it
+# only if its cl100k payload, CCR marker included, is under that word count
+# (:3974). Code runs 2.1-2.4 tokens per word, so Kompress never wins: rc8 spent
+# 19.8s of ONNX inference on a 1821-line Read for 0 tokens saved
+# (hr_1790743422_000578, logged as lossy_unrecoverable_skipped), holding the
+# Kompress slot other requests queue on. Skip that one call when Kompress cannot
+# clear the bar and return what a Kompress passthrough returns there, (content,
+# W), so the compare, the ratio, the guards and the forwarded bytes stay the
+# wheel's. "Cannot" means the must-keep words Kompress always keeps already cost
+# W tokens, or would with a keep-floor share of the other tokens. Latency only:
+# fixing the unit mismatch would start compressing code Reads, a compression
+# change for the soak and savings:did gate. Exact-pin gated to wheel 0.39.0;
+# self-neutralizes once either half of the mismatch changes. Kill switch:
+# HEADROOM_KOMPRESS_WASTE=0.
+_hd_kw_flag = _hd_os.environ.get("HEADROOM_KOMPRESS_WASTE", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_kw_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_kw_meta
+
+        if _hd_kw_meta.version("headroom-ai") == "0.39.0":
+            import contextvars as _hd_kw_cvars
+            import inspect as _hd_kw_inspect
+
+            from headroom.transforms import content_router as _hd_kw_cr
+            from headroom.transforms import kompress_compressor as _hd_kw_kc
+            from headroom.transforms.tag_protector import protect_tags as _hd_kw_tags
+
+            _hd_kw_R = _hd_kw_cr.ContentRouter
+            _hd_kw_src = _hd_kw_inspect.getsource(_hd_kw_R._apply_strategy_to_content)
+            # ponytail: empirical share of non-must-keep tokens Kompress keeps
+            # (lowest seen 0.43 over 18 code reads, 2026-09-30); re-measure on
+            # a Kompress model bump.
+            _hd_kw_floor = float(
+                _hd_os.environ.get("HEADROOM_KOMPRESS_WASTE_KEEP_FLOOR", "0.30")
+            )
+            _hd_kw_pending = _hd_kw_cvars.ContextVar("hd_kompress_waste", default=None)
+            _hd_kw_orig_reg = _hd_kw_R._registry_compress
+            _hd_kw_orig_ml = _hd_kw_R._try_ml_compressor
+
+            def _hd_kw_cannot_beat(text, words):
+                if _hd_os.environ.get(_hd_kw_kc._KOMPRESS_MUST_KEEP_ENV, "1") == "0":
+                    return False
+                total = _hd_kw_kc.payload_tokens(text)
+                enc = _hd_kw_kc._payload_encoder
+                if not enc:
+                    return False
+                # cl100k never merges across the single spaces Kompress joins
+                # kept words with, so the words' own counts add up; the marker
+                # (30+ tokens) is left out, which keeps this a lower bound.
+                keep = [" " + w for w in text.split() if _hd_kw_kc._KOMPRESS_MUST_KEEP_RE.search(w)]
+                low = sum(len(t) for t in enc.encode_ordinary_batch(keep))
+                return low + _hd_kw_floor * max(0, total - low) >= words
+
+            def _hd_kw_reg(self, name, strategy, content, *args, **kwargs):
+                out = _hd_kw_orig_reg(self, name, strategy, content, *args, **kwargs)
+                noop = (
+                    name == "code_aware"
+                    and out is not None
+                    and out.compressed
+                    and out.content == content
+                )
+                # Same expression as the router's compressed_tokens (:3707).
+                _hd_kw_pending.set((content, len(out.content.split())) if noop else None)
+                return out
+
+            def _hd_kw_ml(self, content, context, question=None, target_ratio=None):
+                pending = _hd_kw_pending.get()
+                _hd_kw_pending.set(None)
+                try:
+                    if (
+                        pending is not None
+                        and pending[0] is content
+                        and target_ratio is None
+                        and getattr(self, "_runtime_target_ratio", None) is None
+                        and not self._lossless_then_lossy
+                        and self.config.enable_kompress
+                        and not getattr(self, "_runtime_skip_kompress", False)
+                        and not (
+                            self._kompress_max_tokens > 0
+                            and _hd_kw_cr._estimate_tokens(content) > self._kompress_max_tokens
+                        )
+                        and not _hd_kw_tags(
+                            content, compress_tagged_content=self.config.compress_tagged_content
+                        )[1]
+                    ):
+                        k = self._get_kompress()
+                        if (
+                            type(k) is _hd_kw_kc.KompressCompressor
+                            and k.config.enable_ccr
+                            and k.is_ready()
+                            and _hd_kw_cannot_beat(content, pending[1])
+                        ):
+                            return content, pending[1]
+                except Exception:
+                    pass
+                return _hd_kw_orig_ml(self, content, context, question, target_ratio)
+
+            if (
+                "compressed_tokens = len(output.content.split())" in _hd_kw_src
+                and "if fallback_tokens < compressed_tokens:" in _hd_kw_src
+            ):
+                _hd_kw_R._registry_compress = _hd_kw_reg
+                _hd_kw_R._try_ml_compressor = _hd_kw_ml
+    except Exception:
+        # Fail-open to the wheel's fallback (the pre-vendor behaviour).
+        pass
+
 # Proxied guarded upstreams (upstream PR #3804; self-neutralizes once
 # upstream_pinning grows `proxied_guarded_upstreams_allowed`):
 # 0.39.0 pins caller-supplied upstreams (x-headroom-base-url) to the address the
@@ -14719,6 +14838,23 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_kompress_waste() {
+        // code_aware no-ops on a code Read, and the router then runs Kompress
+        // against a word count it can never beat (rc8: 19.8s of inference, 0
+        // tokens saved). Behaviour is proven by
+        // kompress_waste_behaves_against_the_installed_wheel; this pins the
+        // backend gate, the exact pin, the kill switch, the self-neutralization
+        // probe on both halves of the unit mismatch and the two rebinds.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_KOMPRESS_WASTE"));
+        assert!(py.contains(r#"_hd_kw_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains(r#""compressed_tokens = len(output.content.split())" in _hd_kw_src"#));
+        assert!(py.contains(r#""if fallback_tokens < compressed_tokens:" in _hd_kw_src"#));
+        assert!(py.contains("_hd_kw_R._registry_compress = _hd_kw_reg"));
+        assert!(py.contains("_hd_kw_R._try_ml_compressor = _hd_kw_ml"));
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -15387,6 +15523,79 @@ assert g.done"#,
             off, "2 True True 0 ['x', 'b', 'go']",
             "kill switch did not unbind:\n{off_err}"
         );
+    }
+
+    #[test]
+    fn kompress_waste_behaves_against_the_installed_wheel() {
+        // The rc8 repro: a 1821-line Read of logging.rs routes to code_aware,
+        // which hands it back unchanged, and the no-savings fallback runs
+        // Kompress (~20s on a laptop) on a result the router then discards.
+        // With the vendor the router forwards the same bytes and the same token
+        // counts without calling Kompress at all; the kill switch restores the
+        // call. Kompress is stubbed (ready, passthrough) so the probe needs no
+        // ONNX model and measures only the router's own decision.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-kompress-waste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/logging.rs");
+        // The stub hands back a real shrink one token short of the whole block:
+        // the wheel's fallback must discard it (still above the word count),
+        // which is what makes the call pure waste. Output unchanged plus a
+        // code_aware,kompress chain pins the repro path.
+        let probe = "import hashlib, sys\n\
+                     from headroom.transforms import content_router as cr\n\
+                     from headroom.transforms import kompress_compressor as kc\n\
+                     calls = []\n\
+                     def fake(self, content, **kw):\n\
+                     \x20   calls.append(1)\n\
+                     \x20   tokens = kc.payload_tokens(content) - 1\n\
+                     \x20   return kc.KompressResult(content[:-1], content, 0, tokens, 1.0)\n\
+                     kc.KompressCompressor.is_ready = lambda self: True\n\
+                     kc.KompressCompressor.compress = fake\n\
+                     src = open(sys.argv[1]).read().split('\\n')\n\
+                     text = '\\n'.join(f'{i}\\t{l}' for i, l in enumerate(src, 1))\n\
+                     router = cr.ContentRouter(cr.ContentRouterConfig(enable_code_aware=True))\n\
+                     out = router.compress(text, context='Summarise this.')\n\
+                     print(len(calls), out.compressed == text, ','.join(out.strategy_chain),\n\
+                     out.total_original_tokens, out.total_compressed_tokens,\n\
+                     hashlib.sha256(out.compressed.encode()).hexdigest())";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .arg(&source)
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_KOMPRESS_WASTE", kill)
+                .output()
+                .expect("run kompress waste probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (on_calls, on_rest) = on.split_once(' ').unwrap_or((&on, ""));
+        let (off_calls, off_rest) = off.split_once(' ').unwrap_or((&off, ""));
+        if off_calls == "0" && !off_rest.is_empty() {
+            eprintln!("skipping: the wheel no longer runs this Kompress fallback; drop the vendor");
+            return;
+        }
+        assert_eq!(off_calls, "1", "kill switch arm:\n{off}\n{off_err}");
+        assert!(
+            off_rest.starts_with("True code_aware,kompress "),
+            "not the repro path: {off}"
+        );
+        assert_eq!(on_calls, "0", "vendor still ran Kompress:\n{on}\n{on_err}");
+        assert_eq!(on_rest, off_rest, "vendor changed the router's output");
     }
 
     #[test]
