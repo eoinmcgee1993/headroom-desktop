@@ -1577,6 +1577,100 @@ if _hd_cq_flag.strip().lower() not in ("", "0", "false", "no", "off"):
     except Exception:
         pass
 
+# --- CCR history repair: keep tool_result blocks first (vendor) ---------------
+# strip_unsupported_ccr_retrieve_blocks (#2876, since 0.36.0) turns each
+# headroom_retrieve tool_use/tool_result pair into text blocks IN PLACE when the
+# outbound tools do not declare the tool. When the retrieve was one of several
+# parallel tool calls and its tool_result was not the last block, the user turn
+# becomes [text, tool_result] and Anthropic 400s "tool_use ids were found
+# without tool_result blocks immediately after" (Claude Code: "API Error: 400
+# due to tool use concurrency issues"). The repair runs whenever the tool is not
+# injected this turn, which on a cold backend (every restart, every app update)
+# is the first request of each long session carrying such a pair. Stable-
+# partition each message the repair rewrote so its tool_result blocks lead in
+# their original order; messages it did not touch keep their identity and the
+# (messages, count) return is the wheel's. The anthropic handler imports the
+# function at call time, so rebinding the module attribute reaches it. Changes
+# only requests that would otherwise 400. Exact-pin gated to wheel 0.39.0;
+# self-neutralizes when the wheel's own repair already keeps tool_results
+# first. Kill switch: HEADROOM_CCR_REPAIR_ORDER=0.
+_hd_cro_flag = _hd_os.environ.get("HEADROOM_CCR_REPAIR_ORDER", "1")
+if _hd_os.environ.get(
+    "HEADROOM_SDK"
+) == "headroom-desktop-proxy" and _hd_cro_flag.strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+):
+    try:
+        import importlib.metadata as _hd_cro_meta
+
+        if _hd_cro_meta.version("headroom-ai") == "0.39.0":
+            import logging as _hd_cro_logging
+
+            from headroom.ccr.tool_injection import CCR_TOOL_NAME as _hd_cro_name
+            from headroom.proxy import helpers as _hd_cro_mod
+
+            _hd_cro_orig = _hd_cro_mod.strip_unsupported_ccr_retrieve_blocks
+            _hd_cro_log = _hd_cro_logging.getLogger("headroom.proxy")
+
+            def _hd_cro_is_result(block):
+                return isinstance(block, dict) and block.get("type") == "tool_result"
+
+            def _hd_cro_needed():
+                # The incident's shape: does the wheel's repair still leave a
+                # sibling tool_result behind the neutralized text?
+                pair = [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": "r", "name": _hd_cro_name, "input": {}},
+                            {"type": "tool_use", "id": "b", "name": "Bash", "input": {}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "r", "content": "x"},
+                            {"type": "tool_result", "tool_use_id": "b", "content": "ok"},
+                        ],
+                    },
+                ]
+                out, _ = _hd_cro_orig(pair, [])
+                return not _hd_cro_is_result(out[1]["content"][0])
+
+            def _hd_cro_strip(messages, tools):
+                out, n = _hd_cro_orig(messages, tools)
+                if not n or out is messages:
+                    return out, n
+                try:
+                    fixed, moved = list(out), 0
+                    for i, msg in enumerate(fixed):
+                        if i < len(messages) and msg is messages[i]:
+                            continue
+                        content = msg.get("content") if isinstance(msg, dict) else None
+                        if not isinstance(content, list):
+                            continue
+                        # sorted() is stable: a partition, original order kept.
+                        ordered = sorted(content, key=lambda b: not _hd_cro_is_result(b))
+                        if any(x is not y for x, y in zip(ordered, content)):
+                            fixed[i] = dict(msg, content=ordered)
+                            moved += 1
+                    if not moved:
+                        return out, n
+                    _hd_cro_log.info("event=ccr_repair_reordered messages=%d", moved)
+                    return fixed, n
+                except Exception:
+                    return out, n
+
+            if _hd_cro_needed():
+                _hd_cro_mod.strip_unsupported_ccr_retrieve_blocks = _hd_cro_strip
+    except Exception:
+        # Fail-open to the wheel's repair (the pre-vendor behaviour).
+        pass
+
 # Proxied guarded upstreams (upstream PR #3804; self-neutralizes once
 # upstream_pinning grows `proxied_guarded_upstreams_allowed`):
 # 0.39.0 pins caller-supplied upstreams (x-headroom-base-url) to the address the
@@ -14640,6 +14734,19 @@ mod tests {
     }
 
     #[test]
+    fn sitecustomize_vendors_ccr_repair_order() {
+        // A parallel headroom_retrieve pair neutralized in place leaves
+        // [text, tool_result] that Anthropic 400s. Behaviour is proven by
+        // ccr_repair_order_behaves_against_the_installed_wheel; this pins the
+        // gate, the kill switch, the self-neutralization probe and the rebind.
+        let py = super::SITECUSTOMIZE_PY;
+        assert!(py.contains("HEADROOM_CCR_REPAIR_ORDER"));
+        assert!(py.contains(r#"_hd_cro_meta.version("headroom-ai") == "0.39.0""#));
+        assert!(py.contains("if _hd_cro_needed():"));
+        assert!(py.contains("_hd_cro_mod.strip_unsupported_ccr_retrieve_blocks = _hd_cro_strip"));
+    }
+
+    #[test]
     fn sitecustomize_ports_context_limit_guard() {
         // Upstream PR #2942: without the guard, long sessions degrade into a
         // compact-every-other-prompt loop once the compressed request hits
@@ -15247,6 +15354,67 @@ assert g.done"#,
         assert_eq!(on, r"['- a\n- b']", "stderr:\n{on_err}");
         assert!(
             off_err.contains("has no attribute 'strip'"),
+            "kill switch did not unbind:\n{off_err}"
+        );
+    }
+
+    #[test]
+    fn ccr_repair_order_behaves_against_the_installed_wheel() {
+        // A headroom_retrieve call made in parallel with another tool: the
+        // wheel's CCR history repair turns its tool_result into text in place,
+        // so the sibling tool_result no longer leads the user message and
+        // Anthropic 400s ("tool_use ids were found without tool_result blocks
+        // immediately after"). The vendor moves tool_results back to the front
+        // in their original order; untouched messages keep their identity; the
+        // kill switch restores the wheel's order.
+        let python =
+            ManagedRuntime::bootstrap_root(&crate::storage::app_data_dir()).managed_python();
+        if !python.exists() || !installed_wheel_is_pinned(&python) {
+            eprintln!("skipping: no managed runtime on the {HEADROOM_PINNED_VERSION} pin");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hd-ccr-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp inject dir");
+        std::fs::write(dir.join("sitecustomize.py"), super::SITECUSTOMIZE_PY)
+            .expect("write sitecustomize");
+        let probe =
+            "from headroom.proxy.helpers import strip_unsupported_ccr_retrieve_blocks as s\n\
+                     k = {'role': 'user', 'content': [{'type': 'text', 'text': 'hi'}]}\n\
+                     a = {'role': 'assistant', 'content': [\n\
+                     {'type': 'tool_use', 'id': 'r', 'name': 'headroom_retrieve', 'input': {}},\n\
+                     {'type': 'tool_use', 'id': 'b', 'name': 'Bash', 'input': {}}]}\n\
+                     u = {'role': 'user', 'content': [\n\
+                     {'type': 'tool_result', 'tool_use_id': 'r', 'content': 'x'},\n\
+                     {'type': 'tool_result', 'tool_use_id': 'b', 'content': 'ok'},\n\
+                     {'type': 'text', 'text': 'go'}]}\n\
+                     m = [k, a, u]\n\
+                     out, n = s(m, [{'name': 'Bash'}])\n\
+                     same = s(m, [{'name': 'headroom_retrieve'}])\n\
+                     print(n, out[0] is k, same[0] is m, same[1],\n\
+                     [b.get('tool_use_id') or b['text'] for b in out[2]['content']])";
+        let run = |kill: &str| {
+            let out = crate::proc::command(&python)
+                .args(["-c", probe])
+                .env("PYTHONPATH", &dir)
+                .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                .env("HEADROOM_CCR_REPAIR_ORDER", kill)
+                .output()
+                .expect("run ccr repair-order probe");
+            (
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
+        };
+        let (on, on_err) = run("1");
+        let (off, off_err) = run("0");
+        let _ = std::fs::remove_dir_all(&dir);
+        if off == "2 True True 0 ['b', 'x', 'go']" {
+            eprintln!("skipping: the wheel already orders tool_results first; drop the vendor");
+            return;
+        }
+        assert_eq!(on, "2 True True 0 ['b', 'x', 'go']", "stderr:\n{on_err}");
+        assert_eq!(
+            off, "2 True True 0 ['x', 'b', 'go']",
             "kill switch did not unbind:\n{off_err}"
         );
     }

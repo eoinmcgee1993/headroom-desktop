@@ -3223,10 +3223,17 @@ fn ensure_managed_rtk_on_path(
         bin_dir.into_owned()
     };
     let path_value = shell_double_quote(&bin_dir);
+    // Written to both the profile and the rc file, so a login shell sources it
+    // twice: skip only when the dir is already FIRST. Anywhere-on-PATH is not
+    // enough: in a nested macOS login shell (tmux, VS Code, `zsh -l`)
+    // path_helper moves the inherited dir behind /etc/paths, and a Homebrew or
+    // Rust Type Kit `rtk` would then win.
     configure_shell_block(
         shell_targets,
         "managed_rtk",
-        &format!("export PATH=\"{path_value}:$PATH\""),
+        &format!(
+            "case \"$PATH\" in\n  \"{path_value}\"|\"{path_value}\":*) ;;\n  *) export PATH=\"{path_value}:$PATH\" ;;\nesac"
+        ),
     )
 }
 
@@ -11419,6 +11426,70 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(!updated.contains("# >>> headroom:claude_code >>>"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_rtk_path_export_is_idempotent_across_profile_and_rc() {
+        // The block lands in both .zprofile and .zshrc, so a login zsh sourced
+        // it twice and carried the bin dir twice. A stale unconditional block
+        // is rewritten on the next apply, and verification still finds it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin = tmp.path().join("Head room $x").join("bin");
+        let rc = tmp.path().join(".zshrc");
+        let dir = bin.to_string_lossy().into_owned();
+        let stale = format!(
+            "# >>> headroom:managed_rtk >>>\nexport PATH=\"{}:$PATH\"\n# <<< headroom:managed_rtk <<<\n",
+            super::shell_double_quote(&dir)
+        );
+        fs::write(&rc, stale).unwrap();
+
+        let (changed, _) =
+            super::ensure_managed_rtk_on_path(&bin.join("rtk"), std::slice::from_ref(&rc)).unwrap();
+        assert_eq!(changed.len(), 1, "stale block was not rewritten");
+        assert!(super::shell_block_contains_text_in_files(
+            std::slice::from_ref(&rc),
+            "managed_rtk",
+            "export PATH="
+        )
+        .unwrap());
+
+        // A nested macOS login shell inherits PATH and path_helper moves the
+        // inherited dir behind /etc/paths, so "on PATH" is not enough: the
+        // block must put it back first.
+        let reordered = format!("/usr/bin:/bin:{dir}");
+        let cases: [(&str, Vec<&str>); 2] = [
+            ("/usr/bin:/bin", vec![dir.as_str(), "/usr/bin", "/bin"]),
+            (
+                reordered.as_str(),
+                vec![dir.as_str(), "/usr/bin", "/bin", dir.as_str()],
+            ),
+        ];
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            for (start, expected) in &cases {
+                let out = crate::proc::command(shell)
+                    .args(["-c", ". \"$1\"; . \"$1\"; printf %s \"$PATH\"", "sh"])
+                    .arg(&rc)
+                    .env("PATH", start)
+                    // zsh -c still reads $ZDOTDIR/.zshenv, and a developer's
+                    // one prepends its own PATH entries.
+                    .env("ZDOTDIR", tmp.path())
+                    .env_remove("BASH_ENV")
+                    .output()
+                    .unwrap();
+                let path = String::from_utf8_lossy(&out.stdout).into_owned();
+                let entries: Vec<&str> = path.split(':').collect();
+                assert_eq!(
+                    &entries,
+                    expected,
+                    "{shell} from {start}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
