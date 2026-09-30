@@ -7051,15 +7051,22 @@ impl ToolManager {
     /// Hash-checking mode like every other install from the lock (#125): a bare
     /// `pydantic` here took whatever PyPI served.
     fn repair_pydantic_core(&self) -> Result<()> {
+        self.reinstall_lock_pins(&["pydantic", "pydantic-core"], "pydantic-repair.lock")
+            .context("reinstalling the lock's pydantic and pydantic-core")
+    }
+
+    /// Force-reinstall `names` at the platform lock's pins, hash-checked and
+    /// without deps, via a `file_name` requirements file in downloads/.
+    fn reinstall_lock_pins(&self, names: &[&str], file_name: &str) -> Result<()> {
         let lock = bootstrap_requirements_lock();
         let mut pins = String::new();
-        for name in ["pydantic", "pydantic-core"] {
+        for name in names {
             let entry = lock_entry(lock, name)
                 .ok_or_else(|| anyhow!("the requirements lock does not pin {name}"))?;
             pins.push_str(&entry);
             pins.push('\n');
         }
-        let pins_path = self.runtime.downloads_dir.join("pydantic-repair.lock");
+        let pins_path = self.runtime.downloads_dir.join(file_name);
         crate::client_adapters::atomic_write(&pins_path, pins.as_bytes())
             .with_context(|| format!("writing {}", pins_path.display()))?;
         run_pip_install_with_retries_clearing_locks(
@@ -7085,7 +7092,6 @@ impl ToolManager {
             &self.runtime.venv_dir,
             |_| {},
         )
-        .context("reinstalling the lock's pydantic and pydantic-core")
     }
 
     /// Restore deps from `previous_lock_backup` via
@@ -8037,6 +8043,14 @@ impl ToolManager {
             &self.runtime.root_dir,
             |line| log_pip_line("markitdown pip", line),
         )?;
+        // markitdown 0.1.7 requires magika~=0.6.1, so pip downgrades the
+        // lock's magika (the content router's detector) below its hashed pin.
+        // Put the lock's pin back: same API and labels, and markitdown runs on
+        // it. Warn-only: 0.6.3 behaves the same, and failing here would take
+        // the addon down over a pin.
+        if let Err(err) = self.reinstall_lock_pins(&["magika"], "markitdown-magika.lock") {
+            log::warn!("restoring the lock's magika after markitdown failed: {err:#}");
+        }
         if !self.markitdown_entrypoint().exists() {
             bail!(
                 "markitdown install completed but {} was not found",
@@ -22672,6 +22686,48 @@ exec(os.environ["HELPER"])
         let md = fs::read_to_string(&claude_md).expect("CLAUDE.md");
         assert!(!md.contains("markitdown_office"), "{md}");
         assert!(md.starts_with("mine\n"), "{md}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// markitdown 0.1.7 requires magika~=0.6.1, so its install downgraded the
+    /// lock's magika; the lock's hashed pin goes back on right after.
+    #[test]
+    #[cfg(unix)] // fake shell-script python
+    fn install_markitdown_puts_the_locks_magika_back() {
+        let (root, runtime, manager) = seed_test_runtime("markitdown-magika");
+        let home = root.join("home");
+        fs::create_dir_all(&home).expect("home");
+        let _home = HomeGuard::new(&home);
+        let log = root.join("argv.log");
+        let entrypoint = manager.markitdown_entrypoint();
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\necho \"ARGV $*\" >> {log}\nprev=\n\
+                 for a in \"$@\"; do [ \"$prev\" = --requirement ] && cat \"$a\" >> {log}; prev=$a; done\n\
+                 mkdir -p '{dir}'\nprintf '#!/bin/sh\\nexit 0\\n' > '{e}'\nchmod +x '{e}'\n",
+                log = log.display(),
+                dir = entrypoint.parent().expect("bin").display(),
+                e = entrypoint.display()
+            ),
+        );
+        manager.install_markitdown().expect("install");
+        let calls = fs::read_to_string(&log).expect("argv log");
+        let argvs: Vec<&str> = calls.lines().filter(|l| l.starts_with("ARGV ")).collect();
+        let markitdown = argvs
+            .iter()
+            .position(|a| a.contains("markitdown[all]=="))
+            .expect("markitdown installed");
+        let repin = argvs
+            .iter()
+            .position(|a| a.contains("--require-hashes"))
+            .expect("magika re-pinned");
+        assert!(repin > markitdown, "{calls}");
+        assert!(argvs[repin].contains("--no-deps"), "{calls}");
+        let entry = super::lock_entry(super::bootstrap_requirements_lock(), "magika")
+            .expect("lock pins magika");
+        assert!(entry.contains("--hash=sha256:"), "{entry}");
+        assert!(calls.contains(&entry), "{calls}");
         let _ = fs::remove_dir_all(root);
     }
 
